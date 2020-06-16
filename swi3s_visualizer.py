@@ -1,5 +1,5 @@
 """
-Copyright (c) 2019 Apple Inc. All Rights Reserved.
+Copyright (c) 2019 Apple Inc. and other contributors. All Rights Reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
