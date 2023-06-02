@@ -1,5 +1,6 @@
+
 """
-Copyright (c) 2019 MIPI Alliance and other contributors. All Rights Reserved.
+Copyright (c) 2020-2023 MIPI Alliance and other contributors. All Rights Reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
@@ -12,17 +13,34 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-# To Do
-# Fix guard bits when using channel grouping. Should be at the end of each channel group? Or after the last bitslot driven in each row.
-# Add G polarity
-# Add phat bits
+# Break lines
 
+# To Do
+# Fix first row so that complementary sample rate can share an interval (e.g. 23 and 25 kHz can exist in the same 48 kHz interval).
+# Channel group spacing breaks guards an tails even with channel grouping = 0
+# Error when h_count is too small? Hard to tell.
+# Handovers not showing clashes with guard & tail
+# Handle the specific detail of manager as data source near the end of a row (just before S0).
+# Allow the control column to be anywhere (including just before S0).
+# break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
+
+# Reconcile Device Numbers and is Manager attributes.
+# make guard and tail rules contemplate Device number and not just data ports.
+# Fix S0 handover (preceding bit)
+
+# To Dos that might want to start with a re-write:
+# Have a way to indicate that two dataports are in the same device (and thus the guards and tails are impacted).
+# Change the SampleGroup to support up to 16 (and use for SRI)
+# Add Flow-control bits (including the runt port).
+# Fold up the check boxex
+# Put all of the drawn data into an array (rows by columns):
+#    Output a CSV of what is drawn on the screen
+#    Read in wav files per data port and place in output 
 
 # Done
-# Don't draw guard or tail bit for a sink data port
-# Fixed an issue where guard bitslots depended on tail length parameter
-# Looks like already had a CDS guard bit option
-
+# Issue with wide bits missing guards and tails missing on some rows fixed
+# Added error checking for h_width + 1 mod bit_width + 1 = 0
+# Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
 from __future__ import division  # Fixes a Python 2 issue with integer division
 
 import sys
@@ -32,6 +50,45 @@ import csv
 import os
 import platform
 import distutils.util
+
+import argparse
+import re
+from enum import Enum
+import json
+
+#Strings that are use in file loading and storing
+
+DATA_PORT_NAME = 'Data Port Name'
+DATA_PORT_DEVICE_NUMBER = 'Data Port Device Number'
+DATA_PORT_CHANNELS = 'Data Port Channels'
+DATA_PORT_CHANNEL_GROUPING = 'Data Port Channel Grouping'
+DATA_PORT_CHANNEL_GROUP_SPACING = 'Data Port Channel Group Spacing'
+DATA_PORT_SAMPLE_WIDTH = 'Data Port Sample Width'
+DATA_PORT_SAMPLE_GROUPING = 'Data Port Sample Grouping'
+DATA_PORT_INTERVAL = 'Data Port Interval Integer'
+DATA_PORT_SKIPPING_NUMERATOR = 'Data Port Interval Numerator'
+DATA_PORT_OFFSET = 'Data Port Offset'
+DATA_PORT_HORIZONTAL_START = 'Data Port Horizontal Start'
+DATA_PORT_HORIZONTAL_COUNT = 'Data Port Horizontal Count'
+DATA_PORT_TAIL_WIDTH = 'Data Port Tail Width'
+DATA_PORT_BIT_WIDTH = 'Data Port Bit Width'
+DATA_PORT_IS_SOURCE = 'Source'
+DATA_PORT_DRAW_HANDOVER = 'Draw Data Port Handover'
+DATA_PORT_GUARD_ENABLED = 'Data Port Guard Enabled'
+DATA_PORT_GUARD_POLARITY = 'Data Port Guard Polarity'
+DATA_PORT_ENABLED = 'Data Port Enabled'
+DATA_PORT_IN_MANAGER = 'Data Port In Manager'
+DATA_PORT_SRI =  'Data Port DRI'
+
+
+NOT_OWNED = 'not owned'
+
+
+# in C these would be compilation switches.  Here they are controlling blocks of code.
+SRI_USES_CHANNEL_GROUPING_ONLY = False
+SRI_USES_SAMPLE_COUNT = True
+FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
+Debug_Drawing = False
 
 try:
     import canvasvg
@@ -58,12 +115,92 @@ else:
     to_unicode = unicode
 
 
+GuardText = 'G'
+
+###############################
+#                             #
+#    FRAME MODEL CLASSES      #
+#                             #
+###############################
+
+class Frame_model:
+
+    def __init__(self, n_rows=0, n_cols=2):
+        self.row_info = []
+        for i in range(0, n_rows):
+            self.row_info.append(Row_info(n_cols))            
+
+    def append_row(self, row):
+        self.row_info.append(row)
+
+    def get_row(self, i):
+        return self.row_info[i]
+
+class Row_info:
+
+    def __init__(self, n_col):
+        self.col_info = [Col_info() for i in range(0, n_col)]
+
+    def get_col(self, i):
+        return self.col_info[i]
+        
+class Col_info:
+
+    def __init__(self):
+        self.slot_info = []
+
+    def append_slot(self, slot):
+        self.slot_info.append(slot)
+
+class Slot_info:
+
+    def __init__(self):
+        self.slot_type  = Slot_type.NORMAL
+        self.dir        = Direction_type.SINK
+        self.device_num = 0
+        self.dp_num     = 0
+        self.channel    = 0
+        self.sample     = 0
+        self.bit_num    = 0
+
+class Direction_type(Enum):
+    SOURCE = 0
+    SINK   = 1
+
+class Slot_type(Enum):
+    NORMAL   = 0
+    GUARD    = 1
+    TAIL     = 2
+    HANDOVER = 3
+    CDS      = 4
+    S0       = 5
+    S1       = 6
+
+
+class SimpleJSONEncoder(json.JSONEncoder):
+   def default(self, obj):
+        if hasattr(obj, "__dict__"):
+            d = {}
+            for key, value in obj.__dict__.items():
+                if not key.startswith("_"):
+                    if (isinstance(value, Enum)):
+                        d[key] = value.name
+                    else:
+                        d[key] = value
+            return d
+        return super().default(obj)
+
+###############################
+
+
 class App(tk.Frame):
-    def __init__(self, master):
+    def __init__(self, master, args):
         tk.Frame.__init__(self, master)
         # root is window
 
-        self.VERSION = '1.16'
+        self.VERSION = '1.42'
+        self.args = args
+        self.frame_model = Frame_model()
 
         # Appearance settings
         self.NUMBER_ENTRY_WIDTH = 5  # In characters
@@ -89,26 +226,25 @@ class App(tk.Frame):
         self.rows_in_frame = 64
 
         self.DP_COLORS = ['#FF80BF', '#FFA080', '#FFFF80', '#A0FF80', '#80FFFF', '#8080FF', '#BF80FF', '#FFBFFF', '#FFBFBF', '#FFFFBF',
-                          '#BFFFBF', '#BFFFFF']
+                          '#BFFFBF', '#BFFFFF'] # Thanks to Eddie for the colours.
 
-        self.INTERFACE_PARAMETER_TITLES = ['Rows to Draw (' + str(self.MIN_ROWS_IN_FRAME) + '-' + str(self.MAX_ROWS_IN_FRAME) + ')',
-                                           'Columns per Row (' + str(Interface.MIN_COLUMNS_PER_ROW) + '-' + str(Interface.MAX_COLUMNS_PER_ROW)
+        self.INTERFACE_PARAMETER_TITLES = ['Columns per Row (' + str(Interface.MIN_COLUMNS_PER_ROW) + '-' + str(Interface.MAX_COLUMNS_PER_ROW)
                                            + ')',
                                            'S0 S1 Enabled',
                                            'S0 Width (' + str(Interface.MIN_S0_WIDTH) + '-' + str(Interface.MAX_S0_WIDTH) + ')',
-                                           'S0 Handover Enabled',
+                                           # 'S1 Tails',
                                            'CDS Guard Enabled',
-                                           'Handover Width (' + str(Interface.MIN_HANDOVER_WIDTH) + '-' + str(
-                                               Interface.MAX_HANDOVER_WIDTH) + ')',
-                                           'Tail Width (' + str(Interface.MIN_TAIL_WIDTH) + '-' + str(Interface.MAX_TAIL_WIDTH) + ')',
-                                           'Interval Denominator (' + str(Interface.MIN_INTERVAL_DENOMINATOR) + '-' + str(
-                                               Interface.MAX_INTERVAL_DENOMINATOR) + ')',
-                                           'Bulk Horizontal Start (1-' + str(Interface.MAX_COLUMNS - 2) + ')',
-                                           'Bulk Width (0,2,5,10)',
-                                           'Bulk Guard Enabled',
-                                           'Row Rate [kHz] (' + str(Interface.MIN_ROW_RATE) + '-' + str(Interface.MAX_ROW_RATE) + ')']
+                                           'CDS Tail Width (' + str(Interface.MIN_TAIL_WIDTH) + '-' + str(Interface.MAX_TAIL_WIDTH) + ')',
+                                           'Skipping Denominator (' + str(Interface.MIN_SKIPPING_DENOMINATOR) + '-' + str(
+                                               Interface.MAX_SKIPPING_DENOMINATOR) + ')',
+                                           'CDS/S0 Handover Width (' + str(Interface.MIN_CDS_S0_HANDOVER_WIDTH) + '-' + str(
+                                               Interface.MAX_CDS_S0_HANDOVER_WIDTH) + ')',
+                                           'Draw S0 Handover',
+                                           'Row Rate [kHz] (' + str(Interface.MIN_ROW_RATE) + '-' + str(Interface.MAX_ROW_RATE) + ')',
+                                           'Rows to Draw (' + str(self.MIN_ROWS_IN_FRAME) + '-' + str(self.MAX_ROWS_IN_FRAME) + ')']
 
-        self.DP_PARAMETER_DESCRIPTIONS = ['Channels (' + str(DataPort.MIN_CHANNELS) + '-' + str(DataPort.MAX_CHANNELS) + ')',
+        self.DP_PARAMETER_DESCRIPTIONS = ['Device Number (' + str(DataPort.MIN_DEVICE_NUMBER) + '-' + str(DataPort.MAX_DEVICE_NUMBER) + ')',
+                                          'Channels (' + str(DataPort.MIN_CHANNELS) + '-' + str(DataPort.MAX_CHANNELS) + ')',
                                           'Channel Grouping (' + str(DataPort.MIN_CHANNEL_GROUPING) + '-' + str(
                                               DataPort.MAX_CHANNEL_GROUPING) + ')',
                                           'Channel Group Spacing (' + str(DataPort.MIN_CHANNEL_GROUP_SPACING) + '-' + str(
@@ -116,18 +252,21 @@ class App(tk.Frame):
                                           'Sample Width (' + str(DataPort.MIN_SAMPLE_WIDTH) + '-' + str(DataPort.MAX_SAMPLE_WIDTH) + ')',
                                           'Sample Grouping (' + str(DataPort.MIN_SAMPLE_GROUPING) + '-' + str(
                                               DataPort.MAX_SAMPLE_GROUPING) + ')',
-                                          'Interval (' + str(DataPort.MIN_INTERVAL_INTEGER) + '-' + str(
-                                              DataPort.MAX_INTERVAL_INTEGER) + ')',
-                                          'Fractional Interval (' + str(DataPort.MIN_INTERVAL_NUMERATOR) + '-' + str(
-                                              DataPort.MAX_INTERVAL_NUMERATOR) + ')',
+                                          'Interval (' + str(DataPort.MIN_INTERVAL) + '-' + str(
+                                              DataPort.MAX_INTERVAL) + ')',
+                                          'Numerator (' + str(DataPort.MIN_SKIPPING_NUMERATOR) + '-' + str(
+                                              DataPort.MAX_SKIPPING_NUMERATOR) + ')',
                                           'Offset (' + str(DataPort.MIN_OFFSET) + '-' + str(DataPort.MAX_OFFSET) + ')',
                                           'Horizontal Start (0-' + str(Interface.MAX_COLUMNS - 1) + ')',
-                                          'Horizontal Stop (0-' + str(Interface.MAX_COLUMNS - 1) + ')',
+                                          'Horizontal Count (0-' + str(Interface.MAX_COLUMNS - 1) + ')',
+                                          'Tail Width (0-' + str(Interface.MAX_TAIL_WIDTH) + ')',
+                                          'WideBit Width (0-' + str(Interface.MAX_BIT_WIDTH) + ')',
                                           'Source [checked] / Sink',
-                                          'Handover Enabled',
-                                          'Tail Enabled',
+                                          'Draw Handover',
                                           'Guard Enabled',
+                                          'SRI',
                                           'Data Port Enabled',
+                                          'Manager DataPort',
                                           'Calculated Sample Rate [kHz]']
 
         window_width = int(35.5 * self.COLUMN_SIZE)
@@ -138,7 +277,7 @@ class App(tk.Frame):
 
         self.interface = Interface()
 
-        self.master.title('SoundWire Next Payload Visualizer v' + self.VERSION)
+        self.master.title('SoundWire I3S Payload Visualizer v' + self.VERSION)
         self.master.minsize(window_width, window_height)
         self.master.geometry("+150+50")
         self.master.resizable(False, True)
@@ -146,6 +285,7 @@ class App(tk.Frame):
         self.master.config(menu=tk.Menu(self.master))
 
         # Used to validate data port entry widget values
+        self.device_number_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_DEVICE_NUMBER, DataPort.MAX_DEVICE_NUMBER)
         self.channels_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_CHANNELS, DataPort.MAX_CHANNELS)
         self.channel_grouping_vcmd = (
             self.register(self.validate), '%d', '%P', DataPort.MIN_CHANNEL_GROUPING, DataPort.MAX_CHANNEL_GROUPING)
@@ -153,12 +293,15 @@ class App(tk.Frame):
                                            DataPort.MAX_CHANNEL_GROUP_SPACING)
         self.sample_width_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SAMPLE_WIDTH, DataPort.MAX_SAMPLE_WIDTH)
         self.sample_grouping_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SAMPLE_GROUPING, DataPort.MAX_SAMPLE_GROUPING)
-        self.interval_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_INTERVAL_INTEGER, DataPort.MAX_INTERVAL_INTEGER)
-        self.numerator_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_INTERVAL_NUMERATOR, DataPort.MAX_INTERVAL_NUMERATOR)
+        self.interval_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_INTERVAL, DataPort.MAX_INTERVAL)
+        self.numerator_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SKIPPING_NUMERATOR, DataPort.MAX_SKIPPING_NUMERATOR)
         self.offset_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_OFFSET, DataPort.MAX_OFFSET)
         self.column_vcmd = (self.register(self.validate), '%d', '%P', 0, Interface.MAX_COLUMNS - 1)
+        self.tail_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_TAIL_WIDTH, Interface.MAX_TAIL_WIDTH)
+        self.bit_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_BIT_WIDTH, Interface.MAX_BIT_WIDTH)
 
-        dp_entry_box_validate_functions = [self.channels_vcmd,
+        dp_entry_box_validate_functions = [self.device_number_vcmd,
+                                           self.channels_vcmd,
                                            self.channel_grouping_vcmd,
                                            self.channel_group_spacing_vcmd,
                                            self.sample_width_vcmd,
@@ -167,6 +310,9 @@ class App(tk.Frame):
                                            self.numerator_vcmd,
                                            self.offset_vcmd,
                                            self.column_vcmd,
+                                           self.column_vcmd,
+                                           self.tail_width_vcmd,
+                                           self.bit_width_vcmd,
                                            self.column_vcmd]
 
         # Used to validate interface parameter entry widget values
@@ -174,13 +320,10 @@ class App(tk.Frame):
         self.columns_per_row_vcmd = (self.register(self.validate), '%d', '%P', 1, Interface.MAX_COLUMNS_PER_ROW)
         self.rows_vcmd = (self.register(self.validate), '%d', '%P', self.MIN_ROWS_IN_FRAME, self.MAX_ROWS_IN_FRAME)
         self.denominator_vcmd = (
-            self.register(self.validate), '%d', '%P', Interface.MIN_INTERVAL_DENOMINATOR, Interface.MAX_INTERVAL_DENOMINATOR)
-        self.bulk_hstart_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_BULK_HORIZONTAL_START,
-                                 Interface.MAX_BULK_HORIZONTAL_START)
-        self.bulk_width_vcmd = (self.register(self.validate_values), '%d', '%P', [0, 2, 5, 10])
-        self.handover_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_TAIL_WIDTH, Interface.MAX_TAIL_WIDTH)
-        self.tail_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_TAIL_WIDTH, Interface.MAX_TAIL_WIDTH)
+            self.register(self.validate), '%d', '%P', Interface.MIN_SKIPPING_DENOMINATOR, Interface.MAX_SKIPPING_DENOMINATOR)
+        self.cds_s0_handover_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_CDS_S0_HANDOVER_WIDTH, Interface.MAX_CDS_S0_HANDOVER_WIDTH)
         self.s0_width_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_S0_WIDTH, Interface.MAX_S0_WIDTH)
+        # self.s1_tails_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_S1_TAILS, Interface.MAX_S1_TAILS)
         self.row_rate_vcmd = (self.register(self.validate), '%d', '%P', Interface.MIN_ROW_RATE, Interface.MAX_ROW_RATE)
 
         master.bind('<Control-h>', self.toggle_ui)
@@ -197,20 +340,31 @@ class App(tk.Frame):
         self.s0s1_enabled_tk = tk.BooleanVar(value=self.interface.s0s1_enabled)
         self.s0_ta_enable_tk = tk.BooleanVar(value=self.interface.s0_handover_enabled)
         self.cd0_enable_tk = tk.BooleanVar(value=self.interface.cds_guard_enabled)
-        self.bulk_guard_enabled_tk = tk.BooleanVar(value=self.interface.bulk_guard_enabled)
 
-        # We'll use these to detect bus clashes
+        # We'll use these to detect bus clashes of various kinds
         self.bit_slots_source = []
+        self.bit_slots_source_device = []
         self.bit_slots_source_clashed = []
         self.bit_slots_sink = []
+        self.bit_slots_sink_device = []
         self.bit_slots_sink_clashed = []
+        self.bit_slots_guard = []
+        self.bit_slots_guard_device = []
+        self.bit_slots_guard_clashed = []
+        self.bit_slots_tail = []
+        self.bit_slots_tail_device = []
+        self.bit_slots_tail_clashed = []
         self.bit_slots_turnaround = []
+        self.bit_slots_turnaround_device = []
+        self.bit_slots_turnaround_clashed = []
 
         self.dp_enable_check_button_vars = []
+        self.dp_manager_check_button_vars = []
         self.dp_direction_check_button_vars = []
         self.dp_ta_enable_check_button_vars = []
         self.dp_tail_enable_check_button_vars = []
-        self.dp_zero_enable_check_button_vars = []
+        self.dp_guard_enable_check_button_vars = []
+        self.dp_sri_enable_check_button_vars = []
         self.dp_entry_boxes = []
         self.dp_name_entry_boxes = []
         self.dp_parameter_labels = []
@@ -241,7 +395,7 @@ class App(tk.Frame):
         # Data port direction checkbutton widgets
         self.dp_sample_rate_labels = []
         for count, data_port in enumerate(self.interface.data_ports):
-            self.dp_direction_check_button_vars.append(tk.BooleanVar(value=data_port.source))
+            self.dp_direction_check_button_vars.append(tk.BooleanVar(value=data_port.source_REG))
             cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_direction_check_button_vars[count])
             cb.grid(row=DataPort.NUM_DP_PARAMETERS+1, column=count+1)
 
@@ -249,17 +403,21 @@ class App(tk.Frame):
             cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_ta_enable_check_button_vars[count])
             cb.grid(row=DataPort.NUM_DP_PARAMETERS+2, column=count+1)
 
-            self.dp_tail_enable_check_button_vars.append(tk.BooleanVar(value=data_port.tail))
-            cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_tail_enable_check_button_vars[count])
+            self.dp_guard_enable_check_button_vars.append(tk.BooleanVar(value=data_port.guard_REG))
+            cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_guard_enable_check_button_vars[count])
             cb.grid(row=DataPort.NUM_DP_PARAMETERS+3, column=count+1)
 
-            self.dp_zero_enable_check_button_vars.append(tk.BooleanVar(value=data_port.guard))
-            cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_zero_enable_check_button_vars[count])
+            self.dp_sri_enable_check_button_vars.append(tk.BooleanVar(value=data_port.sri_REG))
+            cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_sri_enable_check_button_vars[count])
             cb.grid(row=DataPort.NUM_DP_PARAMETERS+4, column=count+1)
 
             self.dp_enable_check_button_vars.append(tk.BooleanVar(value=data_port.enabled))
             cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_enable_check_button_vars[count])
             cb.grid(row=DataPort.NUM_DP_PARAMETERS+5, column=count+1)
+
+            self.dp_manager_check_button_vars.append(tk.BooleanVar(value=data_port.inManager))
+            cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.dp_manager_check_button_vars[count])
+            cb.grid(row=DataPort.NUM_DP_PARAMETERS+6, column=count+1)
 
             self.dp_sample_rate_labels.append(
                 tk.Label(self.config_frame, text=data_port.sample_rate, anchor=tk.CENTER, font=(self.APP_FONT, self.TEXT_SIZE)))
@@ -272,7 +430,7 @@ class App(tk.Frame):
 
         # Interface Parameters
         self.frame_labels.append(
-            tk.Label(self.config_frame, text='Interface Parameters', anchor=tk.CENTER, font=(self.APP_FONT, self.TEXT_SIZE+6), padx=10))
+            tk.Label(self.config_frame, text='Miscellaneous Parameters', anchor=tk.CENTER, font=(self.APP_FONT, self.TEXT_SIZE+6), padx=10))
         self.frame_labels[-1].grid(row=0, column=Interface.NUM_DATA_PORTS+2, columnspan=2)
         for count, text in enumerate(self.INTERFACE_PARAMETER_TITLES):
             self.frame_labels.append(
@@ -292,66 +450,57 @@ class App(tk.Frame):
 
         # Interface parameter entry widgets
 
-        # Rows to draw
-        self.rpf_entry = self.create_entry(self.rows_vcmd)
-        self.rpf_entry.grid(row=1, column=Interface.NUM_DATA_PORTS+3)
-        self.rpf_entry.bind('<Return>', self.master_focus)
-
         # Columns per row
         self.cpr_entry = self.create_entry(self.columns_per_row_vcmd)
-        self.cpr_entry.grid(row=2, column=Interface.NUM_DATA_PORTS+3)
+        self.cpr_entry.grid(row=1, column=Interface.NUM_DATA_PORTS+3)
         self.cpr_entry.bind('<Return>', self.master_focus)
 
         # S0/S1 enable
         cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.s0s1_enabled_tk)
-        cb.grid(row=3, column=Interface.NUM_DATA_PORTS+3)
+        cb.grid(row=2, column=Interface.NUM_DATA_PORTS+3)
 
         # S0 width
         self.s0w_entry = self.create_entry(self.s0_width_vcmd)
-        self.s0w_entry.grid(row=4, column=Interface.NUM_DATA_PORTS+3)
+        self.s0w_entry.grid(row=3, column=Interface.NUM_DATA_PORTS+3)
         self.s0w_entry.bind('<Return>', self.master_focus)
 
-        # S0 handover enable
-        cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.s0_ta_enable_tk)
-        cb.grid(row=5, column=Interface.NUM_DATA_PORTS+3)
+        # Number of S1 Tails   TODO:  Should probably remove the hard coded row number here to add more parameters.
+        #self.s1tails_entry = self.create_entry(self.s1_tails_vcmd)
+        #self.s1tails_entry.grid( row = 4, column = Interface.NUM_DATA_PORTS + 3 )
+        #self.s1tails_entry.bind('<Return>', self.master_focus)
 
         # Control Data Stream guard
         cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.cd0_enable_tk)
-        cb.grid(row=6, column=Interface.NUM_DATA_PORTS+3)
+        cb.grid(row=4, column=Interface.NUM_DATA_PORTS+3)
 
-        # Handover width
-        self.handover_width_entry = self.create_entry(self.handover_width_vcmd)
-        self.handover_width_entry.grid(row=7, column=Interface.NUM_DATA_PORTS+3)
-        self.handover_width_entry.bind('<Return>', self.master_focus)
-
-        # Tail width
+        # CDS Tail width
         self.tail_width_entry = self.create_entry(self.tail_width_vcmd)
-        self.tail_width_entry.grid(row=8, column=Interface.NUM_DATA_PORTS+3)
+        self.tail_width_entry.grid(row=5, column=Interface.NUM_DATA_PORTS+3)
         self.tail_width_entry.bind('<Return>', self.master_focus)
 
-        # Fractional interval denominator
+        # Fractional skipping denominator
         self.fid_entry = self.create_entry(self.denominator_vcmd)
-        self.fid_entry.grid(row=9, column=Interface.NUM_DATA_PORTS+3)
+        self.fid_entry.grid(row=6, column=Interface.NUM_DATA_PORTS+3)
         self.fid_entry.bind('<Return>', self.master_focus)
 
-        # Bulk horizontal start
-        self.bulk_hstart_entry = self.create_entry(self.bulk_hstart_vcmd)
-        self.bulk_hstart_entry.grid(row=10, column=Interface.NUM_DATA_PORTS+3)
-        self.bulk_hstart_entry.bind('<Return>', self.master_focus)
+        # Handover width
+        self.cds_s0_handover_width_entry = self.create_entry(self.cds_s0_handover_width_vcmd)
+        self.cds_s0_handover_width_entry.grid(row=7, column=Interface.NUM_DATA_PORTS+3)
+        self.cds_s0_handover_width_entry.bind('<Return>', self.master_focus)
 
-        # Bulk width
-        self.bulk_width_entry = self.create_entry(self.bulk_width_vcmd)
-        self.bulk_width_entry.grid(row=11, column=Interface.NUM_DATA_PORTS+3)
-        self.bulk_width_entry.bind('<Return>', self.master_focus)
-
-        # Bulk guard enable
-        cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.bulk_guard_enabled_tk)
-        cb.grid(row=12, column=Interface.NUM_DATA_PORTS+3)
+        # Draw S0 handover
+        cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.s0_ta_enable_tk)
+        cb.grid(row=8, column=Interface.NUM_DATA_PORTS+3)
 
         # Row rate
         self.row_rate_entry = self.create_entry(self.row_rate_vcmd)
-        self.row_rate_entry.grid(row=13, column=Interface.NUM_DATA_PORTS + 3)
+        self.row_rate_entry.grid(row=9, column=Interface.NUM_DATA_PORTS + 3)
         self.row_rate_entry.bind('<Return>', self.master_focus)
+
+        # Rows to draw
+        self.rpf_entry = self.create_entry(self.rows_vcmd)
+        self.rpf_entry.grid(row=10, column=Interface.NUM_DATA_PORTS+3)
+        self.rpf_entry.bind('<Return>', self.master_focus)
 
         # render_frame contains the canvas widget where we draw the SoundWire frame
         render_frame = tk.Frame(frame)
@@ -402,8 +551,16 @@ class App(tk.Frame):
         btn1.grid(column=Interface.NUM_DATA_PORTS + 2, columnspan=2, row=DataPort.NUM_DP_PARAMETERS + 6,
                   sticky=tk.N + tk.S + tk.E + tk.W, padx=10, pady=3)
 
+        if self.args.config_filename is not None:
+            self.load_csv_file_int(self.args.config_filename)
+
         self.update_ui()
         self.refresh_data_ports()
+
+        # if in batch mode exit here
+        if (self.args.batch_mode):
+            exit(0)
+
 
     # Validates entry widget text
     @staticmethod
@@ -472,58 +629,78 @@ class App(tk.Frame):
         self.refresh_data_ports()
 
         # Write csv file
-        filename = filedialog.asksaveasfilename(initialdir=".", title="Select an output parameter file name", defaultextension=".csv",
+        filename = filedialog.asksaveasfilename(title="Select an output parameter file name", defaultextension=".csv",
                                                 filetypes=[("CSV Files", "*.csv")])
 
         if filename:
             with io.open(filename, 'w', encoding='utf8') as outfile:
                 writer = csv.writer(outfile, delimiter=',', lineterminator='\n')
-                frame_values = [self.rows_in_frame, self.interface.columns_per_row, self.interface.s0s1_enabled,
-                                self.interface.s0_width, self.interface.s0_handover_enabled, self.interface.cds_guard_enabled,
-                                self.interface.handover_width, self.interface.tail_width, self.interface.interval_denominator,
-                                self.interface.bulk_horizontal_start, self.interface.bulk_width,
-                                self.interface.bulk_guard_enabled, self.interface.row_rate]
+                frame_values = [self.interface.columns_per_row,
+                                self.interface.s0s1_enabled,
+                                self.interface.s0_width,
+                                #self.interface.s1_tails,
+                                self.interface.cds_guard_enabled,
+                                self.interface.tail_width,
+                                self.interface.skipping_denominator_REG,
+                                self.interface.cds_s0_handover_width,
+                                self.interface.s0_handover_enabled,
+                                self.interface.row_rate,
+                                self.rows_in_frame]
                 for count, value in enumerate(frame_values):
                     row = [self.INTERFACE_PARAMETER_TITLES[count]] + [str(value)]
                     writer.writerow(row)
-                row = ['Data Port Names'] + [data_port.name for data_port in self.interface.data_ports]
+                # TODO: Techincal debt:  Re-write the following to use a string constants and use the same constant for both read and write.
+                row = [ DATA_PORT_NAME ] + [data_port.name for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Channels'] + [str(data_port.channels) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_DEVICE_NUMBER ] + [str(data_port.device_number) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Channel Grouping'] + [str(data_port.channel_grouping) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_CHANNELS ] + [str(data_port.channels_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Channel Group Spacing'] + [str(data_port.channel_group_spacing) for data_port in
+                row = [ DATA_PORT_CHANNEL_GROUPING ] + [str(data_port.channel_grouping_REG) for data_port in self.interface.data_ports]
+                writer.writerow(row)
+                row = [ DATA_PORT_CHANNEL_GROUP_SPACING ] + [str(data_port.channel_group_spacing_REG) for data_port in
                                                              self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Sample Width'] + [str(data_port.sample_width) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Sample Grouping'] + [str(data_port.sample_grouping) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_SAMPLE_GROUPING ] + [str(data_port.sample_grouping_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Interval Integer'] + [str(data_port.interval_integer) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_INTERVAL ] + [str(data_port.interval_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Interval Numerator'] + [str(data_port.interval_numerator) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_SKIPPING_NUMERATOR ] + [str(data_port.skipping_numerator_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Offset'] + [str(data_port.offset) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_OFFSET ] + [str(data_port.offset_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Horizontal Start'] + [str(data_port.h_start) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_HORIZONTAL_START ] + [str(data_port.h_start_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Horizontal Stop'] + [str(data_port.h_stop) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_HORIZONTAL_COUNT ] + [str(data_port.h_count_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Source'] + [str(data_port.source) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_TAIL_WIDTH ] + [str(data_port.tail_width_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Handover Enabled'] + [str(data_port.handover) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_BIT_WIDTH ] + [str(data_port.bit_width_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Tail Enabled'] + [str(data_port.tail) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_IS_SOURCE ] + [str(data_port.source_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Guard Enabled'] + [str(data_port.guard) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_DRAW_HANDOVER ] + [str(data_port.handover) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = ['Data Port Enabled'] + [str(data_port.enabled) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_GUARD_ENABLED ] + [str(data_port.guard_REG) for data_port in self.interface.data_ports]
+                writer.writerow(row)
+                row = [ DATA_PORT_ENABLED ] + [str(data_port.enabled) for data_port in self.interface.data_ports]
+                writer.writerow(row)
+                row = [ DATA_PORT_IN_MANAGER ] + [str(data_port.inManager) for data_port in self.interface.data_ports]
+                writer.writerow(row)
+                row = [ DATA_PORT_SRI ] + [str(data_port.sri_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
             outfile.close()
-
             # Write SVG export file if the canvasvg module was found
             if canvasvg:
                 canvasvg.saveall(os.path.splitext(filename)[0] + '.svg', self.render_canvas)
+            else:
+                messagebox.showwarning('Warning!', 'No canvasvg.')
+
+    def save_frame_model(self, filename, model):
+        fh = openfile(filename, 'w')
+        json.dump(model, fh, cls=SimpleJSONEncoder, indent=4)
 
     # Writes UI elements
     def update_ui(self):
@@ -537,59 +714,74 @@ class App(tk.Frame):
         for entry_column, data_port in enumerate(self.interface.data_ports):  # Rows
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 0 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 0 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].channels)
-            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].delete(0, tk.END)
-            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].insert(0, self.interface.data_ports[
-                entry_column].channel_grouping)
-            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].delete(0, tk.END)
-            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].channel_group_spacing)
+                                                                                             entry_column].device_number)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].delete(0, tk.END)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].insert(0,
+                                                                                         self.interface.data_ports[entry_column].channels_REG)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].delete(0, tk.END)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].insert(0, self.interface.data_ports[
+                entry_column].channel_grouping_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 3 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 3 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].sample_width)
+                                                                                             entry_column].channel_group_spacing_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].sample_grouping)
+                                                                                             entry_column].sample_width_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].interval_integer)
+                                                                                             entry_column].sample_grouping_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].interval_numerator)
+                                                                                             entry_column].interval_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].offset)
+                                                                                         self.interface.data_ports[
+                                                                                             entry_column].skipping_numerator_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 8 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 8 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].h_start)
+                                                                                         self.interface.data_ports[entry_column].offset_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].h_stop)
+                                                                                         self.interface.data_ports[entry_column].h_start_REG)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].delete(0, tk.END)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].insert(0,
+                                                                                         self.interface.data_ports[entry_column].h_count_REG)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 11 + entry_column].delete(0, tk.END)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 11 + entry_column].insert(0,
+                                                                                         self.interface.data_ports[entry_column].tail_width_REG)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 12 + entry_column].delete(0, tk.END)
+            self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 12 + entry_column].insert(0,
+                                                                                          self.interface.data_ports[
+                                                                                              entry_column].bit_width_REG)
 
         # Data port direction
         for count, x in enumerate(self.dp_direction_check_button_vars):
-            x.set(self.interface.data_ports[count].source)
+            x.set(self.interface.data_ports[count].source_REG)
 
         # Data port turn around enables
         for count, x in enumerate(self.dp_ta_enable_check_button_vars):
             x.set(self.interface.data_ports[count].handover)
 
-        # Data port tail enables
-        for count, x in enumerate(self.dp_tail_enable_check_button_vars):
-            x.set(self.interface.data_ports[count].tail)
+        # Data port zero enables
+        for count, x in enumerate(self.dp_guard_enable_check_button_vars):
+            x.set(self.interface.data_ports[count].guard_REG)
 
         # Data port zero enables
-        for count, x in enumerate(self.dp_zero_enable_check_button_vars):
-            x.set(self.interface.data_ports[count].guard)
+        for count, x in enumerate(self.dp_sri_enable_check_button_vars):
+            x.set(self.interface.data_ports[count].sri_REG)
 
         # Data port enables
         for count, x in enumerate(self.dp_enable_check_button_vars):
             x.set(self.interface.data_ports[count].enabled)
+
+        # Data port in Manager
+        for count, x in enumerate(self.dp_manager_check_button_vars):
+            x.set(self.interface.data_ports[count].inManager)
 
         # Rows per frame
         self.rpf_entry.delete(0, tk.END)
@@ -602,40 +794,41 @@ class App(tk.Frame):
         # S0 width
         self.s0w_entry.delete(0, tk.END)
         self.s0w_entry.insert(tk.END, self.interface.s0_width)
+        # S1 tails
+        #self.s1tails_entry.delete(0, tk.END)
+        #self.s1tails_entry.insert(tk.END, self.interface.s1_tails)
         # S0 TA enable
         self.s0_ta_enable_tk.set(self.interface.s0_handover_enabled)
         # CDS guard enable
         self.cd0_enable_tk.set(self.interface.cds_guard_enabled)
-        # Handover width
-        self.handover_width_entry.delete(0, tk.END)
-        self.handover_width_entry.insert(tk.END, self.interface.handover_width)
+        # CDS S0 Handover width
+        self.cds_s0_handover_width_entry.delete(0, tk.END)
+        self.cds_s0_handover_width_entry.insert(tk.END, self.interface.cds_s0_handover_width)
         # Tail width
         self.tail_width_entry.delete(0, tk.END)
         self.tail_width_entry.insert(tk.END, self.interface.tail_width)
-        # Fractional interval denominator
+        # Fractional skipping denominator
         self.fid_entry.delete(0, tk.END)
-        self.fid_entry.insert(tk.END, self.interface.interval_denominator)
-        # Bulk channel horizontal start
-        self.bulk_hstart_entry.delete(0, tk.END)
-        self.bulk_hstart_entry.insert(tk.END, self.interface.bulk_horizontal_start)
-        # Bulk channel width
-        self.bulk_width_entry.delete(0, tk.END)
-        self.bulk_width_entry.insert(tk.END, self.interface.bulk_width)
-        # Bulk channel guard enable
-        self.bulk_guard_enabled_tk.set(self.interface.bulk_guard_enabled)
+        self.fid_entry.insert(tk.END, self.interface.skipping_denominator_REG)
         # Row rate
         self.row_rate_entry.delete(0, tk.END)
         self.row_rate_entry.insert(tk.END, self.interface.row_rate)
 
         # Update sample rate labels
         for count, x in enumerate(self.dp_sample_rate_labels):
-            if self.interface.data_ports[count].interval_integer != 0:
-                sample_rate = "{:.2f}".format(self.interface.data_ports[count].sample_grouping * self.interface.row_rate / (
-                        self.interface.data_ports[count].interval_integer + self.interface.data_ports[count].interval_numerator /
-                        self.interface.interval_denominator))
-                x.config(text=sample_rate)
+            if self.interface.data_ports[count].interval_REG != 0:
+                if not self.interface.data_ports[count].sri_REG and ( 0 == self.interface.data_ports[count].skipping_numerator_REG ) :
+                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG ) )
+                elif not self.interface.data_ports[count].sri_REG :                           
+                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG ) *
+                                                   ( (self.interface.skipping_denominator_REG - self.interface.data_ports[count].skipping_numerator_REG ) /
+                                                     ( self.interface.skipping_denominator_REG ) ) )
+                else : # it is SRI
+                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG *
+                                                     math.ceil( ( self.interface.data_ports[count].h_count_REG + 1 ) / ( self.interface.data_ports[count].channels_REG * self.interface.data_ports[count].sample_grouping_REG * self.interface.data_ports[count].sample_width_REG + ( self.interface.data_ports[count].channel_group_spacing_REG - 1 ) ) ) ) )
+                x.config( text = sample_rate )
             else:
-                x.config(text='Error')
+                x.config( text = 'Error' )
 
         # Update Interval LCM
         self.frame_labels[-1].config(text=self.interface.interval_lcm)
@@ -649,75 +842,81 @@ class App(tk.Frame):
 
         # Data port entry widgets
         for entry_column, data_port in enumerate(self.interface.data_ports):  # Rows
-            self.interface.data_ports[entry_column].channels = \
+            self.interface.data_ports[entry_column].device_number = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 0 + entry_column].get())
 
-            self.interface.data_ports[entry_column].channel_grouping = \
+            self.interface.data_ports[entry_column].channels_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].get())
 
-            self.interface.data_ports[entry_column].channel_group_spacing = \
+            self.interface.data_ports[entry_column].channel_grouping_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].get())
 
-            self.interface.data_ports[entry_column].sample_width = \
+            self.interface.data_ports[entry_column].channel_group_spacing_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 3 + entry_column].get())
 
-            self.interface.data_ports[entry_column].sample_grouping = \
+            self.interface.data_ports[entry_column].sample_width_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].get())
 
-            self.interface.data_ports[entry_column].interval_integer = \
+            self.interface.data_ports[entry_column].sample_grouping_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].get())
 
-            self.interface.data_ports[entry_column].interval_numerator = \
+            self.interface.data_ports[entry_column].interval_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].get())
 
-            self.interface.data_ports[entry_column].offset = \
+            self.interface.data_ports[entry_column].skipping_numerator_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].get())
 
-            self.interface.data_ports[entry_column].h_start = \
+            self.interface.data_ports[entry_column].offset_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 8 + entry_column].get())
 
-            self.interface.data_ports[entry_column].h_stop = \
+            self.interface.data_ports[entry_column].h_start_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].get())
 
+            self.interface.data_ports[entry_column].h_count_REG = \
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].get())
+
+            self.interface.data_ports[entry_column].tail_width_REG = \
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 11 + entry_column].get())
+
+            self.interface.data_ports[entry_column].bit_width_REG = \
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 12 + entry_column].get())
+
         # read & error check rows per frame
-        self.rows_in_frame = max(self.MIN_ROWS_IN_FRAME, min(self.MAX_ROWS_IN_FRAME, self.st_int(self.rpf_entry.get())))
+        self.rows_in_frame = max(self.MIN_ROWS_IN_FRAME,
+                                 min(self.MAX_ROWS_IN_FRAME,
+                                     self.st_int(self.rpf_entry.get())))
 
         # read & error check columns per row
-        self.interface.columns_per_row = max(Interface.MIN_COLUMNS_PER_ROW, min(Interface.MAX_COLUMNS_PER_ROW, self.st_int(self.cpr_entry.get())))
+        self.interface.columns_per_row = max(Interface.MIN_COLUMNS_PER_ROW,
+                                             min(Interface.MAX_COLUMNS_PER_ROW,
+                                                 self.st_int(self.cpr_entry.get())))
         # If odd, make even
-        self.interface.columns_per_row -= self.interface.columns_per_row % 2
+        self.interface.columns_per_row -= \
+            self.interface.columns_per_row % 2
 
         self.interface.s0s1_enabled = self.s0s1_enabled_tk.get()
 
         # read & error check s0 width
-        self.interface.s0_width = max(Interface.MIN_S0_WIDTH, min(Interface.MAX_S0_WIDTH, self.st_int(self.s0w_entry.get())))
+        self.interface.s0_width = max(Interface.MIN_S0_WIDTH,
+                                      min(Interface.MAX_S0_WIDTH,
+                                          self.st_int(self.s0w_entry.get())))
+
+        #self.interface.s1_tails = max(Interface.MIN_S1_TAILS, min(Interface.MAX_S1_TAILS, self.st_int(self.s1tails_entry.get())))
 
         self.interface.s0_handover_enabled = self.s0_ta_enable_tk.get()
 
         self.interface.cds_guard_enabled = self.cd0_enable_tk.get()
 
         # read & error check Handover width
-        self.interface.handover_width = max(Interface.MIN_HANDOVER_WIDTH,
-                                            min(Interface.MAX_HANDOVER_WIDTH, self.st_int(self.handover_width_entry.get())))
+        self.interface.cds_s0_handover_width = max(Interface.MIN_CDS_S0_HANDOVER_WIDTH,
+                                            min(Interface.MAX_CDS_S0_HANDOVER_WIDTH, self.st_int(self.cds_s0_handover_width_entry.get())))
 
         # read & error check Tail width
         self.interface.tail_width = max(Interface.MIN_TAIL_WIDTH, min(Interface.MAX_TAIL_WIDTH, self.st_int(self.tail_width_entry.get())))
 
-        # read & error check fractional interval denominator
-        self.interface.interval_denominator = max(Interface.MIN_INTERVAL_DENOMINATOR,
-                                                  min(Interface.MAX_INTERVAL_DENOMINATOR, self.st_int(self.fid_entry.get())))
-
-        # read & error check bulk hstart
-        self.interface.bulk_horizontal_start = max(Interface.MIN_COLUMNS, min(Interface.MAX_COLUMNS, self.st_int(
-            self.bulk_hstart_entry.get())))
-
-        # read & error check bulk width
-        if self.st_int(self.bulk_width_entry.get()) not in [0, 2, 5, 10]:
-            self.interface.bulk_width = 0
-        else:
-            self.interface.bulk_width = self.st_int(self.bulk_width_entry.get())
-
-        self.interface.bulk_guard_enabled = self.bulk_guard_enabled_tk.get()
+        # read & error check fractional skipping denominator
+        self.interface.skipping_denominator_REG = max(Interface.MIN_SKIPPING_DENOMINATOR,
+                                                  min(Interface.MAX_SKIPPING_DENOMINATOR, self.st_int(self.fid_entry.get())))
 
         # read & error check row rate
         # self.interface.row_rate = max(1, min(self.interface.row_rate - 1, self.st_int(self.interface.row_rate_entry.get())))
@@ -725,23 +924,27 @@ class App(tk.Frame):
 
         # Data port direction check button widgets
         for count, direction in enumerate(self.dp_direction_check_button_vars):
-            self.interface.data_ports[count].source = bool(direction.get())
+            self.interface.data_ports[count].source_REG = bool(direction.get())
 
         # Data port handover enable check button widgets
         for count, x in enumerate(self.dp_ta_enable_check_button_vars):
             self.interface.data_ports[count].handover = bool(x.get())
 
-        # Data port tail enable check button widgets
-        for count, x in enumerate(self.dp_tail_enable_check_button_vars):
-            self.interface.data_ports[count].tail = bool(x.get())
-
         # Data port guard enable check button widgets
-        for count, x in enumerate(self.dp_zero_enable_check_button_vars):
-            self.interface.data_ports[count].guard = bool(x.get())
+        for count, x in enumerate(self.dp_guard_enable_check_button_vars):
+            self.interface.data_ports[count].guard_REG = bool(x.get())
+
+        # Data port sri enable check button widgets
+        for count, x in enumerate(self.dp_sri_enable_check_button_vars):
+            self.interface.data_ports[count].sri_REG = bool(x.get())
 
         # Data port enable check button widgets
         for count, x in enumerate(self.dp_enable_check_button_vars):
             self.interface.data_ports[count].enabled = bool(x.get())
+
+        # Data in Manager check button widgets
+        for count, x in enumerate(self.dp_manager_check_button_vars):
+            self.interface.data_ports[count].inManager = bool(x.get())
 
     # Draws all data ports
     def refresh_data_ports(self):
@@ -750,13 +953,21 @@ class App(tk.Frame):
         self.render_canvas.delete(tk.ALL)
         self.header_canvas.delete(tk.ALL)
 
-        self.bit_slots_source_clashed[:] = []
         self.bit_slots_source[:] = []
-
-        self.bit_slots_sink_clashed[:] = []
+        self.bit_slots_source_device[:] = []
+        self.bit_slots_source_clashed[:] = []
         self.bit_slots_sink[:] = []
-
+        self.bit_slots_sink_device[:] = []
+        self.bit_slots_sink_clashed[:] = []
+        self.bit_slots_guard[:] = []
+        self.bit_slots_guard_device[:] = []
+        self.bit_slots_guard_clashed[:] = []
+        self.bit_slots_tail[:] = []
+        self.bit_slots_tail_device[:] = []
+        self.bit_slots_tail_clashed[:] = []
         self.bit_slots_turnaround[:] = []
+        self.bit_slots_turnaround_device[:] = []
+        self.bit_slots_turnaround_clashed[:] = []
 
         self.update_model()
         self.update_ui()
@@ -816,74 +1027,73 @@ class App(tk.Frame):
                                            font=(self.APP_FONT, self.TEXT_SIZE - 2),
                                            justify=tk.CENTER, text='Sink')
 
+        self.frame_model = Frame_model(self.rows_in_frame, self.interface.columns_per_row)
+
         # S0 S1 Columns
         if self.interface.s0s1_enabled:
             if self.interface.columns_per_row > self.interface.s0_width + 3 + int(self.interface.cds_guard_enabled) + int(
-                    self.interface.s0_handover_enabled) * self.interface.handover_width:
+                    self.interface.s0_handover_enabled) * self.interface.cds_s0_handover_width:
                 # S0 Column(s)
                 if self.interface.s0_handover_enabled:
-                    for column_offset in range(0, self.interface.handover_width):
-                        self.draw_column(self.interface.columns_per_row - column_offset - self.interface.s0_width - 1, 'TA')
+                    for column_offset in range(0, self.interface.cds_s0_handover_width):
+                        # self.draw_column(self.interface.columns_per_row - column_offset - self.interface.s0_width - 1, 0,  'TA')
+                        pass
 
                 for column_offset in range(0, self.interface.s0_width):
-                    self.draw_column(self.interface.columns_per_row - column_offset - 1, 'S0')
+                    self.draw_column(self.interface.columns_per_row - column_offset - 1, 0, 'S0')
 
-                self.draw_column(0, 'S1')
+                self.draw_column(0, 0, 'S1')
 
-                for column_offset in range(0, self.interface.handover_width):
-                    self.draw_column(1 + column_offset + self.interface.tail_width, 'TA')
+                for column_offset in range(0, self.interface.cds_s0_handover_width):
+                    self.draw_column(1 + column_offset + self.interface.tail_width, 0, 'TA')
 
-                self.draw_column(1 + self.interface.handover_width + self.interface.tail_width, 'CDS')
+                self.draw_column(1 + self.interface.cds_s0_handover_width + self.interface.tail_width, 0, 'CDS')
 
                 if self.interface.cds_guard_enabled:
-                    self.draw_column(2 + self.interface.handover_width + self.interface.tail_width, 'GRD')
+                    self.draw_column(2 + self.interface.cds_s0_handover_width + self.interface.tail_width, 0, GuardText)
 
-                for column_offset in range(0, self.interface.handover_width):
-                    self.draw_column(2 + self.interface.handover_width + 2 * self.interface.tail_width + int(
-                        self.interface.cds_guard_enabled) + column_offset, 'TA')
+                for column_offset in range(0, self.interface.cds_s0_handover_width):
+                    self.draw_column(2 + self.interface.cds_s0_handover_width + 2 * self.interface.tail_width + int(
+                        self.interface.cds_guard_enabled) + column_offset, 0, 'TA')
 
+                # TODO: can't this be done by draw_column?
+                # If so, we could let draw_column update frame_model in all the cases
+                # under if self.interface.s0s1_enabled: else: ...
                 for column_offset in range(0, self.interface.tail_width):
                     for count in range(0, self.rows_in_frame):
-                        self.draw_tail(count, 1 + column_offset, self.PREFERRED_GRAY)
-                        self.draw_tail(count, 2 + self.interface.tail_width + self.interface.handover_width + int(
+                        self.draw_tail(count, 1 + column_offset, 0, self.PREFERRED_GRAY)
+                        self.draw_tail(count, 2 + self.interface.tail_width + self.interface.cds_s0_handover_width + int(
                             self.interface.cds_guard_enabled) + column_offset,
-                                       self.PREFERRED_GRAY)
+                                       0, self.PREFERRED_GRAY)
             else:
                 self.master.update()
                 messagebox.showwarning('Error!', 'Unable to draw S0, S1 & control stream columns: Too few columns in each row.')
         else:
-            self.draw_column(0, 'CDS')
+            self.draw_column(0, 0, 'CDS')
             if self.interface.cds_guard_enabled:
-                self.draw_column(1, 'GRD')
-            for column_offset in range(0, self.interface.handover_width):
-                self.draw_column(int(self.interface.cds_guard_enabled) + column_offset + 1, 'TA')
-                self.draw_column(self.interface.columns_per_row - column_offset - 1, 'TA')
-
-        # Draw the bulk channel
-        if self.interface.bulk_width:
-            for count in range(0, self.interface.bulk_width):
-                self.draw_column(self.interface.bulk_horizontal_start + count, 'BULK')
-            if self.interface.bulk_guard_enabled:
-                self.draw_column(self.interface.bulk_horizontal_start + self.interface.bulk_width, 'GRD')
-            for column_offset in range(0, self.interface.tail_width):
-                for count in range(0, self.rows_in_frame):
-                    self.draw_tail(count,
-                                   column_offset + self.interface.bulk_horizontal_start + self.interface.bulk_width +
-                                   self.interface.bulk_guard_enabled, self.PREFERRED_GRAY)
-            for column_offset in range(0, self.interface.handover_width):
-                self.draw_column(self.interface.bulk_horizontal_start - column_offset - 1, 'TA')
-                self.draw_column(
-                    self.interface.bulk_horizontal_start + self.interface.bulk_width + column_offset + self.interface.tail_width +
-                    self.interface.bulk_guard_enabled, 'TA')
+                self.draw_column(1, 0, GuardText)
+            for column_offset in range(0, self.interface.cds_s0_handover_width):
+                self.draw_column(int(self.interface.cds_guard_enabled) + column_offset + 1, 0, 'TA')
+                self.draw_column(self.interface.columns_per_row - column_offset - 1, 0, 'TA')
 
         error_text = ''
-        for count, data_port in enumerate(self.interface.data_ports):
-            if data_port.enabled:
-                temp_text = self.draw_data_port(self.interface.data_ports[count], self.DP_COLORS[count])
-                if len(temp_text):
-                    error_text += temp_text + 'In ' + self.interface.data_ports[count].name + '\n'
 
+        # Draw our data ports
+        # Draw for each device in sequence
+        # Loop though all devices
+        print( "about to draw the data ports" )
+        for device in range(0, 8):
+            for count, data_port in enumerate(self.interface.data_ports):
+                if data_port.device_number == device:
+                    if data_port.enabled:
+                        temp_text = self.draw_data_port(self.interface.data_ports[count], self.DP_COLORS[count])
+                        # temp_text += self.draw_data_port_guard_tail(self.interface.data_ports[count], self.DP_COLORS[count])
+                        if len(temp_text):
+                            error_text += temp_text + 'In ' + self.interface.data_ports[count].name + '\n'
         self.master.update()
+
+        if (self.args.out_frame_filename is not None):
+            self.save_frame_model(args.out_frame_filename, self.frame_model)
 
         if len(error_text):
             messagebox.showwarning("Warning", "Some data ports could not be drawn since: " + error_text)
@@ -900,82 +1110,91 @@ class App(tk.Frame):
     def load_csv_file(self):
         self.master_focus()
 
-        filename = filedialog.askopenfilename(initialdir=".", title="Select an input parameter filename",
+        filename = filedialog.askopenfilename(title="Select an input parameter filename",
                                               filetypes=[("CSV Files", "*.csv")])
+
+        self.load_csv_file_int(filename)        
+
+    def load_csv_file_int(self, filename):
 
         if filename:
             with open(filename) as data_file:
                 csv_data = csv.reader(data_file)
                 for count, row in enumerate(csv_data):
+                    print( "when reading number", count, "we see '", row[0], " and ", row[1] )
+                    # TODO: Technical debt:  Rewrite the following to not use count but instead use the string at the begnning of each line.
                     if count == 0:
-                        self.rows_in_frame = self.st_int(row[1])
-                    elif count == 1:
                         self.interface.columns_per_row = self.st_int(row[1])
-                    elif count == 2:
+                    elif count == 1:
                         self.interface.s0s1_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 3:
+                    elif count == 2:
                         self.interface.s0_width = self.st_int(row[1])
-                    elif count == 4:
-                        self.interface.s0_handover_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 5:
+                    elif count == 3:
                         self.interface.cds_guard_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 6:
-                        self.interface.handover_width = self.st_int(row[1])
-                    elif count == 7:
+                    elif count == 4:
                         self.interface.tail_width = self.st_int(row[1])
+                    elif count == 5:
+                        self.interface.skipping_denominator_REG = self.st_int(row[1])
+                    elif count == 6:
+                        self.interface.cds_s0_handover_width = self.st_int(row[1])
+                    elif count == 7:
+                        self.interface.s0_handover_enabled = bool(distutils.util.strtobool(row[1]))
                     elif count == 8:
-                        self.interface.interval_denominator = self.st_int(row[1])
-                    elif count == 9:
-                        self.interface.bulk_horizontal_start = self.st_int(row[1])
-                    elif count == 10:
-                        self.interface.bulk_width = self.st_int(row[1])
-                    elif count == 11:
-                        self.interface.bulk_guard_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 12:
                         self.interface.row_rate = self.st_int(row[1])
-                    elif count == 13:
+                    elif count == 9:
+                        self.rows_in_frame = self.st_int(row[1])
+                    elif DATA_PORT_NAME == row[ 0 ] :                    
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.name = row[obj_count + 1]
-                    elif count == 14:
+                    elif DATA_PORT_DEVICE_NUMBER == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.channels = self.st_int(row[obj_count + 1])
-                    elif count == 15:
+                            data_port.device_number = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_CHANNELS == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.channel_grouping = self.st_int(row[obj_count + 1])
-                    elif count == 16:
+                            data_port.channels_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_CHANNEL_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.channel_group_spacing = self.st_int(row[obj_count + 1])
-                    elif count == 17:
+                            data_port.channel_grouping_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_CHANNEL_GROUP_SPACING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.sample_width = self.st_int(row[obj_count + 1])
-                    elif count == 18:
+                            data_port.channel_group_spacing_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_SAMPLE_WIDTH == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.sample_grouping = self.st_int(row[obj_count + 1])
-                    elif count == 19:
+                            data_port.sample_width_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_SAMPLE_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.interval_integer = self.st_int(row[obj_count + 1])
-                    elif count == 20:
+                            data_port.sample_grouping_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_INTERVAL == row[ 0 ]:
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.interval_numerator = self.st_int(row[obj_count + 1])
-                    elif count == 21:
+                            data_port.interval_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_SKIPPING_NUMERATOR == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.offset = self.st_int(row[obj_count + 1])
-                    elif count == 22:
+                            data_port.skipping_numerator_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_OFFSET == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.h_start = self.st_int(row[obj_count + 1])
-                    elif count == 23:
+                            data_port.offset_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_HORIZONTAL_START == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.h_stop = self.st_int(row[obj_count + 1])
-                    elif count == 24:
+                            data_port.h_start_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_HORIZONTAL_COUNT == row[ 0 ] :
+                        for obj_count, data_port in enumerate(self.interface.data_ports):
+                            data_port.h_count_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_TAIL_WIDTH == row[ 0 ] :
+                        for obj_count, data_port in enumerate(self.interface.data_ports):
+                            data_port.tail_width_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_BIT_WIDTH == row[ 0 ] :
+                        for obj_count, data_port in enumerate(self.interface.data_ports):
+                            data_port.bit_width_REG = self.st_int(row[obj_count + 1])
+                    elif DATA_PORT_IS_SOURCE == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.source = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.source_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
                                 count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
                             return
-                    elif count == 25:
+                    elif DATA_PORT_DRAW_HANDOVER == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
                                 data_port.handover = bool(distutils.util.strtobool(row[obj_count + 1]))
@@ -984,25 +1203,16 @@ class App(tk.Frame):
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
                                 count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
                             return
-                    elif count == 26:
+                    elif DATA_PORT_GUARD_ENABLED == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.tail = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.guard_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
                                 count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
                             return
-                    elif count == 27:
-                        if len(row[1:]) == Interface.NUM_DATA_PORTS:
-                            for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.guard = bool(distutils.util.strtobool(row[obj_count + 1]))
-                        else:
-                            messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
-                                Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
-                                count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
-                            return
-                    elif count == 28:
+                    elif DATA_PORT_ENABLED == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
                                 data_port.enabled = bool(distutils.util.strtobool(row[obj_count + 1]))
@@ -1011,6 +1221,25 @@ class App(tk.Frame):
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
                                 count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
                             return
+                    elif DATA_PORT_IN_MANAGER == row[ 0 ] :
+                        if len(row[1:]) == Interface.NUM_DATA_PORTS:
+                            for obj_count, data_port in enumerate(self.interface.data_ports):
+                                data_port.inManager = bool(distutils.util.strtobool(row[obj_count + 1]))
+                        else:
+                            messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
+                                Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
+                                count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
+                            return
+                    elif DATA_PORT_SRI == row[0] :
+                        if len(row[1:]) == Interface.NUM_DATA_PORTS:
+                            for obj_count, data_port in enumerate(self.interface.data_ports):
+                                data_port.sri_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
+                        else:
+                            messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
+                                Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
+                                count + 1) + '.\nFound ' + str(len(row[1:])) + '.')
+                    #elif count == 28:
+                    #    self.interface.s1_tails = self.st_int(row[1])
 
             data_file.close()
             self.master.update()
@@ -1018,35 +1247,47 @@ class App(tk.Frame):
             self.refresh_data_ports()
 
     # Draws a single repeating column in a frame
-    def draw_column(self, column, text):
+    def draw_column(self, column, device, text):
         if not isinstance(column, int):
             raise TypeError('Expected int for column')
         if not isinstance(text, str):
             raise TypeError('Expected str for text')
         for row in range(0, self.rows_in_frame):
             if text == 'TA':
-                self.draw_handover(row, column)
+                self.draw_handover(row, column, device)
             else:
                 self.render_canvas.create_text((column + 2) * self.COLUMN_SIZE, (row + 2.5) * self.ROW_SIZE, text=text,
                                                font=(self.APP_FONT, self.TEXT_SIZE))
-                self.check_bus_clash(row, column, 'write')
+                self.check_bus_clash(row, column, device, 'write')
+
+        # Frame model update
+        for row in range(0, self.rows_in_frame):
+            print(f'row = {row}')
+            self.update_col_in_frame_model(row, column, 0, 0, 0, text)
 
     # Draws a handover bit slot
-    def draw_handover(self, row, column):
+    def draw_handover(self, row, column, device):
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
             raise TypeError('Expected int for column')
+        if Debug_Drawing : print( "draw_handover called for column:" )
+        if Debug_Drawing : print( column )
+        if Debug_Drawing : print( " row:" )
+        if Debug_Drawing : print( row )
+        if Debug_Drawing : print( " device:" )
+        if Debug_Drawing : print( device )
         self.render_canvas.create_line((column + 1.725) * self.COLUMN_SIZE, (row + 2.35) * self.ROW_SIZE,
                                        (column + 2.275) * self.COLUMN_SIZE,
                                        (row + 2.35) * self.ROW_SIZE, arrow=tk.LAST)
         self.render_canvas.create_line((column + 1.725) * self.COLUMN_SIZE, (row + 2.65) * self.ROW_SIZE,
                                        (column + 2.275) * self.COLUMN_SIZE,
                                        (row + 2.65) * self.ROW_SIZE, arrow=tk.FIRST)
-        self.check_bus_clash(row, column, 'handover')
+        self.check_bus_clash(row, column, device, 'handover')
 
     # Draws a tail bit slot
-    def draw_tail(self, row, column, color):
+    def draw_tail(self, row, column, device, color):
+        print( 'draw_tail called with row={:d}, column={:d}, device={}'.format( row, column, device) )
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
@@ -1054,36 +1295,37 @@ class App(tk.Frame):
         if not isinstance(color, str):
             raise TypeError('Expected str for color')
         direction = 1
-        self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
-                                            (row + 2 + 0.5 * (direction == 0)) * self.ROW_SIZE + 2 * (
-                                                    direction == 1) + 0 * (direction == 0),
-                                            (column + 2.5) * self.COLUMN_SIZE,
-                                            (row + 2.5 + 0.5 * (direction == 0)) * self.ROW_SIZE + 0 * (
-                                                    direction == 1) - 1 * (direction == 0),
-                                            fill=color, width=0)
-        # Bit of a hack here
-        if color == self.PREFERRED_GRAY:
-            self.render_canvas.create_line((column + 1.65) * self.COLUMN_SIZE, (row + 2.45 + 0.25) * self.ROW_SIZE,
-                                           (column + 1.75) * self.COLUMN_SIZE, (row + 2.10 + 0.25) * self.ROW_SIZE,
-                                           (column + 1.85) * self.COLUMN_SIZE, (row + 2.40 + 0.25) * self.ROW_SIZE,
-                                           (column + 1.95) * self.COLUMN_SIZE, (row + 2.15 + 0.25) * self.ROW_SIZE,
-                                           (column + 2.05) * self.COLUMN_SIZE, (row + 2.35 + 0.25) * self.ROW_SIZE,
-                                           (column + 2.15) * self.COLUMN_SIZE, (row + 2.20 + 0.25) * self.ROW_SIZE,
-                                           (column + 2.25) * self.COLUMN_SIZE, (row + 2.30 + 0.25) * self.ROW_SIZE,
-                                           (column + 2.35) * self.COLUMN_SIZE, (row + 2.25 + 0.25) * self.ROW_SIZE)
-        else:
-            self.render_canvas.create_line((column + 1.65) * self.COLUMN_SIZE, (row + 2.45) * self.ROW_SIZE,
-                                           (column + 1.75) * self.COLUMN_SIZE, (row + 2.10) * self.ROW_SIZE,
-                                           (column + 1.85) * self.COLUMN_SIZE, (row + 2.40) * self.ROW_SIZE,
-                                           (column + 1.95) * self.COLUMN_SIZE, (row + 2.15) * self.ROW_SIZE,
-                                           (column + 2.05) * self.COLUMN_SIZE, (row + 2.35) * self.ROW_SIZE,
-                                           (column + 2.15) * self.COLUMN_SIZE, (row + 2.20) * self.ROW_SIZE,
-                                           (column + 2.25) * self.COLUMN_SIZE, (row + 2.30) * self.ROW_SIZE,
-                                           (column + 2.35) * self.COLUMN_SIZE, (row + 2.25) * self.ROW_SIZE)
-        self.check_bus_clash(row, column, 'write')
+        if self.check_bus_clash(row, column, device, 'tail'):
+            self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                (row + 2 + 0.5 * (direction == 0)) * self.ROW_SIZE + 2 * (
+                                                        direction == 1) + 0 * (direction == 0),
+                                                (column + 2.5) * self.COLUMN_SIZE,
+                                                (row + 2.5 + 0.5 * (direction == 0)) * self.ROW_SIZE + 0 * (
+                                                        direction == 1) - 1 * (direction == 0),
+                                                fill=color, width=1)
+            # Bit of a hack here
+            if color == self.PREFERRED_GRAY:
+                self.render_canvas.create_line((column + 1.65) * self.COLUMN_SIZE, (row + 2.45 + 0.25) * self.ROW_SIZE,
+                                               (column + 1.75) * self.COLUMN_SIZE, (row + 2.10 + 0.25) * self.ROW_SIZE,
+                                               (column + 1.85) * self.COLUMN_SIZE, (row + 2.40 + 0.25) * self.ROW_SIZE,
+                                               (column + 1.95) * self.COLUMN_SIZE, (row + 2.15 + 0.25) * self.ROW_SIZE,
+                                               (column + 2.05) * self.COLUMN_SIZE, (row + 2.35 + 0.25) * self.ROW_SIZE,
+                                               (column + 2.15) * self.COLUMN_SIZE, (row + 2.20 + 0.25) * self.ROW_SIZE,
+                                               (column + 2.25) * self.COLUMN_SIZE, (row + 2.30 + 0.25) * self.ROW_SIZE,
+                                               (column + 2.35) * self.COLUMN_SIZE, (row + 2.25 + 0.25) * self.ROW_SIZE)
+            else:
+                self.render_canvas.create_line((column + 1.65) * self.COLUMN_SIZE, (row + 2.45) * self.ROW_SIZE,
+                                               (column + 1.75) * self.COLUMN_SIZE, (row + 2.10) * self.ROW_SIZE,
+                                               (column + 1.85) * self.COLUMN_SIZE, (row + 2.40) * self.ROW_SIZE,
+                                               (column + 1.95) * self.COLUMN_SIZE, (row + 2.15) * self.ROW_SIZE,
+                                               (column + 2.05) * self.COLUMN_SIZE, (row + 2.35) * self.ROW_SIZE,
+                                               (column + 2.15) * self.COLUMN_SIZE, (row + 2.20) * self.ROW_SIZE,
+                                               (column + 2.25) * self.COLUMN_SIZE, (row + 2.30) * self.ROW_SIZE,
+                                               (column + 2.35) * self.COLUMN_SIZE, (row + 2.25) * self.ROW_SIZE)
 
-    # Draws a tail bit slot
-    def draw_guard(self, row, column, color):
+    # Draws a guard bit slot
+    def draw_guard(self, row, column, device, color):
+        print( 'draw_guard called with row={:d}, column={:d}, device={}'.format( row, column, device) )
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
@@ -1091,21 +1333,25 @@ class App(tk.Frame):
         if not isinstance(color, str):
             raise TypeError('Expected str for color')
         direction = 1
-        self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+        if self.check_bus_clash(row, column, device, 'guard'):
+            print( "clash check returned True")
+            self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
                                             (row + 2 + 0.5 * (direction == 0)) * self.ROW_SIZE + 2 * (
                                                     direction == 1) + 0 * (direction == 0),
                                             (column + 2.5) * self.COLUMN_SIZE,
                                             (row + 2.5 + 0.5 * (direction == 0)) * self.ROW_SIZE + 0 * (
                                                     direction == 1) - 1 * (direction == 0),
-                                            fill=color, width=0)
-        self.render_canvas.create_text((column + 2) * self.COLUMN_SIZE,
+                                            fill=color, width=1)
+            self.render_canvas.create_text((column + 2) * self.COLUMN_SIZE,
                                        (row + 2.25) * self.ROW_SIZE,
                                        font=(self.APP_FONT, self.TEXT_SIZE - 2),
                                        justify=tk.CENTER,
-                                       text='GRD')
-        self.check_bus_clash(row, column, 'write')
+                                       text=GuardText)
+        else :
+            print( "clash check returned False")
 
-    def check_bus_clash(self, row, column, bit_slot_type):
+
+    def check_bus_clash(self, row, column, device, bit_slot_type):
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
@@ -1114,11 +1360,15 @@ class App(tk.Frame):
             raise TypeError('Expected str for bit_slot_type')
 
         bit_slot = column + row * self.interface.columns_per_row
+        return_value = 0
 
         # write
         if bit_slot_type == 'write':
             # Check if this bit slot is already driven
-            if bit_slot in self.bit_slots_source or bit_slot in self.bit_slots_turnaround:
+            if bit_slot in self.bit_slots_source or \
+                    (bit_slot in self.bit_slots_turnaround ) or \
+                     (bit_slot in self.bit_slots_guard and device != self.bit_slots_guard_device[self.bit_slots_guard.index(bit_slot)]) or \
+                      (bit_slot in self.bit_slots_tail and device != self.bit_slots_tail_device[self.bit_slots_tail.index(bit_slot)]):
                 # bus clash
                 if bit_slot not in self.bit_slots_source_clashed:
                     self.bit_slots_source_clashed.append(bit_slot)
@@ -1130,6 +1380,100 @@ class App(tk.Frame):
             else:
                 # No clash
                 self.bit_slots_source.append(bit_slot)
+                self.bit_slots_source_device.append(device)
+
+        # guard
+        if bit_slot_type == 'guard':
+            # Check if this bit slot is already driven
+            if bit_slot in self.bit_slots_source and device != self.bit_slots_source_device[self.bit_slots_source.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_source and device == self.bit_slots_source_device[self.bit_slots_source.index(bit_slot)]:
+                # Same device already has a bit slot driven here
+                return_value = 0
+            elif bit_slot in self.bit_slots_guard and device != self.bit_slots_guard_device[self.bit_slots_guard.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_guard and device == self.bit_slots_guard_device[self.bit_slots_guard.index(bit_slot)]:
+                # No action needed since the same device is requesting a guard in this location
+                return_value = 0
+            elif bit_slot in self.bit_slots_tail and device != self.bit_slots_tail_device[self.bit_slots_tail.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_tail and device == self.bit_slots_tail_device[self.bit_slots_tail.index(bit_slot)]:
+                # Guard should have priority over tails within a device
+                self.bit_slots_guard.append(bit_slot)
+                self.bit_slots_guard_device.append(device)
+                return_value = 1
+            else:
+                # No clash
+                self.bit_slots_guard.append(bit_slot)
+                self.bit_slots_guard_device.append(device)
+                return_value = 1
+        # tail
+        if bit_slot_type == 'tail':
+            # Check if this bit slot is already driven
+
+            if bit_slot in self.bit_slots_source and device != self.bit_slots_source_device[self.bit_slots_source.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_source and device == self.bit_slots_source_device[self.bit_slots_source.index(bit_slot)]:
+                # Same device already has a bit slot driven here
+                return_value = 0
+            elif bit_slot in self.bit_slots_tail and device != self.bit_slots_tail_device[self.bit_slots_tail.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_tail and device == self.bit_slots_tail_device[self.bit_slots_tail.index(bit_slot)]:
+                # No action needed since the same device is requesting only a tail in this location
+                return_value = 0
+            elif bit_slot in self.bit_slots_guard and device != self.bit_slots_guard_device[self.bit_slots_guard.index(bit_slot)]:
+                # bus clash
+                if bit_slot not in self.bit_slots_source_clashed:
+                    self.bit_slots_source_clashed.append(bit_slot)
+                self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
+                                                    (row + 2) * self.ROW_SIZE + 2,
+                                                    (column + 2.5) * self.COLUMN_SIZE,
+                                                    (row + 2.5) * self.ROW_SIZE,
+                                                    fill='black', width=0)
+            elif bit_slot in self.bit_slots_guard and device == self.bit_slots_guard_device[self.bit_slots_guard.index(bit_slot)]:
+                # No action needed since the same device is requesting only a guard in this location
+                return_value = 0
+            else:
+                # No clash
+                self.bit_slots_tail.append(bit_slot)
+                self.bit_slots_tail_device.append(device)
+                return_value = 1
+
         # read
         elif bit_slot_type == 'read':
             # Check if this bit slot is already read
@@ -1144,6 +1488,7 @@ class App(tk.Frame):
                                                     fill='red', width=0)
             else:
                 self.bit_slots_sink.append(bit_slot)
+                self.bit_slots_sink_device.append(device)
 
         # handover
         elif bit_slot_type == 'handover':
@@ -1169,14 +1514,65 @@ class App(tk.Frame):
 
             if bit_slot not in self.bit_slots_turnaround:
                 self.bit_slots_turnaround.append(bit_slot)
+        return return_value
 
-    def write_bit_slot(self, row, column, source, text, color):
+    def update_col_in_frame_model(self, row, column, dp_num, is_source, width, rrrr):
+        ri = self.frame_model.get_row(row)
+        si = Slot_info()
+
+        if "tail" == rrrr:
+            si.slot_type = Slot_type.TAIL
+            # TODO: is dp_num relevant in case of TAIL?
+        elif 'G' == rrrr :
+            si.slot_type = Slot_type.GUARD
+            si.dp_num = dp_num
+        elif 'HANDOVER' == rrrr :
+            si.slot_type = Slot_type.HANDOVER
+            si.dp_num = dp_num # TODO: is dp_num relevant in case of HANDOVER?
+        elif 'TA' == rrrr:
+            si.slot_type = Slot_type.HANDOVER
+        elif 'CDS' == rrrr:
+            si.slot_type = Slot_type.CDS
+        elif 'S0' == rrrr:
+            si.slot_type = Slot_type.S0
+        elif 'S1' == rrrr:
+            si.slot_type = Slot_type.S1
+
+        elif NOT_OWNED != rrrr :
+            si.slot_type = Slot_type.NORMAL
+            if is_source:
+                si.dir = Direction_type.SOURCE
+            else:
+                si.dir = Direction_type.SINK
+            si.dp_num = dp_num
+            chan = 0
+            bit_num = 0
+            m = re.match("^c(\d+)b(\d+)$", rrrr)
+            if (m):
+                chan     = m.group(1)
+                bit_num  = m.group(2)
+            else:
+                print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
+#                exit(1)
+            si.channel = chan
+            si.bit_num = bit_num
+            
+        for i in range(0, width+1):
+            ci = ri.get_col(column+i)
+            ci.append_slot(si)
+    
+
+    
+    def write_bit_slot(self, row, column, width, source, text, color):
+#        print( 'write_bit_slot called for row={:d}, column={:d}, width={:d}'.format( row, column, width) )
         if not isinstance(source, bool):
             raise TypeError('Expected bool for source')
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
             raise TypeError('Expected int for column')
+        if not isinstance(width, int):
+            raise TypeError('Expected int for width')
         if not isinstance(text, str):
             raise TypeError('Expected str for text')
         if not isinstance(color, str):
@@ -1186,157 +1582,155 @@ class App(tk.Frame):
         self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
                                             (row + 2 + 0.5 * (not source)) * self.ROW_SIZE + 2 * (
                                                 source) + 0 * (not source),
-                                            (column + 2.5) * self.COLUMN_SIZE,
+                                            (column + 2.5 + width) * self.COLUMN_SIZE,
                                             (row + 2.5 + 0.5 * (not source)) * self.ROW_SIZE + 0 * (
                                                 source) - 1 * (not source),
-                                            fill=color, width=0)
-        self.render_canvas.create_text((column + 2) * self.COLUMN_SIZE,
+                                            fill=color, width=1)
+        self.render_canvas.create_text((column + 2 + width/2) * self.COLUMN_SIZE,
                                        (row + 2.25 + 0.5 * (not source)) * self.ROW_SIZE + 0 * (
                                            source) - 1 * (not source),
                                        font=(self.APP_FONT, self.TEXT_SIZE - 2),
                                        justify=tk.CENTER,
                                        text=text)
-        if source:
-            self.check_bus_clash(row, column, 'write')
-        else:
-            self.check_bus_clash(row, column, 'read')
 
     # Draws one data port in a canvas
     def draw_data_port(self, data_port, color):
 
+        print( "draw_data_port called." )
         if not isinstance(data_port, DataPort):
             raise TypeError('Expected DataPort object, got: ' + str(type(data_port)))
         if not isinstance(color, str):
             raise TypeError('Expected str for color')
-
+        print('draw_data_port' + str( data_port.number ) )
         # Check ranges of input parameters, should be ok based on earlier checking
         error_text = ''
-        if data_port.channels < DataPort.MIN_CHANNELS or data_port.channels > DataPort.MAX_CHANNELS:
+        if data_port.device_number < DataPort.MIN_DEVICE_NUMBER or data_port.device_number > DataPort.MAX_DEVICE_NUMBER:
             error_text += 'Channel count out of range\n'
-        if data_port.channel_grouping < DataPort.MIN_CHANNEL_GROUPING or data_port.channel_grouping > DataPort.MAX_CHANNEL_GROUPING:
+        if data_port.channels_REG < DataPort.MIN_CHANNELS or data_port.channels_REG > DataPort.MAX_CHANNELS:
+            error_text += 'Channel count out of range\n'
+        if data_port.channel_grouping_REG < DataPort.MIN_CHANNEL_GROUPING or data_port.channel_grouping_REG > DataPort.MAX_CHANNEL_GROUPING:
             error_text += 'Channel Grouping out of range\n'
-        if data_port.channel_group_spacing < DataPort.MIN_CHANNEL_GROUP_SPACING or data_port.channel_group_spacing > \
+        if data_port.channel_group_spacing_REG < DataPort.MIN_CHANNEL_GROUP_SPACING or data_port.channel_group_spacing_REG > \
                 DataPort.MAX_CHANNEL_GROUP_SPACING:
             error_text += 'Change Group Spacing out of range\n'
-        if data_port.sample_width < DataPort.MIN_SAMPLE_WIDTH or data_port.sample_width > DataPort.MAX_SAMPLE_WIDTH:
+        if data_port.sample_width_REG < DataPort.MIN_SAMPLE_WIDTH or data_port.sample_width_REG > DataPort.MAX_SAMPLE_WIDTH:
             error_text += 'Sample Width out of range\n'
-        if data_port.sample_grouping < DataPort.MIN_SAMPLE_GROUPING or data_port.sample_grouping > DataPort.MAX_SAMPLE_GROUPING:
+        if data_port.sample_grouping_REG < DataPort.MIN_SAMPLE_GROUPING or data_port.sample_grouping_REG > DataPort.MAX_SAMPLE_GROUPING:
             error_text += 'Sample Grouping out of range\n'
-        if data_port.interval_integer < DataPort.MIN_INTERVAL_INTEGER or data_port.interval_integer > DataPort.MAX_INTERVAL_INTEGER:
+        if data_port.interval_REG < DataPort.MIN_INTERVAL or data_port.interval_REG > DataPort.MAX_INTERVAL:
             error_text += 'Interval out of range\n'
-        if data_port.interval_numerator < DataPort.MIN_INTERVAL_NUMERATOR or data_port.interval_numerator > DataPort.MAX_INTERVAL_NUMERATOR:
-            error_text += 'Fractional Interval out of range\n'
-        if data_port.offset < DataPort.MIN_OFFSET or data_port.offset > DataPort.MAX_OFFSET:
+        if data_port.skipping_numerator_REG < DataPort.MIN_SKIPPING_NUMERATOR or data_port.skipping_numerator_REG > DataPort.MAX_SKIPPING_NUMERATOR:
+            error_text += 'Fractional Skipping out of range\n'
+        if data_port.offset_REG < DataPort.MIN_OFFSET or data_port.offset_REG > DataPort.MAX_OFFSET:
             error_text += 'Offset out of range\n'
-        if data_port.h_start < 0 or data_port.h_start >= self.interface.MAX_COLUMNS:
+        if data_port.h_start_REG < 0 or data_port.h_start_REG >= self.interface.MAX_COLUMNS:
             error_text += 'Horizontal Start out of range\n'
-        if data_port.h_stop < 0 or data_port.h_stop >= self.interface.MAX_COLUMNS:
-            error_text += 'Horizontal Stop out of range\n'
+        if data_port.h_count_REG < 0 or data_port.h_count_REG >= self.interface.MAX_COLUMNS:
+            error_text += 'Horizontal Count out of range\n'
 
         # Check some relationships
-        if data_port.offset > data_port.interval_integer:
+        if data_port.h_start_REG + data_port.h_count_REG >= self.interface.columns_per_row :
+            error_text += 'h_start(' + str( data_port.h_start_REG ) + ') + h_count(' + str( data_port.h_count_REG ) + ') >= number of columns (exceeds last column)\n'
+        if data_port.sri_REG :
+            if data_port.channel_group_spacing_REG == 0 :
+                error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
+            drive_in_group = data_port.sample_width_REG * data_port.sample_grouping_REG * data_port.channel_grouping_REG * data_port.bit_width_REG # for DataPort programming validation.
+            cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG # for DataPort programming validation.
+            if math.floor( ( data_port.h_count_REG - data_port.h_start_REG ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.h_count_REG + 1 ) :
+                error_text += 'Group or Sample is incomplete when end of row encounters for data port\n'
+        if data_port.offset_REG > data_port.interval_REG:
             error_text += 'Offset > Interval\n'
-        if data_port.h_start >= self.interface.columns_per_row:
+        if data_port.h_start_REG >= self.interface.columns_per_row:
             error_text += 'Horizontal Start > Columns per Row\n'
-        if data_port.h_stop >= self.interface.columns_per_row:
-            error_text += 'Horizontal Stop > Columns per Row\n'
-        if data_port.h_stop < data_port.h_start:
-            error_text += 'Horizontal Stop < Horizontal Start\n'
-        if self.interface.handover_width > data_port.h_start and data_port.source and data_port.handover:
+        if data_port.h_count_REG >= self.interface.columns_per_row:
+            error_text += 'Horizontal Count > Columns per Row\n'
+        if self.interface.cds_s0_handover_width > data_port.h_start_REG and data_port.source_REG and data_port.handover:
             error_text += 'TA width > Horizontal Start\n'
-        if self.interface.tail_width > self.interface.columns_per_row - data_port.h_stop and data_port.source and data_port.tail:
+        if data_port.tail_width_REG > self.interface.columns_per_row - data_port.h_count_REG and data_port.source_REG:
             error_text += 'Tail width would overflow row\n'
-        if data_port.h_stop >= self.interface.columns_per_row and data_port.source and data_port.guard:
+        if data_port.bit_width_REG > self.interface.columns_per_row - data_port.h_count_REG and data_port.source_REG:
+            error_text += 'Bit width would overflow row\n'
+        if data_port.bit_width_REG > data_port.h_count_REG:
+            error_text += 'Bit width would overflow h_count\n'
+        if (data_port.h_count_REG + 1) % (data_port.bit_width_REG + 1) != 0:
+            error_text += 'h_count_REG + 1 should be a multiple of bit_width_REG + 1\n'
+        if data_port.h_count_REG >= self.interface.columns_per_row and data_port.source_REG and data_port.guard_REG:
             error_text += 'Post zero would overflow row\n'
 
         if len(error_text) > 0:
             return error_text
 
-        horizontal_width = data_port.h_stop - data_port.h_start + 1
-
+### Cut from here for Eddie
+# This is run for each DataPort.
         # Raster our frame
-        for row_counter in range(data_port.offset * self.interface.interval_denominator,
-                                 self.rows_in_frame * self.interface.interval_denominator,
-                                 self.interface.interval_denominator * data_port.interval_integer + data_port.interval_numerator):
-            interval_start_row = int(math.ceil(row_counter / self.interface.interval_denominator))
-            interval_next_row = int(math.ceil(
-                (row_counter + self.interface.interval_denominator * data_port.interval_integer + data_port.interval_numerator) /
-                self.interface.interval_denominator))
 
-            # Re-arm the data port here
-            bits_remaining = data_port.sample_width
-            samples_remaining = data_port.sample_grouping
-            channels_remaining = data_port.channels
-            if data_port.channel_grouping == 0 or data_port.channel_grouping > data_port.channels:
-                effective_channel_group = data_port.channels
-            else:
-                effective_channel_group = data_port.channel_grouping
-            channel_groups_counter = effective_channel_group
+        started = False
+        Row = 0
+        if data_port.skipping_numerator_REG > ( self.interface.skipping_denominator_REG / 2 ) :
+            frac_accum = self.interface.skipping_denominator_REG - 1
+        else :
+            frac_accum = 0 # accumlate to decide when to skip this transport opportunity
+        interval_counter = 0
+        end_of_interval = False
 
-            for data_port_row in range(0, interval_next_row - interval_start_row):
-                next_column = 0
-                for data_port_column in range(0, horizontal_width):
-                    # Do we drove this bit slot?
-                    if samples_remaining > 0 and channels_remaining > 0 and bits_remaining > 0 and data_port_column == next_column:
+        if data_port.channel_grouping_REG == 0 or data_port.channel_grouping_REG > ( data_port.channels_REG_X1 + 1 ) or data_port.sri_REG:
+            effective_channel_group = data_port.channels_REG + 1
+        else:
+            effective_channel_group = data_port.channel_grouping_REG
 
-                        end_of_row = 0
-                        channel = data_port.channels - channels_remaining + 1
-
-                        if data_port_column == 0 and data_port.handover and data_port.source:
-                            # We have turnarounds to write
-                            for count in range(0, self.interface.handover_width):
-                                self.draw_handover(interval_start_row + data_port_row, (data_port.h_start - count - 1))
-
-                        self.write_bit_slot(interval_start_row + data_port_row, data_port.h_start + data_port_column, data_port.source,
-                                            'c' + str(channel) +
-                                            'b' + str(bits_remaining - 1), color)
-
-                        # We've written a bit slot, decrement bits remaining
-                        bits_remaining -= 1
-                        next_column += 1
-
-                        # Order of iterators: bits, channels in a channel group, samples in a group, finally channel groups
-
-                        # We've drawn all bits in a sample
-                        if bits_remaining == 0:
-                            if samples_remaining >= 1:
-                                # Decrement channels in our channel group
-                                channels_remaining -= 1
-                                bits_remaining = data_port.sample_width
-
-                                # Done with channels in a group?
-                                if channels_remaining == data_port.channels - channel_groups_counter:
-                                    channels_remaining = data_port.channels + effective_channel_group - channel_groups_counter
-                                    # Decrement samples in our sample group
-                                    samples_remaining -= 1
-
-                                # Done with samples in a group?
-                                if samples_remaining == 0:
-                                    samples_remaining = data_port.sample_grouping
-                                    channels_remaining -= effective_channel_group
-                                    # In case channels_remaining is less than channel_groups
-                                    effective_channel_group = min(effective_channel_group, channels_remaining)
-                                    # Next channel group
-                                    channel_groups_counter += effective_channel_group
-
-                                    # Channel-group spacing
-                                    if data_port.channel_group_spacing != 0:
-                                        # Hold off writing for (data_port.channel_group_spacing - 1) columns if needed
-                                        next_column = data_port_column + data_port.channel_group_spacing
-                                    else:
-                                        # Wait until the next row
-                                        next_column = horizontal_width
-                                        end_of_row = 1
-                        if next_column >= horizontal_width or end_of_row:
-                            # We have a guard bitslot to write?
-                            if (data_port_column == horizontal_width - 1 or end_of_row) and data_port.guard and data_port.source:
-                                self.draw_guard(interval_start_row + data_port_row, (data_port.h_start + data_port_column
-                                                                                        + 1), color)
-                            # We have tails to write?
-                            if (data_port_column == horizontal_width - 1 or end_of_row) and data_port.tail and data_port.source:
-                                for count in range(data_port.guard, self.interface.tail_width + data_port.guard):
-                                    self.draw_tail(interval_start_row + data_port_row, (data_port.h_start + data_port_column
-                                                                                        + count + 1), color)
+        print ( 'about to raster' )
+        data_port.reset()
+        
+        # Row counter is not part of the needed data port mechanism but is to support drawing
+        for row_counter in range( 0, self.rows_in_frame, 1 ) : 
+            print ( 'row_counter={},'.format( row_counter ) )
+            Row += 1
+### To here for Eddie
+            if True : # insert old method stuff here from files names scr
+### Cut from here for Eddie
+                last_bit_was_driven = 0
+                column_counter = 0
+                while column_counter < self.interface.columns_per_row :
+                    width, rrrr = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
+                    if Debug_Drawing : print ( 'result from trying = "{}"'.format( rrrr ) )
+                    if NOT_OWNED == rrrr :
+                        rrrr = data_port.get_guard_or_tails()
+                        if NOT_OWNED == rrrr :
+                            if Debug_Drawing : print( 'not drawing this bit.' ) # note drawing
+                            if last_bit_was_driven :
+                                if data_port.source_REG and data_port.handover :
+                                    self.draw_handover( row_counter, column_counter, data_port.device_number)
+                                    self.update_col_in_frame_model(row_counter, column_counter, data_port.number,
+                                                                   data_port.source_REG, 0, 'HANDOVER')
+                            last_bit_was_driven = False
+                        elif "tail" == rrrr :
+                            print( 'calling draw tail' )
+                            self.draw_tail( row_counter, column_counter, data_port.device_number, color )
+                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG, width, rrrr )
+                            last_bit_was_driven = True
+                        elif 'G' == rrrr :
+                            self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color)
+                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
+                                                           width, rrrr)
+                            last_bit_was_driven = True
+                        else :
+                            error()
+                    else :
+                        self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color)
+                        self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
+                                                       width, rrrr)
+                        last_bit_was_driven = True
+                        data_port.set_guards_and_tails() # A bit is owned so 
+                        if data_port.source_REG:
+                            self.check_bus_clash(row_counter, column_counter, data_port.device_number, 'write')
+                        else:
+                            self.check_bus_clash(row_counter, column_counter, data_port.device_number, 'read')
+                    column_counter += width + 1
+### To here for Eddie
+                    
+                    # more stuff here
+                    # next gorup
+                        
 
         return ''
 
@@ -1356,34 +1750,33 @@ class Interface:
     MAX_ROWS = 10240
     MIN_ROW_RATE = 1
     MAX_ROW_RATE = 6144
-    MIN_INTERVAL_DENOMINATOR = 1
-    MAX_INTERVAL_DENOMINATOR = 512
-    MIN_BULK_HORIZONTAL_START = 1
-    MAX_BULK_HORIZONTAL_START = MAX_COLUMNS - 2
-    BULK_WIDTH = [0, 2, 5, 10]
+    MIN_SKIPPING_DENOMINATOR = 1
+    MAX_SKIPPING_DENOMINATOR = 4096
     MIN_S0_WIDTH = 1
     MAX_S0_WIDTH = 2
-    MIN_HANDOVER_WIDTH = 0
-    MAX_HANDOVER_WIDTH = 2
+    #MIN_S1_TAILS = 0
+    #MAX_S1_TAILS = 3
+    MIN_CDS_S0_HANDOVER_WIDTH = 0
+    MAX_CDS_S0_HANDOVER_WIDTH = 2
     MIN_TAIL_WIDTH = 0
-    MAX_TAIL_WIDTH = 2
+    MAX_TAIL_WIDTH = 3
+    MIN_BIT_WIDTH = 0
+    MAX_BIT_WIDTH = 3
 
     NUM_DATA_PORTS = 12
 
     def __init__(self):
-        self.columns_per_row = Interface.MAX_COLUMNS
+        self.columns_per_row = 24
         self.s0s1_enabled = True
         self.s0_width = Interface.MIN_S0_WIDTH
+        #self.s1_tails = Interface.MIN_S1_TAILS
         self.s0_handover_enabled = True
         self.cds_guard_enabled = False
-        self.handover_width = 1
+        self.cds_s0_handover_width = 1
         self.tail_width = Interface.MIN_TAIL_WIDTH
-        self.interval_denominator = 16
-        self.bulk_horizontal_start = 2
-        self.bulk_width = min(Interface.BULK_WIDTH)
-        self.bulk_guard_enabled = False
+        self.skipping_denominator_REG = 16
         self.row_rate = 3072
-        self._interval_lcm = 0
+        self._interval_lcm = 0 # This is likely broken
         self.data_ports = []
         for count in range(0, self.NUM_DATA_PORTS):
             self.data_ports.append(DataPort())
@@ -1426,6 +1819,20 @@ class Interface:
             raise ValueError('S0 width must be >= ' + str(Interface.MIN_S0_WIDTH))
         self._s0_width = v
 
+    #@property
+    #def s1_tails(self):
+    #    return self._s1_tails
+
+    #@s1_tails.setter
+    #def s1_tails(self, v):
+    #    if type(v) != int:
+    #        raise TypeError('S1 tails must be int, got ' + str(type(v)))
+    #    if v > Interface.MAX_S1_TAILS:
+    #        raise ValueError('S1 tails must be <= ' + str(Interface.MAX_S1_TAILS))
+    #    if v < Interface.MIN_S1_TAILS:
+    #        raise ValueError('S1 tails must be >= ' + str(Interface.MIN_S1_TAILS))
+    #    self._s1_tails = v
+#
     @property
     def s0_handover_enabled(self):
         return self._s0_handover_enabled
@@ -1433,7 +1840,7 @@ class Interface:
     @s0_handover_enabled.setter
     def s0_handover_enabled(self, v):
         if type(v) != bool:
-            raise TypeError('S0 handover enabled must be bool, got ' + str(type(v)))
+            raise TypeError('Draw S0 Handover must be bool, got ' + str(type(v)))
         self._s0_handover_enabled = bool(v)
 
     @property
@@ -1447,18 +1854,18 @@ class Interface:
         self._cds_guard_enabled = bool(v)
 
     @property
-    def handover_width(self):
-        return self._handover_width
+    def cds_s0_handover_width(self):
+        return self._cds_s0_handover_width
 
-    @handover_width.setter
-    def handover_width(self, v):
+    @cds_s0_handover_width.setter
+    def cds_s0_handover_width(self, v):
         if type(v) != int:
-            raise TypeError('Handover width must be int, got ' + str(type(v)))
-        if v > Interface.MAX_HANDOVER_WIDTH:
-            raise ValueError('Handover width must be <= ' + str(Interface.MAX_HANDOVER_WIDTH))
-        if v < Interface.MIN_HANDOVER_WIDTH:
-            raise ValueError('Handover width must be >= ' + str(Interface.MIN_HANDOVER_WIDTH))
-        self._handover_width = v
+            raise TypeError('CDS/S0 Handover width must be int, got ' + str(type(v)))
+        if v > Interface.MAX_CDS_S0_HANDOVER_WIDTH:
+            raise ValueError('CDS/S0 Handover width must be <= ' + str(Interface.MAX_CDS_S0_HANDOVER_WIDTH))
+        if v < Interface.MIN_CDS_S0_HANDOVER_WIDTH:
+            raise ValueError('CDS/S0 Handover width must be >= ' + str(Interface.MIN_CDS_S0_HANDOVER_WIDTH))
+        self._cds_s0_handover_width = v
 
     @property
     def tail_width(self):
@@ -1471,58 +1878,22 @@ class Interface:
         if v > Interface.MAX_TAIL_WIDTH:
             raise ValueError('Tail width must be <= ' + str(Interface.MAX_TAIL_WIDTH))
         if v < Interface.MIN_TAIL_WIDTH:
-            raise ValueError('Handover width must be >= ' + str(Interface.MIN_TAIL_WIDTH))
+            raise ValueError('Tail width must be >= ' + str(Interface.MIN_TAIL_WIDTH))
         self._tail_width = v
 
     @property
-    def interval_denominator(self):
-        return self._interval_denominator
+    def skipping_denominator_REG(self):
+        return self._skipping_denominator_REG
 
-    @interval_denominator.setter
-    def interval_denominator(self, v):
+    @skipping_denominator_REG.setter
+    def skipping_denominator_REG(self, v):
         if type(v) != int:
-            raise TypeError('Interval denominator must be int, got ' + str(type(v)))
-        if v > Interface.MAX_INTERVAL_DENOMINATOR:
-            raise ValueError('Interval denominator must be <= ' + str(Interface.MAX_INTERVAL_DENOMINATOR))
-        if v < Interface.MIN_INTERVAL_DENOMINATOR:
-            raise ValueError('Interval denominator must be >= ' + str(Interface.MIN_INTERVAL_DENOMINATOR))
-        self._interval_denominator = v
-
-    @property
-    def bulk_horizontal_start(self):
-        return self._bulk_horizontal_start
-
-    @bulk_horizontal_start.setter
-    def bulk_horizontal_start(self, v):
-        if type(v) != int:
-            raise TypeError('Bulk horizontal start must be int, got ' + str(type(v)))
-        if v > Interface.MAX_BULK_HORIZONTAL_START:
-            raise ValueError('Bulk horizontal start must be <= ' + str(Interface.MAX_BULK_HORIZONTAL_START))
-        if v < Interface.MIN_BULK_HORIZONTAL_START:
-            raise ValueError('Bulk horizontal start must be >= ' + str(Interface.MIN_BULK_HORIZONTAL_START))
-        self._bulk_horizontal_start = v
-
-    @property
-    def bulk_width(self):
-        return self._bulk_width
-
-    @bulk_width.setter
-    def bulk_width(self, v):
-        if type(v) != int:
-            raise TypeError('Bulk width must be int, got ' + str(type(v)))
-        if v not in Interface.BULK_WIDTH:
-            raise ValueError('Bulk width start must be' + str(Interface.BULK_WIDTH))
-        self._bulk_width = v
-
-    @property
-    def bulk_guard_enabled(self):
-        return self._bulk_guard_enabled
-
-    @bulk_guard_enabled.setter
-    def bulk_guard_enabled(self, v):
-        if type(v) != bool:
-            raise TypeError('Bulk guard enabled must be bool, got ' + str(type(v)))
-        self._bulk_guard_enabled = bool(v)
+            raise TypeError('Skipping denominator must be int, got ' + str(type(v)))
+        if v > Interface.MAX_SKIPPING_DENOMINATOR:
+            raise ValueError('Skipping denominator must be <= ' + str(Interface.MAX_SKIPPING_DENOMINATOR))
+        if v < Interface.MIN_SKIPPING_DENOMINATOR:
+            raise ValueError('Skipping denominator must be >= ' + str(Interface.MIN_SKIPPING_DENOMINATOR))
+        self._skipping_denominator_REG = v
 
     @property
     def row_rate(self):
@@ -1539,30 +1910,24 @@ class Interface:
         self._row_rate = v
 
     @property
-    def interval_lcm(self):
+    def interval_lcm(self):  # All LCM stuff is probably broken
         # This will be calculated rather than be an instance variable
         interval_list = []
         for count, data_port in enumerate(self.data_ports):
             if data_port.enabled:
                 interval_list.append(
-                    self.data_ports[count].interval_integer * self.interval_denominator + self.data_ports[
-                        count].interval_numerator)
-            interval_list.append(self.interval_denominator)
-
-        self._interval_lcm = interval_list[0]
-        for i in interval_list[1:]:
-            if sys.version_info[0] == 3:
-                self._interval_lcm = int(self._interval_lcm * i / math.gcd(self._interval_lcm, i))
-            else:
-                self._interval_lcm = int(self._interval_lcm * i / fractions.gcd(self._interval_lcm, i))
-        self._interval_lcm = int(self._interval_lcm / self.interval_denominator)
+                    self.data_ports[ count ].interval_REG * self.skipping_denominator_REG + self.data_ports[ count ].skipping_numerator_REG)
+            interval_list.append( self.skipping_denominator_REG )
         return self._interval_lcm
 
-
+### Cut from here for Eddie
 class DataPort:
+### To here for Eddie
     count = 0
 
     # Data port ranges
+    MIN_DEVICE_NUMBER = 0
+    MAX_DEVICE_NUMBER = 8
     MIN_CHANNELS = 1
     MAX_CHANNELS = 16
     MIN_CHANNEL_GROUPING = 0
@@ -1572,39 +1937,84 @@ class DataPort:
     MIN_SAMPLE_WIDTH = 1
     MAX_SAMPLE_WIDTH = 64
     MIN_SAMPLE_GROUPING = 1
-    MAX_SAMPLE_GROUPING = 8
-    MIN_INTERVAL_INTEGER = 1
-    MAX_INTERVAL_INTEGER = 1024
-    MIN_INTERVAL_NUMERATOR = 0
-    MAX_INTERVAL_NUMERATOR = Interface.MAX_INTERVAL_DENOMINATOR - 1
+    MAX_SAMPLE_GROUPING = 16
+    MIN_INTERVAL = 1
+    MAX_INTERVAL = 1024
+    MIN_SKIPPING_NUMERATOR = 0
+    MAX_SKIPPING_NUMERATOR = Interface.MAX_SKIPPING_DENOMINATOR - 1
+    MIN_SKIPPING_DENOMINATOR = 0
+    MAX_SKIPPING_DENOMINATOR = Interface.MAX_SKIPPING_DENOMINATOR - 1
     MIN_OFFSET = 0
-    MAX_OFFSET = MAX_INTERVAL_INTEGER - 1
-    MIN_H_START = 1
-    MAX_H_START = Interface.MAX_COLUMNS
-    MIN_H_STOP = 1
-    MAX_H_STOP = Interface.MAX_COLUMNS
+    MAX_OFFSET = MAX_INTERVAL - 1
+    MIN_H_START = 0
+    MAX_H_START = Interface.MAX_COLUMNS - 1
+    MIN_H_COUNT = 0
+    MAX_H_COUNT = Interface.MAX_COLUMNS - 1
+    MIN_TAIL_WIDTH = 0
+    MAX_TAIL_WIDTH = Interface.MAX_TAIL_WIDTH
+    MIN_BIT_WIDTH = 0
+    MAX_BIT_WIDTH = Interface.MAX_BIT_WIDTH
 
-    NUM_DP_PARAMETERS = 10
+    NUM_DP_PARAMETERS = 13
 
+### Cut from here for Eddie
     def __init__(self):
         self.name = 'DP' + str(DataPort.count)
-        self.channels = 1
-        self.channel_grouping = 0
-        self.channel_group_spacing = 0
-        self.sample_width = 16
-        self.sample_grouping = 1
-        self.interval_integer = 64
-        self.interval_numerator = 0
-        self.offset = 0
-        self.h_start = 4
-        self.h_stop = 10
-        self.source = True
-        self.handover = True
-        self.tail = False
-        self.guard = False
+        self.number = DataPort.count
+        self.device_number = 0
+        # All variables that contain "_REG" correspond registers in the specification.
+        # Where coding is unnatural, _X1 is suffixed to draw attention.
+        # Example when the sample width is equal to 1 bit, sample_width_REG_X1 == 0.
+        self.channels_REG = 1
+        self.channel_grouping_REG = 0
+        self.channel_group_spacing_REG = 0
+        self.sample_width_REG = 1
+        self.sample_grouping_REG = 1
+        self.interval_REG = 1
+        self.skipping_numerator_REG = 0
+        self.offset_REG = 0
+        self.h_start_REG = 4
+        self.h_count_REG = 0
+        self.tail_width_REG = 0
+        self.bit_width_REG = 0
+        self.source_REG = True
+        self.handover = False
+        self.tail_REG = False
+        self.guard_REG = False
+        self.sri_REG = False
+        
+        # The following variables are used for modeling with this tool and do not relate to actual implementation.
         self.enabled = False
-        self.sample_rate = 48.0
+        self.inManager = False
+        self.sample_rate = 0
+        
+        # The following variables might correpond closely to a real implementation
+        self.offset_in_interval = -1
+        self.current_channel = 0
+        self.current_sample_index = 0
+        self.samples_remaining_in_sample_group = 0
+        self.accumulated_fraction = 0
+        self.tails_left = 0
+        self.guards_left = 0
+        self.channel_group_is_spacing = 0
+        
+        # effect_channel_grouping is a helper variable that is calculated from channel_grouping_REG and channels_REG
+        self.effective_channel_group = 0
+        
+        # These two variables are used for channel grouping.  Simpler implementations might exist.
+        self.channel_group_end = 0
+        self.channel_group_base = 0
+        
+        # The following variables are use for housekeeping
+        # and error checking in this tools and would likely not exist in real implementations
+        self.done_with_interval = False
+        self.last_column_evaluated = -1
+        self.last_row_evaluated = -1
+        self.end_of_row = False
+        self.started = False
         DataPort.count += 1
+### To here for Eddie
+
 
     @property
     def name(self):
@@ -1615,156 +2025,212 @@ class DataPort:
         if type(v) != str:
             raise TypeError('Name must be a string, got ' + str(type(v)))
         self._name = v
+    @property
+    def device_number(self):
+        return self._device_number
+
+    @device_number.setter
+    def device_number(self, v):
+        if type(v) != int:
+            raise TypeError('Device number must be int, got ' + str(type(v)))
+        if v > DataPort.MAX_DEVICE_NUMBER:
+            raise ValueError('Device number must be <= ' + str(DataPort.MAX_DEVICE_NUMBER))
+        if v < DataPort.MIN_DEVICE_NUMBER:
+            raise ValueError('Device number must be >= ' + str(DataPort.MIN_DEVICE_NUMBER))
+        self._device_number = v
+    @property
+    def channels_REG(self):
+        return self._channels_REG
 
     @property
-    def channels(self):
-        return self._channels
+    def channels_REG_X1(self):
+        return self._channels_REG - 1
 
-    @channels.setter
-    def channels(self, v):
+    @channels_REG.setter
+    def channels_REG(self, v):
         if type(v) != int:
             raise TypeError('Channels must be int, got ' + str(type(v)))
         if v > DataPort.MAX_CHANNELS:
             raise ValueError('Channels must be <= ' + str(DataPort.MAX_CHANNELS))
         if v < DataPort.MIN_CHANNELS:
             raise ValueError('Channels must be >= ' + str(DataPort.MIN_CHANNELS))
-        self._channels = v
+        self._channels_REG = v
 
     @property
-    def channel_grouping(self):
-        return self._channel_grouping
+    def channel_grouping_REG(self):
+        return self._channel_grouping_REG
 
-    @channel_grouping.setter
-    def channel_grouping(self, v):
+    @channel_grouping_REG.setter
+    def channel_grouping_REG(self, v):
         if type(v) != int:
             raise TypeError('Channel grouping must be int, got ' + str(type(v)))
         if v > DataPort.MAX_CHANNEL_GROUPING:
             raise ValueError('Channel grouping must be <= ' + str(DataPort.MAX_CHANNEL_GROUPING))
         if v < DataPort.MIN_CHANNEL_GROUPING:
             raise ValueError('Channel grouping be >= ' + str(DataPort.MIN_CHANNEL_GROUPING))
-        self._channel_grouping = v
+        self._channel_grouping_REG = v
 
     @property
-    def channel_group_spacing(self):
-        return self._channel_group_spacing
+    def channel_group_spacing_REG(self):
+        return self._channel_group_spacing_REG
 
-    @channel_group_spacing.setter
-    def channel_group_spacing(self, v):
+    @channel_group_spacing_REG.setter
+    def channel_group_spacing_REG(self, v):
         if type(v) != int:
             raise TypeError('Channel group spacing must be int, got ' + str(type(v)))
         if v > DataPort.MAX_CHANNEL_GROUP_SPACING:
             raise ValueError('Channel group spacing must be <= ' + str(DataPort.MAX_CHANNEL_GROUP_SPACING))
         if v < DataPort.MIN_CHANNEL_GROUP_SPACING:
             raise ValueError('Channel group spacing must be >= ' + str(DataPort.MIN_CHANNEL_GROUP_SPACING))
-        self._channel_group_spacing = v
+        self._channel_group_spacing_REG = v
 
     @property
-    def sample_width(self):
-        return self._sample_width
+    def sample_width_REG(self):
+        return self._sample_width_REG
 
-    @sample_width.setter
-    def sample_width(self, v):
+    @property
+    def sample_width_REG_X1(self):
+        return self._sample_width_REG - 1
+
+    @sample_width_REG.setter
+    def sample_width_REG(self, v):
         if type(v) != int:
             raise TypeError('Sample width must be int, got ' + str(type(v)))
         if v > DataPort.MAX_SAMPLE_WIDTH:
             raise ValueError('Sample width must be <= ' + str(DataPort.MAX_SAMPLE_WIDTH))
         if v < DataPort.MIN_SAMPLE_WIDTH:
             raise ValueError('Sample width must be >= ' + str(DataPort.MIN_SAMPLE_WIDTH))
-        self._sample_width = v
+        self._sample_width_REG = v
 
     @property
-    def sample_grouping(self):
-        return self._sample_grouping
+    def sample_grouping_REG(self):
+        return self._sample_grouping_REG
 
-    @sample_grouping.setter
-    def sample_grouping(self, v):
+    @property
+    def sample_grouping_REG_X1(self):
+        return self._sample_grouping_REG - 1
+
+    @sample_grouping_REG.setter
+    def sample_grouping_REG(self, v):
         if type(v) != int:
             raise TypeError('Sample grouping must be int, got ' + str(type(v)))
         if v > DataPort.MAX_SAMPLE_GROUPING:
             raise ValueError('Sample grouping must be <= ' + str(DataPort.MAX_SAMPLE_GROUPING))
         if v < DataPort.MIN_SAMPLE_GROUPING:
             raise ValueError('Sample grouping must be >= ' + str(DataPort.MIN_SAMPLE_GROUPING))
-        self._sample_grouping = v
+        self._sample_grouping_REG = v
 
     @property
-    def interval_integer(self):
-        return self._interval_integer
-
-    @interval_integer.setter
-    def interval_integer(self, v):
-        if type(v) != int:
-            raise TypeError('Interval integer must be int, got ' + str(type(v)))
-        if v > DataPort.MAX_INTERVAL_INTEGER:
-            raise ValueError('Interval integer must be <= ' + str(DataPort.MAX_INTERVAL_INTEGER))
-        if v < DataPort.MIN_INTERVAL_INTEGER:
-            raise ValueError('Interval integer must be >= ' + str(DataPort.MIN_INTERVAL_INTEGER))
-        self._interval_integer = v
+    def interval_REG(self):
+        return self._interval_REG
 
     @property
-    def interval_numerator(self):
-        return self._interval_numerator
+    def interval_REG_X1(self):
+        return self._interval_REG - 1
 
-    @interval_numerator.setter
-    def interval_numerator(self, v):
+    @interval_REG.setter
+    def interval_REG(self, v):
         if type(v) != int:
             raise TypeError('Interval must be int, got ' + str(type(v)))
-        if v > DataPort.MAX_INTERVAL_NUMERATOR:
-            raise ValueError('Interval must be <= ' + str(DataPort.MAX_INTERVAL_NUMERATOR))
-        if v < DataPort.MIN_INTERVAL_NUMERATOR:
-            raise ValueError('Interval must be >= ' + str(DataPort.MIN_INTERVAL_NUMERATOR))
-        self._interval_numerator = v
+        if v > DataPort.MAX_INTERVAL:
+            raise ValueError('Interval must be <= ' + str(DataPort.MAX_INTERVAL_INTEGER))
+        if v < DataPort.MIN_INTERVAL:
+            raise ValueError('Interval must be >= ' + str(DataPort.MIN_INTERVAL_INTEGER))
+        self._interval_REG = v
 
     @property
-    def offset(self):
-        return self._offset
+    def skipping_numerator_REG(self):
+        return self._skipping_numerator_REG
 
-    @offset.setter
-    def offset(self, v):
+    @skipping_numerator_REG.setter
+    def skipping_numerator_REG(self, v):
+        if type(v) != int:
+            raise TypeError('Interval must be int, got ' + str(type(v)))
+        if v > DataPort.MAX_SKIPPING_NUMERATOR:
+            raise ValueError('Interval must be <= ' + str(DataPort.MAX_SKIPPING_NUMERATOR))
+        if v < DataPort.MIN_SKIPPING_NUMERATOR:
+            raise ValueError('Interval must be >= ' + str(DataPort.MIN_SKIPPING_NUMERATOR))
+        self._skipping_numerator_REG = v
+
+    @property
+    def offset_REG(self):
+        return self._offset_REG
+
+    @offset_REG.setter
+    def offset_REG(self, v):
         if type(v) != int:
             raise TypeError('Offset must be int, got ' + str(type(v)))
         if v > DataPort.MAX_OFFSET:
             raise ValueError('Offset must be <= ' + str(DataPort.MAX_OFFSET))
         if v < DataPort.MIN_OFFSET:
             raise ValueError('Offset must be >= ' + str(DataPort.MIN_OFFSET))
-        self._offset = v
+        self._offset_REG = v
 
     @property
-    def h_start(self):
-        return self._h_start
+    def h_start_REG(self):
+        return self._h_start_REG
 
-    @h_start.setter
-    def h_start(self, v):
+    @h_start_REG.setter
+    def h_start_REG(self, v):
         if type(v) != int:
             raise TypeError('Horizontal start must be int, got ' + str(type(v)))
         if v > DataPort.MAX_H_START:
             raise ValueError('Horizontal start must be <= ' + str(DataPort.MAX_H_START))
         if v < DataPort.MIN_H_START:
             raise ValueError('Horizontal start must be >= ' + str(DataPort.MIN_H_START))
-        self._h_start = v
+        self._h_start_REG = v
 
     @property
-    def h_stop(self):
-        return self._h_stop
+    def h_count_REG(self):
+        return self._h_count_REG
 
-    @h_stop.setter
-    def h_stop(self, v):
+    @h_count_REG.setter
+    def h_count_REG(self, v):
         if type(v) != int:
             raise TypeError('Horizontal stop must be int, got ' + str(type(v)))
-        if v > DataPort.MAX_H_STOP:
-            raise ValueError('Horizontal stop must be <= ' + str(DataPort.MAX_H_STOP))
-        if v < DataPort.MIN_H_STOP:
-            raise ValueError('Horizontal stop must be >= ' + str(DataPort.MIN_H_STOP))
-        self._h_stop = v
+        if v > DataPort.MAX_H_COUNT:
+            raise ValueError('Horizontal stop must be <= ' + str(DataPort.MAX_H_COUNT))
+        if v < DataPort.MIN_H_COUNT:
+            raise ValueError('Horizontal stop must be >= ' + str(DataPort.MIN_H_COUNT))
+        self._h_count_REG = v
 
     @property
-    def source(self):
-        return self._source
+    def tail_width_REG(self):
+        return self._tail_width_REG
 
-    @source.setter
-    def source(self, v):
+    @tail_width_REG.setter
+    def tail_width_REG(self, v):
+        if type(v) != int:
+            raise TypeError('Tail Width must be int, got ' + str(type(v)))
+        if v > DataPort.MAX_TAIL_WIDTH:
+            raise ValueError('Tail Width must be <= ' + str(DataPort.MAX_TAIL_WIDTH))
+        if v < DataPort.MIN_TAIL_WIDTH:
+            raise ValueError('Tail Width must be >= ' + str(DataPort.MIN_TAIL_WIDTH))
+        self._tail_width_REG = v
+
+    @property
+    def bit_width_REG(self):
+        return self._bit_width_REG
+
+    @bit_width_REG.setter
+    def bit_width_REG(self, v):
+        if type(v) != int:
+            raise TypeError('WideBit Width must be int, got ' + str(type(v)))
+        if v > DataPort.MAX_BIT_WIDTH:
+            raise ValueError('WideBit Width must be <= ' + str(DataPort.MAX_BIT_WIDTH))
+        if v < DataPort.MIN_BIT_WIDTH:
+            raise ValueError('WideBit Width must be >= ' + str(DataPort.MIN_BIT_WIDTH))
+        self._bit_width_REG = v
+
+    @property
+    def source_REG(self):
+        return self._source_REG
+
+    @source_REG.setter
+    def source_REG(self, v):
         if type(v) != bool:
             raise TypeError('Source enabled must be bool, got ' + str(type(v)))
-        self._source = bool(v)
+        self._source_REG = bool(v)
 
     @property
     def handover(self):
@@ -1773,7 +2239,7 @@ class DataPort:
     @handover.setter
     def handover(self, v):
         if type(v) != bool:
-            raise TypeError('Handover enabled must be bool, got ' + str(type(v)))
+            raise TypeError('Draw Handover must be bool, got ' + str(type(v)))
         self._handover = bool(v)
 
     @property
@@ -1787,14 +2253,24 @@ class DataPort:
         self._tail = bool(v)
 
     @property
-    def guard(self):
-        return self._guard
+    def guard_REG(self):
+        return self._guard_REG
 
-    @guard.setter
-    def guard(self, v):
+    @guard_REG.setter
+    def guard_REG(self, v):
         if type(v) != bool:
             raise TypeError('Guard enabled must be bool, got ' + str(type(v)))
-        self._guard = bool(v)
+        self._guard_REG = bool(v)
+
+    @property
+    def sri_REG(self):
+        return self._sri_REG
+
+    @sri_REG.setter
+    def sri_REG(self, v):
+        if type(v) != bool:
+            raise TypeError('Multiple transport interval per row must be a bool, got ' + str( type( v ) ) )
+        self._sri_REG = bool( v )
 
     @property
     def enabled(self):
@@ -1806,10 +2282,257 @@ class DataPort:
             raise TypeError('Data port enabled must be bool, got ' + str(type(v)))
         self._enabled = bool(v)
 
+    @property
+    def inManager(self):
+        return self._inManager
+
+    @inManager.setter
+    def inManager(self, v):
+        if type(v) != bool:
+            raise TypeError('Data port inManager must be bool, got ' + str(type(v)))
+        self._inManager = bool(v)
+
+    def set_guards_and_tails( self ) : # TODO: This method should move to the device (not dataport). The RHS would come from the active dataport
+        self.tails_left = self.tail_width_REG
+        self.guards_left = self.guard_REG
+        #self.last_dataport_was_source = self.source_REG
+
+    def get_guard_or_tails( self ): # TODO: This method should move to the device (not dataport)
+        if self.source_REG :
+            if ( self.guards_left ) :
+                self.guards_left = False
+                return 'G'
+            if ( self.tails_left > 0 ) :
+                self.tails_left -= 1
+                return 'tail'
+        return NOT_OWNED
+
+
+### Cut from here for Eddie
+    # The initial values might be quite different in a real implementation.
+    # These values are chosen mostly due to artifacts of this tool.
+    def reset( self ):
+        self.current_offset_in_interval = -1
+        self.last_row_evaluated = -1
+        self.started = False
+        self.done_with_interval = False
+        self.end_of_row = False
+        # these two should move to the device
+        self.tails_left = 0
+
+        self.guards_left = False
+        print( "dataport reset called" )
+
+    def startInterval( self ) :
+        self.samples_remaining_in_sample_group = self.sample_grouping_REG_X1
+        self.channel_group_base = 0 # Like current_channel, starts at 0
+        self.current_channel = 0
+        if self.channel_grouping_REG == 0 or self.channel_grouping_REG >= self.channels_REG_X1 : # or self.sri_REG:
+            self.effective_channel_grouping = self.channels_REG_X1 + 1
+        else:
+            self.effective_channel_grouping = self.channel_grouping_REG
+            # effective_channel_grouping is an intermediate variable for clarity
+        self.channel_group_end = self.effective_channel_grouping
+        # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
+
+        self.current_bit_in_sample = self.sample_width_REG_X1
+        # TODO: this is where a call to fetch SampleGroup * Channels of audio from the file to playing out.
+
+
+### To here for Eddie
+### Cut from here for Eddie        
+    # This is called for each possible column that start a bit (or wide bit).  This is not called more than once per data bit.
+    # try_bit returns a tuple containing
+    # 1. the width (integer) of the "bit" (how many UIs) and
+    # 2. the value to drive (a string coding ownership or the bit address withing the sample frames)
+    def try_bit( self, row_number, column_number, denominator_REG ) :
+        if Debug_Drawing : print( 'try_bit called with row={:d}, column={:d}'.format( row_number, column_number ) )
+        ret_value = 'error'
+        if self.sri_REG :
+            if not self.started :
+                if Debug_Drawing : print( "starting interval due to SRI" )
+                self.startInterval()
+                self.end_of_row = False
+                self.started = True
+                self.done_with_interval = False
+                self.channel_group_is_spacing = 0
+
+        elif self.last_row_evaluated != row_number :
+            assert( self.last_row_evaluated + 1 == row_number )
+            self.last_row_evaluated = row_number
+            self.last_column_evaluated = -1
+            self.end_of_row = False # we are starting a new row
+
+            # Current_offset_in_interval should be 0 anytime an SSP occurs
+            # and is reset when channels are enabled or prepared.
+            self.current_offset_in_interval += 1 # update the interval counter
+            
+            # Greater than should never occur in real systems
+            if self.current_offset_in_interval >= self.interval_REG_X1 + 1 :
+                self.current_offset_in_interval = 0
+                self.done_with_interval = False # This is a new interval.
+
+            # This should be true once per interval
+            if not self.started and self.current_offset_in_interval == self.offset_REG :
+                # These lines are for the optional skipping feature
+                if ( self.skipping_numerator_REG != 0 ) :
+                    self.accumulated_fraction += self.skipping_numerator_REG
+                    if self.accumulated_fraction < denominator_REG :
+                        self.done_with_interval = True
+                        if Debug_Drawing : print( 'leaving try_bit early due to skipping' )
+                        return 0, NOT_OWNED
+                if Debug_Drawing : print( '    will drive bits this interval' )
+                self.accumulated_fraction -= denominator_REG
+                
+                assert( not self.started )
+                self.started = True
+  
+                self.startInterval()
+
+        if ( self.end_of_row or self.done_with_interval ) :
+            if Debug_Drawing : print( 'leaving try_bit early due to end_of_row or done_with_interval' )
+            return 0, NOT_OWNED # self.drive_guards_and_tails()
+
+        if self.last_column_evaluated == column_number :
+            raise ValueError ( "This column was already evaluated " )
+        self.last_column_evaluated = column_number
+
+        if self.started :
+            # Rendering of bits starts when the column gets to h_start
+            if column_number == self.h_start_REG :
+                if Debug_Drawing : print( '    starting row, set done_with_row to false' )
+                self.done_with_row = False
+            if column_number < self.h_start_REG :
+                if Debug_Drawing : print( ' leaving try_bit early:   left of h_start, not owning' )
+                return 0, NOT_OWNED
+            if self.done_with_row or self.done_with_interval :
+                if Debug_Drawing : print( ' leaving try_bit early:   driving any guard or tail as done_with_Row or done_with_interval or channel_group_is_spacing' )
+                return 0, NOT_OWNED # self.drive_guards_and_tails()
+
+            # Are we past the end of the row?
+            elif column_number > self.h_start_REG + self.h_count_REG :
+                if Debug_Drawing : print( '    hit h_stop, setting done_with_row True h_start={}, hstop={}'.format( self.h_start_REG, self.h_count_REG ) )
+                self.done_with_row = True
+                self.channel_group_is_spacing = 0;
+                if self.sri_REG :
+                    if Debug_Drawing : print( "ending interval due to SRI" )
+                    self.started = False
+                    self.done_with_interval = True
+                    self.end_of_row = True 
+                return 0, NOT_OWNED # self.drive_guards_and_tails()
+            
+            else : # In between HSTART and ( HSTART + HCOUNT ), inclusive.
+                if self.channel_group_is_spacing > 0 :
+                    self.channel_group_is_spacing -= 1
+                    if Debug_Drawing : print( " leaving try_bit early skipping bits due to spacing" )
+                    return 0, NOT_OWNED # self.drive_guards_and_tails()
+
+                # last_value_sent would be this value of this return  <--- what the heck does this mean?
+                else : # done with any bit widening
+                    if Debug_Drawing : print( '    Done with wide bit, going on to next bit (if it exists)' )
+                    if ( self.current_bit_in_sample >= 0 ) :
+                        if Debug_Drawing : print( '    There is at least one bit left in the current sample' )
+                        self.current_bit_in_sample -= 1
+                        ret_value = 'c' + str( self.current_channel ) + 'b' + str( self.current_bit_in_sample )
+                        # last_value_sent would be this value of this return
+                    if self.current_bit_in_sample < 0 :
+                        # Done will all bits in the current sample.  Go to the next channel or frame
+                        if Debug_Drawing : print( '    going on to next channel (if it exists)' )
+                        self.current_channel += 1
+                        if self.channel_group_end <= self.current_channel : # are we at tthe end of the channel group
+                            if Debug_Drawing : print( '    end of channel group' )
+                            self.samples_remaining_in_sample_group -= 1
+                            if 0 > self.samples_remaining_in_sample_group : # done with sample group ?
+                                if Debug_Drawing : print( 'finished sample group' )
+                                if self.channel_group_end >= self.channels_REG_X1 + 1 : # Done with all channel groups
+                                    if not self.sri_REG :
+                                        if Debug_Drawing : print( 'done with interval' )
+                                        self.done_with_interval = True
+                                        self.end_of_row = True # NDW change for SRI
+                                        self.started = False
+                                    else :
+                                        self.channel_group_is_spacing = self.channel_group_spacing_REG
+                                        self.startInterval()
+ 
+                                else : # we are not at the last channel and so need to go to the next channel group.
+                                    if Debug_Drawing : print( "starting next channel group (After spacing)" )
+                                    self.channel_group_base += self.effective_channel_grouping
+                                    self.channel_group_end += self.effective_channel_grouping
+                                    # clip when last group of channels is smaller
+                                    if self.channel_group_end >= self.channels_REG_X1 :
+                                        self.channel_group_end = self.channels_REG_X1 + 1
+                                    # reset sample group counter
+                                    self.samples_remaining_in_sample_group = self.sample_grouping_REG_X1
+                                    self.current_bit_in_sample = self.sample_width_REG_X1
+                                    self.channel_group_is_spacing = self.channel_group_spacing_REG
+                                    assert( self.current_channel == self.channel_group_base )
+                                if 0 == self.channel_group_spacing_REG : # 0 means next row.
+                                    self.end_of_row = True
+                                else : # 1 for spacing means next column
+                                    self.channel_group_is_spacing -= 1
+                            else : # continue with current group of channels starting at the first channel in the group
+                                self.current_bit_in_sample = self.sample_width_REG_X1
+                                self.current_channel = self.channel_group_base
+                        else : # not the end of the channel group just go to the next channel
+                            self.current_bit_in_sample = self.sample_width_REG_X1
+                            # TODO: This is where the output shift register would get loaded with a new sample
+
+                if Debug_Drawing : print( "normal end of bit" )
+        else:
+            ret_value = NOT_OWNED
+
+        if ( self.sri_REG ) :
+            if Debug_Drawing : print( "SRI noted near end") 
+            if ( column_number == self.h_start_REG + self.h_count_REG ) :
+                # for SRI, these variable need to be reset so that things start the same each row.
+                if Debug_Drawing : print( "special SRI check worked" )
+                self.started = False
+                self.done_with_interval = True
+                self.end_of_row = True # NDW change for SRI???
+        return self.bit_width_REG, ret_value
+### To here for Eddie
+
+###############################
+#                             #
+#       COMMAND LINE          #
+#     ARGUMENT PARSING        #
+#                             #
+###############################
+
+def parse_cmdline():
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('-b', '--batch', required=False,
+                        dest='batch_mode', default=False, action='store_true',
+                        help='Execute the application in batch mode')
+    
+    parser.add_argument('-c', '--config_file', metavar='file', required=False,
+                                          dest='config_filename', action='store',
+                                          help='System/dataports config file (CSV)')
+
+    parser.add_argument('-o', '--output_frame_file', metavar='file', required=False,
+                                          dest='out_frame_filename', default='frame.json', action='store',
+                                          help='Frame model output file (JSON)')    
+
+    args      = parser.parse_args()
+    print(args)
+    return args
+
+def openfile(filename, mode):
+   try:
+      f = open(filename, mode)
+   except OSError:
+      print("openfile: Cannot open file", filename )
+      exit(1)
+   else:
+      return f
+
+###############################
 
 if __name__ == '__main__':
+    args = parse_cmdline()
     root = tk.Tk()
-    app = App(root)
+    app = App(root, args)
+
     while True:
         try:
             app.mainloop()
