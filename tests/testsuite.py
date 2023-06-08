@@ -16,8 +16,12 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 import unittest
 import os
+import subprocess
 
 class CompareFramesTest(unittest.TestCase):
+
+    # TODO: paths are not managed robustly. Currently
+    # running only under tests/
   
     @classmethod
     def setUpClass(cls):
@@ -38,46 +42,30 @@ class CompareFramesTest(unittest.TestCase):
         for root, dirs, files in os.walk(cls.cfg_dir):
             for file in files:
                 if file.endswith('.csv'):
-                    cls.cfg_list.append(file)
+                    cls.cfg_list.append(os.path.join(root, file))
         print(f'configs = {cls.cfg_list}')
-        # TODO: delete
-        cls.num_list = range(0, 8)
+      
+    def config_test(self, cfg):
+        # Infer test and reference output file names
+        cfg_relpath = os.path.relpath(cfg, self.cfg_dir)
+        print (f'Will run test for config {cfg_relpath}')
+        (cfg_basename, ext) = os.path.splitext(cfg_relpath)
+        json_relpath = cfg_basename + '.json'
+        out_path = os.path.join(self.out_dir, json_relpath)
+        ref_path = os.path.join(self.ref_dir, json_relpath)
 
-
-#    def setUp(self):
-#        # Set paths for configurations, test outputs and
-#        # reference (i.e. golden) outputs
-#        cur_dir = os.path.dirname(__file__)
-#        self.cfg_dir = os.path.join(cur_dir, "test_cfgs")
-#        self.ref_dir = os.path.join(cur_dir, "test_refs")
-#        self.out_dir = os.path.join(cur_dir, "test_out")
-#
-#        # Stop if the test output directory exists
-#        # (alternatively we can remove it, but I prefer to be
-#        # on the safe side)
-##        if (os.path.exists(self.out_dir)):
-##            print(f"Error: {self.out_dir} already exists")
-##            exit(1)
-##        else:
-#        os.mkdir(self.out_dir)
-
-        # Find all the configuration files we want to test
-        # (by default we will test all those in cfg_dir)
-        
-
-    def test_basic(self):
+        # Call visualizer
+        cmd = f"python3 ../swi3s_visualizer.py -c {cfg} -o {out_path} -b"
+        print (f'cmd = {cmd}')
+        result = subprocess.run([cmd], shell=True, check=True)
+        # Compare output file with reference
+        # TODO
         self.assertEqual(1, 1)
 
-    def test_failing(self):
-        self.assertEqual(1, 2)
-
-    def evenness_test(self, i):
-         self.assertEqual(i % 2, 0)
-
-    def test_multiple(self):
-        for i in self.num_list:
-            with self.subTest(i=i):
-               self.evenness_test(i)
+    def test_regression(self):
+        for cfg in self.cfg_list:
+            with self.subTest(cfg=cfg):
+               self.config_test(cfg)
 
 
 if __name__ == '__main__':
