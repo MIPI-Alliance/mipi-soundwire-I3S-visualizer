@@ -1547,13 +1547,13 @@ class App(tk.Frame):
             si.dp_num = dp_num
             chan = 0
             bit_num = 0
-            m = re.match("^c(\d+)b(\d+)$", rrrr)
+            m = re.match("^c(\d+)b(-?\d+)$", rrrr)
             if (m):
                 chan     = m.group(1)
                 bit_num  = m.group(2)
             else:
                 print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
-#                exit(1)
+                exit(1)
             si.channel = chan
             si.bit_num = bit_num
             
