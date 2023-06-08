@@ -1,0 +1,30 @@
+Columns per Row (2-32),16
+S0 S1 Enabled,True
+S0 Width (1-2),2
+CDS Guard Enabled,False
+CDS Tail Width (0-3),0
+Interval Denominator (1-4096),16
+CDS/S0 Handover Width (0-2),1
+Draw S0 Handover,True
+Row Rate [kHz] (1-6144),3072
+Rows to Draw (1-10240),66
+Data Port Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
+Data Port Device Number,0,0,0,0,0,0,0,0,0,0,0,0
+Data Port Channels,1,1,1,1,1,1,1,1,1,1,1,1
+Data Port Channel Grouping,0,0,0,0,0,0,0,0,0,0,0,0
+Data Port Channel Group Spacing,0,0,4,3,3,0,0,0,0,0,0,0
+Data Port Sample Width,1,16,16,24,16,1,24,16,1,1,1,1
+Data Port Sample Grouping,1,1,1,1,1,1,1,1,1,1,1,1
+Data Port Interval Integer,64,64,64,64,64,1,64,64,1,1,64,64
+Data Port Interval Numerator,0,0,0,0,0,0,0,0,0,0,0,0
+Data Port Offset,0,28,16,0,22,0,8,34,0,0,0,0
+Data Port Horizontal Start,4,4,4,4,4,8,4,4,10,12,4,9
+Data Port Horizontal Count,0,2,2,2,2,0,2,2,0,0,3,3
+Data Port Tail Width,0,0,0,0,0,0,0,0,0,0,0,0
+Data Port Bit Width,0,0,0,0,0,0,0,0,0,0,0,0
+Source,False,True,True,True,True,True,True,True,True,True,False,False
+Draw Data Port Handover,False,True,True,True,True,True,True,True,True,True,False,False
+Data Port Guard Enabled,False,False,False,False,False,False,False,False,False,False,False,False
+Data Port Enabled,False,True,True,True,True,True,True,True,True,True,False,False
+Data Port In Manager,False,False,False,False,False,False,False,False,False,False,False,False
+Data Port DRI,False,False,False,False,False,False,False,False,False,False,False,False
