@@ -29,8 +29,12 @@ class CompareFramesTest(unittest.TestCase):
         # reference (i.e. golden) outputs
         cur_dir = os.path.dirname(__file__)
         cls.cfg_dir = os.path.join(cur_dir, "test_cfgs")
-        cls.ref_dir = os.path.join(cur_dir, "test_refs")
-        cls.out_dir = os.path.join(cur_dir, "test_out")
+        # TODO: the reference directory is temporarily called
+        # tmp_refs/ to stress that the files there cannot be
+        # considered actual references until they are validated
+        # by someone
+        cls.ref_dir = os.path.join(cur_dir, "tmp_refs")
+        cls.out_dir = os.path.join(cur_dir, "test_outs")
         # Create the test output directory, stopping if it
         # already exists (alternatively we can remove it,
         # but I prefer to be on the safe side)
@@ -58,10 +62,13 @@ class CompareFramesTest(unittest.TestCase):
         cmd = f"python3 ../swi3s_visualizer.py -c {cfg} -o {out_path} -b"
         print (f'cmd = {cmd}')
         result = subprocess.run([cmd], shell=True, check=True)
+        self.assertTrue(result.returncode == 0, f"swi3s_visualizer exited with code {result.returncode}")    
         # Compare output file with reference
-        # TODO
-        self.assertEqual(1, 1)
-
+        cmd = f"cmp {ref_path} {out_path}"
+        print (f'cmd = {cmd}')
+        result = subprocess.run([cmd], shell=True, check=True)
+        self.assertTrue(result.returncode == 0, f"Compare failed")    
+      
     def test_regression(self):
         for cfg in self.cfg_list:
             with self.subTest(cfg=cfg):
