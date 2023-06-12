@@ -1,8 +1,10 @@
 {
     "row_info": [
         {
+            "row_num": 0,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -16,6 +18,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -31,8 +34,10 @@
             ]
         },
         {
+            "row_num": 1,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -40,12 +45,13 @@
                             "device_num": 0,
                             "dp_num": 0,
                             "channel": 0,
-                            "sample": 4,
+                            "sample": 0,
                             "bit_num": 0
                         }
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -61,8 +67,10 @@
             ]
         },
         {
+            "row_num": 2,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -76,6 +84,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -91,8 +100,10 @@
             ]
         },
         {
+            "row_num": 3,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -106,6 +117,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",

@@ -1,8 +1,10 @@
 {
     "row_info": [
         {
+            "row_num": 0,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -16,6 +18,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -29,6 +32,7 @@
                     ]
                 },
                 {
+                    "col_num": 2,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -42,6 +46,7 @@
                     ]
                 },
                 {
+                    "col_num": 3,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -57,8 +62,10 @@
             ]
         },
         {
+            "row_num": 1,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -72,6 +79,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -85,6 +93,7 @@
                     ]
                 },
                 {
+                    "col_num": 2,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -98,6 +107,7 @@
                     ]
                 },
                 {
+                    "col_num": 3,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -113,8 +123,10 @@
             ]
         },
         {
+            "row_num": 2,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -128,6 +140,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -141,6 +154,7 @@
                     ]
                 },
                 {
+                    "col_num": 2,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -154,6 +168,7 @@
                     ]
                 },
                 {
+                    "col_num": 3,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -169,8 +184,10 @@
             ]
         },
         {
+            "row_num": 3,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -184,6 +201,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -197,6 +215,7 @@
                     ]
                 },
                 {
+                    "col_num": 2,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -210,6 +229,7 @@
                     ]
                 },
                 {
+                    "col_num": 3,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -225,8 +245,10 @@
             ]
         },
         {
+            "row_num": 4,
             "col_info": [
                 {
+                    "col_num": 0,
                     "slot_info": [
                         {
                             "slot_type": "CDS",
@@ -240,6 +262,7 @@
                     ]
                 },
                 {
+                    "col_num": 1,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -253,6 +276,7 @@
                     ]
                 },
                 {
+                    "col_num": 2,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
@@ -266,6 +290,7 @@
                     ]
                 },
                 {
+                    "col_num": 3,
                     "slot_info": [
                         {
                             "slot_type": "NORMAL",
