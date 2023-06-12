@@ -27,7 +27,8 @@ class CompareFramesTest(unittest.TestCase):
     def setUpClass(cls):
         # Set paths for configurations, test outputs and
         # reference (i.e. golden) outputs
-        cur_dir = os.path.dirname(__file__)
+        cur_dir = os.path.abspath(os.path.dirname(__file__))
+        print(f'############## {cur_dir}')
         cls.cfg_dir = os.path.join(cur_dir, "test_cfgs")
         # TODO: the reference directory is temporarily called
         # tmp_refs/ to stress that the files there cannot be
@@ -35,6 +36,7 @@ class CompareFramesTest(unittest.TestCase):
         # by someone
         cls.ref_dir = os.path.join(cur_dir, "tmp_refs")
         cls.out_dir = os.path.join(cur_dir, "test_outs")
+        cls.script = os.path.normpath(os.path.join(cur_dir, '../swi3s_visualizer.py'))
         # Create the test output directory, stopping if it
         # already exists (alternatively we can remove it,
         # but I prefer to be on the safe side)
@@ -59,7 +61,7 @@ class CompareFramesTest(unittest.TestCase):
         ref_path = os.path.join(self.ref_dir, json_relpath)
 
         # Call visualizer
-        cmd = f"python3 ../swi3s_visualizer.py -c {cfg} -o {out_path} -b"
+        cmd = f"python3 {self.script} -c {cfg} -o {out_path} -b"
         print (f'cmd = {cmd}')
         result = subprocess.run([cmd], shell=True, check=True)
         self.assertTrue(result.returncode == 0, f"swi3s_visualizer exited with code {result.returncode}")    
