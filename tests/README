@@ -11,7 +11,6 @@ the regression this way:
 
 TODO: 
  - better path handling (does not work if the structure under test_cfgs is not flat)
- - comparison between test output and reference is not implemented
  - it would be useful to be able to run the test for only a selected number of configurations
 
 
