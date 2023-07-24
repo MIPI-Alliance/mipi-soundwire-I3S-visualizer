@@ -1,6 +1,6 @@
 
 """
-Copyright (c) 2020-2023 MIPI Alliance and other contributors. All Rights Reserved.
+Copyright (c) 2020-2022 MIPI Alliance and other contributors. All Rights Reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
@@ -16,11 +16,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Break lines
 
 # To Do
-# Fix first row so that complementary sample rate can share an interval (e.g. 23 and 25 kHz can exist in the same 48 kHz interval).
 # Channel group spacing breaks guards an tails even with channel grouping = 0
 # Error when h_count is too small? Hard to tell.
-# Handovers not showing clashes with guard & tail
 # Handle the specific detail of manager as data source near the end of a row (just before S0).
+# Add a field to control CDS_Width.
 # Allow the control column to be anywhere (including just before S0).
 # break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
 
@@ -41,6 +40,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Issue with wide bits missing guards and tails missing on some rows fixed
 # Added error checking for h_width + 1 mod bit_width + 1 = 0
 # Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
+
+# Not TODO (mostly because it does not make sense):
+# Fix first row so that complementary sample rate can share an interval (e.g. 23 and 25 kHz can exist in the same 48 kHz interval).
+
 from __future__ import division  # Fixes a Python 2 issue with integer division
 
 import sys
@@ -55,6 +58,8 @@ import argparse
 import re
 from enum import Enum
 import json
+
+sys.path.insert( 0, "/Library/Frameworks/Python.framework/Versions/3.9/lib" )
 
 #Strings that are use in file loading and storing
 
@@ -88,6 +93,8 @@ NOT_OWNED = 'not owned'
 SRI_USES_CHANNEL_GROUPING_ONLY = False
 SRI_USES_SAMPLE_COUNT = True
 FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
+EXCESS_ONE_IS_DEFAULT = True # False # True
+EXCESS_ONE_IS_IN_FILES = False
 Debug_Drawing = False
 
 try:
@@ -101,6 +108,7 @@ if sys.version_info[0] == 3:
     print('Python 3.x')
     import tkinter as tk
     from tkinter import messagebox
+    print( messagebox )
     import tkinter.filedialog as filedialog
 
     to_unicode = str
@@ -198,7 +206,9 @@ class App(tk.Frame):
         tk.Frame.__init__(self, master)
         # root is window
 
-        self.VERSION = '1.42'
+### Cut from here for Eddie
+        self.VERSION = '1.46'
+### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
 
@@ -707,6 +717,7 @@ class App(tk.Frame):
 
         # Update data port names
         for count, x in enumerate(self.dp_name_entry_boxes):
+            print( x )
             x.delete(0, tk.END)
             x.insert(0, self.interface.data_ports[count].name)
 
@@ -1151,7 +1162,10 @@ class App(tk.Frame):
                             data_port.device_number = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_CHANNELS == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.channels_REG = self.st_int(row[obj_count + 1])
+                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                                data_port.channels_REG = self.st_int(row[obj_count + 1]) - 1
+                            else :
+                                data_port.channels_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_CHANNEL_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.channel_grouping_REG = self.st_int(row[obj_count + 1])
@@ -1160,13 +1174,22 @@ class App(tk.Frame):
                             data_port.channel_group_spacing_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SAMPLE_WIDTH == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.sample_width_REG = self.st_int(row[obj_count + 1])
+                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                                data_port.sample_width_REG = self.st_int(row[obj_count + 1]) - 1
+                            else :
+                                data_port.sample_width_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SAMPLE_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.sample_grouping_REG = self.st_int(row[obj_count + 1])
+                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                                data_port.sample_grouping_REG = self.st_int(row[obj_count + 1]) - 1
+                            else :
+                                data_port.sample_grouping_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_INTERVAL == row[ 0 ]:
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.interval_REG = self.st_int(row[obj_count + 1])
+                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                                data_port.interval_REG = self.st_int(row[obj_count + 1]) - 1
+                            else :
+                                data_port.interval_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SKIPPING_NUMERATOR == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.skipping_numerator_REG = self.st_int(row[obj_count + 1])
@@ -1627,6 +1650,8 @@ class App(tk.Frame):
             error_text += 'Horizontal Start out of range\n'
         if data_port.h_count_REG < 0 or data_port.h_count_REG >= self.interface.MAX_COLUMNS:
             error_text += 'Horizontal Count out of range\n'
+        if ( ( data_port.sample_width_REG + 1 ) * ( data_port.channels_REG + 1 ) * ( data_port.sample_grouping_REG  + 1) ) >  ( (data_port.h_count_REG + 1 ) * ( data_port.interval_REG + 1 ) ) :
+            error_text += 'A single sample frame does not fit in an interval"s worth of bit as width = ' + str( data_port.sample_width_REG ) + ', channels = ' + str( data_port.channels_REG ) + ' grouping = ' + str( data_port.sample_grouping_REG ) + ', count = ' + str( data_port.channels_REG ) + ', interval = ' + str( data_port.interval_REG )
 
         # Check some relationships
         if data_port.h_start_REG + data_port.h_count_REG >= self.interface.columns_per_row :
@@ -1928,24 +1953,35 @@ class DataPort:
     # Data port ranges
     MIN_DEVICE_NUMBER = 0
     MAX_DEVICE_NUMBER = 8
-    MIN_CHANNELS = 1
-    MAX_CHANNELS = 16
+    MIN_OFFSET = 0
+    if EXCESS_ONE_IS_DEFAULT :
+        MIN_INTERVAL = 0
+        MAX_INTERVAL = 1023
+        MAX_OFFSET = MAX_INTERVAL
+        MIN_CHANNELS = 0
+        MAX_CHANNELS = 15
+        MIN_SAMPLE_WIDTH = 0
+        MAX_SAMPLE_WIDTH = 63
+        MIN_SAMPLE_GROUPING = 0
+        MAX_SAMPLE_GROUPING = 15
+    else :
+        MIN_INTERVAL = 1
+        MAX_INTERVAL = 1024
+        MAX_OFFSET = MAX_INTERVAL - 1
+        MIN_CHANNELS = 1
+        MAX_CHANNELS = 16
+        MIN_SAMPLE_WIDTH = 1
+        MAX_SAMPLE_WIDTH = 64
+        MIN_SAMPLE_GROUPING = 1
+        MAX_SAMPLE_GROUPING = 16
     MIN_CHANNEL_GROUPING = 0
     MAX_CHANNEL_GROUPING = MAX_CHANNELS - 1
     MIN_CHANNEL_GROUP_SPACING = 0
     MAX_CHANNEL_GROUP_SPACING = MAX_CHANNELS - 1
-    MIN_SAMPLE_WIDTH = 1
-    MAX_SAMPLE_WIDTH = 64
-    MIN_SAMPLE_GROUPING = 1
-    MAX_SAMPLE_GROUPING = 16
-    MIN_INTERVAL = 1
-    MAX_INTERVAL = 1024
     MIN_SKIPPING_NUMERATOR = 0
     MAX_SKIPPING_NUMERATOR = Interface.MAX_SKIPPING_DENOMINATOR - 1
     MIN_SKIPPING_DENOMINATOR = 0
     MAX_SKIPPING_DENOMINATOR = Interface.MAX_SKIPPING_DENOMINATOR - 1
-    MIN_OFFSET = 0
-    MAX_OFFSET = MAX_INTERVAL - 1
     MIN_H_START = 0
     MAX_H_START = Interface.MAX_COLUMNS - 1
     MIN_H_COUNT = 0
@@ -1989,7 +2025,7 @@ class DataPort:
         self.sample_rate = 0
         
         # The following variables might correpond closely to a real implementation
-        self.offset_in_interval = -1
+        self.current_offset_in_interval = -1
         self.current_channel = 0
         self.current_sample_index = 0
         self.samples_remaining_in_sample_group = 0
@@ -2044,7 +2080,10 @@ class DataPort:
 
     @property
     def channels_REG_X1(self):
-        return self._channels_REG - 1
+        if EXCESS_ONE_IS_DEFAULT :
+            return self._channels_REG
+        else :
+            return self._channels_REG - 1
 
     @channels_REG.setter
     def channels_REG(self, v):
@@ -2090,7 +2129,10 @@ class DataPort:
 
     @property
     def sample_width_REG_X1(self):
-        return self._sample_width_REG - 1
+        if EXCESS_ONE_IS_DEFAULT :
+            return self._sample_width_REG
+        else :
+            return self._sample_width_REG - 1
 
     @sample_width_REG.setter
     def sample_width_REG(self, v):
@@ -2108,7 +2150,10 @@ class DataPort:
 
     @property
     def sample_grouping_REG_X1(self):
-        return self._sample_grouping_REG - 1
+        if EXCESS_ONE_IS_DEFAULT :
+            return self._sample_grouping_REG
+        else :
+            return self._sample_grouping_REG - 1    
 
     @sample_grouping_REG.setter
     def sample_grouping_REG(self, v):
@@ -2126,16 +2171,19 @@ class DataPort:
 
     @property
     def interval_REG_X1(self):
-        return self._interval_REG - 1
+        if EXCESS_ONE_IS_DEFAULT :
+            return self._interval_REG
+        else :
+            return self._interval_REG - 1
 
     @interval_REG.setter
     def interval_REG(self, v):
         if type(v) != int:
             raise TypeError('Interval must be int, got ' + str(type(v)))
         if v > DataPort.MAX_INTERVAL:
-            raise ValueError('Interval must be <= ' + str(DataPort.MAX_INTERVAL_INTEGER))
+            raise ValueError('Interval must be <= ' + str(DataPort.MAX_INTERVAL))
         if v < DataPort.MIN_INTERVAL:
-            raise ValueError('Interval must be >= ' + str(DataPort.MIN_INTERVAL_INTEGER))
+            raise ValueError('Interval must be >= ' + str(DataPort.MIN_INTERVAL))
         self._interval_REG = v
 
     @property
@@ -2368,7 +2416,7 @@ class DataPort:
             self.current_offset_in_interval += 1 # update the interval counter
             
             # Greater than should never occur in real systems
-            if self.current_offset_in_interval >= self.interval_REG_X1 + 1 :
+            if self.current_offset_in_interval >= ( ( self.interval_REG + 1 ) if EXCESS_ONE_IS_DEFAULT else self.interval_REG ) :
                 self.current_offset_in_interval = 0
                 self.done_with_interval = False # This is a new interval.
 
@@ -2432,9 +2480,9 @@ class DataPort:
                     if Debug_Drawing : print( '    Done with wide bit, going on to next bit (if it exists)' )
                     if ( self.current_bit_in_sample >= 0 ) :
                         if Debug_Drawing : print( '    There is at least one bit left in the current sample' )
-                        self.current_bit_in_sample -= 1
                         ret_value = 'c' + str( self.current_channel ) + 'b' + str( self.current_bit_in_sample )
-                        # last_value_sent would be this value of this return
+                        self.current_bit_in_sample -= 1
+                    # ??? last_value_sent would be this value of this return
                     if self.current_bit_in_sample < 0 :
                         # Done will all bits in the current sample.  Go to the next channel or frame
                         if Debug_Drawing : print( '    going on to next channel (if it exists)' )
@@ -2459,7 +2507,7 @@ class DataPort:
                                     self.channel_group_base += self.effective_channel_grouping
                                     self.channel_group_end += self.effective_channel_grouping
                                     # clip when last group of channels is smaller
-                                    if self.channel_group_end >= self.channels_REG_X1 :
+                                    if self.channel_group_end > self.channels_REG_X1 :
                                         self.channel_group_end = self.channels_REG_X1 + 1
                                     # reset sample group counter
                                     self.samples_remaining_in_sample_group = self.sample_grouping_REG_X1
