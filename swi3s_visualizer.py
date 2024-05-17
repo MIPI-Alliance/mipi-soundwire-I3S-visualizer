@@ -16,27 +16,31 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Break lines
 
 # To Do
+# Support odd columne counts.
+# Add a calculator of the Visualizer that shows the value that would be written the bit clock to sample clock register
 # Channel group spacing breaks guards an tails even with channel grouping = 0
-# Error when h_count is too small? Hard to tell.
+# Error when horizontal_count is too small? Hard to tell.
 # Handle the specific detail of manager as data source near the end of a row (just before S0).
 # Add a field to control CDS_Width.
+# Tidy up (maybe) the spacing of the check boxes.
 # Allow the control column to be anywhere (including just before S0).
-# break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
 
-# Reconcile Device Numbers and is Manager attributes.
+# Reconcile Device Numbers and 'is Manager' attributes.
 # make guard and tail rules contemplate Device number and not just data ports.
-# Fix S0 handover (preceding bit)
 
-# To Dos that might want to start with a re-write:
+# ToDos that might want to start with a re-write:
+# Investigate and remote "Draw S0 Handover".Fix S0 handover (preceding bit)
+# Have the denominator also change witth the UI view flag.
+# Widen the range for S0.
+# Change the name of "Interval Denominator" to skipping.
+# Fix the offset betwen the label for sample rate and the values.
+# break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
 # Have a way to indicate that two dataports are in the same device (and thus the guards and tails are impacted).
-# Change the SampleGroup to support up to 16 (and use for SRI)
+# Fold up the check boxes
+# Change the symbol between S1 and Control to show the funny Manager handover
+# Read in wav files per data port and place in output
 # Add Flow-control bits (including the runt port).
-# Fold up the check boxex
-# Put all of the drawn data into an array (rows by columns):
-#    Output a CSV of what is drawn on the screen
-#    Read in wav files per data port and place in output 
 
-# Done
 # Issue with wide bits missing guards and tails missing on some rows fixed
 # Added error checking for h_width + 1 mod bit_width + 1 = 0
 # Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
@@ -62,7 +66,7 @@ import json
 sys.path.insert( 0, "/Library/Frameworks/Python.framework/Versions/3.9/lib" )
 
 #Strings that are use in file loading and storing
-
+SAVE_CODING_STRING = 'Save file using excess one'
 DATA_PORT_NAME = 'Data Port Name'
 DATA_PORT_DEVICE_NUMBER = 'Data Port Device Number'
 DATA_PORT_CHANNELS = 'Data Port Channels'
@@ -88,14 +92,17 @@ DATA_PORT_SRI =  'Data Port DRI'
 
 NOT_OWNED = 'not owned'
 
+finished_drawing = False
 
 # in C these would be compilation switches.  Here they are controlling blocks of code.
 SRI_USES_CHANNEL_GROUPING_ONLY = False
 SRI_USES_SAMPLE_COUNT = True
 FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
-EXCESS_ONE_IS_DEFAULT = True # False # True
-EXCESS_ONE_IS_IN_FILES = False
+SAVE_FILE_USING_EXCESS_ONE = True
 Debug_Drawing = False
+
+# While currently used as a switch, these varibles might by controlled by the UI should someone add a widget to do so:
+UI_IS_EXCESS_1 = True
 
 try:
     import canvasvg
@@ -207,7 +214,7 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.46'
+        self.VERSION = '1.57'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -245,7 +252,7 @@ class App(tk.Frame):
                                            # 'S1 Tails',
                                            'CDS Guard Enabled',
                                            'CDS Tail Width (' + str(Interface.MIN_TAIL_WIDTH) + '-' + str(Interface.MAX_TAIL_WIDTH) + ')',
-                                           'Skipping Denominator (' + str(Interface.MIN_SKIPPING_DENOMINATOR) + '-' + str(
+                                           'Interval Denominator (' + str(Interface.MIN_SKIPPING_DENOMINATOR) + '-' + str(
                                                Interface.MAX_SKIPPING_DENOMINATOR) + ')',
                                            'CDS/S0 Handover Width (' + str(Interface.MIN_CDS_S0_HANDOVER_WIDTH) + '-' + str(
                                                Interface.MAX_CDS_S0_HANDOVER_WIDTH) + ')',
@@ -254,17 +261,17 @@ class App(tk.Frame):
                                            'Rows to Draw (' + str(self.MIN_ROWS_IN_FRAME) + '-' + str(self.MAX_ROWS_IN_FRAME) + ')']
 
         self.DP_PARAMETER_DESCRIPTIONS = ['Device Number (' + str(DataPort.MIN_DEVICE_NUMBER) + '-' + str(DataPort.MAX_DEVICE_NUMBER) + ')',
-                                          'Channels (' + str(DataPort.MIN_CHANNELS) + '-' + str(DataPort.MAX_CHANNELS) + ')',
+                                          'Channels (' + str(DataPort.MIN_CHANNELS + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(DataPort.MAX_CHANNELS + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
                                           'Channel Grouping (' + str(DataPort.MIN_CHANNEL_GROUPING) + '-' + str(
                                               DataPort.MAX_CHANNEL_GROUPING) + ')',
-                                          'Channel Group Spacing (' + str(DataPort.MIN_CHANNEL_GROUP_SPACING) + '-' + str(
+                                          'Spacing (' + str(DataPort.MIN_CHANNEL_GROUP_SPACING) + '-' + str(
                                               DataPort.MAX_CHANNEL_GROUP_SPACING) + ')',
-                                          'Sample Width (' + str(DataPort.MIN_SAMPLE_WIDTH) + '-' + str(DataPort.MAX_SAMPLE_WIDTH) + ')',
-                                          'Sample Grouping (' + str(DataPort.MIN_SAMPLE_GROUPING) + '-' + str(
-                                              DataPort.MAX_SAMPLE_GROUPING) + ')',
-                                          'Interval (' + str(DataPort.MIN_INTERVAL) + '-' + str(
-                                              DataPort.MAX_INTERVAL) + ')',
-                                          'Numerator (' + str(DataPort.MIN_SKIPPING_NUMERATOR) + '-' + str(
+                                          'Sample Size (' + str(DataPort.MIN_SAMPLE_WIDTH + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(DataPort.MAX_SAMPLE_WIDTH + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
+                                          'Sample Grouping (' + str(DataPort.MIN_SAMPLE_GROUPING + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(
+                                              DataPort.MAX_SAMPLE_GROUPING + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
+                                          'Interval (' + str(DataPort.MIN_INTERVAL + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(
+                                              DataPort.MAX_INTERVAL + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
+                                          'Skipping Numerator (' + str(DataPort.MIN_SKIPPING_NUMERATOR) + '-' + str(
                                               DataPort.MAX_SKIPPING_NUMERATOR) + ')',
                                           'Offset (' + str(DataPort.MIN_OFFSET) + '-' + str(DataPort.MAX_OFFSET) + ')',
                                           'Horizontal Start (0-' + str(Interface.MAX_COLUMNS - 1) + ')',
@@ -277,7 +284,7 @@ class App(tk.Frame):
                                           'SRI',
                                           'Data Port Enabled',
                                           'Manager DataPort',
-                                          'Calculated Sample Rate [kHz]']
+                                          'Calculated SR [kHz]']
 
         window_width = int(35.5 * self.COLUMN_SIZE)
         window_height = 800
@@ -393,7 +400,7 @@ class App(tk.Frame):
             self.dp_parameter_labels.append(tk.Label(self.config_frame, text=title, anchor=tk.E, font=(self.APP_FONT, self.TEXT_SIZE)))
             self.dp_parameter_labels[count].grid(row=count+1, column=0)
         # Shift down sample rate label
-        self.dp_parameter_labels[-1].grid(row=count+2, column=0)
+       # self.dp_parameter_labels[-1].grid(row=count+2, column=0)
 
         # Data port entry widgets
         for entry_row in range(0, DataPort.NUM_DP_PARAMETERS):  # Columns
@@ -544,14 +551,14 @@ class App(tk.Frame):
         cmd2 = self.load_csv_file
         btn2 = tk.Button(self.config_frame, text='Load Configuration', default='active', command=cmd2,
                          font=(self.APP_FONT, self.TEXT_SIZE + 3), relief=tk.FLAT)
-        btn2.grid(column=Interface.NUM_DATA_PORTS + 2, columnspan=2, row=DataPort.NUM_DP_PARAMETERS + 4,
+        btn2.grid(column=Interface.NUM_DATA_PORTS + 2, columnspan=2, row=DataPort.NUM_DP_PARAMETERS + 2,
                   sticky=tk.N + tk.S + tk.E + tk.W, padx=10, pady=3)
 
         # Write configuration file button
         cmd3 = self.save_csv_file
         btn3 = tk.Button(self.config_frame, text='Save Configuration', default='active', command=cmd3,
                          font=(self.APP_FONT, self.TEXT_SIZE + 3), relief=tk.FLAT)
-        btn3.grid(column=Interface.NUM_DATA_PORTS + 2, columnspan=2, row=DataPort.NUM_DP_PARAMETERS + 5,
+        btn3.grid(column=Interface.NUM_DATA_PORTS + 2, columnspan=2, row=DataPort.NUM_DP_PARAMETERS + 4,
                   sticky=tk.N + tk.S + tk.E + tk.W, padx=10, pady=3)
 
         # Redraw data ports button
@@ -568,7 +575,7 @@ class App(tk.Frame):
         self.refresh_data_ports()
 
         # if in batch mode exit here
-        if (self.args.batch_mode):
+        if (self.args.batch_mode or ( self.args.simple_mode and finished_drawing ) ):
             exit(0)
 
 
@@ -656,34 +663,47 @@ class App(tk.Frame):
                                 self.interface.s0_handover_enabled,
                                 self.interface.row_rate,
                                 self.rows_in_frame]
+                row = [ SAVE_CODING_STRING ] + [ str( SAVE_FILE_USING_EXCESS_ONE ) ]
+                writer.writerow(row)                
                 for count, value in enumerate(frame_values):
                     row = [self.INTERFACE_PARAMETER_TITLES[count]] + [str(value)]
                     writer.writerow(row)
-                # TODO: Techincal debt:  Re-write the following to use a string constants and use the same constant for both read and write.
                 row = [ DATA_PORT_NAME ] + [data_port.name for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_DEVICE_NUMBER ] + [str(data_port.device_number) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = [ DATA_PORT_CHANNELS ] + [str(data_port.channels_REG) for data_port in self.interface.data_ports]
+                if ( SAVE_FILE_USING_EXCESS_ONE ) :
+                    row = [ DATA_PORT_CHANNELS ] + [str(data_port.channels_REG) for data_port in self.interface.data_ports]
+                else :
+                    row = [ DATA_PORT_CHANNELS ] + [str(data_port.channels_REG + 1) for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_CHANNEL_GROUPING ] + [str(data_port.channel_grouping_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_CHANNEL_GROUP_SPACING ] + [str(data_port.channel_group_spacing_REG) for data_port in
                                                              self.interface.data_ports]
                 writer.writerow(row)
-                row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG) for data_port in self.interface.data_ports]
+                if ( SAVE_FILE_USING_EXCESS_ONE ) :
+                    row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG) for data_port in self.interface.data_ports]
+                else :
+                    row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG + 1) for data_port in self.interface.data_ports]                    
                 writer.writerow(row)
-                row = [ DATA_PORT_SAMPLE_GROUPING ] + [str(data_port.sample_grouping_REG) for data_port in self.interface.data_ports]
+                if ( SAVE_FILE_USING_EXCESS_ONE ) :
+                    row = [ DATA_PORT_SAMPLE_GROUPING ] + [str(data_port.sample_grouping_REG) for data_port in self.interface.data_ports]
+                else :
+                    row = [ DATA_PORT_SAMPLE_GROUPING ] + [str(data_port.sample_grouping_REG + 1) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = [ DATA_PORT_INTERVAL ] + [str(data_port.interval_REG) for data_port in self.interface.data_ports]
+                if ( SAVE_FILE_USING_EXCESS_ONE ) :
+                    row = [ DATA_PORT_INTERVAL ] + [str(data_port.interval_REG) for data_port in self.interface.data_ports]
+                else :
+                    row = [ DATA_PORT_INTERVAL ] + [str(data_port.interval_REG + 1) for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_SKIPPING_NUMERATOR ] + [str(data_port.skipping_numerator_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_OFFSET ] + [str(data_port.offset_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = [ DATA_PORT_HORIZONTAL_START ] + [str(data_port.h_start_REG) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_HORIZONTAL_START ] + [str(data_port.horizontal_start_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
-                row = [ DATA_PORT_HORIZONTAL_COUNT ] + [str(data_port.h_count_REG) for data_port in self.interface.data_ports]
+                row = [ DATA_PORT_HORIZONTAL_COUNT ] + [str(data_port.horizontal_count_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
                 row = [ DATA_PORT_TAIL_WIDTH ] + [str(data_port.tail_width_REG) for data_port in self.interface.data_ports]
                 writer.writerow(row)
@@ -729,7 +749,7 @@ class App(tk.Frame):
                                                                                              entry_column].device_number)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].channels_REG)
+                                                                                         self.interface.data_ports[entry_column].channels_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].insert(0, self.interface.data_ports[
                 entry_column].channel_grouping_REG)
@@ -740,15 +760,15 @@ class App(tk.Frame):
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].sample_width_REG)
+                                                                                             entry_column].sample_width_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].sample_grouping_REG)
+                                                                                             entry_column].sample_grouping_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].interval_REG)
+                                                                                             entry_column].interval_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
@@ -758,10 +778,10 @@ class App(tk.Frame):
                                                                                          self.interface.data_ports[entry_column].offset_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].h_start_REG)
+                                                                                         self.interface.data_ports[entry_column].horizontal_start_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].insert(0,
-                                                                                         self.interface.data_ports[entry_column].h_count_REG)
+                                                                                         self.interface.data_ports[entry_column].horizontal_count_REG)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 11 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 11 + entry_column].insert(0,
                                                                                          self.interface.data_ports[entry_column].tail_width_REG)
@@ -827,19 +847,19 @@ class App(tk.Frame):
 
         # Update sample rate labels
         for count, x in enumerate(self.dp_sample_rate_labels):
-            if self.interface.data_ports[count].interval_REG != 0:
+#            if self.interface.data_ports[count].interval_REG != 0:
                 if not self.interface.data_ports[count].sri_REG and ( 0 == self.interface.data_ports[count].skipping_numerator_REG ) :
-                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG ) )
+                    sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /(  self.interface.data_ports[ count ].interval_REG + 1 ) ) )
                 elif not self.interface.data_ports[count].sri_REG :                           
-                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG ) *
+                    sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) *
                                                    ( (self.interface.skipping_denominator_REG - self.interface.data_ports[count].skipping_numerator_REG ) /
                                                      ( self.interface.skipping_denominator_REG ) ) )
                 else : # it is SRI
-                    sample_rate = "{:.2f}".format( ( self.interface.data_ports[ count ].sample_grouping_REG * self.interface.row_rate / self.interface.data_ports[ count ].interval_REG *
-                                                     math.ceil( ( self.interface.data_ports[count].h_count_REG + 1 ) / ( self.interface.data_ports[count].channels_REG * self.interface.data_ports[count].sample_grouping_REG * self.interface.data_ports[count].sample_width_REG + ( self.interface.data_ports[count].channel_group_spacing_REG - 1 ) ) ) ) )
+                    sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate *
+                                                     math.ceil( ( self.interface.data_ports[count].horizontal_count_REG + 1 ) / ( ( self.interface.data_ports[count].channels_REG + 1 ) * ( self.interface.data_ports[count].sample_grouping_REG + 1 )* ( self.interface.data_ports[count].sample_width_REG + 1 ) + ( self.interface.data_ports[count].channel_group_spacing_REG - 1 ) ) ) ) )
                 x.config( text = sample_rate )
-            else:
-                x.config( text = 'Error' )
+#            else:
+#                x.config( text = 'Error' )
 
         # Update Interval LCM
         self.frame_labels[-1].config(text=self.interface.interval_lcm)
@@ -857,8 +877,7 @@ class App(tk.Frame):
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 0 + entry_column].get())
 
             self.interface.data_ports[entry_column].channels_REG = \
-                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].get())
-
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 1 + entry_column].get()) - ( 0 if UI_IS_EXCESS_1 else 1 )
             self.interface.data_ports[entry_column].channel_grouping_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 2 + entry_column].get())
 
@@ -866,13 +885,13 @@ class App(tk.Frame):
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 3 + entry_column].get())
 
             self.interface.data_ports[entry_column].sample_width_REG = \
-                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].get())
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].get()) - ( 0 if UI_IS_EXCESS_1 else 1 )
 
             self.interface.data_ports[entry_column].sample_grouping_REG = \
-                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].get())
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].get()) - ( 0 if UI_IS_EXCESS_1 else 1 )
 
             self.interface.data_ports[entry_column].interval_REG = \
-                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].get())
+                self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 6 + entry_column].get()) - ( 0 if UI_IS_EXCESS_1 else 1 )
 
             self.interface.data_ports[entry_column].skipping_numerator_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 7 + entry_column].get())
@@ -880,10 +899,10 @@ class App(tk.Frame):
             self.interface.data_ports[entry_column].offset_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 8 + entry_column].get())
 
-            self.interface.data_ports[entry_column].h_start_REG = \
+            self.interface.data_ports[entry_column].horizontal_start_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 9 + entry_column].get())
 
-            self.interface.data_ports[entry_column].h_count_REG = \
+            self.interface.data_ports[entry_column].horizontal_count_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 10 + entry_column].get())
 
             self.interface.data_ports[entry_column].tail_width_REG = \
@@ -1131,29 +1150,32 @@ class App(tk.Frame):
         if filename:
             with open(filename) as data_file:
                 csv_data = csv.reader(data_file)
+                file_is_excess_one = False
                 for count, row in enumerate(csv_data):
                     print( "when reading number", count, "we see '", row[0], " and ", row[1] )
-                    # TODO: Technical debt:  Rewrite the following to not use count but instead use the string at the begnning of each line.
-                    if count == 0:
-                        self.interface.columns_per_row = self.st_int(row[1])
-                    elif count == 1:
-                        self.interface.s0s1_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 2:
-                        self.interface.s0_width = self.st_int(row[1])
-                    elif count == 3:
-                        self.interface.cds_guard_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 4:
-                        self.interface.tail_width = self.st_int(row[1])
-                    elif count == 5:
-                        self.interface.skipping_denominator_REG = self.st_int(row[1])
-                    elif count == 6:
-                        self.interface.cds_s0_handover_width = self.st_int(row[1])
-                    elif count == 7:
-                        self.interface.s0_handover_enabled = bool(distutils.util.strtobool(row[1]))
-                    elif count == 8:
-                        self.interface.row_rate = self.st_int(row[1])
-                    elif count == 9:
-                        self.rows_in_frame = self.st_int(row[1])
+                    # TODO: Technical debt:  Rewrite the following to not use strings that are in the xxx struct 
+                    if 0 == row[0].find( "Columns per Row", 0 ) :
+                        self.interface.columns_per_row = self.st_int(row[ 1 ] )
+                    elif 0 == row[0].find( "S0 S1 Enabled", 0 ) :
+                        self.interface.s0s1_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                    elif 0 == row[0].find( "S0 Width", 0 ) :
+                        self.interface.s0_width = self.st_int( row[ 1 ] )
+                    elif 0 == row[0].find( "CDS Guard Enabled", 0 ) :
+                        self.interface.cds_guard_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                    elif 0 == row[0].find( "CDS Tail Width", 0 ) :
+                        self.interface.tail_width = self.st_int( row[ 1 ] )
+                    elif 0 == row[0].find( "Interval Denominator", 0 ) :
+                        self.interface.skipping_denominator_REG = self.st_int( row[ 1 ] )
+                    elif 0 == row[0].find( "CDS/S0 Handover Width", 0 ) :
+                        self.interface.cds_s0_handover_width = self.st_int( row[1])
+                    elif 0 == row[0].find( "Draw S0 Hanbdover", 0 ):
+                        self.interface.s0_handover_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                    elif 0 == row[0].find( "Row Rate", 0 ):
+                        self.interface.row_rate = self.st_int( row[ 1 ] )
+                    elif 0 == row[0].find( "Rows to Draw", 0 ):
+                        self.rows_in_frame = self.st_int( row[ 1 ] )
+                    elif SAVE_CODING_STRING == row[ 0 ]:
+                        file_is_excess_one = bool( distutils.util.strtobool( row[ 1 ] ) )
                     elif DATA_PORT_NAME == row[ 0 ] :                    
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.name = row[obj_count + 1]
@@ -1162,7 +1184,7 @@ class App(tk.Frame):
                             data_port.device_number = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_CHANNELS == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                            if not file_is_excess_one :
                                 data_port.channels_REG = self.st_int(row[obj_count + 1]) - 1
                             else :
                                 data_port.channels_REG = self.st_int(row[obj_count + 1])
@@ -1174,19 +1196,19 @@ class App(tk.Frame):
                             data_port.channel_group_spacing_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SAMPLE_WIDTH == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                            if not file_is_excess_one :
                                 data_port.sample_width_REG = self.st_int(row[obj_count + 1]) - 1
                             else :
                                 data_port.sample_width_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SAMPLE_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                            if not file_is_excess_one :
                                 data_port.sample_grouping_REG = self.st_int(row[obj_count + 1]) - 1
                             else :
                                 data_port.sample_grouping_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_INTERVAL == row[ 0 ]:
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            if EXCESS_ONE_IS_DEFAULT and not EXCESS_ONE_IS_IN_FILES :
+                            if not file_is_excess_one :
                                 data_port.interval_REG = self.st_int(row[obj_count + 1]) - 1
                             else :
                                 data_port.interval_REG = self.st_int(row[obj_count + 1])
@@ -1198,10 +1220,10 @@ class App(tk.Frame):
                             data_port.offset_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_HORIZONTAL_START == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.h_start_REG = self.st_int(row[obj_count + 1])
+                            data_port.horizontal_start_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_HORIZONTAL_COUNT == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
-                            data_port.h_count_REG = self.st_int(row[obj_count + 1])
+                            data_port.horizontal_count_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_TAIL_WIDTH == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.tail_width_REG = self.st_int(row[obj_count + 1])
@@ -1268,6 +1290,7 @@ class App(tk.Frame):
             self.master.update()
             self.update_ui()
             self.refresh_data_ports()
+            finished_drawing = True
 
     # Draws a single repeating column in a frame
     def draw_column(self, column, device, text):
@@ -1586,8 +1609,13 @@ class App(tk.Frame):
     
 
     
-    def write_bit_slot(self, row, column, width, source, text, color):
+    def write_bit_slot(self, row, column, width, source, text, color, data_port_number ):
 #        print( 'write_bit_slot called for row={:d}, column={:d}, width={:d}'.format( row, column, width) )
+        if (self.args.simple_mode):
+            print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, D="{:s}"'.format( row, column, data_port_number, text ) )
+            for ii in range( 1, width ) :
+                print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, WWW'.format (row, column + 1, data_port_number, text ) )
+
         if not isinstance(source, bool):
             raise TypeError('Expected bool for source')
         if not isinstance(row, int):
@@ -1646,40 +1674,40 @@ class App(tk.Frame):
             error_text += 'Fractional Skipping out of range\n'
         if data_port.offset_REG < DataPort.MIN_OFFSET or data_port.offset_REG > DataPort.MAX_OFFSET:
             error_text += 'Offset out of range\n'
-        if data_port.h_start_REG < 0 or data_port.h_start_REG >= self.interface.MAX_COLUMNS:
+        if data_port.horizontal_start_REG < 0 or data_port.horizontal_start_REG >= self.interface.MAX_COLUMNS:
             error_text += 'Horizontal Start out of range\n'
-        if data_port.h_count_REG < 0 or data_port.h_count_REG >= self.interface.MAX_COLUMNS:
+        if data_port.horizontal_count_REG < 0 or data_port.horizontal_count_REG >= self.interface.MAX_COLUMNS:
             error_text += 'Horizontal Count out of range\n'
-        if ( ( data_port.sample_width_REG + 1 ) * ( data_port.channels_REG + 1 ) * ( data_port.sample_grouping_REG  + 1) ) >  ( (data_port.h_count_REG + 1 ) * ( data_port.interval_REG + 1 ) ) :
+        if ( ( data_port.sample_width_REG + 1 ) * ( data_port.channels_REG + 1 ) * ( data_port.sample_grouping_REG  + 1) ) >  ( (data_port.horizontal_count_REG + 1 ) * ( data_port.interval_REG + 1 ) ) :
             error_text += 'A single sample frame does not fit in an interval"s worth of bit as width = ' + str( data_port.sample_width_REG ) + ', channels = ' + str( data_port.channels_REG ) + ' grouping = ' + str( data_port.sample_grouping_REG ) + ', count = ' + str( data_port.channels_REG ) + ', interval = ' + str( data_port.interval_REG )
 
         # Check some relationships
-        if data_port.h_start_REG + data_port.h_count_REG >= self.interface.columns_per_row :
-            error_text += 'h_start(' + str( data_port.h_start_REG ) + ') + h_count(' + str( data_port.h_count_REG ) + ') >= number of columns (exceeds last column)\n'
+        if data_port.horizontal_start_REG + data_port.horizontal_count_REG >= self.interface.columns_per_row :
+            error_text += 'horizontal_start(' + str( data_port.horizontal_start_REG ) + ') + horizontal_count(' + str( data_port.horizontal_count_REG ) + ') >= number of columns (exceeds last column)\n'
         if data_port.sri_REG :
             if data_port.channel_group_spacing_REG == 0 :
                 error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
-            drive_in_group = data_port.sample_width_REG * data_port.sample_grouping_REG * data_port.channel_grouping_REG * data_port.bit_width_REG # for DataPort programming validation.
+            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
             cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG # for DataPort programming validation.
-            if math.floor( ( data_port.h_count_REG - data_port.h_start_REG ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.h_count_REG + 1 ) :
+            if math.floor( ( data_port.horizontal_count_REG - data_port.horizontal_start_REG ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.horizontal_count_REG + 1 ) :
                 error_text += 'Group or Sample is incomplete when end of row encounters for data port\n'
         if data_port.offset_REG > data_port.interval_REG:
             error_text += 'Offset > Interval\n'
-        if data_port.h_start_REG >= self.interface.columns_per_row:
+        if data_port.horizontal_start_REG >= self.interface.columns_per_row:
             error_text += 'Horizontal Start > Columns per Row\n'
-        if data_port.h_count_REG >= self.interface.columns_per_row:
+        if data_port.horizontal_count_REG >= self.interface.columns_per_row:
             error_text += 'Horizontal Count > Columns per Row\n'
-        if self.interface.cds_s0_handover_width > data_port.h_start_REG and data_port.source_REG and data_port.handover:
+        if self.interface.cds_s0_handover_width > data_port.horizontal_start_REG and data_port.source_REG and data_port.handover:
             error_text += 'TA width > Horizontal Start\n'
-        if data_port.tail_width_REG > self.interface.columns_per_row - data_port.h_count_REG and data_port.source_REG:
+        if data_port.tail_width_REG > self.interface.columns_per_row - data_port.horizontal_count_REG and data_port.source_REG:
             error_text += 'Tail width would overflow row\n'
-        if data_port.bit_width_REG > self.interface.columns_per_row - data_port.h_count_REG and data_port.source_REG:
+        if data_port.bit_width_REG > self.interface.columns_per_row - data_port.horizontal_count_REG and data_port.source_REG:
             error_text += 'Bit width would overflow row\n'
-        if data_port.bit_width_REG > data_port.h_count_REG:
-            error_text += 'Bit width would overflow h_count\n'
-        if (data_port.h_count_REG + 1) % (data_port.bit_width_REG + 1) != 0:
-            error_text += 'h_count_REG + 1 should be a multiple of bit_width_REG + 1\n'
-        if data_port.h_count_REG >= self.interface.columns_per_row and data_port.source_REG and data_port.guard_REG:
+        if data_port.bit_width_REG > data_port.horizontal_count_REG:
+            error_text += 'Bit width would overflow horizontal_count\n'
+        if (data_port.horizontal_count_REG + 1) % (data_port.bit_width_REG + 1) != 0:
+            error_text += 'horizontal_count_REG + 1 should be a multiple of bit_width_REG + 1\n'
+        if data_port.horizontal_count_REG >= self.interface.columns_per_row and data_port.source_REG and data_port.guard_REG:
             error_text += 'Post zero would overflow row\n'
 
         if len(error_text) > 0:
@@ -1698,7 +1726,7 @@ class App(tk.Frame):
         interval_counter = 0
         end_of_interval = False
 
-        if data_port.channel_grouping_REG == 0 or data_port.channel_grouping_REG > ( data_port.channels_REG_X1 + 1 ) or data_port.sri_REG:
+        if data_port.channel_grouping_REG == 0 or data_port.channel_grouping_REG > ( data_port.channels_REG + 1 ):  # NDW check or data_port.sri_REG:
             effective_channel_group = data_port.channels_REG + 1
         else:
             effective_channel_group = data_port.channel_grouping_REG
@@ -1710,6 +1738,7 @@ class App(tk.Frame):
         for row_counter in range( 0, self.rows_in_frame, 1 ) : 
             print ( 'row_counter={},'.format( row_counter ) )
             Row += 1
+            data_port.new_row( row_counter, self.interface.skipping_denominator_REG )
 ### To here for Eddie
             if True : # insert old method stuff here from files names scr
 ### Cut from here for Eddie
@@ -1734,14 +1763,14 @@ class App(tk.Frame):
                             self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG, width, rrrr )
                             last_bit_was_driven = True
                         elif 'G' == rrrr :
-                            self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color)
+                            self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number ) #, data_port.sample_grouping_REG - data_port.samples_remaining_in_sample_group, data_port.current_channel, data_port.current_bit_in_sample )
                             self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
                                                            width, rrrr)
                             last_bit_was_driven = True
                         else :
                             error()
                     else :
-                        self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color)
+                        self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number)
                         self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
                                                        width, rrrr)
                         last_bit_was_driven = True
@@ -1784,9 +1813,9 @@ class Interface:
     MIN_CDS_S0_HANDOVER_WIDTH = 0
     MAX_CDS_S0_HANDOVER_WIDTH = 2
     MIN_TAIL_WIDTH = 0
-    MAX_TAIL_WIDTH = 3
+    MAX_TAIL_WIDTH = 2
     MIN_BIT_WIDTH = 0
-    MAX_BIT_WIDTH = 3
+    MAX_BIT_WIDTH = 2
 
     NUM_DATA_PORTS = 12
 
@@ -1952,32 +1981,21 @@ class DataPort:
 
     # Data port ranges
     MIN_DEVICE_NUMBER = 0
-    MAX_DEVICE_NUMBER = 8
+    MAX_DEVICE_NUMBER = 12
     MIN_OFFSET = 0
-    if EXCESS_ONE_IS_DEFAULT :
-        MIN_INTERVAL = 0
-        MAX_INTERVAL = 1023
-        MAX_OFFSET = MAX_INTERVAL
-        MIN_CHANNELS = 0
-        MAX_CHANNELS = 15
-        MIN_SAMPLE_WIDTH = 0
-        MAX_SAMPLE_WIDTH = 63
-        MIN_SAMPLE_GROUPING = 0
-        MAX_SAMPLE_GROUPING = 15
-    else :
-        MIN_INTERVAL = 1
-        MAX_INTERVAL = 1024
-        MAX_OFFSET = MAX_INTERVAL - 1
-        MIN_CHANNELS = 1
-        MAX_CHANNELS = 16
-        MIN_SAMPLE_WIDTH = 1
-        MAX_SAMPLE_WIDTH = 64
-        MIN_SAMPLE_GROUPING = 1
-        MAX_SAMPLE_GROUPING = 16
+    MIN_INTERVAL = 0
+    MAX_INTERVAL = 4095
+    MAX_OFFSET = MAX_INTERVAL
+    MIN_CHANNELS = 0
+    MAX_CHANNELS = 15
+    MIN_SAMPLE_WIDTH = 0
+    MAX_SAMPLE_WIDTH = 31
+    MIN_SAMPLE_GROUPING = 0
+    MAX_SAMPLE_GROUPING = 7
     MIN_CHANNEL_GROUPING = 0
-    MAX_CHANNEL_GROUPING = MAX_CHANNELS - 1
+    MAX_CHANNEL_GROUPING = MAX_CHANNELS
     MIN_CHANNEL_GROUP_SPACING = 0
-    MAX_CHANNEL_GROUP_SPACING = MAX_CHANNELS - 1
+    MAX_CHANNEL_GROUP_SPACING = MAX_CHANNELS
     MIN_SKIPPING_NUMERATOR = 0
     MAX_SKIPPING_NUMERATOR = Interface.MAX_SKIPPING_DENOMINATOR - 1
     MIN_SKIPPING_DENOMINATOR = 0
@@ -1991,26 +2009,25 @@ class DataPort:
     MIN_BIT_WIDTH = 0
     MAX_BIT_WIDTH = Interface.MAX_BIT_WIDTH
 
-    NUM_DP_PARAMETERS = 13
+    NUM_DP_PARAMETERS = 13 # This name is not accurate.  This is the count of the things that are not check boxes and also includes device number
 
-### Cut from here for Eddie
+
     def __init__(self):
         self.name = 'DP' + str(DataPort.count)
         self.number = DataPort.count
         self.device_number = 0
-        # All variables that contain "_REG" correspond registers in the specification.
-        # Where coding is unnatural, _X1 is suffixed to draw attention.
-        # Example when the sample width is equal to 1 bit, sample_width_REG_X1 == 0.
-        self.channels_REG = 1
+        # All variables that contain "_REG" correspond to registers in the specification.
+        # Example when the sample width is equal to 1 bit, sample_width_REG == 0.
+        self.channels_REG = 0
         self.channel_grouping_REG = 0
         self.channel_group_spacing_REG = 0
-        self.sample_width_REG = 1
-        self.sample_grouping_REG = 1
-        self.interval_REG = 1
+        self.sample_width_REG =0
+        self.sample_grouping_REG = 0
+        self.interval_REG = 0
         self.skipping_numerator_REG = 0
         self.offset_REG = 0
-        self.h_start_REG = 4
-        self.h_count_REG = 0
+        self.horizontal_start_REG = 4
+        self.horizontal_count_REG = 0
         self.tail_width_REG = 0
         self.bit_width_REG = 0
         self.source_REG = True
@@ -2019,7 +2036,8 @@ class DataPort:
         self.guard_REG = False
         self.sri_REG = False
         
-        # The following variables are used for modeling with this tool and do not relate to actual implementation.
+ ### Cut from here for Eddie
+# The following variables are used for modeling with this tool and do not relate to actual implementation.
         self.enabled = False
         self.inManager = False
         self.sample_rate = 0
@@ -2078,13 +2096,6 @@ class DataPort:
     def channels_REG(self):
         return self._channels_REG
 
-    @property
-    def channels_REG_X1(self):
-        if EXCESS_ONE_IS_DEFAULT :
-            return self._channels_REG
-        else :
-            return self._channels_REG - 1
-
     @channels_REG.setter
     def channels_REG(self, v):
         if type(v) != int:
@@ -2127,13 +2138,6 @@ class DataPort:
     def sample_width_REG(self):
         return self._sample_width_REG
 
-    @property
-    def sample_width_REG_X1(self):
-        if EXCESS_ONE_IS_DEFAULT :
-            return self._sample_width_REG
-        else :
-            return self._sample_width_REG - 1
-
     @sample_width_REG.setter
     def sample_width_REG(self, v):
         if type(v) != int:
@@ -2148,13 +2152,6 @@ class DataPort:
     def sample_grouping_REG(self):
         return self._sample_grouping_REG
 
-    @property
-    def sample_grouping_REG_X1(self):
-        if EXCESS_ONE_IS_DEFAULT :
-            return self._sample_grouping_REG
-        else :
-            return self._sample_grouping_REG - 1    
-
     @sample_grouping_REG.setter
     def sample_grouping_REG(self, v):
         if type(v) != int:
@@ -2168,13 +2165,6 @@ class DataPort:
     @property
     def interval_REG(self):
         return self._interval_REG
-
-    @property
-    def interval_REG_X1(self):
-        if EXCESS_ONE_IS_DEFAULT :
-            return self._interval_REG
-        else :
-            return self._interval_REG - 1
 
     @interval_REG.setter
     def interval_REG(self, v):
@@ -2215,32 +2205,32 @@ class DataPort:
         self._offset_REG = v
 
     @property
-    def h_start_REG(self):
-        return self._h_start_REG
+    def horizontal_start_REG(self):
+        return self._horizontal_start_REG
 
-    @h_start_REG.setter
-    def h_start_REG(self, v):
+    @horizontal_start_REG.setter
+    def horizontal_start_REG(self, v):
         if type(v) != int:
             raise TypeError('Horizontal start must be int, got ' + str(type(v)))
         if v > DataPort.MAX_H_START:
             raise ValueError('Horizontal start must be <= ' + str(DataPort.MAX_H_START))
         if v < DataPort.MIN_H_START:
             raise ValueError('Horizontal start must be >= ' + str(DataPort.MIN_H_START))
-        self._h_start_REG = v
+        self._horizontal_start_REG = v
 
     @property
-    def h_count_REG(self):
-        return self._h_count_REG
+    def horizontal_count_REG(self):
+        return self._horizontal_count_REG
 
-    @h_count_REG.setter
-    def h_count_REG(self, v):
+    @horizontal_count_REG.setter
+    def horizontal_count_REG(self, v):
         if type(v) != int:
             raise TypeError('Horizontal stop must be int, got ' + str(type(v)))
         if v > DataPort.MAX_H_COUNT:
-            raise ValueError('Horizontal stop must be <= ' + str(DataPort.MAX_H_COUNT))
+            raise ValueError('Horizontal Count must be <= ' + str(DataPort.MAX_H_COUNT))
         if v < DataPort.MIN_H_COUNT:
-            raise ValueError('Horizontal stop must be >= ' + str(DataPort.MIN_H_COUNT))
-        self._h_count_REG = v
+            raise ValueError('Horizontal Count must be >= ' + str(DataPort.MIN_H_COUNT))
+        self._horizontal_count_REG = v
 
     @property
     def tail_width_REG(self):
@@ -2359,6 +2349,7 @@ class DataPort:
 ### Cut from here for Eddie
     # The initial values might be quite different in a real implementation.
     # These values are chosen mostly due to artifacts of this tool.
+    # This sequence is done both when the port is enabled or when the port is prepared.
     def reset( self ):
         self.current_offset_in_interval = -1
         self.last_row_evaluated = -1
@@ -2372,71 +2363,32 @@ class DataPort:
         print( "dataport reset called" )
 
     def startInterval( self ) :
-        self.samples_remaining_in_sample_group = self.sample_grouping_REG_X1
+        self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
-        if self.channel_grouping_REG == 0 or self.channel_grouping_REG >= self.channels_REG_X1 : # or self.sri_REG:
-            self.effective_channel_grouping = self.channels_REG_X1 + 1
+        if self.channel_grouping_REG == 0 or self.channel_grouping_REG >= self.channels_REG : # or self.sri_REG:
+            self.effective_channel_grouping = self.channels_REG + 1
         else:
             self.effective_channel_grouping = self.channel_grouping_REG
             # effective_channel_grouping is an intermediate variable for clarity
         self.channel_group_end = self.effective_channel_grouping
         # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
 
-        self.current_bit_in_sample = self.sample_width_REG_X1
+        self.current_bit_in_sample = self.sample_width_REG
         # TODO: this is where a call to fetch SampleGroup * Channels of audio from the file to playing out.
 
 
 ### To here for Eddie
 ### Cut from here for Eddie        
-    # This is called for each possible column that start a bit (or wide bit).  This is not called more than once per data bit.
+    # This is called for each possible column that could start a bit (or wide bit).  This is not called more than once per data bit.
     # try_bit returns a tuple containing
     # 1. the width (integer) of the "bit" (how many UIs) and
     # 2. the value to drive (a string coding ownership or the bit address withing the sample frames)
     def try_bit( self, row_number, column_number, denominator_REG ) :
         if Debug_Drawing : print( 'try_bit called with row={:d}, column={:d}'.format( row_number, column_number ) )
         ret_value = 'error'
-        if self.sri_REG :
-            if not self.started :
-                if Debug_Drawing : print( "starting interval due to SRI" )
-                self.startInterval()
-                self.end_of_row = False
-                self.started = True
-                self.done_with_interval = False
-                self.channel_group_is_spacing = 0
 
-        elif self.last_row_evaluated != row_number :
-            assert( self.last_row_evaluated + 1 == row_number )
-            self.last_row_evaluated = row_number
-            self.last_column_evaluated = -1
-            self.end_of_row = False # we are starting a new row
-
-            # Current_offset_in_interval should be 0 anytime an SSP occurs
-            # and is reset when channels are enabled or prepared.
-            self.current_offset_in_interval += 1 # update the interval counter
-            
-            # Greater than should never occur in real systems
-            if self.current_offset_in_interval >= ( ( self.interval_REG + 1 ) if EXCESS_ONE_IS_DEFAULT else self.interval_REG ) :
-                self.current_offset_in_interval = 0
-                self.done_with_interval = False # This is a new interval.
-
-            # This should be true once per interval
-            if not self.started and self.current_offset_in_interval == self.offset_REG :
-                # These lines are for the optional skipping feature
-                if ( self.skipping_numerator_REG != 0 ) :
-                    self.accumulated_fraction += self.skipping_numerator_REG
-                    if self.accumulated_fraction < denominator_REG :
-                        self.done_with_interval = True
-                        if Debug_Drawing : print( 'leaving try_bit early due to skipping' )
-                        return 0, NOT_OWNED
-                if Debug_Drawing : print( '    will drive bits this interval' )
-                self.accumulated_fraction -= denominator_REG
-                
-                assert( not self.started )
-                self.started = True
-  
-                self.startInterval()
-
+           
         if ( self.end_of_row or self.done_with_interval ) :
             if Debug_Drawing : print( 'leaving try_bit early due to end_of_row or done_with_interval' )
             return 0, NOT_OWNED # self.drive_guards_and_tails()
@@ -2446,20 +2398,20 @@ class DataPort:
         self.last_column_evaluated = column_number
 
         if self.started :
-            # Rendering of bits starts when the column gets to h_start
-            if column_number == self.h_start_REG :
+            # Rendering of bits starts when the column gets to horizontal_start
+            if column_number == self.horizontal_start_REG :
                 if Debug_Drawing : print( '    starting row, set done_with_row to false' )
                 self.done_with_row = False
-            if column_number < self.h_start_REG :
-                if Debug_Drawing : print( ' leaving try_bit early:   left of h_start, not owning' )
+            if column_number < self.horizontal_start_REG :
+                if Debug_Drawing : print( ' leaving try_bit early:   left of horizontal_start, not owning' )
                 return 0, NOT_OWNED
             if self.done_with_row or self.done_with_interval :
                 if Debug_Drawing : print( ' leaving try_bit early:   driving any guard or tail as done_with_Row or done_with_interval or channel_group_is_spacing' )
                 return 0, NOT_OWNED # self.drive_guards_and_tails()
 
             # Are we past the end of the row?
-            elif column_number > self.h_start_REG + self.h_count_REG :
-                if Debug_Drawing : print( '    hit h_stop, setting done_with_row True h_start={}, hstop={}'.format( self.h_start_REG, self.h_count_REG ) )
+            elif column_number > self.horizontal_start_REG + self.horizontal_count_REG :
+                if Debug_Drawing : print( '    hit h_stop, setting done_with_row True horizontal_start={}, hstop={}'.format(self.horizontal_start_REG, self.horizontal_count_REG ) )
                 self.done_with_row = True
                 self.channel_group_is_spacing = 0;
                 if self.sri_REG :
@@ -2492,7 +2444,7 @@ class DataPort:
                             self.samples_remaining_in_sample_group -= 1
                             if 0 > self.samples_remaining_in_sample_group : # done with sample group ?
                                 if Debug_Drawing : print( 'finished sample group' )
-                                if self.channel_group_end >= self.channels_REG_X1 + 1 : # Done with all channel groups
+                                if self.channel_group_end >= self.channels_REG + 1 : # Done with all channel groups
                                     if not self.sri_REG :
                                         if Debug_Drawing : print( 'done with interval' )
                                         self.done_with_interval = True
@@ -2507,11 +2459,11 @@ class DataPort:
                                     self.channel_group_base += self.effective_channel_grouping
                                     self.channel_group_end += self.effective_channel_grouping
                                     # clip when last group of channels is smaller
-                                    if self.channel_group_end > self.channels_REG_X1 :
-                                        self.channel_group_end = self.channels_REG_X1 + 1
+                                    if self.channel_group_end > self.channels_REG :
+                                        self.channel_group_end = self.channels_REG + 1
                                     # reset sample group counter
-                                    self.samples_remaining_in_sample_group = self.sample_grouping_REG_X1
-                                    self.current_bit_in_sample = self.sample_width_REG_X1
+                                    self.samples_remaining_in_sample_group = self.sample_grouping_REG
+                                    self.current_bit_in_sample = self.sample_width_REG
                                     self.channel_group_is_spacing = self.channel_group_spacing_REG
                                     assert( self.current_channel == self.channel_group_base )
                                 if 0 == self.channel_group_spacing_REG : # 0 means next row.
@@ -2519,10 +2471,10 @@ class DataPort:
                                 else : # 1 for spacing means next column
                                     self.channel_group_is_spacing -= 1
                             else : # continue with current group of channels starting at the first channel in the group
-                                self.current_bit_in_sample = self.sample_width_REG_X1
+                                self.current_bit_in_sample = self.sample_width_REG
                                 self.current_channel = self.channel_group_base
                         else : # not the end of the channel group just go to the next channel
-                            self.current_bit_in_sample = self.sample_width_REG_X1
+                            self.current_bit_in_sample = self.sample_width_REG
                             # TODO: This is where the output shift register would get loaded with a new sample
 
                 if Debug_Drawing : print( "normal end of bit" )
@@ -2531,13 +2483,55 @@ class DataPort:
 
         if ( self.sri_REG ) :
             if Debug_Drawing : print( "SRI noted near end") 
-            if ( column_number == self.h_start_REG + self.h_count_REG ) :
+            if ( column_number == self.horizontal_start_REG + self.horizontal_count_REG ) :
                 # for SRI, these variable need to be reset so that things start the same each row.
                 if Debug_Drawing : print( "special SRI check worked" )
                 self.started = False
                 self.done_with_interval = True
                 self.end_of_row = True # NDW change for SRI???
         return self.bit_width_REG, ret_value
+
+
+    def new_row( self, row_number, denominator_REG ) :
+        if Debug_Drawing : print( 'new_row called with row={:d}, denominator_REG={:d}'.format( row_number, denominator_REG ) )
+        ret_value = 'error'
+        if self.sri_REG :
+            self.startInterval()
+            self.end_or_row = False
+            self.started = True
+            self.done_with_interval = False
+            self.channel_group_is_spacing = 0
+            ret_value = 'started'
+        else :
+            assert( self.last_row_evaluated + 1 == row_number )
+            self.last_row_evaluated = row_number
+            self.last_column_evaluatted = -1
+            self.end_or_row = False
+            self.current_offset_in_interval += 1
+            # Current_offset_in_interval should be 0 anytime an SSP occurs
+            # and is reset when channels are enabled or prepared.
+
+            assert( self.current_offset_in_interval <= self.interval_REG + 1 )
+            if self.current_offset_in_interval == ( self.interval_REG + 1 ) :
+                self.current_offset_in_interval = 0
+                self.done_with_interval = False
+            if self.current_offset_in_interval == self.offset_REG:
+                assert( not self.started )
+                # These lines are for the optional skipping feature
+                if ( self.skipping_numerator_REG != 0 ) :
+                    self.accumulated_fraction += self.skipping_numerator_REG
+                    if self.accumulated_fraction < denominator_REG : # comment about skipping.
+                        self.done_with_interval = True
+                        if Debug_Drawing : print( 'leaving new_row early due to skipping' )
+                        ret_value = 'skipping'
+                        return
+                if Debug_Drawing : print( '    will drive bits this interval' )
+                self.accumulated_fraction -= denominator_REG
+                self.started = True
+                self.startInterval()
+                ret_value = 'starting'
+        return ret_value
+        
 ### To here for Eddie
 
 ###############################
@@ -2552,6 +2546,10 @@ def parse_cmdline():
     parser.add_argument('-b', '--batch', required=False,
                         dest='batch_mode', default=False, action='store_true',
                         help='Execute the application in batch mode')
+    
+    parser.add_argument('-s', '--simple', required=False,
+                        dest='simple_mode', default=False, action='store_true',
+                        help='Execute the application using simple output if in batch mode')
     
     parser.add_argument('-c', '--config_file', metavar='file', required=False,
                                           dest='config_filename', action='store',
