@@ -143,7 +143,7 @@ class Frame_model:
     def __init__(self, n_rows=0, n_cols=2):
         self.row_info = []
         for i in range(0, n_rows):
-            self.row_info.append(Row_info(n_cols))            
+            self.row_info.append(Row_info(n_cols, i))            
 
     def append_row(self, row):
         self.row_info.append(row)
@@ -153,15 +153,17 @@ class Frame_model:
 
 class Row_info:
 
-    def __init__(self, n_col):
-        self.col_info = [Col_info() for i in range(0, n_col)]
+    def __init__(self, n_col, row_number):
+        self.row_num = row_number
+        self.col_info = [Col_info(i) for i in range(0, n_col)]
 
     def get_col(self, i):
         return self.col_info[i]
         
 class Col_info:
 
-    def __init__(self):
+    def __init__(self, col_number):
+        self.col_num = col_number
         self.slot_info = []
 
     def append_slot(self, slot):
@@ -729,6 +731,7 @@ class App(tk.Frame):
                 messagebox.showwarning('Warning!', 'No canvasvg.')
 
     def save_frame_model(self, filename, model):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         fh = openfile(filename, 'w')
         json.dump(model, fh, cls=SimpleJSONEncoder, indent=4)
 
@@ -1123,7 +1126,7 @@ class App(tk.Frame):
         self.master.update()
 
         if (self.args.out_frame_filename is not None):
-            self.save_frame_model(args.out_frame_filename, self.frame_model)
+            self.save_frame_model(self.args.out_frame_filename, self.frame_model)
 
         if len(error_text):
             messagebox.showwarning("Warning", "Some data ports could not be drawn since: " + error_text)
@@ -1308,7 +1311,6 @@ class App(tk.Frame):
 
         # Frame model update
         for row in range(0, self.rows_in_frame):
-            print(f'row = {row}')
             self.update_col_in_frame_model(row, column, 0, 0, 0, text)
 
     # Draws a handover bit slot
@@ -1593,13 +1595,13 @@ class App(tk.Frame):
             si.dp_num = dp_num
             chan = 0
             bit_num = 0
-            m = re.match("^c(\d+)b(\d+)$", rrrr)
+            m = re.match("^c(\d+)b(-?\d+)$", rrrr)
             if (m):
                 chan     = m.group(1)
                 bit_num  = m.group(2)
             else:
                 print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
-#                exit(1)
+                exit(1)
             si.channel = chan
             si.bit_num = bit_num
             

@@ -1,0 +1,16 @@
+Running the command
+
+#> python3 testsuite.py
+
+under the directory tests/ invokes swi3s_visualizer.py for all the configuration files
+in tests/test_cfgs in batch mode.
+Output JSONs are put under tests/test_out/, that must not exist, so the advice is to run
+the regression this way:
+
+#> rmdir test_out/ && python3 testsuite.py
+
+TODO: 
+ - it would be useful to be able to run the test for only a selected number of configurations
+
+
+
