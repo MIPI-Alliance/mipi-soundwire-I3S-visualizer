@@ -99,7 +99,7 @@ SRI_USES_CHANNEL_GROUPING_ONLY = False
 SRI_USES_SAMPLE_COUNT = True
 FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
 SAVE_FILE_USING_EXCESS_ONE = True
-Debug_Drawing = False
+Debug_Drawing = True # False
 
 # While currently used as a switch, these varibles might by controlled by the UI should someone add a widget to do so:
 UI_IS_EXCESS_1 = True
@@ -216,7 +216,7 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.57'
+        self.VERSION = '1.59'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -731,9 +731,10 @@ class App(tk.Frame):
                 messagebox.showwarning('Warning!', 'No canvasvg.')
 
     def save_frame_model(self, filename, model):
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        fh = openfile(filename, 'w')
-        json.dump(model, fh, cls=SimpleJSONEncoder, indent=4)
+        if self.args.batch_mode :
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            fh = openfile(filename, 'w')
+            json.dump(model, fh, cls=SimpleJSONEncoder, indent=4)
 
     # Writes UI elements
     def update_ui(self):
@@ -1125,6 +1126,8 @@ class App(tk.Frame):
                             error_text += temp_text + 'In ' + self.interface.data_ports[count].name + '\n'
         self.master.update()
 
+        print( "about to print filename: " )
+        print( self.args.out_frame_filename )
         if (self.args.out_frame_filename is not None):
             self.save_frame_model(self.args.out_frame_filename, self.frame_model)
 
@@ -1748,7 +1751,7 @@ class App(tk.Frame):
                 column_counter = 0
                 while column_counter < self.interface.columns_per_row :
                     width, rrrr = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
-                    if Debug_Drawing : print ( 'result from trying = "{}"'.format( rrrr ) )
+                    if Debug_Drawing : print ( 'result from try_bit = "{}"'.format( width, rrrr ) )
                     if NOT_OWNED == rrrr :
                         rrrr = data_port.get_guard_or_tails()
                         if NOT_OWNED == rrrr :
@@ -2387,12 +2390,12 @@ class DataPort:
     # 1. the width (integer) of the "bit" (how many UIs) and
     # 2. the value to drive (a string coding ownership or the bit address withing the sample frames)
     def try_bit( self, row_number, column_number, denominator_REG ) :
-        if Debug_Drawing : print( 'try_bit called with row={:d}, column={:d}'.format( row_number, column_number ) )
+        if Debug_Drawing : print( 'try_bit called with DP={:d}, row={:d}, column={:d}'.format( self.number, row_number, column_number ) )
         ret_value = 'error'
 
            
         if ( self.end_of_row or self.done_with_interval ) :
-            if Debug_Drawing : print( 'leaving try_bit early due to end_of_row or done_with_interval' )
+            if Debug_Drawing : print( 'leaving try_bit early due to end_of_row = ', self.end_of_row, ' or done_with_interval =', self.done_with_interval )
             return 0, NOT_OWNED # self.drive_guards_and_tails()
 
         if self.last_column_evaluated == column_number :
@@ -2499,7 +2502,7 @@ class DataPort:
         ret_value = 'error'
         if self.sri_REG :
             self.startInterval()
-            self.end_or_row = False
+            self.end_of_row = False
             self.started = True
             self.done_with_interval = False
             self.channel_group_is_spacing = 0
@@ -2508,16 +2511,18 @@ class DataPort:
             assert( self.last_row_evaluated + 1 == row_number )
             self.last_row_evaluated = row_number
             self.last_column_evaluatted = -1
-            self.end_or_row = False
+            self.end_of_row = False
             self.current_offset_in_interval += 1
             # Current_offset_in_interval should be 0 anytime an SSP occurs
             # and is reset when channels are enabled or prepared.
 
             assert( self.current_offset_in_interval <= self.interval_REG + 1 )
             if self.current_offset_in_interval == ( self.interval_REG + 1 ) :
+                if Debug_Drawing : print( 'end of interval reached for DP={:d}, row={:d}'.format( self.number, row_number ) )
                 self.current_offset_in_interval = 0
                 self.done_with_interval = False
             if self.current_offset_in_interval == self.offset_REG:
+                if Debug_Drawing : print( 'offset matched for DP={:d}, row={:d}'.format( self.number, row_number ) )
                 assert( not self.started )
                 # These lines are for the optional skipping feature
                 if ( self.skipping_numerator_REG != 0 ) :
