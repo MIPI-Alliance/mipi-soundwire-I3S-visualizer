@@ -99,7 +99,8 @@ SRI_USES_CHANNEL_GROUPING_ONLY = False
 SRI_USES_SAMPLE_COUNT = True
 FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
 SAVE_FILE_USING_EXCESS_ONE = True
-Debug_Drawing = True # False
+Debug_Drawing = False
+Debug_FileIO = False
 
 # While currently used as a switch, these varibles might by controlled by the UI should someone add a widget to do so:
 UI_IS_EXCESS_1 = True
@@ -732,6 +733,7 @@ class App(tk.Frame):
 
     def save_frame_model(self, filename, model):
         if self.args.batch_mode :
+            if Debug_FileIO : print( 'about to put result in', os.path.dirname(filename) )
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             fh = openfile(filename, 'w')
             json.dump(model, fh, cls=SimpleJSONEncoder, indent=4)
@@ -741,7 +743,7 @@ class App(tk.Frame):
 
         # Update data port names
         for count, x in enumerate(self.dp_name_entry_boxes):
-            print( x )
+            if Debug_Drawing : print( x )
             x.delete(0, tk.END)
             x.insert(0, self.interface.data_ports[count].name)
 
@@ -1115,7 +1117,7 @@ class App(tk.Frame):
         # Draw our data ports
         # Draw for each device in sequence
         # Loop though all devices
-        print( "about to draw the data ports" )
+        if Debug_Drawing : print( "about to draw the data ports" )
         for device in range(0, 8):
             for count, data_port in enumerate(self.interface.data_ports):
                 if data_port.device_number == device:
@@ -1126,9 +1128,10 @@ class App(tk.Frame):
                             error_text += temp_text + 'In ' + self.interface.data_ports[count].name + '\n'
         self.master.update()
 
-        print( "about to print filename: " )
-        print( self.args.out_frame_filename )
+        if Debug_FileIO : print( "about to print filename: " )
+        if Debug_FileIO : print( self.args.out_frame_filename )
         if (self.args.out_frame_filename is not None):
+            if Debug_FileIO : print( 'about to save in', self.args.out_frame_filename )
             self.save_frame_model(self.args.out_frame_filename, self.frame_model)
 
         if len(error_text):
@@ -1158,7 +1161,7 @@ class App(tk.Frame):
                 csv_data = csv.reader(data_file)
                 file_is_excess_one = False
                 for count, row in enumerate(csv_data):
-                    print( "when reading number", count, "we see '", row[0], " and ", row[1] )
+                    if Debug_FileIO : print( "when reading number", count, "we see '", row[0], " and ", row[1] )
                     # TODO: Technical debt:  Rewrite the following to not use strings that are in the xxx struct 
                     if 0 == row[0].find( "Columns per Row", 0 ) :
                         self.interface.columns_per_row = self.st_int(row[ 1 ] )
@@ -1314,7 +1317,7 @@ class App(tk.Frame):
 
         # Frame model update
         for row in range(0, self.rows_in_frame):
-            self.update_col_in_frame_model(row, column, 0, 0, 0, text)
+            self.update_col_in_frame_model(row, column, 0, 0, 0, text, 0)
 
     # Draws a handover bit slot
     def draw_handover(self, row, column, device):
@@ -1338,7 +1341,7 @@ class App(tk.Frame):
 
     # Draws a tail bit slot
     def draw_tail(self, row, column, device, color):
-        print( 'draw_tail called with row={:d}, column={:d}, device={}'.format( row, column, device) )
+        if Debug_Drawing : print( 'draw_tail called with row={:d}, column={:d}, device={}'.format( row, column, device) )
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
@@ -1376,7 +1379,7 @@ class App(tk.Frame):
 
     # Draws a guard bit slot
     def draw_guard(self, row, column, device, color):
-        print( 'draw_guard called with row={:d}, column={:d}, device={}'.format( row, column, device) )
+        if Debug_Drawing : print( 'draw_guard called with row={:d}, column={:d}, device={}'.format( row, column, device) )
         if not isinstance(row, int):
             raise TypeError('Expected int for row')
         if not isinstance(column, int):
@@ -1385,7 +1388,7 @@ class App(tk.Frame):
             raise TypeError('Expected str for color')
         direction = 1
         if self.check_bus_clash(row, column, device, 'guard'):
-            print( "clash check returned True")
+            if Debug_Clash : print( "clash check returned True")
             self.render_canvas.create_rectangle((column + 1.5) * self.COLUMN_SIZE,
                                             (row + 2 + 0.5 * (direction == 0)) * self.ROW_SIZE + 2 * (
                                                     direction == 1) + 0 * (direction == 0),
@@ -1399,7 +1402,7 @@ class App(tk.Frame):
                                        justify=tk.CENTER,
                                        text=GuardText)
         else :
-            print( "clash check returned False")
+            if Debug_Clash : print( "clash check returned False")
 
 
     def check_bus_clash(self, row, column, device, bit_slot_type):
@@ -1567,7 +1570,7 @@ class App(tk.Frame):
                 self.bit_slots_turnaround.append(bit_slot)
         return return_value
 
-    def update_col_in_frame_model(self, row, column, dp_num, is_source, width, rrrr):
+    def update_col_in_frame_model(self, row, column, dp_num, is_source, width, rrrr, sample_num_in_group ):
         ri = self.frame_model.get_row(row)
         si = Slot_info()
 
@@ -1603,23 +1606,25 @@ class App(tk.Frame):
                 chan     = m.group(1)
                 bit_num  = m.group(2)
             else:
-                print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
+                if Debug_Drawing : print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
                 exit(1)
             si.channel = chan
             si.bit_num = bit_num
-            
+            si.sample = sample_num_in_group
+
+        if True or ( si.slot_type == Slot_type.HANDOVER ) or ( si.slot_type == Slot_type.CDS ) or ( si.slot_type == Slot_type.S0 ) or ( si.slot_type == Slot_type.S1 ) :
+            si.dp_num = 'None'
+                       
         for i in range(0, width+1):
             ci = ri.get_col(column+i)
             ci.append_slot(si)
     
-
-    
     def write_bit_slot(self, row, column, width, source, text, color, data_port_number ):
 #        print( 'write_bit_slot called for row={:d}, column={:d}, width={:d}'.format( row, column, width) )
         if (self.args.simple_mode):
-            print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, D="{:s}"'.format( row, column, data_port_number, text ) )
+            if Debug_Drawing : print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, D="{:s}"'.format( row, column, data_port_number, text ) )
             for ii in range( 1, width ) :
-                print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, WWW'.format (row, column + 1, data_port_number, text ) )
+                if Debug_Drawing : print( 'Row={:04d}, Col={:02d}, PortNum={:02d}, WWW'.format (row, column + 1, data_port_number, text ) )
 
         if not isinstance(source, bool):
             raise TypeError('Expected bool for source')
@@ -1652,12 +1657,12 @@ class App(tk.Frame):
     # Draws one data port in a canvas
     def draw_data_port(self, data_port, color):
 
-        print( "draw_data_port called." )
+        if Debug_Drawing : print( "draw_data_port called." )
         if not isinstance(data_port, DataPort):
             raise TypeError('Expected DataPort object, got: ' + str(type(data_port)))
         if not isinstance(color, str):
             raise TypeError('Expected str for color')
-        print('draw_data_port' + str( data_port.number ) )
+        if Debug_Drawing : print('draw_data_port' + str( data_port.number ) )
         # Check ranges of input parameters, should be ok based on earlier checking
         error_text = ''
         if data_port.device_number < DataPort.MIN_DEVICE_NUMBER or data_port.device_number > DataPort.MAX_DEVICE_NUMBER:
@@ -1724,10 +1729,7 @@ class App(tk.Frame):
 
         started = False
         Row = 0
-        if data_port.skipping_numerator_REG > ( self.interface.skipping_denominator_REG / 2 ) :
-            frac_accum = self.interface.skipping_denominator_REG - 1
-        else :
-            frac_accum = 0 # accumlate to decide when to skip this transport opportunity
+        frac_accum = 0 # accumlate to decide when to skip this transport opportunity
         interval_counter = 0
         end_of_interval = False
 
@@ -1736,12 +1738,12 @@ class App(tk.Frame):
         else:
             effective_channel_group = data_port.channel_grouping_REG
 
-        print ( 'about to raster' )
+        if Debug_Drawing : print ( 'about to raster' )
         data_port.reset()
         
         # Row counter is not part of the needed data port mechanism but is to support drawing
         for row_counter in range( 0, self.rows_in_frame, 1 ) : 
-            print ( 'row_counter={},'.format( row_counter ) )
+            if Debug_Drawing : print ( 'row_counter={},'.format( row_counter ) )
             Row += 1
             data_port.new_row( row_counter, self.interface.skipping_denominator_REG )
 ### To here for Eddie
@@ -1750,7 +1752,7 @@ class App(tk.Frame):
                 last_bit_was_driven = 0
                 column_counter = 0
                 while column_counter < self.interface.columns_per_row :
-                    width, rrrr = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
+                    width, rrrr, sample_number_in_group = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
                     if Debug_Drawing : print ( 'result from try_bit = "{}"'.format( width, rrrr ) )
                     if NOT_OWNED == rrrr :
                         rrrr = data_port.get_guard_or_tails()
@@ -1760,24 +1762,24 @@ class App(tk.Frame):
                                 if data_port.source_REG and data_port.handover :
                                     self.draw_handover( row_counter, column_counter, data_port.device_number)
                                     self.update_col_in_frame_model(row_counter, column_counter, data_port.number,
-                                                                   data_port.source_REG, 0, 'HANDOVER')
+                                                                   data_port.source_REG, 0, 'HANDOVER', sample_number_in_group)
                             last_bit_was_driven = False
                         elif "tail" == rrrr :
-                            print( 'calling draw tail' )
+                            if Debug_Drawing : print( 'calling draw tail' )
                             self.draw_tail( row_counter, column_counter, data_port.device_number, color )
-                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG, width, rrrr )
+                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG, width, rrrr, 0 )
                             last_bit_was_driven = True
                         elif 'G' == rrrr :
                             self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number ) #, data_port.sample_grouping_REG - data_port.samples_remaining_in_sample_group, data_port.current_channel, data_port.current_bit_in_sample )
                             self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
-                                                           width, rrrr)
+                                                           width, rrrr, 0)
                             last_bit_was_driven = True
                         else :
                             error()
                     else :
                         self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number)
                         self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
-                                                       width, rrrr)
+                                                       width, rrrr, sample_number_in_group)
                         last_bit_was_driven = True
                         data_port.set_guards_and_tails() # A bit is owned so 
                         if data_port.source_REG:
@@ -1812,11 +1814,13 @@ class Interface:
     MIN_SKIPPING_DENOMINATOR = 1
     MAX_SKIPPING_DENOMINATOR = 4096
     MIN_S0_WIDTH = 1
-    MAX_S0_WIDTH = 2
+    MAX_S0_WIDTH = 8
+    MIN_S1_WIDTH = 1
+    MAX_S1_WIDTH = 8
     #MIN_S1_TAILS = 0
     #MAX_S1_TAILS = 3
     MIN_CDS_S0_HANDOVER_WIDTH = 0
-    MAX_CDS_S0_HANDOVER_WIDTH = 2
+    MAX_CDS_S0_HANDOVER_WIDTH = 8
     MIN_TAIL_WIDTH = 0
     MAX_TAIL_WIDTH = 2
     MIN_BIT_WIDTH = 0
@@ -1828,6 +1832,7 @@ class Interface:
         self.columns_per_row = 24
         self.s0s1_enabled = True
         self.s0_width = Interface.MIN_S0_WIDTH
+        self.s1_width = Interface.MIN_S1_WIDTH
         #self.s1_tails = Interface.MIN_S1_TAILS
         self.s0_handover_enabled = True
         self.cds_guard_enabled = False
@@ -1877,6 +1882,20 @@ class Interface:
         if v < Interface.MIN_S0_WIDTH:
             raise ValueError('S0 width must be >= ' + str(Interface.MIN_S0_WIDTH))
         self._s0_width = v
+
+    @property
+    def s1_width(self):
+        return self._s1_width
+
+    @s0_width.setter
+    def s1_width(self, v):
+        if type(v) != int:
+            raise TypeError('S1 width must be int, got ' + str(type(v)))
+        if v > Interface.MAX_S1_WIDTH:
+            raise ValueError('S1 width must be <= ' + str(Interface.MAX_S0_WIDTH))
+        if v < Interface.MIN_S1_WIDTH:
+            raise ValueError('S1 width must be >= ' + str(Interface.MIN_S0_WIDTH))
+        self._s1_width = v
 
     #@property
     #def s1_tails(self):
@@ -2363,19 +2382,21 @@ class DataPort:
         self.end_of_row = False
         # these two should move to the device
         self.tails_left = 0
-
         self.guards_left = False
-        print( "dataport reset called" )
+        self.accumulated_fraction = 0
+        if Debug_Drawing : print( "dataport reset called" )
 
     def startInterval( self ) :
         self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
-        if self.channel_grouping_REG == 0 or self.channel_grouping_REG >= self.channels_REG : # or self.sri_REG:
+        if Debug_Drawing : print ("channel_grouping_Reg = ", self.channel_grouping_REG, " channels_REG = ", self.channels_REG )
+        if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
             self.effective_channel_grouping = self.channels_REG + 1
         else:
             self.effective_channel_grouping = self.channel_grouping_REG
             # effective_channel_grouping is an intermediate variable for clarity
+        if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
         self.channel_group_end = self.effective_channel_grouping
         # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
 
@@ -2396,7 +2417,7 @@ class DataPort:
            
         if ( self.end_of_row or self.done_with_interval ) :
             if Debug_Drawing : print( 'leaving try_bit early due to end_of_row = ', self.end_of_row, ' or done_with_interval =', self.done_with_interval )
-            return 0, NOT_OWNED # self.drive_guards_and_tails()
+            return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
 
         if self.last_column_evaluated == column_number :
             raise ValueError ( "This column was already evaluated " )
@@ -2409,10 +2430,10 @@ class DataPort:
                 self.done_with_row = False
             if column_number < self.horizontal_start_REG :
                 if Debug_Drawing : print( ' leaving try_bit early:   left of horizontal_start, not owning' )
-                return 0, NOT_OWNED
+                return 0, NOT_OWNED, 0
             if self.done_with_row or self.done_with_interval :
                 if Debug_Drawing : print( ' leaving try_bit early:   driving any guard or tail as done_with_Row or done_with_interval or channel_group_is_spacing' )
-                return 0, NOT_OWNED # self.drive_guards_and_tails()
+                return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
 
             # Are we past the end of the row?
             elif column_number > self.horizontal_start_REG + self.horizontal_count_REG :
@@ -2424,13 +2445,14 @@ class DataPort:
                     self.started = False
                     self.done_with_interval = True
                     self.end_of_row = True 
-                return 0, NOT_OWNED # self.drive_guards_and_tails()
+                return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
             
             else : # In between HSTART and ( HSTART + HCOUNT ), inclusive.
+                sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
                 if self.channel_group_is_spacing > 0 :
                     self.channel_group_is_spacing -= 1
                     if Debug_Drawing : print( " leaving try_bit early skipping bits due to spacing" )
-                    return 0, NOT_OWNED # self.drive_guards_and_tails()
+                    return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
 
                 # last_value_sent would be this value of this return  <--- what the heck does this mean?
                 else : # done with any bit widening
@@ -2442,9 +2464,9 @@ class DataPort:
                     # ??? last_value_sent would be this value of this return
                     if self.current_bit_in_sample < 0 :
                         # Done will all bits in the current sample.  Go to the next channel or frame
-                        if Debug_Drawing : print( '    going on to next channel (if it exists)' )
+                        if Debug_Drawing : print( '    going on to next channel (if it exists) channel_group_end = ', self.channel_group_end, " current_channel = ", self.current_channel )
                         self.current_channel += 1
-                        if self.channel_group_end <= self.current_channel : # are we at tthe end of the channel group
+                        if self.channel_group_end <= self.current_channel : # are we at the end of the channel group
                             if Debug_Drawing : print( '    end of channel group' )
                             self.samples_remaining_in_sample_group -= 1
                             if 0 > self.samples_remaining_in_sample_group : # done with sample group ?
@@ -2479,10 +2501,12 @@ class DataPort:
                                 self.current_bit_in_sample = self.sample_width_REG
                                 self.current_channel = self.channel_group_base
                         else : # not the end of the channel group just go to the next channel
+                            if Debug_Drawing : print( "    still in the channel group" )
                             self.current_bit_in_sample = self.sample_width_REG
                             # TODO: This is where the output shift register would get loaded with a new sample
-
                 if Debug_Drawing : print( "normal end of bit" )
+
+
         else:
             ret_value = NOT_OWNED
 
@@ -2494,7 +2518,8 @@ class DataPort:
                 self.started = False
                 self.done_with_interval = True
                 self.end_of_row = True # NDW change for SRI???
-        return self.bit_width_REG, ret_value
+        sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
+        return self.bit_width_REG, ret_value, sample_number_in_group
 
 
     def new_row( self, row_number, denominator_REG ) :
@@ -2527,13 +2552,15 @@ class DataPort:
                 # These lines are for the optional skipping feature
                 if ( self.skipping_numerator_REG != 0 ) :
                     self.accumulated_fraction += self.skipping_numerator_REG
-                    if self.accumulated_fraction < denominator_REG : # comment about skipping.
+                    if self.accumulated_fraction >= denominator_REG : # comment about skipping.
                         self.done_with_interval = True
+                        self.accumulated_fraction -= denominator_REG
                         if Debug_Drawing : print( 'leaving new_row early due to skipping' )
                         ret_value = 'skipping'
                         return
+                    
                 if Debug_Drawing : print( '    will drive bits this interval' )
-                self.accumulated_fraction -= denominator_REG
+                
                 self.started = True
                 self.startInterval()
                 ret_value = 'starting'
@@ -2567,7 +2594,7 @@ def parse_cmdline():
                                           help='Frame model output file (JSON)')    
 
     args      = parser.parse_args()
-    print(args)
+    if Debug_FileIO : print(args)
     return args
 
 def openfile(filename, mode):
