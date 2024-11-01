@@ -31,12 +31,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # ToDos that might want to start with a re-write:
 # Investigate and remote "Draw S0 Handover".Fix S0 handover (preceding bit)
 # Have the denominator also change witth the UI view flag.
-# Widen the range for S0.
+# Widen the range for S0. - done.
 # Change the name of "Interval Denominator" to skipping.
 # Fix the offset betwen the label for sample rate and the values.
 # break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
 # Have a way to indicate that two dataports are in the same device (and thus the guards and tails are impacted).
 # Fold up the check boxes
+# Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
 # Change the symbol between S1 and Control to show the funny Manager handover
 # Read in wav files per data port and place in output
 # Add Flow-control bits (including the runt port).
@@ -217,7 +218,7 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.59'
+        self.VERSION = '1.60'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -2471,6 +2472,10 @@ class DataPort:
                             self.samples_remaining_in_sample_group -= 1
                             if 0 > self.samples_remaining_in_sample_group : # done with sample group ?
                                 if Debug_Drawing : print( 'finished sample group' )
+                                self.sample_number_in_group += 1
+                                if self.sample_number_in_group >= self.sample_grouping_REG :
+                                    self.sample_number_in_group = 0
+                                    self.big_sample_group += self.sample_groupng_REG
                                 if self.channel_group_end >= self.channels_REG + 1 : # Done with all channel groups
                                     if not self.sri_REG :
                                         if Debug_Drawing : print( 'done with interval' )
