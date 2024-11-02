@@ -218,7 +218,7 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.60'
+        self.VERSION = '1.61'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -1753,7 +1753,7 @@ class App(tk.Frame):
                 last_bit_was_driven = 0
                 column_counter = 0
                 while column_counter < self.interface.columns_per_row :
-                    width, rrrr, sample_number_in_group = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
+                    width, rrrr, data_port.sample_number_in_group = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
                     if Debug_Drawing : print ( 'result from try_bit = "{}"'.format( width, rrrr ) )
                     if NOT_OWNED == rrrr :
                         rrrr = data_port.get_guard_or_tails()
@@ -1763,7 +1763,7 @@ class App(tk.Frame):
                                 if data_port.source_REG and data_port.handover :
                                     self.draw_handover( row_counter, column_counter, data_port.device_number)
                                     self.update_col_in_frame_model(row_counter, column_counter, data_port.number,
-                                                                   data_port.source_REG, 0, 'HANDOVER', sample_number_in_group)
+                                                                   data_port.source_REG, 0, 'HANDOVER', data_port.sample_number_in_group)
                             last_bit_was_driven = False
                         elif "tail" == rrrr :
                             if Debug_Drawing : print( 'calling draw tail' )
@@ -1780,7 +1780,7 @@ class App(tk.Frame):
                     else :
                         self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number)
                         self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
-                                                       width, rrrr, sample_number_in_group)
+                                                       width, rrrr, data_port.sample_number_in_group)
                         last_bit_was_driven = True
                         data_port.set_guards_and_tails() # A bit is owned so 
                         if data_port.source_REG:
@@ -2076,6 +2076,7 @@ class DataPort:
         self.tails_left = 0
         self.guards_left = 0
         self.channel_group_is_spacing = 0
+        self.sample_number_in_group = 'u'
         
         # effect_channel_grouping is a helper variable that is calculated from channel_grouping_REG and channels_REG
         self.effective_channel_group = 0
@@ -2355,6 +2356,15 @@ class DataPort:
             raise TypeError('Data port inManager must be bool, got ' + str(type(v)))
         self._inManager = bool(v)
 
+    @property
+    def sample_number_in_group(self):
+        return self._sample_number_in_group
+
+    @sample_number_in_group.setter
+    def sample_number_in_group( self, v):
+        self._sample_number_in_group = v
+    
+
     def set_guards_and_tails( self ) : # TODO: This method should move to the device (not dataport). The RHS would come from the active dataport
         self.tails_left = self.tail_width_REG
         self.guards_left = self.guard_REG
@@ -2449,7 +2459,7 @@ class DataPort:
                 return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
             
             else : # In between HSTART and ( HSTART + HCOUNT ), inclusive.
-                sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
+                self.sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
                 if self.channel_group_is_spacing > 0 :
                     self.channel_group_is_spacing -= 1
                     if Debug_Drawing : print( " leaving try_bit early skipping bits due to spacing" )
@@ -2475,7 +2485,7 @@ class DataPort:
                                 self.sample_number_in_group += 1
                                 if self.sample_number_in_group >= self.sample_grouping_REG :
                                     self.sample_number_in_group = 0
-                                    self.big_sample_group += self.sample_groupng_REG
+                                   # NDW Niel work here self.big_sample_group += self.sample_groupng_REG
                                 if self.channel_group_end >= self.channels_REG + 1 : # Done with all channel groups
                                     if not self.sri_REG :
                                         if Debug_Drawing : print( 'done with interval' )
@@ -2523,8 +2533,8 @@ class DataPort:
                 self.started = False
                 self.done_with_interval = True
                 self.end_of_row = True # NDW change for SRI???
-        sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
-        return self.bit_width_REG, ret_value, sample_number_in_group
+        self.sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
+        return self.bit_width_REG, ret_value, self.sample_number_in_group
 
 
     def new_row( self, row_number, denominator_REG ) :
