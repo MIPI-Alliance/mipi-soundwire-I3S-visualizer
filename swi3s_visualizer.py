@@ -218,7 +218,6 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.61'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -2398,6 +2397,8 @@ class DataPort:
         if Debug_Drawing : print( "dataport reset called" )
 
     def startInterval( self ) :
+        if ( False != self.done_with_interval ) :
+            messagebox.showwarning("Error!", "Data past eng of interval, check all sizes and interval and offset.")
         self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
