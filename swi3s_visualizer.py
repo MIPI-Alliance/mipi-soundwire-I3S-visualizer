@@ -218,6 +218,7 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
+        self.VERSION = '1.63'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
