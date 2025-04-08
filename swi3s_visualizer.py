@@ -1,6 +1,6 @@
 
 """
-Copyright (c) 2020-2022 MIPI Alliance and other contributors. All Rights Reserved.
+Copyright (c) 2020-2025 MIPI Alliance and other contributors. All Rights Reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
@@ -16,6 +16,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Break lines
 
 # To Do
+# give up on the first user error
+# Go over the check added in version 1.63 that broke "1_PDM_Stream_With_Phy1"
 # Support odd columne counts.
 # Add a calculator of the Visualizer that shows the value that would be written the bit clock to sample clock register
 # Channel group spacing breaks guards an tails even with channel grouping = 0
@@ -23,15 +25,13 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Handle the specific detail of manager as data source near the end of a row (just before S0).
 # Add a field to control CDS_Width.
 # Tidy up (maybe) the spacing of the check boxes.
-# Allow the control column to be anywhere (including just before S0).
-
 # Reconcile Device Numbers and 'is Manager' attributes.
 # make guard and tail rules contemplate Device number and not just data ports.
-
+# Add data port number to the error messages.
 # ToDos that might want to start with a re-write:
-# Investigate and remote "Draw S0 Handover".Fix S0 handover (preceding bit)
+# Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit)
+# Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
 # Have the denominator also change witth the UI view flag.
-# Widen the range for S0. - done.
 # Change the name of "Interval Denominator" to skipping.
 # Fix the offset betwen the label for sample rate and the values.
 # break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
@@ -43,7 +43,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Add Flow-control bits (including the runt port).
 
 # Issue with wide bits missing guards and tails missing on some rows fixed
-# Added error checking for h_width + 1 mod bit_width + 1 = 0
+# Add error checking to make sure (h_count + 1) mod (bit_width + 1) == 0 (to prevent crash)
 # Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
 
 # Not TODO (mostly because it does not make sense):
@@ -57,7 +57,6 @@ import math
 import csv
 import os
 import platform
-import distutils.util
 
 import argparse
 import re
@@ -89,6 +88,7 @@ DATA_PORT_GUARD_POLARITY = 'Data Port Guard Polarity'
 DATA_PORT_ENABLED = 'Data Port Enabled'
 DATA_PORT_IN_MANAGER = 'Data Port In Manager'
 DATA_PORT_SRI =  'Data Port DRI'
+
 
 
 NOT_OWNED = 'not owned'
@@ -133,6 +133,41 @@ else:
 
 
 GuardText = 'G'
+
+# Help Functions
+def Str2Bool( str ) :
+    if ( 'On' == str ) :
+        return 1
+    if ( 'ON' == str ) :
+        return 1
+    if ( 'on' == str ) :
+        return 1
+    if ( 'True' == str ) :
+        return 1
+    if ( 'true' == str ) :
+        return 1
+    if ( '1' == str ) :
+        return 1
+    if ( 'TRUE' == str ) :
+        return 1
+    if ( 'Off' == str ) :
+        return 0
+    if ( 'OFF' == str ) :
+        return 0
+    if ( 'off' == str ) :
+        return 0
+    if ( 'FALSE' == str ) :
+        return 0
+    if ( 'False' == str ) :
+        return 0
+    if ( 'false' == str ) :
+        return 0
+    if ( '0' == str ) :
+        return 0
+    raise TypeError( 'Invalid content in file' )
+
+    
+
 
 ###############################
 #                             #
@@ -218,7 +253,8 @@ class App(tk.Frame):
         # root is window
 
 ### Cut from here for Eddie
-        self.VERSION = '1.63'
+# Visualizer Source Code Fragment: source code version
+        self.VERSION = '1.66'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -256,7 +292,7 @@ class App(tk.Frame):
                                            # 'S1 Tails',
                                            'CDS Guard Enabled',
                                            'CDS Tail Width (' + str(Interface.MIN_TAIL_WIDTH) + '-' + str(Interface.MAX_TAIL_WIDTH) + ')',
-                                           'Interval Denominator (' + str(Interface.MIN_SKIPPING_DENOMINATOR) + '-' + str(
+                                           'Skipping Denominator (' + str(Interface.MIN_SKIPPING_DENOMINATOR) + '-' + str(
                                                Interface.MAX_SKIPPING_DENOMINATOR) + ')',
                                            'CDS/S0 Handover Width (' + str(Interface.MIN_CDS_S0_HANDOVER_WIDTH) + '-' + str(
                                                Interface.MAX_CDS_S0_HANDOVER_WIDTH) + ')',
@@ -1167,11 +1203,11 @@ class App(tk.Frame):
                     if 0 == row[0].find( "Columns per Row", 0 ) :
                         self.interface.columns_per_row = self.st_int(row[ 1 ] )
                     elif 0 == row[0].find( "S0 S1 Enabled", 0 ) :
-                        self.interface.s0s1_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                        self.interface.s0s1_enabled = bool( Str2Bool( row[ 1 ] ) )
                     elif 0 == row[0].find( "S0 Width", 0 ) :
                         self.interface.s0_width = self.st_int( row[ 1 ] )
                     elif 0 == row[0].find( "CDS Guard Enabled", 0 ) :
-                        self.interface.cds_guard_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                        self.interface.cds_guard_enabled = bool( Str2Bool( row[ 1 ] ) )
                     elif 0 == row[0].find( "CDS Tail Width", 0 ) :
                         self.interface.tail_width = self.st_int( row[ 1 ] )
                     elif 0 == row[0].find( "Interval Denominator", 0 ) :
@@ -1179,13 +1215,13 @@ class App(tk.Frame):
                     elif 0 == row[0].find( "CDS/S0 Handover Width", 0 ) :
                         self.interface.cds_s0_handover_width = self.st_int( row[1])
                     elif 0 == row[0].find( "Draw S0 Hanbdover", 0 ):
-                        self.interface.s0_handover_enabled = bool( distutils.util.strtobool( row[ 1 ] ) )
+                        self.interface.s0_handover_enabled = bool( Str2Bool( row[ 1 ] ) )
                     elif 0 == row[0].find( "Row Rate", 0 ):
                         self.interface.row_rate = self.st_int( row[ 1 ] )
                     elif 0 == row[0].find( "Rows to Draw", 0 ):
                         self.rows_in_frame = self.st_int( row[ 1 ] )
                     elif SAVE_CODING_STRING == row[ 0 ]:
-                        file_is_excess_one = bool( distutils.util.strtobool( row[ 1 ] ) )
+                        file_is_excess_one = bool( Str2Bool( row[ 1 ] ) )
                     elif DATA_PORT_NAME == row[ 0 ] :                    
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.name = row[obj_count + 1]
@@ -1243,7 +1279,7 @@ class App(tk.Frame):
                     elif DATA_PORT_IS_SOURCE == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.source_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.source_REG = bool( Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1252,7 +1288,7 @@ class App(tk.Frame):
                     elif DATA_PORT_DRAW_HANDOVER == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.handover = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.handover = bool( Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1261,7 +1297,7 @@ class App(tk.Frame):
                     elif DATA_PORT_GUARD_ENABLED == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.guard_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.guard_REG = bool(Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1270,7 +1306,7 @@ class App(tk.Frame):
                     elif DATA_PORT_ENABLED == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.enabled = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.enabled = bool( Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1279,7 +1315,7 @@ class App(tk.Frame):
                     elif DATA_PORT_IN_MANAGER == row[ 0 ] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.inManager = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.inManager = bool( Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1288,7 +1324,7 @@ class App(tk.Frame):
                     elif DATA_PORT_SRI == row[0] :
                         if len(row[1:]) == Interface.NUM_DATA_PORTS:
                             for obj_count, data_port in enumerate(self.interface.data_ports):
-                                data_port.sri_REG = bool(distutils.util.strtobool(row[obj_count + 1]))
+                                data_port.sri_REG = bool( Str2Bool(row[obj_count + 1]))
                         else:
                             messagebox.showwarning("Warning", "Error reading CSV file.\n" + str(
                                 Interface.NUM_DATA_PORTS) + ' data port entry columns expected in row ' + str(
@@ -1698,10 +1734,16 @@ class App(tk.Frame):
         if data_port.sri_REG :
             if data_port.channel_group_spacing_REG == 0 :
                 error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
-            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
-            cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG # for DataPort programming validation.
-            if math.floor( ( data_port.horizontal_count_REG - data_port.horizontal_start_REG ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.horizontal_count_REG + 1 ) :
-                error_text += 'Group or Sample is incomplete when end of row encounters for data port\n'
+            #NDW use a channel group/channe
+#            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
+            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.effective_channel_grouping ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
+            cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG - 1 # for DataPort programming validation.
+
+            # Subtract one so that a perfect fit looks plenty big.
+            if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group < drive_in_group :
+               # if math.floor( ( data_port.horizontal_count_REG + 1 ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.horizontal_count_REG + 1 ) :
+
+                error_text += 'Group or Sample is incomplete at end of row for data port\n'
         if data_port.offset_REG > data_port.interval_REG:
             error_text += 'Offset > Interval\n'
         if data_port.horizontal_start_REG >= self.interface.columns_per_row:
@@ -1725,6 +1767,7 @@ class App(tk.Frame):
             return error_text
 
 ### Cut from here for Eddie
+# Visualizer Source Code Fragment: Outer loop
 # This is run for each DataPort.
         # Raster our frame
 
@@ -1734,14 +1777,9 @@ class App(tk.Frame):
         interval_counter = 0
         end_of_interval = False
 
-        if data_port.channel_grouping_REG == 0 or data_port.channel_grouping_REG > ( data_port.channels_REG + 1 ):  # NDW check or data_port.sri_REG:
-            effective_channel_group = data_port.channels_REG + 1
-        else:
-            effective_channel_group = data_port.channel_grouping_REG
-
         if Debug_Drawing : print ( 'about to raster' )
         data_port.reset()
-        
+
         # Row counter is not part of the needed data port mechanism but is to support drawing
         for row_counter in range( 0, self.rows_in_frame, 1 ) : 
             if Debug_Drawing : print ( 'row_counter={},'.format( row_counter ) )
@@ -2000,13 +2038,14 @@ class Interface:
         return self._interval_lcm
 
 ### Cut from here for Eddie
+# Visualizer Source Code Fragment: class Dataport
 class DataPort:
 ### To here for Eddie
     count = 0
 
     # Data port ranges
     MIN_DEVICE_NUMBER = 0
-    MAX_DEVICE_NUMBER = 12
+    MAX_DEVICE_NUMBER = 11
     MIN_OFFSET = 0
     MIN_INTERVAL = 0
     MAX_INTERVAL = 4095
@@ -2062,7 +2101,7 @@ class DataPort:
         self.sri_REG = False
         
  ### Cut from here for Eddie
-# The following variables are used for modeling with this tool and do not relate to actual implementation.
+        # The following variables are used for modeling with this tool and do not relate to actual implementation.
         self.enabled = False
         self.inManager = False
         self.sample_rate = 0
@@ -2079,7 +2118,7 @@ class DataPort:
         self.sample_number_in_group = 'u'
         
         # effect_channel_grouping is a helper variable that is calculated from channel_grouping_REG and channels_REG
-        self.effective_channel_group = 0
+        self.effective_channel_grouping = 0
         
         # These two variables are used for channel grouping.  Simpler implementations might exist.
         self.channel_group_end = 0
@@ -2382,6 +2421,7 @@ class DataPort:
 
 
 ### Cut from here for Eddie
+# Visualizer Source Code Fragment: Helper Functions:
     # The initial values might be quite different in a real implementation.
     # These values are chosen mostly due to artifacts of this tool.
     # This sequence is done both when the port is enabled or when the port is prepared.
@@ -2398,27 +2438,34 @@ class DataPort:
         if Debug_Drawing : print( "dataport reset called" )
 
     def startInterval( self ) :
-        if ( False != self.done_with_interval ) :
-            messagebox.showwarning("Error!", "Data past eng of interval, check all sizes and interval and offset.")
+#        if ( False != self.done_with_interval ) :
+#            messagebox.showwarning("Error!", "Data past end of interval: check dataport parameters (e.g., interval and offset).")
         self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
         if Debug_Drawing : print ("channel_grouping_Reg = ", self.channel_grouping_REG, " channels_REG = ", self.channels_REG )
+#       if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
+#            self.effective_channel_grouping = self.channels_REG + 1
+#        else:
+#            self.effective_channel_grouping = self.channel_grouping_REG
+#            # effective_channel_grouping is an intermediate variable for clarity
+#        if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
+        self.channel_group_end = self.effective_channel_grouping
+        # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
+
+        self.current_bit_in_sample = self.sample_width_REG
         if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
             self.effective_channel_grouping = self.channels_REG + 1
         else:
             self.effective_channel_grouping = self.channel_grouping_REG
             # effective_channel_grouping is an intermediate variable for clarity
         if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
-        self.channel_group_end = self.effective_channel_grouping
-        # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
-
-        self.current_bit_in_sample = self.sample_width_REG
-        # TODO: this is where a call to fetch SampleGroup * Channels of audio from the file to playing out.
-
 
 ### To here for Eddie
-### Cut from here for Eddie        
+        # TODO: this is where a call to fetch SampleGroup * Channels of audio from the file to playing out.
+
+### Cut from here for Eddie
+# Visualizer Source Code Fragment: Data Port behavior per bit
     # This is called for each possible column that could start a bit (or wide bit).  This is not called more than once per data bit.
     # try_bit returns a tuple containing
     # 1. the width (integer) of the "bit" (how many UIs) and
@@ -2509,7 +2556,7 @@ class DataPort:
                                     self.samples_remaining_in_sample_group = self.sample_grouping_REG
                                     self.current_bit_in_sample = self.sample_width_REG
                                     self.channel_group_is_spacing = self.channel_group_spacing_REG
-                                    assert( self.current_channel == self.channel_group_base )
+#                                    assert( self.current_channel == self.channel_group_base ) # Bug or feature (channel is not multiple of channel grouping.
                                 if 0 == self.channel_group_spacing_REG : # 0 means next row.
                                     self.end_of_row = True
                                 else : # 1 for spacing means next column
@@ -2565,7 +2612,9 @@ class DataPort:
                 self.done_with_interval = False
             if self.current_offset_in_interval == self.offset_REG:
                 if Debug_Drawing : print( 'offset matched for DP={:d}, row={:d}'.format( self.number, row_number ) )
-                assert( not self.started )
+                if ( self.started ) :
+                    messagebox.showwarning("Error", 'Data went past end of interval in data port: ' + str( self.number ) )
+# assert( not self.started )
                 # These lines are for the optional skipping feature
                 if ( self.skipping_numerator_REG != 0 ) :
                     self.accumulated_fraction += self.skipping_numerator_REG
