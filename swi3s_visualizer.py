@@ -254,7 +254,7 @@ class App(tk.Frame):
 
 ### Cut from here for Eddie
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.66'
+        self.VERSION = '1.67'
 ### To here for Eddie
         self.args = args
         self.frame_model = Frame_model()
@@ -1739,11 +1739,10 @@ class App(tk.Frame):
             drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.effective_channel_grouping ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
             cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG - 1 # for DataPort programming validation.
 
-            # Subtract one so that a perfect fit looks plenty big.
-            if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group < drive_in_group :
-               # if math.floor( ( data_port.horizontal_count_REG + 1 ) / cadence_of_group ) * cadence_of_group + drive_in_group > ( data_port.horizontal_count_REG + 1 ) :
-
-                error_text += 'Group or Sample is incomplete at end of row for data port\n'
+            # Subtract one before mode so that 0 wraps to max.  Subtract one from right side to match
+            if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group != 0:
+                if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group < drive_in_group:
+                    error_text += 'Group or Sample is incomplete at end of row for data port\n'
         if data_port.offset_REG > data_port.interval_REG:
             error_text += 'Offset > Interval\n'
         if data_port.horizontal_start_REG >= self.interface.columns_per_row:
@@ -1758,7 +1757,7 @@ class App(tk.Frame):
             error_text += 'Bit width would overflow row\n'
         if data_port.bit_width_REG > data_port.horizontal_count_REG:
             error_text += 'Bit width would overflow horizontal_count\n'
-        if (data_port.horizontal_count_REG + 1) % (data_port.bit_width_REG + 1) != 0:
+        if ( not data_port.sri_REG ) and (data_port.horizontal_count_REG + 1) % (data_port.bit_width_REG + 1) != 0:
             error_text += 'horizontal_count_REG + 1 should be a multiple of bit_width_REG + 1\n'
         if data_port.horizontal_count_REG >= self.interface.columns_per_row and data_port.source_REG and data_port.guard_REG:
             error_text += 'Post zero would overflow row\n'
