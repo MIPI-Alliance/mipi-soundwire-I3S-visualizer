@@ -16,38 +16,37 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Break lines
 
 # To Do
+# Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
+# Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
+# Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit)
 # give up on the first user error
+# Sometimes things are "misdrawn" and clicking the "Redraw" button 'fixes' things.  There must be some incorrect initialization order.
 # Go over the check added in version 1.63 that broke "1_PDM_Stream_With_Phy1"
-# Support odd columne counts.
-# Add a calculator of the Visualizer that shows the value that would be written the bit clock to sample clock register
+# Add a calculator of the Visualizer that shows the value that would be written the bit clock to sample clock register (clkDiv)
 # Channel group spacing breaks guards an tails even with channel grouping = 0
 # Error when horizontal_count is too small? Hard to tell.
 # Handle the specific detail of manager as data source near the end of a row (just before S0).
 # Add a field to control CDS_Width.
 # Tidy up (maybe) the spacing of the check boxes.
 # Reconcile Device Numbers and 'is Manager' attributes.
+# Have a way to indicate that two dataports are in the same device (and thus the guards and tails are impacted).
 # make guard and tail rules contemplate Device number and not just data ports.
 # Add data port number to the error messages.
+# Add check for Horizontal Counts that are too high.
+
 # ToDos that might want to start with a re-write:
-# Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit)
-# Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
-# Have the denominator also change witth the UI view flag.
-# Change the name of "Interval Denominator" to skipping.
-# Fix the offset betwen the label for sample rate and the values.
 # break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
-# Have a way to indicate that two dataports are in the same device (and thus the guards and tails are impacted).
 # Fold up the check boxes
-# Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
 # Change the symbol between S1 and Control to show the funny Manager handover
 # Read in wav files per data port and place in output
-# Add Flow-control bits (including the runt port).
 
-# Issue with wide bits missing guards and tails missing on some rows fixed
-# Add error checking to make sure (h_count + 1) mod (bit_width + 1) == 0 (to prevent crash)
+# Add error checking to make sure (h_count + 1) mod (bit_width + 1) == 0 (to prevent crash).  This seems like a bad thing to do.  Better to fix the crash.
 # Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
 
+# Probably hard to do
+# Add Flow-control bits (including the runt port).
+
 # Not TODO (mostly because it does not make sense):
-# Fix first row so that complementary sample rate can share an interval (e.g. 23 and 25 kHz can exist in the same 48 kHz interval).
 
 from __future__ import division  # Fixes a Python 2 issue with integer division
 
@@ -252,11 +251,25 @@ class App(tk.Frame):
         tk.Frame.__init__(self, master)
         # root is window
 
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.67'
-### To here for Eddie
+        self.VERSION = '1.68'
+### To here for Specification Extraction
         self.args = args
+        if ( self.args.extract_mode ) :
+            print ( self.args.extract_mode )
+            extracting = False
+            inputFile = __file__
+            if inputFile:
+                with open (inputFile) as source_file:
+                    for line in source_file :
+                        if ( line.lower().startswith('### To here for Specification Extractio'.lower() ) ) :
+                            extracting = False
+                        if extracting :
+                            print( line.rstrip() )
+                        if ( line.lower().startswith('### Cut from here for Specification Extractio'.lower() ) ) :
+                            extracting = True
+            exit(1)
         self.frame_model = Frame_model()
 
         # Appearance settings
@@ -615,7 +628,7 @@ class App(tk.Frame):
         self.refresh_data_ports()
 
         # if in batch mode exit here
-        if (self.args.batch_mode or ( self.args.simple_mode and finished_drawing ) ):
+        if (self.args.batch_mode or self.args.extract_mode or ( self.args.simple_mode and finished_drawing ) ):
             exit(0)
 
 
@@ -893,13 +906,15 @@ class App(tk.Frame):
 #            if self.interface.data_ports[count].interval_REG != 0:
                 if not self.interface.data_ports[count].sri_REG and ( 0 == self.interface.data_ports[count].skipping_numerator_REG ) :
                     sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /(  self.interface.data_ports[ count ].interval_REG + 1 ) ) )
-                elif not self.interface.data_ports[count].sri_REG :                           
-                    sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) *
-                                                   ( (self.interface.skipping_denominator_REG - self.interface.data_ports[count].skipping_numerator_REG ) /
-                                                     ( self.interface.skipping_denominator_REG ) ) )
+                elif not self.interface.data_ports[count].sri_REG :
+                    if ( 0 == self.interface.data_ports[ count ].skipping_denominator_REG ) :
+                        sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) )
+                    else :
+                        sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) *
+                                                       ( (self.interface.skipping_denominator_REG - self.interface.data_ports[count].skipping_numerator_REG ) /
+                                                         ( self.interface.skipping_denominator_REG ) ) )
                 else : # it is SRI
-                    sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate *
-                                                     math.ceil( ( self.interface.data_ports[count].horizontal_count_REG + 1 ) / ( ( self.interface.data_ports[count].channels_REG + 1 ) * ( self.interface.data_ports[count].sample_grouping_REG + 1 )* ( self.interface.data_ports[count].sample_width_REG + 1 ) + ( self.interface.data_ports[count].channel_group_spacing_REG - 1 ) ) ) ) )
+                    sample_rate = "BUG"
                 x.config( text = sample_rate )
 #            else:
 #                x.config( text = 'Error' )
@@ -964,8 +979,8 @@ class App(tk.Frame):
                                              min(Interface.MAX_COLUMNS_PER_ROW,
                                                  self.st_int(self.cpr_entry.get())))
         # If odd, make even
-        self.interface.columns_per_row -= \
-            self.interface.columns_per_row % 2
+#        self.interface.columns_per_row -= \
+#            self.interface.columns_per_row % 2
 
         self.interface.s0s1_enabled = self.s0s1_enabled_tk.get()
 
@@ -1638,7 +1653,7 @@ class App(tk.Frame):
             si.dp_num = dp_num
             chan = 0
             bit_num = 0
-            m = re.match("^c(\d+)b(-?\d+)$", rrrr)
+            m = re.fullmatch("^c([0-9]+)b(-?[0-9]+)$", rrrr)
             if (m):
                 chan     = m.group(1)
                 bit_num  = m.group(2)
@@ -1732,15 +1747,15 @@ class App(tk.Frame):
         if data_port.horizontal_start_REG + data_port.horizontal_count_REG >= self.interface.columns_per_row :
             error_text += 'horizontal_start(' + str( data_port.horizontal_start_REG ) + ') + horizontal_count(' + str( data_port.horizontal_count_REG ) + ') >= number of columns (exceeds last column)\n'
         if data_port.sri_REG :
-            if data_port.channel_group_spacing_REG == 0 :
-                error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
+          #  if data_port.channel_group_spacing_REG == 0 :
+           #     error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
             #NDW use a channel group/channe
 #            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
             drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.effective_channel_grouping ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
             cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG - 1 # for DataPort programming validation.
 
             # Subtract one before mode so that 0 wraps to max.  Subtract one from right side to match
-            if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group != 0:
+            if ( ( 0 != cadence_of_group ) and ( data_port.horizontal_count_REG + 1 ) % cadence_of_group != 0 ):
                 if ( data_port.horizontal_count_REG + 1 ) % cadence_of_group < drive_in_group:
                     error_text += 'Group or Sample is incomplete at end of row for data port\n'
         if data_port.offset_REG > data_port.interval_REG:
@@ -1765,7 +1780,7 @@ class App(tk.Frame):
         if len(error_text) > 0:
             return error_text
 
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: Outer loop
 # This is run for each DataPort.
         # Raster our frame
@@ -1784,9 +1799,9 @@ class App(tk.Frame):
             if Debug_Drawing : print ( 'row_counter={},'.format( row_counter ) )
             Row += 1
             data_port.new_row( row_counter, self.interface.skipping_denominator_REG )
-### To here for Eddie
+### To here for Specification Extraction
             if True : # insert old method stuff here from files names scr
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
                 last_bit_was_driven = 0
                 column_counter = 0
                 while column_counter < self.interface.columns_per_row :
@@ -1825,7 +1840,7 @@ class App(tk.Frame):
                         else:
                             self.check_bus_clash(row_counter, column_counter, data_port.device_number, 'read')
                     column_counter += width + 1
-### To here for Eddie
+### To here for Specification Extraction
                     
                     # more stuff here
                     # next gorup
@@ -2036,10 +2051,10 @@ class Interface:
             interval_list.append( self.skipping_denominator_REG )
         return self._interval_lcm
 
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: class Dataport
 class DataPort:
-### To here for Eddie
+### To here for Specification Extraction
     count = 0
 
     # Data port ranges
@@ -2099,7 +2114,7 @@ class DataPort:
         self.guard_REG = False
         self.sri_REG = False
         
- ### Cut from here for Eddie
+ ### Cut from here for Specification Extraction
         # The following variables are used for modeling with this tool and do not relate to actual implementation.
         self.enabled = False
         self.inManager = False
@@ -2131,7 +2146,7 @@ class DataPort:
         self.end_of_row = False
         self.started = False
         DataPort.count += 1
-### To here for Eddie
+### To here for Specification Extraction
 
 
     @property
@@ -2419,7 +2434,7 @@ class DataPort:
         return NOT_OWNED
 
 
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: Helper Functions:
     # The initial values might be quite different in a real implementation.
     # These values are chosen mostly due to artifacts of this tool.
@@ -2460,10 +2475,10 @@ class DataPort:
             # effective_channel_grouping is an intermediate variable for clarity
         if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
 
-### To here for Eddie
+### To here for Specification Extraction
         # TODO: this is where a call to fetch SampleGroup * Channels of audio from the file to playing out.
 
-### Cut from here for Eddie
+### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: Data Port behavior per bit
     # This is called for each possible column that could start a bit (or wide bit).  This is not called more than once per data bit.
     # try_bit returns a tuple containing
@@ -2617,7 +2632,7 @@ class DataPort:
                 # These lines are for the optional skipping feature
                 if ( self.skipping_numerator_REG != 0 ) :
                     self.accumulated_fraction += self.skipping_numerator_REG
-                    if self.accumulated_fraction >= denominator_REG : # comment about skipping.
+                    if self.accumulated_fraction >= denominator_REG : # Accumulated_fraction should be zero whenever and SSP occurs.
                         self.done_with_interval = True
                         self.accumulated_fraction -= denominator_REG
                         if Debug_Drawing : print( 'leaving new_row early due to skipping' )
@@ -2631,7 +2646,7 @@ class DataPort:
                 ret_value = 'starting'
         return ret_value
         
-### To here for Eddie
+### To here for Specification Extraction
 
 ###############################
 #                             #
@@ -2642,6 +2657,7 @@ class DataPort:
 
 def parse_cmdline():
     parser = argparse.ArgumentParser(description='')
+    parser.add_argument('-e', '--extract', required=False, dest='extract_mode', default = False, action = 'store', help='extract only the logical code for data port behavior.' )
     parser.add_argument('-b', '--batch', required=False,
                         dest='batch_mode', default=False, action='store_true',
                         help='Execute the application in batch mode')
