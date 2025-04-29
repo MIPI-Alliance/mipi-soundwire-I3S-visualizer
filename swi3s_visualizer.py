@@ -18,13 +18,11 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # To Do
 # Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
 # Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
-# Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit)
+# Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit):  Seems there is both s0_handover_enabled and s0_ta_enable_tk and some effort to keep them in sync.  Do we need both?
 # give up on the first user error
 # Sometimes things are "misdrawn" and clicking the "Redraw" button 'fixes' things.  There must be some incorrect initialization order.
-# Go over the check added in version 1.63 that broke "1_PDM_Stream_With_Phy1"
 # Add a calculator of the Visualizer that shows the value that would be written the bit clock to sample clock register (clkDiv)
-# Channel group spacing breaks guards an tails even with channel grouping = 0
-# Error when horizontal_count is too small? Hard to tell.
+# Error when horizontal_count is too small? Hard to tell if there is an error.
 # Handle the specific detail of manager as data source near the end of a row (just before S0).
 # Add a field to control CDS_Width.
 # Tidy up (maybe) the spacing of the check boxes.
@@ -253,7 +251,7 @@ class App(tk.Frame):
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.68'
+        self.VERSION = '1.70'
 ### To here for Specification Extraction
         self.args = args
         if ( self.args.extract_mode ) :
@@ -558,7 +556,7 @@ class App(tk.Frame):
         self.cds_s0_handover_width_entry.grid(row=7, column=Interface.NUM_DATA_PORTS+3)
         self.cds_s0_handover_width_entry.bind('<Return>', self.master_focus)
 
-        # Draw S0 handover
+        # S0 handover
         cb = tk.Checkbutton(self.config_frame, justify=tk.CENTER, variable=self.s0_ta_enable_tk)
         cb.grid(row=8, column=Interface.NUM_DATA_PORTS+3)
 
@@ -1229,7 +1227,7 @@ class App(tk.Frame):
                         self.interface.skipping_denominator_REG = self.st_int( row[ 1 ] )
                     elif 0 == row[0].find( "CDS/S0 Handover Width", 0 ) :
                         self.interface.cds_s0_handover_width = self.st_int( row[1])
-                    elif 0 == row[0].find( "Draw S0 Hanbdover", 0 ):
+                    elif 0 == row[0].find( "Draw S0 Handover", 0 ):
                         self.interface.s0_handover_enabled = bool( Str2Bool( row[ 1 ] ) )
                     elif 0 == row[0].find( "Row Rate", 0 ):
                         self.interface.row_rate = self.st_int( row[ 1 ] )
@@ -2114,7 +2112,7 @@ class DataPort:
         self.guard_REG = False
         self.sri_REG = False
         
- ### Cut from here for Specification Extraction
+### Cut from here for Specification Extraction
         # The following variables are used for modeling with this tool and do not relate to actual implementation.
         self.enabled = False
         self.inManager = False
