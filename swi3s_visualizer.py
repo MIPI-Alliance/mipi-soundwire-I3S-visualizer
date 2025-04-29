@@ -17,7 +17,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 # To Do
 # Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
+# Have the tools import data files that use SampleWidth (old name) and SampleSize (new name)
 # Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
+# Make the extract flag ("-e") use a string to allow selection of dataport refernce fragement or programming sanity checking (mostly not seen with the current fragement export).
 # Investigate and remove "Draw S0 Handover".Fix S0 handover (preceding bit):  Seems there is both s0_handover_enabled and s0_ta_enable_tk and some effort to keep them in sync.  Do we need both?
 # give up on the first user error
 # Sometimes things are "misdrawn" and clicking the "Redraw" button 'fixes' things.  There must be some incorrect initialization order.
@@ -69,7 +71,7 @@ DATA_PORT_DEVICE_NUMBER = 'Data Port Device Number'
 DATA_PORT_CHANNELS = 'Data Port Channels'
 DATA_PORT_CHANNEL_GROUPING = 'Data Port Channel Grouping'
 DATA_PORT_CHANNEL_GROUP_SPACING = 'Data Port Channel Group Spacing'
-DATA_PORT_SAMPLE_WIDTH = 'Data Port Sample Width'
+DATA_PORT_SAMPLE_SIZE = 'Data Port Sample Width'
 DATA_PORT_SAMPLE_GROUPING = 'Data Port Sample Grouping'
 DATA_PORT_INTERVAL = 'Data Port Interval Integer'
 DATA_PORT_SKIPPING_NUMERATOR = 'Data Port Interval Numerator'
@@ -251,7 +253,7 @@ class App(tk.Frame):
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.70'
+        self.VERSION = '1.71'
 ### To here for Specification Extraction
         self.args = args
         if ( self.args.extract_mode ) :
@@ -317,7 +319,7 @@ class App(tk.Frame):
                                               DataPort.MAX_CHANNEL_GROUPING) + ')',
                                           'Spacing (' + str(DataPort.MIN_CHANNEL_GROUP_SPACING) + '-' + str(
                                               DataPort.MAX_CHANNEL_GROUP_SPACING) + ')',
-                                          'Sample Size (' + str(DataPort.MIN_SAMPLE_WIDTH + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(DataPort.MAX_SAMPLE_WIDTH + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
+                                          'Sample Size (' + str(DataPort.MIN_SAMPLE_SIZE + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(DataPort.MAX_SAMPLE_SIZE + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
                                           'Sample Grouping (' + str(DataPort.MIN_SAMPLE_GROUPING + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(
                                               DataPort.MAX_SAMPLE_GROUPING + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + ')',
                                           'Interval (' + str(DataPort.MIN_INTERVAL + ( 0 if UI_IS_EXCESS_1 else 1 ) ) + '-' + str(
@@ -359,7 +361,7 @@ class App(tk.Frame):
             self.register(self.validate), '%d', '%P', DataPort.MIN_CHANNEL_GROUPING, DataPort.MAX_CHANNEL_GROUPING)
         self.channel_group_spacing_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_CHANNEL_GROUP_SPACING,
                                            DataPort.MAX_CHANNEL_GROUP_SPACING)
-        self.sample_width_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SAMPLE_WIDTH, DataPort.MAX_SAMPLE_WIDTH)
+        self.sample_size_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SAMPLE_SIZE, DataPort.MAX_SAMPLE_SIZE)
         self.sample_grouping_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SAMPLE_GROUPING, DataPort.MAX_SAMPLE_GROUPING)
         self.interval_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_INTERVAL, DataPort.MAX_INTERVAL)
         self.numerator_vcmd = (self.register(self.validate), '%d', '%P', DataPort.MIN_SKIPPING_NUMERATOR, DataPort.MAX_SKIPPING_NUMERATOR)
@@ -372,7 +374,7 @@ class App(tk.Frame):
                                            self.channels_vcmd,
                                            self.channel_grouping_vcmd,
                                            self.channel_group_spacing_vcmd,
-                                           self.sample_width_vcmd,
+                                           self.sample_size_vcmd,
                                            self.sample_grouping_vcmd,
                                            self.interval_vcmd,
                                            self.numerator_vcmd,
@@ -734,9 +736,9 @@ class App(tk.Frame):
                                                              self.interface.data_ports]
                 writer.writerow(row)
                 if ( SAVE_FILE_USING_EXCESS_ONE ) :
-                    row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG) for data_port in self.interface.data_ports]
+                    row = [ DATA_PORT_SAMPLE_SIZE ] + [str(data_port.sample_size_REG) for data_port in self.interface.data_ports]
                 else :
-                    row = [ DATA_PORT_SAMPLE_WIDTH ] + [str(data_port.sample_width_REG + 1) for data_port in self.interface.data_ports]                    
+                    row = [ DATA_PORT_SAMPLE_SIZE ] + [str(data_port.sample_size_REG + 1) for data_port in self.interface.data_ports]                    
                 writer.writerow(row)
                 if ( SAVE_FILE_USING_EXCESS_ONE ) :
                     row = [ DATA_PORT_SAMPLE_GROUPING ] + [str(data_port.sample_grouping_REG) for data_port in self.interface.data_ports]
@@ -814,7 +816,7 @@ class App(tk.Frame):
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
-                                                                                             entry_column].sample_width_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
+                                                                                             entry_column].sample_size_REG + ( 0 if UI_IS_EXCESS_1 else 1 ) )
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].delete(0, tk.END)
             self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 5 + entry_column].insert(0,
                                                                                          self.interface.data_ports[
@@ -940,7 +942,7 @@ class App(tk.Frame):
             self.interface.data_ports[entry_column].channel_group_spacing_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 3 + entry_column].get())
 
-            self.interface.data_ports[entry_column].sample_width_REG = \
+            self.interface.data_ports[entry_column].sample_size_REG = \
                 self.st_int(self.dp_entry_boxes[self.interface.NUM_DATA_PORTS * 4 + entry_column].get()) - ( 0 if UI_IS_EXCESS_1 else 1 )
 
             self.interface.data_ports[entry_column].sample_grouping_REG = \
@@ -1253,12 +1255,12 @@ class App(tk.Frame):
                     elif DATA_PORT_CHANNEL_GROUP_SPACING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             data_port.channel_group_spacing_REG = self.st_int(row[obj_count + 1])
-                    elif DATA_PORT_SAMPLE_WIDTH == row[ 0 ] :
+                    elif DATA_PORT_SAMPLE_SIZE == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             if not file_is_excess_one :
-                                data_port.sample_width_REG = self.st_int(row[obj_count + 1]) - 1
+                                data_port.sample_size_REG = self.st_int(row[obj_count + 1]) - 1
                             else :
-                                data_port.sample_width_REG = self.st_int(row[obj_count + 1])
+                                data_port.sample_size_REG = self.st_int(row[obj_count + 1])
                     elif DATA_PORT_SAMPLE_GROUPING == row[ 0 ] :
                         for obj_count, data_port in enumerate(self.interface.data_ports):
                             if not file_is_excess_one :
@@ -1724,7 +1726,7 @@ class App(tk.Frame):
         if data_port.channel_group_spacing_REG < DataPort.MIN_CHANNEL_GROUP_SPACING or data_port.channel_group_spacing_REG > \
                 DataPort.MAX_CHANNEL_GROUP_SPACING:
             error_text += 'Change Group Spacing out of range\n'
-        if data_port.sample_width_REG < DataPort.MIN_SAMPLE_WIDTH or data_port.sample_width_REG > DataPort.MAX_SAMPLE_WIDTH:
+        if data_port.sample_size_REG < DataPort.MIN_SAMPLE_SIZE or data_port.sample_size_REG > DataPort.MAX_SAMPLE_SIZE:
             error_text += 'Sample Width out of range\n'
         if data_port.sample_grouping_REG < DataPort.MIN_SAMPLE_GROUPING or data_port.sample_grouping_REG > DataPort.MAX_SAMPLE_GROUPING:
             error_text += 'Sample Grouping out of range\n'
@@ -1738,8 +1740,8 @@ class App(tk.Frame):
             error_text += 'Horizontal Start out of range\n'
         if data_port.horizontal_count_REG < 0 or data_port.horizontal_count_REG >= self.interface.MAX_COLUMNS:
             error_text += 'Horizontal Count out of range\n'
-        if ( ( data_port.sample_width_REG + 1 ) * ( data_port.channels_REG + 1 ) * ( data_port.sample_grouping_REG  + 1) ) >  ( (data_port.horizontal_count_REG + 1 ) * ( data_port.interval_REG + 1 ) ) :
-            error_text += 'A single sample frame does not fit in an interval"s worth of bit as width = ' + str( data_port.sample_width_REG ) + ', channels = ' + str( data_port.channels_REG ) + ' grouping = ' + str( data_port.sample_grouping_REG ) + ', count = ' + str( data_port.channels_REG ) + ', interval = ' + str( data_port.interval_REG )
+        if ( ( data_port.sample_size_REG + 1 ) * ( data_port.channels_REG + 1 ) * ( data_port.sample_grouping_REG  + 1) ) >  ( (data_port.horizontal_count_REG + 1 ) * ( data_port.interval_REG + 1 ) ) :
+            error_text += 'A single sample frame does not fit in an interval"s worth of bit as width = ' + str( data_port.sample_size_REG ) + ', channels = ' + str( data_port.channels_REG ) + ' grouping = ' + str( data_port.sample_grouping_REG ) + ', count = ' + str( data_port.channels_REG ) + ', interval = ' + str( data_port.interval_REG )
 
         # Check some relationships
         if data_port.horizontal_start_REG + data_port.horizontal_count_REG >= self.interface.columns_per_row :
@@ -1748,8 +1750,8 @@ class App(tk.Frame):
           #  if data_port.channel_group_spacing_REG == 0 :
            #     error_text += 'Channel_Group_Spacing cannot be 0 when SRI is set\n'
             #NDW use a channel group/channe
-#            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
-            drive_in_group = ( data_port.sample_width_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.effective_channel_grouping ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
+#            drive_in_group = ( data_port.sample_size_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.channel_grouping_REG + 1 ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
+            drive_in_group = ( data_port.sample_size_REG + 1 ) * ( data_port.sample_grouping_REG + 1 ) * ( data_port.effective_channel_grouping ) * ( data_port.bit_width_REG + 1 ) # for DataPort programming validation.   ### BUG, channel_grouping is not in this calculation properly.
             cadence_of_group = drive_in_group + data_port.channel_group_spacing_REG - 1 # for DataPort programming validation.
 
             # Subtract one before mode so that 0 wraps to max.  Subtract one from right side to match
@@ -2064,8 +2066,8 @@ class DataPort:
     MAX_OFFSET = MAX_INTERVAL
     MIN_CHANNELS = 0
     MAX_CHANNELS = 15
-    MIN_SAMPLE_WIDTH = 0
-    MAX_SAMPLE_WIDTH = 31
+    MIN_SAMPLE_SIZE = 0
+    MAX_SAMPLE_SIZE = 31
     MIN_SAMPLE_GROUPING = 0
     MAX_SAMPLE_GROUPING = 7
     MIN_CHANNEL_GROUPING = 0
@@ -2093,11 +2095,11 @@ class DataPort:
         self.number = DataPort.count
         self.device_number = 0
         # All variables that contain "_REG" correspond to registers in the specification.
-        # Example when the sample width is equal to 1 bit, sample_width_REG == 0.
+        # Example when the sample width is equal to 1 bit, sample_size_REG == 0.
         self.channels_REG = 0
         self.channel_grouping_REG = 0
         self.channel_group_spacing_REG = 0
-        self.sample_width_REG =0
+        self.sample_size_REG =0
         self.sample_grouping_REG = 0
         self.interval_REG = 0
         self.skipping_numerator_REG = 0
@@ -2129,7 +2131,7 @@ class DataPort:
         self.channel_group_is_spacing = 0
         self.sample_number_in_group = 'u'
         
-        # effect_channel_grouping is a helper variable that is calculated from channel_grouping_REG and channels_REG
+        # effective_channel_grouping is a helper variable that is calculated from channel_grouping_REG and channels_REG
         self.effective_channel_grouping = 0
         
         # These two variables are used for channel grouping.  Simpler implementations might exist.
@@ -2212,18 +2214,18 @@ class DataPort:
         self._channel_group_spacing_REG = v
 
     @property
-    def sample_width_REG(self):
-        return self._sample_width_REG
+    def sample_size_REG(self):
+        return self._sample_size_REG
 
-    @sample_width_REG.setter
-    def sample_width_REG(self, v):
+    @sample_size_REG.setter
+    def sample_size_REG(self, v):
         if type(v) != int:
             raise TypeError('Sample width must be int, got ' + str(type(v)))
-        if v > DataPort.MAX_SAMPLE_WIDTH:
-            raise ValueError('Sample width must be <= ' + str(DataPort.MAX_SAMPLE_WIDTH))
-        if v < DataPort.MIN_SAMPLE_WIDTH:
-            raise ValueError('Sample width must be >= ' + str(DataPort.MIN_SAMPLE_WIDTH))
-        self._sample_width_REG = v
+        if v > DataPort.MAX_SAMPLE_SIZE:
+            raise ValueError('Sample width must be <= ' + str(DataPort.MAX_SAMPLE_SIZE))
+        if v < DataPort.MIN_SAMPLE_SIZE:
+            raise ValueError('Sample width must be >= ' + str(DataPort.MIN_SAMPLE_SIZE))
+        self._sample_size_REG = v
 
     @property
     def sample_grouping_REG(self):
@@ -2450,22 +2452,22 @@ class DataPort:
         if Debug_Drawing : print( "dataport reset called" )
 
     def startInterval( self ) :
-#        if ( False != self.done_with_interval ) :
-#            messagebox.showwarning("Error!", "Data past end of interval: check dataport parameters (e.g., interval and offset).")
+# NDW       if ( False != self.done_with_interval ) :
+# NDW           messagebox.showwarning("Error!", "Data past end of interval: check dataport parameters (e.g., interval and offset).")
         self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
         if Debug_Drawing : print ("channel_grouping_Reg = ", self.channel_grouping_REG, " channels_REG = ", self.channels_REG )
-#       if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
-#            self.effective_channel_grouping = self.channels_REG + 1
-#        else:
-#            self.effective_channel_grouping = self.channel_grouping_REG
-#            # effective_channel_grouping is an intermediate variable for clarity
-#        if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
+# NDW      if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
+# NDW            self.effective_channel_grouping = self.channels_REG + 1
+# NDW       else:
+# NDW           self.effective_channel_grouping = self.channel_grouping_REG
+# NDW           # effective_channel_grouping is an intermediate variable for clarity
+# NDW       if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
         self.channel_group_end = self.effective_channel_grouping
         # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
 
-        self.current_bit_in_sample = self.sample_width_REG
+        self.current_bit_in_sample = self.sample_size_REG
         if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
             self.effective_channel_grouping = self.channels_REG + 1
         else:
@@ -2566,7 +2568,7 @@ class DataPort:
                                         self.channel_group_end = self.channels_REG + 1
                                     # reset sample group counter
                                     self.samples_remaining_in_sample_group = self.sample_grouping_REG
-                                    self.current_bit_in_sample = self.sample_width_REG
+                                    self.current_bit_in_sample = self.sample_size_REG
                                     self.channel_group_is_spacing = self.channel_group_spacing_REG
 #                                    assert( self.current_channel == self.channel_group_base ) # Bug or feature (channel is not multiple of channel grouping.
                                 if 0 == self.channel_group_spacing_REG : # 0 means next row.
@@ -2574,11 +2576,11 @@ class DataPort:
                                 else : # 1 for spacing means next column
                                     self.channel_group_is_spacing -= 1
                             else : # continue with current group of channels starting at the first channel in the group
-                                self.current_bit_in_sample = self.sample_width_REG
+                                self.current_bit_in_sample = self.sample_size_REG
                                 self.current_channel = self.channel_group_base
                         else : # not the end of the channel group just go to the next channel
                             if Debug_Drawing : print( "    still in the channel group" )
-                            self.current_bit_in_sample = self.sample_width_REG
+                            self.current_bit_in_sample = self.sample_size_REG
                             # TODO: This is where the output shift register would get loaded with a new sample
                 if Debug_Drawing : print( "normal end of bit" )
 
