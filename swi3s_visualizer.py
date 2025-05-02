@@ -34,6 +34,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Add data port number to the error messages.
 # Add check for Horizontal Counts that are too high.
 
+#TODOs soon:
+#  Add a test at the very beginning of startInterval that self.done_with_interval is true (assert) (mayabe qualify with SRI.
+
 # ToDos that might want to start with a re-write:
 # break dataport reset into two functions and rename so that prepare/enable/SSP portion is clear.
 # Fold up the check boxes
@@ -253,7 +256,7 @@ class App(tk.Frame):
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.71'
+        self.VERSION = '1.72'
 ### To here for Specification Extraction
         self.args = args
         if ( self.args.extract_mode ) :
@@ -907,7 +910,7 @@ class App(tk.Frame):
                 if not self.interface.data_ports[count].sri_REG and ( 0 == self.interface.data_ports[count].skipping_numerator_REG ) :
                     sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /(  self.interface.data_ports[ count ].interval_REG + 1 ) ) )
                 elif not self.interface.data_ports[count].sri_REG :
-                    if ( 0 == self.interface.data_ports[ count ].skipping_denominator_REG ) :
+                    if ( 0 == self.interface.skipping_denominator_REG ) :
                         sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) )
                     else :
                         sample_rate = "{:.2f}".format( ( ( self.interface.data_ports[ count ].sample_grouping_REG + 1 ) * self.interface.row_rate /( self.interface.data_ports[ count ].interval_REG + 1 ) ) *
@@ -1787,25 +1790,28 @@ class App(tk.Frame):
 
         started = False
         Row = 0
-        frac_accum = 0 # accumlate to decide when to skip this transport opportunity
+        frac_accum = 0 # accumlate to decide when to skip a transport opportunity
         interval_counter = 0
         end_of_interval = False
 
         if Debug_Drawing : print ( 'about to raster' )
         data_port.reset()
 
-        # Row counter is not part of the needed data port mechanism but is to support drawing
+        # Row counter is to support drawing
         for row_counter in range( 0, self.rows_in_frame, 1 ) : 
             if Debug_Drawing : print ( 'row_counter={},'.format( row_counter ) )
             Row += 1
-            data_port.new_row( row_counter, self.interface.skipping_denominator_REG )
+            data_port.new_row( row_counter,
+                               self.interface.skipping_denominator_REG )
 ### To here for Specification Extraction
             if True : # insert old method stuff here from files names scr
 ### Cut from here for Specification Extraction
                 last_bit_was_driven = 0
                 column_counter = 0
                 while column_counter < self.interface.columns_per_row :
-                    width, rrrr, data_port.sample_number_in_group = data_port.try_bit( row_counter, column_counter, self.interface.skipping_denominator_REG )
+                    width, rrrr, data_port.sample_number_in_group = data_port.try_bit( row_counter,
+                                                                                       column_counter,
+                                                                                       self.interface.skipping_denominator_REG )
                     if Debug_Drawing : print ( 'result from try_bit = "{}"'.format( width, rrrr ) )
                     if NOT_OWNED == rrrr :
                         rrrr = data_port.get_guard_or_tails()
@@ -1815,22 +1821,26 @@ class App(tk.Frame):
                                 if data_port.source_REG and data_port.handover :
                                     self.draw_handover( row_counter, column_counter, data_port.device_number)
                                     self.update_col_in_frame_model(row_counter, column_counter, data_port.number,
-                                                                   data_port.source_REG, 0, 'HANDOVER', data_port.sample_number_in_group)
+                                                                   data_port.source_REG, 0, 'HANDOVER',
+                                                                   data_port.sample_number_in_group)
                             last_bit_was_driven = False
                         elif "tail" == rrrr :
                             if Debug_Drawing : print( 'calling draw tail' )
                             self.draw_tail( row_counter, column_counter, data_port.device_number, color )
-                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG, width, rrrr, 0 )
+                            self.update_col_in_frame_model(row_counter, column_counter, data_port.number,
+                                                           data_port.source_REG, width, rrrr, 0 )
                             last_bit_was_driven = True
                         elif 'G' == rrrr :
-                            self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number ) #, data_port.sample_grouping_REG - data_port.samples_remaining_in_sample_group, data_port.current_channel, data_port.current_bit_in_sample )
+                            self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color,
+                                                 data_port.number )
                             self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
                                                            width, rrrr, 0)
                             last_bit_was_driven = True
                         else :
                             error()
                     else :
-                        self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color, data_port.number)
+                        self.write_bit_slot( row_counter, column_counter, width, data_port.source_REG, rrrr, color,
+                                             data_port.number)
                         self.update_col_in_frame_model(row_counter, column_counter, data_port.number, data_port.source_REG,
                                                        width, rrrr, data_port.sample_number_in_group)
                         last_bit_was_driven = True
@@ -2452,18 +2462,10 @@ class DataPort:
         if Debug_Drawing : print( "dataport reset called" )
 
     def startInterval( self ) :
-# NDW       if ( False != self.done_with_interval ) :
-# NDW           messagebox.showwarning("Error!", "Data past end of interval: check dataport parameters (e.g., interval and offset).")
         self.samples_remaining_in_sample_group = self.sample_grouping_REG
         self.channel_group_base = 0 # Like current_channel, starts at 0
         self.current_channel = 0
         if Debug_Drawing : print ("channel_grouping_Reg = ", self.channel_grouping_REG, " channels_REG = ", self.channels_REG )
-# NDW      if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
-# NDW            self.effective_channel_grouping = self.channels_REG + 1
-# NDW       else:
-# NDW           self.effective_channel_grouping = self.channel_grouping_REG
-# NDW           # effective_channel_grouping is an intermediate variable for clarity
-# NDW       if Debug_Drawing : print ( "effective_channel_grouping = ", self.effective_channel_grouping )
         self.channel_group_end = self.effective_channel_grouping
         # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
 
@@ -2480,10 +2482,12 @@ class DataPort:
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: Data Port behavior per bit
-    # This is called for each possible column that could start a bit (or wide bit).  This is not called more than once per data bit.
-    # try_bit returns a tuple containing
+    # This is called for each possible column that could start a bit (or wide bit).
+    # This is not called more than once per data bit.
+    # The funciton try_bit returns a tuple containing
     # 1. the width (integer) of the "bit" (how many UIs) and
     # 2. the value to drive (a string coding ownership or the bit address withing the sample frames)
+    # 3. the Sample Frame Offset (withing the current group of Sample) for the rendered bit.
     def try_bit( self, row_number, column_number, denominator_REG ) :
         if Debug_Drawing : print( 'try_bit called with DP={:d}, row={:d}, column={:d}'.format( self.number, row_number, column_number ) )
         ret_value = 'error'
@@ -2632,7 +2636,7 @@ class DataPort:
                 # These lines are for the optional skipping feature
                 if ( self.skipping_numerator_REG != 0 ) :
                     self.accumulated_fraction += self.skipping_numerator_REG
-                    if self.accumulated_fraction >= denominator_REG : # Accumulated_fraction should be zero whenever and SSP occurs.
+                    if self.accumulated_fraction >= denominator_REG : # Accumulated_fraction should be zero whenever SSPA occurs.
                         self.done_with_interval = True
                         self.accumulated_fraction -= denominator_REG
                         if Debug_Drawing : print( 'leaving new_row early due to skipping' )
