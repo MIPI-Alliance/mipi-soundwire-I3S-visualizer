@@ -16,6 +16,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Break lines
 
 # To Do
+# Fix Manager Data port handling with regard to tails and handovers (should not show no collisions at end of row) to handle "PCM & PCM Stream with PHY Tail Bits properly.
 # Add CDS Start control and S1 tails and rename  "CDS/S0 Handover Width" (actually controlling the S1 tail) to be S1 tail width.
 # Have the tools import data files that use SampleWidth (old name) and SampleSize (new name)
 # Rename CDS/S0 Handover Width to pre and post (and go in the system group of fields).
@@ -256,7 +257,7 @@ class App(tk.Frame):
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.72'
+        self.VERSION = '1.73'
 ### To here for Specification Extraction
         self.args = args
         if ( self.args.extract_mode ) :
@@ -350,7 +351,9 @@ class App(tk.Frame):
 
         self.interface = Interface()
 
-        self.master.title('SoundWire I3S Payload Visualizer v' + self.VERSION)
+### Cut from here for Specification Extraction
+        self.master.title('SoundWire I3S v1.0 Payload Visualizer v' + self.VERSION)
+### To here for Specification Extraction
         self.master.minsize(window_width, window_height)
         self.master.geometry("+150+50")
         self.master.resizable(False, True)
@@ -2467,7 +2470,7 @@ class DataPort:
         self.current_channel = 0
         if Debug_Drawing : print ("channel_grouping_Reg = ", self.channel_grouping_REG, " channels_REG = ", self.channels_REG )
         self.channel_group_end = self.effective_channel_grouping
-        # as soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
+        # As soon as (just after last bit in sample) the current channel gets here, it is time for spacing.
 
         self.current_bit_in_sample = self.sample_size_REG
         if self.channel_grouping_REG == 0 or self.channel_grouping_REG > self.channels_REG : # or self.sri_REG:
@@ -2484,7 +2487,7 @@ class DataPort:
 # Visualizer Source Code Fragment: Data Port behavior per bit
     # This is called for each possible column that could start a bit (or wide bit).
     # This is not called more than once per data bit.
-    # The funciton try_bit returns a tuple containing
+    # The function try_bit returns a tuple containing:
     # 1. the width (integer) of the "bit" (how many UIs) and
     # 2. the value to drive (a string coding ownership or the bit address withing the sample frames)
     # 3. the Sample Frame Offset (withing the current group of Sample) for the rendered bit.
@@ -2525,7 +2528,7 @@ class DataPort:
                     self.end_of_row = True 
                 return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
             
-            else : # In between HSTART and ( HSTART + HCOUNT ), inclusive.
+            else : # In between horizontal_start and ( horizontal_start + horizontal_count ), inclusive.
                 self.sample_number_in_group = self.sample_grouping_REG - self.samples_remaining_in_sample_group
                 if self.channel_group_is_spacing > 0 :
                     self.channel_group_is_spacing -= 1
@@ -2533,7 +2536,7 @@ class DataPort:
                     return 0, NOT_OWNED, 0 # self.drive_guards_and_tails()
 
                 # last_value_sent would be this value of this return  <--- what the heck does this mean?
-                else : # done with any bit widening
+                else : # Done with any bit widening.
                     if Debug_Drawing : print( '    Done with wide bit, going on to next bit (if it exists)' )
                     if ( self.current_bit_in_sample >= 0 ) :
                         if Debug_Drawing : print( '    There is at least one bit left in the current sample' )
@@ -2544,10 +2547,10 @@ class DataPort:
                         # Done will all bits in the current sample.  Go to the next channel or frame
                         if Debug_Drawing : print( '    going on to next channel (if it exists) channel_group_end = ', self.channel_group_end, " current_channel = ", self.current_channel )
                         self.current_channel += 1
-                        if self.channel_group_end <= self.current_channel : # are we at the end of the channel group
+                        if self.channel_group_end <= self.current_channel : # Are we at the end of the channel group?
                             if Debug_Drawing : print( '    end of channel group' )
                             self.samples_remaining_in_sample_group -= 1
-                            if 0 > self.samples_remaining_in_sample_group : # done with sample group ?
+                            if 0 > self.samples_remaining_in_sample_group : # Done with sample group ?
                                 if Debug_Drawing : print( 'finished sample group' )
                                 self.sample_number_in_group += 1
                                 if self.sample_number_in_group >= self.sample_grouping_REG :
@@ -2563,14 +2566,14 @@ class DataPort:
                                         self.channel_group_is_spacing = self.channel_group_spacing_REG
                                         self.startInterval()
  
-                                else : # we are not at the last channel and so need to go to the next channel group.
+                                else : # We are not at the last channel and so need to go to the next channel group.
                                     if Debug_Drawing : print( "starting next channel group (After spacing)" )
                                     self.channel_group_base += self.effective_channel_grouping
                                     self.channel_group_end += self.effective_channel_grouping
-                                    # clip when last group of channels is smaller
+                                    # Clip when last group of channels is smaller.
                                     if self.channel_group_end > self.channels_REG :
                                         self.channel_group_end = self.channels_REG + 1
-                                    # reset sample group counter
+                                    # Reset sample group counter.
                                     self.samples_remaining_in_sample_group = self.sample_grouping_REG
                                     self.current_bit_in_sample = self.sample_size_REG
                                     self.channel_group_is_spacing = self.channel_group_spacing_REG
@@ -2579,10 +2582,10 @@ class DataPort:
                                     self.end_of_row = True
                                 else : # 1 for spacing means next column
                                     self.channel_group_is_spacing -= 1
-                            else : # continue with current group of channels starting at the first channel in the group
+                            else : # Continue with current group of channels starting at the first channel in the group.
                                 self.current_bit_in_sample = self.sample_size_REG
                                 self.current_channel = self.channel_group_base
-                        else : # not the end of the channel group just go to the next channel
+                        else : # Not the end of the channel group just go to the next channel.
                             if Debug_Drawing : print( "    still in the channel group" )
                             self.current_bit_in_sample = self.sample_size_REG
                             # TODO: This is where the output shift register would get loaded with a new sample
@@ -2595,7 +2598,7 @@ class DataPort:
         if ( self.sri_REG ) :
             if Debug_Drawing : print( "SRI noted near end") 
             if ( column_number == self.horizontal_start_REG + self.horizontal_count_REG ) :
-                # for SRI, these variable need to be reset so that things start the same each row.
+                # For SRI, these variable need to be reset so that things start the same each row.
                 if Debug_Drawing : print( "special SRI check worked" )
                 self.started = False
                 self.done_with_interval = True
