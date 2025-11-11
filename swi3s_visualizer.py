@@ -1793,7 +1793,7 @@ class App(tk.Frame):
 
         started = False
         Row = 0
-        frac_accum = 0 # accumlate to decide when to skip a transport opportunity
+        frac_accum = 0 # accumulate to decide when to skip a transport opportunity
         interval_counter = 0
         end_of_interval = False
 
@@ -2133,7 +2133,7 @@ class DataPort:
         self.inManager = False
         self.sample_rate = 0
         
-        # The following variables might correpond closely to a real implementation
+        # The following variables might correspond closely to a real implementation
         self.current_offset_in_interval = -1
         self.current_channel = 0
         self.current_sample_index = 0
@@ -2151,8 +2151,8 @@ class DataPort:
         self.channel_group_end = 0
         self.channel_group_base = 0
         
-        # The following variables are use for housekeeping
-        # and error checking in this tools and would likely not exist in real implementations
+        # The following variables are used for housekeeping
+        # and error checking in this tool and would likely not exist in real implementations
         self.done_with_interval = False
         self.last_column_evaluated = -1
         self.last_row_evaluated = -1
@@ -2520,7 +2520,7 @@ class DataPort:
             elif column_number > self.horizontal_start_REG + self.horizontal_count_REG :
                 if Debug_Drawing : print( '    hit h_stop, setting done_with_row True horizontal_start={}, hstop={}'.format(self.horizontal_start_REG, self.horizontal_count_REG ) )
                 self.done_with_row = True
-                self.channel_group_is_spacing = 0;
+                self.channel_group_is_spacing = 0
                 if self.sri_REG :
                     if Debug_Drawing : print( "ending interval due to SRI" )
                     self.started = False
@@ -2598,7 +2598,7 @@ class DataPort:
         if ( self.sri_REG ) :
             if Debug_Drawing : print( "SRI noted near end") 
             if ( column_number == self.horizontal_start_REG + self.horizontal_count_REG ) :
-                # For SRI, these variable need to be reset so that things start the same each row.
+                # For SRI, these variables need to be reset so that things start the same each row.
                 if Debug_Drawing : print( "special SRI check worked" )
                 self.started = False
                 self.done_with_interval = True
@@ -2620,7 +2620,7 @@ class DataPort:
         else :
             assert( self.last_row_evaluated + 1 == row_number )
             self.last_row_evaluated = row_number
-            self.last_column_evaluatted = -1
+            self.last_column_evaluated = -1
             self.end_of_row = False
             self.current_offset_in_interval += 1
             # Current_offset_in_interval should be 0 anytime an SSP occurs
