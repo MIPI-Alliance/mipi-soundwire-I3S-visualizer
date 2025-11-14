@@ -10,7 +10,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -25,9 +25,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -39,9 +39,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 2,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -53,9 +53,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -71,7 +71,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -86,9 +86,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -100,9 +100,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 2,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -114,9 +114,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -132,7 +132,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -147,9 +147,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -161,9 +161,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 2,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -175,9 +175,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -193,7 +193,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -208,9 +208,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -222,9 +222,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 2,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -236,9 +236,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -254,7 +254,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -269,9 +269,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -283,9 +283,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 2,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -297,9 +297,9 @@
                             "dir": "SINK",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 }

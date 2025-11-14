@@ -10,7 +10,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -25,9 +25,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 0,
-                            "channel": "0",
+                            "channel": 0,
                             "sample": 0,
-                            "bit_num": "-1"
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -43,7 +43,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -58,9 +58,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 0,
-                            "channel": "0",
+                            "channel": 0,
                             "sample": 0,
-                            "bit_num": "-1"
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -76,7 +76,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -91,9 +91,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 0,
-                            "channel": "0",
+                            "channel": 0,
                             "sample": 0,
-                            "bit_num": "-1"
+                            "bit_num": 0
                         }
                     ]
                 }
@@ -109,7 +109,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -124,9 +124,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 0,
-                            "channel": "0",
+                            "channel": 0,
                             "sample": 0,
-                            "bit_num": "-1"
+                            "bit_num": 0
                         }
                     ]
                 }

@@ -10,7 +10,7 @@
                             "slot_type": "S1",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -24,7 +24,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -38,7 +38,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -52,7 +52,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -67,9 +67,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -80,7 +80,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 3,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -95,9 +95,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -108,7 +108,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 6,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -123,9 +123,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 2,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -136,7 +136,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 2,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -151,9 +151,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 4,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -164,7 +164,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 4,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -190,7 +190,7 @@
                             "slot_type": "S0",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -209,7 +209,7 @@
                             "slot_type": "S1",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -223,7 +223,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -237,7 +237,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -251,7 +251,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -266,9 +266,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -279,7 +279,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 3,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -294,9 +294,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -307,7 +307,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 6,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -322,9 +322,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 2,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -335,7 +335,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 2,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -350,9 +350,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 4,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -363,7 +363,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 4,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -389,7 +389,7 @@
                             "slot_type": "S0",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -408,7 +408,7 @@
                             "slot_type": "S1",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -422,7 +422,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -436,7 +436,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -450,7 +450,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -465,9 +465,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -478,7 +478,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 3,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -493,9 +493,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -506,7 +506,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 6,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -521,9 +521,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 2,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -534,7 +534,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 2,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -549,9 +549,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 4,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -562,7 +562,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 4,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -588,7 +588,7 @@
                             "slot_type": "S0",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -607,7 +607,7 @@
                             "slot_type": "S1",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -621,7 +621,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -635,7 +635,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -649,7 +649,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -664,9 +664,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -677,7 +677,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 3,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -692,9 +692,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -705,7 +705,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 6,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -720,9 +720,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 2,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -733,7 +733,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 2,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -748,9 +748,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 4,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -761,7 +761,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 4,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -787,7 +787,7 @@
                             "slot_type": "S0",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -806,7 +806,7 @@
                             "slot_type": "S1",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -820,7 +820,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -834,7 +834,7 @@
                             "slot_type": "CDS",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -848,7 +848,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -863,9 +863,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 3,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -876,7 +876,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 3,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -891,9 +891,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 6,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -904,7 +904,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 6,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -919,9 +919,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 2,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -932,7 +932,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 2,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -947,9 +947,9 @@
                             "dir": "SOURCE",
                             "device_num": 0,
                             "dp_num": 4,
-                            "channel": "0",
-                            "sample": 0,
-                            "bit_num": "-1"
+                            "channel": 0,
+                            "sample": 1,
+                            "bit_num": 0
                         }
                     ]
                 },
@@ -960,7 +960,7 @@
                             "slot_type": "HANDOVER",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 4,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0
@@ -986,7 +986,7 @@
                             "slot_type": "S0",
                             "dir": "SINK",
                             "device_num": 0,
-                            "dp_num": 0,
+                            "dp_num": "None",
                             "channel": 0,
                             "sample": 0,
                             "bit_num": 0

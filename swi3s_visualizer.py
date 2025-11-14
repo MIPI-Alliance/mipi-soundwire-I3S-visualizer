@@ -44,6 +44,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 # Change the symbol between S1 and Control to show the funny Manager handover
 # Read in wav files per data port and place in output
 
+# Fix sample number in the test files so they do not increment when going to bit 0.  Maybe double check wide bits.
 # Add error checking to make sure (h_count + 1) mod (bit_width + 1) == 0 (to prevent crash).  This seems like a bad thing to do.  Better to fix the crash.
 # Fixed tail & guard bits when using channel grouping. Now after the last bitslot driven in each row.
 
@@ -257,7 +258,7 @@ class App(tk.Frame):
 
 ### Cut from here for Specification Extraction
 # Visualizer Source Code Fragment: source code version
-        self.VERSION = '1.73'
+        self.VERSION = '1.74'
 ### To here for Specification Extraction
         self.args = args
         if ( self.args.extract_mode ) :
@@ -1661,8 +1662,8 @@ class App(tk.Frame):
             bit_num = 0
             m = re.fullmatch("^c([0-9]+)b(-?[0-9]+)$", rrrr)
             if (m):
-                chan     = m.group(1)
-                bit_num  = m.group(2)
+                chan     = int(m.group(1))
+                bit_num  = int(m.group(2))
             else:
                 if Debug_Drawing : print(f'Error: update_col_in_frame_model called with rrrr = {rrrr}')
                 exit(1)
@@ -1670,7 +1671,7 @@ class App(tk.Frame):
             si.bit_num = bit_num
             si.sample = sample_num_in_group
 
-        if True or ( si.slot_type == Slot_type.HANDOVER ) or ( si.slot_type == Slot_type.CDS ) or ( si.slot_type == Slot_type.S0 ) or ( si.slot_type == Slot_type.S1 ) :
+        if ( si.slot_type == Slot_type.HANDOVER ) or ( si.slot_type == Slot_type.CDS ) or ( si.slot_type == Slot_type.S0 ) or ( si.slot_type == Slot_type.S1 ) :
             si.dp_num = 'None'
                        
         for i in range(0, width+1):
