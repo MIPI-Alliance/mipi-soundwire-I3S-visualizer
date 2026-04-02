@@ -1,0 +1,107 @@
+{
+  "num_rows": 2,
+  "num_columns": 24,
+  "row_rate": 3072,
+  "bits": {
+    "0": {
+      "row": 0,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "1": {
+      "row": 0,
+      "column": 1,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "2": {
+      "row": 0,
+      "column": 2,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "24": {
+      "row": 1,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "25": {
+      "row": 1,
+      "column": 1,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "26": {
+      "row": 1,
+      "column": 2,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    }
+  },
+  "bus_clashes": [],
+  "device_clashes": [],
+  "read_overlaps": [],
+  "warnings": {}
+}

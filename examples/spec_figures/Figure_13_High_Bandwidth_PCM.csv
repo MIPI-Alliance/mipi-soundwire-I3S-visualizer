@@ -1,0 +1,48 @@
+NumColumns_REG,15
+SkippingDenominator_REG,16
+PHY3Enabled,True
+S0Width,2
+S1TailWidth_REG,0
+EnforceS1Handover,True
+CDS_BitWidth_REG,0
+CDS_GuardEnabled_REG,False
+CDS_GuardPolarity_REG,False
+CDS_TailWidth_REG,0
+EnforceCDSHandover,True
+RowRate,3072
+RowsToDraw,17
+Description,"Figure 13 is 3.072 MRows/sec × 16 columns = 49.152 Mbps
+The audio streams in this Transport Pattern are:
+6 channels of 192 kHz × 24 bits.
+The SSP Rate in this example is 192 kHz, because the Transport Pattern repeats every 16 Rows."
+DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ManagerDataport,False,False,False,False,False,False,False,False,False,False,False,False
+Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
+EnableCh_REG,0b0,0b0,0b0,0b111111,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0
+SampleSize_REG,0,0,0,23,0,0,0,0,0,0,0,0
+SampleGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ChannelGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
+Spacing_REG,0,0,0,3,0,0,0,0,0,0,0,0
+Interval_REG,0,0,0,15,0,0,0,0,0,0,0,0
+Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
+HorizontalStart_REG,0,0,0,4,0,0,0,0,0,0,0,0
+HorizontalCount_REG,0,0,0,8,0,0,0,0,0,0,0,0
+TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+SkippingNumerator_REG,0,0,0,0,0,0,0,0,0,0,0,0
+PortDirection_REG,False,False,False,False,False,False,False,False,False,False,False,False
+EnforceHandover,False,False,False,True,False,False,False,False,False,False,False,False
+GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
+GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
+SubRowInterval_REG,False,False,False,False,False,False,False,False,False,False,False,False
+Enabled,False,False,False,True,False,False,False,False,False,False,False,False
+DisplayFields,cb,cb,cb,sc,cb,cb,cb,cb,cb,cb,cb,cb
+FlowMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
+PortMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
+FCP_HorizontalStart_REG,0,0,0,4,0,0,0,0,0,0,0,0
+FCP_BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
+FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False

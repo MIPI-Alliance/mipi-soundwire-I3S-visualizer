@@ -1,0 +1,28 @@
+{
+  "total_tests": 84,
+  "passed": 84,
+  "total_bits": 11944,
+  "total_slots": 13287,
+  "total_handovers": 2574,
+  "bus_clashes": 16,
+  "device_clashes": 3,
+  "read_overlaps": 64,
+  "slot_types": {
+    "S1": 772,
+    "TAIL": 284,
+    "HANDOVER": 2574,
+    "CDS": 1187,
+    "NORMAL": 7081,
+    "S0": 996,
+    "GUARD_0": 285,
+    "DRQ": 40,
+    "TX_PRESENT": 36,
+    "GUARD_1": 32
+  },
+  "directions": {
+    "SOURCE": 11836,
+    "SINK": 1451
+  },
+  "elapsed_time": 16.15910315513611,
+  "timestamp": "2026-04-03T14:36:58.994107"
+}

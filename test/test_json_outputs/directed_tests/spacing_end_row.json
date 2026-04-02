@@ -1,0 +1,651 @@
+{
+  "num_rows": 4,
+  "num_columns": 24,
+  "row_rate": 3072,
+  "bits": {
+    "0": {
+      "row": 0,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "4": {
+      "row": 0,
+      "column": 4,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "5": {
+      "row": 0,
+      "column": 5,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "6": {
+      "row": 0,
+      "column": 6,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "7": {
+      "row": 0,
+      "column": 7,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "8": {
+      "row": 0,
+      "column": 8,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 1,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "9": {
+      "row": 0,
+      "column": 9,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 1,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "10": {
+      "row": 0,
+      "column": 10,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 1,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "11": {
+      "row": 0,
+      "column": 11,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 1,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "12": {
+      "row": 0,
+      "column": 12,
+      "slots": [
+        {
+          "slot": "HANDOVER",
+          "direction": "SOURCE",
+          "device": -3,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "24": {
+      "row": 1,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "28": {
+      "row": 1,
+      "column": 4,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 2,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "29": {
+      "row": 1,
+      "column": 5,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 2,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "30": {
+      "row": 1,
+      "column": 6,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 2,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "31": {
+      "row": 1,
+      "column": 7,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 2,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "32": {
+      "row": 1,
+      "column": 8,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 3,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "33": {
+      "row": 1,
+      "column": 9,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 3,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "34": {
+      "row": 1,
+      "column": 10,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 3,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "35": {
+      "row": 1,
+      "column": 11,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 0,
+          "channel": 3,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "36": {
+      "row": 1,
+      "column": 12,
+      "slots": [
+        {
+          "slot": "HANDOVER",
+          "direction": "SOURCE",
+          "device": -3,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "48": {
+      "row": 2,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "52": {
+      "row": 2,
+      "column": 4,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 0,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "53": {
+      "row": 2,
+      "column": 5,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 0,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "54": {
+      "row": 2,
+      "column": 6,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 0,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "55": {
+      "row": 2,
+      "column": 7,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "56": {
+      "row": 2,
+      "column": 8,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 1,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "57": {
+      "row": 2,
+      "column": 9,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 1,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "58": {
+      "row": 2,
+      "column": 10,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 1,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "59": {
+      "row": 2,
+      "column": 11,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 1,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "60": {
+      "row": 2,
+      "column": 12,
+      "slots": [
+        {
+          "slot": "HANDOVER",
+          "direction": "SOURCE",
+          "device": -3,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "72": {
+      "row": 3,
+      "column": 0,
+      "slots": [
+        {
+          "slot": "CDS",
+          "direction": "SOURCE",
+          "device": -2,
+          "dp": null,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "76": {
+      "row": 3,
+      "column": 4,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 2,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "77": {
+      "row": 3,
+      "column": 5,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 2,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "78": {
+      "row": 3,
+      "column": 6,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 2,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "79": {
+      "row": 3,
+      "column": 7,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 2,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "80": {
+      "row": 3,
+      "column": 8,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 3,
+          "bit": 3,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "81": {
+      "row": 3,
+      "column": 9,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 3,
+          "bit": 2,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "82": {
+      "row": 3,
+      "column": 10,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 3,
+          "bit": 1,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "83": {
+      "row": 3,
+      "column": 11,
+      "slots": [
+        {
+          "slot": "NORMAL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 0,
+          "sample": 1,
+          "channel": 3,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "84": {
+      "row": 3,
+      "column": 12,
+      "slots": [
+        {
+          "slot": "HANDOVER",
+          "direction": "SOURCE",
+          "device": -3,
+          "dp": 0,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    }
+  },
+  "bus_clashes": [],
+  "device_clashes": [],
+  "read_overlaps": [],
+  "warnings": {}
+}

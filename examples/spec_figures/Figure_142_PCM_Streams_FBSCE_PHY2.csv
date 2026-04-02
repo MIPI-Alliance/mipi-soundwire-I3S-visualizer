@@ -1,0 +1,50 @@
+NumColumns_REG,15
+SkippingDenominator_REG,16
+PHY3Enabled,False
+S0Width,1
+S1TailWidth_REG,0
+EnforceS1Handover,False
+CDS_BitWidth_REG,0
+CDS_GuardEnabled_REG,False
+CDS_GuardPolarity_REG,False
+CDS_TailWidth_REG,0
+EnforceCDSHandover,True
+RowRate,384
+Description,"The Clock Config in Figure 142 is 384 kRows/sec × 16 columns = 6.144 Mbps.
+The audio streams in the Transport Pattern are:
+• Manager: 2 channels of 48 kHz × 16-bit PCM.
+• Peripheral 3: 2 channels of 48 kHz × 16-bit PCM.
+• Peripheral 4: 2 channels of 48 kHz × 16-bit PCM.
+The SSP Rate in this example is 48 kHz because the pattern repeats every 8 Rows."
+RowsToDraw,9
+DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ManagerDataport,False,False,False,True,False,False,False,False,False,False,False,False
+EnableCh_REG,0b0,0b1,0b1,0b1,0b0,0b1,0b1,0b0,0b1,0b0,0b0,0b0
+SampleSize_REG,0,15,15,15,0,15,15,0,15,0,0,0
+SampleGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ChannelGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
+Spacing_REG,0,0,0,0,0,0,0,0,0,0,0,0
+Interval_REG,0,7,7,7,0,7,7,0,7,0,0,0
+Offset_REG,0,2,4,0,0,4,6,0,0,0,0,0
+HorizontalStart_REG,0,7,2,2,0,7,7,0,7,0,0,0
+HorizontalCount_REG,0,7,3,3,0,7,7,0,7,0,0,0
+TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+SkippingNumerator_REG,0,0,0,0,0,0,0,0,0,0,0,0
+PortDirection_REG,False,False,False,False,False,False,False,False,False,False,False,False
+GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
+GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
+SubRowInterval_REG,False,False,False,False,False,False,False,False,False,False,False,False
+FlowMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
+PortMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
+ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
+FCP_HorizontalStart_REG,0,4,4,4,0,4,4,0,4,0,0,0
+FCP_BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
+FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
+Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
+EnforceHandover,False,True,True,True,False,True,True,False,True,False,False,False
+Enabled,False,True,True,True,False,True,True,False,True,False,False,False
+DisplayFields,cb,sc,sc,sc,cb,sc,sc,cb,sc,cb,cb,cb
