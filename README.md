@@ -1,17 +1,17 @@
-# SWI3S Visualizer v2.0
+# SWI3S Traffic Visualizer
 
-MIPI SoundWire I3S Frame Visualizer - A tool for visualizing and validating SoundWire I3S frame configurations.
+MIPI SoundWire I3S Traffic Visualizer - A tool for visualizing SoundWire I3S data port configurations.
 
 ## Overview
 
 This application provides both a graphical user interface (GUI) and command-line batch mode for:
 
-- Visualizing SoundWire I3S frame layouts
-- Configuring interface parameters (columns, PHY settings, CDS/S0/S1 timing)
+- Visualizing SoundWire I3S transport patterns
+- Configuring interface parameters (Columns per row, CDS, S0 & S1)
 - Configuring up to 12 data ports with PCM or PDM streams
 - Supporting Flow Control modes with TxP and DRQ bits
 - Detecting bus clashes and read/write conflicts
-- Exporting frame models to JSON for further analysis
+- Exporting symbolic bus trafic to JSON for further analysis
 - Loading and saving configurations via CSV files
 
 ## Requirements
@@ -74,7 +74,7 @@ python swi3s_visualizer.py
 This opens the graphical interface where you can:
 - Adjust interface parameters in the top panel
 - Configure data ports in the middle panel
-- View the frame visualization in the canvas area
+- View traffic visualization in the canvas area
 - Save/load configurations via File menu
 
 ### Batch Mode (Headless)
@@ -126,11 +126,9 @@ See `examples/` for example configurations.
 ### JSON Output
 
 The JSON frame model output contains:
-- Frame dimensions and timing parameters
 - Per-slot ownership and state information
 - TxP and DRQ bit locations (for Flow Control modes)
 - Clash detection results
-- Data port configuration summary
 
 ## Project Structure
 
@@ -172,7 +170,6 @@ mipi-soundwire-I3S-visualizer/
 │   ├── testsuite.py       # Test runner with summary generation
 │   ├── summary.md         # Test statistics (generated after each run)
 │   └── test_json_outputs/ # Expected JSON outputs for tests
-├── docs/                  # Additional documentation
 ├── requirements.txt       # Python dependencies
 ├── architecture.md        # Detailed architecture documentation
 ├── LICENSE.md             # BSD 3-Clause License
@@ -189,7 +186,7 @@ rm -rf temp && python testsuite.py
 
 The test suite:
 1. Runs each CSV configuration through the visualizer in batch mode
-2. Compares generated JSON output against reference files
+2. Compares generated JSON output against reference JSON files
 3. Generates a detailed `summary.md` with test statistics
 4. Cleans up temporary files after completion
 
@@ -208,27 +205,27 @@ python testsuite.py --regenerate
 | Parameter | Description |
 |-----------|-------------|
 | `NumColumns_REG` | Number of columns per row (excess-1 encoded) |
-| `PHY3Enabled` | Enable S0/S1 PHY layer bits |
-| `SkippingDenominator_REG` | Frame skipping denominator |
+| `PHY3Enabled` | Enable S0/S1 bit slots |
+| `SkippingDenominator_REG` | Skipping interval denominator |
 | `CDS_BitWidth_REG` | Control Data Stream bit width |
-| `S0Width` | S0 synchronization width |
+| `S0Width` | S0 width |
 | `S1TailWidth_REG` | S1 tail width |
 
 ### Data Port Parameters
 
 | Parameter | Description |
 |-----------|-------------|
-| `EnableCh_REG` | Channel enable bitmap (e.g., 0b11111 for 5 channels) |
+| `EnableCh_REG` | Channel enables (e.g., 0b11111 for channels 0-4) |
 | `SampleSize_REG` | Sample width in bits (excess-1 encoded) |
 | `SampleGrouping_REG` | Samples grouped per transport (excess-1 encoded) |
 | `ChannelGrouping_REG` | Channels grouped before spacing |
 | `Spacing_REG` | Slots between channel groups |
-| `Interval_REG` | Rows per transport pattern (excess-1 encoded) |
+| `Interval_REG` | Rows per interval (excess-1 encoded) |
 | `Offset_REG` | Row offset for first transport |
 | `HorizontalStart_REG` | Starting column |
 | `HorizontalCount_REG` | Columns owned per row |
-| `PortDirection_REG` | True = Sink (read), False = Source (write) |
-| `SubRowInterval_REG` | Enable sub-row interval mode |
+| `PortDirection_REG` | 1 = Sink, 0 = Source |
+| `SubRowInterval_REG` | Enable Sub-Row Interval mode |
 | `FlowMode_REG` | Flow control mode |
 
 ### Flow Control Modes
