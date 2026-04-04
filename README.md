@@ -1,6 +1,6 @@
 # SWI3S Visualizer v2.0
 
-MIPI SoundWire I3S Frame Visualizer - A tool for visualizing and validating SoundWire Isochronous 3-wire Serial (I3S) frame configurations.
+MIPI SoundWire I3S Frame Visualizer - A tool for visualizing and validating SoundWire I3S frame configurations.
 
 ## Overview
 
