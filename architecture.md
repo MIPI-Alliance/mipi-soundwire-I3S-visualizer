@@ -1,6 +1,6 @@
 # SWI3S Visualizer Architecture
 
-This document describes the architecture of the SWI3S Visualizer, a tool for visualizing MIPI SoundWire Isochronous 3-wire Serial (I3S) frame configurations.
+This document describes the architecture of the SWI3S Visualizer, a tool for visualizing MIPI SoundWire I3S data port configurations.
 
 ## Table of Contents
 
@@ -19,7 +19,7 @@ This document describes the architecture of the SWI3S Visualizer, a tool for vis
 
 ## Overview
 
-The SWI3S Visualizer is a Python application that renders SoundWire I3S frame configurations. It supports:
+The SWI3S Visualizer is a Python application that renders SoundWire I3S data port configurations. It supports:
 
 - **GUI Mode**: Interactive tkinter-based interface for real-time visualization
 - **Headless Mode**: Command-line batch processing for automated testing
