@@ -110,7 +110,7 @@ class JSONHandler:
             bus_model = BusModel(
                 num_rows=data['num_rows'],
                 num_columns=data['num_columns'],
-                row_rate=data.get('row_rate', 3072)  # Default if not present
+                row_rate=data.get('row_rate', 3072.0)  # Default if not present
             )
 
             # Load bits - new hierarchical format: bits is dict keyed by bit_index

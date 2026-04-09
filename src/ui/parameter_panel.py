@@ -34,6 +34,7 @@ from src.ui.helpers import (
     get_interface_labels,
     get_dp_labels,
     safe_int,
+    safe_float,
     MIN_ROWS_IN_FRAME,
     MAX_ROWS_IN_FRAME,
 )
@@ -143,6 +144,9 @@ class ParameterPanel(ctk.CTkFrame):
 
     def _create_validation_commands(self) -> Dict[str, Any]:
         """Create validation command tuples for entry widgets."""
+        # Import validate_entry from helpers for float validation
+        from src.ui.helpers import validate_entry
+
         def validate(action: str, value_if_allowed: str, low: int, high: int) -> bool:
             if action == '1':
                 try:
@@ -188,15 +192,22 @@ class ParameterPanel(ctk.CTkFrame):
                              InterfaceRanges.MIN_CDS_WIDTH, InterfaceRanges.MAX_CDS_WIDTH),
             'cds_tail_width': (self.register(validate), '%d', '%P',
                               InterfaceRanges.MIN_CDS_TAIL_WIDTH, InterfaceRanges.MAX_CDS_TAIL_WIDTH),
-            'row_rate': (self.register(validate), '%d', '%P',
+            # Use validate_entry from helpers for row_rate (supports floats)
+            'row_rate': (self.register(validate_entry), '%d', '%P',
                         InterfaceRanges.MIN_ROW_RATE, InterfaceRanges.MAX_ROW_RATE),
         }
 
-    def _create_entry(self, parent: Any, validate_cmd: tuple) -> ctk.CTkEntry:
-        """Create a styled entry widget with auto-refresh on focus-out or Enter."""
+    def _create_entry(self, parent: Any, validate_cmd: tuple, width_multiplier: float = 1.0) -> ctk.CTkEntry:
+        """Create a styled entry widget with auto-refresh on focus-out or Enter.
+
+        Args:
+            parent: Parent widget
+            validate_cmd: Validation command tuple
+            width_multiplier: Multiplier for entry width (default 1.0, use 1.2 for 20% wider)
+        """
         entry = ctk.CTkEntry(
             parent,
-            width=self.ui.config.entry_width * PIXELS_PER_CHAR,
+            width=int(self.ui.config.entry_width * PIXELS_PER_CHAR * width_multiplier),
             validate='key',
             validatecommand=validate_cmd,
             justify=tk.CENTER,
@@ -487,11 +498,11 @@ class ParameterPanel(ctk.CTkFrame):
         entry_col = Interface.NUM_DATA_PORTS + 3
 
         # Row 1: Columns per row
-        self.interface_entries['cpr_entry'] = self._create_entry(self, self.vcmds['num_columns_reg'])
+        self.interface_entries['cpr_entry'] = self._create_entry(self, self.vcmds['num_columns_reg'], width_multiplier=1.2)
         self.interface_entries['cpr_entry'].grid(row=1, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # Row 2: Fractional skipping denominator
-        self.interface_entries['fid_entry'] = self._create_entry(self, self.vcmds['denominator'])
+        self.interface_entries['fid_entry'] = self._create_entry(self, self.vcmds['denominator'], width_multiplier=1.2)
         self.interface_entries['fid_entry'].grid(row=2, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # Row 3: PHY3 enable
@@ -503,12 +514,12 @@ class ParameterPanel(ctk.CTkFrame):
         )
 
         # Row 4: S0 width
-        self.s0w_entry = self._create_entry(self, self.vcmds['s0_width'])
+        self.s0w_entry = self._create_entry(self, self.vcmds['s0_width'], width_multiplier=1.2)
         self.s0w_entry.grid(row=4, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
         self.interface_entries['s0w_entry'] = self.s0w_entry
 
         # Row 5: S1 Tail width
-        self.tail_width_entry = self._create_entry(self, self.vcmds['tail_width'])
+        self.tail_width_entry = self._create_entry(self, self.vcmds['tail_width'], width_multiplier=1.2)
         self.tail_width_entry.grid(row=5, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
         self.interface_entries['tail_width_entry'] = self.tail_width_entry
 
@@ -521,7 +532,7 @@ class ParameterPanel(ctk.CTkFrame):
         )
 
         # Row 7: CDS width
-        self.interface_entries['cds_width_entry'] = self._create_entry(self, self.vcmds['cds_bit_width'])
+        self.interface_entries['cds_width_entry'] = self._create_entry(self, self.vcmds['cds_bit_width'], width_multiplier=1.2)
         self.interface_entries['cds_width_entry'].grid(row=7, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # Row 8: CDS guard
@@ -533,7 +544,7 @@ class ParameterPanel(ctk.CTkFrame):
         )
 
         # Row 9: CDS Tail width
-        self.interface_entries['cds_tail_entry'] = self._create_entry(self, self.vcmds['cds_tail_width'])
+        self.interface_entries['cds_tail_entry'] = self._create_entry(self, self.vcmds['cds_tail_width'], width_multiplier=1.2)
         self.interface_entries['cds_tail_entry'].grid(row=9, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # Row 10: CDS handover
@@ -545,11 +556,11 @@ class ParameterPanel(ctk.CTkFrame):
         )
 
         # Row 11: Row rate
-        self.interface_entries['row_rate_entry'] = self._create_entry(self, self.vcmds['row_rate'])
+        self.interface_entries['row_rate_entry'] = self._create_entry(self, self.vcmds['row_rate'], width_multiplier=1.2)
         self.interface_entries['row_rate_entry'].grid(row=11, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # Row 12: Rows to draw
-        self.interface_entries['rpf_entry'] = self._create_entry(self, self.vcmds['rows'])
+        self.interface_entries['rpf_entry'] = self._create_entry(self, self.vcmds['rows'], width_multiplier=1.2)
         self.interface_entries['rpf_entry'].grid(row=12, column=entry_col, padx=ENTRY_PADX, pady=ENTRY_PADY)
 
         # System SSP Interval - label centered under buttons, value under entry column (same row)
@@ -754,7 +765,9 @@ class ParameterPanel(ctk.CTkFrame):
         self.interface_vars['cds_handover'].set(self.interface.cds_handover_enabled)
 
         self.interface_entries['row_rate_entry'].delete(0, tk.END)
-        self.interface_entries['row_rate_entry'].insert(tk.END, self.interface.row_rate)
+        # Format to remove unnecessary trailing zeros (3072.0 -> 3072, but 2400.5 -> 2400.5)
+        row_rate_str = f"{self.interface.row_rate:g}"
+        self.interface_entries['row_rate_entry'].insert(tk.END, row_rate_str)
 
         # Update SSP label
         self.ssp_value_label.configure(text=str(self.interface.interval_lcm))
@@ -884,7 +897,7 @@ class ParameterPanel(ctk.CTkFrame):
 
         self.interface.cds_handover_enabled = self.interface_vars['cds_handover'].get()
 
-        self.interface.row_rate = safe_int(self.interface_entries['row_rate_entry'].get())
+        self.interface.row_rate = safe_float(self.interface_entries['row_rate_entry'].get(), 3072.0)
 
         self.interface.SkippingDenominator_REG = max(Interface.MIN_SKIPPING_DENOMINATOR,
                                                    min(Interface.MAX_SKIPPING_DENOMINATOR,

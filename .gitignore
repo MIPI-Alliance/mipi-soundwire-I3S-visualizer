@@ -1,0 +1,36 @@
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode
+
+# macOS
+.DS_Store
+
+# Test artifacts
+tests/previous_stats.json
+tests/temp/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Claude
+CLAUDE.md
+.claude
+settings.json
+
+# Tools
+tools/
+
+# Scratch directory
+scratch/

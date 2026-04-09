@@ -91,7 +91,7 @@ class BusModel:
     """
     num_rows: int
     num_columns: int
-    row_rate: int = 3072  # kHz, default value
+    row_rate: float = 3072.0  # kHz, default value
     bits: List[BitInfo] = field(default_factory=list)
 
     # Clash tracking

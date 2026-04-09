@@ -57,7 +57,7 @@ class MinimalApp(ctk.CTkFrame):
     - FrameRenderer handles all drawing (pure rendering)
     """
 
-    def __init__(self, master: ctk.CTk, args: argparse.Namespace, version: str = '2.0'):
+    def __init__(self, master: ctk.CTk, args: argparse.Namespace, version: str = '2.1.0'):
         super().__init__(master)
         self.root: ctk.CTk = master
         self.args = args
@@ -844,7 +844,7 @@ class MinimalApp(ctk.CTkFrame):
         self.root.update()
 
 
-def run_app(args: argparse.Namespace, version: str = '2.0') -> None:
+def run_app(args: argparse.Namespace, version: str = '2.1.0') -> None:
     """Run the GUI application.
 
     Args:

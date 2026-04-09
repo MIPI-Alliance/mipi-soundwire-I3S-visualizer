@@ -23,6 +23,7 @@ from src.viz import VizConfig, DataPortVizConfig
 class FieldType(Enum):
     """Types of CSV field values."""
     INT = auto()       # Integer value
+    FLOAT = auto()     # Float value
     BOOL = auto()      # Boolean value (True/False or 0/1)
     STRING = auto()    # String value
     BINARY_INT = auto() # Integer in binary format (0b prefix)
@@ -107,7 +108,7 @@ class CSVHandler:
         ('CDS_GuardPolarity_REG', 'CDS_GuardPolarity_REG', FieldType.BOOL),
         ('CDS_TailWidth_REG', 'CDS_TailWidth_REG', FieldType.INT),
         ('EnforceCDSHandover', 'cds_handover_enabled', FieldType.BOOL),
-        ('RowRate', 'row_rate', FieldType.INT),
+        ('RowRate', 'row_rate', FieldType.FLOAT),
         ('Description', 'description', FieldType.STRING),  # User description text
     ]
 
@@ -200,6 +201,27 @@ class CSVHandler:
             raise ValueError(f"Cannot parse integer from '{value}'")
 
     @staticmethod
+    def parse_float_value(value: str) -> float:
+        """Parse a float value from string.
+
+        Args:
+            value: String value to parse (e.g., "123.45" or "3072")
+
+        Returns:
+            Float value
+
+        Raises:
+            ValueError: If value is empty or cannot be parsed as float
+        """
+        value = value.strip()
+        if not value:
+            raise ValueError("Cannot parse float from empty string")
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f"Cannot parse float from '{value}'")
+
+    @staticmethod
     def parse_bool_value(value: str) -> bool:
         """Parse a boolean value from string.
 
@@ -283,6 +305,9 @@ class CSVHandler:
         if field_type == FieldType.INT:
             return CSVHandler.parse_int_value(value)
 
+        if field_type == FieldType.FLOAT:
+            return CSVHandler.parse_float_value(value)
+
         if field_type == FieldType.DISPLAY_FIELDS:
             return CSVHandler.parse_display_fields(value)
 
@@ -334,7 +359,7 @@ class CSVHandler:
         interface.CDS_TailWidth_REG = InterfaceClass.MIN_CDS_TAIL_WIDTH
         interface.tail_width = InterfaceClass.MIN_TAIL_WIDTH
         interface.SkippingDenominator_REG = 1
-        interface.row_rate = 3072
+        interface.row_rate = 3072.0
         interface.description = ''
 
         # Reset data port configs to defaults before loading

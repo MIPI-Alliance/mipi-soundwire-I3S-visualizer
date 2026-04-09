@@ -7,7 +7,7 @@ from typing import Dict, List, TYPE_CHECKING
 # Import math at module level for math.lcm
 import math
 
-from src.utils.descriptors import ValidatedInt, ValidatedBool
+from src.utils.descriptors import ValidatedInt, ValidatedBool, ValidatedFloat
 
 # Import DataPort only for type checking to avoid circular import
 if TYPE_CHECKING:
@@ -30,8 +30,8 @@ class Interface:
     MAX_COLUMNS = MAX_COLUMNS_PER_ROW
     MIN_ROWS = 1
     MAX_ROWS = 10240
-    MIN_ROW_RATE = 1
-    MAX_ROW_RATE = 6144
+    MIN_ROW_RATE = 1.0
+    MAX_ROW_RATE = 48000.0
     MIN_SKIPPING_DENOMINATOR = 1
     MAX_SKIPPING_DENOMINATOR = 4096
     MIN_S0_WIDTH = 1
@@ -56,7 +56,7 @@ class Interface:
     CDS_TailWidth_REG: int = ValidatedInt('CDS_TailWidth_REG', MIN_CDS_TAIL_WIDTH, MAX_CDS_TAIL_WIDTH, 'CDS tail width')  # type: ignore[assignment]
     tail_width: int = ValidatedInt('tail_width', MIN_TAIL_WIDTH, MAX_TAIL_WIDTH, 'Tail width')  # type: ignore[assignment]
     SkippingDenominator_REG: int = ValidatedInt('SkippingDenominator_REG', MIN_SKIPPING_DENOMINATOR, MAX_SKIPPING_DENOMINATOR, 'Skipping denominator')  # type: ignore[assignment]
-    row_rate: int = ValidatedInt('row_rate', MIN_ROW_RATE, MAX_ROW_RATE, 'Row rate')  # type: ignore[assignment]
+    row_rate: float = ValidatedFloat('row_rate', MIN_ROW_RATE, MAX_ROW_RATE, 'Row rate')  # type: ignore[assignment]
 
     # Boolean properties
     phy3_enabled: bool = ValidatedBool('phy3_enabled', 'PHY3 enabled')  # type: ignore[assignment]
@@ -82,7 +82,7 @@ class Interface:
         self.CDS_TailWidth_REG: int = Interface.MIN_CDS_TAIL_WIDTH
         self.tail_width: int = Interface.MIN_TAIL_WIDTH
         self.SkippingDenominator_REG: int = 1
-        self.row_rate: int = 3072
+        self.row_rate: float = 3072.0
         self.description: str = ''  # User description for CSV storage
 
         # Primary storage: devices dict containing DataPorts

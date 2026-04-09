@@ -85,6 +85,82 @@ class ValidatedInt:
         setattr(obj, self.private_name, value)
 
 
+class ValidatedFloat:
+    """Descriptor for validated float properties with range checking.
+
+    This descriptor reduces boilerplate for properties that need:
+    - Type checking (must be int or float)
+    - Range validation (min <= value <= max)
+    - Custom error messages
+
+    Example usage:
+        class MyClass:
+            MIN_VALUE = 0.0
+            MAX_VALUE = 100.0
+
+            value: float = ValidatedFloat('value', MIN_VALUE, MAX_VALUE)  # type: ignore[assignment]
+
+            def __init__(self):
+                self.value = 50.5  # Uses the descriptor
+    """
+
+    def __init__(self, name: str, min_val: float, max_val: float,
+                 friendly_name: Optional[str] = None) -> None:
+        """Initialize the descriptor.
+
+        Args:
+            name: The attribute name (used for storage as _name)
+            min_val: Minimum allowed value (inclusive)
+            max_val: Maximum allowed value (inclusive)
+            friendly_name: Human-readable name for error messages (defaults to name)
+        """
+        self.name = name
+        self.private_name = f'_{name}'
+        self.min_val = min_val
+        self.max_val = max_val
+        self.friendly_name = friendly_name or name
+
+    @overload
+    def __get__(self, obj: None, objtype: Type[Any]) -> 'ValidatedFloat': ...
+    @overload
+    def __get__(self, obj: object, objtype: Optional[Type[Any]] = None) -> float: ...
+
+    def __get__(self, obj: Optional[object], objtype: Optional[Type[Any]] = None) -> Union['ValidatedFloat', float]:
+        """Get the attribute value.
+
+        Args:
+            obj: The instance to get the attribute from
+            objtype: The class type (unused)
+
+        Returns:
+            The attribute value, or the descriptor itself if accessed on the class
+        """
+        if obj is None:
+            return self
+        return getattr(obj, self.private_name)  # type: ignore[no-any-return]
+
+    def __set__(self, obj: object, value: Union[int, float]) -> None:
+        """Set the attribute value with validation.
+
+        Args:
+            obj: The instance to set the attribute on
+            value: The value to set (int or float)
+
+        Raises:
+            TypeError: If value is not an int or float
+            ValueError: If value is outside the allowed range
+        """
+        if not isinstance(value, (int, float)):
+            raise TypeError(f'{self.friendly_name} must be int or float, got {type(value).__name__}')
+        # Convert int to float for consistency
+        float_value = float(value)
+        if float_value > self.max_val:
+            raise ValueError(f'{self.friendly_name} must be <= {self.max_val}')
+        if float_value < self.min_val:
+            raise ValueError(f'{self.friendly_name} must be >= {self.min_val}')
+        setattr(obj, self.private_name, float_value)
+
+
 class ValidatedBool:
     """Descriptor for validated boolean properties.
 

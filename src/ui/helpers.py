@@ -126,13 +126,22 @@ DP_CUSTOM_LABELS: Dict[str, str] = {
     'ScramblerEn_REG': 'Scrambler Enable',
 }
 
+# Custom display labels for interface fields (overrides friendly_name)
+INTERFACE_CUSTOM_LABELS: Dict[str, str] = {
+    'RowRate': 'Row Rate [kHz] (1-48000)',
+}
+
 
 def get_interface_labels() -> List[str]:
     """Generate UI labels for interface parameters from field names and ranges."""
-    return [
-        friendly_name(name, INTERFACE_PARAM_RANGES.get(name))
-        for name in INTERFACE_FIELD_NAMES
-    ]
+    labels = []
+    for name in INTERFACE_FIELD_NAMES:
+        # Check if there's a custom label first
+        if name in INTERFACE_CUSTOM_LABELS:
+            labels.append(INTERFACE_CUSTOM_LABELS[name])
+        else:
+            labels.append(friendly_name(name, INTERFACE_PARAM_RANGES.get(name)))
+    return labels
 
 
 def get_dp_labels() -> List[str]:
@@ -239,7 +248,7 @@ def friendly_name(variable_name: str, range_info: Optional[Tuple] = None) -> str
 def validate_entry(action: str, value_if_allowed: str, low: Union[int, str], high: Union[int, str]) -> bool:
     """Validate that entry widget text is within numeric range.
 
-    Used as a Tkinter validatecommand callback.
+    Used as a Tkinter validatecommand callback. Supports both integer and float values.
 
     Args:
         action: '1' for insert, '0' for delete
@@ -252,11 +261,20 @@ def validate_entry(action: str, value_if_allowed: str, low: Union[int, str], hig
     """
     if action == '1':  # Entry action
         try:
-            if int(low) <= int(value_if_allowed) <= int(high):
+            # Try float first to support decimals (int will also work as float)
+            value = float(value_if_allowed)
+            if float(low) <= value <= float(high):
                 return True
             else:
                 return False
         except ValueError:
+            # Allow partial decimal entry like "123." or "123.4" while typing
+            # Check if it's a valid partial float format
+            if value_if_allowed and all(c.isdigit() or c == '.' for c in value_if_allowed):
+                # Check for multiple decimal points
+                if value_if_allowed.count('.') <= 1:
+                    # Allow it if we're still typing
+                    return True
             return False
     else:
         return True
@@ -307,6 +325,29 @@ def safe_int(str_in: str) -> int:
         return 0
     else:
         return int(str_in)
+
+
+def safe_float(str_in: str, default: float = 0.0) -> float:
+    """Convert string to float, returning default for empty strings.
+
+    Extends float() to handle empty strings from entry widgets gracefully.
+
+    Args:
+        str_in: String to convert
+        default: Default value to return for empty strings (default: 0.0)
+
+    Returns:
+        Float value, or default if string is empty
+
+    Raises:
+        TypeError: If str_in is not a string
+    """
+    if not isinstance(str_in, str):
+        raise TypeError('Expected str for str_in')
+    if str_in == '':
+        return default
+    else:
+        return float(str_in)
 
 
 # =============================================================================
