@@ -1,18 +1,18 @@
 {
-  "total_tests": 84,
-  "passed": 84,
-  "total_bits": 11944,
-  "total_slots": 13287,
-  "total_handovers": 2574,
+  "total_tests": 86,
+  "passed": 86,
+  "total_bits": 12016,
+  "total_slots": 13359,
+  "total_handovers": 2586,
   "bus_clashes": 16,
   "device_clashes": 3,
   "read_overlaps": 64,
   "slot_types": {
     "S1": 772,
     "TAIL": 284,
-    "HANDOVER": 2574,
-    "CDS": 1187,
-    "NORMAL": 7081,
+    "HANDOVER": 2586,
+    "CDS": 1193,
+    "NORMAL": 7135,
     "S0": 996,
     "GUARD_0": 285,
     "DRQ": 40,
@@ -20,9 +20,9 @@
     "GUARD_1": 32
   },
   "directions": {
-    "SOURCE": 11836,
+    "SOURCE": 11908,
     "SINK": 1451
   },
-  "elapsed_time": 22.530829906463623,
-  "timestamp": "2026-04-21T13:57:06.482570"
+  "elapsed_time": 24.071926832199097,
+  "timestamp": "2026-04-21T16:37:35.403868"
 }

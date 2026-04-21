@@ -1,52 +1,52 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-21 13:57:06
+**Generated:** 2026-04-21 16:37:35
 
-**Total Time:** 0:22.5 (+10.9s)
+**Total Time:** 0:24.1 (+0.3s)
 
-**Comparing to:** 2026-04-21T13:48:02.441312
+**Comparing to:** 2026-04-21T16:36:56.674418
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
-| Total Tests | 84 | 0 |
-| Passed | 84 | +84 |
-| Failed | 0 |  |
+| Total Tests | 86 | 0 |
+| Passed | 86 | 0 |
+| Failed | 0 | 0 |
 | Pass Rate | 100.0% | |
 
 ## Aggregate Statistics (All Tests)
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 11,944 | +11,944 |
-| Total Slots | 13,287 | +13,287 |
-| Total Handovers | 2,574 | +2,574 |
-| Bus Clashes | 16 | +16 |
-| Device Clashes | 3 | +3 |
-| Read Overlaps | 64 | +64 |
+| Total Bit Positions | 12,016 | 0 |
+| Total Slots | 13,359 | 0 |
+| Total Handovers | 2,586 | 0 |
+| Bus Clashes | 16 | 0 |
+| Device Clashes | 3 | 0 |
+| Read Overlaps | 64 | 0 |
 
 ## Slot Type Distribution
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,187 | 8.9% |  |
-| DRQ | 40 | 0.3% |  |
-| GUARD_0 | 285 | 2.1% |  |
-| GUARD_1 | 32 | 0.2% |  |
-| HANDOVER | 2,574 | 19.4% |  |
-| NORMAL | 7,081 | 53.3% |  |
-| S0 | 996 | 7.5% |  |
-| S1 | 772 | 5.8% |  |
-| TAIL | 284 | 2.1% |  |
-| TX_PRESENT | 36 | 0.3% |  |
+| CDS | 1,193 | 8.9% | 0 |
+| DRQ | 40 | 0.3% | 0 |
+| GUARD_0 | 285 | 2.1% | 0 |
+| GUARD_1 | 32 | 0.2% | 0 |
+| HANDOVER | 2,586 | 19.4% | 0 |
+| NORMAL | 7,135 | 53.4% | 0 |
+| S0 | 996 | 7.5% | 0 |
+| S1 | 772 | 5.8% | 0 |
+| TAIL | 284 | 2.1% | 0 |
+| TX_PRESENT | 36 | 0.3% | 0 |
 
 ## Direction Distribution
 
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| SINK | 1,451 | 10.9% |  |
-| SOURCE | 11,836 | 89.1% |  |
+| SINK | 1,451 | 10.9% | 0 |
+| SOURCE | 11,908 | 89.1% | 0 |
 
 ## Individual Test Results
 
@@ -117,9 +117,11 @@
 | test_mode_ones | 5 | 16 | 12 | 14 | 5 | 0 | 0 |
 | display_fields | 4 | 16 | 44 | 44 | 4 | 0 | 0 |
 | partial_last_channel_group | 4 | 32 | 96 | 96 | 12 | 0 | 0 |
+| sri_transport_truncated_at_horizontal_end | 3 | 17 | 21 | 21 | 6 | 0 | 0 |
 | dp_guards | 1 | 24 | 7 | 7 | 1 | 0 | 0 |
 | CDS_width_8_bit_slots | 2 | 24 | 16 | 16 | 0 | 0 | 0 |
 | test_mode_mismatch | 5 | 16 | 12 | 14 | 5 | 0 | 0 |
+| sri_horizontal_end_at_row_boundary | 3 | 17 | 51 | 51 | 6 | 0 | 0 |
 | PDM_SRI_with_channel_grouping | 2 | 32 | 28 | 44 | 10 | 0 | 0 |
 | CDS_width_6_bit_slots | 2 | 24 | 12 | 12 | 0 | 0 | 0 |
 | CDS_width_2_bit_slots | 2 | 24 | 4 | 4 | 0 | 0 | 0 |

@@ -256,6 +256,13 @@ class DataPortValidator:
                     ErrorSeverity.WARNING
                 )
 
+            if config.SkippingNumerator_REG > 0:
+                result.add_error(
+                    'SkippingNumerator',
+                    f"SRI mode does not support skipping; SkippingNumerator_REG should be 0 (currently {config.SkippingNumerator_REG})",
+                    ErrorSeverity.ERROR
+                )
+
             drive_in_group = (
                 (config.SampleSize_REG + 1) *
                 (config.SampleGrouping_REG + 1) *
@@ -421,6 +428,7 @@ class DataPortValidator:
             data_port: DataPort being validated
         """
         config = data_port.config
+        fcp_config = data_port.fcp.config
 
         # Import ranges and enums for validation
         from src.config.constants import DataPortRanges
@@ -432,41 +440,41 @@ class DataPortValidator:
 
         # Validate FCP parameter ranges
         self._validate_range(
-            result, 'FCP_HorizontalStart_REG', config.FCP_HorizontalStart_REG,
+            result, 'FCP_HorizontalStart_REG', fcp_config.HorizontalStart_REG,
             DataPortRanges.MIN_FCP_H_START, min(DataPortRanges.MAX_FCP_H_START, self.interface.num_columns - 1)
         )
 
         self._validate_range(
-            result, 'FCP_BitWidth_REG', config.FCP_BitWidth_REG,
+            result, 'FCP_BitWidth_REG', fcp_config.BitWidth_REG,
             DataPortRanges.MIN_FCP_BIT_WIDTH, DataPortRanges.MAX_FCP_BIT_WIDTH
         )
 
         self._validate_range(
-            result, 'FCP_TailWidth_REG', config.FCP_TailWidth_REG,
+            result, 'FCP_TailWidth_REG', fcp_config.TailWidth_REG,
             DataPortRanges.MIN_FCP_TAIL_WIDTH, DataPortRanges.MAX_FCP_TAIL_WIDTH
         )
 
         self._validate_range(
-            result, 'FCP_Offset_REG', config.FCP_Offset_REG,
+            result, 'FCP_Offset_REG', fcp_config.Offset_REG,
             DataPortRanges.MIN_FCP_OFFSET, DataPortRanges.MAX_FCP_OFFSET
         )
 
         # Check FCP offset vs interval
-        if config.FCP_Offset_REG > config.Interval_REG:
+        if fcp_config.Offset_REG > config.Interval_REG:
             result.add_error(
                 'FCP_Offset_REG',
-                f"FCP Offset ({config.FCP_Offset_REG}) exceeds Interval ({config.Interval_REG})",
+                f"FCP Offset ({fcp_config.Offset_REG}) exceeds Interval ({config.Interval_REG})",
                 ErrorSeverity.ERROR
             )
 
         # Calculate total FCP width (guard + data + tails)
-        fcp_total_width = config.FCP_BitWidth_REG + 1  # Data width
-        if config.FCP_GuardEnable_REG:
-            fcp_total_width += config.FCP_BitWidth_REG + 1  # Guard width
-        fcp_total_width += config.FCP_TailWidth_REG  # Tail width
+        fcp_total_width = fcp_config.BitWidth_REG + 1  # Data width
+        if fcp_config.GuardEnable_REG:
+            fcp_total_width += fcp_config.BitWidth_REG + 1  # Guard width
+        fcp_total_width += fcp_config.TailWidth_REG  # Tail width
 
         # Check FCP doesn't overflow row
-        if config.FCP_HorizontalStart_REG + fcp_total_width > self.interface.num_columns:
+        if fcp_config.HorizontalStart_REG + fcp_total_width > self.interface.num_columns:
             result.add_error(
                 'FCP_HorizontalStart_REG',
                 "FCP bits would overflow row",

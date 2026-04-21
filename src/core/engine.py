@@ -346,18 +346,62 @@ class BusModelBuilder:
             row = bit_num // self.interface.num_columns
             column = bit_num % self.interface.num_columns
 
-            # Get bit slot state (auto-advances internally)
+            # Snapshot DP's interval state BEFORE the data path advances it
+            # (dp.next_bit_slot() may advance current_row_in_interval at column=0).
+            # The FCP needs the CURRENT row's value, not the next one.
+            row_in_interval_for_fcp = dp.current_row_in_interval
+
+            # DP data path emits first
             bit_slot = dp.next_bit_slot()
-            # Engine stamps position (dataport doesn't know about row/column)
             bit_slot.row = row
             bit_slot.column = column
-            bit_slot.device_num = device  # Stamp device number from engine's knowledge
-            bit_slot.dp_num = dp_index  # Stamp data port number from engine's knowledge
+            bit_slot.device_num = device
+            bit_slot.dp_num = dp_index
+
+            # FCP emits as an independent parallel source. Any DP+FCP collision
+            # is surfaced by the bus model's SAME_DEVICE clash detector (no
+            # arbitration in the core loop).
+            fcp_slot = dp.fcp.next_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
+            fcp_slot.row = row
+            fcp_slot.column = column
+            fcp_slot.device_num = device
+            fcp_slot.dp_num = dp_index
+
+            # Dispatch DP slot to bus model (with handover tracking below)
+            # Track tail_drawn across both paths for handover semantics.
+            tail_drawn_any = False
+
+            if not bit_slot.is_owned():
+                dp_emitted = False
+            else:
+                dp_emitted = True
+                if bit_slot.slot_type == SlotType.TAIL:
+                    tail_drawn_any = self._add_tail_bit(row, column, dp_index, dp, device, bit_slot) or tail_drawn_any
+                elif bit_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
+                    self._add_guard_bit(row, column, dp_index, dp, device, bit_slot)
+                else:
+                    # Data bit (NORMAL, TX_PRESENT)
+                    self._add_data_bit(row, column, dp_index, dp, device, bit_slot)
+
+            # Dispatch FCP slot to bus model (separate write — clash detector
+            # surfaces any overlap with the DP's emission as SAME_DEVICE).
+            if fcp_slot.slot_type != SlotType.EMPTY:
+                if fcp_slot.slot_type == SlotType.TAIL:
+                    tail_drawn_any = self._add_tail_bit(row, column, dp_index, dp, device, fcp_slot) or tail_drawn_any
+                elif fcp_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
+                    self._add_guard_bit(row, column, dp_index, dp, device, fcp_slot)
+                elif fcp_slot.slot_type == SlotType.DRQ:
+                    self._add_data_bit(row, column, dp_index, dp, device, fcp_slot)
+
+            # Handover tracking — use the emitted slot. In correct configs DP
+            # and FCP are mutually exclusive at any column, so whichever is
+            # non-EMPTY is "the" emission for handover purposes.
+            effective_slot = fcp_slot if (fcp_slot.slot_type != SlotType.EMPTY and not dp_emitted) else bit_slot
 
             # Note: Don't reset flags at row boundaries - handovers should
             # appear after the last driven bit regardless of row position
 
-            if not bit_slot.is_owned():
+            if not effective_slot.is_owned():
                 # No data at this position - check for potential handover
                 # Priority: tail > guard > data bit
                 # - If tails exist: record after TAIL
@@ -376,19 +420,16 @@ class BusModelBuilder:
                 last_bit_was_driven = False
                 last_slot_was_tail = False
                 last_slot_was_guard = False
-            elif bit_slot.slot_type == SlotType.TAIL:
-                tail_drawn = self._add_tail_bit(row, column, dp_index, dp, device, bit_slot)
+            elif effective_slot.slot_type == SlotType.TAIL:
                 last_bit_was_driven = True
-                last_slot_was_tail = tail_drawn  # Only mark for handover if tail was actually drawn
+                last_slot_was_tail = tail_drawn_any  # Only mark for handover if tail was actually drawn
                 last_slot_was_guard = False
-            elif bit_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
-                self._add_guard_bit(row, column, dp_index, dp, device, bit_slot)
+            elif effective_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
                 last_bit_was_driven = True
                 last_slot_was_tail = False
                 last_slot_was_guard = True  # Mark for handover if no tail
             else:
                 # Data bit (NORMAL, TX_PRESENT, or DRQ)
-                self._add_data_bit(row, column, dp_index, dp, device, bit_slot)
                 last_bit_was_driven = True
                 last_slot_was_tail = False
                 last_slot_was_guard = False

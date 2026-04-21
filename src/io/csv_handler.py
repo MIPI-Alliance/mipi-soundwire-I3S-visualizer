@@ -144,13 +144,24 @@ class CSVHandler:
         (DATA_PORT_PORT_MODE, 'PortMode_REG', FieldType.INT, False),
         (DATA_PORT_SCRAMBLER_EN, 'ScramblerEn_REG', FieldType.BOOL, False),
         # Flow Control Port (FCP) parameters for DRQ bits
-        (DATA_PORT_FCP_H_START, 'FCP_HorizontalStart_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_BIT_WIDTH, 'FCP_BitWidth_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_TAIL_WIDTH, 'FCP_TailWidth_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_OFFSET, 'FCP_Offset_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_GUARD_ENABLE, 'FCP_GuardEnable_REG', FieldType.BOOL, False),
-        (DATA_PORT_FCP_GUARD_POLARITY, 'FCP_GuardPolarity_REG', FieldType.BOOL, False),
+        # These route to data_port.fcp.config.* (not data_port.config.*) via _FCP_CSV_FIELDS below.
+        (DATA_PORT_FCP_H_START, 'HorizontalStart_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_BIT_WIDTH, 'BitWidth_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_TAIL_WIDTH, 'TailWidth_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_OFFSET, 'Offset_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_GUARD_ENABLE, 'GuardEnable_REG', FieldType.BOOL, False),
+        (DATA_PORT_FCP_GUARD_POLARITY, 'GuardPolarity_REG', FieldType.BOOL, False),
     ]
+
+    # CSV fields whose attr lives on data_port.fcp.config instead of data_port.config.
+    _FCP_CSV_FIELDS = frozenset({
+        DATA_PORT_FCP_H_START,
+        DATA_PORT_FCP_BIT_WIDTH,
+        DATA_PORT_FCP_TAIL_WIDTH,
+        DATA_PORT_FCP_OFFSET,
+        DATA_PORT_FCP_GUARD_ENABLE,
+        DATA_PORT_FCP_GUARD_POLARITY,
+    })
 
     # Data port visualization fields (go to VizConfig.data_ports, not DataPortConfig)
     # Format: (csv_field_name, viz_attribute_name, field_type)
@@ -430,7 +441,12 @@ class CSVHandler:
                             value = CSVHandler.parse_value(
                                 row[dp_index + 1], field_type
                             )
-                            setattr(data_port.config, attr_name, value)
+                            target_config = (
+                                data_port.fcp.config
+                                if field_name in CSVHandler._FCP_CSV_FIELDS
+                                else data_port.config
+                            )
+                            setattr(target_config, attr_name, value)
                         continue
 
                     # Try data port viz parameter (exact match)
@@ -590,7 +606,12 @@ class CSVHandler:
                 for csv_field, attr_name, field_type, _ in CSVHandler.DATAPORT_FIELD_MAP:
                     values = []
                     for data_port in interface.data_ports:
-                        value = getattr(data_port.config, attr_name)
+                        source_config = (
+                            data_port.fcp.config
+                            if csv_field in CSVHandler._FCP_CSV_FIELDS
+                            else data_port.config
+                        )
+                        value = getattr(source_config, attr_name)
                         # Format based on field type
                         if field_type == FieldType.BINARY_INT:
                             values.append(bin(value))

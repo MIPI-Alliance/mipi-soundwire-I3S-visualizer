@@ -31,6 +31,18 @@ class PortMode(IntEnum):
     TEST_ZEROS = 3    # Test Mode - all zeros (c0t0)
 
 
+class TransportState(Enum):
+    """Lifecycle of a DataPort's transport pattern within an interval.
+
+    Encodes a 3-state lifecycle that previously required two booleans
+    (transport_started, transport_done). The (started=True, done=True)
+    combination was impossible by construction; the enum makes that explicit.
+    """
+    IDLE   = 0  # Pre-transport: post-interval-wrap, before Offset_REG row reached
+    ACTIVE = 1  # Currently emitting data within the transport pattern
+    DONE   = 2  # Transport complete for this interval (skipped or ended naturally)
+
+
 class SlotType(Enum):
     """Type of slot in the frame"""
     EMPTY    = -1 # Position not owned by any DataPort (returned by next_bit_slot when inactive)
