@@ -8,7 +8,7 @@ from .enums import DirectionType, SlotType, DisplayField, FlowMode
 from .frame import Frame_model, Row_info, Col_info, Slot_info, SimpleJSONEncoder
 from .interface import Interface
 from .dataport import DataPort, DataPortConfig
-from .bit_slot import BitSlotData, BitSlotState, NOT_OWNED_SLOT
+from .bit_slot import BitSlotData, BitSlotState
 from .bus_model import BusModel, BitInfo, ClashType, BusModelJSONEncoder
 from .device import Device, create_device_map, get_devices_in_priority_order
 from .manager import Manager, SystemSlotLayout, SystemSlot
@@ -38,7 +38,6 @@ __all__ = [
     # Bit slot state
     'BitSlotData',
     'BitSlotState',
-    'NOT_OWNED_SLOT',
     # Device
     'Device',
     'create_device_map',

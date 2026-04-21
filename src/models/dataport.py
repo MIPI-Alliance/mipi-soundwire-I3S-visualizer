@@ -90,7 +90,7 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
-from .bit_slot import BitSlotData, BitSlotState, NOT_OWNED_SLOT
+from .bit_slot import BitSlotData, BitSlotState
 from .enums import SlotType, DirectionType, FlowMode
 
 if TYPE_CHECKING:
@@ -140,7 +140,6 @@ class DataPortState:
         self.skipping_accumulator: int = 0
         self.sample: int = 0
         self.sample_group_base: int = 0  # Sample number at start of transport (for channel grouping)
-        self.sample_number_in_group: Optional[int] = None  # None = uninitialized
         self.samples_in_group_remaining: int = 0
 
         # Channel tracking
@@ -313,6 +312,7 @@ class DataPortAlgorithm:
         self._state.transport_started = False
 
     def _advance_channel_group(self) -> None:
+        """Advance to next channel group; in SRI mode prepare next transport, otherwise terminate the pattern when groups exhausted."""
         if self._state.channel_group_base + self._state.channel_group_size >= self._config._NumChannels:
             # All channel groups complete - handle transport completion
             if self._config.SubRowInterval_REG:
@@ -343,6 +343,7 @@ class DataPortAlgorithm:
             self._state.bit = self._config.SampleSize_REG
             self._state.channel_index = self._state.channel_group_base
             self._state.spacing_slots_remaining = self._config.Spacing_REG
+            self._state.txp_sent = False
 
         # Handle spacing after any channel group transition
         if self._config.Spacing_REG == 0:
@@ -356,12 +357,7 @@ class DataPortAlgorithm:
         self._state.samples_in_group_remaining -= 1
 
         if self._state.samples_in_group_remaining < 0:
-            # Sample group complete - update sample_number_in_group and advance channel group
-            if self._state.sample_number_in_group is None:
-                raise RuntimeError("sample_number_in_group uninitialized in _advance_sample")
-            self._state.sample_number_in_group += 1
-            if self._state.sample_number_in_group >= self._config.SampleGrouping_REG:
-                self._state.sample_number_in_group = 0
+            # Sample group complete - advance channel group
             self._advance_channel_group()
         else:
             # More samples in this group - reset to first channel
@@ -434,6 +430,10 @@ class DataPortAlgorithm:
         # Wrap around at end of interval
         if next_row > self._config.Interval_REG:
             next_row = 0
+            # Reset interval-scoped flags between intervals. Required when Offset_REG > 0,
+            # because _start_interval() doesn't run until row == Offset_REG; without this,
+            # stale drq_sent/transport_started from the previous interval would corrupt the
+            # new interval's first DRQ trigger and slot logic.
             self._state.transport_done = False
             self._state.transport_started = False
             self._state.drq_sent = False
@@ -475,63 +475,64 @@ class DataPortAlgorithm:
             self._advance_row()
 
     def _slot(self) -> BitSlotState:
-        """Return the BitSlotState at current position based on internal state."""
-        slot: BitSlotState = NOT_OWNED_SLOT
+        """Return the BitSlotState at current position based on internal state.
+
+        Returns a fresh BitSlotState (NORMAL with no data) when no data is owned.
+        """
+        slot: BitSlotState = BitSlotState(slot_type=SlotType.NORMAL)
         column = self._state.column
 
         if self._state.row_transport_done or self._state.transport_done:
-            return NOT_OWNED_SLOT
+            return BitSlotState(slot_type=SlotType.NORMAL)
 
         if self._config._NumChannels == 0:
-            return NOT_OWNED_SLOT
+            return BitSlotState(slot_type=SlotType.NORMAL)
 
         if self._state.transport_started:
             if column == self._config.HorizontalStart_REG:
                 self._state.horizontal_count_done = False
             if column < self._config.HorizontalStart_REG:
-                return NOT_OWNED_SLOT
+                return BitSlotState(slot_type=SlotType.NORMAL)
             if self._state.horizontal_count_done or self._state.transport_done:
-                return NOT_OWNED_SLOT
+                return BitSlotState(slot_type=SlotType.NORMAL)
 
             if column > self._config._HorizontalEnd:
                 self._state.horizontal_count_done = True
                 self._state.spacing_slots_remaining = 0
                 if self._config.SubRowInterval_REG:
                     self._end_transport_pattern()
-                return NOT_OWNED_SLOT
+                return BitSlotState(slot_type=SlotType.NORMAL)
 
             else:
-                self._state.sample_number_in_group = self._config.SampleGrouping_REG - self._state.samples_in_group_remaining
                 if self._state.spacing_slots_remaining > 0:
                     self._state.spacing_slots_remaining -= 1
-                    return NOT_OWNED_SLOT
+                    return BitSlotState(slot_type=SlotType.NORMAL)
 
                 else:
-                    if self._state.bit >= 0:
-                        if (self._config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC) and
-                            not self._state.txp_sent and
-                            self._state.bit == self._config.SampleSize_REG):
-                            slot = BitSlotState(
-                                slot_type=SlotType.TX_PRESENT,
-                                direction=DirectionType.SINK if self._config.PortDirection_REG else DirectionType.SOURCE,
-                                data=BitSlotData(
-                                    sample=self._state.sample,
-                                    channel=self._config._channel(self._state.channel_index),
-                                    bit=0
-                                )
+                    if (self._config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC) and
+                        not self._state.txp_sent and
+                        self._state.bit == self._config.SampleSize_REG):
+                        slot = BitSlotState(
+                            slot_type=SlotType.TX_PRESENT,
+                            direction=DirectionType.SINK if self._config.PortDirection_REG else DirectionType.SOURCE,
+                            data=BitSlotData(
+                                sample=self._state.sample,
+                                channel=self._config._channel(self._state.channel_index),
+                                bit=0
                             )
-                            self._state.txp_sent = True
-                        else:
-                            slot = BitSlotState(
-                                slot_type=SlotType.NORMAL,
-                                direction=DirectionType.SINK if self._config.PortDirection_REG else DirectionType.SOURCE,
-                                data=BitSlotData(
-                                    sample=self._state.sample,
-                                    channel=self._config._channel(self._state.channel_index),
-                                    bit=self._state.bit
-                                )
+                        )
+                        self._state.txp_sent = True
+                    else:
+                        slot = BitSlotState(
+                            slot_type=SlotType.NORMAL,
+                            direction=DirectionType.SINK if self._config.PortDirection_REG else DirectionType.SOURCE,
+                            data=BitSlotData(
+                                sample=self._state.sample,
+                                channel=self._config._channel(self._state.channel_index),
+                                bit=self._state.bit
                             )
-                            self._advance_bit()
+                        )
+                        self._advance_bit()
 
         if self._config.SubRowInterval_REG:
             if column == self._config._HorizontalEnd:
@@ -637,8 +638,13 @@ class DataPortAlgorithm:
         # If we got a data slot, return it and prepare guards/tails for later
         if slot.is_owned() and slot.slot_type in (SlotType.NORMAL, SlotType.TX_PRESENT):
             # Handle wide bits for data slots
+            # Clip wide-bit data at HorizontalEnd; guards/tails may extend past.
             if self._config.BitWidth_REG > 0:
-                self._state.wide_bit_slots_remaining = self._config.BitWidth_REG
+                columns_remaining_in_window = self._config._HorizontalEnd - self._state.column
+                self._state.wide_bit_slots_remaining = min(
+                    self._config.BitWidth_REG,
+                    max(0, columns_remaining_in_window)
+                )
                 self._state.stored_wide_bit_slot = slot
 
             # Source ports get guards and tails after data (will emit when no more data)

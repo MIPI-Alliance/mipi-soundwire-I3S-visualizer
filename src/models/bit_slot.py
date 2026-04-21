@@ -43,12 +43,13 @@ _PATTERN_S = PATTERN_S
 # BitSlotData Class
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class BitSlotData:
     """Data for a normal bit slot.
 
     Represents the sample, channel, and bit information
-    for a data-carrying slot.
+    for a data-carrying slot. Frozen so shared instances (e.g. from wide-bit
+    replay in DataPort) cannot be corrupted by accidental mutation.
     """
     sample: int = 0  # Absolute sample counter across all channels
     channel: int = 0
@@ -191,8 +192,7 @@ class BitSlotState:
             return False
         # A slot is owned if it's not NORMAL type or if it has data
         # NORMAL slots without data are not owned
-        return (self.slot_type != SlotType.NORMAL or
-                (self.slot_type == SlotType.NORMAL and self.data is not None))
+        return self.slot_type != SlotType.NORMAL or self.data is not None
 
     def get_label(self) -> str:
         """Get display label for this slot.
@@ -233,9 +233,6 @@ class BitSlotState:
 # =============================================================================
 # Sentinel Values
 # =============================================================================
-
-# Sentinel value for "not owned" slots
-NOT_OWNED_SLOT = BitSlotState(slot_type=SlotType.NORMAL)
 
 # Sentinel value for empty positions (DataPort returns this when not active at current position)
 EMPTY_SLOT = BitSlotState(

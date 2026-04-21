@@ -249,6 +249,13 @@ class DataPortValidator:
 
         # SRI mode validations
         if config.SubRowInterval_REG:
+            if config.Interval_REG != 0:
+                result.add_error(
+                    'Interval',
+                    f"SRI mode implies one-row interval; Interval_REG should be 0 (currently {config.Interval_REG})",
+                    ErrorSeverity.WARNING
+                )
+
             drive_in_group = (
                 (config.SampleSize_REG + 1) *
                 (config.SampleGrouping_REG + 1) *

@@ -1,7 +1,7 @@
 {
   "num_rows": 4,
   "num_columns": 32,
-  "row_rate": 384,
+  "row_rate": 384.0,
   "bits": {
     "0": {
       "row": 0,
