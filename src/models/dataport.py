@@ -423,11 +423,12 @@ class DataPort:
         self._state.bit = self.config.SampleSize_REG
         self._state.txp_sent = False
 
-    def _apply_skipping_at_offset(self) -> bool:
-        """Apply the skipping accumulator at an offset row.
+    def _apply_skipping(self) -> bool:
+        """Apply the skipping accumulator at the start of an SSP interval.
 
-        When the accumulator reaches SkippingDenominator, mark the interval as
-        skipped (phase = PATTERN_DONE) and return True; otherwise return False.
+        Fired on row-counter rollover. When the accumulator reaches
+        SkippingDenominator, mark the interval as skipped (phase = PATTERN_DONE)
+        and return True; otherwise return False.
         """
         if self.config.SkippingNumerator_REG == 0:
             return False
@@ -438,6 +439,17 @@ class DataPort:
         self._state.phase = TransportPhase.PATTERN_DONE
         self._state.skipping_accumulator -= self._device._interface.SkippingDenominator_REG
         return True
+
+    def _start_interval(self) -> None:
+        """Initialize state at the start of an SSP interval.
+
+        Models the hardware behaviour at row-counter rollover: advance the
+        skipping accumulator; if this interval is not skipped, arm a fresh
+        transport. Emission remains gated by Offset_REG in _probe_slot.
+        """
+        if self._apply_skipping():
+            return
+        self._reset_transport()
 
     # =========================================================================
     # Position Management
@@ -450,27 +462,22 @@ class DataPort:
         self._state.wide_replay = None
         self._state.post_data_queue.clear()
 
-        # Entering a new row: ROW_DONE means the horizontal window closed on the
-        # prior row but the transport pattern is still alive (counters unspent).
-        # The fresh row's window resumes emission, so flip back to ACTIVE.
-        # Interval-scope reset (below) handles the pre-Offset IDLE case.
+        # SRI row-cut: prior row ended mid-transport (phase left as ROW_DONE by
+        # the HorizontalEnd guard). The fresh row resumes emission, so flip
+        # back to ACTIVE. An interval rollover below, if it fires, will reset
+        # transport state and overwrite this.
         if self._state.phase == TransportPhase.ROW_DONE:
             self._state.phase = TransportPhase.ACTIVE
 
         self._state.row_in_interval += 1
 
-        # Interval-scope reset at end-of-interval wrap. Required when Offset_REG > 0,
-        # because _reset_transport() doesn't run until row == Offset_REG; without this,
-        # stale phase from the previous interval would corrupt the new interval's
-        # slot logic.
+        # Row-counter rollover = SSP interval boundary. Hardware model: at
+        # rollover, the interval-start sequence fires (skipping check, and if
+        # not skipped, a fresh transport is armed). State is then identical
+        # at the start of every interval, including the one following reset().
         if self._state.row_in_interval > self.config.Interval_REG:
             self._state.row_in_interval = 0
-            self._state.phase = TransportPhase.IDLE
-
-        if self._state.row_in_interval == self.config.Offset_REG:
-            if self._apply_skipping_at_offset():
-                return
-            self._reset_transport()
+            self._start_interval()
 
     def _advance_column(self) -> None:
         """Advance position by one column, wrapping to the next row at the edge."""
@@ -494,6 +501,11 @@ class DataPort:
             return BitSlotState(slot_type=SlotType.EMPTY)
 
         if self.config._num_channels == 0:
+            return BitSlotState(slot_type=SlotType.EMPTY)
+
+        # Pre-Offset rows: transport is armed (phase=ACTIVE) but emission
+        # is gated until the row counter reaches Offset_REG.
+        if self._state.row_in_interval < self.config.Offset_REG:
             return BitSlotState(slot_type=SlotType.EMPTY)
 
         if self._state.phase in (TransportPhase.ACTIVE, TransportPhase.SPACING):
@@ -569,12 +581,13 @@ class DataPort:
         Call before starting a new rendering pass. The companion
         FlowControlPort (held by the parent Interface) must be reset
         separately by the caller (the engine).
+
+        After state init, fires the interval-start sequence so the initial
+        interval begins in the same state any subsequent interval does
+        following a row-counter rollover (skipping check + transport arm).
         """
         self._state.reset()
-        # Prime row 0 if it's already at Offset_REG.
-        if self._state.row_in_interval == self.config.Offset_REG:
-            if not self._apply_skipping_at_offset():
-                self._reset_transport()
+        self._start_interval()
 
     def next_bit_slot(self) -> BitSlotState:
         """Get the slot for the current column and auto-advance.
