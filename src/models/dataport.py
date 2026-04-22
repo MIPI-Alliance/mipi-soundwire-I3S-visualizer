@@ -5,7 +5,7 @@ Classes:
     DataPortConfig: Configuration and register values
     DataPort:       Combines config, state, and algorithm
 
-Phase: TransportPhase tracks the transport lifecycle:
+`phase: TransportPhase` tracks the transport lifecycle:
     ACTIVE       Emitting inside the horizontal window
     SPACING      Inter-channel-group / SRI inter-transport gap
     ROW_DONE     Row's window exhausted; transport still alive across wrap
@@ -242,6 +242,8 @@ class DataPort:
         self._state.column = 0
         self._state.post_data_queue.clear()
 
+        # SRI row-cut: HorizontalEnd ended the prior row mid-transport; the
+        # fresh row resumes emission, so flip phase back to ACTIVE.
         if self._state.phase == TransportPhase.ROW_DONE:
             self._state.phase = TransportPhase.ACTIVE
 
@@ -259,7 +261,7 @@ class DataPort:
     def _advance_skipping(self) -> bool:
         """Advance the skipping accumulator at the start of an SSP interval.
 
-        Returns True iff this interval should be skipped. 
+        Returns True iff this interval should be skipped.
         """
         if self.config.SkippingNumerator_REG == 0:
             return False
@@ -309,31 +311,27 @@ class DataPort:
             return
         self._state.bit -= 1
         if self._state.bit < 0:
+            self._state.bit = self.config.SampleSize_REG
+            self._state.txp_pending = self.config._emits_txp
             self._advance_channel()
 
     def _advance_channel(self) -> None:
         """Next channel; cascades to _advance_sample on exhaustion."""
         self._state.channel_index += 1
         self._state.channels_in_group_remaining -= 1
-
         if self._state.channels_in_group_remaining < 0:
+            self._state.channel_index = self._state.channel_group_base
+            self._state.channels_in_group_remaining = self._state.channel_group_size - 1
             self._advance_sample()
-        else:
-            self._state.bit = self.config.SampleSize_REG
-            self._state.txp_pending = self.config._emits_txp
 
     def _advance_sample(self) -> None:
         """Next sample; cascades to _advance_channel_group on exhaustion."""
         self._state.sample_in_group += 1
         self._state.samples_in_group_remaining -= 1
-
         if self._state.samples_in_group_remaining < 0:
+            self._state.sample_in_group = 0
+            self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
             self._advance_channel_group()
-        else:
-            self._state.bit = self.config.SampleSize_REG
-            self._state.txp_pending = self.config._emits_txp
-            self._state.channel_index = self._state.channel_group_base
-            self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
     def _advance_channel_group(self) -> None:
         """Advance to the next channel group (or to the next transport in SRI)."""
@@ -348,26 +346,25 @@ class DataPort:
                 self._state.phase = TransportPhase.PATTERN_DONE
                 return
         else:
+            # Next CG within same transport; inner counters (bit, txp_pending,
+            # sample, channels_in_group_remaining, channel_index) were already
+            # reset by the cascade that brought us here. Update the CG-scope
+            # counters for the new group's size and starting channel.
             self._state.channel_group_base += self._state.channel_group_size
             remaining_channels = self.config._num_channels - self._state.channel_group_base
             if remaining_channels > self._state.channel_group_size:
                 remaining_channels = self._state.channel_group_size
             self._state.channels_in_group_remaining = remaining_channels - 1
-
-            self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
-            if (self.config.ChannelGrouping_REG > 0 and
-                self.config.ChannelGrouping_REG < self.config._num_channels):
-                self._state.sample_in_group = 0
-            self._state.bit = self.config.SampleSize_REG
-            self._state.txp_pending = self.config._emits_txp
             self._state.channel_index = self._state.channel_group_base
 
-        if self.config.Spacing_REG == 0:
-            # No gap: Normal mode already returned PATTERN_DONE above; SRI
-            # ends the row and the next row's _start_interval arms a fresh
-            # transport.
-            self._state.phase = TransportPhase.ROW_DONE
-        else:
-            self._state.spacing_slots_remaining = self.config.Spacing_REG - 1
-            self._state.phase = (TransportPhase.SPACING if self.config.Spacing_REG > 1
-                                 else TransportPhase.ACTIVE)
+        # Inter-group gap (SRI next-transport or next-CG path; non-SRI
+        # pattern-complete returned above).
+        if self.config.SubRowInterval_REG or not pattern_complete:
+            if self.config.Spacing_REG == 0:
+                # No gap: SRI ends the row here; the next row's
+                # _start_interval arms a fresh transport.
+                self._state.phase = TransportPhase.ROW_DONE
+            else:
+                self._state.spacing_slots_remaining = self.config.Spacing_REG - 1
+                self._state.phase = (TransportPhase.SPACING if self.config.Spacing_REG > 1
+                                     else TransportPhase.ACTIVE)
