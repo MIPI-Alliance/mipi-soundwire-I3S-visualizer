@@ -429,10 +429,6 @@ class DataPortAlgorithm:
         self._dataport.fcp.reset_for_row()
         self._state.row_transport_done = False
 
-        if self._config.SubRowInterval_REG:
-            self._start_interval()
-            return
-
         self._state.current_row_in_interval += 1
 
         # Wrap around at end of interval
@@ -444,10 +440,12 @@ class DataPortAlgorithm:
             # new interval's first DRQ trigger and slot logic.
             self._state.transport_state = TransportState.IDLE
             self._dataport.fcp.reset_drq_sent()
-            # Advance sample base for new interval (even if previous was truncated)
-            # This only applies when we have channel grouping with sample grouping,
-            # where each channel group resets samples to sample_group_base
-            if (self._config.SampleGrouping_REG > 0 and
+            # Advance sample base for new interval (truncation recovery for normal mode).
+            # SRI is excluded: each transport is self-contained per row and advances the
+            # sample counter naturally via _advance_channel_group -> _start_interval, so
+            # applying the expected-samples recompute would double-count the last group.
+            if (not self._config.SubRowInterval_REG and
+                self._config.SampleGrouping_REG > 0 and
                 self._config.ChannelGrouping_REG > 0 and
                 self._config.ChannelGrouping_REG < self._config._NumChannels):
                 expected_samples_per_interval = self._config.SampleGrouping_REG + 1
