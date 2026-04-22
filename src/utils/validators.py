@@ -228,7 +228,7 @@ class DataPortValidator:
         # Access config for all register values
         config = data_port.config
 
-        # Compute effective_channel_grouping locally (same logic as DataPort.reset_transport)
+        # Compute effective_channel_grouping locally (same logic as DataPort._reset_transport)
         num_channels = bin(config.EnableCh_REG).count('1')
         if config.ChannelGrouping_REG == 0 or config.ChannelGrouping_REG > num_channels:
             effective_channel_grouping = num_channels  # Natural count
@@ -428,7 +428,7 @@ class DataPortValidator:
             data_port: DataPort being validated
         """
         config = data_port.config
-        fcp_config = data_port.fcp.config
+        fcp_config = self.interface.get_fcp(data_port.dp_index).config
 
         # Import ranges and enums for validation
         from src.config.constants import DataPortRanges

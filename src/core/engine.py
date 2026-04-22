@@ -14,6 +14,7 @@ from src.models import (
     SlotType,
     DirectionType,
 )
+from src.models.enums import TransportPhase
 from src.models.bus_model import BusModel, BitInfo, ClashType
 from src.drawing.clash_detector import ClashDetector, SlotClashCategory
 from src.config import SpecialDevices, DataPortRanges
@@ -55,6 +56,15 @@ class BusModelBuilder:
         # Track potential handover positions for post-processing
         # Structure: list of (row, column, dp_number) tuples
         self._potential_handovers: list = []
+
+        # Per-DP running count of transports that have emitted at least one
+        # slot. Incremented by the engine when it detects (via DP state
+        # observation — see _process_data_port) that a fresh _reset_transport
+        # has just run and the next emission is the first of a new transport.
+        # Owned by the engine — the DataPort hardware model tracks no
+        # running counter and emits no transport-start strobe (see CLAUDE.md
+        # hardware-model policy).
+        self._transport_counts: dict[int, int] = {}
 
     def build(self) -> BusModel:
         """Build the complete bus model.
@@ -330,7 +340,33 @@ class BusModelBuilder:
         self.logger.debug(f'Processing data port DP{dp_index}')
 
         # Reset data port state for fresh drawing pass
-        dp.reset()
+        dp.reset_frame()
+
+        # The FCP lives on Interface, not DataPort. Engine drives its lifecycle
+        # explicitly at the same moments the DP transitions.
+        fcp = self.interface.flow_control_ports[dp_index]
+        fcp.reset()
+
+        # Engine-owned per-DP transport counter — starts at 0, incremented
+        # when the engine observes that a fresh _reset_transport just ran
+        # in the DP (state snapshot matches post-reset values) and a DATA
+        # or TX_PRESENT emission follows. In SRI mode a transport cut by a
+        # row boundary is re-emitted from bit 0 on the next row; that is
+        # the same logical transport, so the engine detects "resume" by
+        # observing the old transport did not finish — fewer bits were
+        # emitted than the transport pattern requires — and suppresses the
+        # count bump.
+        self._transport_counts[dp_index] = 0
+        has_emitted_in_current_transport = False
+        bits_emitted_in_current_transport = 0
+        # Expected DATA/TX_PRESENT emissions per transport: every enabled
+        # channel emits (SampleSize_REG + 1) bits for each of (SG+1) samples.
+        # TX_PRESENT replaces the first DATA slot, so the count is identical.
+        bits_per_transport = (
+            dp.config._num_channels
+            * (dp.config.SampleSize_REG + 1)
+            * (dp.config.SampleGrouping_REG + 1)
+        )
 
         # Get device number from interface's device assignments
         device = self.interface.get_dp_device(dp_index)
@@ -341,15 +377,32 @@ class BusModelBuilder:
         last_slot_was_tail = False  # Track if previous slot was TAIL
         last_slot_was_guard = False  # Track if previous slot was GUARD
 
+        num_cols = self.interface.num_columns
+
         for bit_num in range(total_bits):
             # Calculate position from iteration index
-            row = bit_num // self.interface.num_columns
-            column = bit_num % self.interface.num_columns
+            row = bit_num // num_cols
+            column = bit_num % num_cols
 
             # Snapshot DP's interval state BEFORE the data path advances it
-            # (dp.next_bit_slot() may advance current_row_in_interval at column=0).
+            # (dp.next_bit_slot() may advance row_in_interval at column=0).
             # The FCP needs the CURRENT row's value, not the next one.
-            row_in_interval_for_fcp = dp.current_row_in_interval
+            row_in_interval_for_fcp = dp.row_in_interval
+
+            # Detect "DP is sitting at the post-_reset_transport state, about
+            # to emit the first bit of a new transport pattern." This unique
+            # state combination is set ONLY by _reset_transport (not by
+            # _advance_channel_group non-terminal or any other path).
+            dp_state = dp._state
+            pre_is_fresh_transport = (
+                dp_state.phase == TransportPhase.ACTIVE
+                and dp_state.channel_group_base == 0
+                and dp_state.channel_index == 0
+                and dp_state.sample_in_group == 0
+                and dp_state.bit == dp.config.SampleSize_REG
+                and dp_state.samples_in_group_remaining == dp.config.SampleGrouping_REG
+                and not dp_state.txp_sent
+            )
 
             # DP data path emits first
             bit_slot = dp.next_bit_slot()
@@ -358,10 +411,54 @@ class BusModelBuilder:
             bit_slot.device_num = device
             bit_slot.dp_num = dp_index
 
+            is_owned_data = (
+                bit_slot.is_owned()
+                and bit_slot.slot_type in (SlotType.DATA, SlotType.TX_PRESENT)
+            )
+
+            # A new transport emission occurred IFF the pre-snapshot was in
+            # the fresh-transport state AND this slot actually emitted data.
+            new_transport_emission = is_owned_data and pre_is_fresh_transport
+
+            # Drive the FCP lifecycle in the same order the old DP-driven code
+            # did — resets fire BETWEEN the DP's emission and the FCP's so the
+            # FCP sees the same state the old FCP-owned-by-DP path did.
+            if column == num_cols - 1:
+                fcp.reset_for_row()
+            if (row_in_interval_for_fcp > 0
+                    and dp.row_in_interval == 0
+                    and not new_transport_emission):
+                # Interval wrapped and no new transport starting on this slot —
+                # Offset_REG > 0 case: clear DRQ-sent latch; leave tails/guard
+                # residues alone (matches the interval-scope reset inlined in
+                # DataPort._advance_row).
+                fcp.reset_drq_sent()
+            if new_transport_emission:
+                # Resume detection: in SRI, if the prior transport had emitted
+                # some bits but did not finish (fewer than bits_per_transport),
+                # the row boundary cut it and this "new" emission is the same
+                # logical transport re-started from bit 0. Don't bump the count
+                # and don't reset_for_interval — matches the old resume=True path.
+                is_sri_resume = (
+                    dp.config.SubRowInterval_REG
+                    and has_emitted_in_current_transport
+                    and 0 < bits_emitted_in_current_transport < bits_per_transport
+                )
+                if not is_sri_resume:
+                    self._transport_counts[dp_index] += 1
+                    fcp.reset_for_interval()
+                has_emitted_in_current_transport = True
+                bits_emitted_in_current_transport = 0
+
+            if is_owned_data:
+                bits_emitted_in_current_transport += 1
+
+            transport_index_at_emit = self._transport_counts[dp_index]
+
             # FCP emits as an independent parallel source. Any DP+FCP collision
             # is surfaced by the bus model's SAME_DEVICE clash detector (no
             # arbitration in the core loop).
-            fcp_slot = dp.fcp.next_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
+            fcp_slot = fcp.next_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
             fcp_slot.row = row
             fcp_slot.column = column
             fcp_slot.device_num = device
@@ -381,7 +478,7 @@ class BusModelBuilder:
                     self._add_guard_bit(row, column, dp_index, dp, device, bit_slot)
                 else:
                     # Data bit (DATA, TX_PRESENT)
-                    self._add_data_bit(row, column, dp_index, dp, device, bit_slot)
+                    self._add_data_bit(row, column, dp_index, dp, device, bit_slot, transport_index_at_emit)
 
             # Dispatch FCP slot to bus model (separate write — clash detector
             # surfaces any overlap with the DP's emission as SAME_DEVICE).
@@ -391,7 +488,7 @@ class BusModelBuilder:
                 elif fcp_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
                     self._add_guard_bit(row, column, dp_index, dp, device, fcp_slot)
                 elif fcp_slot.slot_type == SlotType.DRQ:
-                    self._add_data_bit(row, column, dp_index, dp, device, fcp_slot)
+                    self._add_data_bit(row, column, dp_index, dp, device, fcp_slot, transport_index_at_emit)
 
             # Handover tracking — use the emitted slot. In correct configs DP
             # and FCP are mutually exclusive at any column, so whichever is
@@ -435,7 +532,7 @@ class BusModelBuilder:
                 last_slot_was_guard = False
 
     def _add_data_bit(self, row: int, column: int, dp_index: int, dp: DataPort,
-                      device: int, bit_slot) -> None:
+                      device: int, bit_slot, transport_index_at_emit: int) -> None:
         """Add a data bit to the bus model.
 
         Args:
@@ -445,6 +542,11 @@ class BusModelBuilder:
             dp: Data port
             device: Device number
             bit_slot: Bit slot state
+            transport_index_at_emit: Engine-owned running count of transports
+                that have emitted at least one slot for this DP, up to and
+                including the transport that owns this slot. Used to
+                reconstruct the global/absolute sample ordinal externally —
+                the DataPort hardware model has no cross-interval counter.
         """
         bit_index = self.bus_model.bit_index(row, column)
 
@@ -455,10 +557,20 @@ class BusModelBuilder:
         else:
             direction = DirectionType.SINK if dp.config.PortDirection_REG else DirectionType.SOURCE
 
-        # Get sample, channel, and bit info
-        global_sample = bit_slot.data.sample if bit_slot.data else 0
-        channel = bit_slot.data.channel if bit_slot.data else 0
-        bit_in_sample = bit_slot.data.bit if bit_slot.data else 0
+        # Get sample, channel, and bit info.
+        # DataPort emits only the transport-scoped sample_in_group (0..SG).
+        # The absolute/global sample ordinal is reconstructed here using
+        # the engine-owned per-DP transport count — DataPort itself has no
+        # cross-interval sample counter (hardware-accurate).
+        if bit_slot.data:
+            sample_base = max(0, transport_index_at_emit - 1) * (dp.config.SampleGrouping_REG + 1)
+            global_sample = sample_base + bit_slot.data.sample_in_group
+            channel = bit_slot.data.channel
+            bit_in_sample = bit_slot.data.bit
+        else:
+            global_sample = 0
+            channel = 0
+            bit_in_sample = 0
 
         # Check for clashes
         clash_type = ClashType.NONE
@@ -839,8 +951,8 @@ class BusModelBuilder:
             if not self.viz_config.data_ports[dp_index].enabled:
                 continue
 
-            # Use cached _NumChannels property for performance
-            num_channels = dp.config._NumChannels
+            # Use cached _num_channels property for performance
+            num_channels = dp.config._num_channels
             if num_channels == 0:
                 continue
 
@@ -975,8 +1087,8 @@ class BusModelBuilder:
             if not self.viz_config.data_ports[dp_index].enabled:
                 continue  # Not enabled, no warning needed
 
-            # Use cached _NumChannels property for performance
-            if dp.config._NumChannels > 0:
+            # Use cached _num_channels property for performance
+            if dp.config._num_channels > 0:
                 continue  # Has channels, no warning needed
 
             # Enabled but no channels - issue warning

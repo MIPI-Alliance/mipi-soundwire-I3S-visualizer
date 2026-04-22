@@ -75,10 +75,10 @@ Reset Scopes
 
 Each field has exactly one reset scope:
 
-    Frame     — whole rendering pass (DataPort.reset / DataPortState.reset_frame)
-    Interval  — one Interval_REG period (_reset_interval_wrap on wrap)
-    Row       — one column sweep (reset_row before each row)
-    Transport — one transport pattern within an interval (reset_transport)
+    Frame     — whole rendering pass (DataPort.reset_frame / DataPortState.reset_frame)
+    Interval  — one Interval_REG period (inlined in _advance_row on wrap)
+    Row       — one column sweep (inlined in _advance_row before each row)
+    Transport — one transport pattern within an interval (_reset_transport)
 
 Counter Hierarchy
 -----------------
@@ -103,7 +103,6 @@ from typing import Optional, TYPE_CHECKING
 
 from .bit_slot import BitSlotData, BitSlotState
 from .enums import SlotType, DirectionType, FlowMode, TransportPhase
-from .flow_control_port import FlowControlPort
 
 if TYPE_CHECKING:
     from .device import Device
@@ -149,15 +148,14 @@ class DataPortState:
         self.column: int = 0
 
         # Interval-scope
-        self.current_row_in_interval: int = 0
+        self.row_in_interval: int = 0
         self.phase: TransportPhase = TransportPhase.IDLE
 
         # Frame-scope (persists across intervals)
         self.skipping_accumulator: int = 0
-        self.sample: int = 0
 
-        # Transport-scope (reset by reset_transport on each Offset row)
-        self.sample_group_base: int = 0
+        # Transport-scope (reset by _reset_transport on each Offset row)
+        self.sample_in_group: int = 0  # 0..SampleGrouping_REG within current transport
         self.samples_in_group_remaining: int = 0
         self.channel_index: int = 0
         self.spacing_slots_remaining: int = 0
@@ -196,7 +194,7 @@ class DataPortConfig:
         # NOTE: DeviceNumber_REG is stored in Interface.dp_device_assignments, not here
         self._EnableCh_REG: int = 0  # 16-bit bitmask for enabled channels
         # Cached (enabled_channels, num_channels). None = dirty; one invalidation point.
-        self._ch_cache: Optional[tuple[tuple[int, ...], int]] = None
+        self._channel_cache: Optional[tuple[tuple[int, ...], int]] = None
         self.ChannelGrouping_REG: int = 0
         self.Spacing_REG: int = 0
         self.SampleSize_REG: int = 0
@@ -225,32 +223,32 @@ class DataPortConfig:
     def EnableCh_REG(self, value: int) -> None:
         if self._EnableCh_REG != value:
             self._EnableCh_REG = value
-            self._ch_cache = None
+            self._channel_cache = None
 
-    def _compute_ch_cache(self) -> tuple[tuple[int, ...], int]:
+    def _compute_channel_cache(self) -> tuple[tuple[int, ...], int]:
         """Derive the enabled-channel tuple and count from EnableCh_REG."""
         enabled = tuple(i for i in range(16) if self._EnableCh_REG & (1 << i))
-        self._ch_cache = (enabled, len(enabled))
-        return self._ch_cache
+        self._channel_cache = (enabled, len(enabled))
+        return self._channel_cache
 
     @property
-    def _NumChannels(self) -> int:
+    def _num_channels(self) -> int:
         """Count of enabled channels (derived from EnableCh_REG)."""
-        return (self._ch_cache or self._compute_ch_cache())[1]
+        return (self._channel_cache or self._compute_channel_cache())[1]
 
     @property
     def _enabled_channels(self) -> tuple[int, ...]:
         """Tuple of enabled channel numbers (derived from EnableCh_REG)."""
-        return (self._ch_cache or self._compute_ch_cache())[0]
+        return (self._channel_cache or self._compute_channel_cache())[0]
 
     @property
-    def _HorizontalEnd(self) -> int:
+    def _horizontal_end(self) -> int:
         """Last column of the horizontal window (HorizontalStart + HorizontalCount)."""
         return self.HorizontalStart_REG + self.HorizontalCount_REG
 
-    def _channel(self, sequential_index: int) -> int:
+    def _channel(self, index: int) -> int:
         """Map sequential index to actual channel number from EnableCh_REG bitmask."""
-        return self._enabled_channels[sequential_index]
+        return self._enabled_channels[index]
 
 
 # =============================================================================
@@ -263,12 +261,14 @@ class DataPort:
     External interface:
         - config: DataPortConfig for configuration/register attributes
         - dp_index: Canonical position index (0-15)
-        - fcp: Parallel FlowControlPort for DRQ/guards/tails
-        - reset(): Reset state for a new frame
+        - reset_frame(): Reset state for a new frame
         - next_bit_slot(): Get slot for current position (auto-advances)
-        - current_row_in_interval: DP's current row index within its interval
+        - row_in_interval: DP's current row index within its interval
 
-    State is internal and not accessible from outside.
+    State is internal and not accessible from outside. The companion
+    FlowControlPort lives on the parent Interface (`interface.flow_control_ports[dp_index]`)
+    and is driven independently by the engine — the DataPort is a pure
+    hardware model with no FCP back-reference (see CLAUDE.md).
     """
 
     def __init__(self, device: 'Device', dp_index: int) -> None:
@@ -288,17 +288,14 @@ class DataPort:
 
         self._state = DataPortState()
 
-        # Flow Control Port — parallel source for DRQ/guards/tails (public).
-        self.fcp = FlowControlPort(self)
-
     @property
-    def current_row_in_interval(self) -> int:
+    def row_in_interval(self) -> int:
         """Current row index within this DP's interval.
 
-        Snapshot before calling next_bit_slot (which may advance it) and pass
-        to fcp.next_bit_slot.
+        Snapshot before calling next_bit_slot (which may advance it) and
+        pass to the companion FlowControlPort's next_bit_slot.
         """
-        return self._state.current_row_in_interval
+        return self._state.row_in_interval
 
     # =========================================================================
     # Counter Advancement (transport → bit)
@@ -316,7 +313,7 @@ class DataPort:
         so one spacing tick is consumed up-front.
         """
         pattern_complete = (self._state.channel_group_base + self._state.channel_group_size
-                            >= self.config._NumChannels)
+                            >= self.config._num_channels)
 
         if pattern_complete and not self.config.SubRowInterval_REG:
             self._state.phase = TransportPhase.PATTERN_DONE
@@ -324,24 +321,24 @@ class DataPort:
 
         if pattern_complete:
             # SRI mode: prepare for next transport within the row.
-            # (Final PATTERN_DONE in SRI is driven by HorizontalEnd in _slot().)
-            self.reset_transport()
+            # (Final PATTERN_DONE in SRI is driven by HorizontalEnd in _probe_slot().)
+            self._reset_transport()
         else:
             # Move to next channel group.
             self._state.channel_group_base += self._state.channel_group_size
-            remaining_channels = self.config._NumChannels - self._state.channel_group_base
+            remaining_channels = self.config._num_channels - self._state.channel_group_base
             if remaining_channels > self._state.channel_group_size:
                 remaining_channels = self._state.channel_group_size
             self._state.channels_in_group_remaining = remaining_channels - 1
 
-            # Reset per-group counters. Sample counter restarts from sample_group_base
-            # because all channel groups within a transport share the same sample(s):
-            #   SampleGrouping=0 → each CG gets sample_group_base (one sample per transport)
-            #   SampleGrouping>0 → each CG processes sample_group_base..base+N
+            # Reset per-group counters. Sample counter restarts at 0 because
+            # all channel groups within a transport share the same sample(s):
+            #   SampleGrouping=0 → each CG processes sample_in_group 0 only
+            #   SampleGrouping>0 → each CG processes sample_in_group 0..SG
             self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
             if (self.config.ChannelGrouping_REG > 0 and
-                self.config.ChannelGrouping_REG < self.config._NumChannels):
-                self._state.sample = self._state.sample_group_base
+                self.config.ChannelGrouping_REG < self.config._num_channels):
+                self._state.sample_in_group = 0
             self._state.bit = self.config.SampleSize_REG
             self._state.channel_index = self._state.channel_group_base
             self._state.txp_sent = False
@@ -359,7 +356,7 @@ class DataPort:
 
     def _advance_sample(self) -> None:
         """Advance to next sample, calling _advance_channel_group when sample group exhausted."""
-        self._state.sample += 1
+        self._state.sample_in_group += 1
         self._state.samples_in_group_remaining -= 1
 
         if self._state.samples_in_group_remaining < 0:
@@ -391,33 +388,38 @@ class DataPort:
     # Scope-Named Resets
     # =========================================================================
 
-    def reset_transport(self) -> None:
+    def _reset_transport(self) -> None:
         """Transport-scope reset: initialize state for a new transport pattern.
 
-        Called at the Offset row (Normal mode: once per interval) or on each
-        new transport within a row (SRI mode). Does NOT touch column, row
-        counter, wide replay, or post-data queue (those are row-scoped).
+        Called at the Offset row (Normal mode: once per interval), on each
+        new transport within a row (SRI mode), or when a row wraps mid-transport
+        in SRI mode (row-boundary resumption re-emits the cut transport from
+        the start). Does NOT touch column, row counter, wide replay, or
+        post-data queue (those are row-scoped).
+
+        The DataPort keeps no transport-count state. Consumers that need to
+        label samples with an absolute ordinal detect resets externally by
+        observing DP state (see engine.py).
         """
         self._state.phase = TransportPhase.ACTIVE
         self._state.spacing_slots_remaining = 0
 
-        self._state.sample_group_base = self._state.sample
+        self._state.sample_in_group = 0
         self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
 
         self._state.channel_group_base = 0
         self._state.channel_index = 0
         if (self.config.ChannelGrouping_REG == 0
-                or self.config.ChannelGrouping_REG > self.config._NumChannels):
-            self._state.channel_group_size = self.config._NumChannels
+                or self.config.ChannelGrouping_REG > self.config._num_channels):
+            self._state.channel_group_size = self.config._num_channels
         else:
             self._state.channel_group_size = self.config.ChannelGrouping_REG
         self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
         self._state.bit = self.config.SampleSize_REG
         self._state.txp_sent = False
-        self.fcp.reset_for_interval()
 
-    def _check_skipping_at_offset(self) -> bool:
+    def _apply_skipping_at_offset(self) -> bool:
         """Apply the skipping accumulator at an offset row.
 
         When the accumulator reaches SkippingDenominator, mark the interval as
@@ -433,59 +435,38 @@ class DataPort:
         self._state.skipping_accumulator -= self._device._interface.SkippingDenominator_REG
         return True
 
-    def reset_row(self) -> None:
-        """Row-scope reset: per-row state cleared before the next column sweep."""
-        self._state.column = 0
-        self._state.wide_replay = None
-        self._state.post_data_queue.clear()
-        self.fcp.reset_for_row()
-
-    def _reset_interval_wrap(self) -> None:
-        """Interval-scope reset on wrap (called from _advance_row only).
-
-        Clears interval-scoped flags between intervals. Required when Offset_REG > 0,
-        because reset_transport() doesn't run until row == Offset_REG; without this,
-        stale drq_sent/phase from the previous interval would corrupt the
-        new interval's first DRQ trigger and slot logic.
-        """
-        self._state.current_row_in_interval = 0
-        self._state.phase = TransportPhase.IDLE
-        self.fcp.reset_drq_sent()
-        # Advance sample base for new interval (truncation recovery for normal mode).
-        # SRI is excluded: each transport is self-contained per row and advances the
-        # sample counter naturally via _advance_channel_group -> reset_transport, so
-        # applying the expected-samples recompute would double-count the last group.
-        if (not self.config.SubRowInterval_REG
-                and self.config.SampleGrouping_REG > 0
-                and self.config.ChannelGrouping_REG > 0
-                and self.config.ChannelGrouping_REG < self.config._NumChannels):
-            self._state.sample = (self._state.sample_group_base
-                                  + self.config.SampleGrouping_REG + 1)
-
     # =========================================================================
     # Position Management
     # =========================================================================
 
     def _advance_row(self) -> None:
         """Wrap position to the next row and prepare per-row state."""
-        self.reset_row()
+        # Row-scope reset (inlined): clear per-row state for the new column sweep.
+        self._state.column = 0
+        self._state.wide_replay = None
+        self._state.post_data_queue.clear()
+
         # Entering a new row: ROW_DONE means the horizontal window closed on the
         # prior row but the transport pattern is still alive (counters unspent).
         # The fresh row's window resumes emission, so flip back to ACTIVE.
-        # Interval/pre-Offset state is resolved below by _reset_interval_wrap.
+        # Interval-scope reset (below) handles the pre-Offset IDLE case.
         if self._state.phase == TransportPhase.ROW_DONE:
             self._state.phase = TransportPhase.ACTIVE
 
-        self._state.current_row_in_interval += 1
+        self._state.row_in_interval += 1
 
-        # Wrap around at end of interval.
-        if self._state.current_row_in_interval > self.config.Interval_REG:
-            self._reset_interval_wrap()
+        # Interval-scope reset at end-of-interval wrap. Required when Offset_REG > 0,
+        # because _reset_transport() doesn't run until row == Offset_REG; without this,
+        # stale phase from the previous interval would corrupt the new interval's
+        # slot logic.
+        if self._state.row_in_interval > self.config.Interval_REG:
+            self._state.row_in_interval = 0
+            self._state.phase = TransportPhase.IDLE
 
-        if self._state.current_row_in_interval == self.config.Offset_REG:
-            if self._check_skipping_at_offset():
+        if self._state.row_in_interval == self.config.Offset_REG:
+            if self._apply_skipping_at_offset():
                 return
-            self.reset_transport()
+            self._reset_transport()
 
     def _advance_column(self) -> None:
         """Advance position by one column, wrapping to the next row at the edge."""
@@ -497,67 +478,66 @@ class DataPort:
     # Slot Emission
     # =========================================================================
 
-    def _slot(self) -> BitSlotState:
+    def _probe_slot(self) -> BitSlotState:
         """Return the BitSlotState at current position based on internal state.
 
         Returns EMPTY when the DP has nothing to emit this slot (outside
         transport window, spacing gap, or post-PATTERN_DONE). Returns DATA
         or TX_PRESENT (both with BitSlotData payload) when emitting.
         """
-        slot = BitSlotState(slot_type=SlotType.EMPTY)
 
-        if self._state.phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE):
-            return slot
+        if self._state.phase in (TransportPhase.IDLE, TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE):
+            return BitSlotState(slot_type=SlotType.EMPTY)
 
-        if self.config._NumChannels == 0:
-            return slot
+        if self.config._num_channels == 0:
+            return BitSlotState(slot_type=SlotType.EMPTY)
 
         if self._state.phase in (TransportPhase.ACTIVE, TransportPhase.SPACING):
             if self._state.column < self.config.HorizontalStart_REG:
-                return slot
+                return BitSlotState(slot_type=SlotType.EMPTY)
 
-            if self._state.column > self.config._HorizontalEnd:
+            if self._state.column > self.config._horizontal_end:
                 # Transport window exhausted on this row. Clear spacing so stale gaps
                 # don't leak into the next row's first emission window.
                 if self._state.spacing_slots_remaining > 0:
                     self._state.spacing_slots_remaining = 0
                 self._state.phase = TransportPhase.ROW_DONE
-                return slot
+                return BitSlotState(slot_type=SlotType.EMPTY)
 
             if self._state.phase == TransportPhase.SPACING:
                 self._state.spacing_slots_remaining -= 1
                 if self._state.spacing_slots_remaining <= 0:
                     self._state.phase = TransportPhase.ACTIVE
-                return slot
+                return BitSlotState(slot_type=SlotType.EMPTY)
 
             # phase == ACTIVE here — emit data (or TxPresent).
             direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
             if (self.config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
                     and not self._state.txp_sent
                     and self._state.bit == self.config.SampleSize_REG):
-                slot = BitSlotState(
+                self._state.txp_sent = True
+                return BitSlotState(
                     slot_type=SlotType.TX_PRESENT,
                     direction=direction,
                     data=BitSlotData(
-                        sample=self._state.sample,
+                        sample_in_group=self._state.sample_in_group,
                         channel=self.config._channel(self._state.channel_index),
                         bit=0
-                    )
+                    ),
                 )
-                self._state.txp_sent = True
-            else:
-                slot = BitSlotState(
-                    slot_type=SlotType.DATA,
-                    direction=direction,
-                    data=BitSlotData(
-                        sample=self._state.sample,
-                        channel=self.config._channel(self._state.channel_index),
-                        bit=self._state.bit
-                    )
-                )
-                self._advance_bit()
+            slot = BitSlotState(
+                slot_type=SlotType.DATA,
+                direction=direction,
+                data=BitSlotData(
+                    sample_in_group=self._state.sample_in_group,
+                    channel=self.config._channel(self._state.channel_index),
+                    bit=self._state.bit
+                ),
+            )
+            self._advance_bit()
+            return slot
 
-        return slot
+        return BitSlotState(slot_type=SlotType.EMPTY)
 
     def _prime_post_data_queue(self) -> None:
         """Prime the post-data queue after a source-port data slot.
@@ -579,23 +559,25 @@ class DataPort:
     # Public Interface
     # =========================================================================
 
-    def reset(self) -> None:
+    def reset_frame(self) -> None:
         """Reset all runtime state for a fresh drawing pass.
 
-        Call before starting a new frame.
+        Call before starting a new frame. The companion FlowControlPort
+        (held by the parent Interface) must be reset separately by the
+        caller (the engine).
         """
         self._state.reset_frame()
-        self.fcp.reset()
         # Prime row 0 if it's already at Offset_REG.
-        if self._state.current_row_in_interval == self.config.Offset_REG:
-            if not self._check_skipping_at_offset():
-                self.reset_transport()
+        if self._state.row_in_interval == self.config.Offset_REG:
+            if not self._apply_skipping_at_offset():
+                self._reset_transport()
 
     def next_bit_slot(self) -> BitSlotState:
         """Get the slot for the current column and auto-advance.
 
         The only external frame-rendering entry point. Handles wide bits, guards,
-        tails, and TxP internally; FCP guards/tails emit via self.fcp separately.
+        tails, and TxP internally; the companion FlowControlPort is emitted
+        separately by the engine.
 
         Returns:
             BitSlotState for current position (EMPTY if not active).
@@ -610,13 +592,13 @@ class DataPort:
             return replay.slot
 
         # Probe current position for a data slot.
-        slot = self._slot()
+        slot = self._probe_slot()
         if slot.is_owned():
             # Clip wide-bit data at HorizontalEnd; guards/tails may extend past.
             if self.config.BitWidth_REG > 0:
                 remaining = min(
                     self.config.BitWidth_REG,
-                    max(0, self.config._HorizontalEnd - self._state.column)
+                    max(0, self.config._horizontal_end - self._state.column)
                 )
                 if remaining > 0:
                     self._state.wide_replay = WideBitReplay(slot=slot, remaining=remaining)

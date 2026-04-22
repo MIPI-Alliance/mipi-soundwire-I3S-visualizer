@@ -50,8 +50,15 @@ class BitSlotData:
     Represents the sample, channel, and bit information
     for a data-carrying slot. Frozen so shared instances (e.g. from wide-bit
     replay in DataPort) cannot be corrupted by accidental mutation.
+
+    The `sample_in_group` field holds the transport-scoped sample index
+    (0..SampleGrouping_REG). The global/absolute sample counter is not
+    tracked in DataPort state — it is reconstructed externally by the
+    engine from its own per-DP transport count and SampleGrouping_REG.
+    Callers that need a label with an absolute sample (e.g. frame_renderer)
+    may pass the global value into this field at label-formatting time.
     """
-    sample: int = 0  # Absolute sample counter across all channels
+    sample_in_group: int = 0  # Transport-scoped sample index (0..SG)
     channel: int = 0
     bit: int = 0
 
@@ -72,7 +79,7 @@ class BitSlotData:
 
         parts = []
         if DisplayField.SAMPLE in display_fields:
-            parts.append(f"S{self.sample}")
+            parts.append(f"S{self.sample_in_group}")
         if DisplayField.CHANNEL in display_fields:
             parts.append(f"C{self.channel}")
         if DisplayField.BIT in display_fields:
@@ -105,7 +112,7 @@ class BitSlotData:
             return cls(
                 channel=int(match.group(2)),
                 bit=0,
-                sample=int(match.group(1))
+                sample_in_group=int(match.group(1))
             )
 
         # Format: sXbY (sample + bit)
@@ -114,7 +121,7 @@ class BitSlotData:
             return cls(
                 channel=0,
                 bit=int(match.group(2)),
-                sample=int(match.group(1))
+                sample_in_group=int(match.group(1))
             )
 
         # Format: sXcYbZ (all three)
@@ -123,7 +130,7 @@ class BitSlotData:
             return cls(
                 channel=int(match.group(2)),
                 bit=int(match.group(3)),
-                sample=int(match.group(1))
+                sample_in_group=int(match.group(1))
             )
 
         # Format: cX (channel only, for merged bits)
@@ -140,7 +147,7 @@ class BitSlotData:
             return cls(
                 channel=0,
                 bit=0,
-                sample=int(match.group(1))
+                sample_in_group=int(match.group(1))
             )
 
         return None

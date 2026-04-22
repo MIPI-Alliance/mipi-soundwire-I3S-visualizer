@@ -745,7 +745,7 @@ first). This is a behavior-neutral tightening.
 -                self._config.ChannelGrouping_REG < self._config._NumChannels):
 -                expected_samples_per_interval = self._config.SampleGrouping_REG + 1
 -                self._state.sample = self._state.sample_group_base + expected_samples_per_interval
-+            self._reset_interval_wrap()
++            self._reset_interval()
 
          if self._state.current_row_in_interval == self._config.Offset_REG:
              if self._check_skipping_at_offset():
@@ -753,7 +753,7 @@ first). This is a behavior-neutral tightening.
 -            self._start_interval()
 +            self.reset_transport()
 +
-+    def _reset_interval_wrap(self) -> None:
++    def _reset_interval(self) -> None:
 +        """Interval-scope reset on wrap (called from _advance_row only)."""
 +        self._state.current_row_in_interval = 0
 +        self._state.phase = TransportPhase.IDLE

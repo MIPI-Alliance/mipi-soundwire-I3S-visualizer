@@ -164,7 +164,7 @@ BusModelBuilder.build()
     │       │
     │       └── For each enabled data port:
     │               │
-    │               ├── dp.reset()           # Reset state machine
+    │               ├── dp.reset_frame()     # Reset state machine
     │               │
     │               └── For each bit position:
     │                       │
@@ -365,7 +365,7 @@ class DataPortConfig:
     _cached_num_channels: Optional[int]
 
     @property
-    def _NumChannels(self) -> int:
+    def _num_channels(self) -> int:
         """Number of enabled channels (cached for performance)."""
         if self._cached_num_channels is None:
             self._cached_num_channels = self._EnableCh_REG.bit_count()
@@ -392,16 +392,16 @@ class DataPortState:
     # Position
     column: int
 
-    # Interval-scope (cleared by _reset_interval_wrap)
-    current_row_in_interval: int
+    # Interval-scope (cleared by _reset_interval)
+    row_in_interval: int
     phase: TransportPhase        # IDLE | ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
 
     # Frame-scope (persists across intervals)
     skipping_accumulator: int
-    sample: int
+    transport_index: int         # incremented on each _reset_transport (hardware-style counter)
 
-    # Transport-scope (set by reset_transport on each Offset row)
-    sample_group_base: int
+    # Transport-scope (set by _reset_transport on each Offset row)
+    sample_in_group: int         # 0..SampleGrouping_REG within current transport
     samples_in_group_remaining: int
     channel_index: int
     channel_group_base: int
@@ -411,7 +411,7 @@ class DataPortState:
     bit: int
     txp_sent: bool
 
-    # Row-scope (cleared by reset_row)
+    # Row-scope (cleared by _reset_row)
     wide_replay: Optional[WideBitReplay]   # slot + remaining columns
     post_data_queue: deque[SlotType]       # deferred GUARD/TAIL tokens
 ```
@@ -421,6 +421,19 @@ earlier triple (`transport_started`, `transport_done`, `row_transport_done`) so
 illegal combinations are unrepresentable. Guard/tail pending state lives in
 `post_data_queue` (data-port side); the parallel `FlowControlPort` owns its own
 DRQ/guard/tail counters and is not part of `DataPortState`.
+
+**Sample tracking is external to DataPort.** `DataPortState` holds only
+`sample_in_group` (transport-scoped, 0..SG) and `transport_index` (a
+hardware-style counter bumped each `_reset_transport`). The absolute/global
+sample ordinal shown in labels is reconstructed by the engine as:
+
+```
+global_sample = max(0, transport_index - 1) * (SampleGrouping_REG + 1) + sample_in_group
+```
+
+This matches real hardware, where a data port tracks only its position within
+the current transport pattern and has no knowledge of cross-interval sample
+ordinals (those are a DMA/source-side concept).
 
 ### DataPortAlgorithm
 
@@ -455,7 +468,7 @@ def _advance_channel(self):
         self._state.bit = self._config.SampleSize_REG
 
 def _advance_sample(self):
-    self._state.sample += 1
+    self._state.sample_in_group += 1
     self._state.samples_in_group_remaining -= 1
     if self._state.samples_in_group_remaining < 0:
         self._advance_channel_group()
@@ -468,15 +481,16 @@ def _advance_channel_group(self):
     if all_groups_complete:
         if self._config.SubRowInterval_REG:
             # SRI: prepare for next transport within row
-            self.reset_transport()
+            self._reset_transport()
             self._state.spacing_slots_remaining = self._config.Spacing_REG
         else:
             # Normal: transport complete
             self._end_transport_pattern()    # phase = PATTERN_DONE
     else:
-        # Move to next group, reset sample to group base
+        # Move to next group, restart sample counter at 0
+        # (all CGs within a transport share the same samples 0..SG)
         self._state.channel_group_base += self._state.channel_group_size
-        self._state.sample = self._state.sample_group_base
+        self._state.sample_in_group = 0
         self._state.spacing_slots_remaining = self._config.Spacing_REG
 ```
 

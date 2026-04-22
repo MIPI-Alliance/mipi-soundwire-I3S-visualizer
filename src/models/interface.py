@@ -13,6 +13,7 @@ from src.utils.descriptors import ValidatedInt, ValidatedBool, ValidatedFloat
 if TYPE_CHECKING:
     from .dataport import DataPort
     from .device import Device
+    from .flow_control_port import FlowControlPort
 
 
 class Interface:
@@ -69,6 +70,7 @@ class Interface:
         # Import here to avoid circular dependency at module level
         from .dataport import DataPort
         from .device import Device
+        from .flow_control_port import FlowControlPort
 
         self.NumColumns_REG: int = 15  # Register value 15 = 16 actual columns
         self.phy3_enabled: bool = False
@@ -96,6 +98,16 @@ class Interface:
             dp = DataPort(default_device, i)
             default_device.add_data_port(dp)
 
+        # Parallel per-DP Flow Control Ports, indexed by dp_index.
+        # Owned by Interface (not DataPort) so the DataPort hardware model
+        # stays pure — FCP lifecycle is driven independently by the engine.
+        # Each FCP keeps a config back-reference to its DataPort for
+        # hardware-accurate reads of FlowMode_REG / PortDirection_REG.
+        self.flow_control_ports: List['FlowControlPort'] = [
+            FlowControlPort(self._get_dp_by_index(i))
+            for i in range(self.NUM_DATA_PORTS)
+        ]
+
         # Device assignments for each data port (legacy, for backward compat)
         # Values: device number (0-11), or SpecialDevices.MANAGER (-1) for manager
         # Index corresponds to dp_index
@@ -117,6 +129,22 @@ class Interface:
     def num_columns(self) -> int:
         """Return the actual number of columns (NumColumns_REG + 1)."""
         return self.NumColumns_REG + 1
+
+    def get_fcp(self, dp_index: int) -> 'FlowControlPort':
+        """Get the FlowControlPort parallel to the DataPort at dp_index.
+
+        The FCP is owned by the Interface (not the DataPort) so the DataPort
+        hardware model stays a pure bit-emission source. The engine drives
+        the FCP lifecycle explicitly at the same points the DataPort
+        transitions (frame reset, new transport, row boundary, interval wrap).
+
+        Args:
+            dp_index: Canonical data port index (0-11)
+
+        Returns:
+            The FlowControlPort parallel to data_ports[dp_index].
+        """
+        return self.flow_control_ports[dp_index]
 
     def get_dp_device(self, dp_index: int) -> int:
         """Get device assignment for a data port.
@@ -214,8 +242,8 @@ class Interface:
         interval_list: List[int] = []
         for data_port in self.data_ports:
             # Include data ports that have channels configured (NumChannels > 0)
-            # Uses cached _NumChannels property for performance
-            if data_port.config._NumChannels > 0:
+            # Uses cached _num_channels property for performance
+            if data_port.config._num_channels > 0:
                 base_interval = data_port.config.Interval_REG + 1
                 skipping_num = data_port.config.SkippingNumerator_REG
 

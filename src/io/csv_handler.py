@@ -144,7 +144,7 @@ class CSVHandler:
         (DATA_PORT_PORT_MODE, 'PortMode_REG', FieldType.INT, False),
         (DATA_PORT_SCRAMBLER_EN, 'ScramblerEn_REG', FieldType.BOOL, False),
         # Flow Control Port (FCP) parameters for DRQ bits
-        # These route to data_port.fcp.config.* (not data_port.config.*) via _FCP_CSV_FIELDS below.
+        # These route to interface.flow_control_ports[dp_index].config.* (not data_port.config.*) via _FCP_CSV_FIELDS below.
         (DATA_PORT_FCP_H_START, 'HorizontalStart_REG', FieldType.INT, False),
         (DATA_PORT_FCP_BIT_WIDTH, 'BitWidth_REG', FieldType.INT, False),
         (DATA_PORT_FCP_TAIL_WIDTH, 'TailWidth_REG', FieldType.INT, False),
@@ -153,7 +153,7 @@ class CSVHandler:
         (DATA_PORT_FCP_GUARD_POLARITY, 'GuardPolarity_REG', FieldType.BOOL, False),
     ]
 
-    # CSV fields whose attr lives on data_port.fcp.config instead of data_port.config.
+    # CSV fields whose attr lives on interface.flow_control_ports[dp_index].config instead of data_port.config.
     _FCP_CSV_FIELDS = frozenset({
         DATA_PORT_FCP_H_START,
         DATA_PORT_FCP_BIT_WIDTH,
@@ -442,7 +442,7 @@ class CSVHandler:
                                 row[dp_index + 1], field_type
                             )
                             target_config = (
-                                data_port.fcp.config
+                                interface.get_fcp(dp_index).config
                                 if field_name in CSVHandler._FCP_CSV_FIELDS
                                 else data_port.config
                             )
@@ -534,7 +534,7 @@ class CSVHandler:
 
                 # Reset all data ports to clear stale runtime state
                 for data_port in interface.data_ports:
-                    data_port.reset()
+                    data_port.reset_frame()
 
                 # Store rows_to_draw from viz_config into result for backward compatibility
                 result.rows_in_frame = viz_config.rows_to_draw
@@ -605,9 +605,9 @@ class CSVHandler:
                 # Write data port parameters using field mapping
                 for csv_field, attr_name, field_type, _ in CSVHandler.DATAPORT_FIELD_MAP:
                     values = []
-                    for data_port in interface.data_ports:
+                    for dp_index, data_port in enumerate(interface.data_ports):
                         source_config = (
-                            data_port.fcp.config
+                            interface.flow_control_ports[dp_index].config
                             if csv_field in CSVHandler._FCP_CSV_FIELDS
                             else data_port.config
                         )

@@ -389,8 +389,12 @@ class FrameRenderer:
         elif bit.port_mode == PortMode.TEST_ZEROS:
             label = self._build_test_mode_label(bit, "T0")
         else:
+            # BitInfo.sample is already the global/absolute sample ordinal
+            # (reconstructed by the engine from transport_index + sample_in_group).
+            # We pass it into the in-group field purely for label formatting —
+            # to_label() emits "S<value>" regardless of which field holds it.
             bit_data = BitSlotData(
-                sample=bit.sample,
+                sample_in_group=bit.sample,
                 channel=bit.channel,
                 bit=bit.bit
             )

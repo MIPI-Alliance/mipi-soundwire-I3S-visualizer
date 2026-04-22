@@ -189,7 +189,7 @@ def _build_dataport(cfg: DpConfig) -> Tuple[Interface, DataPort]:
     dp.config.GuardEnable_REG = cfg.guard_enable
     dp.config.SubRowInterval_REG = cfg.sri
     dp.config.FlowMode_REG = cfg.flow_mode
-    dp.reset()
+    dp.reset_frame()
     return iface, dp
 
 
@@ -245,7 +245,7 @@ def _snapshot_legacy_fields(state: DataPortState) -> Dict[str, Any]:
         "row_transport_done": s[1],
         "horizontal_count_done": s[2],
         "column": state.column,
-        "current_row_in_interval": state.current_row_in_interval,
+        "row_in_interval": state.row_in_interval,
         "channel_index": state.channel_index,
         "channels_in_group_remaining": state.channels_in_group_remaining,
         "samples_in_group_remaining": state.samples_in_group_remaining,
@@ -285,7 +285,7 @@ def _snapshot_phase_fields(state: DataPortState) -> Dict[str, Any]:
     return {
         "phase": state.phase,
         "column": state.column,
-        "current_row_in_interval": state.current_row_in_interval,
+        "row_in_interval": state.row_in_interval,
         "channel_index": state.channel_index,
         "channels_in_group_remaining": state.channels_in_group_remaining,
         "samples_in_group_remaining": state.samples_in_group_remaining,
@@ -523,9 +523,9 @@ def _check_invariants(cfg: DpConfig, sample: Dict[str, Any]) -> List[str]:
                 f"wide_stored_present={wide_present}"
             )
 
-    # I3: when ACTIVE, 0 <= channel_index < _NumChannels (checked at read-time
+    # I3: when ACTIVE, 0 <= channel_index < _num_channels (checked at read-time
     # by _config._channel; here we sample between calls so channel_index may
-    # transiently equal _NumChannels if _slot() isn't what triggered the next
+    # transiently equal _num_channels if _probe_slot() isn't what triggered the next
     # call. Bound it by NumChannels + 1 as the documented transient.)
     num_channels = bin(cfg.enable_ch).count("1")
     if ts == "ACTIVE":
