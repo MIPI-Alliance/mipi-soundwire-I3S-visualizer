@@ -371,7 +371,7 @@ class BusModelBuilder:
         # Get device number from interface's device assignments
         device = self.interface.get_dp_device(dp_index)
 
-        # Process using next_bit_slot() - it auto-advances and handles wide bits, guards, tails
+        # Process using fetch_bit_slot() - it auto-advances and handles wide bits, guards, tails
         total_bits = self.num_rows * self.interface.num_columns
         last_bit_was_driven = False
         last_slot_was_tail = False  # Track if previous slot was TAIL
@@ -385,7 +385,7 @@ class BusModelBuilder:
             column = bit_num % num_cols
 
             # Snapshot DP's interval state BEFORE the data path advances it
-            # (dp.next_bit_slot() may advance row_in_interval at column=0).
+            # (dp.fetch_bit_slot() may advance row_in_interval at column=0).
             # The FCP needs the CURRENT row's value, not the next one.
             row_in_interval_for_fcp = dp.row_in_interval
 
@@ -405,7 +405,7 @@ class BusModelBuilder:
             )
 
             # DP data path emits first
-            bit_slot = dp.next_bit_slot()
+            bit_slot = dp.fetch_bit_slot()
             bit_slot.row = row
             bit_slot.column = column
             bit_slot.device_num = device
@@ -458,7 +458,7 @@ class BusModelBuilder:
             # FCP emits as an independent parallel source. Any DP+FCP collision
             # is surfaced by the bus model's SAME_DEVICE clash detector (no
             # arbitration in the core loop).
-            fcp_slot = fcp.next_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
+            fcp_slot = fcp.fetch_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
             fcp_slot.row = row
             fcp_slot.column = column
             fcp_slot.device_num = device

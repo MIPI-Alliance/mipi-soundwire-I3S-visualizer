@@ -15,7 +15,7 @@ Three groups of tests:
 
   (2) test_refactor_preserves_slot_sequence
         For the same config matrix, captures the sequence of SlotType values
-        emitted by next_bit_slot(). If the proposed TransportPhase refactor is
+        emitted by fetch_bit_slot(). If the proposed TransportPhase refactor is
         ever applied, this test re-imports the refactored DataPort (detected
         by presence of TransportPhase on the state) and asserts the slot
         sequence is byte-for-byte identical. Until applied, the test is
@@ -194,7 +194,7 @@ def _build_dataport(cfg: DpConfig) -> Tuple[Interface, DataPort]:
 
 
 def _frame_iterations(iface: Interface, cfg: DpConfig) -> int:
-    """Number of next_bit_slot() calls to simulate a few full intervals.
+    """Number of fetch_bit_slot() calls to simulate a few full intervals.
 
     We want enough to see interval wraps, skip events, and multiple SRI
     transports — 4 intervals' worth is plenty.
@@ -251,10 +251,10 @@ def _snapshot_legacy_fields(state: DataPortState) -> Dict[str, Any]:
         "bit": state.bit,
         "spacing_slots_remaining": state.spacing_slots_remaining,
         "wide_slots_remaining": getattr(state, "wide_bit_slots_remaining",
-                                        getattr(state, "wide_replay", None) is not None),
+                                        getattr(state, "wide_bit_repeat", None) is not None),
         "wide_stored_present": (getattr(state, "stored_wide_bit", None) is not None
                                 if hasattr(state, "stored_wide_bit")
-                                else getattr(state, "wide_replay", None) is not None),
+                                else getattr(state, "wide_bit_repeat", None) is not None),
     }
 
 
@@ -278,9 +278,9 @@ def _snapshot_phase_fields(state: DataPortState) -> Dict[str, Any]:
     """Post-refactor raw-field snapshot, for TransportPhase-native invariants.
 
     Returns a plain dict so samples are immutable between subsequent
-    next_bit_slot() calls.
+    fetch_bit_slot() calls.
     """
-    wide = getattr(state, "wide_replay", None)
+    wide = getattr(state, "wide_bit_repeat", None)
     return {
         "phase": state.phase,
         "column": state.column,
@@ -290,13 +290,13 @@ def _snapshot_phase_fields(state: DataPortState) -> Dict[str, Any]:
         "samples_in_group_remaining": state.samples_in_group_remaining,
         "bit": state.bit,
         "spacing_slots_remaining": state.spacing_slots_remaining,
-        "wide_replay_attached": wide is not None,
-        "wide_replay_remaining": wide.remaining if wide is not None else None,
+        "wide_bit_repeat_attached": wide is not None,
+        "wide_bit_repeat_remaining": wide.remaining if wide is not None else None,
     }
 
 
 def _drive_frame(cfg: DpConfig, *, sample_every: int = 1) -> FrameTrace:
-    """Run next_bit_slot() for a full multi-interval frame.
+    """Run fetch_bit_slot() for a full multi-interval frame.
 
     Args:
         cfg: the DataPort configuration to simulate.
@@ -312,7 +312,7 @@ def _drive_frame(cfg: DpConfig, *, sample_every: int = 1) -> FrameTrace:
             trace.state_samples.append(_snapshot_legacy_fields(dp._state))
             if _HAS_TRANSPORT_PHASE:
                 trace.phase_samples.append(_snapshot_phase_fields(dp._state))
-        slot = dp.next_bit_slot()
+        slot = dp.fetch_bit_slot()
         trace.slot_sequence.append(slot.slot_type.name)
     # Record terminal tuple too.
     trace.tuples.add(_snapshot_legacy_tuple(dp._state))
@@ -454,7 +454,7 @@ else:
 
 @_refactor_skip
 def test_refactor_preserves_slot_sequence() -> None:
-    """After the refactor, next_bit_slot() yields the same sequence as before.
+    """After the refactor, fetch_bit_slot() yields the same sequence as before.
 
     Only runs when TransportPhase is importable. Until then, skipped.
     """
@@ -573,7 +573,7 @@ def _check_invariants_phase(cfg: DpConfig, sample: Dict[str, Any]) -> List[str]:
            tighter property that PATTERN_DONE implies we have already stopped
            emitting (bit < 0 is unreachable while PATTERN_DONE is set because
            the advance chain terminated).
-      I2 : wide_replay is None OR wide_replay.remaining >= 1 — the dataclass
+      I2 : wide_bit_repeat is None OR wide_bit_repeat.remaining >= 1 — the dataclass
            enforces it by construction; we check the invariant post-hoc.
       I3 : ACTIVE/SPACING => channel_index in [0, NumChannels].
       I4 : channels/samples_in_group_remaining >= -1.
@@ -591,11 +591,11 @@ def _check_invariants_phase(cfg: DpConfig, sample: Dict[str, Any]) -> List[str]:
     if not isinstance(phase, TransportPhase):
         violations.append(f"I1: phase={phase!r} is not a TransportPhase member")
 
-    # I2: wide_replay structural invariant.
-    if sample["wide_replay_attached"] and (sample["wide_replay_remaining"] or 0) < 1:
+    # I2: wide_bit_repeat structural invariant.
+    if sample["wide_bit_repeat_attached"] and (sample["wide_bit_repeat_remaining"] or 0) < 1:
         violations.append(
-            f"I2: wide_replay attached but remaining="
-            f"{sample['wide_replay_remaining']}"
+            f"I2: wide_bit_repeat attached but remaining="
+            f"{sample['wide_bit_repeat_remaining']}"
         )
 
     # I3: ACTIVE/SPACING => channel_index in bounds.

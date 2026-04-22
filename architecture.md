@@ -168,7 +168,7 @@ BusModelBuilder.build()
     │               │
     │               └── For each bit position:
     │                       │
-    │                       ├── dp.next_bit_slot()  # Get slot info
+    │                       ├── dp.fetch_bit_slot()  # Get slot info
     │                       │
     │                       └── Add to BusModel + ClashDetector
     │
@@ -339,7 +339,7 @@ DataPort (Facade)
     │
     └── _algorithm: DataPortAlgorithm  # State machine logic
             │
-            └── next_bit_slot() → BitSlotState
+            └── fetch_bit_slot() → BitSlotState
 ```
 
 ### DataPortConfig
@@ -413,7 +413,7 @@ class DataPortState:
     txp_sent: bool
 
     # Row-scope (cleared at row wrap)
-    wide_replay: Optional[WideBitReplay]   # slot + remaining columns
+    wide_bit_repeat: Optional[WideBitRepeat]   # slot + remaining columns
     post_data_queue: deque[SlotType]       # deferred GUARD/TAIL tokens
 ```
 
@@ -439,7 +439,7 @@ sample ordinals (those are a DMA/source-side concept).
 
 ### DataPortAlgorithm
 
-State machine that generates bit slot ownership. The engine calls `next_bit_slot()` for every frame position.
+State machine that generates bit slot ownership. The engine calls `fetch_bit_slot()` for every frame position.
 
 #### Counter Hierarchy
 
@@ -530,19 +530,19 @@ Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
                                                               [ACTIVE]
 ```
 
-#### next_bit_slot() Flow
+#### fetch_bit_slot() Flow
 
 Emission runs as a two-arm `match` on an `EmissionPhase`:
 
 ```python
-def next_bit_slot(self) -> BitSlotState:
+def fetch_bit_slot(self) -> BitSlotState:
     match self._emission_phase():
         case EmissionPhase.WIDE_REPLAY:
             # Replay stored slot across BitWidth columns
-            slot = self._state.wide_replay.slot
-            self._state.wide_replay.remaining -= 1
-            if self._state.wide_replay.remaining == 0:
-                self._state.wide_replay = None
+            slot = self._state.wide_bit_repeat.slot
+            self._state.wide_bit_repeat.remaining -= 1
+            if self._state.wide_bit_repeat.remaining == 0:
+                self._state.wide_bit_repeat = None
             self._advance_column()
             return slot
 
@@ -603,8 +603,8 @@ class DataPort:
         self._state = DataPortState()        # Runtime state
         self._algorithm = DataPortAlgorithm(self)  # Logic
 
-    def next_bit_slot(self) -> BitSlotState:
-        return self._algorithm.next_bit_slot()  # Delegate
+    def fetch_bit_slot(self) -> BitSlotState:
+        return self._algorithm.fetch_bit_slot()  # Delegate
 ```
 
 ### 2. Property Caching with Invalidation

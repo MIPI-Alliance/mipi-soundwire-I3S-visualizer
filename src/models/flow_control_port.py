@@ -115,7 +115,7 @@ class FlowControlPort:
         self._state.wide_bit_slots_remaining = 0
         self._state.stored_wide_bit_slot = None
 
-    def next_bit_slot(self, column: int, row_in_interval: int) -> BitSlotState:
+    def fetch_bit_slot(self, column: int, row_in_interval: int) -> BitSlotState:
         """Return the slot FCP emits at this column.
 
         Handles (in priority order):
