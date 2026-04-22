@@ -75,7 +75,6 @@ class DataPortState:
         self.channel_group_size: int = 0
         self.bit: int = 0
         self.wide_bit_remaining: int = 0  # innermost counter; rolls over into _advance_bit
-        self.txp_sent: bool = False
 
         # Row-scope
         self.post_data_queue.clear()
@@ -142,6 +141,20 @@ class DataPortConfig:
     def _horizontal_end(self) -> int:
         """Last column of the horizontal window (HorizontalStart + HorizontalCount)."""
         return self.HorizontalStart_REG + self.HorizontalCount_REG
+
+    @property
+    def _top_bit(self) -> int:
+        """Starting bit-cursor position for a fresh (channel, sample) pair.
+
+        In TX_CONTROLLED / ASYNC flow modes this is SampleSize_REG + 1,
+        where the extra position encodes TX_PRESENT (emitted before the
+        DATA bits). In NORMAL / RX_CONTROLLED it is SampleSize_REG (first
+        DATA bit). The cursor counts down from here to 0; a bit > SampleSize_REG
+        selects TX_PRESENT, anything else selects DATA.
+        """
+        return self.SampleSize_REG + (
+            1 if self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC) else 0
+        )
 
     def _channel(self, index: int) -> int:
         """Map sequential index to actual channel number from EnableCh_REG bitmask."""
@@ -238,13 +251,11 @@ class DataPort:
         # phase == ACTIVE — emit data (or TxPresent). The wide_bit counter is
         # the innermost counter in the cascade (wide_bit → bit → channel →
         # sample → channel_group): the same bit is emitted BitWidth_REG + 1
-        # times before the bit cursor advances.
+        # times before the bit cursor advances. A cursor position above
+        # SampleSize_REG encodes TX_PRESENT (only reachable in TX_CONTROLLED
+        # / ASYNC flow modes; see config._top_bit).
         direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
-        is_txp = (
-            self.config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
-            and not self._state.txp_sent
-            and self._state.bit == self.config.SampleSize_REG
-        )
+        is_txp = self._state.bit > self.config.SampleSize_REG
 
         if is_txp:
             slot = BitSlotState(
@@ -267,7 +278,7 @@ class DataPort:
                 ),
             )
 
-        self._advance_wide_bit(is_txp)
+        self._advance_wide_bit()
         return slot
 
     def _prime_post_data_queue(self) -> None:
@@ -363,23 +374,19 @@ class DataPort:
             self._state.channel_group_size = self.config.ChannelGrouping_REG
         self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
-        self._state.bit = self.config.SampleSize_REG
+        self._state.bit = self.config._top_bit
         self._state.wide_bit_remaining = self.config.BitWidth_REG
-        self._state.txp_sent = False
 
     # =========================================================================
     # Counter Cascade (wide_bit → bit → channel → sample → channel_group)
     # =========================================================================
 
-    def _advance_wide_bit(self, is_txp: bool) -> None:
+    def _advance_wide_bit(self) -> None:
         """Next wide-bit tick; cascades to _advance_bit on exhaustion."""
         self._state.wide_bit_remaining -= 1
         if self._state.wide_bit_remaining < 0:
             self._state.wide_bit_remaining = self.config.BitWidth_REG
-            if is_txp:
-                self._state.txp_sent = True
-            else:
-                self._advance_bit()
+            self._advance_bit()
 
     def _advance_bit(self) -> None:
         """Next bit; cascades to _advance_channel on exhaustion."""
@@ -390,13 +397,12 @@ class DataPort:
     def _advance_channel(self) -> None:
         """Next channel; cascades to _advance_sample on exhaustion."""
         self._state.channel_index += 1
-        self._state.txp_sent = False
         self._state.channels_in_group_remaining -= 1
 
         if self._state.channels_in_group_remaining < 0:
             self._advance_sample()
         else:
-            self._state.bit = self.config.SampleSize_REG
+            self._state.bit = self.config._top_bit
 
     def _advance_sample(self) -> None:
         """Next sample; cascades to _advance_channel_group on exhaustion."""
@@ -406,10 +412,9 @@ class DataPort:
         if self._state.samples_in_group_remaining < 0:
             self._advance_channel_group()
         else:
-            self._state.bit = self.config.SampleSize_REG
+            self._state.bit = self.config._top_bit
             self._state.channel_index = self._state.channel_group_base
             self._state.channels_in_group_remaining = self._state.channel_group_size - 1
-            self._state.txp_sent = False
 
     def _advance_channel_group(self) -> None:
         """Advance to the next channel group (or to the next transport in SRI)."""
@@ -440,9 +445,8 @@ class DataPort:
             if (self.config.ChannelGrouping_REG > 0 and
                 self.config.ChannelGrouping_REG < self.config._num_channels):
                 self._state.sample_in_group = 0
-            self._state.bit = self.config.SampleSize_REG
+            self._state.bit = self.config._top_bit
             self._state.channel_index = self._state.channel_group_base
-            self._state.txp_sent = False
 
         # Inter-group gap. Both the SRI-next-transport and next-CG paths land
         # here; the current slot is consumed as the first tick of the gap.
