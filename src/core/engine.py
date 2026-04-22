@@ -360,12 +360,14 @@ class BusModelBuilder:
         has_emitted_in_current_transport = False
         bits_emitted_in_current_transport = 0
         # Expected DATA/TX_PRESENT emissions per transport: every enabled
-        # channel emits (SampleSize_REG + 1) bits for each of (SG+1) samples.
-        # TX_PRESENT replaces the first DATA slot, so the count is identical.
+        # channel emits (SampleSize_REG + 1) bits × (SG + 1) samples, each
+        # held for (BitWidth_REG + 1) columns. TX_PRESENT replaces the first
+        # DATA slot of each channel/sample pair, so it doesn't add to the count.
         bits_per_transport = (
             dp.config._num_channels
             * (dp.config.SampleSize_REG + 1)
             * (dp.config.SampleGrouping_REG + 1)
+            * (dp.config.BitWidth_REG + 1)
         )
 
         # Get device number from interface's device assignments
@@ -402,6 +404,7 @@ class BusModelBuilder:
                 and dp_state.bit == dp.config.SampleSize_REG
                 and dp_state.samples_in_group_remaining == dp.config.SampleGrouping_REG
                 and not dp_state.txp_sent
+                and dp_state.wide_bit_remaining == dp.config.BitWidth_REG
             )
 
             # DP data path emits first

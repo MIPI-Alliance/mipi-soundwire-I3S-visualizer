@@ -3,21 +3,18 @@
 Classes:
     DataPortState: Runtime state for frame rendering
     DataPortConfig: Configuration and register values
-    DataPort: Combines config, state, and rendering algorithm
+    DataPort: Combines config, state, and algorithm
 
-Must remain UI-independent (no tkinter / widget / dialog imports) — see
-CLAUDE.md. Usable headless as a library.
-
-`phase: TransportPhase` tracks the transport lifecycle:
+Phase: TransportPhase tracks the transport lifecycle:
     ACTIVE       emitting inside the horizontal window
-    SPACING      inter-channel-group / inter-transport gap
+    SPACING      inter-channel-group / SRI inter-transport gap
     ROW_DONE     row's window exhausted; transport still alive across wrap
-    PATTERN_DONE transport complete or interval skipped; emission gated
+    PATTERN_DONE transport complete or interval skipped
 
 Normal vs SRI:
-    - Normal: one multi-row transport per SSP interval; channel groups
+    - Normal: one transport per SSP interval; channel groups
       structure the burst/space pattern within the transport.
-    - SRI:    multiple transports per row; HorizontalEnd bounds emission.
+    - SRI:    multiple transports per row.
 
 Reset scopes (outer → inner):
     Reset     DataPort.reset                   hardware reset
@@ -25,38 +22,18 @@ Reset scopes (outer → inner):
     Row       inlined in _advance_row          clear per-row containers
     Transport _reset_transport                 re-init transport-scope state
 
-Counter cascade (exhaustion propagates outward):
-    bit → channel → sample → channel_group → transport completion
+Counter cascade (propagates outward):
+    wide_bit → bit → channel → sample → channel_group → transport completion
 """
 
 from __future__ import annotations
-
 from collections import deque
-from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
-
 from .bit_slot import BitSlotData, BitSlotState
 from .enums import SlotType, DirectionType, FlowMode, TransportPhase
 
 if TYPE_CHECKING:
     from .device import Device
-
-
-# =============================================================================
-# Supporting Types
-# =============================================================================
-
-@dataclass
-class WideBitRepeat:
-    """A data slot being replayed across multiple columns (BitWidth_REG > 0).
-
-    Invariant: remaining >= 1. When the replay is exhausted, the containing
-    Optional is set to None rather than leaving remaining == 0 with a slot
-    still attached.
-    """
-    slot: BitSlotState
-    remaining: int
-
 
 # =============================================================================
 # Runtime State Class
@@ -94,10 +71,10 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.channel_group_size: int = 0
         self.bit: int = 0
+        self.wide_bit_remaining: int = 0  # innermost counter; rolls over into _advance_bit
         self.txp_sent: bool = False
 
         # Row-scope
-        self.wide_bit_repeat: Optional[WideBitRepeat] = None
         self.post_data_queue.clear()
 
 
@@ -205,14 +182,6 @@ class DataPort:
 
     def fetch_bit_slot(self) -> BitSlotState:
         """Emit bit slot information at the current position and auto-advance."""
-        if self._state.wide_bit_repeat is not None:
-            repeat = self._state.wide_bit_repeat
-            repeat.remaining -= 1
-            if repeat.remaining == 0:
-                self._state.wide_bit_repeat = None
-            self._advance_column()
-            return repeat.slot
-
         if (self.config._num_channels == 0
                 or self._state.phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
                 or self._state.row_in_interval < self.config.Offset_REG
@@ -222,14 +191,6 @@ class DataPort:
             slot = self._data_slot()
 
         if slot.is_owned():
-            # Clip wide-bit replay at HorizontalEnd; guards/tails may extend past.
-            if self.config.BitWidth_REG > 0:
-                repeat_count = min(
-                    self.config.BitWidth_REG,
-                    max(0, self.config._horizontal_end - self._state.column)
-                )
-                if repeat_count > 0:
-                    self._state.wide_bit_repeat = WideBitRepeat(slot=slot, remaining=repeat_count)
             self._prime_post_data_queue()
             self._advance_column()
             return slot
@@ -252,8 +213,9 @@ class DataPort:
         Assumes the caller has filtered the passive gates (num_channels > 0,
         phase ∈ {ACTIVE, SPACING}, row_in_interval ≥ Offset_REG, column ≥
         HorizontalStart_REG). Mutates state: sets ROW_DONE at HorizontalEnd,
-        decrements the SPACING counter, or advances the bit/channel cursor on
-        emission.
+        decrements the SPACING counter, or, on emission, manages the wide-bit
+        hold counter and advances the bit/channel cursor when the hold rolls
+        over.
         """
         if self._state.column > self.config._horizontal_end:
             # Transport window exhausted on this row. Clear spacing so
@@ -269,13 +231,19 @@ class DataPort:
                 self._state.phase = TransportPhase.ACTIVE
             return BitSlotState(slot_type=SlotType.EMPTY)
 
-        # phase == ACTIVE — emit data (or TxPresent).
+        # phase == ACTIVE — emit data (or TxPresent). The wide_bit counter is
+        # the innermost counter in the cascade (wide_bit → bit → channel →
+        # sample → channel_group): the same bit is emitted BitWidth_REG + 1
+        # times before the bit cursor advances.
         direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
-        if (self.config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
-                and not self._state.txp_sent
-                and self._state.bit == self.config.SampleSize_REG):
-            self._state.txp_sent = True
-            return BitSlotState(
+        is_txp = (
+            self.config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
+            and not self._state.txp_sent
+            and self._state.bit == self.config.SampleSize_REG
+        )
+
+        if is_txp:
+            slot = BitSlotState(
                 slot_type=SlotType.TX_PRESENT,
                 direction=direction,
                 data=BitSlotData(
@@ -284,16 +252,18 @@ class DataPort:
                     bit=0
                 ),
             )
-        slot = BitSlotState(
-            slot_type=SlotType.DATA,
-            direction=direction,
-            data=BitSlotData(
-                sample_in_group=self._state.sample_in_group,
-                channel=self.config._channel(self._state.channel_index),
-                bit=self._state.bit
-            ),
-        )
-        self._advance_bit()
+        else:
+            slot = BitSlotState(
+                slot_type=SlotType.DATA,
+                direction=direction,
+                data=BitSlotData(
+                    sample_in_group=self._state.sample_in_group,
+                    channel=self.config._channel(self._state.channel_index),
+                    bit=self._state.bit
+                ),
+            )
+
+        self._advance_wide_bit(is_txp)
         return slot
 
     def _prime_post_data_queue(self) -> None:
@@ -322,7 +292,6 @@ class DataPort:
         """Advance the row counter and prepare per-row state."""
         # Row-scope reset: clear per-row containers.
         self._state.column = 0
-        self._state.wide_bit_repeat = None
         self._state.post_data_queue.clear()
 
         # SRI row-cut: ROW_DONE was set by the HorizontalEnd guard while a
@@ -348,11 +317,11 @@ class DataPort:
         not skipped, arm a fresh transport. Emission is row-gated by
         Offset_REG in _probe_slot.
         """
-        if self._apply_skipping():
+        if self._advance_skipping():
             return
         self._reset_transport()
 
-    def _apply_skipping(self) -> bool:
+    def _advance_skipping(self) -> bool:
         """Advance the skipping accumulator at the start of an SSP interval.
 
         When the accumulator reaches SkippingDenominator, mark the interval
@@ -373,8 +342,8 @@ class DataPort:
 
         Called from _start_interval on every row-counter rollover and, SRI
         only, inline from _advance_channel_group on mid-row pattern
-        completion. Does NOT touch column, row counter, wide replay, or
-        post-data queue (those are row-scoped).
+        completion. Does NOT touch column, row counter, or post-data queue
+        (those are row-scoped).
         """
         self._state.phase = TransportPhase.ACTIVE
         self._state.spacing_slots_remaining = 0
@@ -392,11 +361,22 @@ class DataPort:
         self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
         self._state.bit = self.config.SampleSize_REG
+        self._state.wide_bit_remaining = self.config.BitWidth_REG
         self._state.txp_sent = False
 
     # =========================================================================
-    # Counter Cascade (bit → channel → sample → channel_group)
+    # Counter Cascade (wide_bit → bit → channel → sample → channel_group)
     # =========================================================================
+
+    def _advance_wide_bit(self, is_txp: bool) -> None:
+        """Next wide-bit tick; cascades to _advance_bit on exhaustion."""
+        self._state.wide_bit_remaining -= 1
+        if self._state.wide_bit_remaining < 0:
+            self._state.wide_bit_remaining = self.config.BitWidth_REG
+            if is_txp:
+                self._state.txp_sent = True
+            else:
+                self._advance_bit()
 
     def _advance_bit(self) -> None:
         """Next bit; cascades to _advance_channel on exhaustion."""
@@ -429,12 +409,7 @@ class DataPort:
             self._state.txp_sent = False
 
     def _advance_channel_group(self) -> None:
-        """Advance to the next channel group (or to the next transport in SRI).
-
-        Leaves `phase` in its final state; the current slot is the first
-        tick of any inter-group/inter-transport gap, so one spacing tick
-        is consumed up-front.
-        """
+        """Advance to the next channel group (or to the next transport in SRI)."""
         pattern_complete = (self._state.channel_group_base + self._state.channel_group_size
                             >= self.config._num_channels)
 

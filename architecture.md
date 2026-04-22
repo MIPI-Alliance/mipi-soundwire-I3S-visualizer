@@ -410,10 +410,10 @@ class DataPortState:
     channels_in_group_remaining: int
     spacing_slots_remaining: int
     bit: int
+    wide_bit_remaining: int                # innermost counter; rolls over to _advance_bit
     txp_sent: bool
 
     # Row-scope (cleared at row wrap)
-    wide_bit_repeat: Optional[WideBitRepeat]   # slot + remaining columns
     post_data_queue: deque[SlotType]       # deferred GUARD/TAIL tokens
 ```
 
@@ -532,38 +532,26 @@ Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
 
 #### fetch_bit_slot() Flow
 
-Emission runs as a two-arm `match` on an `EmissionPhase`:
+`fetch_bit_slot()` combines four layers:
 
-```python
-def fetch_bit_slot(self) -> BitSlotState:
-    match self._emission_phase():
-        case EmissionPhase.WIDE_REPLAY:
-            # Replay stored slot across BitWidth columns
-            slot = self._state.wide_bit_repeat.slot
-            self._state.wide_bit_repeat.remaining -= 1
-            if self._state.wide_bit_repeat.remaining == 0:
-                self._state.wide_bit_repeat = None
-            self._advance_column()
-            return slot
+1. **Passive gate** — if `num_channels == 0`, `phase ∈ {ROW_DONE,
+   PATTERN_DONE}`, `row_in_interval < Offset_REG`, or
+   `column < HorizontalStart_REG`, return an EMPTY slot (no fresh data
+   this tick).
+2. **Data probe** — otherwise call `_data_slot()`, which handles the
+   horizontal-end cut (sets `ROW_DONE`), the SPACING decrement, and the
+   DATA / TX_PRESENT emission with the counter cascade
+   `wide_bit → bit → channel → sample → channel_group`.
+3. **Post-data queue** — on an EMPTY result, drain any pending
+   GUARD/TAIL tokens queued by the previous owned emission.
+4. **Column advance** — always step the column cursor, wrapping to the
+   next row at the right edge (which may trigger the interval-start
+   sequence at row-counter rollover).
 
-        case EmissionPhase.DATA_PROBE:
-            slot = self._slot()          # phase-driven state machine
-            if slot.is_owned():
-                # Set up wide-bit replay (if BitWidth > 0) and prime
-                # guard/tail tokens into post_data_queue for later columns.
-                self._prime_post_data_queue()
-                self._advance_column()
-                return slot
-
-            # No data — drain deferred guard/tail queue
-            if self._state.post_data_queue:
-                slot_type = self._state.post_data_queue.popleft()
-                self._advance_column()
-                return BitSlotState(slot_type=slot_type, direction=SOURCE)
-
-            self._advance_column()
-            return BitSlotState(slot_type=EMPTY)
-```
+The wide-bit hold is handled by the innermost cascade counter
+(`wide_bit_remaining`): the same bit emits for `BitWidth_REG + 1`
+columns before the bit cursor advances. No cached `BitSlotState` — the
+slot is recomputed from current state on every emission.
 
 DRQ/FCP guards/tails are *not* in this path — the parallel `FlowControlPort`
 emits them independently and is composed at the engine layer.

@@ -251,10 +251,10 @@ def _snapshot_legacy_fields(state: DataPortState) -> Dict[str, Any]:
         "bit": state.bit,
         "spacing_slots_remaining": state.spacing_slots_remaining,
         "wide_slots_remaining": getattr(state, "wide_bit_slots_remaining",
-                                        getattr(state, "wide_bit_repeat", None) is not None),
+                                        getattr(state, "wide_bit_remaining", 0) > 0),
         "wide_stored_present": (getattr(state, "stored_wide_bit", None) is not None
                                 if hasattr(state, "stored_wide_bit")
-                                else getattr(state, "wide_bit_repeat", None) is not None),
+                                else getattr(state, "wide_bit_remaining", 0) > 0),
     }
 
 
@@ -280,7 +280,7 @@ def _snapshot_phase_fields(state: DataPortState) -> Dict[str, Any]:
     Returns a plain dict so samples are immutable between subsequent
     fetch_bit_slot() calls.
     """
-    wide = getattr(state, "wide_bit_repeat", None)
+    wide_remaining = getattr(state, "wide_bit_remaining", 0)
     return {
         "phase": state.phase,
         "column": state.column,
@@ -290,8 +290,7 @@ def _snapshot_phase_fields(state: DataPortState) -> Dict[str, Any]:
         "samples_in_group_remaining": state.samples_in_group_remaining,
         "bit": state.bit,
         "spacing_slots_remaining": state.spacing_slots_remaining,
-        "wide_bit_repeat_attached": wide is not None,
-        "wide_bit_repeat_remaining": wide.remaining if wide is not None else None,
+        "wide_bit_remaining": wide_remaining,
     }
 
 
@@ -573,8 +572,9 @@ def _check_invariants_phase(cfg: DpConfig, sample: Dict[str, Any]) -> List[str]:
            tighter property that PATTERN_DONE implies we have already stopped
            emitting (bit < 0 is unreachable while PATTERN_DONE is set because
            the advance chain terminated).
-      I2 : wide_bit_repeat is None OR wide_bit_repeat.remaining >= 1 — the dataclass
-           enforces it by construction; we check the invariant post-hoc.
+      I2 : wide_bit_remaining ∈ [0, BitWidth_REG] — the innermost counter in
+           the cascade (wide_bit → bit → channel → sample → channel_group)
+           stays bounded by its ceiling at all times.
       I3 : ACTIVE/SPACING => channel_index in [0, NumChannels].
       I4 : channels/samples_in_group_remaining >= -1.
       I5 : spacing_slots_remaining >= 0, bit in [-1, SampleSize_REG].
@@ -591,11 +591,11 @@ def _check_invariants_phase(cfg: DpConfig, sample: Dict[str, Any]) -> List[str]:
     if not isinstance(phase, TransportPhase):
         violations.append(f"I1: phase={phase!r} is not a TransportPhase member")
 
-    # I2: wide_bit_repeat structural invariant.
-    if sample["wide_bit_repeat_attached"] and (sample["wide_bit_repeat_remaining"] or 0) < 1:
+    # I2: wide_bit cascade counter stays in bounds [0, BitWidth_REG].
+    if not (0 <= sample["wide_bit_remaining"] <= cfg.bit_width):
         violations.append(
-            f"I2: wide_bit_repeat attached but remaining="
-            f"{sample['wide_bit_repeat_remaining']}"
+            f"I2: wide_bit_remaining={sample['wide_bit_remaining']} out of range "
+            f"[0, BitWidth_REG={cfg.bit_width}]"
         )
 
     # I3: ACTIVE/SPACING => channel_index in bounds.
