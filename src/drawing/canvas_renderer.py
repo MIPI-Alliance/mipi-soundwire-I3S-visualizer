@@ -458,7 +458,7 @@ class CanvasRenderer:
         if m:
             # Data slot (any of the above formats matched)
             slot_info = Slot_info()
-            slot_info.slot_type = SlotType.NORMAL
+            slot_info.slot_type = SlotType.DATA
             slot_info.dir = DirectionType.SOURCE if is_source else DirectionType.SINK
             slot_info.device_num = device
             slot_info.dp_num = dp_num

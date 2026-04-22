@@ -72,7 +72,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -88,7 +88,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -104,7 +104,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -120,7 +120,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -232,7 +232,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -248,7 +248,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -264,7 +264,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -280,7 +280,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -392,7 +392,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 2,
@@ -408,7 +408,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 2,
@@ -424,7 +424,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 2,
@@ -440,7 +440,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 2,
@@ -552,7 +552,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 4,
@@ -568,7 +568,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 4,
@@ -584,7 +584,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 4,
@@ -600,7 +600,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 4,
@@ -712,7 +712,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -728,7 +728,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -744,7 +744,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -760,7 +760,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 3,
@@ -872,7 +872,7 @@
       "column": 4,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -888,7 +888,7 @@
       "column": 5,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -904,7 +904,7 @@
       "column": 6,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -920,7 +920,7 @@
       "column": 7,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,

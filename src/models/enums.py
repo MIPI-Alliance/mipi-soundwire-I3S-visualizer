@@ -48,7 +48,7 @@ class TransportPhase(Enum):
 class SlotType(Enum):
     """Type of slot in the frame"""
     EMPTY    = -1 # Position not owned by any DataPort (returned by next_bit_slot when inactive)
-    NORMAL   = 0  # Regular data bit
+    DATA     = 0  # Regular data bit
     GUARD_0  = 1  # Guard bit with polarity 0 (G0)
     TAIL     = 2  # Tail bit (to prevent clash)
     HANDOVER = 3  # Handover/turnaround bit

@@ -770,7 +770,7 @@ first). This is a behavior-neutral tightening.
              self._advance_row()
 
      def _slot(self) -> BitSlotState:
-         slot: BitSlotState = BitSlotState(slot_type=SlotType.NORMAL)
+         slot: BitSlotState = BitSlotState(slot_type=SlotType.DATA)
          column = self._state.column
 
 -        if self._state.row_transport_done or self._state.transport_state == TransportState.DONE:
@@ -821,7 +821,7 @@ first). This is a behavior-neutral tightening.
                  self._state.txp_sent = True
              else:
                  slot = BitSlotState(
-                     slot_type=SlotType.NORMAL,
+                     slot_type=SlotType.DATA,
                      direction=direction,
                      data=BitSlotData(
                          sample=self._state.sample,

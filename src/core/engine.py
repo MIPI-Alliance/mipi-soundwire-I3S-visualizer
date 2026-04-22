@@ -380,7 +380,7 @@ class BusModelBuilder:
                 elif bit_slot.slot_type in (SlotType.GUARD_0, SlotType.GUARD_1):
                     self._add_guard_bit(row, column, dp_index, dp, device, bit_slot)
                 else:
-                    # Data bit (NORMAL, TX_PRESENT)
+                    # Data bit (DATA, TX_PRESENT)
                     self._add_data_bit(row, column, dp_index, dp, device, bit_slot)
 
             # Dispatch FCP slot to bus model (separate write — clash detector
@@ -429,7 +429,7 @@ class BusModelBuilder:
                 last_slot_was_tail = False
                 last_slot_was_guard = True  # Mark for handover if no tail
             else:
-                # Data bit (NORMAL, TX_PRESENT, or DRQ)
+                # Data bit (DATA, TX_PRESENT, or DRQ)
                 last_bit_was_driven = True
                 last_slot_was_tail = False
                 last_slot_was_guard = False
@@ -758,11 +758,11 @@ class BusModelBuilder:
 
         # Check each position for source/sink scrambler mismatches
         for bit_index, bits in bits_by_index.items():
-            # Find source and sink bits at this position (only NORMAL data bits)
+            # Find source and sink bits at this position (only DATA data bits)
             sources = [b for b in bits if b.direction == DirectionType.SOURCE
-                       and b.dp is not None and b.slot == SlotType.NORMAL]
+                       and b.dp is not None and b.slot == SlotType.DATA]
             sinks = [b for b in bits if b.direction == DirectionType.SINK
-                     and b.dp is not None and b.slot == SlotType.NORMAL]
+                     and b.dp is not None and b.slot == SlotType.DATA]
 
             # Check for mismatches between each source/sink pair
             for source in sources:
@@ -794,8 +794,8 @@ class BusModelBuilder:
 
         # Check each position for test mode mismatches
         for bit_index, bits in bits_by_index.items():
-            # Get all data port bits at this position (only NORMAL data bits)
-            dp_bits = [b for b in bits if b.dp is not None and b.slot == SlotType.NORMAL]
+            # Get all data port bits at this position (only DATA data bits)
+            dp_bits = [b for b in bits if b.dp is not None and b.slot == SlotType.DATA]
 
             if len(dp_bits) < 2:
                 continue
@@ -863,8 +863,8 @@ class BusModelBuilder:
             actual_bits = 0
             for bit_info in self.bus_model.bits:
                 if bit_info.dp == dp_index and bit_info.bit_index < interval_end_bit:
-                    # Count NORMAL data bits and TX_PRESENT bits
-                    if bit_info.slot in (SlotType.NORMAL, SlotType.TX_PRESENT):
+                    # Count DATA data bits and TX_PRESENT bits
+                    if bit_info.slot in (SlotType.DATA, SlotType.TX_PRESENT):
                         actual_bits += 1
 
             if actual_bits < expected_bits:
@@ -903,11 +903,11 @@ class BusModelBuilder:
 
         # Check each position for source/sink sample/bit mismatches
         for bit_index, bits in bits_by_index.items():
-            # Find source and sink NORMAL data bits at this position
+            # Find source and sink DATA data bits at this position
             sources = [b for b in bits if b.direction == DirectionType.SOURCE
-                       and b.dp is not None and b.slot == SlotType.NORMAL]
+                       and b.dp is not None and b.slot == SlotType.DATA]
             sinks = [b for b in bits if b.direction == DirectionType.SINK
-                     and b.dp is not None and b.slot == SlotType.NORMAL]
+                     and b.dp is not None and b.slot == SlotType.DATA]
 
             # Check for mismatches between each source/sink pair
             for source in sources:

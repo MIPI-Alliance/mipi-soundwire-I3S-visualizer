@@ -169,9 +169,9 @@ class BitSlotState:
         """Check if this is a data-carrying slot.
 
         Returns:
-            True if slot_type is NORMAL
+            True if slot_type is DATA
         """
-        return self.slot_type == SlotType.NORMAL
+        return self.slot_type == SlotType.DATA
 
     def is_control_slot(self) -> bool:
         """Check if this is a control slot (CDS, S0, S1).
@@ -190,9 +190,9 @@ class BitSlotState:
         # EMPTY slots are never owned
         if self.slot_type == SlotType.EMPTY:
             return False
-        # A slot is owned if it's not NORMAL type or if it has data
-        # NORMAL slots without data are not owned
-        return self.slot_type != SlotType.NORMAL or self.data is not None
+        # A slot is owned if it's not DATA type or if it has data
+        # DATA slots without data are not owned
+        return self.slot_type != SlotType.DATA or self.data is not None
 
     def get_label(self) -> str:
         """Get display label for this slot.

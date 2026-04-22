@@ -51,7 +51,7 @@ class Slot_info:
     """Information about a single slot in the frame"""
 
     def __init__(self) -> None:
-        self.slot_type: SlotType  = SlotType.NORMAL
+        self.slot_type: SlotType  = SlotType.DATA
         self.dir: DirectionType        = DirectionType.SINK
         self.device_num: int = 0
         self.dp_num: Union[int, str]     = 0

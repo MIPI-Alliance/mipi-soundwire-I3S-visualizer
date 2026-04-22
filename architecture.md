@@ -263,7 +263,7 @@ Sequential bus representation:
 @dataclass
 class BitInfo:
     bit_index: int               # Global index (row * num_columns + column)
-    slot: SlotType               # NORMAL, GUARD, TAIL, CDS, etc.
+    slot: SlotType               # DATA, GUARD, TAIL, CDS, etc.
     direction: DirectionType     # SOURCE (write) or SINK (read)
     device: int                  # Device number
     dp: Optional[int]            # Data port index (None for system slots)
@@ -532,9 +532,9 @@ def next_bit_slot(self) -> BitSlotState:
         case EmissionPhase.DATA_PROBE:
             slot = self._slot()          # phase-driven state machine
             if slot.is_owned():
-                # Set up wide-bit replay (if BitWidth > 0) and seed
+                # Set up wide-bit replay (if BitWidth > 0) and prime
                 # guard/tail tokens into post_data_queue for later columns.
-                self._seed_post_data_queue()
+                self._prime_post_data_queue()
                 self._advance_column()
                 return slot
 
@@ -703,7 +703,7 @@ if slot_type == SlotOccupancyType.WRITE: ...
 | SlotType | Value | Description |
 |----------|-------|-------------|
 | EMPTY | -1 | Position not owned |
-| NORMAL | 0 | Regular data bit |
+| DATA | 0 | Regular data bit |
 | GUARD_0 | 1 | Guard bit (polarity 0) |
 | TAIL | 2 | Tail bit |
 | HANDOVER | 3 | Direction change indicator |

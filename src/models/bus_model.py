@@ -32,7 +32,7 @@ class BitInfo:
 
     Attributes:
         bit_index: Global sequential index (0 to N-1)
-        slot: Type of slot (NORMAL, CDS, S0, S1, GUARD, TAIL, etc.)
+        slot: Type of slot (DATA, CDS, S0, S1, GUARD, TAIL, etc.)
         direction: SOURCE (write) or SINK (read)
         device: Device number (-1=manager, -2=universal, -3=viz, 0-11=peripheral)
         dp: Data port number (None for system slots)
@@ -269,8 +269,8 @@ class BusModelJSONEncoder(json.JSONEncoder):
                 "row": 0,
                 "column": 1,
                 "slots": [
-                    { "slot_type": "NORMAL", "direction": "SOURCE", "dp_num": 0, ... },
-                    { "slot_type": "NORMAL", "direction": "SOURCE", "dp_num": 1, ... }
+                    { "slot_type": "DATA", "direction": "SOURCE", "dp_num": 0, ... },
+                    { "slot_type": "DATA", "direction": "SOURCE", "dp_num": 1, ... }
                 ]
             }
         },

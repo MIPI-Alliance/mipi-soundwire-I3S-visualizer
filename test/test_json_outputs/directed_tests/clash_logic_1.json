@@ -114,7 +114,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 0,
@@ -252,7 +252,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 1,
@@ -384,7 +384,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 2,
@@ -516,7 +516,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 3,
@@ -648,7 +648,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 4,
@@ -780,7 +780,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 5,
@@ -912,7 +912,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 6,
@@ -1172,7 +1172,7 @@
           "clash": "DIFFERENT_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 7,
@@ -1310,7 +1310,7 @@
       "column": 30,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 8,
@@ -1464,7 +1464,7 @@
       "column": 29,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": 0,
           "dp": 9,
@@ -1624,7 +1624,7 @@
       "column": 30,
       "slots": [
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 10,
@@ -1778,7 +1778,7 @@
           "clash": "SAME_DEVICE"
         },
         {
-          "slot": "NORMAL",
+          "slot": "DATA",
           "direction": "SOURCE",
           "device": -1,
           "dp": 11,

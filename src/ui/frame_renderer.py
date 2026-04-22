@@ -368,7 +368,7 @@ class FrameRenderer:
                            i: int, bit: 'BitInfo', row: int, column: int,
                            is_source: bool, color: str,
                            processed: set) -> int:
-        """Process and draw data bits (NORMAL, TX_PRESENT, DRQ), merging by display fields.
+        """Process and draw data bits (DATA, TX_PRESENT, DRQ), merging by display fields.
 
         Args:
             processed: Set of row_bits indices already processed. Merged indices will be added.
@@ -536,7 +536,7 @@ class FrameRenderer:
                         canvas, row_bits, i, bit, row, column)
 
                 else:
-                    # Data bits: NORMAL, TX_PRESENT, DRQ
+                    # Data bits: DATA, TX_PRESENT, DRQ
                     bits_consumed = self._process_data_bits(
                         canvas, row_bits, i, bit, row, column, is_source, color,
                         processed)
@@ -615,7 +615,7 @@ class FrameRenderer:
             # Only draw for data port bits with scrambler enabled
             if (bit.dp is not None and
                 bit.scrambler_enabled and
-                bit.slot == SlotType.NORMAL):
+                bit.slot == SlotType.DATA):
 
                 # Skip if we've already drawn at this position
                 pos_key = (bit.row, bit.column, bit.direction)

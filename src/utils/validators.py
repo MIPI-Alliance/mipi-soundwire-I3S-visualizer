@@ -228,7 +228,7 @@ class DataPortValidator:
         # Access config for all register values
         config = data_port.config
 
-        # Compute effective_channel_grouping locally (same logic as DataPortAlgorithm)
+        # Compute effective_channel_grouping locally (same logic as DataPort.reset_transport)
         num_channels = bin(config.EnableCh_REG).count('1')
         if config.ChannelGrouping_REG == 0 or config.ChannelGrouping_REG > num_channels:
             effective_channel_grouping = num_channels  # Natural count
