@@ -383,47 +383,44 @@ class DataPortConfig:
 
 ### DataPortState
 
-Mutable runtime state, reset before each frame render:
+Mutable runtime state, organized by reset scope. `DataPortState.reset_frame()`
+resets the whole object for a new render; narrower resets (row / transport /
+interval-wrap) live on `DataPortAlgorithm`.
 
 ```python
 class DataPortState:
-    # Position tracking
-    row: int                     # Current row
-    column: int                  # Current column
+    # Position
+    column: int
 
-    # Transport lifecycle
-    transport_started: bool      # Currently outputting data
-    transport_done: bool         # Transport complete for interval
-    row_transport_done: bool     # No more data on current row
-
-    # Interval tracking
+    # Interval-scope (cleared by _reset_interval_wrap)
     current_row_in_interval: int
+    phase: TransportPhase        # IDLE | ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
+
+    # Frame-scope (persists across intervals)
     skipping_accumulator: int
+    sample: int
 
-    # Sample tracking
-    sample: int                  # Global sample counter
-    sample_group_base: int       # Sample at start of transport
+    # Transport-scope (set by reset_transport on each Offset row)
+    sample_group_base: int
     samples_in_group_remaining: int
-
-    # Channel tracking
-    channel_index: int           # Current channel (sequential)
-    channel_group_base: int      # First channel in current group
+    channel_index: int
+    channel_group_base: int
+    channel_group_size: int
     channels_in_group_remaining: int
-    spacing_slots_remaining: int # Slots until next group
+    spacing_slots_remaining: int
+    bit: int
+    txp_sent: bool
 
-    # Bit tracking
-    bit: int                     # Current bit in sample
-    txp_sent: bool               # TxPresent bit sent for channel
-    drq_sent: bool               # DRQ bit sent for row
-
-    # Guard/tail state
-    guard_left: bool             # Guard pending after data
-    tails_left: int              # Tail bits remaining
-
-    # Wide bit tracking
-    wide_bit_slots_remaining: int
-    stored_wide_bit_slot: Optional[BitSlotState]
+    # Row-scope (cleared by reset_row)
+    wide_replay: Optional[WideBitReplay]   # slot + remaining columns
+    post_data_queue: deque[SlotType]       # deferred GUARD/TAIL tokens
 ```
+
+`phase` is the single source of truth for transport lifecycle — it replaces the
+earlier triple (`transport_started`, `transport_done`, `row_transport_done`) so
+illegal combinations are unrepresentable. Guard/tail pending state lives in
+`post_data_queue` (data-port side); the parallel `FlowControlPort` owns its own
+DRQ/guard/tail counters and is not part of `DataPortState`.
 
 ### DataPortAlgorithm
 
@@ -471,11 +468,11 @@ def _advance_channel_group(self):
     if all_groups_complete:
         if self._config.SubRowInterval_REG:
             # SRI: prepare for next transport within row
-            self._start_interval()
+            self.reset_transport()
             self._state.spacing_slots_remaining = self._config.Spacing_REG
         else:
             # Normal: transport complete
-            self._end_transport_pattern()
+            self._end_transport_pattern()    # phase = PATTERN_DONE
     else:
         # Move to next group, reset sample to group base
         self._state.channel_group_base += self._state.channel_group_size
@@ -485,58 +482,74 @@ def _advance_channel_group(self):
 
 #### Transport Pattern Lifecycle
 
+Phase transitions are driven by `TransportPhase` (5 values). `ROW_DONE` means
+"horizontal window closed on this row; pattern still alive" — on row wrap it
+flips back to `ACTIVE` so the next row's fresh window resumes emission.
+`PATTERN_DONE` persists until interval wrap sets `IDLE`.
+
 **Normal Mode** (one transport per interval):
 
 ```
-Row 0: [IDLE] ─(Offset match)─> [ACTIVE] ─(all CGs done)─> [DONE]
-Row 1: [DONE] ─────────────────────────────────────────────────>
-...
-Row N: [DONE] ─(interval wrap)─> [IDLE] ─(Offset match)─> [ACTIVE]
+Row N:   [IDLE] ─(row == Offset)─> [ACTIVE] ─(all CGs done)─> [PATTERN_DONE]
+                                      │
+                                      v
+                            [ROW_DONE]    (past HorizontalEnd on this row)
+                                      │
+                            (row wrap)│
+                                      v
+                                  [ACTIVE]   (next row resumes window)
+
+Row M:   [PATTERN_DONE] ─(interval wrap)─> [IDLE] ─(Offset match)─> [ACTIVE]
 ```
 
 **SRI Mode** (multiple transports per row):
 
 ```
-Col 0: [ACTIVE] ─(data)─> ... ─(all CGs)─> [PREPARE] ─(spacing)─> [ACTIVE]
-        │                                      │
-        └──────────────────────────────────────┴─(HorizontalEnd)─> [DONE]
+Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
+                                    │
+                                    └──(past HorizontalEnd)──> [ROW_DONE]
+                                                                   │
+                                                      (row wrap)   v
+                                                              [ACTIVE]
 ```
 
 #### next_bit_slot() Flow
 
+Emission runs as a two-arm `match` on an `EmissionPhase`:
+
 ```python
 def next_bit_slot(self) -> BitSlotState:
-    # 1. Handle wide bits (return same slot across multiple columns)
-    if self._state.wide_bit_slots_remaining > 0:
-        return stored_slot
+    match self._emission_phase():
+        case EmissionPhase.WIDE_REPLAY:
+            # Replay stored slot across BitWidth columns
+            slot = self._state.wide_replay.slot
+            self._state.wide_replay.remaining -= 1
+            if self._state.wide_replay.remaining == 0:
+                self._state.wide_replay = None
+            self._advance_column()
+            return slot
 
-    # 2. Check FCP guards/tails from previous DRQ
-    if self._state.fcp_guard_left:
-        return guard_slot
-    if self._state.fcp_tails_left > 0:
-        return tail_slot
+        case EmissionPhase.DATA_PROBE:
+            slot = self._slot()          # phase-driven state machine
+            if slot.is_owned():
+                # Set up wide-bit replay (if BitWidth > 0) and seed
+                # guard/tail tokens into post_data_queue for later columns.
+                self._seed_post_data_queue()
+                self._advance_column()
+                return slot
 
-    # 3. Check for DRQ bit (Rx Controlled / Async modes)
-    if fcp_active_row and not drq_sent and column == FCP_HorizontalStart:
-        return drq_slot
+            # No data — drain deferred guard/tail queue
+            if self._state.post_data_queue:
+                slot_type = self._state.post_data_queue.popleft()
+                self._advance_column()
+                return BitSlotState(slot_type=slot_type, direction=SOURCE)
 
-    # 4. Get data slot at current position
-    slot = self._slot()  # Internal state machine
-
-    # 5. If data slot, prepare guards/tails for later
-    if slot.is_owned() and slot.slot_type in (NORMAL, TX_PRESENT):
-        self._state.guard_left = GuardEnable_REG
-        self._state.tails_left = TailWidth_REG
-        return slot
-
-    # 6. If no data, check for guards/tails (deferred)
-    if self._state.guard_left:
-        return guard_slot
-    if self._state.tails_left > 0:
-        return tail_slot
-
-    return EMPTY_SLOT
+            self._advance_column()
+            return BitSlotState(slot_type=EMPTY)
 ```
+
+DRQ/FCP guards/tails are *not* in this path — the parallel `FlowControlPort`
+emits them independently and is composed at the engine layer.
 
 ### Channel Grouping
 

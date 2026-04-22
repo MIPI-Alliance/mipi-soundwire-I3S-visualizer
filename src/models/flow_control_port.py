@@ -107,7 +107,7 @@ class FlowControlPort:
         self._state.guard_left = False
 
     def reset_drq_sent(self) -> None:
-        """Clear drq_sent flag. Called by DP at interval wrap when _start_interval doesn't run."""
+        """Clear drq_sent flag. Called by DP at interval wrap when reset_transport() doesn't run."""
         self._state.drq_sent = False
 
     def reset_for_row(self) -> None:

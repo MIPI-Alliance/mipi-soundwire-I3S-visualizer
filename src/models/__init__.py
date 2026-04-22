@@ -4,7 +4,7 @@ This package contains the data model classes for representing
 SoundWire I3S frames, interfaces, and data ports.
 """
 
-from .enums import DirectionType, SlotType, DisplayField, FlowMode, TransportState
+from .enums import DirectionType, SlotType, DisplayField, FlowMode, TransportPhase
 from .frame import Frame_model, Row_info, Col_info, Slot_info, SimpleJSONEncoder
 from .interface import Interface
 from .dataport import DataPort, DataPortConfig
@@ -20,7 +20,7 @@ __all__ = [
     'SlotType',
     'ClashType',
     'FlowMode',
-    'TransportState',
+    'TransportPhase',
     # Frame model (legacy)
     'Frame_model',
     'Row_info',
