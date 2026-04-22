@@ -32,17 +32,11 @@ class PortMode(IntEnum):
 
 
 class TransportPhase(Enum):
-    """Lifecycle phase for a DataPort's transport pattern.
-
-    Collapses the former (transport_state, row_transport_done,
-    horizontal_count_done) triple into one exhaustive enum. Each phase is
-    mutually exclusive; illegal combinations are unrepresentable.
-    """
-    IDLE         = 0  # Pre-transport: between intervals, before Offset row
+    """Lifecycle phase for a DataPort's transport pattern."""
     ACTIVE       = 1  # Emitting data inside the transport window
     SPACING      = 2  # Inter-CG / inter-transport gap (spacing counter > 0)
     ROW_DONE     = 3  # No more data on this row; interval still alive
-    PATTERN_DONE = 4  # Transport pattern complete for this interval
+    PATTERN_DONE = 4  # Transport pattern complete (or skipped interval)
 
 
 class SlotType(Enum):

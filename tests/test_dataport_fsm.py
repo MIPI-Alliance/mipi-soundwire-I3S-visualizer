@@ -222,7 +222,6 @@ def _snapshot_legacy_tuple(state: DataPortState) -> Tuple[str, bool, bool]:
         # Some post-refactor phases map to multiple legacy tuples; we pick the
         # canonical representative for golden comparison purposes.
         canonical = {
-            TransportPhase.IDLE:         ("IDLE",   False, False),
             TransportPhase.ACTIVE:       ("ACTIVE", False, False),
             TransportPhase.SPACING:      ("ACTIVE", False, False),  # ACTIVE+spacing
             TransportPhase.ROW_DONE:     ("ACTIVE", True,  False),

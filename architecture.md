@@ -164,7 +164,7 @@ BusModelBuilder.build()
     │       │
     │       └── For each enabled data port:
     │               │
-    │               ├── dp.reset_frame()     # Reset state machine
+    │               ├── dp.reset()           # Hardware reset + arm first interval
     │               │
     │               └── For each bit position:
     │                       │
@@ -383,24 +383,25 @@ class DataPortConfig:
 
 ### DataPortState
 
-Mutable runtime state, organized by reset scope. `DataPortState.reset_frame()`
-resets the whole object for a new render; narrower resets (row / transport /
-interval-wrap) live on `DataPortAlgorithm`.
+Mutable runtime state, grouped by reset scope. `DataPortState.reset()` zeros
+the whole object; `DataPort.reset()` chains it with the interval-start
+sequence. Narrower resets (row / interval / transport) are inlined in or
+called from `DataPort._advance_row` and `_reset_transport`.
 
 ```python
 class DataPortState:
     # Position
     column: int
 
-    # Interval-scope (cleared by _reset_interval)
+    # Interval-scope
     row_in_interval: int
-    phase: TransportPhase        # IDLE | ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
+    phase: TransportPhase        # ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
 
-    # Frame-scope (persists across intervals)
+    # Cycles with the effective SSP interval (zeroed only at hardware reset)
     skipping_accumulator: int
-    transport_index: int         # incremented on each _reset_transport (hardware-style counter)
 
-    # Transport-scope (set by _reset_transport on each Offset row)
+    # Transport-scope (set by _reset_transport on each interval start and
+    # on each SRI mid-row transport rollover)
     sample_in_group: int         # 0..SampleGrouping_REG within current transport
     samples_in_group_remaining: int
     channel_index: int
@@ -411,29 +412,30 @@ class DataPortState:
     bit: int
     txp_sent: bool
 
-    # Row-scope (cleared by _reset_row)
+    # Row-scope (cleared at row wrap)
     wide_replay: Optional[WideBitReplay]   # slot + remaining columns
     post_data_queue: deque[SlotType]       # deferred GUARD/TAIL tokens
 ```
 
-`phase` is the single source of truth for transport lifecycle — it replaces the
-earlier triple (`transport_started`, `transport_done`, `row_transport_done`) so
-illegal combinations are unrepresentable. Guard/tail pending state lives in
-`post_data_queue` (data-port side); the parallel `FlowControlPort` owns its own
-DRQ/guard/tail counters and is not part of `DataPortState`.
+`phase` is the single source of truth for transport lifecycle. The parallel
+`FlowControlPort` lives on `Interface.flow_control_ports` and owns its own
+DRQ/guard/tail counters; it is not part of `DataPortState`.
 
 **Sample tracking is external to DataPort.** `DataPortState` holds only
-`sample_in_group` (transport-scoped, 0..SG) and `transport_index` (a
-hardware-style counter bumped each `_reset_transport`). The absolute/global
-sample ordinal shown in labels is reconstructed by the engine as:
+`sample_in_group` (transport-scoped, 0..SG). The engine maintains a per-DP
+transport counter by observing DP state transitions — it detects a fresh
+transport via the unique post-`_reset_transport` state signature and
+distinguishes SRI row-cut resumptions by comparing bits-emitted to
+`num_channels × (SampleSize+1) × (SG+1)`. The absolute/global sample
+ordinal in labels is reconstructed as:
 
 ```
-global_sample = max(0, transport_index - 1) * (SampleGrouping_REG + 1) + sample_in_group
+global_sample = max(0, transport_index_at_emit - 1) * (SampleGrouping_REG + 1) + sample_in_group
 ```
 
-This matches real hardware, where a data port tracks only its position within
-the current transport pattern and has no knowledge of cross-interval sample
-ordinals (those are a DMA/source-side concept).
+This matches real hardware, where a data port tracks only its position
+within the current transport pattern and has no knowledge of cross-interval
+sample ordinals (those are a DMA/source-side concept).
 
 ### DataPortAlgorithm
 
@@ -496,24 +498,25 @@ def _advance_channel_group(self):
 
 #### Transport Pattern Lifecycle
 
-Phase transitions are driven by `TransportPhase` (5 values). `ROW_DONE` means
-"horizontal window closed on this row; pattern still alive" — on row wrap it
-flips back to `ACTIVE` so the next row's fresh window resumes emission.
-`PATTERN_DONE` persists until interval wrap sets `IDLE`.
+`TransportPhase` has four values. `ROW_DONE` means "horizontal window closed
+on this row; pattern still alive" — on row wrap it flips back to `ACTIVE`
+so the next row's fresh window resumes emission. `PATTERN_DONE` persists
+until the next row-counter rollover, where `_start_interval` arms a fresh
+transport (or keeps `PATTERN_DONE` if this interval is skipped).
 
 **Normal Mode** (one transport per interval):
 
 ```
-Row N:   [IDLE] ─(row == Offset)─> [ACTIVE] ─(all CGs done)─> [PATTERN_DONE]
-                                      │
-                                      v
-                            [ROW_DONE]    (past HorizontalEnd on this row)
-                                      │
-                            (row wrap)│
-                                      v
-                                  [ACTIVE]   (next row resumes window)
+Row N:     [ACTIVE] ─(all CGs done)─> [PATTERN_DONE]
+              │
+              v
+         [ROW_DONE]    (past HorizontalEnd on this row)
+              │
+         (row wrap, mid-interval)
+              v
+          [ACTIVE]     (next row resumes window)
 
-Row M:   [PATTERN_DONE] ─(interval wrap)─> [IDLE] ─(Offset match)─> [ACTIVE]
+Row wrap:  [PATTERN_DONE] ─(row-counter rollover → _start_interval)─> [ACTIVE]
 ```
 
 **SRI Mode** (multiple transports per row):
