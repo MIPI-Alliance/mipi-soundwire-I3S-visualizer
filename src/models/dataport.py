@@ -127,10 +127,6 @@ class DataPortConfig:
         """Map sequential index to actual channel number from EnableCh_REG bitmask."""
         return self._enabled_channels[index]
 
-# =============================================================================
-# Main DataPort Class
-# =============================================================================
-
 class DataPort:
     """SWI3S Data Port — config + state + algorithm.
 
@@ -147,10 +143,6 @@ class DataPort:
         self.dp_index = dp_index
         self.config = DataPortConfig()
         self._state = DataPortState()
-
-    # =========================================================================
-    # Public Interface
-    # =========================================================================
 
     @property
     def row_in_interval(self) -> int:
@@ -186,20 +178,8 @@ class DataPort:
         self._advance_column()
         return BitSlotState(slot_type=SlotType.EMPTY)
 
-    # =========================================================================
-    # Slot Emission
-    # =========================================================================
-
     def _data_slot(self) -> BitSlotState:
-        """Return the data slot at the current position, inside the active window.
-
-        Assumes the caller has filtered the passive gates (num_channels > 0,
-        phase ∈ {ACTIVE, SPACING}, row_in_interval ≥ Offset_REG, column ≥
-        HorizontalStart_REG). Mutates state: sets ROW_DONE at HorizontalEnd,
-        decrements the SPACING counter, or, on emission, manages the wide-bit
-        hold counter and advances the bit/channel cursor when the hold rolls
-        over.
-        """
+        """Return the data slot at the current position, inside the active window."""
         if self._state.column > self.config._horizontal_end:
             # Transport window exhausted on this row. Clear spacing so
             # stale gaps don't leak into next row's first emission.
@@ -272,20 +252,14 @@ class DataPort:
             self._start_interval()
 
     def _start_interval(self) -> None:
-        """Hardware behaviour at row-counter rollover: tick the skipping
-        counter, latch whether this interval is skipped, and arm a fresh
-        transport. Emission is gated by `interval_skipped` and Offset_REG
-        in fetch_bit_slot.
-        """
+        """Interval row-counter rollover: advance the skipping accumulator."""
         self._state.interval_skipped = self._advance_skipping()
         self._reset_transport()
 
     def _advance_skipping(self) -> bool:
         """Advance the skipping accumulator at the start of an SSP interval.
 
-        Returns True iff this interval should be skipped (accumulator
-        reached SkippingDenominator). Caller latches the flag; no phase
-        side-effect here.
+        Returns True iff this interval should be skipped. 
         """
         if self.config.SkippingNumerator_REG == 0:
             return False
@@ -298,10 +272,9 @@ class DataPort:
     def _reset_transport(self) -> None:
         """Re-init transport-scope state for a new transport pattern.
 
-        Called from _start_interval on every row-counter rollover and, SRI
-        only, inline from _advance_channel_group on mid-row pattern
-        completion. Does NOT touch column, row counter, or post-data queue
-        (those are row-scoped).
+        Called from _start_interval on interval rollover and, SRI
+        only, from _advance_channel_group on mid-row pattern
+        completion.
         """
         self._state.phase = TransportPhase.ACTIVE
         self._state.spacing_slots_remaining = 0
@@ -322,10 +295,6 @@ class DataPort:
         self._state.wide_bit_remaining = self.config.BitWidth_REG
         self._state.txp_pending = self.config._emits_txp
 
-    # =========================================================================
-    # Counter Cascade (wide_bit → bit → channel → sample → channel_group)
-    # =========================================================================
-
     def _advance_wide_bit(self) -> None:
         """Next wide-bit tick; cascades to _advance_bit on exhaustion."""
         self._state.wide_bit_remaining -= 1
@@ -334,12 +303,7 @@ class DataPort:
             self._advance_bit()
 
     def _advance_bit(self) -> None:
-        """Next emission position within the current (channel, sample).
-
-        If we were emitting TX_PRESENT, end that phase (the bit cursor stays
-        on the first DATA bit). Otherwise decrement the bit cursor and
-        cascade to _advance_channel at underflow.
-        """
+        """Next emission position within the current (channel, sample)."""
         if self._state.txp_pending:
             self._state.txp_pending = False
             return
