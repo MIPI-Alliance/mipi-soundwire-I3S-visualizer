@@ -500,9 +500,11 @@ class DataPort:
     def _slot(self) -> BitSlotState:
         """Return the BitSlotState at current position based on internal state.
 
-        Returns a fresh BitSlotState (DATA with no data) when no data is owned.
+        Returns EMPTY when the DP has nothing to emit this slot (outside
+        transport window, spacing gap, or post-PATTERN_DONE). Returns DATA
+        or TX_PRESENT (both with BitSlotData payload) when emitting.
         """
-        slot = BitSlotState(slot_type=SlotType.DATA)
+        slot = BitSlotState(slot_type=SlotType.EMPTY)
 
         if self._state.phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE):
             return slot

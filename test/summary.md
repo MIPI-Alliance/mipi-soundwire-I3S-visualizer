@@ -1,10 +1,10 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 06:57:00
+**Generated:** 2026-04-22 07:44:00
 
-**Total Time:** 0:24.4 (+1.3s)
+**Total Time:** 0:23.5 (-0.9s)
 
-**Comparing to:** 2026-04-22T06:40:31.240958
+**Comparing to:** 2026-04-22T06:57:00.364745
 
 ## Test Results
 
@@ -31,7 +31,7 @@
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
 | CDS | 1,193 | 8.9% | 0 |
-| DATA | 7,135 | 53.4% |  |
+| DATA | 7,135 | 53.4% | 0 |
 | DRQ | 40 | 0.3% | 0 |
 | GUARD_0 | 285 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
