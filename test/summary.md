@@ -1,26 +1,26 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 15:43:46
+**Generated:** 2026-04-22 16:23:43
 
-**Total Time:** 0:29.1 (+1.2s)
+**Total Time:** 0:30.4 (+2.0s)
 
-**Comparing to:** 2026-04-22T15:32:22.210441
+**Comparing to:** 2026-04-22T16:22:21.884573
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
 | Total Tests | 86 | 0 |
-| Passed | 86 | 0 |
-| Failed | 0 | 0 |
+| Passed | 86 | +6 |
+| Failed | 0 | -6 |
 | Pass Rate | 100.0% | |
 
 ## Aggregate Statistics (All Tests)
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,016 | 0 |
-| Total Slots | 13,359 | 0 |
+| Total Bit Positions | 12,016 | +348 |
+| Total Slots | 13,359 | +594 |
 | Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
@@ -30,23 +30,23 @@
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,193 | 8.9% | 0 |
-| DATA | 7,135 | 53.4% | 0 |
-| DRQ | 40 | 0.3% | 0 |
-| GUARD_0 | 285 | 2.1% | 0 |
-| GUARD_1 | 32 | 0.2% | 0 |
+| CDS | 1,193 | 8.9% | +58 |
+| DATA | 7,135 | 53.4% | +460 |
+| DRQ | 40 | 0.3% | +32 |
+| GUARD_0 | 285 | 2.1% | +2 |
+| GUARD_1 | 32 | 0.2% | +2 |
 | HANDOVER | 2,586 | 19.4% | 0 |
 | S0 | 996 | 7.5% | 0 |
 | S1 | 772 | 5.8% | 0 |
-| TAIL | 284 | 2.1% | 0 |
-| TX_PRESENT | 36 | 0.3% | 0 |
+| TAIL | 284 | 2.1% | +4 |
+| TX_PRESENT | 36 | 0.3% |  |
 
 ## Direction Distribution
 
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| SINK | 1,451 | 10.9% | 0 |
-| SOURCE | 11,908 | 89.1% | 0 |
+| SINK | 1,451 | 10.9% | +264 |
+| SOURCE | 11,908 | 89.1% | +330 |
 
 ## Individual Test Results
 

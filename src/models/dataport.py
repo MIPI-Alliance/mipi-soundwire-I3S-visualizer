@@ -1,28 +1,22 @@
 """DataPort configuration and state management.
 
 Classes:
-    DataPortState: Runtime state for frame rendering
+    DataPortState:  Runtime state
     DataPortConfig: Configuration and register values
-    DataPort: Combines config, state, and algorithm
+    DataPort:       Combines config, state, and algorithm
 
 Phase: TransportPhase tracks the transport lifecycle:
-    ACTIVE       emitting inside the horizontal window
-    SPACING      inter-channel-group / SRI inter-transport gap
-    ROW_DONE     row's window exhausted; transport still alive across wrap
-    PATTERN_DONE transport complete or interval skipped
+    ACTIVE       Emitting inside the horizontal window
+    SPACING      Inter-channel-group / SRI inter-transport gap
+    ROW_DONE     Row's window exhausted; transport still alive across wrap
+    PATTERN_DONE Transport complete or interval skipped
 
 Normal vs SRI:
-    - Normal: one transport per SSP interval; channel groups
+    - Normal: One transport per SSP interval; channel groups
       structure the burst/space pattern within the transport.
-    - SRI:    multiple transports per row.
+    - SRI:    Multiple transports per row.
 
-Reset scopes (outer → inner):
-    Reset     DataPort.reset                   hardware reset
-    Interval  row-counter rollover             skipping check; arm transport
-    Row       inlined in _advance_row          clear per-row containers
-    Transport _reset_transport                 re-init transport-scope state
-
-Counter cascade (propagates outward):
+Counter cascade:
     wide_bit → bit → channel → sample → channel_group → transport completion
 """
 
@@ -35,10 +29,6 @@ from .enums import SlotType, DirectionType, FlowMode, TransportPhase
 if TYPE_CHECKING:
     from .device import Device
 
-# =============================================================================
-# Runtime State Class
-# =============================================================================
-
 class DataPortState:
     """Runtime state for a DataPort."""
 
@@ -50,22 +40,12 @@ class DataPortState:
 
     def reset(self) -> None:
         """Hardware reset model."""
-        # Position
-        self.column: int = 0
 
-        # Interval-scope
+        self.column: int = 0
         self.row_in_interval: int = 0
         self.phase: TransportPhase = TransportPhase.PATTERN_DONE
-        # Latched at interval start by _advance_skipping; gates emission
-        # for the whole interval when True.
         self.interval_skipped: bool = False
-
-        # Cycles with the effective SSP interval; zeroed at hardware reset
-        # so every render starts deterministically.
         self.skipping_accumulator: int = 0
-
-        # Transport-scope (set by _reset_transport at every interval start
-        # and at each SRI mid-row transport rollover).
         self.sample_in_group: int = 0
         self.samples_in_group_remaining: int = 0
         self.channel_index: int = 0
@@ -74,15 +54,9 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.channel_group_size: int = 0
         self.bit: int = 0
-        self.wide_bit_remaining: int = 0  # innermost counter; rolls over into _advance_bit
-
-        # Row-scope
+        self.wide_bit_remaining: int = 0
+        self.txp_pending: bool = False  # True → next emission is TX_PRESENT (not DATA)
         self.post_data_queue.clear()
-
-
-# =============================================================================
-# Configuration Class
-# =============================================================================
 
 class DataPortConfig:
     """Configuration and register state for a DataPort."""
@@ -143,23 +117,15 @@ class DataPortConfig:
         return self.HorizontalStart_REG + self.HorizontalCount_REG
 
     @property
-    def _top_bit(self) -> int:
-        """Starting bit-cursor position for a fresh (channel, sample) pair.
-
-        In TX_CONTROLLED / ASYNC flow modes this is SampleSize_REG + 1,
-        where the extra position encodes TX_PRESENT (emitted before the
-        DATA bits). In NORMAL / RX_CONTROLLED it is SampleSize_REG (first
-        DATA bit). The cursor counts down from here to 0; a bit > SampleSize_REG
-        selects TX_PRESENT, anything else selects DATA.
+    def _emits_txp(self) -> bool:
+        """True iff FlowMode prepends a TX_PRESENT slot before each
+        (channel, sample) pair's DATA bits (TX_CONTROLLED or ASYNC).
         """
-        return self.SampleSize_REG + (
-            1 if self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC) else 0
-        )
+        return self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
 
     def _channel(self, index: int) -> int:
         """Map sequential index to actual channel number from EnableCh_REG bitmask."""
         return self._enabled_channels[index]
-
 
 # =============================================================================
 # Main DataPort Class
@@ -248,16 +214,8 @@ class DataPort:
                 self._state.phase = TransportPhase.ACTIVE
             return BitSlotState(slot_type=SlotType.EMPTY)
 
-        # phase == ACTIVE — emit data (or TxPresent). The wide_bit counter is
-        # the innermost counter in the cascade (wide_bit → bit → channel →
-        # sample → channel_group): the same bit is emitted BitWidth_REG + 1
-        # times before the bit cursor advances. A cursor position above
-        # SampleSize_REG encodes TX_PRESENT (only reachable in TX_CONTROLLED
-        # / ASYNC flow modes; see config._top_bit).
         direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
-        is_txp = self._state.bit > self.config.SampleSize_REG
-
-        if is_txp:
+        if self._state.txp_pending:
             slot = BitSlotState(
                 slot_type=SlotType.TX_PRESENT,
                 direction=direction,
@@ -293,10 +251,6 @@ class DataPort:
         for _ in range(self.config.TailWidth_REG):
             self._state.post_data_queue.append(SlotType.TAIL)
 
-    # =========================================================================
-    # Position Management
-    # =========================================================================
-
     def _advance_column(self) -> None:
         """Advance column; wrap to the next row at the right edge."""
         self._state.column += 1
@@ -305,27 +259,17 @@ class DataPort:
 
     def _advance_row(self) -> None:
         """Advance the row counter and prepare per-row state."""
-        # Row-scope reset: clear per-row containers.
         self._state.column = 0
         self._state.post_data_queue.clear()
 
-        # SRI row-cut: ROW_DONE was set by the HorizontalEnd guard while a
-        # transport was still alive. Fresh row resumes emission. Interval
-        # rollover (below) overrides this if it fires.
         if self._state.phase == TransportPhase.ROW_DONE:
             self._state.phase = TransportPhase.ACTIVE
 
         self._state.row_in_interval += 1
 
-        # Row-counter rollover = SSP interval boundary. Fire interval-start
-        # so state is identical at every interval (including post-reset).
         if self._state.row_in_interval > self.config.Interval_REG:
             self._state.row_in_interval = 0
             self._start_interval()
-
-    # =========================================================================
-    # Scope Resets
-    # =========================================================================
 
     def _start_interval(self) -> None:
         """Hardware behaviour at row-counter rollover: tick the skipping
@@ -374,8 +318,9 @@ class DataPort:
             self._state.channel_group_size = self.config.ChannelGrouping_REG
         self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
-        self._state.bit = self.config._top_bit
+        self._state.bit = self.config.SampleSize_REG
         self._state.wide_bit_remaining = self.config.BitWidth_REG
+        self._state.txp_pending = self.config._emits_txp
 
     # =========================================================================
     # Counter Cascade (wide_bit → bit → channel → sample → channel_group)
@@ -389,7 +334,15 @@ class DataPort:
             self._advance_bit()
 
     def _advance_bit(self) -> None:
-        """Next bit; cascades to _advance_channel on exhaustion."""
+        """Next emission position within the current (channel, sample).
+
+        If we were emitting TX_PRESENT, end that phase (the bit cursor stays
+        on the first DATA bit). Otherwise decrement the bit cursor and
+        cascade to _advance_channel at underflow.
+        """
+        if self._state.txp_pending:
+            self._state.txp_pending = False
+            return
         self._state.bit -= 1
         if self._state.bit < 0:
             self._advance_channel()
@@ -402,7 +355,8 @@ class DataPort:
         if self._state.channels_in_group_remaining < 0:
             self._advance_sample()
         else:
-            self._state.bit = self.config._top_bit
+            self._state.bit = self.config.SampleSize_REG
+            self._state.txp_pending = self.config._emits_txp
 
     def _advance_sample(self) -> None:
         """Next sample; cascades to _advance_channel_group on exhaustion."""
@@ -412,7 +366,8 @@ class DataPort:
         if self._state.samples_in_group_remaining < 0:
             self._advance_channel_group()
         else:
-            self._state.bit = self.config._top_bit
+            self._state.bit = self.config.SampleSize_REG
+            self._state.txp_pending = self.config._emits_txp
             self._state.channel_index = self._state.channel_group_base
             self._state.channels_in_group_remaining = self._state.channel_group_size - 1
 
@@ -423,11 +378,9 @@ class DataPort:
 
         if pattern_complete:
             if self.config.SubRowInterval_REG:
-                # SRI mid-row transport rollover. Final PATTERN_DONE in SRI
-                # is driven by the HorizontalEnd guard in _probe_slot.
+                # SRI mid-row transport rollover.
                 self._reset_transport()
             else:
-                # Normal mode: transport done — wait for row-counter rollover.
                 self._state.phase = TransportPhase.PATTERN_DONE
                 return
         else:
@@ -437,19 +390,14 @@ class DataPort:
                 remaining_channels = self._state.channel_group_size
             self._state.channels_in_group_remaining = remaining_channels - 1
 
-            # Sample counter restarts at 0 because all channel groups within
-            # one transport share the same sample(s):
-            #   SampleGrouping=0 → each CG processes sample_in_group 0 only
-            #   SampleGrouping>0 → each CG processes sample_in_group 0..SG
             self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
             if (self.config.ChannelGrouping_REG > 0 and
                 self.config.ChannelGrouping_REG < self.config._num_channels):
                 self._state.sample_in_group = 0
-            self._state.bit = self.config._top_bit
+            self._state.bit = self.config.SampleSize_REG
+            self._state.txp_pending = self.config._emits_txp
             self._state.channel_index = self._state.channel_group_base
 
-        # Inter-group gap. Both the SRI-next-transport and next-CG paths land
-        # here; the current slot is consumed as the first tick of the gap.
         if self.config.Spacing_REG == 0:
             # No gap: Normal mode already returned PATTERN_DONE above; SRI
             # ends the row and the next row's _start_interval arms a fresh
