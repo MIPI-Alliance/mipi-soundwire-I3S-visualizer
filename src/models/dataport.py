@@ -56,6 +56,9 @@ class DataPortState:
         # Interval-scope
         self.row_in_interval: int = 0
         self.phase: TransportPhase = TransportPhase.PATTERN_DONE
+        # Latched at interval start by _advance_skipping; gates emission
+        # for the whole interval when True.
+        self.interval_skipped: bool = False
 
         # Cycles with the effective SSP interval; zeroed at hardware reset
         # so every render starts deterministically.
@@ -183,6 +186,7 @@ class DataPort:
     def fetch_bit_slot(self) -> BitSlotState:
         """Emit bit slot information at the current position and auto-advance."""
         if (self.config._num_channels == 0
+                or self._state.interval_skipped
                 or self._state.phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
                 or self._state.row_in_interval < self.config.Offset_REG
                 or self._state.column < self.config.HorizontalStart_REG):
@@ -313,27 +317,26 @@ class DataPort:
     # =========================================================================
 
     def _start_interval(self) -> None:
-        """Hardware behaviour at row-counter rollover: check skipping; if
-        not skipped, arm a fresh transport. Emission is row-gated by
-        Offset_REG in _probe_slot.
+        """Hardware behaviour at row-counter rollover: tick the skipping
+        counter, latch whether this interval is skipped, and arm a fresh
+        transport. Emission is gated by `interval_skipped` and Offset_REG
+        in fetch_bit_slot.
         """
-        if self._advance_skipping():
-            return
+        self._state.interval_skipped = self._advance_skipping()
         self._reset_transport()
 
     def _advance_skipping(self) -> bool:
         """Advance the skipping accumulator at the start of an SSP interval.
 
-        When the accumulator reaches SkippingDenominator, mark the interval
-        skipped (phase = PATTERN_DONE) and return True; otherwise False.
+        Returns True iff this interval should be skipped (accumulator
+        reached SkippingDenominator). Caller latches the flag; no phase
+        side-effect here.
         """
         if self.config.SkippingNumerator_REG == 0:
             return False
         self._state.skipping_accumulator += self.config.SkippingNumerator_REG
         if self._state.skipping_accumulator < self._device._interface.SkippingDenominator_REG:
             return False
-        # PATTERN_DONE encodes both "skip" and "row done" in one state.
-        self._state.phase = TransportPhase.PATTERN_DONE
         self._state.skipping_accumulator -= self._device._interface.SkippingDenominator_REG
         return True
 
