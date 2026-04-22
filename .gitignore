@@ -18,6 +18,8 @@ __pycache__/
 # Test artifacts
 tests/previous_stats.json
 tests/temp/
+test/temp/
+test/diffcheck/
 
 # PyInstaller
 build/
