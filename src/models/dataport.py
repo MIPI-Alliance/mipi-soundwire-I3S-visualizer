@@ -75,8 +75,10 @@ Reset Scopes
 
 Each field has exactly one reset scope:
 
-    Frame     — whole rendering pass (DataPort.reset_frame / DataPortState.reset_frame)
-    Interval  — one Interval_REG period (inlined in _advance_row on wrap)
+    Reset     — full hardware reset (DataPort.reset / DataPortState.reset)
+    Interval  — one effective SSP interval (inlined in _advance_row on wrap;
+                the effective interval is (Interval_REG + 1) rows, extended
+                by the skipping factor when SkippingNumerator_REG is set)
     Row       — one column sweep (inlined in _advance_row before each row)
     Transport — one transport pattern within an interval (_reset_transport)
 
@@ -140,10 +142,10 @@ class DataPortState:
         # Persistent containers created once; cleared (not reassigned) on reset.
         self.post_data_queue: deque[SlotType] = deque()
         self.wide_replay: Optional[WideBitReplay] = None
-        self.reset_frame()
+        self.reset()
 
-    def reset_frame(self) -> None:
-        """Frame-scope reset — full re-init for a new rendering pass."""
+    def reset(self) -> None:
+        """Hardware reset — full re-init of all runtime state."""
         # Position
         self.column: int = 0
 
@@ -151,7 +153,8 @@ class DataPortState:
         self.row_in_interval: int = 0
         self.phase: TransportPhase = TransportPhase.IDLE
 
-        # Frame-scope (persists across intervals)
+        # Cycles with the effective SSP interval; zeroed here only so every
+        # rendering pass starts from the same deterministic state.
         self.skipping_accumulator: int = 0
 
         # Transport-scope (reset by _reset_transport on each Offset row)
@@ -261,7 +264,8 @@ class DataPort:
     External interface:
         - config: DataPortConfig for configuration/register attributes
         - dp_index: Canonical position index (0-15)
-        - reset_frame(): Reset state for a new frame
+        - reset(): Hardware reset — re-init runtime state before a new
+          rendering pass
         - next_bit_slot(): Get slot for current position (auto-advances)
         - row_in_interval: DP's current row index within its interval
 
@@ -559,14 +563,14 @@ class DataPort:
     # Public Interface
     # =========================================================================
 
-    def reset_frame(self) -> None:
-        """Reset all runtime state for a fresh drawing pass.
+    def reset(self) -> None:
+        """Hardware reset: re-init all runtime state.
 
-        Call before starting a new frame. The companion FlowControlPort
-        (held by the parent Interface) must be reset separately by the
-        caller (the engine).
+        Call before starting a new rendering pass. The companion
+        FlowControlPort (held by the parent Interface) must be reset
+        separately by the caller (the engine).
         """
-        self._state.reset_frame()
+        self._state.reset()
         # Prime row 0 if it's already at Offset_REG.
         if self._state.row_in_interval == self.config.Offset_REG:
             if not self._apply_skipping_at_offset():

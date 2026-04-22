@@ -534,7 +534,7 @@ class CSVHandler:
 
                 # Reset all data ports to clear stale runtime state
                 for data_port in interface.data_ports:
-                    data_port.reset_frame()
+                    data_port.reset()
 
                 # Store rows_to_draw from viz_config into result for backward compatibility
                 result.rows_in_frame = viz_config.rows_to_draw

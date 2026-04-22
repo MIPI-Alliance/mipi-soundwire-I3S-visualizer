@@ -1,10 +1,10 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 12:46:16
+**Generated:** 2026-04-22 12:59:26
 
-**Total Time:** 0:25.1 (+0.7s)
+**Total Time:** 0:23.8 (-1.3s)
 
-**Comparing to:** 2026-04-22T12:45:31.365250
+**Comparing to:** 2026-04-22T12:46:16.770748
 
 ## Test Results
 
