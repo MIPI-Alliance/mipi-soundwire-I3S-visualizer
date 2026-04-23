@@ -1,27 +1,27 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 17:36:49
+**Generated:** 2026-04-22 17:52:53
 
-**Total Time:** 0:27.8 (-1.1s)
+**Total Time:** 0:28.4 (+0.6s)
 
-**Comparing to:** 2026-04-22T17:32:20.100276
+**Comparing to:** 2026-04-22T17:36:49.173020
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
 | Total Tests | 86 | 0 |
-| Passed | 86 | +1 |
-| Failed | 0 | -1 |
+| Passed | 86 | 0 |
+| Failed | 0 | 0 |
 | Pass Rate | 100.0% | |
 
 ## Aggregate Statistics (All Tests)
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,016 | +51 |
-| Total Slots | 13,359 | +51 |
-| Total Handovers | 2,586 | +6 |
+| Total Bit Positions | 12,016 | 0 |
+| Total Slots | 13,359 | 0 |
+| Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
 | Read Overlaps | 64 | 0 |
@@ -30,12 +30,12 @@
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,193 | 8.9% | +3 |
-| DATA | 7,135 | 53.4% | +42 |
+| CDS | 1,193 | 8.9% | 0 |
+| DATA | 7,135 | 53.4% | 0 |
 | DRQ | 40 | 0.3% | 0 |
 | GUARD_0 | 285 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
-| HANDOVER | 2,586 | 19.4% | +6 |
+| HANDOVER | 2,586 | 19.4% | 0 |
 | S0 | 996 | 7.5% | 0 |
 | S1 | 772 | 5.8% | 0 |
 | TAIL | 284 | 2.1% | 0 |
@@ -46,7 +46,7 @@
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
 | SINK | 1,451 | 10.9% | 0 |
-| SOURCE | 11,908 | 89.1% | +51 |
+| SOURCE | 11,908 | 89.1% | 0 |
 
 ## Individual Test Results
 

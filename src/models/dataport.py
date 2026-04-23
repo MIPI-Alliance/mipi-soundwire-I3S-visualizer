@@ -32,13 +32,13 @@ if TYPE_CHECKING:
 class DataPortState:
     """Runtime state for a DataPort."""
 
-    def __init__(self, config: 'DataPortConfig') -> None:
+    def __init__(self, config: DataPortConfig) -> None:
         # post_data_queue is reused across initializations so external holders
         # keep a stable reference; initialize() clears it in place.
         self.post_data_queue: deque[SlotType] = deque()
         self.initialize(config)
 
-    def initialize(self, config: 'DataPortConfig') -> None:
+    def initialize(self, config: DataPortConfig) -> None:
         """Set state to the current config."""
         self.column: int = 0
         self.row_in_interval: int = 0
@@ -189,8 +189,7 @@ class DataPort:
         if self._state.column > self.config._horizontal_end:
             # Transport window exhausted on this row. Clear spacing so
             # stale gaps don't leak into next row.
-            if self._state.spacing_slots_remaining > 0:
-                self._state.spacing_slots_remaining = 0
+            self._state.spacing_slots_remaining = 0
             self._state.phase = TransportPhase.ROW_DONE
             return BitSlotState(slot_type=SlotType.EMPTY)
 
@@ -340,10 +339,12 @@ class DataPort:
                 self._state.phase = TransportPhase.PATTERN_DONE
                 return
         else:
-            # Next CG within same transport; inner counters (bit, txp_pending,
-            # sample, channels_in_group_remaining, channel_index) were already
-            # reset by the cascade that brought us here. Update the CG-scope
-            # counters for the new group's size and starting channel.
+            # Next CG within same transport. The cascade that brought us here
+            # left the inner counters (bit, wide_bit_remaining, txp_pending,
+            # sample_in_group, samples_in_group_remaining) at fresh-transport
+            # values. Retarget the CG-scope counters at the new group: advance
+            # channel_group_base, point channel_index at the new base, and set
+            # channels_in_group_remaining (trimmed if the last group is partial).
             self._state.channel_group_base += cg_size
             remaining_channels = self.config._num_channels - self._state.channel_group_base
             if remaining_channels > cg_size:
