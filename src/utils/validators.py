@@ -267,12 +267,12 @@ class DataPortValidator:
             )
 
     def _check_sri_interval_zero(self, result: ValidationResult, config: Any) -> None:
-        """In SRI mode (SubRowInterval_REG=1), Interval_REG should be 0 (one-row interval)."""
+        """In SRI mode (SubRowInterval_REG=1), Interval_REG shall be 0 (one-row interval)."""
         if config.SubRowInterval_REG and config.Interval_REG != 0:
             result.add_error(
                 'Interval',
                 f"SRI mode implies one-row interval; Interval_REG should be 0 (currently {config.Interval_REG})",
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_sri_skipping_disabled(self, result: ValidationResult, config: Any) -> None:
@@ -331,16 +331,12 @@ class DataPortValidator:
             )
 
     def _check_horizontal_window_within_columns(self, result: ValidationResult, config: Any) -> None:
-        """HorizontalStart + HorizontalCount should fit within the row (warning).
-
-        Non-fatal because in non-SRI mode a pattern may legitimately wrap; CDS
-        clash detection surfaces any actual conflict.
-        """
+        """HorizontalStart_REG + HorizontalCount_REG shall fit within NumColumns."""
         if config.HorizontalStart_REG + config.HorizontalCount_REG >= self.interface.num_columns:
             result.add_error(
                 'HorizontalCount',
                 'HorizontalStart + HorizontalCount exceeds NumColumns',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_tail_fits_row(self, result: ValidationResult, config: Any, columns_after_data: int) -> None:
@@ -349,7 +345,7 @@ class DataPortValidator:
             result.add_error(
                 'TailWidth',
                 'Tail would overflow row',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_bitwidth_fits_remaining_columns(self, result: ValidationResult, config: Any) -> None:
@@ -386,7 +382,7 @@ class DataPortValidator:
             result.add_error(
                 'GuardEnable',
                 'Guard would overflow row',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_sink_no_guard(self, result: ValidationResult, config: Any) -> None:
@@ -395,7 +391,7 @@ class DataPortValidator:
             result.add_error(
                 'GuardEnable',
                 'Sink data port has Guard enabled',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_sink_no_tail(self, result: ValidationResult, config: Any) -> None:
@@ -404,7 +400,7 @@ class DataPortValidator:
             result.add_error(
                 'TailWidth',
                 'Sink data port has Tail(s) enabled',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
 
     def _check_fcp_offset_within_interval(self, result: ValidationResult,
@@ -470,5 +466,5 @@ class InterfaceValidator:
                 'NumColumns',
                 f'When FBSCE PHYs are used, number of columns must be even '
                 f'(currently {self.interface.num_columns})',
-                ErrorSeverity.WARNING
+                ErrorSeverity.ERROR
             )
