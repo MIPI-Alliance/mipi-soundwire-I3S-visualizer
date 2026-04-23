@@ -15,12 +15,68 @@ from src.models import (
     DirectionType,
 )
 from src.models.enums import TransportPhase
+from src.models.bit_slot import BitSlotState, BitSlotData
+from src.models.dataport import DataPortState, DataPortConfig
 from src.models.bus_model import BusModel, BitInfo, ClashType
 from src.drawing.clash_detector import ClashDetector, SlotClashCategory
 from src.config import SpecialDevices, DataPortRanges
 from src.utils.validators import DataPortValidator
 from src.utils.logging_config import get_logger
 from src.viz import VizConfig
+
+
+def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlotState:
+    """Derive the BitSlotState that fetch_bit_slot() would return at the
+    current DP state, without advancing.
+
+    Engine uses this in conjunction with clock_tick() to consume bit slots
+    while keeping construction in the engine layer (per the clock_tick
+    refactor design — DP exposes state, engine builds slots).
+    """
+    direction = DirectionType.SINK if config.PortDirection_REG else DirectionType.SOURCE
+
+    # Mirror fetch_bit_slot's gating predicates and _data_slot dispatch.
+    in_emit_path = not (
+        config._num_channels == 0
+        or state.interval_skipped
+        or state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
+        or state.row_in_interval < config.Offset_REG
+        or state.column < config.HorizontalStart_REG
+    )
+
+    if in_emit_path:
+        if state.column > config._horizontal_end:
+            pass  # _data_slot would set ROW_DONE and return EMPTY → fall through
+        elif state.transport_phase == TransportPhase.SPACING:
+            pass  # _data_slot returns EMPTY → fall through
+        elif state.txp_pending:
+            return BitSlotState(
+                slot_type=SlotType.TX_PRESENT,
+                direction=direction,
+                data=BitSlotData(
+                    sample_in_group=state.sample_in_group,
+                    channel=config._channel(state.channel_index),
+                    bit=0,
+                ),
+            )
+        else:
+            return BitSlotState(
+                slot_type=SlotType.DATA,
+                direction=direction,
+                data=BitSlotData(
+                    sample_in_group=state.sample_in_group,
+                    channel=config._channel(state.channel_index),
+                    bit=state.bit_in_channel,
+                ),
+            )
+
+    # Post-data drain (Source-only — guard/tail fields stay at defaults for Sink).
+    if state.post_data_guard_pending:
+        slot_type = SlotType.GUARD_1 if config.GuardPolarity_REG else SlotType.GUARD_0
+        return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
+    if state.post_data_tail_remaining > 0:
+        return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
+    return BitSlotState(slot_type=SlotType.EMPTY)
 
 
 class BusModelBuilder:
@@ -404,7 +460,8 @@ class BusModelBuilder:
             )
 
             # DP data path emits first
-            bit_slot = dp.fetch_bit_slot()
+            bit_slot = _derive_dp_bit_slot(dp.state, dp.config)
+            dp.clock_tick()
             bit_slot.row = row
             bit_slot.column = column
             bit_slot.device_num = device
