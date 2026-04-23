@@ -391,7 +391,7 @@ class BusModelBuilder:
             # to emit the first bit of a new transport pattern." This unique
             # state combination is set ONLY by _reset_transport (not by
             # _advance_channel_group non-terminal or any other path).
-            dp_state = dp._state
+            dp_state = dp.state
             pre_is_fresh_transport = (
                 dp_state.transport_phase == TransportPhase.ACTIVE
                 and dp_state.channel_group_base_channel == 0

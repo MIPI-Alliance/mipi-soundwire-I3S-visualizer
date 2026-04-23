@@ -10,7 +10,7 @@ library without any UI dependencies.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from src.config.constants import SpecialDevices
 
@@ -113,6 +113,24 @@ class Device:
         """
         if dp in self._data_ports:
             self._data_ports.remove(dp)
+
+    def fifo_pull(self, dp_index: int, ch_index: int) -> Optional[int]:
+        """Audio source delivers the next data bit for (DP, channel).
+
+        Conceptual hook for the data-layer fifo. The visualizer renders
+        metadata only (slot kind, position, channel/sample/bit indices) and
+        does not need real bit values, so the default implementation is a
+        no-op returning None. Hardware-realistic simulators or test harnesses
+        may subclass to wire a real audio fifo.
+        """
+        return None
+
+    def fifo_push(self, dp_index: int, ch_index: int, bit: int) -> None:
+        """Audio sink receives a data bit for (DP, channel).
+
+        Conceptual hook for the data-layer fifo. See fifo_pull for context.
+        """
+        pass
 
     def __repr__(self) -> str:
         """String representation for debugging."""
