@@ -330,7 +330,7 @@ class BusModelBuilder:
         # Validate data port configuration - warn but don't block
         # Uses reusable validator for performance
         dp_viz = self.viz_config.data_ports[dp_index]
-        validation_result = self._dp_validator.validate(dp, dp_index, dp_viz.enable_handover)
+        validation_result = self._dp_validator.validate(dp, dp_index)
         if not validation_result.is_valid or validation_result.has_warnings:
             self.logger.warning(f"Validation issues for DP{dp_index}: {validation_result.get_summary()}")
             # Store validation issues in bus_model for later display

@@ -1,31 +1,34 @@
 """
 Validation utilities for MIPI SoundWire I3S Visualizer.
 
-This module provides structured validation for interface and data port configurations,
-replacing string concatenation error handling with type-safe validation results.
+Two validation categories, intentionally separated so the settings category
+can serve as source material for written requirements in the SWI3S
+specification:
+
+    - Ranges   — register bit-field bounds. In hardware these are enforced
+                 by the registers themselves; we check them here because the
+                 visualizer lets users type arbitrary values via the UI/CSV.
+    - Settings — semantic rules that cross fields (e.g. HorizontalStart +
+                 HorizontalCount must fit within NumColumns; SRI mode
+                 implies Interval = 0). These are the specification
+                 requirements the visualizer enforces.
 
 Classes:
-    ErrorSeverity: Severity levels for validation errors
-    ValidationError: Represents a single validation error
-    ValidationResult: Result of a validation operation
-    InterfaceValidator: Validates Interface configurations
-    DataPortValidator: Validates DataPort configurations
+    ErrorSeverity:       Severity levels for validation errors
+    ValidationError:     A single validation error
+    ValidationResult:    Result of a validation operation
+    InterfaceValidator:  Validates Interface configurations
+    DataPortValidator:   Validates DataPort (and associated FCP) configurations
 """
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Any, Dict
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-# Import will be circular if we import DataPort here, so we'll use TYPE_CHECKING
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from src.models import DataPort
-    from src.models import Interface
+    from src.models import DataPort, Interface
+    from src.models.flow_control_port import FlowControlPortConfig
 
-
-# =============================================================================
-# Enums and Data Classes
-# =============================================================================
 
 class ErrorSeverity(Enum):
     """Severity levels for validation errors."""
@@ -47,10 +50,6 @@ class ValidationError:
     def __str__(self) -> str:
         return f"{self.severity.value.upper()}: {self.field} - {self.message}"
 
-
-# =============================================================================
-# Validation Result Class
-# =============================================================================
 
 class ValidationResult:
     """Result of a validation operation."""
@@ -81,217 +80,240 @@ class ValidationResult:
         """Get a formatted summary of all errors."""
         if not self.errors:
             return "Validation passed"
-
-        lines = []
-        for error in self.errors:
-            lines.append(str(error))
-        return "\n".join(lines)
+        return "\n".join(str(e) for e in self.errors)
 
 
-# =============================================================================
-# DataPort Validator Class
-# =============================================================================
+def _check_range(result: ValidationResult, field: str, value: int,
+                 min_val: int, max_val: int) -> None:
+    """Shared helper: flag value outside [min_val, max_val] as ERROR."""
+    if value < min_val:
+        result.add_error(
+            field, f"{field} ({value}) is below minimum ({min_val})",
+            ErrorSeverity.ERROR, value
+        )
+    elif value > max_val:
+        result.add_error(
+            field, f"{field} ({value}) exceeds maximum ({max_val})",
+            ErrorSeverity.ERROR, value
+        )
+
 
 class DataPortValidator:
-    """Validates DataPort configurations."""
+    """Validates DataPort configurations (plus the associated FCP).
+
+    validate() is the single public entry point. It runs range checks first,
+    then settings checks. The two groups are cleanly separated internally so
+    that settings rules can be enumerated as SWI3S specification requirements.
+    """
 
     def __init__(self, interface: Any):
-        """Initialize validator with interface for relationship checks.
-
-        Args:
-            interface: The Interface object containing global parameters
-        """
         self.interface = interface
 
-    def validate(self, data_port: 'DataPort', dp_index: int,
-                 enable_handover: bool = False) -> ValidationResult:
-        """Validate all DataPort parameters.
-
-        Args:
-            data_port: The DataPort to validate
-            dp_index: Index of the data port (0-11)
-            enable_handover: Whether handover visualization is enabled (from VizConfig)
-
-        Returns:
-            ValidationResult containing any errors or warnings found
-        """
+    def validate(self, data_port: 'DataPort', dp_index: int) -> ValidationResult:
+        """Validate DataPort ranges + settings. Returns a single ValidationResult."""
         result = ValidationResult()
-
-        # Import ranges for validation
-        from src.config.constants import DataPortRanges, SpecialDevices
-
-        # Access config for all register values
-        config = data_port.config
-
-        # Store enable_handover for use in _validate_relationships
-        self._enable_handover = enable_handover
-
-        # Validate device number (stored in interface, not data port)
-        # Note: Device -1 (MANAGER) is valid for manager data ports
-        device_num = self.interface.get_dp_device(dp_index)
-        if device_num != SpecialDevices.MANAGER:
-            self._validate_range(
-                result, 'DeviceNumber', device_num,
-                DataPortRanges.MIN_DEVICE_NUMBER, DataPortRanges.MAX_DEVICE_NUMBER
-            )
-
-        num_channels = bin(config.EnableCh_REG).count('1')
-        self._validate_range(
-            result, 'NumChannels', num_channels,
-            DataPortRanges.MIN_CHANNELS, DataPortRanges.MAX_CHANNELS
-        )
-
-        self._validate_range(
-            result, 'ChannelGrouping_REG', config.ChannelGrouping_REG,
-            DataPortRanges.MIN_CHANNEL_GROUPING, DataPortRanges.MAX_CHANNEL_GROUPING
-        )
-
-        self._validate_range(
-            result, 'Spacing_REG', config.Spacing_REG,
-            DataPortRanges.MIN_CHANNEL_GROUP_SPACING, DataPortRanges.MAX_CHANNEL_GROUP_SPACING
-        )
-
-        self._validate_range(
-            result, 'SampleSize_REG', config.SampleSize_REG,
-            DataPortRanges.MIN_SAMPLE_SIZE, DataPortRanges.MAX_SAMPLE_SIZE
-        )
-
-        self._validate_range(
-            result, 'SampleGrouping_REG', config.SampleGrouping_REG,
-            DataPortRanges.MIN_SAMPLE_GROUPING, DataPortRanges.MAX_SAMPLE_GROUPING
-        )
-
-        self._validate_range(
-            result, 'Interval_REG', config.Interval_REG,
-            DataPortRanges.MIN_INTERVAL, DataPortRanges.MAX_INTERVAL
-        )
-
-        self._validate_range(
-            result, 'SkippingNumerator_REG', config.SkippingNumerator_REG,
-            DataPortRanges.MIN_SKIPPING_NUMERATOR, DataPortRanges.MAX_SKIPPING_NUMERATOR
-        )
-
-        self._validate_range(
-            result, 'Offset_REG', config.Offset_REG,
-            DataPortRanges.MIN_OFFSET, DataPortRanges.MAX_OFFSET
-        )
-
-        self._validate_range(
-            result, 'HorizontalStart_REG', config.HorizontalStart_REG,
-            0, self.interface.num_columns - 1  # Max column index for current num_columns
-        )
-
-        self._validate_range(
-            result, 'HorizontalCount_REG', config.HorizontalCount_REG,
-            0, self.interface.num_columns - 1  # Max column index for current num_columns
-        )
-
-        # Validate relationships between parameters
-        self._validate_relationships(result, data_port)
-
+        self._validate_ranges(result, data_port, dp_index)
+        self._validate_settings(result, data_port)
         return result
 
-    def _validate_range(self, result: ValidationResult, field: str,
-                       value: int, min_val: int, max_val: int) -> None:
-        """Validate that a value is within range.
+    # ---------------------------------------------------------------
+    # Range checks — hardware register bit-field bounds.
+    # ---------------------------------------------------------------
 
-        Args:
-            result: ValidationResult to add errors to
-            field: Name of the field being validated
-            value: Current value
-            min_val: Minimum allowed value
-            max_val: Maximum allowed value
-        """
-        if value < min_val:
-            result.add_error(
-                field,
-                f"{field} ({value}) is below minimum ({min_val})",
-                ErrorSeverity.ERROR,
-                value
-            )
-        elif value > max_val:
-            result.add_error(
-                field,
-                f"{field} ({value}) exceeds maximum ({max_val})",
-                ErrorSeverity.ERROR,
-                value
-            )
+    def _validate_ranges(self, result: ValidationResult,
+                         data_port: 'DataPort', dp_index: int) -> None:
+        """Run all register range checks."""
+        from src.config.constants import DataPortRanges, SpecialDevices
+        from src.models import FlowMode
 
-    def _validate_relationships(self, result: ValidationResult,
-                                data_port: 'DataPort') -> None:
-        """Validate relationships between parameters.
-
-        Args:
-            result: ValidationResult to add errors to
-            data_port: DataPort being validated
-        """
-        # Access config for all register values
         config = data_port.config
 
-        # Compute effective_channel_grouping locally (same logic as DataPort._reset_transport)
-        num_channels = bin(config.EnableCh_REG).count('1')
-        if config.ChannelGrouping_REG == 0 or config.ChannelGrouping_REG > num_channels:
-            effective_channel_grouping = num_channels  # Natural count
-        else:
-            effective_channel_grouping = config.ChannelGrouping_REG
+        # Device number (stored on interface, not DP)
+        device_num = self.interface.get_dp_device(dp_index)
+        if device_num != SpecialDevices.MANAGER:
+            _check_range(result, 'DeviceNumber', device_num,
+                         DataPortRanges.MIN_DEVICE_NUMBER, DataPortRanges.MAX_DEVICE_NUMBER)
 
-        # Check offset vs interval FIRST (needed for bits_per_interval calculation)
+        num_channels = bin(config.EnableCh_REG).count('1')
+        _check_range(result, 'NumChannels', num_channels,
+                     DataPortRanges.MIN_CHANNELS, DataPortRanges.MAX_CHANNELS)
+        _check_range(result, 'ChannelGrouping_REG', config.ChannelGrouping_REG,
+                     DataPortRanges.MIN_CHANNEL_GROUPING, DataPortRanges.MAX_CHANNEL_GROUPING)
+        _check_range(result, 'Spacing_REG', config.Spacing_REG,
+                     DataPortRanges.MIN_CHANNEL_GROUP_SPACING, DataPortRanges.MAX_CHANNEL_GROUP_SPACING)
+        _check_range(result, 'SampleSize_REG', config.SampleSize_REG,
+                     DataPortRanges.MIN_SAMPLE_SIZE, DataPortRanges.MAX_SAMPLE_SIZE)
+        _check_range(result, 'SampleGrouping_REG', config.SampleGrouping_REG,
+                     DataPortRanges.MIN_SAMPLE_GROUPING, DataPortRanges.MAX_SAMPLE_GROUPING)
+        _check_range(result, 'Interval_REG', config.Interval_REG,
+                     DataPortRanges.MIN_INTERVAL, DataPortRanges.MAX_INTERVAL)
+        _check_range(result, 'SkippingNumerator_REG', config.SkippingNumerator_REG,
+                     DataPortRanges.MIN_SKIPPING_NUMERATOR, DataPortRanges.MAX_SKIPPING_NUMERATOR)
+        _check_range(result, 'Offset_REG', config.Offset_REG,
+                     DataPortRanges.MIN_OFFSET, DataPortRanges.MAX_OFFSET)
+        _check_range(result, 'HorizontalStart_REG', config.HorizontalStart_REG,
+                     DataPortRanges.MIN_H_START, DataPortRanges.MAX_H_START)
+        _check_range(result, 'HorizontalCount_REG', config.HorizontalCount_REG,
+                     DataPortRanges.MIN_H_COUNT, DataPortRanges.MAX_H_COUNT)
+
+        # FCP register ranges only matter when FlowMode activates the FCP
+        if config.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC):
+            fcp_config = self.interface.get_fcp(data_port.dp_index).config
+            _check_range(result, 'FCP_HorizontalStart_REG', fcp_config.HorizontalStart_REG,
+                         DataPortRanges.MIN_FCP_H_START, DataPortRanges.MAX_FCP_H_START)
+            _check_range(result, 'FCP_BitWidth_REG', fcp_config.BitWidth_REG,
+                         DataPortRanges.MIN_FCP_BIT_WIDTH, DataPortRanges.MAX_FCP_BIT_WIDTH)
+            _check_range(result, 'FCP_TailWidth_REG', fcp_config.TailWidth_REG,
+                         DataPortRanges.MIN_FCP_TAIL_WIDTH, DataPortRanges.MAX_FCP_TAIL_WIDTH)
+            _check_range(result, 'FCP_Offset_REG', fcp_config.Offset_REG,
+                         DataPortRanges.MIN_FCP_OFFSET, DataPortRanges.MAX_FCP_OFFSET)
+
+    # ---------------------------------------------------------------
+    # Settings checks — spec-level semantic requirements.
+    # Each _check_* below is one requirement. The docstring is the
+    # rule statement in human-readable form.
+    # ---------------------------------------------------------------
+
+    def _validate_settings(self, result: ValidationResult, data_port: 'DataPort') -> None:
+        """Run all settings checks. Shared computations happen here once."""
+        from src.models import FlowMode
+
+        config = data_port.config
+        num_channels = bin(config.EnableCh_REG).count('1')
+        effective_channel_grouping = self._effective_channel_grouping(config, num_channels)
+        drive_in_group = self._drive_in_group(config, effective_channel_grouping)
+        last_data_column = self._last_data_column(config, drive_in_group)
+        columns_after_data = self.interface.num_columns - 1 - last_data_column
+
+        self._check_offset_within_interval(result, config)
+        self._check_sri_interval_zero(result, config)
+        self._check_sri_skipping_disabled(result, config)
+        self._check_sri_pattern_fits(result, config, drive_in_group)
+        self._check_horizontal_start_within_columns(result, config)
+        self._check_horizontal_count_within_columns(result, config)
+        self._check_horizontal_window_within_columns(result, config)
+        self._check_tail_fits_row(result, config, columns_after_data)
+        self._check_bitwidth_fits_remaining_columns(result, config)
+        self._check_bitwidth_fits_horizontal_count(result, config)
+        self._check_horizontal_count_divisible_by_bitwidth(result, config)
+        self._check_guard_fits_row(result, config, columns_after_data)
+        self._check_sink_no_guard(result, config)
+        self._check_sink_no_tail(result, config)
+
+        if config.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC):
+            fcp_config = self.interface.get_fcp(data_port.dp_index).config
+            self._check_fcp_offset_within_interval(result, config, fcp_config)
+            self._check_fcp_fits_row(result, fcp_config)
+
+    # Shared settings-scope helpers.
+
+    @staticmethod
+    def _effective_channel_grouping(config: Any, num_channels: int) -> int:
+        """Channels per group (clamped to num_channels when register is 0 or oversized)."""
+        if config.ChannelGrouping_REG == 0 or config.ChannelGrouping_REG > num_channels:
+            return num_channels
+        return config.ChannelGrouping_REG
+
+    @staticmethod
+    def _drive_in_group(config: Any, effective_channel_grouping: int) -> int:
+        """Number of bus slots required to transmit one complete channel group."""
+        return (
+            (config.SampleSize_REG + 1) *
+            (config.SampleGrouping_REG + 1) *
+            effective_channel_grouping *
+            (config.BitWidth_REG + 1)
+        )
+
+    def _last_data_column(self, config: Any, drive_in_group: int) -> int:
+        """Absolute column index of the last data slot in a row.
+
+        Accounts for inter-group spacing when Spacing_REG > 0. Clamped to the
+        last column in non-SRI mode (where the pattern stops at row boundary).
+        """
+        window_size = config.HorizontalCount_REG + 1
+
+        if config.Spacing_REG == 0:
+            data_bits_in_row = min(drive_in_group, window_size)
+            last = config.HorizontalStart_REG + data_bits_in_row - 1
+        else:
+            cadence = drive_in_group + config.Spacing_REG - 1
+            if cadence > 0:
+                num_complete = window_size // cadence
+                remaining = window_size % cadence
+                if num_complete == 0:
+                    data_bits = min(drive_in_group, window_size)
+                    last = config.HorizontalStart_REG + data_bits - 1
+                elif remaining > 0:
+                    partial_data = min(drive_in_group, remaining)
+                    last = config.HorizontalStart_REG + num_complete * cadence + partial_data - 1
+                else:
+                    last = config.HorizontalStart_REG + (num_complete - 1) * cadence + drive_in_group - 1
+            else:
+                last = config.HorizontalStart_REG
+
+        if not config.SubRowInterval_REG:
+            last = min(last, self.interface.num_columns - 1)
+        return last
+
+    # Individual settings checks — one method per spec requirement.
+
+    def _check_offset_within_interval(self, result: ValidationResult, config: Any) -> None:
+        """Offset_REG shall be less than or equal to Interval_REG."""
         if config.Offset_REG > config.Interval_REG:
             result.add_error(
                 'Offset',
                 f"Offset ({config.Offset_REG}) exceeds Interval ({config.Interval_REG})",
                 ErrorSeverity.ERROR
             )
-            # Skip further checks if offset is invalid
 
-        # Note: Sample overflow and HorizontalCount overflow are detected by
-        # engine's _detect_interval_overflow() and reported as truncation warnings.
-
-        # SRI mode validations
-        if config.SubRowInterval_REG:
-            if config.Interval_REG != 0:
-                result.add_error(
-                    'Interval',
-                    f"SRI mode implies one-row interval; Interval_REG should be 0 (currently {config.Interval_REG})",
-                    ErrorSeverity.WARNING
-                )
-
-            if config.SkippingNumerator_REG > 0:
-                result.add_error(
-                    'SkippingNumerator',
-                    f"SRI mode does not support skipping; SkippingNumerator_REG should be 0 (currently {config.SkippingNumerator_REG})",
-                    ErrorSeverity.ERROR
-                )
-
-            drive_in_group = (
-                (config.SampleSize_REG + 1) *
-                (config.SampleGrouping_REG + 1) *
-                effective_channel_grouping *
-                (config.BitWidth_REG + 1)
+    def _check_sri_interval_zero(self, result: ValidationResult, config: Any) -> None:
+        """In SRI mode (SubRowInterval_REG=1), Interval_REG should be 0 (one-row interval)."""
+        if config.SubRowInterval_REG and config.Interval_REG != 0:
+            result.add_error(
+                'Interval',
+                f"SRI mode implies one-row interval; Interval_REG should be 0 (currently {config.Interval_REG})",
+                ErrorSeverity.WARNING
             )
 
-            if config.Spacing_REG == 0:
-                # Spacing_REG == 0 means "end row after one group" (only one group per row)
-                # Just need enough bits for one complete group
-                if (config.HorizontalCount_REG + 1) < drive_in_group:
+    def _check_sri_skipping_disabled(self, result: ValidationResult, config: Any) -> None:
+        """In SRI mode, SkippingNumerator_REG shall be 0 (skipping not supported in SRI)."""
+        if config.SubRowInterval_REG and config.SkippingNumerator_REG > 0:
+            result.add_error(
+                'SkippingNumerator',
+                f"SRI mode does not support skipping; SkippingNumerator_REG should be 0 (currently {config.SkippingNumerator_REG})",
+                ErrorSeverity.ERROR
+            )
+
+    def _check_sri_pattern_fits(self, result: ValidationResult, config: Any, drive_in_group: int) -> None:
+        """In SRI mode, HorizontalCount shall be large enough to emit at least one complete channel group.
+
+        When Spacing_REG == 0 (single group per row), HorizontalCount + 1 must be
+        >= drive_in_group. When Spacing_REG > 0 (multiple groups per row), any
+        partial trailing group must still fit a complete drive_in_group.
+        """
+        if not config.SubRowInterval_REG:
+            return
+
+        window_size = config.HorizontalCount_REG + 1
+        if config.Spacing_REG == 0:
+            if window_size < drive_in_group:
+                result.add_error(
+                    'HorizontalCount',
+                    'Group, or sample, incomplete when HorizontalCount expires.',
+                    ErrorSeverity.ERROR
+                )
+        else:
+            cadence = drive_in_group + config.Spacing_REG - 1
+            if cadence != 0 and window_size % cadence != 0:
+                if window_size % cadence < drive_in_group:
                     result.add_error(
                         'HorizontalCount',
                         'Group, or sample, incomplete when HorizontalCount expires.',
                         ErrorSeverity.ERROR
                     )
-            else:
-                # Multiple groups per row - check if groups fit evenly
-                cadence_of_group = drive_in_group + config.Spacing_REG - 1
 
-                if cadence_of_group != 0 and (config.HorizontalCount_REG + 1) % cadence_of_group != 0:
-                    if (config.HorizontalCount_REG + 1) % cadence_of_group < drive_in_group:
-                        result.add_error(
-                            'HorizontalCount',
-                            'Group, or sample, incomplete when HorizontalCount expires.',
-                            ErrorSeverity.ERROR
-                        )
-
-        # Check horizontal_start against NumColumns_REG
+    def _check_horizontal_start_within_columns(self, result: ValidationResult, config: Any) -> None:
+        """HorizontalStart_REG shall be a valid column index (< NumColumns)."""
         if config.HorizontalStart_REG >= self.interface.num_columns:
             result.add_error(
                 'HorizontalStart',
@@ -299,7 +321,8 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-        # Check horizontal_count against NumColumns_REG
+    def _check_horizontal_count_within_columns(self, result: ValidationResult, config: Any) -> None:
+        """HorizontalCount_REG shall be a valid column index (< NumColumns)."""
         if config.HorizontalCount_REG >= self.interface.num_columns:
             result.add_error(
                 'HorizontalCount',
@@ -307,61 +330,21 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-        # Check HorizontalStart + HorizontalCount overflow
-        # In SRI mode this is an error (window must fit in one row)
-        # In non-SRI mode this is a warning (wrapping can clash with CDS if not configured correctly)
+    def _check_horizontal_window_within_columns(self, result: ValidationResult, config: Any) -> None:
+        """HorizontalStart + HorizontalCount should fit within the row (warning).
+
+        Non-fatal because in non-SRI mode a pattern may legitimately wrap; CDS
+        clash detection surfaces any actual conflict.
+        """
         if config.HorizontalStart_REG + config.HorizontalCount_REG >= self.interface.num_columns:
             result.add_error(
                 'HorizontalCount',
                 'HorizontalStart + HorizontalCount exceeds NumColumns',
-                ErrorSeverity.WARNING)
+                ErrorSeverity.WARNING
+            )
 
-        # Check tail width overflow
-        # Calculate actual last data column based on grouping pattern, not window boundary
-        drive_in_group = (
-            (config.SampleSize_REG + 1) *
-            (config.SampleGrouping_REG + 1) *
-            effective_channel_grouping *
-            (config.BitWidth_REG + 1)
-        )
-
-        window_size = config.HorizontalCount_REG + 1
-
-        if config.Spacing_REG == 0:
-            # One group per row - data ends after drive_in_group bits (or window end)
-            data_bits_in_row = min(drive_in_group, window_size)
-            last_data_column = config.HorizontalStart_REG + data_bits_in_row - 1
-        else:
-            # Multiple groups - calculate based on cadence
-            cadence = drive_in_group + config.Spacing_REG - 1
-            if cadence > 0:
-                num_complete_cadences = window_size // cadence
-                remaining = window_size % cadence
-
-                if num_complete_cadences == 0:
-                    # Partial first group
-                    data_bits = min(drive_in_group, window_size)
-                    last_data_column = config.HorizontalStart_REG + data_bits - 1
-                else:
-                    # Position after last complete group's data
-                    last_complete_data = config.HorizontalStart_REG + (num_complete_cadences - 1) * cadence + drive_in_group - 1
-
-                    # Check if partial group fits in remaining space
-                    if remaining > 0:
-                        # After spacing from last cadence, new group starts
-                        partial_data = min(drive_in_group, remaining)
-                        last_data_column = config.HorizontalStart_REG + num_complete_cadences * cadence + partial_data - 1
-                    else:
-                        last_data_column = last_complete_data
-            else:
-                last_data_column = config.HorizontalStart_REG
-
-        # Clamp to row boundary for non-SRI mode
-        if not config.SubRowInterval_REG:
-            last_data_column = min(last_data_column, self.interface.num_columns - 1)
-
-        columns_after_data = self.interface.num_columns - 1 - last_data_column
-
+    def _check_tail_fits_row(self, result: ValidationResult, config: Any, columns_after_data: int) -> None:
+        """TailWidth_REG shall fit in the columns remaining after the last data slot (source DP only)."""
         if config.TailWidth_REG > columns_after_data and not config.PortDirection_REG:
             result.add_error(
                 'TailWidth',
@@ -369,15 +352,18 @@ class DataPortValidator:
                 ErrorSeverity.WARNING
             )
 
-        # Check bit width overflow
-        if config.BitWidth_REG > self.interface.num_columns - config.HorizontalCount_REG and not config.PortDirection_REG:
+    def _check_bitwidth_fits_remaining_columns(self, result: ValidationResult, config: Any) -> None:
+        """BitWidth_REG shall not exceed the columns remaining after HorizontalCount (source DP only)."""
+        if (config.BitWidth_REG > self.interface.num_columns - config.HorizontalCount_REG
+                and not config.PortDirection_REG):
             result.add_error(
                 'BitWidth',
                 'Bit would overflow row',
                 ErrorSeverity.ERROR
             )
 
-        # Check bit width vs horizontal_count
+    def _check_bitwidth_fits_horizontal_count(self, result: ValidationResult, config: Any) -> None:
+        """BitWidth_REG shall not exceed HorizontalCount_REG (a bit must fit in the transport window)."""
         if config.BitWidth_REG > config.HorizontalCount_REG:
             result.add_error(
                 'BitWidth',
@@ -385,7 +371,8 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-        # Check horizontal_count divisibility by bit_width (non-SRI mode)
+    def _check_horizontal_count_divisible_by_bitwidth(self, result: ValidationResult, config: Any) -> None:
+        """In non-SRI mode, (HorizontalCount + 1) shall be a multiple of (BitWidth + 1)."""
         if not config.SubRowInterval_REG and (config.HorizontalCount_REG + 1) % (config.BitWidth_REG + 1) != 0:
             result.add_error(
                 'HorizontalCount',
@@ -393,7 +380,8 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-        # Check post guard overflow - reuse last_data_column calculated above
+    def _check_guard_fits_row(self, result: ValidationResult, config: Any, columns_after_data: int) -> None:
+        """A post-data guard bit shall have at least one column remaining after the last data slot (source DP only)."""
         if config.GuardEnable_REG and not config.PortDirection_REG and columns_after_data < 1:
             result.add_error(
                 'GuardEnable',
@@ -401,65 +389,27 @@ class DataPortValidator:
                 ErrorSeverity.WARNING
             )
 
-        # Sink-specific validations (PortDirection_REG=True means sink)
-        # Sinks read from the bus and shouldn't drive guards or tails
-        if config.PortDirection_REG:
-            if config.GuardEnable_REG:
-                result.add_error(
-                    'GuardEnable',
-                    'Sink data port has Guard enabled',
-                    ErrorSeverity.WARNING
-                )
-            if config.TailWidth_REG > 0:
-                result.add_error(
-                    'TailWidth',
-                    'Sink data port has Tail(s) enabled',
-                    ErrorSeverity.WARNING
-                )
+    def _check_sink_no_guard(self, result: ValidationResult, config: Any) -> None:
+        """A sink DP shall not drive Guard bits (Guard comes from the source)."""
+        if config.PortDirection_REG and config.GuardEnable_REG:
+            result.add_error(
+                'GuardEnable',
+                'Sink data port has Guard enabled',
+                ErrorSeverity.WARNING
+            )
 
-        # FCP (Flow Control Port) validations - only if flow control is enabled
-        self._validate_fcp(result, data_port)
+    def _check_sink_no_tail(self, result: ValidationResult, config: Any) -> None:
+        """A sink DP shall not drive Tail bits (Tail comes from the source)."""
+        if config.PortDirection_REG and config.TailWidth_REG > 0:
+            result.add_error(
+                'TailWidth',
+                'Sink data port has Tail(s) enabled',
+                ErrorSeverity.WARNING
+            )
 
-    def _validate_fcp(self, result: ValidationResult, data_port: 'DataPort') -> None:
-        """Validate Flow Control Port (FCP/DRQ) parameters.
-
-        Args:
-            result: ValidationResult to add errors to
-            data_port: DataPort being validated
-        """
-        config = data_port.config
-        fcp_config = self.interface.get_fcp(data_port.dp_index).config
-
-        # Import ranges and enums for validation
-        from src.config.constants import DataPortRanges
-        from src.models import FlowMode
-
-        # Only validate FCP if DRQ bits are needed (RX_CONTROLLED or ASYNC flow modes)
-        if config.FlowMode_REG not in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC):
-            return
-
-        # Validate FCP parameter ranges
-        self._validate_range(
-            result, 'FCP_HorizontalStart_REG', fcp_config.HorizontalStart_REG,
-            DataPortRanges.MIN_FCP_H_START, min(DataPortRanges.MAX_FCP_H_START, self.interface.num_columns - 1)
-        )
-
-        self._validate_range(
-            result, 'FCP_BitWidth_REG', fcp_config.BitWidth_REG,
-            DataPortRanges.MIN_FCP_BIT_WIDTH, DataPortRanges.MAX_FCP_BIT_WIDTH
-        )
-
-        self._validate_range(
-            result, 'FCP_TailWidth_REG', fcp_config.TailWidth_REG,
-            DataPortRanges.MIN_FCP_TAIL_WIDTH, DataPortRanges.MAX_FCP_TAIL_WIDTH
-        )
-
-        self._validate_range(
-            result, 'FCP_Offset_REG', fcp_config.Offset_REG,
-            DataPortRanges.MIN_FCP_OFFSET, DataPortRanges.MAX_FCP_OFFSET
-        )
-
-        # Check FCP offset vs interval
+    def _check_fcp_offset_within_interval(self, result: ValidationResult,
+                                          config: Any, fcp_config: 'FlowControlPortConfig') -> None:
+        """FCP Offset_REG shall be less than or equal to the parent DP's Interval_REG."""
         if fcp_config.Offset_REG > config.Interval_REG:
             result.add_error(
                 'FCP_Offset_REG',
@@ -467,13 +417,14 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-        # Calculate total FCP width (guard + data + tails)
-        fcp_total_width = fcp_config.BitWidth_REG + 1  # Data width
+    def _check_fcp_fits_row(self, result: ValidationResult,
+                            fcp_config: 'FlowControlPortConfig') -> None:
+        """FCP (DRQ + optional guard + tails) shall fit in the row starting at FCP_HorizontalStart."""
+        fcp_total_width = fcp_config.BitWidth_REG + 1
         if fcp_config.GuardEnable_REG:
-            fcp_total_width += fcp_config.BitWidth_REG + 1  # Guard width
-        fcp_total_width += fcp_config.TailWidth_REG  # Tail width
+            fcp_total_width += fcp_config.BitWidth_REG + 1
+        fcp_total_width += fcp_config.TailWidth_REG
 
-        # Check FCP doesn't overflow row
         if fcp_config.HorizontalStart_REG + fcp_total_width > self.interface.num_columns:
             result.add_error(
                 'FCP_HorizontalStart_REG',
@@ -481,53 +432,43 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-# =============================================================================
-# Interface Validator Class
-# =============================================================================
 
 class InterfaceValidator:
     """Validates Interface configurations.
 
-    Performs cross-field validations for interface-level parameters that
-    cannot be validated by individual field descriptors.
+    validate() is the single public entry point. No range checks here yet —
+    interface registers are validated through field descriptors elsewhere —
+    but the method layout mirrors DataPortValidator so additions land
+    consistently.
     """
 
     def __init__(self, interface: 'Interface'):
-        """Initialize validator with interface to validate.
-
-        Args:
-            interface: The Interface object to validate
-        """
         self.interface = interface
 
     def validate(self) -> ValidationResult:
-        """Validate all Interface parameters.
-
-        Returns:
-            ValidationResult containing any errors or warnings found
-        """
+        """Validate Interface settings. Returns a single ValidationResult."""
         result = ValidationResult()
-
-        # PHY3 disabled requires even number of columns
-        self._validate_phy3_columns(result)
-
+        self._validate_settings(result)
         return result
 
-    def _validate_phy3_columns(self, result: ValidationResult) -> None:
-        """Validate PHY3/columns relationship.
+    # ---------------------------------------------------------------
+    # Settings checks — spec-level semantic requirements.
+    # ---------------------------------------------------------------
 
-        When PHY3 is disabled, the number of columns must be even.
+    def _validate_settings(self, result: ValidationResult) -> None:
+        """Run all interface settings checks."""
+        self._check_phy3_requires_even_columns(result)
+
+    def _check_phy3_requires_even_columns(self, result: ValidationResult) -> None:
+        """When PHY3 is disabled (FBSCE PHYs used), NumColumns shall be even.
+
         num_columns = NumColumns_REG + 1, so for even num_columns,
         NumColumns_REG must be odd.
-
-        Args:
-            result: ValidationResult to add errors to
         """
-        if not self.interface.phy3_enabled:
-            if self.interface.num_columns % 2 != 0:  # Odd number of columns
-                result.add_error(
-                    'NumColumns',
-                    f'When FBSCE PHYs are used, number of columns must be even '
-                    f'(currently {self.interface.num_columns})',
-                    ErrorSeverity.WARNING
-                )
+        if not self.interface.phy3_enabled and self.interface.num_columns % 2 != 0:
+            result.add_error(
+                'NumColumns',
+                f'When FBSCE PHYs are used, number of columns must be even '
+                f'(currently {self.interface.num_columns})',
+                ErrorSeverity.WARNING
+            )
