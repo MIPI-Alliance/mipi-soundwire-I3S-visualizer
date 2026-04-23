@@ -171,6 +171,65 @@ class DataPort:
         self.state.initialize(self.config)
         self._advance_interval()
 
+    # ------------------------------------------------------------------
+    # New action API (Phase 2 — surface only; implementations in Phase 3).
+    # clock_tick() is the per-UI entry point. Engine migrates from
+    # fetch_bit_slot() to clock_tick() + state reads in Phase 4.
+    # ------------------------------------------------------------------
+
+    def clock_tick(self) -> None:
+        """Advance the DataPort by one UI (cascade tick).
+
+        Phase 2: thin wrapper over fetch_bit_slot() so the new entry-point
+        name is available without behavior change. Phase 3 replaces this
+        with cascade-driven action calls and folds post_data_queue.
+        """
+        self.fetch_bit_slot()
+
+    def write_data_bit_from_fifo(self) -> None:
+        """Source DP: pull next data bit from the audio fifo at UI 0 of a
+        wide-bit period. Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def write_held_bit(self) -> None:
+        """Re-emit the held bit (DATA / TX_PRESENT / TAIL) for subsequent
+        UIs of a wide-bit period. Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def read_data_bit_to_fifo(self) -> None:
+        """Sink DP: sample bus and push to fifo at the last UI of a wide-bit
+        period. Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def write_txp(self) -> None:
+        """Source DP: emit TX_PRESENT at UI 0 of a wide-bit period
+        (FlowMode 1 or 3). Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def read_txp(self) -> None:
+        """Sink DP: sample TX_PRESENT at the last UI of a wide-bit period.
+        Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def write_guard0(self) -> None:
+        """Source DP: emit guard 0 (single UI, post-data emission).
+        Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def write_guard1(self) -> None:
+        """Source DP: emit guard 1 (single UI, post-data emission).
+        Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    def write_tail(self) -> None:
+        """Source DP: emit tail at UI 0 of TailWidth_REG-wide period
+        (post-data emission). Implementation in Phase 3."""
+        raise NotImplementedError("Wired in Phase 3")
+
+    # ------------------------------------------------------------------
+    # Legacy entry point — engine still calls this in Phase 2.
+    # ------------------------------------------------------------------
+
     def fetch_bit_slot(self) -> BitSlotState:
         """Emit bit slot information at the current position and auto-advance."""
         if (self.config._num_channels == 0
