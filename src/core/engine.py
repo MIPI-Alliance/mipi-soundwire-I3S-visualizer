@@ -340,7 +340,7 @@ class BusModelBuilder:
         self.logger.debug(f'Processing data port DP{dp_index}')
 
         # Reset data port state for fresh drawing pass
-        dp.reset()
+        dp.initialize()
 
         # The FCP lives on Interface, not DataPort. Engine drives its lifecycle
         # explicitly at the same moments the DP transitions.

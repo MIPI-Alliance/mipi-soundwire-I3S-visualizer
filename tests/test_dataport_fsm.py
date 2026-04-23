@@ -189,7 +189,7 @@ def _build_dataport(cfg: DpConfig) -> Tuple[Interface, DataPort]:
     dp.config.GuardEnable_REG = cfg.guard_enable
     dp.config.SubRowInterval_REG = cfg.sri
     dp.config.FlowMode_REG = cfg.flow_mode
-    dp.reset()
+    dp.initialize()
     return iface, dp
 
 

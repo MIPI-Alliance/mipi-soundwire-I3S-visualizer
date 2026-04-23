@@ -140,7 +140,7 @@ class DataPort:
         config               configuration / register attributes
         dp_index             canonical position index (0-15)
         row_in_interval      current row within this DP's interval
-        reset()              hardware reset
+        initialize()         initialize before use
         fetch_bit_slot()     emit slot at current position (auto-advances to next UI)
     """
 
@@ -155,10 +155,10 @@ class DataPort:
         """Current row within this DP's interval."""
         return self._state.row_in_interval
 
-    def reset(self) -> None:
-        """Hardware reset before dataport use."""
+    def initialize(self) -> None:
+        """Initialize before dataport use."""
         self._state.initialize(self.config)
-        self._start_interval()
+        self._advance_interval()
 
     def fetch_bit_slot(self) -> BitSlotState:
         """Emit bit slot information at the current position and auto-advance."""
@@ -247,8 +247,10 @@ class DataPort:
         self._state.column = 0
         self._state.post_data_queue.clear()
 
-        # SRI row-cut: HorizontalEnd ended the prior row mid-transport; the
-        # fresh row resumes emission, so flip phase back to ACTIVE.
+        # Row-cut resume: horizontal window exhausted the prior row before
+        # the pattern completed. The pattern resumes on this fresh row, so
+        # flip phase back to ACTIVE. Applies to both non-SRI multi-row
+        # transports and SRI mid-pattern cuts.
         if self._state.phase == TransportPhase.ROW_DONE:
             self._state.phase = TransportPhase.ACTIVE
 
@@ -256,10 +258,10 @@ class DataPort:
 
         if self._state.row_in_interval > self.config.Interval_REG:
             self._state.row_in_interval = 0
-            self._start_interval()
+            self._advance_interval()
 
-    def _start_interval(self) -> None:
-        """Interval row-counter rollover: advance the skipping accumulator."""
+    def _advance_interval(self) -> None:
+        """Advance to the next interval: latch skipping status and reset transport."""
         self._state.interval_skipped = self._advance_skipping()
         self._reset_transport()
 
@@ -357,7 +359,7 @@ class DataPort:
         if self.config.SubRowInterval_REG or not pattern_complete:
             if self.config.Spacing_REG == 0:
                 # No gap: SRI ends the row here; the next row's
-                # _start_interval arms a fresh transport.
+                # _advance_interval arms a fresh transport.
                 self._state.phase = TransportPhase.ROW_DONE
             else:
                 self._state.spacing_slots_remaining = self.config.Spacing_REG - 1
