@@ -32,30 +32,28 @@ if TYPE_CHECKING:
 class DataPortState:
     """Runtime state for a DataPort."""
 
-    def __init__(self) -> None:
-        # post_data_queue is reused across resets so external holders keep a
-        # stable reference; reset() clears it in place rather than reassigning.
+    def __init__(self, config: 'DataPortConfig') -> None:
+        # post_data_queue is reused across initializations so external holders
+        # keep a stable reference; initialize() clears it in place.
         self.post_data_queue: deque[SlotType] = deque()
-        self.reset()
+        self.initialize(config)
 
-    def reset(self) -> None:
-        """Hardware reset model."""
-
+    def initialize(self, config: 'DataPortConfig') -> None:
+        """Set state to the current config."""
         self.column: int = 0
         self.row_in_interval: int = 0
         self.phase: TransportPhase = TransportPhase.PATTERN_DONE
         self.interval_skipped: bool = False
         self.skipping_accumulator: int = 0
         self.sample_in_group: int = 0
-        self.samples_in_group_remaining: int = 0
+        self.samples_in_group_remaining: int = config.SampleGrouping_REG
         self.channel_index: int = 0
         self.spacing_slots_remaining: int = 0
         self.channel_group_base: int = 0
         self.channels_in_group_remaining: int = 0
-        self.channel_group_size: int = 0
-        self.bit: int = 0
-        self.wide_bit_remaining: int = 0
-        self.txp_pending: bool = False  # True → next emission is TX_PRESENT (not DATA)
+        self.bit: int = config.SampleSize_REG
+        self.wide_bit_remaining: int = config.BitWidth_REG
+        self.txp_pending: bool = config._emits_txp  # True → next emission is TX_PRESENT
         self.post_data_queue.clear()
 
 class DataPortConfig:
@@ -123,6 +121,14 @@ class DataPortConfig:
         """
         return self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
 
+    @property
+    def _effective_channel_grouping(self) -> int:
+        """Channels per group: ChannelGrouping_REG, clamped to num_channels
+        when the register is 0 or oversized."""
+        if self.ChannelGrouping_REG == 0 or self.ChannelGrouping_REG > self._num_channels:
+            return self._num_channels
+        return self.ChannelGrouping_REG
+
     def _channel(self, index: int) -> int:
         """Map sequential index to actual channel number from EnableCh_REG bitmask."""
         return self._enabled_channels[index]
@@ -142,7 +148,7 @@ class DataPort:
         self._device = device  # interface reachable via self._device._interface
         self.dp_index = dp_index
         self.config = DataPortConfig()
-        self._state = DataPortState()
+        self._state = DataPortState(self.config)
 
     @property
     def row_in_interval(self) -> int:
@@ -151,7 +157,7 @@ class DataPort:
 
     def reset(self) -> None:
         """Hardware reset before dataport use."""
-        self._state.reset()
+        self._state.initialize(self.config)
         self._start_interval()
 
     def fetch_bit_slot(self) -> BitSlotState:
@@ -182,7 +188,7 @@ class DataPort:
         """Return the data slot at the current position, inside the active window."""
         if self._state.column > self.config._horizontal_end:
             # Transport window exhausted on this row. Clear spacing so
-            # stale gaps don't leak into next row's first emission.
+            # stale gaps don't leak into next row.
             if self._state.spacing_slots_remaining > 0:
                 self._state.spacing_slots_remaining = 0
             self._state.phase = TransportPhase.ROW_DONE
@@ -272,27 +278,14 @@ class DataPort:
         return True
 
     def _reset_transport(self) -> None:
-        """Re-init transport-scope state for a new transport pattern.
-
-        Called from _start_interval on interval rollover and, SRI
-        only, from _advance_channel_group on mid-row pattern
-        completion.
-        """
+        """Re-init transport-scope state for a new transport pattern."""
         self._state.phase = TransportPhase.ACTIVE
         self._state.spacing_slots_remaining = 0
-
         self._state.sample_in_group = 0
         self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
-
         self._state.channel_group_base = 0
         self._state.channel_index = 0
-        if (self.config.ChannelGrouping_REG == 0
-                or self.config.ChannelGrouping_REG > self.config._num_channels):
-            self._state.channel_group_size = self.config._num_channels
-        else:
-            self._state.channel_group_size = self.config.ChannelGrouping_REG
-        self._state.channels_in_group_remaining = self._state.channel_group_size - 1
-
+        self._state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
         self._state.bit = self.config.SampleSize_REG
         self._state.wide_bit_remaining = self.config.BitWidth_REG
         self._state.txp_pending = self.config._emits_txp
@@ -312,16 +305,16 @@ class DataPort:
         self._state.bit -= 1
         if self._state.bit < 0:
             self._state.bit = self.config.SampleSize_REG
-            self._state.txp_pending = self.config._emits_txp
             self._advance_channel()
 
     def _advance_channel(self) -> None:
         """Next channel; cascades to _advance_sample on exhaustion."""
         self._state.channel_index += 1
         self._state.channels_in_group_remaining -= 1
+        self._state.txp_pending = self.config._emits_txp
         if self._state.channels_in_group_remaining < 0:
             self._state.channel_index = self._state.channel_group_base
-            self._state.channels_in_group_remaining = self._state.channel_group_size - 1
+            self._state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
             self._advance_sample()
 
     def _advance_sample(self) -> None:
@@ -335,7 +328,8 @@ class DataPort:
 
     def _advance_channel_group(self) -> None:
         """Advance to the next channel group (or to the next transport in SRI)."""
-        pattern_complete = (self._state.channel_group_base + self._state.channel_group_size
+        cg_size = self.config._effective_channel_grouping
+        pattern_complete = (self._state.channel_group_base + cg_size
                             >= self.config._num_channels)
 
         if pattern_complete:
@@ -350,10 +344,10 @@ class DataPort:
             # sample, channels_in_group_remaining, channel_index) were already
             # reset by the cascade that brought us here. Update the CG-scope
             # counters for the new group's size and starting channel.
-            self._state.channel_group_base += self._state.channel_group_size
+            self._state.channel_group_base += cg_size
             remaining_channels = self.config._num_channels - self._state.channel_group_base
-            if remaining_channels > self._state.channel_group_size:
-                remaining_channels = self._state.channel_group_size
+            if remaining_channels > cg_size:
+                remaining_channels = cg_size
             self._state.channels_in_group_remaining = remaining_channels - 1
             self._state.channel_index = self._state.channel_group_base
 
