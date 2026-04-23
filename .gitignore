@@ -39,3 +39,7 @@ scratch/
 
 # Scratch CSV at repo root
 /test.csv
+
+# Scratch working docs and one-off test harnesses
+/docs/
+/tests/
