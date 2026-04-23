@@ -393,11 +393,11 @@ class BusModelBuilder:
             # _advance_channel_group non-terminal or any other path).
             dp_state = dp._state
             pre_is_fresh_transport = (
-                dp_state.phase == TransportPhase.ACTIVE
-                and dp_state.channel_group_base == 0
+                dp_state.transport_phase == TransportPhase.ACTIVE
+                and dp_state.channel_group_base_channel == 0
                 and dp_state.channel_index == 0
                 and dp_state.sample_in_group == 0
-                and dp_state.bit == dp.config.SampleSize_REG
+                and dp_state.bit_in_channel == dp.config.SampleSize_REG
                 and dp_state.samples_in_group_remaining == dp.config.SampleGrouping_REG
                 and dp_state.wide_bit_remaining == dp.config.BitWidth_REG
                 and dp_state.txp_pending == dp.config._emits_txp

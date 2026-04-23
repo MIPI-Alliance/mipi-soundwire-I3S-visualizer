@@ -5,7 +5,7 @@ Classes:
     DataPortConfig: Configuration and register values
     DataPort:       Combines config, state, and algorithm
 
-`phase: TransportPhase` tracks the transport lifecycle:
+`transport_phase: TransportPhase` tracks the transport lifecycle:
     ACTIVE       Emitting inside the horizontal window
     SPACING      Inter-channel-group / SRI inter-transport gap
     ROW_DONE     Row's window exhausted; transport still alive across wrap
@@ -17,7 +17,7 @@ Normal vs SRI:
     - SRI:    Multiple transports per row.
 
 Counter cascade:
-    wide_bit → bit → channel → sample → channel_group → transport completion
+    wide_bit → bit_in_channel → channel → sample → channel_group → transport completion
 """
 
 from __future__ import annotations
@@ -42,16 +42,16 @@ class DataPortState:
         """Set state to the current config."""
         self.column: int = 0
         self.row_in_interval: int = 0
-        self.phase: TransportPhase = TransportPhase.PATTERN_DONE
+        self.transport_phase: TransportPhase = TransportPhase.PATTERN_DONE
         self.interval_skipped: bool = False
         self.skipping_accumulator: int = 0
         self.sample_in_group: int = 0
         self.samples_in_group_remaining: int = config.SampleGrouping_REG
         self.channel_index: int = 0
         self.spacing_slots_remaining: int = 0
-        self.channel_group_base: int = 0
+        self.channel_group_base_channel: int = 0
         self.channels_in_group_remaining: int = 0
-        self.bit: int = config.SampleSize_REG
+        self.bit_in_channel: int = config.SampleSize_REG
         self.wide_bit_remaining: int = config.BitWidth_REG
         self.txp_pending: bool = config._emits_txp
         self.post_data_queue.clear()
@@ -175,7 +175,7 @@ class DataPort:
         """Emit bit slot information at the current position and auto-advance."""
         if (self.config._num_channels == 0
                 or self._state.interval_skipped
-                or self._state.phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
+                or self._state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
                 or self._state.row_in_interval < self.config.Offset_REG
                 or self._state.column < self.config.HorizontalStart_REG):
             slot = BitSlotState(slot_type=SlotType.EMPTY)
@@ -201,13 +201,13 @@ class DataPort:
             # Transport window exhausted on this row. Clear spacing so
             # stale gaps don't leak into next row.
             self._state.spacing_slots_remaining = 0
-            self._state.phase = TransportPhase.ROW_DONE
+            self._state.transport_phase = TransportPhase.ROW_DONE
             return BitSlotState(slot_type=SlotType.EMPTY)
 
-        if self._state.phase == TransportPhase.SPACING:
+        if self._state.transport_phase == TransportPhase.SPACING:
             self._state.spacing_slots_remaining -= 1
             if self._state.spacing_slots_remaining <= 0:
-                self._state.phase = TransportPhase.ACTIVE
+                self._state.transport_phase = TransportPhase.ACTIVE
             return BitSlotState(slot_type=SlotType.EMPTY)
 
         direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
@@ -228,7 +228,7 @@ class DataPort:
                 data=BitSlotData(
                     sample_in_group=self._state.sample_in_group,
                     channel=self.config._channel(self._state.channel_index),
-                    bit=self._state.bit
+                    bit=self._state.bit_in_channel
                 ),
             )
 
@@ -262,8 +262,8 @@ class DataPort:
         # the pattern completed. The pattern resumes on this fresh row, so
         # flip phase back to ACTIVE. Applies to both non-SRI multi-row
         # transports and SRI mid-pattern cuts.
-        if self._state.phase == TransportPhase.ROW_DONE:
-            self._state.phase = TransportPhase.ACTIVE
+        if self._state.transport_phase == TransportPhase.ROW_DONE:
+            self._state.transport_phase = TransportPhase.ACTIVE
 
         self._state.row_in_interval += 1
 
@@ -291,32 +291,32 @@ class DataPort:
 
     def _reset_transport(self) -> None:
         """Re-init transport-scope state for a new transport pattern."""
-        self._state.phase = TransportPhase.ACTIVE
+        self._state.transport_phase = TransportPhase.ACTIVE
         self._state.spacing_slots_remaining = 0
         self._state.sample_in_group = 0
         self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
-        self._state.channel_group_base = 0
+        self._state.channel_group_base_channel = 0
         self._state.channel_index = 0
         self._state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
-        self._state.bit = self.config.SampleSize_REG
+        self._state.bit_in_channel = self.config.SampleSize_REG
         self._state.wide_bit_remaining = self.config.BitWidth_REG
         self._state.txp_pending = self.config._emits_txp
 
     def _advance_wide_bit(self) -> None:
-        """Next wide-bit tick; cascades to _advance_bit on exhaustion."""
+        """Next wide-bit tick; cascades to _advance_bit_in_channel on exhaustion."""
         self._state.wide_bit_remaining -= 1
         if self._state.wide_bit_remaining < 0:
             self._state.wide_bit_remaining = self.config.BitWidth_REG
-            self._advance_bit()
+            self._advance_bit_in_channel()
 
-    def _advance_bit(self) -> None:
+    def _advance_bit_in_channel(self) -> None:
         """Next emission position within the current (channel, sample)."""
         if self._state.txp_pending:
             self._state.txp_pending = False
             return
-        self._state.bit -= 1
-        if self._state.bit < 0:
-            self._state.bit = self.config.SampleSize_REG
+        self._state.bit_in_channel -= 1
+        if self._state.bit_in_channel < 0:
+            self._state.bit_in_channel = self.config.SampleSize_REG
             self._advance_channel()
 
     def _advance_channel(self) -> None:
@@ -325,7 +325,7 @@ class DataPort:
         self._state.channels_in_group_remaining -= 1
         self._state.txp_pending = self.config._emits_txp
         if self._state.channels_in_group_remaining < 0:
-            self._state.channel_index = self._state.channel_group_base
+            self._state.channel_index = self._state.channel_group_base_channel
             self._state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
             self._advance_sample()
 
@@ -340,41 +340,41 @@ class DataPort:
 
     def _advance_channel_group(self) -> None:
         """Advance to the next channel group (or to the next transport in SRI)."""
-        cg_size = self.config._effective_channel_grouping
-        pattern_complete = (self._state.channel_group_base + cg_size
+        channel_group_size = self.config._effective_channel_grouping
+        transport_pattern_complete = (self._state.channel_group_base_channel + channel_group_size
                             >= self.config._num_channels)
 
-        if pattern_complete:
+        if transport_pattern_complete:
             if self.config.SubRowInterval_REG:
                 # SRI mid-row transport rollover. _reset_transport() arms phase=ACTIVE
                 # and counters; the inter-group gap block below may overwrite phase
                 # to SPACING/ROW_DONE based on Spacing_REG.
                 self._reset_transport()
             else:
-                self._state.phase = TransportPhase.PATTERN_DONE
+                self._state.transport_phase = TransportPhase.PATTERN_DONE
                 return
         else:
             # Next CG within same transport. The cascade that brought us here
-            # left the inner counters (bit, wide_bit_remaining, txp_pending,
+            # left the inner counters (bit_in_channel, wide_bit_remaining, txp_pending,
             # sample_in_group, samples_in_group_remaining) at fresh-transport
             # values. Retarget the CG-scope counters at the new group: advance
-            # channel_group_base, point channel_index at the new base, and set
+            # channel_group_base_channel, point channel_index at the new base, and set
             # channels_in_group_remaining (trimmed if the last group is partial).
-            self._state.channel_group_base += cg_size
-            remaining_channels = self.config._num_channels - self._state.channel_group_base
-            if remaining_channels > cg_size:
-                remaining_channels = cg_size
+            self._state.channel_group_base_channel += channel_group_size
+            remaining_channels = self.config._num_channels - self._state.channel_group_base_channel
+            if remaining_channels > channel_group_size:
+                remaining_channels = channel_group_size
             self._state.channels_in_group_remaining = remaining_channels - 1
-            self._state.channel_index = self._state.channel_group_base
+            self._state.channel_index = self._state.channel_group_base_channel
 
         # Inter-group gap (SRI next-transport or next-CG path; non-SRI
-        # pattern-complete returned above).
-        if self.config.SubRowInterval_REG or not pattern_complete:
+        # transport-pattern-complete returned above).
+        if self.config.SubRowInterval_REG or not transport_pattern_complete:
             if self.config.Spacing_REG == 0:
                 # No gap: SRI ends the row here; the next row's
                 # _advance_interval arms a fresh transport.
-                self._state.phase = TransportPhase.ROW_DONE
+                self._state.transport_phase = TransportPhase.ROW_DONE
             else:
                 self._state.spacing_slots_remaining = self.config.Spacing_REG - 1
-                self._state.phase = (TransportPhase.SPACING if self.config.Spacing_REG > 1
+                self._state.transport_phase = (TransportPhase.SPACING if self.config.Spacing_REG > 1
                                      else TransportPhase.ACTIVE)
