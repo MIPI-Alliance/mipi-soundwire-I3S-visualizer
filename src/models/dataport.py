@@ -53,6 +53,11 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.bit_in_channel: int = config.SampleSize_REG
         self.wide_bit_remaining: int = config.BitWidth_REG
+        # Post-data emission state. Mirrors post_data_queue contents so the
+        # engine can derive slot type without peeking at the queue. Phase 6
+        # will remove the queue and these become the single source of truth.
+        self.post_data_guard_pending: bool = False
+        self.post_data_tail_remaining: int = 0
         self.txp_pending: bool = config._emits_txp
         self.post_data_queue.clear()
 
@@ -248,6 +253,12 @@ class DataPort:
 
         if self.state.post_data_queue:
             slot_type = self.state.post_data_queue.popleft()
+            # Mirror queue mutation in derived state fields.
+            if slot_type == SlotType.TAIL:
+                self.state.post_data_tail_remaining -= 1
+            else:
+                # GUARD_0 or GUARD_1
+                self.state.post_data_guard_pending = False
             self._advance_column()
             return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
 
@@ -297,14 +308,18 @@ class DataPort:
     def _prime_post_data_queue(self) -> None:
         """Prime the post-data queue after a source-port data slot."""
         self.state.post_data_queue.clear()
+        self.state.post_data_guard_pending = False
+        self.state.post_data_tail_remaining = 0
         if self.config.PortDirection_REG:
             return
         if self.config.GuardEnable_REG:
             self.state.post_data_queue.append(
                 SlotType.GUARD_1 if self.config.GuardPolarity_REG else SlotType.GUARD_0
             )
+            self.state.post_data_guard_pending = True
         for _ in range(self.config.TailWidth_REG):
             self.state.post_data_queue.append(SlotType.TAIL)
+        self.state.post_data_tail_remaining = self.config.TailWidth_REG
 
     def _advance_column(self) -> None:
         """Advance column; wrap to the next row at the right edge."""
@@ -316,6 +331,9 @@ class DataPort:
         """Advance the row counter and prepare per-row state."""
         self.state.column = 0
         self.state.post_data_queue.clear()
+        # Post-data emission doesn't survive row wraps.
+        self.state.post_data_guard_pending = False
+        self.state.post_data_tail_remaining = 0
 
         # Row-cut resume: horizontal window exhausted the prior row before
         # the pattern completed. The pattern resumes on this fresh row, so
