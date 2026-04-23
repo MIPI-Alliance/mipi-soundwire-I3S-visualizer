@@ -345,7 +345,7 @@ class BusModelBuilder:
         # The FCP lives on Interface, not DataPort. Engine drives its lifecycle
         # explicitly at the same moments the DP transitions.
         fcp = self.interface.flow_control_ports[dp_index]
-        fcp.reset()
+        fcp.initialize()
 
         # Engine-owned per-DP transport counter — starts at 0, incremented
         # when the engine observes that a fresh _reset_transport just ran
@@ -387,11 +387,6 @@ class BusModelBuilder:
             row = bit_num // num_cols
             column = bit_num % num_cols
 
-            # Snapshot DP's interval state BEFORE the data path advances it
-            # (dp.fetch_bit_slot() may advance row_in_interval at column=0).
-            # The FCP needs the CURRENT row's value, not the next one.
-            row_in_interval_for_fcp = dp.row_in_interval
-
             # Detect "DP is sitting at the post-_reset_transport state, about
             # to emit the first bit of a new transport pattern." This unique
             # state combination is set ONLY by _reset_transport (not by
@@ -424,25 +419,11 @@ class BusModelBuilder:
             # the fresh-transport state AND this slot actually emitted data.
             new_transport_emission = is_owned_data and pre_is_fresh_transport
 
-            # Drive the FCP lifecycle in the same order the old DP-driven code
-            # did — resets fire BETWEEN the DP's emission and the FCP's so the
-            # FCP sees the same state the old FCP-owned-by-DP path did.
-            if column == num_cols - 1:
-                fcp.reset_for_row()
-            if (row_in_interval_for_fcp > 0
-                    and dp.row_in_interval == 0
-                    and not new_transport_emission):
-                # Interval wrapped and no new transport starting on this slot —
-                # Offset_REG > 0 case: clear DRQ-sent latch; leave tails/guard
-                # residues alone (matches the interval-scope reset inlined in
-                # DataPort._advance_row).
-                fcp.reset_drq_sent()
             if new_transport_emission:
                 # Resume detection: in SRI, if the prior transport had emitted
                 # some bits but did not finish (fewer than bits_per_transport),
                 # the row boundary cut it and this "new" emission is the same
-                # logical transport re-started from bit 0. Don't bump the count
-                # and don't reset_for_interval — matches the old resume=True path.
+                # logical transport re-started from bit 0. Don't bump the count.
                 is_sri_resume = (
                     dp.config.SubRowInterval_REG
                     and has_emitted_in_current_transport
@@ -450,7 +431,6 @@ class BusModelBuilder:
                 )
                 if not is_sri_resume:
                     self._transport_counts[dp_index] += 1
-                    fcp.reset_for_interval()
                 has_emitted_in_current_transport = True
                 bits_emitted_in_current_transport = 0
 
@@ -462,7 +442,7 @@ class BusModelBuilder:
             # FCP emits as an independent parallel source. Any DP+FCP collision
             # is surfaced by the bus model's SAME_DEVICE clash detector (no
             # arbitration in the core loop).
-            fcp_slot = fcp.fetch_bit_slot(column=column, row_in_interval=row_in_interval_for_fcp)
+            fcp_slot = fcp.fetch_bit_slot()
             fcp_slot.row = row
             fcp_slot.column = column
             fcp_slot.device_num = device

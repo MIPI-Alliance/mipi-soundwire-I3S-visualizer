@@ -122,6 +122,11 @@ class DataPortConfig:
         return self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
 
     @property
+    def _emits_drq(self) -> bool:
+        """True iff FlowMode activates the FCP's DRQ path (RX_CONTROLLED or ASYNC)."""
+        return self.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
+
+    @property
     def _effective_channel_grouping(self) -> int:
         """Channels per group: ChannelGrouping_REG, clamped to num_channels
         when the register is 0 or oversized."""

@@ -1,16 +1,18 @@
 """Flow Control Port (FCP) - independent bus source for DRQ + guards + tails.
 
+Classes:
+    FlowControlPortState:  Runtime state
+    FlowControlPortConfig: Configuration and register values
+    FlowControlPort:       Combines config, state, and algorithm
+
 The FCP is a parallel state machine to the DataPort's data path. Both are
 iterated by the engine; when both emit at the same column, the bus model's
 existing SAME_DEVICE clash detector surfaces it as a configuration error.
+No arbitration or priority logic lives in the core loop.
 
-No arbitration or priority logic lives in the core loop. Clash handling is
-delegated to the clash detector.
-
-Classes:
-    FlowControlPortConfig: FCP register values (HorizontalStart, BitWidth, etc.)
-    FlowControlPortState: Runtime state for the DRQ/guard/tail state machine
-    FlowControlPort: Emits one slot per column; EMPTY when not claiming
+Active only in RX_CONTROLLED or ASYNC flow modes. Reads FlowMode_REG,
+PortDirection_REG, and Interval_REG from the parent DataPort (DRQ direction
+is inverted relative to the DP's data direction).
 
 NOTE: This module must remain UI-independent - no tkinter, widgets, dialogs,
 or UI framework imports. See CLAUDE.md for policy.
@@ -18,24 +20,45 @@ or UI framework imports. See CLAUDE.md for policy.
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Optional, TYPE_CHECKING
 
 from .bit_slot import BitSlotState
-from .enums import SlotType, DirectionType, FlowMode
+from .enums import SlotType, DirectionType
 
 if TYPE_CHECKING:
     from .dataport import DataPort
 
 
-# =============================================================================
-# Configuration Class
-# =============================================================================
+class FlowControlPortState:
+    """Runtime state for an FCP."""
+
+    def __init__(self) -> None:
+        # post_data_queue is reused across initializations so external holders
+        # keep a stable reference; initialize() clears it in place.
+        self.post_data_queue: deque[SlotType] = deque()
+        self.initialize()
+
+    def initialize(self) -> None:
+        """Set state to idle-start values.
+
+        No config is needed: the FCP starts dormant (row_in_interval=0,
+        drq_sent=False, no pending guards/tails/replay) and waits for its
+        row/column counters to reach the DRQ trigger condition.
+        """
+        self.column: int = 0
+        self.row_in_interval: int = 0
+        self.drq_sent: bool = False
+        self.wide_bit_remaining: int = 0
+        self.stored_wide_bit_slot: Optional[BitSlotState] = None
+        self.post_data_queue.clear()
+
 
 class FlowControlPortConfig:
-    """Configuration and register values for an FCP.
+    """Configuration and register state for an FCP.
 
     Holds the six FCP-specific registers. Names drop the FCP_ prefix because
-    they now live in their own namespace (accessed via `dp.fcp.config.*`).
+    they live in their own namespace (accessed via `dp.fcp.config.*`).
     """
 
     def __init__(self) -> None:
@@ -47,128 +70,71 @@ class FlowControlPortConfig:
         self.GuardPolarity_REG: bool = False
 
 
-# =============================================================================
-# Runtime State Class
-# =============================================================================
-
-class FlowControlPortState:
-    """Runtime state for the FCP state machine.
-
-    Owns its own wide-bit replay buffer (not shared with the DataPort).
-    """
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        """Reset all runtime state for a fresh drawing pass."""
-        self.drq_sent: bool = False
-        self.tails_left: int = 0
-        self.guard_left: bool = False
-        self.wide_bit_slots_remaining: int = 0
-        self.stored_wide_bit_slot: Optional[BitSlotState] = None
-
-
-# =============================================================================
-# Main FlowControlPort Class
-# =============================================================================
-
 class FlowControlPort:
-    """Flow Control Port - emits DRQ + tails + guards.
+    """SWI3S Flow Control Port — config + state + algorithm.
 
-    Operates as a parallel state machine to the DataPort's data path. Both
-    are iterated by the engine; if they emit at the same column, the bus
-    model's SAME_DEVICE clash detector surfaces it as a config error.
+    Emits DRQ + guards + tails as an independent peer of the DataPort. Both
+    are iterated by the engine; collisions are surfaced by the bus model's
+    SAME_DEVICE clash detector (no arbitration here).
 
-    Active only in RX_CONTROLLED or ASYNC flow modes. Reads FlowMode_REG and
-    PortDirection_REG from the parent DataPort (DRQ direction is inverted
-    relative to the DP's data direction).
+    Public surface:
+        config               configuration / register attributes
+        initialize()         initialize before use
+        fetch_bit_slot()     emit slot at current position (auto-advances)
     """
 
-    def __init__(self, dataport: 'DataPort') -> None:
-        """Initialize the FCP with a reference to its parent DataPort.
-
-        Args:
-            dataport: Parent DataPort (used to read FlowMode_REG and
-                PortDirection_REG from its config).
-        """
-        self._dataport = dataport
+    def __init__(self, dataport: DataPort) -> None:
+        self._dataport = dataport  # parent DP: reads FlowMode_REG,
+                                   # PortDirection_REG, Interval_REG
         self.config = FlowControlPortConfig()
         self._state = FlowControlPortState()
 
-    def reset(self) -> None:
-        """Reset all runtime state for a fresh drawing pass."""
-        self._state.reset()
+    def initialize(self) -> None:
+        """Initialize before FCP use."""
+        self._state.initialize()
 
-    def reset_for_interval(self) -> None:
-        """Clear interval-scoped flags. Called by DP when starting a new interval."""
-        self._state.drq_sent = False
-        self._state.tails_left = 0
-        self._state.guard_left = False
+    def fetch_bit_slot(self) -> BitSlotState:
+        """Emit bit slot information at the current position and auto-advance."""
+        slot = self._data_slot()
 
-    def reset_drq_sent(self) -> None:
-        """Clear drq_sent flag. Called by DP at interval wrap when _reset_transport() doesn't run."""
-        self._state.drq_sent = False
+        if slot.is_owned():
+            self._advance_column()
+            return slot
 
-    def reset_for_row(self) -> None:
-        """Clear wide-bit replay state. Called by DP at row boundary."""
-        self._state.wide_bit_slots_remaining = 0
-        self._state.stored_wide_bit_slot = None
+        if self._state.post_data_queue:
+            slot_type = self._state.post_data_queue.popleft()
+            self._advance_column()
+            return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
 
-    def fetch_bit_slot(self, column: int, row_in_interval: int) -> BitSlotState:
+        self._advance_column()
+        return BitSlotState(slot_type=SlotType.EMPTY)
+
+    def _data_slot(self) -> BitSlotState:
         """Return the slot FCP emits at this column.
 
-        Handles (in priority order):
-            1. Wide-bit replay (from a prior DRQ with BitWidth_REG > 0)
-            2. Pending guard (after a DRQ with GuardEnable_REG)
-            3. Pending tails (after a DRQ with TailWidth_REG)
-            4. DRQ trigger at (Offset_REG, HorizontalStart_REG) in RX_CONTROLLED/ASYNC
+        Priority order:
+            1. Wide-bit replay (a prior DRQ with BitWidth_REG > 0)
+            2. DRQ trigger at (Offset_REG row, HorizontalStart_REG column)
+               in RX_CONTROLLED / ASYNC flow modes
+            3. EMPTY
 
-        Args:
-            column: Current column in the row.
-            row_in_interval: DP's row_in_interval (snapshotted before
-                the DP's data path runs, so FCP sees the current row's value
-                rather than the advanced-past value).
-
-        Returns:
-            BitSlotState for the column. Returns EMPTY when FCP does not
-            claim this column.
+        Post-DRQ guards/tails drain from post_data_queue in fetch_bit_slot
+        (mirrors DataPort's pattern).
         """
+        # Wide-bit replay: return the stored slot directly. Safe to share
+        # the object — the engine overwrites row/column/device_num/dp_num
+        # on every fetch, and the bus-model adapters copy fields into
+        # fresh BitInfo records instead of storing the slot reference.
+        if self._state.stored_wide_bit_slot is not None:
+            slot = self._state.stored_wide_bit_slot
+            self._advance_wide_bit()
+            return slot
+
         dp_config = self._dataport.config
-
-        # Wide-bit replay (same slot across multiple columns)
-        if self._state.wide_bit_slots_remaining > 0:
-            self._state.wide_bit_slots_remaining -= 1
-            if self._state.stored_wide_bit_slot is None:
-                raise RuntimeError("stored_wide_bit_slot uninitialized with wide_bit_slots_remaining > 0")
-            return BitSlotState(
-                slot_type=self._state.stored_wide_bit_slot.slot_type,
-                direction=self._state.stored_wide_bit_slot.direction,
-                data=self._state.stored_wide_bit_slot.data,
-            )
-
-        # Pending guard from a prior DRQ
-        if self._state.guard_left:
-            self._state.guard_left = False
-            return BitSlotState(
-                slot_type=SlotType.GUARD_1 if self.config.GuardPolarity_REG else SlotType.GUARD_0,
-                direction=DirectionType.SOURCE,
-            )
-
-        # Pending tails from a prior DRQ
-        if self._state.tails_left > 0:
-            self._state.tails_left -= 1
-            return BitSlotState(
-                slot_type=SlotType.TAIL,
-                direction=DirectionType.SOURCE,
-            )
-
-        # DRQ trigger - only in RX_CONTROLLED or ASYNC flow modes
-        fcp_active_row = (row_in_interval == self.config.Offset_REG)
-        if (dp_config.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC) and
-                fcp_active_row and
-                not self._state.drq_sent and
-                column == self.config.HorizontalStart_REG):
+        if (dp_config._emits_drq
+                and not self._state.drq_sent
+                and self._state.row_in_interval == self.config.Offset_REG
+                and self._state.column == self.config.HorizontalStart_REG):
             # DRQ direction is opposite to the DP's data direction.
             # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
             slot = BitSlotState(
@@ -177,17 +143,67 @@ class FlowControlPort:
             )
             self._state.drq_sent = True
 
-            # Guards and tails only follow SOURCE DRQs (when this DP sends DRQ)
-            if slot.direction == DirectionType.SOURCE:
-                self._state.guard_left = self.config.GuardEnable_REG
-                self._state.tails_left = self.config.TailWidth_REG
+            # Unlike DP (which primes its post-data queue from fetch_bit_slot
+            # after every owned slot), FCP primes here on fresh DRQ only —
+            # wide-bit replays are continuations of the same DRQ and must NOT
+            # re-prime.
+            self._prime_post_data_queue()
 
-            # Wide-bit replay setup for DRQ
-            if self.config.BitWidth_REG > 0:
-                self._state.wide_bit_slots_remaining = self.config.BitWidth_REG
-                self._state.stored_wide_bit_slot = slot
-
+            # Prime wide-bit replay for this DRQ, then advance once for this
+            # emission. BitWidth_REG == 0 clears stored on the same call, so
+            # no separate guard is needed.
+            self._state.wide_bit_remaining = self.config.BitWidth_REG
+            self._state.stored_wide_bit_slot = slot
+            self._advance_wide_bit()
             return slot
 
-        # FCP does not claim this column
         return BitSlotState(slot_type=SlotType.EMPTY)
+
+    def _prime_post_data_queue(self) -> None:
+        """Prime the post-DRQ queue (guard + tails) after a SOURCE DRQ.
+
+        Mirror image of DataPort._prime_post_data_queue: DP primes when the
+        port is Source (PortDirection_REG=False); FCP primes when the DRQ is
+        Source, which happens when the parent DP is Sink (PortDirection_REG=True).
+        """
+        self._state.post_data_queue.clear()
+        if not self._dataport.config.PortDirection_REG:
+            return
+        if self.config.GuardEnable_REG:
+            self._state.post_data_queue.append(
+                SlotType.GUARD_1 if self.config.GuardPolarity_REG else SlotType.GUARD_0
+            )
+        for _ in range(self.config.TailWidth_REG):
+            self._state.post_data_queue.append(SlotType.TAIL)
+
+    def _advance_column(self) -> None:
+        """Advance column; wrap to the next row at the right edge."""
+        self._state.column += 1
+        if self._state.column >= self._dataport._device._interface.num_columns:
+            self._advance_row()
+
+    def _advance_row(self) -> None:
+        """Advance the row counter and prepare per-row state."""
+        self._state.column = 0
+        self._state.post_data_queue.clear()
+        # Wide-bit replay doesn't survive row wraps.
+        self._state.wide_bit_remaining = 0
+        self._state.stored_wide_bit_slot = None
+        self._state.row_in_interval += 1
+        if self._state.row_in_interval > self._dataport.config.Interval_REG:
+            self._state.row_in_interval = 0
+            self._advance_interval()
+
+    def _advance_interval(self) -> None:
+        """Advance to the next interval: clear the DRQ latch."""
+        self._state.drq_sent = False
+
+    def _advance_wide_bit(self) -> None:
+        """Next wide-bit replay tick; clear stored slot on exhaustion.
+
+        Terminal (unlike DP's _advance_wide_bit which cascades to _advance_bit) —
+        FCP's wide-bit is a one-shot replay, not part of a counter cascade.
+        """
+        self._state.wide_bit_remaining -= 1
+        if self._state.wide_bit_remaining < 0:
+            self._state.stored_wide_bit_slot = None
