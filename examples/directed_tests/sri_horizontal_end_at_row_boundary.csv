@@ -1,4 +1,4 @@
-NumColumns_REG,16
+NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,False
 S0Width,1
@@ -9,7 +9,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,384
+RowRate,384.0
 Description,SRI with _HorizontalEnd exactly at last column of row (NumColumns-1) to pin behavior of L526 outer end-of-pattern check
 RowsToDraw,3
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
@@ -22,7 +22,7 @@ Spacing_REG,1,0,0,0,0,0,0,0,0,0,0,0
 Interval_REG,0,0,0,0,0,0,0,0,0,0,0,0
 Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
 HorizontalStart_REG,2,0,0,0,0,0,0,0,0,0,0,0
-HorizontalCount_REG,13,0,0,0,0,0,0,0,0,0,0,0
+HorizontalCount_REG,12,0,0,0,0,0,0,0,0,0,0,0
 TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 SkippingNumerator_REG,0,0,0,0,0,0,0,0,0,0,0,0

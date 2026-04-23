@@ -1,27 +1,27 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 20:54:06
+**Generated:** 2026-04-22 21:07:27
 
-**Total Time:** 0:24.6 (+1.6s)
+**Total Time:** 0:21.2 (-3.4s)
 
-**Comparing to:** 2026-04-22T20:48:27.144306
+**Comparing to:** 2026-04-22T20:54:06.875062
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
 | Total Tests | 86 | 0 |
-| Passed | 86 | +1 |
-| Failed | 0 | -1 |
+| Passed | 86 | 0 |
+| Failed | 0 | 0 |
 | Pass Rate | 100.0% | |
 
 ## Aggregate Statistics (All Tests)
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,016 | +21 |
-| Total Slots | 13,359 | +21 |
-| Total Handovers | 2,586 | +6 |
+| Total Bit Positions | 12,013 | -3 |
+| Total Slots | 13,356 | -3 |
+| Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
 | Read Overlaps | 64 | 0 |
@@ -30,12 +30,12 @@
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,193 | 8.9% | +3 |
-| DATA | 7,135 | 53.4% | +12 |
+| CDS | 1,193 | 8.9% | 0 |
+| DATA | 7,132 | 53.4% | -3 |
 | DRQ | 40 | 0.3% | 0 |
 | GUARD_0 | 285 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
-| HANDOVER | 2,586 | 19.4% | +6 |
+| HANDOVER | 2,586 | 19.4% | 0 |
 | S0 | 996 | 7.5% | 0 |
 | S1 | 772 | 5.8% | 0 |
 | TAIL | 284 | 2.1% | 0 |
@@ -46,7 +46,7 @@
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
 | SINK | 1,451 | 10.9% | 0 |
-| SOURCE | 11,908 | 89.1% | +21 |
+| SOURCE | 11,905 | 89.1% | -3 |
 
 ## Individual Test Results
 
@@ -121,7 +121,7 @@
 | dp_guards | 1 | 24 | 7 | 7 | 1 | 0 | 0 |
 | CDS_width_8_bit_slots | 2 | 24 | 16 | 16 | 0 | 0 | 0 |
 | test_mode_mismatch | 5 | 16 | 12 | 14 | 5 | 0 | 0 |
-| sri_horizontal_end_at_row_boundary | 3 | 17 | 51 | 51 | 6 | 0 | 0 |
+| sri_horizontal_end_at_row_boundary | 3 | 16 | 48 | 48 | 6 | 0 | 0 |
 | PDM_SRI_with_channel_grouping | 2 | 32 | 28 | 44 | 10 | 0 | 0 |
 | CDS_width_6_bit_slots | 2 | 24 | 12 | 12 | 0 | 0 | 0 |
 | CDS_width_2_bit_slots | 2 | 24 | 4 | 4 | 0 | 0 | 0 |
