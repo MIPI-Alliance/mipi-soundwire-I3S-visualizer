@@ -387,24 +387,24 @@ class MinimalApp(ctk.CTkFrame):
             self.root,
             flow_mode=data_port.config.FlowMode_REG,
             dp_index=dp_index,
-            fcp_h_start=fcp.config.HorizontalStart_REG,
-            fcp_bit_width=fcp.config.BitWidth_REG,
-            fcp_tail_width=fcp.config.TailWidth_REG,
-            fcp_offset=fcp.config.Offset_REG,
-            fcp_guard_enable=fcp.config.GuardEnable_REG,
-            fcp_guard_polarity=fcp.config.GuardPolarity_REG
+            fcp_h_start=fcp.config.FCP_HorizontalStart_REG,
+            fcp_bit_width=fcp.config.FCP_BitWidth_REG,
+            fcp_tail_width=fcp.config.FCP_TailWidth_REG,
+            fcp_offset=fcp.config.FCP_Offset_REG,
+            fcp_guard_enable=fcp.config.FCP_GuardEnable_REG,
+            fcp_guard_polarity=fcp.config.FCP_GuardPolarity_REG
         )
 
         self.root.wait_window(dialog)
 
         if not dialog.cancelled:
             data_port.config.FlowMode_REG = dialog.flow_mode
-            fcp.config.HorizontalStart_REG = dialog.fcp_h_start
-            fcp.config.BitWidth_REG = dialog.fcp_bit_width
-            fcp.config.TailWidth_REG = dialog.fcp_tail_width
-            fcp.config.Offset_REG = dialog.fcp_offset
-            fcp.config.GuardEnable_REG = dialog.fcp_guard_enable
-            fcp.config.GuardPolarity_REG = bool(dialog.fcp_guard_polarity)
+            fcp.config.FCP_HorizontalStart_REG = dialog.fcp_h_start
+            fcp.config.FCP_BitWidth_REG = dialog.fcp_bit_width
+            fcp.config.FCP_TailWidth_REG = dialog.fcp_tail_width
+            fcp.config.FCP_Offset_REG = dialog.fcp_offset
+            fcp.config.FCP_GuardEnable_REG = dialog.fcp_guard_enable
+            fcp.config.FCP_GuardPolarity_REG = bool(dialog.fcp_guard_polarity)
             self.parameter_panel.dp_flow_mode_vars[dp_index].set(dialog.flow_mode != 0)
             self._refresh()
         else:
@@ -602,12 +602,12 @@ class MinimalApp(ctk.CTkFrame):
             dp.config.ScramblerEn_REG = False
             # Also reset FCP fields
             fcp = self.interface.flow_control_ports[dp_index]
-            fcp.config.HorizontalStart_REG = 0
-            fcp.config.BitWidth_REG = 0
-            fcp.config.TailWidth_REG = 0
-            fcp.config.Offset_REG = 0
-            fcp.config.GuardEnable_REG = False
-            fcp.config.GuardPolarity_REG = False
+            fcp.config.FCP_HorizontalStart_REG = 0
+            fcp.config.FCP_BitWidth_REG = 0
+            fcp.config.FCP_TailWidth_REG = 0
+            fcp.config.FCP_Offset_REG = 0
+            fcp.config.FCP_GuardEnable_REG = False
+            fcp.config.FCP_GuardPolarity_REG = False
 
             # Reset viz config for this data port
             dp_viz = self.viz_config.data_ports[dp_index]

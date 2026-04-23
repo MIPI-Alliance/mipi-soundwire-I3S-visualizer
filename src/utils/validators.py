@@ -159,13 +159,13 @@ class DataPortValidator:
         # FCP register ranges only matter when FlowMode activates the FCP
         if config.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC):
             fcp_config = self.interface.get_fcp(data_port.dp_index).config
-            _check_range(result, 'FCP_HorizontalStart_REG', fcp_config.HorizontalStart_REG,
+            _check_range(result, 'FCP_HorizontalStart_REG', fcp_config.FCP_HorizontalStart_REG,
                          DataPortRanges.MIN_FCP_H_START, DataPortRanges.MAX_FCP_H_START)
-            _check_range(result, 'FCP_BitWidth_REG', fcp_config.BitWidth_REG,
+            _check_range(result, 'FCP_BitWidth_REG', fcp_config.FCP_BitWidth_REG,
                          DataPortRanges.MIN_FCP_BIT_WIDTH, DataPortRanges.MAX_FCP_BIT_WIDTH)
-            _check_range(result, 'FCP_TailWidth_REG', fcp_config.TailWidth_REG,
+            _check_range(result, 'FCP_TailWidth_REG', fcp_config.FCP_TailWidth_REG,
                          DataPortRanges.MIN_FCP_TAIL_WIDTH, DataPortRanges.MAX_FCP_TAIL_WIDTH)
-            _check_range(result, 'FCP_Offset_REG', fcp_config.Offset_REG,
+            _check_range(result, 'FCP_Offset_REG', fcp_config.FCP_Offset_REG,
                          DataPortRanges.MIN_FCP_OFFSET, DataPortRanges.MAX_FCP_OFFSET)
 
     # ---------------------------------------------------------------
@@ -406,22 +406,22 @@ class DataPortValidator:
     def _check_fcp_offset_within_interval(self, result: ValidationResult,
                                           config: Any, fcp_config: 'FlowControlPortConfig') -> None:
         """FCP Offset_REG shall be less than or equal to the parent DP's Interval_REG."""
-        if fcp_config.Offset_REG > config.Interval_REG:
+        if fcp_config.FCP_Offset_REG > config.Interval_REG:
             result.add_error(
                 'FCP_Offset_REG',
-                f"FCP Offset ({fcp_config.Offset_REG}) exceeds Interval ({config.Interval_REG})",
+                f"FCP Offset ({fcp_config.FCP_Offset_REG}) exceeds Interval ({config.Interval_REG})",
                 ErrorSeverity.ERROR
             )
 
     def _check_fcp_fits_row(self, result: ValidationResult,
                             fcp_config: 'FlowControlPortConfig') -> None:
         """FCP (DRQ + optional guard + tails) shall fit in the row starting at FCP_HorizontalStart."""
-        fcp_total_width = fcp_config.BitWidth_REG + 1
-        if fcp_config.GuardEnable_REG:
-            fcp_total_width += fcp_config.BitWidth_REG + 1
-        fcp_total_width += fcp_config.TailWidth_REG
+        fcp_total_width = fcp_config.FCP_BitWidth_REG + 1
+        if fcp_config.FCP_GuardEnable_REG:
+            fcp_total_width += fcp_config.FCP_BitWidth_REG + 1
+        fcp_total_width += fcp_config.FCP_TailWidth_REG
 
-        if fcp_config.HorizontalStart_REG + fcp_total_width > self.interface.num_columns:
+        if fcp_config.FCP_HorizontalStart_REG + fcp_total_width > self.interface.num_columns:
             result.add_error(
                 'FCP_HorizontalStart_REG',
                 "FCP bits would overflow row",

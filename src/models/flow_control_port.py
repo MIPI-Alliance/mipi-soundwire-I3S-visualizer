@@ -46,12 +46,12 @@ class FlowControlPortConfig:
     """Configuration and register state for an FCP."""
 
     def __init__(self) -> None:
-        self.HorizontalStart_REG: int = 0
-        self.BitWidth_REG: int = 0
-        self.TailWidth_REG: int = 0
-        self.Offset_REG: int = 0
-        self.GuardEnable_REG: bool = False
-        self.GuardPolarity_REG: bool = False
+        self.FCP_HorizontalStart_REG: int = 0
+        self.FCP_BitWidth_REG: int = 0
+        self.FCP_TailWidth_REG: int = 0
+        self.FCP_Offset_REG: int = 0
+        self.FCP_GuardEnable_REG: bool = False
+        self.FCP_GuardPolarity_REG: bool = False
 
 class FlowControlPort:
     """SWI3S Flow Control Port — config + state + algorithm.
@@ -108,8 +108,8 @@ class FlowControlPort:
         if (dp_config._emits_drq
                 and not self._dataport.interval_skipped
                 and not self._state.drq_sent
-                and self._state.row_in_interval == self.config.Offset_REG
-                and self._state.column == self.config.HorizontalStart_REG):
+                and self._state.row_in_interval == self.config.FCP_Offset_REG
+                and self._state.column == self.config.FCP_HorizontalStart_REG):
             # DRQ direction is opposite to the DP's data direction.
             # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
             slot = BitSlotState(
@@ -126,7 +126,7 @@ class FlowControlPort:
         for wide-bit replay, advance one tick for this emission."""
         self._state.drq_sent = True
         self._prime_post_data_queue()
-        self._state.wide_bit_remaining = self.config.BitWidth_REG
+        self._state.wide_bit_remaining = self.config.FCP_BitWidth_REG
         self._state.stored_wide_bit_slot = slot
         self._advance_wide_bit()
 
@@ -135,11 +135,11 @@ class FlowControlPort:
         self._state.post_data_queue.clear()
         if not self._dataport.config.PortDirection_REG:
             return
-        if self.config.GuardEnable_REG:
+        if self.config.FCP_GuardEnable_REG:
             self._state.post_data_queue.append(
-                SlotType.GUARD_1 if self.config.GuardPolarity_REG else SlotType.GUARD_0
+                SlotType.GUARD_1 if self.config.FCP_GuardPolarity_REG else SlotType.GUARD_0
             )
-        for _ in range(self.config.TailWidth_REG):
+        for _ in range(self.config.FCP_TailWidth_REG):
             self._state.post_data_queue.append(SlotType.TAIL)
 
     def _advance_column(self) -> None:

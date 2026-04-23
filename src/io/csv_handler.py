@@ -145,12 +145,12 @@ class CSVHandler:
         (DATA_PORT_SCRAMBLER_EN, 'ScramblerEn_REG', FieldType.BOOL, False),
         # Flow Control Port (FCP) parameters for DRQ bits
         # These route to interface.flow_control_ports[dp_index].config.* (not data_port.config.*) via _FCP_CSV_FIELDS below.
-        (DATA_PORT_FCP_H_START, 'HorizontalStart_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_BIT_WIDTH, 'BitWidth_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_TAIL_WIDTH, 'TailWidth_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_OFFSET, 'Offset_REG', FieldType.INT, False),
-        (DATA_PORT_FCP_GUARD_ENABLE, 'GuardEnable_REG', FieldType.BOOL, False),
-        (DATA_PORT_FCP_GUARD_POLARITY, 'GuardPolarity_REG', FieldType.BOOL, False),
+        (DATA_PORT_FCP_H_START, 'FCP_HorizontalStart_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_BIT_WIDTH, 'FCP_BitWidth_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_TAIL_WIDTH, 'FCP_TailWidth_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_OFFSET, 'FCP_Offset_REG', FieldType.INT, False),
+        (DATA_PORT_FCP_GUARD_ENABLE, 'FCP_GuardEnable_REG', FieldType.BOOL, False),
+        (DATA_PORT_FCP_GUARD_POLARITY, 'FCP_GuardPolarity_REG', FieldType.BOOL, False),
     ]
 
     # CSV fields whose attr lives on interface.flow_control_ports[dp_index].config instead of data_port.config.
