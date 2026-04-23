@@ -53,7 +53,7 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.bit: int = config.SampleSize_REG
         self.wide_bit_remaining: int = config.BitWidth_REG
-        self.txp_pending: bool = config._emits_txp  # True → next emission is TX_PRESENT
+        self.txp_pending: bool = config._emits_txp
         self.post_data_queue.clear()
 
 class DataPortConfig:
@@ -159,6 +159,12 @@ class DataPort:
     def row_in_interval(self) -> int:
         """Current row within this DP's interval."""
         return self._state.row_in_interval
+
+    @property
+    def interval_skipped(self) -> bool:
+        """True when the current interval is skipped by the Payload Interval
+        Skipping algorithm (no payload emitted)."""
+        return self._state.interval_skipped
 
     def initialize(self) -> None:
         """Initialize before dataport use."""
@@ -340,7 +346,9 @@ class DataPort:
 
         if pattern_complete:
             if self.config.SubRowInterval_REG:
-                # SRI mid-row transport rollover.
+                # SRI mid-row transport rollover. _reset_transport() arms phase=ACTIVE
+                # and counters; the inter-group gap block below may overwrite phase
+                # to SPACING/ROW_DONE based on Spacing_REG.
                 self._reset_transport()
             else:
                 self._state.phase = TransportPhase.PATTERN_DONE
