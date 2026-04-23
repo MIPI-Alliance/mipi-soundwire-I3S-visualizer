@@ -21,10 +21,8 @@ Counter cascade:
 """
 
 from __future__ import annotations
-from collections import deque
 from typing import Optional, TYPE_CHECKING
-from .bit_slot import BitSlotData, BitSlotState
-from .enums import SlotType, DirectionType, FlowMode, TransportPhase
+from .enums import FlowMode, TransportPhase
 
 if TYPE_CHECKING:
     from .device import Device
@@ -33,9 +31,6 @@ class DataPortState:
     """Runtime state for a DataPort."""
 
     def __init__(self, config: DataPortConfig) -> None:
-        # post_data_queue is reused across initializations so external holders
-        # keep a stable reference; initialize() clears it in place.
-        self.post_data_queue: deque[SlotType] = deque()
         self.initialize(config)
 
     def initialize(self, config: DataPortConfig) -> None:
@@ -53,13 +48,11 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.bit_in_channel: int = config.SampleSize_REG
         self.wide_bit_remaining: int = config.BitWidth_REG
-        # Post-data emission state. Mirrors post_data_queue contents so the
-        # engine can derive slot type without peeking at the queue. Phase 6
-        # will remove the queue and these become the single source of truth.
+        # Post-data emission state for source ports: optional guard then
+        # tail bits, drained by clock_tick after each owned data slot.
         self.post_data_guard_pending: bool = False
         self.post_data_tail_remaining: int = 0
         self.txp_pending: bool = config._emits_txp
-        self.post_data_queue.clear()
 
 class DataPortConfig:
     """Configuration and register state for a DataPort."""
@@ -151,7 +144,7 @@ class DataPort:
         dp_index             canonical position index (0-15)
         row_in_interval      current row within this DP's interval
         initialize()         initialize before use
-        fetch_bit_slot()     emit slot at current position (auto-advances to next UI)
+        clock_tick()         advance one UI; engine derives BitSlotState from state
     """
 
     def __init__(self, device: 'Device', dp_index: int) -> None:
@@ -176,149 +169,59 @@ class DataPort:
         self.state.initialize(self.config)
         self._advance_interval()
 
-    # ------------------------------------------------------------------
-    # New action API (Phase 2 — surface only; implementations in Phase 3).
-    # clock_tick() is the per-UI entry point. Engine migrates from
-    # fetch_bit_slot() to clock_tick() + state reads in Phase 4.
-    # ------------------------------------------------------------------
-
     def clock_tick(self) -> None:
-        """Advance the DataPort by one UI (cascade tick).
+        """Advance the DataPort by one UI.
 
-        Phase 2: thin wrapper over fetch_bit_slot() so the new entry-point
-        name is available without behavior change. Phase 3 replaces this
-        with cascade-driven action calls and folds post_data_queue.
+        Self-contained UI advance — engine consumes BitSlotState via the
+        engine-side _derive_dp_bit_slot helper (see core/engine.py).
         """
-        self.fetch_bit_slot()
+        config = self.config
+        state = self.state
 
-    def write_data_bit_from_fifo(self) -> None:
-        """Source DP: pull next data bit from the audio fifo at UI 0 of a
-        wide-bit period. Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
+        in_emit_path = not (
+            config._num_channels == 0
+            or state.interval_skipped
+            or state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
+            or state.row_in_interval < config.Offset_REG
+            or state.column < config.HorizontalStart_REG
+        )
 
-    def write_held_bit(self) -> None:
-        """Re-emit the held bit (DATA / TX_PRESENT / TAIL) for subsequent
-        UIs of a wide-bit period. Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def read_data_bit_to_fifo(self) -> None:
-        """Sink DP: sample bus and push to fifo at the last UI of a wide-bit
-        period. Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def write_txp(self) -> None:
-        """Source DP: emit TX_PRESENT at UI 0 of a wide-bit period
-        (FlowMode 1 or 3). Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def read_txp(self) -> None:
-        """Sink DP: sample TX_PRESENT at the last UI of a wide-bit period.
-        Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def write_guard0(self) -> None:
-        """Source DP: emit guard 0 (single UI, post-data emission).
-        Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def write_guard1(self) -> None:
-        """Source DP: emit guard 1 (single UI, post-data emission).
-        Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    def write_tail(self) -> None:
-        """Source DP: emit tail at UI 0 of TailWidth_REG-wide period
-        (post-data emission). Implementation in Phase 3."""
-        raise NotImplementedError("Wired in Phase 3")
-
-    # ------------------------------------------------------------------
-    # Legacy entry point — engine still calls this in Phase 2.
-    # ------------------------------------------------------------------
-
-    def fetch_bit_slot(self) -> BitSlotState:
-        """Emit bit slot information at the current position and auto-advance."""
-        if (self.config._num_channels == 0
-                or self.state.interval_skipped
-                or self.state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
-                or self.state.row_in_interval < self.config.Offset_REG
-                or self.state.column < self.config.HorizontalStart_REG):
-            slot = BitSlotState(slot_type=SlotType.EMPTY)
-        else:
-            slot = self._data_slot()
-
-        if slot.is_owned():
-            self._prime_post_data_queue()
-            self._advance_column()
-            return slot
-
-        if self.state.post_data_queue:
-            slot_type = self.state.post_data_queue.popleft()
-            # Mirror queue mutation in derived state fields.
-            if slot_type == SlotType.TAIL:
-                self.state.post_data_tail_remaining -= 1
+        if in_emit_path:
+            if state.column > config._horizontal_end:
+                # Window exhausted on this row. Clear spacing so stale gaps
+                # don't leak into next row.
+                state.spacing_slots_remaining = 0
+                state.transport_phase = TransportPhase.ROW_DONE
+                # Falls through to post-data drain below.
+            elif state.transport_phase == TransportPhase.SPACING:
+                state.spacing_slots_remaining -= 1
+                if state.spacing_slots_remaining <= 0:
+                    state.transport_phase = TransportPhase.ACTIVE
+                # Falls through to post-data drain below.
             else:
-                # GUARD_0 or GUARD_1
-                self.state.post_data_guard_pending = False
-            self._advance_column()
-            return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
+                # Owned slot — DATA or TX_PRESENT. Advance cascade, prime
+                # post-data, advance column.
+                self._advance_wide_bit()
+                self._prime_post_data()
+                self._advance_column()
+                return
 
+        # Not owned (gated, window-exhausted, or in spacing) — drain one
+        # post-data slot if any pending.
+        if state.post_data_guard_pending:
+            state.post_data_guard_pending = False
+        elif state.post_data_tail_remaining > 0:
+            state.post_data_tail_remaining -= 1
         self._advance_column()
-        return BitSlotState(slot_type=SlotType.EMPTY)
 
-    def _data_slot(self) -> BitSlotState:
-        """Return the data slot at the current position, inside the active window."""
-        if self.state.column > self.config._horizontal_end:
-            # Transport window exhausted on this row. Clear spacing so
-            # stale gaps don't leak into next row.
-            self.state.spacing_slots_remaining = 0
-            self.state.transport_phase = TransportPhase.ROW_DONE
-            return BitSlotState(slot_type=SlotType.EMPTY)
-
-        if self.state.transport_phase == TransportPhase.SPACING:
-            self.state.spacing_slots_remaining -= 1
-            if self.state.spacing_slots_remaining <= 0:
-                self.state.transport_phase = TransportPhase.ACTIVE
-            return BitSlotState(slot_type=SlotType.EMPTY)
-
-        direction = DirectionType.SINK if self.config.PortDirection_REG else DirectionType.SOURCE
-        if self.state.txp_pending:
-            slot = BitSlotState(
-                slot_type=SlotType.TX_PRESENT,
-                direction=direction,
-                data=BitSlotData(
-                    sample_in_group=self.state.sample_in_group,
-                    channel=self.config._channel(self.state.channel_index),
-                    bit=0
-                ),
-            )
-        else:
-            slot = BitSlotState(
-                slot_type=SlotType.DATA,
-                direction=direction,
-                data=BitSlotData(
-                    sample_in_group=self.state.sample_in_group,
-                    channel=self.config._channel(self.state.channel_index),
-                    bit=self.state.bit_in_channel
-                ),
-            )
-
-        self._advance_wide_bit()
-        return slot
-
-    def _prime_post_data_queue(self) -> None:
-        """Prime the post-data queue after a source-port data slot."""
-        self.state.post_data_queue.clear()
+    def _prime_post_data(self) -> None:
+        """Prime post-data emission state after a source-port owned slot."""
         self.state.post_data_guard_pending = False
         self.state.post_data_tail_remaining = 0
         if self.config.PortDirection_REG:
             return
         if self.config.GuardEnable_REG:
-            self.state.post_data_queue.append(
-                SlotType.GUARD_1 if self.config.GuardPolarity_REG else SlotType.GUARD_0
-            )
             self.state.post_data_guard_pending = True
-        for _ in range(self.config.TailWidth_REG):
-            self.state.post_data_queue.append(SlotType.TAIL)
         self.state.post_data_tail_remaining = self.config.TailWidth_REG
 
     def _advance_column(self) -> None:
@@ -330,7 +233,6 @@ class DataPort:
     def _advance_row(self) -> None:
         """Advance the row counter and prepare per-row state."""
         self.state.column = 0
-        self.state.post_data_queue.clear()
         # Post-data emission doesn't survive row wraps.
         self.state.post_data_guard_pending = False
         self.state.post_data_tail_remaining = 0
