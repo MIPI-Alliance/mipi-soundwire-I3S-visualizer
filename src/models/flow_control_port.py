@@ -40,6 +40,10 @@ class FlowControlPortState:
         self.drq_sent: bool = False
         self.wide_bit_remaining: int = 0
         self.stored_wide_bit_slot: Optional[BitSlotState] = None
+        # Post-data emission state. Mirrors post_data_queue contents so the
+        # engine can derive slot type without peeking at the queue.
+        self.post_data_guard_pending: bool = False
+        self.post_data_tail_remaining: int = 0
         self.post_data_queue.clear()
 
 class FlowControlPortConfig:
@@ -77,6 +81,55 @@ class FlowControlPort:
         self.state.initialize()
         self._advance_interval()
 
+    # ------------------------------------------------------------------
+    # New action API (Phase 5 — surface only; implementations in Phase 6).
+    # clock_tick() is the per-UI entry point. Engine consumes via
+    # _derive_fcp_bit_slot() + clock_tick() (see engine.py).
+    # ------------------------------------------------------------------
+
+    def clock_tick(self) -> None:
+        """Advance the FCP by one UI.
+
+        Phase 5: thin wrapper over fetch_bit_slot() so the new entry-point
+        name is available without behavior change. Phase 6 replaces this
+        with cascade-driven action calls.
+        """
+        self.fetch_bit_slot()
+
+    def write_drq(self) -> None:
+        """Source-side FCP (parent DP is Sink): emit DRQ at UI 0 of a
+        wide-bit period. Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    def write_held_bit(self) -> None:
+        """Re-emit the held bit (DRQ or TAIL) for subsequent UIs of a
+        wide-bit period. Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    def read_drq(self) -> None:
+        """Sink-side FCP (parent DP is Source): sample DRQ at the last UI
+        of a wide-bit period. Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    def write_guard0(self) -> None:
+        """Emit guard 0 (single UI, post-DRQ emission).
+        Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    def write_guard1(self) -> None:
+        """Emit guard 1 (single UI, post-DRQ emission).
+        Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    def write_tail(self) -> None:
+        """Emit tail at UI 0 of FCP_TailWidth_REG-wide period
+        (post-DRQ emission). Implementation in Phase 6."""
+        raise NotImplementedError("Wired in Phase 6")
+
+    # ------------------------------------------------------------------
+    # Legacy entry point — engine uses derive helper + clock_tick.
+    # ------------------------------------------------------------------
+
     def fetch_bit_slot(self) -> BitSlotState:
         """Emit bit slot information at the current position and auto-advance."""
         slot = self._data_slot()
@@ -87,6 +140,12 @@ class FlowControlPort:
 
         if self.state.post_data_queue:
             slot_type = self.state.post_data_queue.popleft()
+            # Mirror queue mutation in derived state fields.
+            if slot_type == SlotType.TAIL:
+                self.state.post_data_tail_remaining -= 1
+            else:
+                # GUARD_0 or GUARD_1
+                self.state.post_data_guard_pending = False
             self._advance_column()
             return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
 
@@ -133,14 +192,18 @@ class FlowControlPort:
     def _prime_post_data_queue(self) -> None:
         """Prime the post-DRQ queue (guard + tails) after a SOURCE DRQ."""
         self.state.post_data_queue.clear()
+        self.state.post_data_guard_pending = False
+        self.state.post_data_tail_remaining = 0
         if not self._dataport.config.PortDirection_REG:
             return
         if self.config.FCP_GuardEnable_REG:
             self.state.post_data_queue.append(
                 SlotType.GUARD_1 if self.config.FCP_GuardPolarity_REG else SlotType.GUARD_0
             )
+            self.state.post_data_guard_pending = True
         for _ in range(self.config.FCP_TailWidth_REG):
             self.state.post_data_queue.append(SlotType.TAIL)
+        self.state.post_data_tail_remaining = self.config.FCP_TailWidth_REG
 
     def _advance_column(self) -> None:
         """Advance column; wrap to the next row at the right edge."""
@@ -152,6 +215,9 @@ class FlowControlPort:
         """Advance the row counter and prepare per-row state."""
         self.state.column = 0
         self.state.post_data_queue.clear()
+        # Post-data emission doesn't survive row wraps.
+        self.state.post_data_guard_pending = False
+        self.state.post_data_tail_remaining = 0
         # Wide-bit replay doesn't survive row wraps.
         self.state.wide_bit_remaining = 0
         self.state.stored_wide_bit_slot = None

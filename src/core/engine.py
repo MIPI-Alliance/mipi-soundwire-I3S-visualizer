@@ -17,6 +17,11 @@ from src.models import (
 from src.models.enums import TransportPhase
 from src.models.bit_slot import BitSlotState, BitSlotData
 from src.models.dataport import DataPortState, DataPortConfig
+from src.models.flow_control_port import (
+    FlowControlPort,
+    FlowControlPortState,
+    FlowControlPortConfig,
+)
 from src.models.bus_model import BusModel, BitInfo, ClashType
 from src.drawing.clash_detector import ClashDetector, SlotClashCategory
 from src.config import SpecialDevices, DataPortRanges
@@ -73,6 +78,43 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
     # Post-data drain (Source-only — guard/tail fields stay at defaults for Sink).
     if state.post_data_guard_pending:
         slot_type = SlotType.GUARD_1 if config.GuardPolarity_REG else SlotType.GUARD_0
+        return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
+    if state.post_data_tail_remaining > 0:
+        return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
+    return BitSlotState(slot_type=SlotType.EMPTY)
+
+
+def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
+    """Derive the BitSlotState that fcp.fetch_bit_slot() would return at
+    the current FCP state, without advancing.
+
+    FCP state-derivation peeks at the parent DP for FlowMode + interval
+    skipping (per real hardware, FCP is part of the same DP unit).
+    """
+    state = fcp.state
+    fcp_config = fcp.config
+    dp = fcp._dataport
+    dp_config = dp.config
+
+    # Wide-bit replay: fcp returns the stored slot directly (object share is
+    # safe; engine overwrites row/column/device_num/dp_num below).
+    if state.stored_wide_bit_slot is not None:
+        return state.stored_wide_bit_slot
+
+    # Fresh DRQ trigger.
+    if (dp_config._emits_drq
+            and not dp.interval_skipped
+            and not state.drq_sent
+            and state.row_in_interval == fcp_config.FCP_Offset_REG
+            and state.column == fcp_config.FCP_HorizontalStart_REG):
+        # DRQ direction is opposite to the DP's data direction.
+        # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
+        direction = DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK
+        return BitSlotState(slot_type=SlotType.DRQ, direction=direction)
+
+    # Post-DRQ drain (Source-DRQ only — fields stay at defaults otherwise).
+    if state.post_data_guard_pending:
+        slot_type = SlotType.GUARD_1 if fcp_config.FCP_GuardPolarity_REG else SlotType.GUARD_0
         return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
     if state.post_data_tail_remaining > 0:
         return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
@@ -499,7 +541,8 @@ class BusModelBuilder:
             # FCP emits as an independent parallel source. Any DP+FCP collision
             # is surfaced by the bus model's SAME_DEVICE clash detector (no
             # arbitration in the core loop).
-            fcp_slot = fcp.fetch_bit_slot()
+            fcp_slot = _derive_fcp_bit_slot(fcp)
+            fcp.clock_tick()
             fcp_slot.row = row
             fcp_slot.column = column
             fcp_slot.device_num = device
