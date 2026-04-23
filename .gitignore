@@ -36,3 +36,6 @@ tools/
 
 # Scratch directory
 scratch/
+
+# Scratch CSV at repo root
+/test.csv
