@@ -33,7 +33,7 @@ class DataPortVizConfig:
     """
     name: str = ""
     enabled: bool = False
-    enable_handover: bool = False
+    enable_handover: bool = True
     display_fields: DisplayField = field(default_factory=lambda: DisplayField(0))
 
 

@@ -613,7 +613,7 @@ class MinimalApp(ctk.CTkFrame):
             dp_viz = self.viz_config.data_ports[dp_index]
             dp_viz.name = f'DP{dp_index}'
             dp_viz.enabled = False
-            dp_viz.enable_handover = False
+            dp_viz.enable_handover = True
 
         # Reset interface "Other Parameters" to defaults
         self.interface.NumColumns_REG = 15  # 16 columns

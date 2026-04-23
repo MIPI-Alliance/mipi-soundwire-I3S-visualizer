@@ -40,6 +40,6 @@ FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
 Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
-EnforceHandover,False,False,False,False,False,False,False,False,False,False,False,False
+EnforceHandover,True,True,True,True,True,True,True,True,True,True,True,True
 Enabled,False,False,False,False,False,False,False,False,False,False,False,False
 DisplayFields,sc,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb
