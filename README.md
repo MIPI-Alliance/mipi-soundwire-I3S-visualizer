@@ -146,12 +146,13 @@ mipi-soundwire-I3S-visualizer/
 │   ├── io/                # CSV and JSON handlers
 │   │   ├── csv_handler.py
 │   │   └── json_handler.py
-│   ├── models/            # Data models (Interface, DataPort, BusModel)
-│   │   ├── dataport.py    # DataPort state machine
+│   ├── models/            # Data models (Interface, DataPort, FCP, BusModel)
+│   │   ├── dataport.py    # DataPort state machine (hardware model)
+│   │   ├── flow_control_port.py  # FCP state machine (parallel peer of DP)
 │   │   ├── interface.py   # Top-level configuration
 │   │   ├── bus_model.py   # Sequential bit representation
 │   │   ├── device.py      # Device abstraction
-│   │   └── enums.py       # SlotType, DirectionType, FlowMode
+│   │   └── enums.py       # SlotType, DirectionType, FlowMode, TransportPhase, PortMode, DisplayField
 │   ├── ui/                # UI components
 │   │   ├── minimal_app.py # Main application window
 │   │   ├── frame_renderer.py
@@ -227,6 +228,21 @@ python testsuite.py --regenerate
 | `PortDirection_REG` | 1 = Sink, 0 = Source |
 | `SubRowInterval_REG` | Enable Sub-Row Interval mode |
 | `FlowMode_REG` | Flow control mode |
+
+### Flow Control Port (FCP) Parameters
+
+Each data port has an associated FCP that emits DRQ + optional guards/tails in
+RX_CONTROLLED or ASYNC flow modes. FCP is a parallel peer of the DataPort on
+the bus, not a sub-component:
+
+| Parameter | Description |
+|-----------|-------------|
+| `FCP_HorizontalStart_REG` | Column where the DRQ fires |
+| `FCP_Offset_REG` | Row within the interval where the DRQ fires |
+| `FCP_BitWidth_REG` | Wide-bit replay count for the DRQ (excess-1) |
+| `FCP_TailWidth_REG` | Tail bits after the DRQ |
+| `FCP_GuardEnable_REG` | Enable guard bit after the DRQ |
+| `FCP_GuardPolarity_REG` | Guard polarity (0 or 1) |
 
 ### Flow Control Modes
 

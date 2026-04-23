@@ -1,10 +1,10 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 21:07:27
+**Generated:** 2026-04-22 21:16:38
 
-**Total Time:** 0:21.2 (-3.4s)
+**Total Time:** 0:22.9 (+1.7s)
 
-**Comparing to:** 2026-04-22T20:54:06.875062
+**Comparing to:** 2026-04-22T21:07:27.759629
 
 ## Test Results
 
@@ -19,8 +19,8 @@
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,013 | -3 |
-| Total Slots | 13,356 | -3 |
+| Total Bit Positions | 12,013 | 0 |
+| Total Slots | 13,356 | 0 |
 | Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
@@ -31,7 +31,7 @@
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
 | CDS | 1,193 | 8.9% | 0 |
-| DATA | 7,132 | 53.4% | -3 |
+| DATA | 7,132 | 53.4% | 0 |
 | DRQ | 40 | 0.3% | 0 |
 | GUARD_0 | 285 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
@@ -46,7 +46,7 @@
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
 | SINK | 1,451 | 10.9% | 0 |
-| SOURCE | 11,905 | 89.1% | -3 |
+| SOURCE | 11,905 | 89.1% | 0 |
 
 ## Individual Test Results
 
