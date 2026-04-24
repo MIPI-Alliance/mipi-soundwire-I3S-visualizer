@@ -18,31 +18,8 @@ __pycache__/
 # Test artifacts
 tests/previous_stats.json
 tests/temp/
-test/temp/
-test/diffcheck/
 
 # PyInstaller
 build/
 dist/
 *.spec
-
-# Claude
-CLAUDE.md
-.claude
-settings.json
-
-# Tools
-tools/
-
-# Scratch directory
-scratch/
-
-# Scratch CSV at repo root
-/test.csv
-
-# Scratch working docs and one-off test harnesses
-/docs/
-/tests/
-
-# Spec rewrite working material
-/spec-rewrite/
