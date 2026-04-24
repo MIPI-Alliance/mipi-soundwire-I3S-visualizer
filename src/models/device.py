@@ -10,7 +10,7 @@ library without any UI dependencies.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 from src.config.constants import SpecialDevices
 
@@ -50,8 +50,13 @@ class Device:
 
     @property
     def num_columns(self) -> int:
-        """Return number of columns from interface (for backward compat)."""
+        """Frame column count (shared bus geometry)."""
         return self._interface.num_columns
+
+    @property
+    def SkippingDenominator_REG(self) -> int:
+        """Skipping denominator (shared bus register)."""
+        return self._interface.SkippingDenominator_REG
 
     @property
     def is_manager(self) -> bool:
@@ -114,22 +119,65 @@ class Device:
         if dp in self._data_ports:
             self._data_ports.remove(dp)
 
-    def fifo_pull(self, dp_index: int, ch_index: int) -> Optional[int]:
-        """Audio source delivers the next data bit for (DP, channel).
+    # ------------------------------------------------------------------
+    # Bus I/O. The device drives the bus on behalf of its DataPorts:
+    # writes bits when a DP is sourcing, reads bits when a DP is sinking.
+    # DataPort.clock_tick() decides when each operation occurs (per the
+    # cascade and wide-bit timing); the device performs the actual bit
+    # write/read. Default implementations are no-ops — the visualizer
+    # renders bus metadata via the engine's _derive_*_bit_slot helpers
+    # without needing real bit values. Hardware-realistic simulators or
+    # test harnesses subclass to drive a real bus.
+    #
+    # The methods take no arguments. Channel / sample / bit position
+    # information for the visualizer is read from dp.state by the engine;
+    # device subclasses that need to identify the calling DP do so via
+    # their own mechanism (per-DP bound hooks, context, etc.).
+    # ------------------------------------------------------------------
 
-        Conceptual hook for the data-layer fifo. The visualizer renders
-        metadata only (slot kind, position, channel/sample/bit indices) and
-        does not need real bit values, so the default implementation is a
-        no-op returning None. Hardware-realistic simulators or test harnesses
-        may subclass to wire a real audio fifo.
-        """
-        return None
+    def write_data_bit_from_fifo(self) -> None:
+        """Pull a fresh DATA bit from the audio fifo and write it to the bus.
 
-    def fifo_push(self, dp_index: int, ch_index: int, bit: int) -> None:
-        """Audio sink receives a data bit for (DP, channel).
+        Called at UI 0 of a wide-bit period for a Source DP."""
+        pass
 
-        Conceptual hook for the data-layer fifo. See fifo_pull for context.
-        """
+    def write_held_bit(self) -> None:
+        """Hold the previously written bit on the bus for one more UI.
+
+        Called for wide-bit repeat UIs (DATA, TX_PRESENT, or TAIL)."""
+        pass
+
+    def read_data_bit_to_fifo(self) -> None:
+        """Read a DATA bit from the bus and push it to the audio fifo.
+
+        Called at the last UI of a wide-bit period for a Sink DP."""
+        pass
+
+    def write_txp(self) -> None:
+        """Write a fresh TX_PRESENT bit to the bus.
+
+        Called at UI 0 of a wide-bit TX_PRESENT period for a Source DP."""
+        pass
+
+    def read_txp(self) -> None:
+        """Read a TX_PRESENT bit from the bus.
+
+        Called at the last UI of a wide-bit TX_PRESENT period for a Sink DP."""
+        pass
+
+    def write_guard0(self) -> None:
+        """Write a guard 0 bit to the bus (single UI, post-data emission)."""
+        pass
+
+    def write_guard1(self) -> None:
+        """Write a guard 1 bit to the bus (single UI, post-data emission)."""
+        pass
+
+    def write_tail(self) -> None:
+        """Write a fresh TAIL bit to the bus.
+
+        Called at UI 0 of a TailWidth_REG-wide post-data period.
+        Subsequent tail UIs are write_held_bit."""
         pass
 
     def __repr__(self) -> str:

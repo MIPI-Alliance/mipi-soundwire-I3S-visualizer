@@ -43,3 +43,6 @@ scratch/
 # Scratch working docs and one-off test harnesses
 /docs/
 /tests/
+
+# Spec rewrite working material
+/spec-rewrite/

@@ -41,15 +41,13 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
     direction = DirectionType.SINK if config.PortDirection_REG else DirectionType.SOURCE
 
     # Mirror fetch_bit_slot's gating predicates and _data_slot dispatch.
-    in_emit_path = not (
+    if not (
         config._num_channels == 0
         or state.interval_skipped
         or state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
         or state.row_in_interval < config.Offset_REG
         or state.column < config.HorizontalStart_REG
-    )
-
-    if in_emit_path:
+    ):
         if state.column > config._horizontal_end:
             pass  # _data_slot would set ROW_DONE and return EMPTY → fall through
         elif state.transport_phase == TransportPhase.SPACING:
@@ -76,10 +74,10 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
             )
 
     # Post-data drain (Source-only — guard/tail fields stay at defaults for Sink).
-    if state.post_data_guard_pending:
+    if state.guard_pending:
         slot_type = SlotType.GUARD_1 if config.GuardPolarity_REG else SlotType.GUARD_0
         return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
-    if state.post_data_tail_remaining > 0:
+    if state.tail_remaining > 0:
         return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
     return BitSlotState(slot_type=SlotType.EMPTY)
 
@@ -102,7 +100,7 @@ def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
         return state.stored_wide_bit_slot
 
     # Fresh DRQ trigger.
-    if (dp_config._emits_drq
+    if (dp_config._drq_enabled
             and not dp.interval_skipped
             and not state.drq_sent
             and state.row_in_interval == fcp_config.FCP_Offset_REG
@@ -113,10 +111,10 @@ def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
         return BitSlotState(slot_type=SlotType.DRQ, direction=direction)
 
     # Post-DRQ drain (Source-DRQ only — fields stay at defaults otherwise).
-    if state.post_data_guard_pending:
+    if state.guard_pending:
         slot_type = SlotType.GUARD_1 if fcp_config.FCP_GuardPolarity_REG else SlotType.GUARD_0
         return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
-    if state.post_data_tail_remaining > 0:
+    if state.tail_remaining > 0:
         return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
     return BitSlotState(slot_type=SlotType.EMPTY)
 
@@ -461,7 +459,7 @@ class BusModelBuilder:
         # channel emits (SampleSize_REG + 1) DATA bits + 1 TX_PRESENT (in
         # TX_CONTROLLED / ASYNC flow modes), times (SG + 1) samples, each
         # held for (BitWidth_REG + 1) columns by the wide-bit counter.
-        txp_slot_per_channel_sample = 1 if dp.config._emits_txp else 0
+        txp_slot_per_channel_sample = 1 if dp.config._txp_enabled else 0
         bits_per_transport = (
             dp.config._num_channels
             * (dp.config.SampleSize_REG + 1 + txp_slot_per_channel_sample)
@@ -498,7 +496,7 @@ class BusModelBuilder:
                 and dp_state.bit_in_channel == dp.config.SampleSize_REG
                 and dp_state.samples_in_group_remaining == dp.config.SampleGrouping_REG
                 and dp_state.wide_bit_remaining == dp.config.BitWidth_REG
-                and dp_state.txp_pending == dp.config._emits_txp
+                and dp_state.txp_pending == dp.config._txp_enabled
             )
 
             # DP data path emits first

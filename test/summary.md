@@ -1,17 +1,17 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-22 21:16:38
+**Generated:** 2026-04-24 10:37:45
 
-**Total Time:** 0:22.9 (+1.7s)
+**Total Time:** 0:23.5 (-4.0s)
 
-**Comparing to:** 2026-04-22T21:07:27.759629
+**Comparing to:** 2026-04-24T10:23:06.819777
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
-| Total Tests | 86 | 0 |
-| Passed | 86 | 0 |
+| Total Tests | 87 | 0 |
+| Passed | 87 | 0 |
 | Failed | 0 | 0 |
 | Pass Rate | 100.0% | |
 
@@ -19,8 +19,8 @@
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,013 | 0 |
-| Total Slots | 13,356 | 0 |
+| Total Bit Positions | 12,157 | 0 |
+| Total Slots | 13,608 | 0 |
 | Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
@@ -30,23 +30,23 @@
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,193 | 8.9% | 0 |
-| DATA | 7,132 | 53.4% | 0 |
-| DRQ | 40 | 0.3% | 0 |
-| GUARD_0 | 285 | 2.1% | 0 |
+| CDS | 1,225 | 9.0% | 0 |
+| DATA | 7,328 | 53.9% | 0 |
+| DRQ | 48 | 0.4% | 0 |
+| GUARD_0 | 287 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
-| HANDOVER | 2,586 | 19.4% | 0 |
-| S0 | 996 | 7.5% | 0 |
-| S1 | 772 | 5.8% | 0 |
-| TAIL | 284 | 2.1% | 0 |
-| TX_PRESENT | 36 | 0.3% | 0 |
+| HANDOVER | 2,586 | 19.0% | 0 |
+| S0 | 996 | 7.3% | 0 |
+| S1 | 772 | 5.7% | 0 |
+| TAIL | 286 | 2.1% | 0 |
+| TX_PRESENT | 48 | 0.4% | 0 |
 
 ## Direction Distribution
 
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| SINK | 1,451 | 10.9% | 0 |
-| SOURCE | 11,905 | 89.1% | 0 |
+| SINK | 1,559 | 11.5% | 0 |
+| SOURCE | 12,049 | 88.5% | 0 |
 
 ## Individual Test Results
 
@@ -89,6 +89,7 @@
 | no_dataports | 4 | 24 | 20 | 20 | 8 | 0 | 0 |
 | CDS_width_4_bit_slots | 2 | 24 | 8 | 8 | 0 | 0 | 0 |
 | dp_sample_size_24_to_31 | 9 | 32 | 237 | 237 | 0 | 0 | 0 |
+| asynchronous_flow_control_with_skipping | 32 | 24 | 144 | 252 | 0 | 0 | 0 |
 | test_mode_zeros | 5 | 16 | 12 | 14 | 5 | 0 | 0 |
 | same_device_clash_logic_1 | 9 | 24 | 102 | 104 | 30 | 0 | 2 |
 | pdm_1 | 64 | 24 | 892 | 892 | 286 | 0 | 0 |

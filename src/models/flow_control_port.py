@@ -38,8 +38,8 @@ class FlowControlPortState:
         self.stored_wide_bit_slot: Optional[BitSlotState] = None
         # Post-data emission state: optional guard then tail bits, drained
         # by clock_tick after a fresh DRQ.
-        self.post_data_guard_pending: bool = False
-        self.post_data_tail_remaining: int = 0
+        self.guard_pending: bool = False
+        self.tail_remaining: int = 0
 
 class FlowControlPortConfig:
     """Configuration and register state for an FCP."""
@@ -91,7 +91,7 @@ class FlowControlPort:
             return
 
         dp_config = self._dataport.config
-        if (dp_config._emits_drq
+        if (dp_config._drq_enabled
                 and not self._dataport.interval_skipped
                 and not state.drq_sent
                 and state.row_in_interval == self.config.FCP_Offset_REG
@@ -102,17 +102,17 @@ class FlowControlPort:
             # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
             slot = BitSlotState(
                 slot_type=SlotType.DRQ,
-                direction=DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK,
+                direction=DirectionType.SINK if dp_config._is_source else DirectionType.SOURCE,
             )
             self._arm_drq_replay(slot)
             self._advance_column()
             return
 
         # Post-DRQ drain (Source-DRQ only — fields stay at defaults otherwise).
-        if state.post_data_guard_pending:
-            state.post_data_guard_pending = False
-        elif state.post_data_tail_remaining > 0:
-            state.post_data_tail_remaining -= 1
+        if state.guard_pending:
+            state.guard_pending = False
+        elif state.tail_remaining > 0:
+            state.tail_remaining -= 1
         self._advance_column()
 
     def _arm_drq_replay(self, slot: BitSlotState) -> None:
@@ -125,27 +125,28 @@ class FlowControlPort:
         self._advance_wide_bit()
 
     def _prime_post_data(self) -> None:
-        """Prime post-DRQ emission state (guard + tails) after a SOURCE DRQ."""
-        self.state.post_data_guard_pending = False
-        self.state.post_data_tail_remaining = 0
-        if not self._dataport.config.PortDirection_REG:
+        """Prime post-DRQ emission state (guard + tails) after a SOURCE DRQ.
+        DRQ is SOURCE iff DP is SINK (DRQ direction is opposite to data direction)."""
+        self.state.guard_pending = False
+        self.state.tail_remaining = 0
+        if self._dataport.config._is_source:
             return
         if self.config.FCP_GuardEnable_REG:
-            self.state.post_data_guard_pending = True
-        self.state.post_data_tail_remaining = self.config.FCP_TailWidth_REG
+            self.state.guard_pending = True
+        self.state.tail_remaining = self.config.FCP_TailWidth_REG
 
     def _advance_column(self) -> None:
         """Advance column; wrap to the next row at the right edge."""
         self.state.column += 1
-        if self.state.column >= self._dataport._device._interface.num_columns:
+        if self.state.column >= self._dataport._device.num_columns:
             self._advance_row()
 
     def _advance_row(self) -> None:
         """Advance the row counter and prepare per-row state."""
         self.state.column = 0
         # Post-data emission doesn't survive row wraps.
-        self.state.post_data_guard_pending = False
-        self.state.post_data_tail_remaining = 0
+        self.state.guard_pending = False
+        self.state.tail_remaining = 0
         # Wide-bit replay doesn't survive row wraps.
         self.state.wide_bit_remaining = 0
         self.state.stored_wide_bit_slot = None
