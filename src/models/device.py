@@ -165,6 +165,21 @@ class Device:
         Called at the last UI of a wide-bit TX_PRESENT period for a Sink DP."""
         pass
 
+    def write_drq(self) -> None:
+        """Write a fresh DRQ bit to the bus.
+
+        Called at UI 0 of a wide-bit DRQ period when the FCP's DRQ direction
+        is SOURCE (i.e., parent DP is Sink). Subsequent wide-bit UIs are
+        write_held_bit."""
+        pass
+
+    def read_drq(self) -> None:
+        """Read a DRQ bit from the bus.
+
+        Called at the last UI of a wide-bit DRQ period when the FCP's DRQ
+        direction is SINK (i.e., parent DP is Source)."""
+        pass
+
     def write_guard0(self) -> None:
         """Write a guard 0 bit to the bus (single UI, post-data emission)."""
         pass

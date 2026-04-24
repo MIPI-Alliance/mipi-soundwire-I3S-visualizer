@@ -34,10 +34,7 @@ class DataPortState:
         self.initialize(config)
 
     def initialize(self, config: DataPortConfig) -> None:
-        """Set state to sane defaults. DataPort.initialize() then calls
-        _advance_interval which writes the transport-scope cascade fields
-        for real (SampleGrouping, channel counters, wide-bit counter, etc.).
-        Values set here are safe starting points before the first tick."""
+        """Set state."""
         self.column: int = 0
         self.row_in_interval: int = 0
         self.transport_phase: TransportPhase = TransportPhase.PATTERN_DONE
@@ -51,9 +48,6 @@ class DataPortState:
         self.channels_in_group_remaining: int = 0
         self.bit_in_channel: int = config.SampleSize_REG
         self.wide_bit_remaining: int = config.BitWidth_REG
-        # Post-data emission state for source ports: guard/tail are primed
-        # by _prime_post_data after each owned data slot, then drained on
-        # subsequent not-owned columns (gated, window-exhausted, or SPACING).
         self.guard_pending: bool = False
         self.tail_remaining: int = 0
         self.txp_pending: bool = config._txp_enabled
@@ -188,10 +182,9 @@ class DataPort:
              prime post-data emission, advance column, return.
           2. In transport window but window-exhausted or in SPACING — update phase /
              spacing counter, then fall through to (3).
-          3. Not owned — drain any post-data slot primed by a prior owned
-             source slot (guard, then tail), then advance column.
-        Sink ports sample the bus on the last UI of each wide bit; mid-UIs the
-        source drives and the sink is quiet.
+          3. Not owned — pop guard and tail armed by a prior owned
+             source slot, then advance column.
+        Sink ports sample the bus on the last UI of each wide bit.
         """
         config = self.config
         state = self.state
@@ -226,21 +219,22 @@ class DataPort:
                         device.write_held_bit()
                 elif state.wide_bit_remaining == 0:  # last UI of wide bit
                     if state.txp_pending:
-                        device.read_txp() 
-                    else: device.read_data_bit_to_fifo()
+                        device.read_txp()
+                    else: 
+                        device.read_data_bit_to_fifo()
                 # Sink mid-UIs: source drives the bus; sink samples only on the last UI.
 
                 self._advance_wide_bit()
-                self._arm_guard_tails()
+                self._arm_guard_tail()
                 self._advance_column()
                 return
 
         # Not owned (gated, window-exhausted, or in SPACING) — drain one
         # post-data slot if any pending.
-        self._pop_gaurd_tails()
+        self._pop_guard_tail()
         self._advance_column()
 
-    def _pop_gaurd_tails(self) -> None:
+    def _pop_guard_tail(self) -> None:
         """Drain one pending post-data slot (guard first, then tail) onto the bus."""
         state = self.state
         config = self.config
@@ -258,7 +252,7 @@ class DataPort:
                 device.write_held_bit()
             state.tail_remaining -= 1
 
-    def _arm_guard_tails(self) -> None:
+    def _arm_guard_tail(self) -> None:
         """Prime post-data emission state after a source-port owned slot."""
         self.state.guard_pending = False
         self.state.tail_remaining = 0

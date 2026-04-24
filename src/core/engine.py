@@ -94,10 +94,13 @@ def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
     dp = fcp._dataport
     dp_config = dp.config
 
-    # Wide-bit replay: fcp returns the stored slot directly (object share is
-    # safe; engine overwrites row/column/device_num/dp_num below).
-    if state.stored_wide_bit_slot is not None:
-        return state.stored_wide_bit_slot
+    # DRQ direction is opposite to the DP's data direction.
+    # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
+    drq_direction = DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK
+
+    # Wide-bit replay: drq_sent and still within FCP_BitWidth_REG UIs.
+    if state.drq_sent and state.wide_bit_remaining >= 0:
+        return BitSlotState(slot_type=SlotType.DRQ, direction=drq_direction)
 
     # Fresh DRQ trigger.
     if (dp_config._drq_enabled
@@ -105,10 +108,7 @@ def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
             and not state.drq_sent
             and state.row_in_interval == fcp_config.FCP_Offset_REG
             and state.column == fcp_config.FCP_HorizontalStart_REG):
-        # DRQ direction is opposite to the DP's data direction.
-        # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
-        direction = DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK
-        return BitSlotState(slot_type=SlotType.DRQ, direction=direction)
+        return BitSlotState(slot_type=SlotType.DRQ, direction=drq_direction)
 
     # Post-DRQ drain (Source-DRQ only — fields stay at defaults otherwise).
     if state.guard_pending:

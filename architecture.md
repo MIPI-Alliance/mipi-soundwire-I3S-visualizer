@@ -176,8 +176,11 @@ BusModelBuilder.build()
     │               │
     │               └── For each bit position (row, column):
     │                       │
-    │                       ├── dp.fetch_bit_slot()   # DP emits DATA/TX_PRESENT/guard/tail/EMPTY
-    │                       ├── fcp.fetch_bit_slot()  # FCP emits DRQ/guard/tail/EMPTY
+    │                       ├── dp.clock_tick()   # DP advances one UI, drives device.write_*/read_*
+    │                       ├── fcp.clock_tick()  # FCP advances one UI, drives device.write_drq/read_drq/write_held_bit
+    │                       │
+    │                       │   Engine derives BitSlotState via _derive_dp_bit_slot / _derive_fcp_bit_slot
+    │                       │   BEFORE each clock_tick() (state snapshot → slot metadata for visualizer)
     │                       │
     │                       └── Both written to BusModel; bus model's SAME_DEVICE clash
     │                           detector surfaces any (DP, FCP) overlap
@@ -344,7 +347,7 @@ class FrameRenderer:
 
 ## DataPort Architecture (Detailed)
 
-The `DataPort` class (`src/models/dataport.py`) implements the hardware state machine that emits one bit slot per bus column. The engine calls `dp.fetch_bit_slot()` for every frame position.
+The `DataPort` class (`src/models/dataport.py`) implements the hardware state machine that advances one UI per call. The engine invokes `dp.clock_tick()` for every column, after reading state via `_derive_dp_bit_slot()` to build the `BitSlotState` the visualizer renders.
 
 ### Class Structure
 
@@ -352,15 +355,16 @@ The `DataPort` class (`src/models/dataport.py`) implements the hardware state ma
 DataPort
     │
     ├── config: DataPortConfig    # Register values + derived properties
-    ├── _state: DataPortState     # Runtime state (column, row, phase, counters)
+    ├── state: DataPortState      # Runtime state (column, row, phase, counters)
     │
     └── Public API:
             initialize()         → hardware init / arm first interval
-            fetch_bit_slot()     → BitSlotState at current position, auto-advance
+            clock_tick()         → advance one UI; drives device.write_*/read_* for the current slot
             row_in_interval      → current row within this DP's interval
+            interval_skipped     → True when the current interval is payload-skipped
 ```
 
-There is no separate algorithm class — the state machine methods live directly on `DataPort`.
+There is no separate algorithm class — the state machine methods live directly on `DataPort`. Bus I/O is delegated to the parent `Device` via no-arg methods (`device.write_data_bit_from_fifo()`, `device.write_held_bit()`, `device.read_data_bit_to_fifo()`, `device.write_txp()`, `device.read_txp()`, `device.write_guard0/1()`, `device.write_tail()`). The default `Device` implementation is no-op — the visualizer renders from the engine's derived `BitSlotState`, not from actual bits on a bus.
 
 ### DataPortConfig
 
@@ -403,12 +407,17 @@ class DataPortConfig:
         return self.ChannelGrouping_REG
 
     @property
-    def _emits_txp(self) -> bool:
+    def _is_source(self) -> bool:
+        """True iff this DP drives data onto the bus (PortDirection_REG: False=source, True=sink)."""
+        return not self.PortDirection_REG
+
+    @property
+    def _txp_enabled(self) -> bool:
         """True iff FlowMode prepends a TX_PRESENT slot before each (channel, sample)'s DATA bits."""
         return self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
 
     @property
-    def _emits_drq(self) -> bool:
+    def _drq_enabled(self) -> bool:
         """True iff FlowMode activates the FCP's DRQ path."""
         return self.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
 ```
@@ -424,7 +433,7 @@ class DataPortState:
     row_in_interval: int
 
     # Transport lifecycle
-    phase: TransportPhase           # ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
+    transport_phase: TransportPhase # ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
     interval_skipped: bool          # Latched by _advance_skipping at interval start
 
     # Skipping accumulator persists across intervals (not reset per interval)
@@ -434,15 +443,17 @@ class DataPortState:
     sample_in_group: int            # 0..SampleGrouping_REG within current transport
     samples_in_group_remaining: int
     channel_index: int
-    channel_group_base: int
+    channel_group_base_channel: int
     channels_in_group_remaining: int
-    bit: int                        # Current bit within (channel, sample)
+    bit_in_channel: int             # Current bit position within (channel, sample)
     wide_bit_remaining: int         # Innermost cascade counter
     txp_pending: bool               # True → next emission is TX_PRESENT (not DATA)
     spacing_slots_remaining: int
 
-    # Row-scope queue (cleared at row wrap / primed after owned DP emissions)
-    post_data_queue: deque[SlotType]   # Deferred GUARD/TAIL tokens
+    # Post-data emission (primed after each owned source-port slot; drained
+    # by _pop_guard_tails on subsequent not-owned columns)
+    guard_pending: bool             # One GUARD UI pending
+    tail_remaining: int             # Remaining TAIL UIs (fresh tail on first, held on rest)
 ```
 
 There is no `channel_group_size` state field — the current group size comes from `config._effective_channel_grouping`, computed on demand.
@@ -451,7 +462,7 @@ There is no `channel_group_size` state field — the current group size comes fr
 
 ```
 bits_per_transport = _num_channels
-                   × (SampleSize_REG + 1 + (1 if _emits_txp else 0))
+                   × (SampleSize_REG + 1 + (1 if _txp_enabled else 0))
                    × (SampleGrouping_REG + 1)
                    × (BitWidth_REG + 1)
 
@@ -466,40 +477,40 @@ This matches real hardware, where the DP tracks only its position within the cur
 The state machine is a nested counter cascade. Each `_advance_*` method decrements its counter; on exhaustion, the counter rolls over and the next-outer counter advances:
 
 ```
-wide_bit → bit → channel → sample → channel_group → transport completion
+wide_bit → bit_in_channel → channel → sample → channel_group → transport completion
 ```
 
 ```python
 def _advance_wide_bit(self) -> None:
-    self._state.wide_bit_remaining -= 1
-    if self._state.wide_bit_remaining < 0:
-        self._state.wide_bit_remaining = self.config.BitWidth_REG
-        self._advance_bit()
+    self.state.wide_bit_remaining -= 1
+    if self.state.wide_bit_remaining < 0:
+        self.state.wide_bit_remaining = self.config.BitWidth_REG
+        self._advance_bit_in_channel()
 
-def _advance_bit(self) -> None:
-    if self._state.txp_pending:
-        self._state.txp_pending = False
+def _advance_bit_in_channel(self) -> None:
+    if self.state.txp_pending:
+        self.state.txp_pending = False
         return                       # TxP fires once per (channel, sample); no bit decrement
-    self._state.bit -= 1
-    if self._state.bit < 0:
-        self._state.bit = self.config.SampleSize_REG
+    self.state.bit_in_channel -= 1
+    if self.state.bit_in_channel < 0:
+        self.state.bit_in_channel = self.config.SampleSize_REG
         self._advance_channel()
 
 def _advance_channel(self) -> None:
-    self._state.channel_index += 1
-    self._state.channels_in_group_remaining -= 1
-    self._state.txp_pending = self.config._emits_txp   # Re-arm for next (channel, sample)
-    if self._state.channels_in_group_remaining < 0:
-        self._state.channel_index = self._state.channel_group_base
-        self._state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
+    self.state.channel_index += 1
+    self.state.channels_in_group_remaining -= 1
+    self.state.txp_pending = self.config._txp_enabled   # Re-arm for next (channel, sample)
+    if self.state.channels_in_group_remaining < 0:
+        self.state.channel_index = self.state.channel_group_base_channel
+        self.state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
         self._advance_sample()
 
 def _advance_sample(self) -> None:
-    self._state.sample_in_group += 1
-    self._state.samples_in_group_remaining -= 1
-    if self._state.samples_in_group_remaining < 0:
-        self._state.sample_in_group = 0
-        self._state.samples_in_group_remaining = self.config.SampleGrouping_REG
+    self.state.sample_in_group += 1
+    self.state.samples_in_group_remaining -= 1
+    if self.state.samples_in_group_remaining < 0:
+        self.state.sample_in_group = 0
+        self.state.samples_in_group_remaining = self.config.SampleGrouping_REG
         self._advance_channel_group()
 ```
 
@@ -546,16 +557,17 @@ Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
                                                                     [ACTIVE]
 ```
 
-### fetch_bit_slot() Flow
+### clock_tick() Flow
 
-`fetch_bit_slot()` is the single public entry point for emission. Four layers:
+`clock_tick()` is the single public entry point for UI advance. It has three paths, gated by a positive `in_transport_window` check (`num_channels > 0` AND `not interval_skipped` AND `transport_phase ∉ {ROW_DONE, PATTERN_DONE}` AND `row_in_interval >= Offset_REG` AND `column >= HorizontalStart_REG`):
 
-1. **Passive gate** — if `num_channels == 0`, `interval_skipped`, `phase ∈ {ROW_DONE, PATTERN_DONE}`, `row_in_interval < Offset_REG`, or `column < HorizontalStart_REG`, return an EMPTY slot (no fresh data this tick).
-2. **Data probe** — otherwise call `_data_slot()`, which handles the horizontal-end cut (sets `ROW_DONE`), the SPACING decrement, and the DATA / TX_PRESENT emission with the counter cascade.
-3. **Post-data queue** — on an EMPTY result, drain any pending GUARD/TAIL tokens queued by the previous owned emission. Primed by `_prime_post_data_queue()` (only for SOURCE-direction DPs — sinks don't drive guards/tails).
-4. **Column advance** — always step the column cursor, wrapping to the next row at the right edge (which may trigger row-counter rollover into `_advance_interval`).
+1. **Window-exhausted / SPACING** — in transport window but past `_horizontal_end` or in SPACING: flip phase (→ROW_DONE / decrement spacing_slots / →ACTIVE), fall through to drain.
+2. **Owned slot** — DATA or TX_PRESENT. Source drives `device.write_txp()`/`write_data_bit_from_fifo()` on first UI of the wide bit and `write_held_bit()` on subsequent UIs; sink samples `device.read_txp()`/`read_data_bit_to_fifo()` on the last UI (`wide_bit_remaining == 0`). Then `_advance_wide_bit()`, `_arm_guard_tails()`, advance column, return.
+3. **Drain** — not owned (gated, window-exhausted, or SPACING): `_pop_guard_tails()` emits any pending GUARD (one UI) then TAIL (`TailWidth_REG` UIs; fresh `write_tail()` on first, `write_held_bit()` on rest). Always advance column.
 
-The wide-bit hold is handled by the innermost cascade counter (`wide_bit_remaining`): the same bit emits for `BitWidth_REG + 1` columns before the bit cursor advances. No cached `BitSlotState` — the slot is recomputed from current state on every emission.
+The engine derives a `BitSlotState` from DP state BEFORE each `clock_tick()` via the module-level helper `_derive_dp_bit_slot(state, config)` — there is no cached slot, and the device bus-I/O hooks are no-op by default (the visualizer renders from the derived metadata). Hardware-realistic harnesses subclass `Device` to drive a real bus.
+
+The wide-bit hold is handled by the innermost cascade counter (`wide_bit_remaining`): the same bit emits for `BitWidth_REG + 1` UIs before the bit cursor advances.
 
 ### Channel Grouping
 
@@ -583,40 +595,41 @@ ChannelGrouping=2, SampleGrouping=1 (2 samples), Spacing=2
 
 The `FlowControlPort` class (`src/models/flow_control_port.py`) emits DRQ + optional guards/tails in `RX_CONTROLLED` / `ASYNC` flow modes. It is an **independent peer** of the DataPort on the bus — both are iterated by the engine in lock-step, and any overlap is surfaced by the bus model's SAME_DEVICE clash detector (no arbitration lives in the core loop).
 
-The FCP mirrors the DataPort's hardware-model structure: it owns its own `column` / `row_in_interval` tracking, exposes a single `initialize()` / `fetch_bit_slot()` public API, and uses the same counter-cascade idiom.
+The FCP mirrors the DataPort's hardware-model structure: it owns its own `column` / `row_in_interval` tracking, exposes a single `initialize()` / `clock_tick()` public API, and uses a DRQ replay sentinel (`drq_sent and wide_bit_remaining >= 0`) instead of a stashed `BitSlotState`.
 
 ### Class Structure
 
 ```
 FlowControlPort
     │
-    ├── config: FlowControlPortConfig   # FCP-specific registers (no FCP_ prefix inside class)
-    ├── _state: FlowControlPortState    # column, row_in_interval, drq_sent, queues
-    ├── _dataport: DataPort             # Back-ref for FlowMode / PortDirection / Interval
+    ├── config: FlowControlPortConfig   # FCP-specific registers (FCP_*_REG)
+    ├── state: FlowControlPortState     # column, row_in_interval, drq_sent,
+    │                                   #   wide_bit_remaining, guard_pending, tail_remaining
+    ├── _dataport: DataPort             # Back-ref for FlowMode / PortDirection / Interval / _is_source
     │
     └── Public API:
             initialize()         → reset FCP state
-            fetch_bit_slot()     → BitSlotState at current position, auto-advance
+            clock_tick()         → advance one UI; drives device.write_drq/read_drq/write_held_bit
 ```
 
 ### Emission Priority
 
-`_data_slot()` evaluates slot sources in strict priority order:
+`clock_tick()` evaluates three paths in strict order:
 
-1. **Wide-bit replay** — if a prior DRQ's replay is still active, emit the stored slot
-2. **DRQ trigger** — if `_emits_drq` and we're at `(Offset_REG, HorizontalStart_REG)` and `drq_sent` is not yet latched, emit `DRQ` with direction opposite to the DP's data direction (Sink DP → SOURCE DRQ, Source DP → SINK DRQ). Prime the post-data queue with guard + tails (SOURCE DRQs only), set up wide-bit replay, and latch `drq_sent`
-3. **EMPTY** otherwise
+1. **Wide-bit replay** — `drq_sent and wide_bit_remaining >= 0`: a prior DRQ is still on the bus. Source DRQ drives `device.write_held_bit()`; sink DRQ samples `device.read_drq()` on the last UI (`wide_bit_remaining == 0`). Then `_advance_wide_bit()` (pure decrement) and advance column.
+2. **Fresh DRQ trigger** — `_drq_enabled` AND `not dp.interval_skipped` AND `not drq_sent` AND column/row match `(FCP_HorizontalStart_REG, FCP_Offset_REG)`. Source DRQ writes `device.write_drq()`; sink DRQ reads `device.read_drq()` only in the single-UI `FCP_BitWidth_REG == 0` case (multi-UI sink reads on the last replay UI above). Then `_arm_drq_replay()` sets `drq_sent`, primes guard/tail pending via `_arm_guards_tails()`, seeds `wide_bit_remaining = FCP_BitWidth_REG`, and calls `_advance_wide_bit()` once for this emission.
+3. **Drain** — otherwise, pop one guard (flip `guard_pending`) or one tail (decrement `tail_remaining`) and advance column. Drain is a no-op on sink DRQ (guard/tail only apply to source DRQ).
 
-Guards and tails drain via the same `post_data_queue` pattern as DataPort, making the two modules architecturally parallel. The queue is primed inside `_data_slot`'s DRQ-trigger branch (not from `fetch_bit_slot`) because wide-bit replays are continuations of the same DRQ and must NOT re-prime.
+DRQ direction is inverted relative to DP data direction: Sink DP → DRQ SOURCE (FCP writes onto bus); Source DP → DRQ SINK (FCP samples bus). The engine reconstructs the `BitSlotState` for the visualizer via `_derive_fcp_bit_slot(fcp)`, which uses the same replay sentinel and trigger conditions and builds the slot from `dp_config` — no `BitSlotState` is stored in FCP state.
 
 ### Lifecycle
 
-- **`_advance_column`** → wraps to `_advance_row` at the right edge
-- **`_advance_row`** → clears wide-bit replay state; increments `row_in_interval`; wraps to `_advance_interval` when `row_in_interval > Interval_REG`
-- **`_advance_interval`** → clears `drq_sent` so the next interval's DRQ can fire
-- **`_advance_wide_bit`** → decrements replay counter; clears stored slot on exhaustion (terminal; unlike DP's, does NOT cascade to `_advance_bit`)
+- **`_advance_column`** → wraps to `_advance_row` at the right edge.
+- **`_advance_row`** → clears `guard_pending`/`tail_remaining` and forces `wide_bit_remaining = -1` so any in-progress DRQ replay terminates at the row boundary (row wrap doesn't carry a replay forward). `drq_sent` persists across rows so a DRQ can only fire once per interval.
+- **`_advance_interval`** → calls `_reset_transport()` which clears `drq_sent` so the next interval's DRQ can fire and zeros `wide_bit_remaining`.
+- **`_advance_wide_bit`** → pure decrement; terminal (unlike DP's cascade). When `wide_bit_remaining` drops below 0, the replay sentinel `(drq_sent and wide_bit_remaining >= 0)` naturally fails on next tick.
 
-Because FCP owns its own row/interval counters, the engine no longer passes `column` / `row_in_interval` into `fetch_bit_slot()` and no longer orchestrates per-row or per-interval reset callbacks.
+Because FCP owns its own row/interval counters, the engine no longer passes `column` / `row_in_interval` into `clock_tick()` and no longer orchestrates per-row or per-interval reset callbacks.
 
 ---
 
@@ -669,7 +682,7 @@ def EnableCh_REG(self, value: int) -> None:
         self._channel_cache = None   # Invalidate
 ```
 
-Lightweight derived properties (`_effective_channel_grouping`, `_emits_txp`, `_emits_drq`, `_horizontal_end`) are computed on each access — cheap enough that caching would be premature.
+Lightweight derived properties (`_effective_channel_grouping`, `_is_source`, `_txp_enabled`, `_drq_enabled`, `_horizontal_end`) are computed on each access — cheap enough that caching would be premature.
 
 ### 4. Enum-Based Type Safety
 
