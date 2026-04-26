@@ -108,7 +108,6 @@ python swi3s_visualizer.py -c config.csv -o output.json -v
 Configuration files use CSV format with interface parameters followed by data port parameters. Example structure:
 
 ```csv
-Save file using excess one,True
 NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -252,6 +251,56 @@ the bus, not a sub-component:
 | Tx Controlled | 1 | Source sends TxPresent bit per channel indicating valid data |
 | Rx Controlled | 2 | Sink sends DRQ bit indicating readiness to receive |
 | Asynchronous | 3 | Both TxP and DRQ bits for bidirectional flow control |
+
+### Configuration Validation
+
+Configurations are validated by `DataPortValidator` and `InterfaceValidator`
+(`src/utils/validators.py`) before the engine runs. Validators fall into two
+categories:
+
+- **Range checks** — register bit-field bounds. In hardware these are enforced
+  by the registers themselves; the visualizer checks them because the UI/CSV
+  accept arbitrary values.
+- **Settings checks** — semantic rules that cross fields. These map
+  one-to-one to SWI3S specification requirements.
+
+#### Data Port Range Checks
+
+Bounds-checked register fields: `DeviceNumber`, `NumChannels`,
+`ChannelGrouping_REG`, `Spacing_REG`, `SampleSize_REG`, `SampleGrouping_REG`,
+`Interval_REG`, `SkippingNumerator_REG`, `Offset_REG`, `HorizontalStart_REG`,
+`HorizontalCount_REG`. When `FlowMode_REG` activates the FCP (RX_CONTROLLED or
+ASYNC): `FCP_HorizontalStart_REG`, `FCP_BitWidth_REG`, `FCP_TailWidth_REG`,
+`FCP_Offset_REG`.
+
+#### Data Port Settings Checks
+
+Each row is one `_check_*` method in `DataPortValidator`.
+
+| Check | Rule |
+|-------|------|
+| Offset within interval | `Offset_REG ≤ Interval_REG` |
+| SRI interval zero | SRI mode (`SubRowInterval_REG=1`) → `Interval_REG = 0` |
+| SRI skipping disabled | SRI mode → `SkippingNumerator_REG = 0` |
+| SRI pattern fits | SRI: `HorizontalCount` large enough to emit one complete channel group |
+| HorizontalStart within columns | `HorizontalStart_REG < NumColumns` |
+| HorizontalCount within columns | `HorizontalCount_REG < NumColumns` |
+| Horizontal window within columns | `HorizontalStart_REG + HorizontalCount_REG < NumColumns` |
+| Tail fits row | `TailWidth_REG` fits in columns after last data slot (source DP only) |
+| BitWidth fits remaining columns | `BitWidth_REG` fits in row tail (source DP only) |
+| BitWidth fits HorizontalCount | `BitWidth_REG ≤ HorizontalCount_REG` |
+| HorizontalCount divisible by BitWidth | non-SRI: `(HorizontalCount + 1) % (BitWidth + 1) == 0` |
+| Guard fits row | Guard has ≥1 column after last data slot (source DP only) |
+| Sink no guard | Sink DP shall not enable Guard |
+| Sink no tail | Sink DP shall not have Tail |
+| FCP offset within interval | `FCP_Offset_REG ≤ Interval_REG` |
+| FCP fits row | FCP (DRQ + optional guard + tails) fits starting at `FCP_HorizontalStart_REG` |
+
+#### Interface Settings Checks
+
+| Check | Rule |
+|-------|------|
+| PHY3 requires even columns | When PHY3 is disabled (FBSCE PHYs used), `NumColumns` must be even |
 
 ### Clash Detection
 
