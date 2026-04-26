@@ -8,6 +8,7 @@ from typing import Dict, List, TYPE_CHECKING
 import math
 
 from src.utils.descriptors import ValidatedInt, ValidatedBool, ValidatedFloat
+from src.config.constants import InterfaceRanges
 
 # Import DataPort only for type checking to avoid circular import
 if TYPE_CHECKING:
@@ -23,28 +24,30 @@ class Interface:
     frame structure, and data port definitions.
     """
 
-    # Frame parameters (class constants)
+    # Frame parameter ranges (delegated to InterfaceRanges as the single
+    # source of truth — kept here as class attributes for backward
+    # compatibility with callers that read Interface.MIN_* / Interface.MAX_*).
     # NumColumns_REG is excess-1 encoded: register value N means N+1 actual columns
-    MIN_COLUMNS_PER_ROW = 1   # Minimum register value (2 actual columns)
-    MAX_COLUMNS_PER_ROW = 31  # Maximum register value (32 actual columns)
-    MIN_COLUMNS = MIN_COLUMNS_PER_ROW
-    MAX_COLUMNS = MAX_COLUMNS_PER_ROW
-    MIN_ROWS = 1
-    MAX_ROWS = 10240
-    MIN_ROW_RATE = 1.0
-    MAX_ROW_RATE = 48000.0
-    MIN_SKIPPING_DENOMINATOR = 1
-    MAX_SKIPPING_DENOMINATOR = 4096
-    MIN_S0_WIDTH = 1
-    MAX_S0_WIDTH = 8
-    MIN_S1_WIDTH = 1
-    MAX_S1_WIDTH = 8
-    MIN_CDS_WIDTH = 0
-    MAX_CDS_WIDTH = 7
-    MIN_CDS_TAIL_WIDTH = 0
-    MAX_CDS_TAIL_WIDTH = 3
-    MIN_TAIL_WIDTH = 0
-    MAX_TAIL_WIDTH = 2
+    MIN_COLUMNS_PER_ROW = InterfaceRanges.MIN_COLUMNS_PER_ROW
+    MAX_COLUMNS_PER_ROW = InterfaceRanges.MAX_COLUMNS_PER_ROW
+    MIN_COLUMNS = InterfaceRanges.MIN_COLUMNS
+    MAX_COLUMNS = InterfaceRanges.MAX_COLUMNS
+    MIN_ROWS = InterfaceRanges.MIN_ROWS
+    MAX_ROWS = InterfaceRanges.MAX_ROWS
+    MIN_ROW_RATE = InterfaceRanges.MIN_ROW_RATE
+    MAX_ROW_RATE = InterfaceRanges.MAX_ROW_RATE
+    MIN_SKIPPING_DENOMINATOR = InterfaceRanges.MIN_SKIPPING_DENOMINATOR
+    MAX_SKIPPING_DENOMINATOR = InterfaceRanges.MAX_SKIPPING_DENOMINATOR
+    MIN_S0_WIDTH = InterfaceRanges.MIN_S0_WIDTH
+    MAX_S0_WIDTH = InterfaceRanges.MAX_S0_WIDTH
+    MIN_S1_WIDTH = InterfaceRanges.MIN_S1_WIDTH
+    MAX_S1_WIDTH = InterfaceRanges.MAX_S1_WIDTH
+    MIN_CDS_WIDTH = InterfaceRanges.MIN_CDS_WIDTH
+    MAX_CDS_WIDTH = InterfaceRanges.MAX_CDS_WIDTH
+    MIN_CDS_TAIL_WIDTH = InterfaceRanges.MIN_CDS_TAIL_WIDTH
+    MAX_CDS_TAIL_WIDTH = InterfaceRanges.MAX_CDS_TAIL_WIDTH
+    MIN_TAIL_WIDTH = InterfaceRanges.MIN_TAIL_WIDTH
+    MAX_TAIL_WIDTH = InterfaceRanges.MAX_TAIL_WIDTH
 
     NUM_DATA_PORTS = 12
 
@@ -72,21 +75,6 @@ class Interface:
         from .device import Device
         from .flow_control_port import FlowControlPort
 
-        self.NumColumns_REG: int = 15  # Register value 15 = 16 actual columns
-        self.phy3_enabled: bool = False
-        self.s0_width: int = Interface.MIN_S0_WIDTH
-        self.s1_width: int = Interface.MIN_S1_WIDTH
-        self.cds_handover_enabled: bool = True
-        self.s1_handover_enabled: bool = True
-        self.CDS_GuardEnabled_REG: bool = False
-        self.CDS_GuardPolarity_REG: bool = False
-        self.CDS_BitWidth_REG: int = Interface.MIN_CDS_WIDTH
-        self.CDS_TailWidth_REG: int = Interface.MIN_CDS_TAIL_WIDTH
-        self.tail_width: int = Interface.MIN_TAIL_WIDTH
-        self.SkippingDenominator_REG: int = 1
-        self.row_rate: float = 3072.0
-        self.description: str = ''  # User description for CSV storage
-
         # Primary storage: devices dict containing DataPorts
         # Device 0 is the default device, created with all DataPorts initially
         self.devices: Dict[int, Device] = {}
@@ -108,10 +96,32 @@ class Interface:
             for i in range(self.NUM_DATA_PORTS)
         ]
 
-        # Device assignments for each data port (legacy, for backward compat)
-        # Values: device number (0-11), or SpecialDevices.MANAGER (-1) for manager
-        # Index corresponds to dp_index
-        self.dp_device_assignments: List[int] = [0] * self.NUM_DATA_PORTS
+        # Initialize all field values to defaults (kept separate from
+        # device/DP/FCP construction so reload paths can re-use it).
+        self.reset_to_defaults()
+
+    def reset_to_defaults(self) -> None:
+        """Reset all field values to their defaults.
+
+        Restores every register/setting Interface owns to its initial value,
+        without touching the device / DataPort / FCP object graph (those are
+        constructed in __init__). Callers that need to reload an interface
+        from a CSV invoke this first to clear stale values.
+        """
+        self.NumColumns_REG: int = 15  # Register value 15 = 16 actual columns
+        self.phy3_enabled: bool = False
+        self.s0_width: int = Interface.MIN_S0_WIDTH
+        self.s1_width: int = Interface.MIN_S1_WIDTH
+        self.cds_handover_enabled: bool = True
+        self.s1_handover_enabled: bool = True
+        self.CDS_GuardEnabled_REG: bool = False
+        self.CDS_GuardPolarity_REG: bool = False
+        self.CDS_BitWidth_REG: int = Interface.MIN_CDS_WIDTH
+        self.CDS_TailWidth_REG: int = Interface.MIN_CDS_TAIL_WIDTH
+        self.tail_width: int = Interface.MIN_TAIL_WIDTH
+        self.SkippingDenominator_REG: int = 1
+        self.row_rate: float = 3072.0
+        self.description: str = ''  # User description for CSV storage
 
     @property
     def data_ports(self) -> List['DataPort']:
@@ -154,8 +164,15 @@ class Interface:
 
         Returns:
             Device number (0-11) or SpecialDevices.MANAGER (-1)
+
+        Raises:
+            ValueError: If no DataPort with the given index exists
         """
-        return self.dp_device_assignments[dp_index]
+        for device_num, device in self.devices.items():
+            for dp in device.data_ports:
+                if dp.dp_index == dp_index:
+                    return device_num
+        raise ValueError(f"No DataPort found with dp_index {dp_index}")
 
     def _get_dp_by_index(self, dp_index: int) -> 'DataPort':
         """Get a DataPort by its canonical index.
@@ -185,23 +202,23 @@ class Interface:
             dp_index: Data port index (0-11)
             device_num: Device number (0-11) or SpecialDevices.MANAGER (-1)
         """
-        # Early return if no change
-        if self.dp_device_assignments[dp_index] == device_num:
-            return
-
         from .device import Device
 
-        # Update legacy tracking list
-        self.dp_device_assignments[dp_index] = device_num
-
-        # Get the DataPort
+        # Get the DataPort and find its current owner
         dp = self._get_dp_by_index(dp_index)
-
-        # Find and remove from current device
-        for device in self.devices.values():
+        current_device_num = None
+        for d_num, device in self.devices.items():
             if dp in device.data_ports:
-                device.remove_data_port(dp)
+                current_device_num = d_num
                 break
+
+        # Early return if no change
+        if current_device_num == device_num:
+            return
+
+        # Remove from current device
+        if current_device_num is not None:
+            self.devices[current_device_num].remove_data_port(dp)
 
         # Create target device if needed
         if device_num not in self.devices:
@@ -220,7 +237,7 @@ class Interface:
             True if data port is in manager
         """
         from src.config.constants import SpecialDevices
-        return self.dp_device_assignments[dp_index] == SpecialDevices.MANAGER
+        return self.get_dp_device(dp_index) == SpecialDevices.MANAGER
 
     @property
     def interval_lcm(self) -> int:

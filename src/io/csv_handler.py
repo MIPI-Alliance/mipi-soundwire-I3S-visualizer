@@ -357,21 +357,7 @@ class CSVHandler:
 
         # Reset interface parameters to defaults before loading
         # This ensures stale values don't persist across loads
-        from src.models.interface import Interface as InterfaceClass
-        interface.NumColumns_REG = 15  # Default: 16 columns
-        interface.phy3_enabled = False
-        interface.s0_width = InterfaceClass.MIN_S0_WIDTH
-        interface.s1_width = InterfaceClass.MIN_S1_WIDTH
-        interface.cds_handover_enabled = True
-        interface.s1_handover_enabled = True
-        interface.CDS_GuardEnabled_REG = False
-        interface.CDS_GuardPolarity_REG = False
-        interface.CDS_BitWidth_REG = InterfaceClass.MIN_CDS_WIDTH
-        interface.CDS_TailWidth_REG = InterfaceClass.MIN_CDS_TAIL_WIDTH
-        interface.tail_width = InterfaceClass.MIN_TAIL_WIDTH
-        interface.SkippingDenominator_REG = 1
-        interface.row_rate = 3072.0
-        interface.description = ''
+        interface.reset_to_defaults()
 
         # Reset data port configs to defaults before loading
         # This ensures stale parameter values don't persist across loads
@@ -516,21 +502,21 @@ class CSVHandler:
                 missing_dataport_viz = expected_dataport_viz - found_dataport_viz_fields
 
                 # Report missing fields (sorted for consistent ordering)
-                for field in sorted(missing_interface):
-                    result.missing_fields.append(f"Interface: {field}")
-                    logger.warning(f"CSV missing interface field: {field} (using default)")
+                for field_name in sorted(missing_interface):
+                    result.missing_fields.append(f"Interface: {field_name}")
+                    logger.warning(f"CSV missing interface field: {field_name} (using default)")
 
-                for field in sorted(missing_interface_viz):
-                    result.missing_fields.append(f"InterfaceViz: {field}")
-                    logger.warning(f"CSV missing interface viz field: {field} (using default)")
+                for field_name in sorted(missing_interface_viz):
+                    result.missing_fields.append(f"InterfaceViz: {field_name}")
+                    logger.warning(f"CSV missing interface viz field: {field_name} (using default)")
 
-                for field in sorted(missing_dataport):
-                    result.missing_fields.append(f"DataPort: {field}")
-                    logger.warning(f"CSV missing data port field: {field} (using default)")
+                for field_name in sorted(missing_dataport):
+                    result.missing_fields.append(f"DataPort: {field_name}")
+                    logger.warning(f"CSV missing data port field: {field_name} (using default)")
 
-                for field in sorted(missing_dataport_viz):
-                    result.missing_fields.append(f"DataPortViz: {field}")
-                    logger.warning(f"CSV missing data port viz field: {field} (using default)")
+                for field_name in sorted(missing_dataport_viz):
+                    result.missing_fields.append(f"DataPortViz: {field_name}")
+                    logger.warning(f"CSV missing data port viz field: {field_name} (using default)")
 
                 # Reset all data ports to clear stale runtime state
                 for data_port in interface.data_ports:

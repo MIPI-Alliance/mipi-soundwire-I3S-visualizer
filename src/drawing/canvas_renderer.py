@@ -32,7 +32,7 @@ from src.ui.constants import (
 
 if TYPE_CHECKING:
     from tkinter import Canvas
-    from src.models import Frame_model
+    from src.models import FrameModel
     from src.drawing import ClashDetector
 
 
@@ -171,9 +171,9 @@ class CanvasRenderer:
 
         if has_write_clash:
             # Add CLASH to frame model (write clash)
-            from src.models.frame import Slot_info
+            from src.models.frame import SlotInfo
             from src.models.enums import SlotType, DirectionType
-            slot_info = Slot_info()
+            slot_info = SlotInfo()
             slot_info.slot_type = SlotType.CLASH
             slot_info.dir = DirectionType.SOURCE
             slot_info.device_num = device
@@ -420,7 +420,7 @@ class CanvasRenderer:
             device: Device number
             sample: Absolute sample counter (default 0)
         """
-        from src.models import DirectionType, SlotType, Slot_info
+        from src.models import DirectionType, SlotType, SlotInfo
         from src.config import SlotTypeStrings
 
         col_info = self.app.frame_model.get_row(row).get_col(column)
@@ -457,7 +457,7 @@ class CanvasRenderer:
 
         if m:
             # Data slot (any of the above formats matched)
-            slot_info = Slot_info()
+            slot_info = SlotInfo()
             slot_info.slot_type = SlotType.DATA
             slot_info.dir = DirectionType.SOURCE if is_source else DirectionType.SINK
             slot_info.device_num = device
@@ -471,7 +471,7 @@ class CanvasRenderer:
             # Check for TxPresent bit (TxPn format)
             txp_match = _PATTERN_TXP.fullmatch(slot_label)
             if txp_match:
-                slot_info = Slot_info()
+                slot_info = SlotInfo()
                 slot_info.slot_type = SlotType.TX_PRESENT
                 slot_info.dir = DirectionType.SOURCE if is_source else DirectionType.SINK
                 slot_info.device_num = device
@@ -482,7 +482,7 @@ class CanvasRenderer:
                 col_info.append_slot(slot_info)
             # Check for DRQ bit (Data Request for Rx Controlled or Async flow modes)
             elif slot_label == SlotTypeStrings.DRQ:
-                slot_info = Slot_info()
+                slot_info = SlotInfo()
                 slot_info.slot_type = SlotType.DRQ
                 slot_info.dir = DirectionType.SOURCE if is_source else DirectionType.SINK
                 slot_info.device_num = device
@@ -493,7 +493,7 @@ class CanvasRenderer:
                 col_info.append_slot(slot_info)
             # System slot (S1, S0, CDS, HANDOVER, G, tail)
             else:
-                slot_info = Slot_info()
+                slot_info = SlotInfo()
 
                 # Map label string to slot type using dictionary lookup
                 SLOT_TYPE_MAP = {

@@ -31,8 +31,8 @@ from src.viz import VizConfig
 
 
 def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlotState:
-    """Derive the BitSlotState that fetch_bit_slot() would return at the
-    current DP state, without advancing.
+    """Derive the BitSlotState that the DataPort would emit at the current
+    state, without advancing.
 
     Engine uses this in conjunction with clock_tick() to consume bit slots
     while keeping construction in the engine layer (per the clock_tick
@@ -40,7 +40,7 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
     """
     direction = DirectionType.SINK if config.PortDirection_REG else DirectionType.SOURCE
 
-    # Mirror fetch_bit_slot's gating predicates and _data_slot dispatch.
+    # Mirror the DP's data-emission gating predicates and dispatch.
     if not (
         config._num_channels == 0
         or state.interval_skipped
@@ -49,9 +49,9 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
         or state.column < config.HorizontalStart_REG
     ):
         if state.column > config._horizontal_end:
-            pass  # _data_slot would set ROW_DONE and return EMPTY → fall through
+            pass  # Past horizontal end → row is done, emit EMPTY → fall through
         elif state.transport_phase == TransportPhase.SPACING:
-            pass  # _data_slot returns EMPTY → fall through
+            pass  # Inter-sample-group spacing → emit EMPTY → fall through
         elif state.txp_pending:
             return BitSlotState(
                 slot_type=SlotType.TX_PRESENT,
@@ -83,8 +83,8 @@ def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlot
 
 
 def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
-    """Derive the BitSlotState that fcp.fetch_bit_slot() would return at
-    the current FCP state, without advancing.
+    """Derive the BitSlotState that the FCP would emit at the current state,
+    without advancing.
 
     FCP state-derivation peeks at the parent DP for FlowMode + interval
     skipping (per real hardware, FCP is part of the same DP unit).
@@ -470,7 +470,7 @@ class BusModelBuilder:
         # Get device number from interface's device assignments
         device = self.interface.get_dp_device(dp_index)
 
-        # Process using fetch_bit_slot() - it auto-advances and handles wide bits, guards, tails
+        # Process using clock_tick() - it auto-advances and handles wide bits, guards, tails
         total_bits = self.num_rows * self.interface.num_columns
         last_bit_was_driven = False
         last_slot_was_tail = False  # Track if previous slot was TAIL
@@ -502,8 +502,6 @@ class BusModelBuilder:
             # DP data path emits first
             bit_slot = _derive_dp_bit_slot(dp.state, dp.config)
             dp.clock_tick()
-            bit_slot.row = row
-            bit_slot.column = column
             bit_slot.device_num = device
             bit_slot.dp_num = dp_index
 
@@ -541,8 +539,6 @@ class BusModelBuilder:
             # arbitration in the core loop).
             fcp_slot = _derive_fcp_bit_slot(fcp)
             fcp.clock_tick()
-            fcp_slot.row = row
-            fcp_slot.column = column
             fcp_slot.device_num = device
             fcp_slot.dp_num = dp_index
 
@@ -673,7 +669,7 @@ class BusModelBuilder:
             # Read clashes don't affect bus model clash type
 
         # Handle TxP tracking for flow control modes
-        # TxP direction matches data port direction (see dataport.py lines 487-489)
+        # TxP direction matches data port direction
         slot_type = bit_slot.slot_type
         if slot_type == SlotType.TX_PRESENT:
             if bit_slot.direction == DirectionType.SOURCE:
@@ -682,7 +678,7 @@ class BusModelBuilder:
                 self.clash_detector.add_txp_sink(row, column, device)
 
         # Handle DRQ tracking for flow control modes
-        # DRQ direction is OPPOSITE to data port direction (see dataport.py lines 739-741)
+        # DRQ direction is OPPOSITE to data port direction:
         # - Sink data ports (PortDirection=True) SEND DRQ (SOURCE)
         # - Source data ports (PortDirection=False) RECEIVE DRQ (SINK)
         if slot_type == SlotType.DRQ:
@@ -784,10 +780,8 @@ class BusModelBuilder:
         """
         total_bits = self.num_rows * self.interface.num_columns
 
-        # Filter potential handovers to keep only the last one per transmission.
-        filtered_handovers = self._filter_consecutive_handovers()
-
-        for start_row, start_column, dp_number in filtered_handovers:
+        # Iterate every recorded potential handover (no filtering).
+        for start_row, start_column, dp_number in self._potential_handovers:
             bit_index = self.bus_model.bit_index(start_row, start_column)
 
             if bit_index >= total_bits:
@@ -832,7 +826,7 @@ class BusModelBuilder:
                 # Different device clash - record properly with clash details
                 # Get device of first non-handover bit for clash record
                 existing_bit = non_handover_bits[0]
-                self.clash_detector._record_clash(
+                self.clash_detector.record_clash(
                     bit_slot=bit_index,
                     category=SlotClashCategory.WRITE_CLASH,
                     device_a=existing_bit.device,
@@ -863,20 +857,6 @@ class BusModelBuilder:
                 clash=ClashType.NONE,
             )
             self.bus_model.add_bit(bit_info)
-
-    def _filter_consecutive_handovers(self) -> list:
-        """Return all potential handovers without filtering.
-
-        Handovers are drawn after every time a data port finishes driving,
-        which could be multiple times per row (e.g., with channel grouping)
-        or multiple times per transmission (once per row of multi-row samples).
-
-        This method returns all recorded potential handovers without modification.
-
-        Returns:
-            List of (row, column, dp_number) tuples.
-        """
-        return self._potential_handovers
 
     def _group_bits_by_index(self) -> dict:
         """Group all bits in the bus model by their bit_index.
@@ -946,8 +926,6 @@ class BusModelBuilder:
         A mismatch occurs when a source data port with scrambler enabled writes
         to a bit position that a sink data port without scrambler reads, or vice versa.
         """
-        from src.models.enums import DirectionType, SlotType
-
         bits_by_index = self._group_bits_by_index()
 
         # Check each position for source/sink scrambler mismatches
@@ -982,8 +960,6 @@ class BusModelBuilder:
         The user specified: "test mode bits in the same bit slot as not test mode bits"
         and "The test mode need to match also i.e 1 vs 1, 0 vs 0"
         """
-        from src.models.enums import DirectionType, SlotType
-
         bits_by_index = self._group_bits_by_index()
 
         # Check each position for test mode mismatches
@@ -1091,8 +1067,6 @@ class BusModelBuilder:
         they should have matching sample and bit numbers (channels may differ).
         A mismatch indicates a configuration error.
         """
-        from src.models.enums import DirectionType, SlotType
-
         bits_by_index = self._group_bits_by_index()
 
         # Check each position for source/sink sample/bit mismatches

@@ -13,41 +13,41 @@ from enum import Enum
 from .enums import DirectionType, SlotType
 
 
-class Frame_model:
+class FrameModel:
     """Complete frame model representing all rows and columns"""
 
     def __init__(self, n_rows: int = 0, n_cols: int = 2) -> None:
-        self.row_info: List[Row_info] = []
+        self.row_info: List[RowInfo] = []
         for i in range(0, n_rows):
-            self.row_info.append(Row_info(n_cols, i))
+            self.row_info.append(RowInfo(n_cols, i))
 
-    def get_row(self, i: int) -> Row_info:
+    def get_row(self, i: int) -> RowInfo:
         return self.row_info[i]
 
 
-class Row_info:
+class RowInfo:
     """Information about a single row in the frame"""
 
     def __init__(self, n_col: int, row_number: int) -> None:
         self.row_num: int = row_number
-        self.col_info: List[Col_info] = [Col_info(i) for i in range(0, n_col)]
+        self.col_info: List[ColInfo] = [ColInfo(i) for i in range(0, n_col)]
 
-    def get_col(self, i: int) -> Col_info:
+    def get_col(self, i: int) -> ColInfo:
         return self.col_info[i]
 
 
-class Col_info:
+class ColInfo:
     """Information about a single column in a row"""
 
     def __init__(self, col_number: int) -> None:
         self.col_num: int = col_number
-        self.slot_info: List[Slot_info] = []
+        self.slot_info: List[SlotInfo] = []
 
-    def append_slot(self, slot: Slot_info) -> None:
+    def append_slot(self, slot: SlotInfo) -> None:
         self.slot_info.append(slot)
 
 
-class Slot_info:
+class SlotInfo:
     """Information about a single slot in the frame"""
 
     def __init__(self) -> None:

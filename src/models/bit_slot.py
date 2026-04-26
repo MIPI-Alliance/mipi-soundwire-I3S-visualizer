@@ -30,14 +30,6 @@ PATTERN_C = re.compile(r"^C(\d+)$")              # CX format (channel only, for 
 PATTERN_S = re.compile(r"^S(\d+)$")              # SX format (sample only, for merged bits)
 PATTERN_TXP = re.compile(r"^TxP(\d+)$")          # TxPn format (TxPresent bit with channel)
 
-# Legacy aliases (underscore prefix) - deprecated, use new names
-_PATTERN_CB = PATTERN_CB
-_PATTERN_SC = PATTERN_SC
-_PATTERN_SB = PATTERN_SB
-_PATTERN_SCB = PATTERN_SCB
-_PATTERN_C = PATTERN_C
-_PATTERN_S = PATTERN_S
-
 
 # =============================================================================
 # BitSlotData Class
@@ -99,7 +91,7 @@ class BitSlotData:
         """
         # Try all supported formats using pre-compiled patterns
         # Format: cXbY (original)
-        match = _PATTERN_CB.fullmatch(label)
+        match = PATTERN_CB.fullmatch(label)
         if match:
             return cls(
                 channel=int(match.group(1)),
@@ -107,7 +99,7 @@ class BitSlotData:
             )
 
         # Format: sXcY (sample + channel)
-        match = _PATTERN_SC.fullmatch(label)
+        match = PATTERN_SC.fullmatch(label)
         if match:
             return cls(
                 channel=int(match.group(2)),
@@ -116,7 +108,7 @@ class BitSlotData:
             )
 
         # Format: sXbY (sample + bit)
-        match = _PATTERN_SB.fullmatch(label)
+        match = PATTERN_SB.fullmatch(label)
         if match:
             return cls(
                 channel=0,
@@ -125,7 +117,7 @@ class BitSlotData:
             )
 
         # Format: sXcYbZ (all three)
-        match = _PATTERN_SCB.fullmatch(label)
+        match = PATTERN_SCB.fullmatch(label)
         if match:
             return cls(
                 channel=int(match.group(2)),
@@ -134,7 +126,7 @@ class BitSlotData:
             )
 
         # Format: cX (channel only, for merged bits)
-        match = _PATTERN_C.fullmatch(label)
+        match = PATTERN_C.fullmatch(label)
         if match:
             return cls(
                 channel=int(match.group(1)),
@@ -142,7 +134,7 @@ class BitSlotData:
             )
 
         # Format: sX (sample only, for merged bits)
-        match = _PATTERN_S.fullmatch(label)
+        match = PATTERN_S.fullmatch(label)
         if match:
             return cls(
                 channel=0,
@@ -169,8 +161,6 @@ class BitSlotState:
     device_num: int = 0
     dp_num: int = 0
     data: Optional[BitSlotData] = None
-    row: int = -1     # Position in frame (-1 = not set)
-    column: int = -1  # Position in frame (-1 = not set)
 
     def is_data_slot(self) -> bool:
         """Check if this is a data-carrying slot.

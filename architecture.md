@@ -24,7 +24,7 @@ This document describes the architecture of the SWI3S Visualizer, a tool for vis
 
 The SWI3S Visualizer is a Python application that renders SoundWire I3S data port configurations. It supports:
 
-- **GUI Mode**: Interactive tkinter-based interface for real-time visualization
+- **GUI Mode**: Interactive tkinter / customtkinter interface for real-time visualization
 - **Headless Mode**: Command-line batch processing for automated testing
 
 The architecture follows a clean separation between:
@@ -95,7 +95,7 @@ src/
 │   ├── flow_control_port.py # FlowControlPort, FlowControlPortConfig, FlowControlPortState
 │   ├── device.py           # Device abstraction
 │   ├── enums.py            # SlotType, DirectionType, FlowMode, TransportPhase, PortMode, DisplayField
-│   ├── frame.py            # Frame_model (legacy grid representation, still used by renderer/json_handler)
+│   ├── frame.py            # FrameModel (legacy grid representation, still used by renderer/json_handler)
 │   ├── interface.py        # Interface configuration (owns data_ports + flow_control_ports)
 │   └── manager.py          # System slot layout
 │

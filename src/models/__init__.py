@@ -5,7 +5,7 @@ SoundWire I3S frames, interfaces, and data ports.
 """
 
 from .enums import DirectionType, SlotType, DisplayField, FlowMode, TransportPhase
-from .frame import Frame_model, Row_info, Col_info, Slot_info, SimpleJSONEncoder
+from .frame import FrameModel, RowInfo, ColInfo, SlotInfo, SimpleJSONEncoder
 from .interface import Interface
 from .dataport import DataPort, DataPortConfig
 from .flow_control_port import FlowControlPort, FlowControlPortConfig, FlowControlPortState
@@ -22,10 +22,10 @@ __all__ = [
     'FlowMode',
     'TransportPhase',
     # Frame model (legacy)
-    'Frame_model',
-    'Row_info',
-    'Col_info',
-    'Slot_info',
+    'FrameModel',
+    'RowInfo',
+    'ColInfo',
+    'SlotInfo',
     'SimpleJSONEncoder',
     # Bus model (new)
     'BusModel',

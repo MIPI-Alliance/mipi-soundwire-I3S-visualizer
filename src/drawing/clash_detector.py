@@ -212,7 +212,7 @@ class ClashDetector:
         )
         self.occupancies[bit_slot].append(occ)
 
-    def _record_clash(self, bit_slot: int, category: SlotClashCategory,
+    def record_clash(self, bit_slot: int, category: SlotClashCategory,
                       device_a: int, device_b: int,
                       slot_type_a: str, slot_type_b: str) -> DeviceClashType:
         """Record a clash with device type distinction.
@@ -312,7 +312,7 @@ class ClashDetector:
             self.write_clashes.add(bit_slot)
             # Record with device type distinction
             if write_device is not None:
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   write_device, device, 'write', 'write')
             self.logger.warning(f'Bus clash detected (write)', extra={
                 'row': row,
@@ -329,7 +329,7 @@ class ClashDetector:
                 has_clash = True
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   handover_device, device, 'handover', 'write')
                 self.logger.warning(f'Bus clash detected (write vs handover)', extra={
                     'row': row,
@@ -352,7 +352,7 @@ class ClashDetector:
                 has_clash = True
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   guard_device, device, 'guard', 'write')
 
         # Check tail - same device suppresses tail, different device clashes
@@ -366,7 +366,7 @@ class ClashDetector:
                 has_clash = True
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   tail_device, device, 'tail', 'write')
 
         # Note: We don't add the write occupancy here - caller uses add_write()
@@ -435,7 +435,7 @@ class ClashDetector:
             elif handover_device is not None:
                 # Different device - clash
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   handover_device, device, 'handover', 'guard')
                 return True, 0, False
 
@@ -447,7 +447,7 @@ class ClashDetector:
                 return False, 0, False
             elif write_device is not None:
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   write_device, device, 'write', 'guard')
                 return True, 0, False
 
@@ -456,7 +456,7 @@ class ClashDetector:
             guard_device = self._get_device_for_type(bit_slot, SlotOccupancyType.GUARD)
             self.write_clashes.add(bit_slot)
             if guard_device is not None:
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   guard_device, device, 'guard', 'guard')
             return True, 0, False
 
@@ -471,7 +471,7 @@ class ClashDetector:
                 return False, 1, suppress_same_device_tail
             elif tail_device is not None:
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   tail_device, device, 'tail', 'guard')
                 return True, 0, False
 
@@ -514,7 +514,7 @@ class ClashDetector:
             elif handover_device is not None:
                 # Different device - clash
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   handover_device, device, 'handover', 'tail')
                 return True, 0
 
@@ -526,7 +526,7 @@ class ClashDetector:
                 return False, 0
             elif write_device is not None:
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   write_device, device, 'write', 'tail')
                 return True, 0
 
@@ -535,7 +535,7 @@ class ClashDetector:
             tail_device = self._get_device_for_type(bit_slot, SlotOccupancyType.TAIL)
             self.write_clashes.add(bit_slot)
             if tail_device is not None:
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   tail_device, device, 'tail', 'tail')
             return True, 0
 
@@ -547,7 +547,7 @@ class ClashDetector:
                 return False, 0
             elif guard_device is not None:
                 self.write_clashes.add(bit_slot)
-                self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                   guard_device, device, 'guard', 'tail')
                 return True, 0
 
@@ -583,7 +583,7 @@ class ClashDetector:
             self.read_clashes.add(bit_slot)
             # Record with device type distinction (for informational purposes)
             if read_device is not None:
-                self._record_clash(bit_slot, SlotClashCategory.READ_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.READ_CLASH,
                                   read_device, device, 'read', 'read')
             self.logger.warning(f'Read overlap detected', extra={
                 'row': row,
@@ -602,7 +602,7 @@ class ClashDetector:
             if handover_device is not None and handover_device != device:
                 self.read_clashes.add(bit_slot)
                 # Record with device type distinction
-                self._record_clash(bit_slot, SlotClashCategory.READ_CLASH,
+                self.record_clash(bit_slot, SlotClashCategory.READ_CLASH,
                                   handover_device, device, 'handover', 'read')
                 self.logger.warning(f'Read overlap detected (vs handover)', extra={
                     'row': row,
@@ -658,7 +658,7 @@ class ClashDetector:
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
                 if write_device is not None:
-                    self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                    self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                       write_device, device, 'write', 'handover')
                 self.logger.warning(f'Bus clash detected (handover)', extra={
                     'row': row,
@@ -678,7 +678,7 @@ class ClashDetector:
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
                 if tail_device is not None:
-                    self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                    self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                       tail_device, device, 'tail', 'handover')
                 self.logger.warning(f'Bus clash detected (handover vs tail)', extra={
                     'row': row,
@@ -696,7 +696,7 @@ class ClashDetector:
                 self.write_clashes.add(bit_slot)
                 # Record with device type distinction
                 if guard_device is not None:
-                    self._record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
+                    self.record_clash(bit_slot, SlotClashCategory.WRITE_CLASH,
                                       guard_device, device, 'guard', 'handover')
                 self.logger.warning(f'Bus clash detected (handover vs guard)', extra={
                     'row': row,
