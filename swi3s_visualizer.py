@@ -21,7 +21,7 @@ import json
 import sys
 from pathlib import Path
 
-APP_VERSION = '2.1.3'
+APP_VERSION = '2.1.4'
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,7 +93,7 @@ def run_headless(args: argparse.Namespace) -> int:
         Exit code (0 = success, 1 = error, 2 = clashes detected)
     """
     from src.models import Interface
-    from src.models.bus_model import BusModel, BusModelJSONEncoder
+    from src.models.bus_model import BusModelJSONEncoder
     from src.core import BusModelBuilder
     from src.io.csv_handler import CSVHandler
     from src.viz import VizConfig

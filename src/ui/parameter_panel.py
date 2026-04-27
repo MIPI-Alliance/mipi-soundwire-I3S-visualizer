@@ -799,22 +799,33 @@ class ParameterPanel(ctk.CTkFrame):
                     self.interface.SkippingDenominator_REG
                 )
         else:
-            # SRI mode
-            if config.Spacing_REG == 0:
+            # SRI mode: transports repeat within the horizontal window.
+            # Transport width = channels * (sample bits + optional TxP slot)
+            # * samples-per-group * UIs-per-bit. Spacing_REG is a period in
+            # UIs (first slot is the transport start), so the inter-transport
+            # gap is Spacing_REG - 1. Available cols = HC + 1 (window runs
+            # HS..HS+HC inclusive, per the engine).
+            from src.models.enums import FlowMode
+            num_channels = bin(config.EnableCh_REG).count('1')
+            txp_slot = 1 if config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC) else 0
+            transport_width = (
+                num_channels
+                * (config.SampleSize_REG + 1 + txp_slot)
+                * (config.SampleGrouping_REG + 1)
+                * (config.BitWidth_REG + 1)
+            )
+            available_cols = config.HorizontalCount_REG + 1
+
+            if transport_width == 0 or available_cols < transport_width:
+                sample_groups_per_row = 0
+            elif config.Spacing_REG == 0:
+                # Hardware sets ROW_DONE after the first transport, so only
+                # one fits per row regardless of leftover columns.
                 sample_groups_per_row = 1
             else:
-                columns_per_sample_group = (
-                    bin(config.EnableCh_REG).count('1') *
-                    (config.SampleSize_REG + 1) *
-                    (config.BitWidth_REG + 1)
-                )
-                spacing = config.Spacing_REG
-                cadence = columns_per_sample_group + spacing - 1
-
-                if cadence > 0:
-                    sample_groups_per_row = (config.HorizontalCount_REG + spacing) // cadence
-                else:
-                    sample_groups_per_row = 0
+                gap = config.Spacing_REG - 1
+                cadence = transport_width + gap
+                sample_groups_per_row = (available_cols + gap) // cadence
 
             samples_per_row = sample_groups_per_row * (config.SampleGrouping_REG + 1)
 

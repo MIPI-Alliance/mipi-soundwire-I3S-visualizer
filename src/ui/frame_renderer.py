@@ -428,32 +428,19 @@ class FrameRenderer:
                 else:
                     break
 
-            # Check displayed fields - only require match for fields that are shown
-            if fields is None:
-                # Default: all fields displayed, require all to match
-                if (next_bit.channel == bit.channel and
-                    next_bit.sample == bit.sample and
-                    next_bit.bit == bit.bit):
-                    processed.add(j)  # Mark this index as merged/processed
-                    merge_count += 1
-                    j += 1
-                else:
-                    break
+            # Merging here represents a wide bit — the same underlying
+            # emission held across consecutive UIs. Adjacent bits from
+            # different samples/channels are separate emissions, so they
+            # must not collapse even when the hidden display fields would
+            # make the labels look identical.
+            if (next_bit.channel == bit.channel and
+                next_bit.sample == bit.sample and
+                next_bit.bit == bit.bit):
+                processed.add(j)
+                merge_count += 1
+                j += 1
             else:
-                # Only check fields that are displayed
-                sample_match = (DisplayField.SAMPLE not in fields or
-                               next_bit.sample == bit.sample)
-                channel_match = (DisplayField.CHANNEL not in fields or
-                                next_bit.channel == bit.channel)
-                bit_match = (DisplayField.BIT not in fields or
-                            next_bit.bit == bit.bit)
-
-                if sample_match and channel_match and bit_match:
-                    processed.add(j)  # Mark this index as merged/processed
-                    merge_count += 1
-                    j += 1
-                else:
-                    break
+                break
 
         # Add 'xN' suffix only for wide bits (same bit number at multiple columns)
         if merge_count > 1:
