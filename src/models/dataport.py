@@ -60,26 +60,25 @@ class DataPortState:
 class DataPortConfig:
     """Configuration and register state for a DataPort."""
 
-    def __init__(self) -> None:
-        self.EnableCh_REG: int = 0
-        self.ChannelGrouping_REG: int = 0
-        self.Spacing_REG: int = 0
-        self.SampleSize_REG: int = 0
-        self.SampleGrouping_REG: int = 0
-        self.Interval_REG: int = 0
-        self.SkippingNumerator_REG: int = 0
-        self.Offset_REG: int = 0
-        self.HorizontalStart_REG: int = 0
-        self.HorizontalCount_REG: int = 0
-        self.TailWidth_REG: int = 0
-        self.BitWidth_REG: int = 0
-        self.PortDirection_REG: bool = False
-        self.GuardEnable_REG: bool = False
-        self.GuardPolarity_REG: bool = False
-        self.SubRowInterval_REG: bool = False
-        self.FlowMode_REG: int = 0
-        self.PortMode_REG: int = 0
-        self.ScramblerEn_REG: bool = False
+    EnableCh_REG: int
+    ChannelGrouping_REG: int
+    Spacing_REG: int
+    SampleSize_REG: int
+    SampleGrouping_REG: int
+    Interval_REG: int
+    SkippingNumerator_REG: int
+    Offset_REG: int
+    HorizontalStart_REG: int
+    HorizontalCount_REG: int
+    TailWidth_REG: int
+    BitWidth_REG: int
+    PortDirection_REG: bool
+    GuardEnable_REG: bool
+    GuardPolarity_REG: bool
+    SubRowInterval_REG: bool
+    FlowMode_REG: int
+    PortMode_REG: int
+    ScramblerEn_REG: bool
 
     @property
     def _num_channels(self) -> int:
@@ -119,15 +118,16 @@ class DataPort:
         clock_tick()         advance one UI; engine derives BitSlotState from state
     """
 
+    state: DataPortState  # created in initialize()
+
     def __init__(self, device: 'Device', dp_index: int) -> None:
         self._device = device
         self.dp_index = dp_index
         self.config = DataPortConfig()
-        self.state = DataPortState(self.config)
 
     def initialize(self) -> None:
         """Initialize before dataport use."""
-        self.state.initialize(self.config)
+        self.state = DataPortState(self.config)
         self._start_interval()
 
     def clock_tick(self) -> None:

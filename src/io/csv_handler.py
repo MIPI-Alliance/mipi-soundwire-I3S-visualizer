@@ -510,13 +510,35 @@ class CSVHandler:
                     result.missing_fields.append(f"InterfaceViz: {field_name}")
                     logger.warning(f"CSV missing interface viz field: {field_name} (using default)")
 
-                for field_name in sorted(missing_dataport):
+                # DP/FCP config fields have no defaults — missing any is a fatal error
+                dp_config_fields = {entry[0] for entry in CSVHandler.DATAPORT_FIELD_MAP
+                                    if entry[0] not in CSVHandler._FCP_CSV_FIELDS}
+                fcp_config_fields = set(CSVHandler._FCP_CSV_FIELDS)
+                missing_dp_required = sorted(missing_dataport & dp_config_fields)
+                missing_fcp_required = sorted(missing_dataport & fcp_config_fields)
+                missing_dp_other = sorted(missing_dataport - dp_config_fields - fcp_config_fields)
+
+                for field_name in missing_dp_required:
+                    result.missing_fields.append(f"DataPort: {field_name}")
+                for field_name in missing_fcp_required:
+                    result.missing_fields.append(f"FlowControlPort: {field_name}")
+                for field_name in missing_dp_other:
                     result.missing_fields.append(f"DataPort: {field_name}")
                     logger.warning(f"CSV missing data port field: {field_name} (using default)")
 
                 for field_name in sorted(missing_dataport_viz):
                     result.missing_fields.append(f"DataPortViz: {field_name}")
                     logger.warning(f"CSV missing data port viz field: {field_name} (using default)")
+
+                if missing_dp_required or missing_fcp_required:
+                    parts = ["CSV missing required field(s):"]
+                    if missing_dp_required:
+                        parts.append(f"  DataPort: {', '.join(missing_dp_required)}")
+                    if missing_fcp_required:
+                        parts.append(f"  FlowControlPort: {', '.join(missing_fcp_required)}")
+                    result.error_message = "\n".join(parts)
+                    logger.error(result.error_message)
+                    return result
 
                 # Reset all data ports to clear stale runtime state
                 for data_port in interface.data_ports:

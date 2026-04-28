@@ -34,13 +34,12 @@ class FlowControlPortState:
 class FlowControlPortConfig:
     """Configuration and register state for an Flow Control Port."""
 
-    def __init__(self) -> None:
-        self.FCP_HorizontalStart_REG: int = 0
-        self.FCP_BitWidth_REG: int = 0
-        self.FCP_TailWidth_REG: int = 0
-        self.FCP_Offset_REG: int = 0
-        self.FCP_GuardEnable_REG: bool = False
-        self.FCP_GuardPolarity_REG: bool = False
+    FCP_HorizontalStart_REG: int
+    FCP_BitWidth_REG: int
+    FCP_TailWidth_REG: int
+    FCP_Offset_REG: int
+    FCP_GuardEnable_REG: bool
+    FCP_GuardPolarity_REG: bool
 
 class FlowControlPort:
     """SWI3S Flow Control Port — config + state + algorithm.
@@ -48,14 +47,15 @@ class FlowControlPort:
         clock_tick()         advance one UI; engine derives BitSlotState from state
     """
 
+    state: FlowControlPortState  # created in initialize()
+
     def __init__(self, dataport: DataPort) -> None:
         self._dataport = dataport
         self.config = FlowControlPortConfig()
-        self.state = FlowControlPortState()
 
     def initialize(self) -> None:
         """Initialize before FCP use."""
-        self.state.initialize()
+        self.state = FlowControlPortState()
         self._start_interval()
 
     def clock_tick(self) -> None:
