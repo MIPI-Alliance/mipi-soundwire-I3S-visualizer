@@ -15,108 +15,13 @@ from src.models import (
     DirectionType,
 )
 from src.models.enums import TransportPhase
-from src.models.bit_slot import BitSlotState, BitSlotData
-from src.models.dataport import DataPortState, DataPortConfig
-from src.models.flow_control_port import (
-    FlowControlPort,
-    FlowControlPortState,
-    FlowControlPortConfig,
-)
+from src.models.bit_slot import BitSlotState
 from src.models.bus_model import BusModel, BitInfo, ClashType
 from src.drawing.clash_detector import ClashDetector, SlotClashCategory
 from src.config import SpecialDevices, DataPortRanges
 from src.utils.validators import DataPortValidator
 from src.utils.logging_config import get_logger
 from src.viz import VizConfig
-
-
-def _derive_dp_bit_slot(state: DataPortState, config: DataPortConfig) -> BitSlotState:
-    """Derive the BitSlotState that the DataPort would emit at the current
-    state, without advancing.
-
-    Engine uses this in conjunction with clock_tick() to consume bit slots
-    while keeping construction in the engine layer (per the clock_tick
-    refactor design — DP exposes state, engine builds slots).
-    """
-    direction = DirectionType.SINK if config.PortDirection_REG else DirectionType.SOURCE
-
-    # Mirror the DP's data-emission gating predicates and dispatch.
-    if not (
-        config._num_channels == 0
-        or state.interval_skipped
-        or state.transport_phase in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
-        or state.row_in_interval < config.Offset_REG
-        or state.column < config.HorizontalStart_REG
-    ):
-        if state.column > config._horizontal_end:
-            pass  # Past horizontal end → row is done, emit EMPTY → fall through
-        elif state.transport_phase == TransportPhase.SPACING:
-            pass  # Inter-sample-group spacing → emit EMPTY → fall through
-        elif state.txp_pending:
-            return BitSlotState(
-                slot_type=SlotType.TX_PRESENT,
-                direction=direction,
-                data=BitSlotData(
-                    sample_in_group=state.sample_in_group,
-                    channel=config._channel(state.channel_index),
-                    bit=0,
-                ),
-            )
-        else:
-            return BitSlotState(
-                slot_type=SlotType.DATA,
-                direction=direction,
-                data=BitSlotData(
-                    sample_in_group=state.sample_in_group,
-                    channel=config._channel(state.channel_index),
-                    bit=state.bit_in_channel,
-                ),
-            )
-
-    # Post-data drain (Source-only — guard/tail fields stay at defaults for Sink).
-    if state.guard_pending:
-        slot_type = SlotType.GUARD_1 if config.GuardPolarity_REG else SlotType.GUARD_0
-        return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
-    if state.tail_remaining > 0:
-        return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
-    return BitSlotState(slot_type=SlotType.EMPTY)
-
-
-def _derive_fcp_bit_slot(fcp: FlowControlPort) -> BitSlotState:
-    """Derive the BitSlotState that the FCP would emit at the current state,
-    without advancing.
-
-    FCP state-derivation peeks at the parent DP for FlowMode + interval
-    skipping (per real hardware, FCP is part of the same DP unit).
-    """
-    state = fcp.state
-    fcp_config = fcp.config
-    dp = fcp._dataport
-    dp_config = dp.config
-
-    # DRQ direction is opposite to the DP's data direction.
-    # Sink DP sends DRQ (SOURCE); Source DP receives DRQ (SINK).
-    drq_direction = DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK
-
-    # Wide-bit replay: drq_sent and still within FCP_BitWidth_REG UIs.
-    if state.drq_sent and state.wide_bit_remaining >= 0:
-        return BitSlotState(slot_type=SlotType.DRQ, direction=drq_direction)
-
-    # Fresh DRQ trigger.
-    if (dp_config._drq_enabled
-            and not dp.interval_skipped
-            and not state.drq_sent
-            and state.row_in_interval == fcp_config.FCP_Offset_REG
-            and state.column == fcp_config.FCP_HorizontalStart_REG):
-        return BitSlotState(slot_type=SlotType.DRQ, direction=drq_direction)
-
-    # Post-DRQ drain (Source-DRQ only — fields stay at defaults otherwise).
-    if state.guard_pending:
-        slot_type = SlotType.GUARD_1 if fcp_config.FCP_GuardPolarity_REG else SlotType.GUARD_0
-        return BitSlotState(slot_type=slot_type, direction=DirectionType.SOURCE)
-    if state.tail_remaining > 0:
-        return BitSlotState(slot_type=SlotType.TAIL, direction=DirectionType.SOURCE)
-    return BitSlotState(slot_type=SlotType.EMPTY)
 
 
 class BusModelBuilder:
@@ -155,7 +60,7 @@ class BusModelBuilder:
 
         # Per-DP running count of transports that have emitted at least one
         # slot. Incremented by the engine when it detects (via DP state
-        # observation — see _process_data_port) that a fresh _reset_transport
+        # observation — see _process_data_port) that a fresh initialize_transport
         # has just run and the next emission is the first of a new transport.
         # Owned by the engine — the DataPort hardware model tracks no
         # running counter and emits no transport-start strobe (see CLAUDE.md
@@ -444,7 +349,7 @@ class BusModelBuilder:
         fcp.initialize()
 
         # Engine-owned per-DP transport counter — starts at 0, incremented
-        # when the engine observes that a fresh _reset_transport just ran
+        # when the engine observes that a fresh initialize_transport just ran
         # in the DP (state snapshot matches post-reset values) and a DATA
         # or TX_PRESENT emission follows. In SRI mode a transport cut by a
         # row boundary is re-emitted from bit 0 on the next row; that is
@@ -478,18 +383,21 @@ class BusModelBuilder:
 
         num_cols = self.interface.num_columns
 
+        dp._device._last_slot_per_port.clear()
+        dp._device._current_slot = None
+
         for bit_num in range(total_bits):
             # Calculate position from iteration index
             row = bit_num // num_cols
             column = bit_num % num_cols
 
-            # Detect "DP is sitting at the post-_reset_transport state, about
+            # Detect "DP is sitting at the post-initialize_transport state, about
             # to emit the first bit of a new transport pattern." This unique
-            # state combination is set ONLY by _reset_transport (not by
+            # state combination is set ONLY by initialize_transport (not by
             # _advance_channel_group non-terminal or any other path).
             dp_state = dp.state
             pre_is_fresh_transport = (
-                dp_state.transport_phase == TransportPhase.ACTIVE
+                dp_state.transport_phase in (TransportPhase.ACTIVE, TransportPhase.PENDING)
                 and dp_state.channel_group_base_channel == 0
                 and dp_state.channel_index == 0
                 and dp_state.sample_in_group == 0
@@ -500,8 +408,13 @@ class BusModelBuilder:
             )
 
             # DP data path emits first
-            bit_slot = _derive_dp_bit_slot(dp.state, dp.config)
+            device_obj = dp._device
+            device_obj._active_port = dp
+            device_obj._current_slot = None
             dp.clock_tick()
+            bit_slot = device_obj._current_slot
+            if bit_slot is None:
+                bit_slot = BitSlotState(slot_type=SlotType.EMPTY)
             bit_slot.device_num = device
             bit_slot.dp_num = dp_index
 
@@ -537,8 +450,12 @@ class BusModelBuilder:
             # FCP emits as an independent parallel source. Any DP+FCP collision
             # is surfaced by the bus model's SAME_DEVICE clash detector (no
             # arbitration in the core loop).
-            fcp_slot = _derive_fcp_bit_slot(fcp)
+            device_obj._active_port = fcp
+            device_obj._current_slot = None
             fcp.clock_tick()
+            fcp_slot = device_obj._current_slot
+            if fcp_slot is None:
+                fcp_slot = BitSlotState(slot_type=SlotType.EMPTY)
             fcp_slot.device_num = device
             fcp_slot.dp_num = dp_index
 
@@ -1009,7 +926,7 @@ class BusModelBuilder:
             if not self.viz_config.data_ports[dp_index].enabled:
                 continue
 
-            # Use cached _num_channels property for performance
+            # Use popcount _num_channels property for performance
             num_channels = dp.config._num_channels
             if num_channels == 0:
                 continue
@@ -1143,7 +1060,7 @@ class BusModelBuilder:
             if not self.viz_config.data_ports[dp_index].enabled:
                 continue  # Not enabled, no warning needed
 
-            # Use cached _num_channels property for performance
+            # Use popcount _num_channels property for performance
             if dp.config._num_channels > 0:
                 continue  # Has channels, no warning needed
 

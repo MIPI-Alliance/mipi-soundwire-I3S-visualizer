@@ -37,6 +37,7 @@ class TransportPhase(Enum):
     SPACING      = 2  # Inter-CG / inter-transport gap (spacing counter > 0)
     ROW_DONE     = 3  # No more data on this row; interval still alive
     PATTERN_DONE = 4  # Transport pattern complete (or skipped interval)
+    PENDING      = 5  # Transport armed, awaiting phase resolution
 
 
 class SlotType(Enum):

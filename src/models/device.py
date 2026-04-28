@@ -10,12 +10,16 @@ library without any UI dependencies.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from src.config.constants import SpecialDevices
+from .bit_slot import BitSlotState, BitSlotData
+from .enums import SlotType, DirectionType
+from .dataport import DataPort
+from .flow_control_port import FlowControlPort
 
 if TYPE_CHECKING:
-    from .dataport import DataPort
+    from .dataport import DataPortConfig
     from .interface import Interface
 
 
@@ -42,6 +46,9 @@ class Device:
         self.device_num = device_num
         self._interface = interface
         self._data_ports: List['DataPort'] = []
+        self._active_port: Optional[Union[DataPort, FlowControlPort]] = None
+        self._current_slot: Optional[BitSlotState] = None
+        self._last_slot_per_port: dict = {}
 
     @property
     def data_ports(self) -> List['DataPort']:
@@ -135,65 +142,131 @@ class Device:
     # their own mechanism (per-DP bound hooks, context, etc.).
     # ------------------------------------------------------------------
 
+    def _channel_from_index(self, config: 'DataPortConfig', index: int) -> int:
+        count = -1
+        for i in range(16):
+            if config.EnableCh_REG & (1 << i):
+                count += 1
+                if count == index:
+                    return i
+        return 0
+
+    def _build_dp_slot(self, slot_type, direction):
+        dp = self._active_port
+        assert isinstance(dp, DataPort)
+        if slot_type == SlotType.TX_PRESENT:
+            data = BitSlotData(
+                sample_in_group=dp.state.sample_in_group,
+                channel=self._channel_from_index(dp.config, dp.state.channel_index),
+                bit=0,
+            )
+            return BitSlotState(slot_type=slot_type, direction=direction, data=data)
+        if slot_type == SlotType.DATA:
+            data = BitSlotData(
+                sample_in_group=dp.state.sample_in_group,
+                channel=self._channel_from_index(dp.config, dp.state.channel_index),
+                bit=dp.state.bit_in_channel,
+            )
+            return BitSlotState(slot_type=slot_type, direction=direction, data=data)
+        return BitSlotState(slot_type=slot_type, direction=direction)
+
+    def _build_fcp_slot(self, slot_type, direction):
+        return BitSlotState(slot_type=slot_type, direction=direction)
+
+    def _record_dp(self, slot_type, direction):
+        slot = self._build_dp_slot(slot_type, direction)
+        self._current_slot = slot
+        self._last_slot_per_port[id(self._active_port)] = slot
+
+    def _record_fcp(self, slot_type, direction):
+        slot = self._build_fcp_slot(slot_type, direction)
+        self._current_slot = slot
+        self._last_slot_per_port[id(self._active_port)] = slot
+
+    def _record_held(self):
+        prev = self._last_slot_per_port.get(id(self._active_port))
+        if prev is not None:
+            self._current_slot = prev
+
+    def _drq_direction(self) -> DirectionType:
+        # DRQ direction is opposite to the parent DP's data direction.
+        # FCP._dataport.config.PortDirection_REG: True = SINK DP -> DRQ SOURCE.
+        fcp = self._active_port
+        assert isinstance(fcp, FlowControlPort)
+        dp_config = fcp._dataport.config
+        return DirectionType.SOURCE if dp_config.PortDirection_REG else DirectionType.SINK
+
     def write_data_bit_from_fifo(self) -> None:
         """Pull a fresh DATA bit from the audio fifo and write it to the bus.
 
         Called at UI 0 of a wide-bit period for a Source DP."""
-        pass
+        self._record_dp(SlotType.DATA, DirectionType.SOURCE)
 
-    def write_held_bit(self) -> None:
+    def held_write_bit(self) -> None:
         """Hold the previously written bit on the bus for one more UI.
 
         Called for wide-bit repeat UIs (DATA, TX_PRESENT, or TAIL)."""
-        pass
+        self._record_held()
+
+    def held_read_bit(self) -> None:
+        self._record_held()
 
     def read_data_bit_to_fifo(self) -> None:
         """Read a DATA bit from the bus and push it to the audio fifo.
 
         Called at the last UI of a wide-bit period for a Sink DP."""
-        pass
+        self._record_dp(SlotType.DATA, DirectionType.SINK)
 
     def write_txp(self) -> None:
         """Write a fresh TX_PRESENT bit to the bus.
 
         Called at UI 0 of a wide-bit TX_PRESENT period for a Source DP."""
-        pass
+        self._record_dp(SlotType.TX_PRESENT, DirectionType.SOURCE)
 
     def read_txp(self) -> None:
         """Read a TX_PRESENT bit from the bus.
 
         Called at the last UI of a wide-bit TX_PRESENT period for a Sink DP."""
-        pass
+        self._record_dp(SlotType.TX_PRESENT, DirectionType.SINK)
 
     def write_drq(self) -> None:
         """Write a fresh DRQ bit to the bus.
 
         Called at UI 0 of a wide-bit DRQ period when the FCP's DRQ direction
         is SOURCE (i.e., parent DP is Sink). Subsequent wide-bit UIs are
-        write_held_bit."""
-        pass
+        held_write_bit."""
+        self._record_fcp(SlotType.DRQ, self._drq_direction())
 
     def read_drq(self) -> None:
         """Read a DRQ bit from the bus.
 
         Called at the last UI of a wide-bit DRQ period when the FCP's DRQ
         direction is SINK (i.e., parent DP is Source)."""
-        pass
+        self._record_fcp(SlotType.DRQ, self._drq_direction())
 
     def write_guard0(self) -> None:
         """Write a guard 0 bit to the bus (single UI, post-data emission)."""
-        pass
+        if isinstance(self._active_port, FlowControlPort):
+            self._record_fcp(SlotType.GUARD_0, DirectionType.SOURCE)
+        else:
+            self._record_dp(SlotType.GUARD_0, DirectionType.SOURCE)
 
     def write_guard1(self) -> None:
         """Write a guard 1 bit to the bus (single UI, post-data emission)."""
-        pass
+        if isinstance(self._active_port, FlowControlPort):
+            self._record_fcp(SlotType.GUARD_1, DirectionType.SOURCE)
+        else:
+            self._record_dp(SlotType.GUARD_1, DirectionType.SOURCE)
 
     def write_tail(self) -> None:
         """Write a fresh TAIL bit to the bus.
 
         Called at UI 0 of a TailWidth_REG-wide post-data period.
-        Subsequent tail UIs are write_held_bit."""
-        pass
+        Subsequent tail UIs are held_write_bit."""
+        if isinstance(self._active_port, FlowControlPort):
+            self._record_fcp(SlotType.TAIL, DirectionType.SOURCE)
+        else:
+            self._record_dp(SlotType.TAIL, DirectionType.SOURCE)
 
     def __repr__(self) -> str:
         """String representation for debugging."""

@@ -259,7 +259,7 @@ class Interface:
         interval_list: List[int] = []
         for data_port in self.data_ports:
             # Include data ports that have channels configured (NumChannels > 0)
-            # Uses cached _num_channels property for performance
+            # Uses popcount _num_channels property for performance
             if data_port.config._num_channels > 0:
                 base_interval = data_port.config.Interval_REG + 1
                 skipping_num = data_port.config.SkippingNumerator_REG
