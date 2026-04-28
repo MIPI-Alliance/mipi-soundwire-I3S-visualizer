@@ -181,6 +181,38 @@
         }
       ]
     },
+    "13": {
+      "row": 0,
+      "column": 13,
+      "slots": [
+        {
+          "slot": "TAIL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 1,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "14": {
+      "row": 0,
+      "column": 14,
+      "slots": [
+        {
+          "slot": "TAIL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 1,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
     "24": {
       "row": 1,
       "column": 0,
@@ -423,6 +455,38 @@
         },
         {
           "slot": "DRQ",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 1,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "109": {
+      "row": 4,
+      "column": 13,
+      "slots": [
+        {
+          "slot": "TAIL",
+          "direction": "SOURCE",
+          "device": 0,
+          "dp": 1,
+          "sample": 0,
+          "channel": 0,
+          "bit": 0,
+          "clash": "NONE"
+        }
+      ]
+    },
+    "110": {
+      "row": 4,
+      "column": 14,
+      "slots": [
+        {
+          "slot": "TAIL",
           "direction": "SOURCE",
           "device": 0,
           "dp": 1,

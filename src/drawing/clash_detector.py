@@ -891,16 +891,22 @@ class ClashDetector:
     # DRQ Source/Sink Tracking
     # -------------------------------------------------------------------------
 
-    def add_drq_source(self, row: int, column: int, device: int) -> None:
+    def add_drq_source(self, row: int, column: int, device: int,
+                       for_validation: bool = True) -> None:
         """Add a DRQ source bit at the given position.
 
         Args:
             row: Row number
             column: Column number
             device: Device number
+            for_validation: If True, register in drq_sources for pair matching.
+                Set False for held UIs of a wide DRQ — only the last UI
+                should be validated, but every UI still needs occupancy
+                tracking for clash detection.
         """
         bit_slot = self._get_bit_slot(row, column)
-        self.drq_sources.add(bit_slot)
+        if for_validation:
+            self.drq_sources.add(bit_slot)
         self._add_occupancy(bit_slot, device, SlotOccupancyType.DRQ_SOURCE)
 
     def add_drq_sink(self, row: int, column: int, device: int) -> None:

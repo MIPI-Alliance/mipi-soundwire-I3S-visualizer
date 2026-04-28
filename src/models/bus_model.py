@@ -122,6 +122,11 @@ class BusModel:
     # Format: (dp_name, bits_needed, bits_available)
     interval_overflow_warnings: List[Tuple[str, int, int]] = field(default_factory=list)
 
+    # DRQ truncation warnings (wide DRQ's last UI falls past the row end, so
+    # the DRQ never completes on the bus — it's a configuration error).
+    # Format: (dp_name, last_ui_column, num_columns)
+    drq_truncation_warnings: List[Tuple[str, int, int]] = field(default_factory=list)
+
     # Display truncation warnings (data would fit if more rows were displayed)
     # Format: (dp_name, interval_rows, displayed_rows)
     display_truncation_warnings: List[Tuple[str, int, int]] = field(default_factory=list)

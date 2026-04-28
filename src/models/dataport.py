@@ -6,7 +6,7 @@ Classes:
     DataPort:       Combines config, state, and algorithm
 
 `transport_phase: TransportPhase` tracks the transport lifecycle:
-    PENDING      Awaiting the transport window
+    PENDING      Awaiting first read/write in the interval
     ACTIVE       Inside the transport window
     SPACING      Channel group spacing / SRI inter-transport spacing
     ROW_DONE     Row's window done; transport still alive across row wrap
@@ -61,7 +61,7 @@ class DataPortConfig:
     """Configuration and register state for a DataPort."""
 
     def __init__(self) -> None:
-        self.EnableCh_REG: int = 0  # 16-bit bitmask for enabled channels
+        self.EnableCh_REG: int = 0
         self.ChannelGrouping_REG: int = 0
         self.Spacing_REG: int = 0
         self.SampleSize_REG: int = 0
@@ -78,7 +78,7 @@ class DataPortConfig:
         self.GuardPolarity_REG: bool = False
         self.SubRowInterval_REG: bool = False
         self.FlowMode_REG: int = 0
-        self.PortMode_REG: int = 0  # 0=Normal, 1=Reserved, 2=Test Ones, 3=Test Zeros
+        self.PortMode_REG: int = 0
         self.ScramblerEn_REG: bool = False
 
     @property
@@ -151,19 +151,15 @@ class DataPort:
 
         if in_transport_window:
             if self.state.column > self.config._horizontal_end:
-                self.state.spacing_slots_remaining = 0
                 self.state.transport_phase = TransportPhase.ROW_DONE
             elif self.state.transport_phase == TransportPhase.SPACING:
                 self.state.spacing_slots_remaining -= 1
-                if self.state.spacing_slots_remaining <= 0:
+                if self.state.spacing_slots_remaining == 0:
                     self.state.transport_phase = TransportPhase.ACTIVE
             else:
-                # Owned slot — DATA or TX_PRESENT.
-                # Write or read the bus this UI, then advance cascade.
-                if self.state.transport_phase == TransportPhase.PENDING:
-                    self.state.transport_phase = TransportPhase.ACTIVE
+                self.state.transport_phase = TransportPhase.ACTIVE
                 if self.config._is_source:
-                    if self.state.wide_bit_remaining == self.config.BitWidth_REG:  # first UI of wide bit
+                    if self.state.wide_bit_remaining == self.config.BitWidth_REG:
                         if self.state.txp_pending:
                             self._device.write_txp()
                         else:
@@ -171,32 +167,26 @@ class DataPort:
                     else:
                         self._device.held_write_bit()
                 else:
-                    # Sink: sampling happens in read_data_bit_to_fifo();
-                    # held_read_bit() only identifies the bits on subsequent UIs.
-                    if self.state.wide_bit_remaining == self.config.BitWidth_REG:  # first UI of wide bit
+                    if self.state.wide_bit_remaining == 0:
                         if self.state.txp_pending:
                             self._device.read_txp()
                         else:
                             self._device.read_data_bit_to_fifo()
-                    else:
-                        self._device.held_read_bit()
 
                 self._advance_wide_bit()
                 self._arm_guard_tail()
                 self._advance_column()
                 return
 
-        # Not owned (gated, window-exhausted, or in SPACING) — drain one
-        # post-data slot if any pending.
         self._pop_guard_tail()
         self._advance_column()
     
     def _start_interval(self) -> None:
         """Start the next interval."""
-        self.state.interval_skipped = self._advance_skipping()
+        self.state.interval_skipped = self._advance_skipping_accumulator()
         self.state.initialize_transport(self.config)
 
-    def _advance_skipping(self) -> bool:
+    def _advance_skipping_accumulator(self) -> bool:
         """Advance skipping accumulator. Returns True iff interval should be skipped."""
         if self.config.SkippingNumerator_REG == 0:
             return False
@@ -270,13 +260,11 @@ class DataPort:
 
         if transport_pattern_complete:
             if self.config.SubRowInterval_REG:
-                # SRI: initialize_transport() resets counters; phase is set by the spacing block below
                 self.state.initialize_transport(self.config)
             else:
                 self.state.transport_phase = TransportPhase.PATTERN_DONE
                 return
         else:
-            # Next Channel
             self.state.channel_group_base_channel += self.config._effective_channel_grouping
             remaining_channels = self.config._num_channels - self.state.channel_group_base_channel
             if remaining_channels > self.config._effective_channel_grouping:

@@ -428,19 +428,19 @@ class FrameRenderer:
                 else:
                     break
 
-            # Merging here represents a wide bit — the same underlying
-            # emission held across consecutive UIs. Adjacent bits from
-            # different samples/channels are separate emissions, so they
-            # must not collapse even when the hidden display fields would
-            # make the labels look identical.
-            if (next_bit.channel == bit.channel and
-                next_bit.sample == bit.sample and
-                next_bit.bit == bit.bit):
-                processed.add(j)
-                merge_count += 1
-                j += 1
-            else:
+            # Same (channel, sample) required — distinct emissions never
+            # merge even when hidden display fields would make labels look
+            # identical. Within a sample, merge when bit is hidden (labels
+            # genuinely identical) or when this is a wide bit (same bit
+            # held across UIs).
+            if next_bit.channel != bit.channel or next_bit.sample != bit.sample:
                 break
+            bit_displayed = fields is None or DisplayField.BIT in fields
+            if bit_displayed and next_bit.bit != bit.bit:
+                break
+            processed.add(j)
+            merge_count += 1
+            j += 1
 
         # Add 'xN' suffix only for wide bits (same bit number at multiple columns)
         if merge_count > 1:

@@ -21,7 +21,7 @@ import json
 import sys
 from pathlib import Path
 
-APP_VERSION = '2.1.4'
+APP_VERSION = '2.1.5'
 
 
 def parse_args() -> argparse.Namespace:
@@ -205,6 +205,13 @@ def run_headless(args: argparse.Namespace) -> int:
         print(f"\nWARNING: {len(bus_model.interval_overflow_warnings)} data port(s) with interval overflow (bits don't fit)")
         for dp_name, bits_needed, bits_available in bus_model.interval_overflow_warnings:
             print(f"  {dp_name}: needs {bits_needed} bits, only {bits_available} fit in interval")
+
+    # Warning: DRQ truncation (wide DRQ can't complete within a row)
+    if bus_model.drq_truncation_warnings:
+        print(f"\nWARNING: {len(bus_model.drq_truncation_warnings)} DRQ configuration(s) truncated (wide DRQ doesn't fit in row)")
+        for dp_name, last_ui_column, num_columns in bus_model.drq_truncation_warnings:
+            print(f"  {dp_name}: wide DRQ last UI at column {last_ui_column}, row ends at {num_columns}")
+        has_critical = True
 
     # Warning: Sample/bit mismatches
     if bus_model.sample_bit_mismatches:

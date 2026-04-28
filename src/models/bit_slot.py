@@ -161,6 +161,7 @@ class BitSlotState:
     device_num: int = 0
     dp_num: int = 0
     data: Optional[BitSlotData] = None
+    fresh_transport: bool = False
 
     def is_data_slot(self) -> bool:
         """Check if this is a data-carrying slot.

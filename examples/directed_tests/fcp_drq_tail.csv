@@ -35,7 +35,7 @@ PortMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_HorizontalStart_REG,10,10,0,0,0,0,0,0,0,0,0,0
 FCP_BitWidth_REG,2,2,0,0,0,0,0,0,0,0,0,0
-FCP_TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
+FCP_TailWidth_REG,0,2,0,0,0,0,0,0,0,0,0,0
 FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False

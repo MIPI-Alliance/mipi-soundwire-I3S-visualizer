@@ -365,7 +365,7 @@ DataPort
 Consumers that need row-within-interval or interval-skipped status read `dp.state.row_in_interval` / `dp.state.interval_skipped` directly — there are no pass-through properties on `DataPort`.
 ```
 
-There is no separate algorithm class — the state machine methods live directly on `DataPort`. Bus I/O is delegated to the parent `Device` via no-arg methods (`device.write_data_bit_from_fifo()`, `device.held_write_bit()`, `device.held_read_bit()`, `device.read_data_bit_to_fifo()`, `device.write_txp()`, `device.read_txp()`, `device.write_guard0/1()`, `device.write_tail()`). Each hook records a `BitSlotState` into `Device._current_slot` describing the slot the DP just drove; the default held hooks extend the most recent slot recorded for the active port (stored per-port in `Device._last_slot_per_port`). The engine sets `Device._active_port` before each tick and reads `_current_slot` after — `None` means EMPTY. Hardware-realistic harnesses can subclass `Device` to additionally drive a real bus.
+There is no separate algorithm class — the state machine methods live directly on `DataPort`. Bus I/O is delegated to the parent `Device` via no-arg methods (`device.write_data_bit_from_fifo()`, `device.held_write_bit()`, `device.read_data_bit_to_fifo()`, `device.write_txp()`, `device.read_txp()`, `device.write_guard0/1()`, `device.write_tail()`). Each hook records a `BitSlotState` into `Device._current_slot` describing the slot the DP just drove; the default `held_write_bit` hook extends the most recent slot recorded for the active port (stored per-port in `Device._last_slot_per_port`). Sink wide bits are **sparse** on the bus: the DP records exactly one bit slot per wide bit, on the **last** UI (when `wide_bit_remaining == 0`, matching real hardware's sample point); held UIs emit nothing. The engine sets `Device._active_port` before each tick and reads `_current_slot` after — `None` means EMPTY. Hardware-realistic harnesses can subclass `Device` to additionally drive a real bus.
 
 ### DataPortConfig
 
@@ -429,7 +429,7 @@ class DataPortState:
 
     # Transport lifecycle
     transport_phase: TransportPhase # PENDING | ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
-    interval_skipped: bool          # Latched by _advance_skipping at interval start
+    interval_skipped: bool          # Latched by _advance_skipping_accumulator at interval start
 
     # Skipping accumulator persists across intervals (not reset per interval)
     skipping_accumulator: int
@@ -453,7 +453,7 @@ class DataPortState:
 
 There is no `channel_group_size` state field — the current group size comes from `config._effective_channel_grouping`, computed on demand.
 
-**Sample tracking is external to DataPort.** `DataPortState` holds only `sample_in_group` (transport-scoped, 0..SG). The engine maintains a per-DP transport counter by observing DP state transitions — it detects a fresh transport by matching the unique post-`initialize_transport` state signature (every counter at its fresh-transport value + `phase == ACTIVE`), and distinguishes SRI row-cut resumptions from genuine new transports by comparing bits-emitted to the full transport bit count. The absolute/global sample ordinal in labels is reconstructed externally:
+**Sample tracking is external to DataPort.** `DataPortState` holds only `sample_in_group` (transport-scoped, 0..SG). The engine maintains a per-DP transport counter by observing DP state transitions. Fresh-transport detection is produced by the model itself (not re-derived in the engine): `Device._build_dp_slot` tests the unique post-`initialize_transport` signature when building a DATA or TX_PRESENT slot and stamps `BitSlotState.fresh_transport = True`. The test is direction-aware — a source fires on the first UI of a wide bit (`wide_bit_remaining == BitWidth_REG`), a sink fires on the last UI (`wide_bit_remaining == 0`), matching each direction's actual emission point. The engine reads `bit_slot.fresh_transport` off the tick result and distinguishes SRI row-cut resumptions from genuine new transports by comparing bits-emitted to the full transport bit count. The absolute/global sample ordinal in labels is reconstructed externally:
 
 ```
 bits_per_transport = _num_channels
@@ -511,7 +511,7 @@ def _advance_sample(self) -> None:
 
 `_advance_channel_group` either starts the next CG in the same transport, or — if the pattern is complete — ends the transport (non-SRI) or resets for the next transport in the same row (SRI). Inter-group spacing is set up via `spacing_slots_remaining = Spacing_REG - 1` (the counter decrements to 0 before phase returns to ACTIVE).
 
-Every new interval triggers `_start_interval` on `DataPort`, which latches the skipping decision (via `_advance_skipping`), calls `state.initialize_transport(config)` to seed the transport-scope fields from config, and sets `transport_phase = ACTIVE` (promoting the transient `PENDING` seeded by `initialize_transport`).
+Every new interval triggers `_start_interval` on `DataPort`, which latches the skipping decision (via `_advance_skipping_accumulator`) and calls `state.initialize_transport(config)` to seed the transport-scope fields (including `transport_phase = PENDING`). The PENDING → ACTIVE promotion now happens lazily on first emission inside `clock_tick()`, not eagerly at interval start — see "Transport Phase Lifecycle" below.
 
 ### Transport Phase Lifecycle
 
@@ -519,13 +519,13 @@ Every new interval triggers `_start_interval` on `DataPort`, which latches the s
 
 | Phase | Meaning |
 |---|---|
-| `PENDING` | Transport-scope counters seeded; awaiting `_start_interval` to promote to ACTIVE |
+| `PENDING` | Transport-scope counters seeded; persists until the first bit actually emits |
 | `ACTIVE` | Emitting data inside the horizontal window |
 | `SPACING` | Inter-channel-group / SRI inter-transport gap (counter > 0) |
 | `ROW_DONE` | Horizontal window closed on this row; transport still alive |
 | `PATTERN_DONE` | Transport complete or interval skipped |
 
-`PENDING` is transient: `DataPortState.initialize_transport` sets it whenever the transport-scope fields are (re-)seeded, and `DataPort._start_interval` immediately promotes it to `ACTIVE`. Under correct caller discipline it is never visible to the engine at `clock_tick` time.
+`PENDING` is set by `DataPortState.initialize_transport` whenever the transport-scope fields are (re-)seeded. It is a **meaningful** phase that can be visible at `clock_tick` time: `DataPort._start_interval` does **not** promote it, and `clock_tick`'s emit branch is the sole promoter (PENDING → ACTIVE on the first bit that actually goes on the bus). This keeps the "armed but not yet emitting" window observable — important when an interval arms mid-row but the first emission slot is still several columns away.
 
 `ROW_DONE` means the window closed mid-pattern — on row wrap it flips back to `ACTIVE` so the fresh row resumes emission. This covers both SRI row-cuts and non-SRI multi-row transports. `PATTERN_DONE` persists until the next row-counter rollover, where `_start_interval` arms a fresh transport (or latches `interval_skipped` if the skipping accumulator says this interval is skipped).
 
@@ -560,10 +560,10 @@ Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
 `clock_tick()` is the single public entry point for UI advance. It has three paths, gated by a positive `in_transport_window` check (`num_channels > 0` AND `not interval_skipped` AND `transport_phase ∉ {ROW_DONE, PATTERN_DONE}` AND `row_in_interval >= Offset_REG` AND `column >= HorizontalStart_REG`):
 
 1. **Window-exhausted / SPACING** — in transport window but past `_horizontal_end` or in SPACING: flip phase (→ROW_DONE / decrement spacing_slots / →ACTIVE), fall through to drain.
-2. **Owned slot** — DATA or TX_PRESENT. Source drives `device.write_txp()`/`write_data_bit_from_fifo()` on the first UI of the wide bit and `device.held_write_bit()` on subsequent UIs; sink calls `device.read_txp()`/`device.read_data_bit_to_fifo()` on the first UI and `device.held_read_bit()` on subsequent UIs (the visualizer records the slot for the whole wide-bit window; real hardware samples on the last UI and may override). Then `_advance_wide_bit()`, `_arm_guard_tail()`, advance column, return.
+2. **Owned slot** — DATA or TX_PRESENT. Source drives `device.write_txp()`/`write_data_bit_from_fifo()` on the first UI of the wide bit (`wide_bit_remaining == BitWidth_REG`) and `device.held_write_bit()` on subsequent UIs. Sink calls `device.read_txp()`/`device.read_data_bit_to_fifo()` on the **last** UI of the wide bit (`wide_bit_remaining == 0`, hardware's actual sample point) and emits nothing on held UIs — so sink wide bits are sparse on the bus (one recorded slot per wide bit, not one per UI). If this branch runs while `transport_phase == PENDING`, the phase is promoted to `ACTIVE` before the hook fires. Then `_advance_wide_bit()`, `_arm_guard_tail()`, advance column, return.
 3. **Drain** — not owned (gated, window-exhausted, or SPACING): `_pop_guard_tail()` emits any pending GUARD (one UI) then TAIL (`TailWidth_REG` UIs; fresh `write_tail()` on first, `held_write_bit()` on rest). Always advance column.
 
-Each hook records a `BitSlotState` into `Device._current_slot`; `held_write_bit` / `held_read_bit` reuse the most recent slot recorded for the active port (stored in `Device._last_slot_per_port`). The engine reads `_current_slot` after each tick and treats `None` as `EMPTY`. Hardware-realistic harnesses subclass `Device` to additionally drive a real bus.
+Each hook records a `BitSlotState` into `Device._current_slot`; `held_write_bit` reuses the most recent slot recorded for the active port (stored in `Device._last_slot_per_port`, with `fresh_transport` forced to `False` on the held copy so only the originating emission carries that flag). The `_last_slot_per_port` cache is cleared at the start of each `_process_data_port` run so state cannot leak across ports. Sinks have no held variant — sink wide bits are sparse (one slot on the last UI, nothing on the others). The engine reads `_current_slot` after each tick and treats `None` as `EMPTY`. Hardware-realistic harnesses subclass `Device` to additionally drive a real bus.
 
 The wide-bit hold is handled by the innermost cascade counter (`wide_bit_remaining`): the same bit emits for `BitWidth_REG + 1` UIs before the bit cursor advances.
 
@@ -593,7 +593,7 @@ ChannelGrouping=2, SampleGrouping=1 (2 samples), Spacing=2
 
 The `FlowControlPort` class (`src/models/flow_control_port.py`) emits DRQ + optional guards/tails in `RX_CONTROLLED` / `ASYNC` flow modes. It is an **independent peer** of the DataPort on the bus — both are iterated by the engine in lock-step, and any overlap is surfaced by the bus model's SAME_DEVICE clash detector (no arbitration lives in the core loop).
 
-The FCP mirrors the DataPort's hardware-model structure: it owns its own `column` / `row_in_interval` tracking, exposes a single `initialize()` / `clock_tick()` public API, and uses a DRQ replay sentinel (`drq_sent and wide_bit_remaining >= 0`). Its emissions are recorded into `Device._current_slot` through the same hooks the DP uses (DRQ-specific `write_drq`/`read_drq`, and shared `held_write_bit`/`held_read_bit`/`write_guard0/1`/`write_tail`) — the engine sets `Device._active_port = fcp` before each FCP tick so the hooks know whose slot they are building.
+The FCP mirrors the DataPort's hardware-model structure: it owns its own `column` / `row_in_interval` tracking, exposes a single `initialize()` / `clock_tick()` public API, and uses a DRQ replay sentinel (`drq_sent and wide_bit_remaining >= 0`). Its emissions are recorded into `Device._current_slot` through the same hooks the DP uses (DRQ-specific `write_drq`/`read_drq`, and shared `held_write_bit`/`write_guard0/1`/`write_tail`) — the engine sets `Device._active_port = fcp` before each FCP tick so the hooks know whose slot they are building.
 
 ### Class Structure
 
@@ -614,7 +614,7 @@ FlowControlPort
 
 `clock_tick()` evaluates three paths in strict order:
 
-1. **Wide-bit replay** — `drq_sent and wide_bit_remaining >= 0`: a prior DRQ is still on the bus. Source DRQ drives `device.held_write_bit()`; sink DRQ calls `device.held_read_bit()` every UI (the visualizer records the slot for the entire wide-bit window; real hardware samples on the last UI and subclasses may override). Then `_advance_wide_bit()` (pure decrement) and advance column.
+1. **Wide-bit replay** — `drq_sent and wide_bit_remaining >= 0`: a prior DRQ is still on the bus. Source DRQ drives `device.held_write_bit()` every UI. Sink DRQ is sparse on the bus like sink DP data — it calls `device.read_drq()` only on the **last** UI of the wide bit (`wide_bit_remaining == 0`, hardware's sample point) and emits nothing on held UIs. Then `_advance_wide_bit()` (pure decrement) and advance column.
 2. **Fresh DRQ trigger** — `_drq_enabled` AND `not dp.state.interval_skipped` AND `not drq_sent` AND column/row match `(FCP_HorizontalStart_REG, FCP_Offset_REG)`. Source DRQ writes `device.write_drq()`; sink DRQ calls `device.read_drq()`. Then `_arm_drq_repeat()` sets `drq_sent`, primes guard/tail pending via `_arm_guard_tail()`, seeds `wide_bit_remaining = FCP_BitWidth_REG`, and calls `_advance_wide_bit()` once for this emission.
 3. **Drain** — otherwise, emit one guard via `device.write_guard0()`/`write_guard1()` (flipping `guard_pending`) or one tail via `device.write_tail()` (first) / `device.held_write_bit()` (subsequent), then advance column. Drain is a no-op on sink DRQ (guard/tail only apply to source DRQ).
 

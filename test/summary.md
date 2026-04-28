@@ -1,17 +1,17 @@
 # SWI3S Visualizer Test Summary
 
-**Generated:** 2026-04-28 08:52:49
+**Generated:** 2026-04-28 14:38:18
 
-**Total Time:** 0:27.3 (+1.9s)
+**Total Time:** 0:26.0 (-0.8s)
 
-**Comparing to:** 2026-04-28T08:43:38.430500
+**Comparing to:** 2026-04-28T14:35:02.214435
 
 ## Test Results
 
 | Metric | Count | Delta |
 |--------|-------|-------|
-| Total Tests | 87 | 0 |
-| Passed | 87 | 0 |
+| Total Tests | 88 | 0 |
+| Passed | 88 | 0 |
 | Failed | 0 | 0 |
 | Pass Rate | 100.0% | |
 
@@ -19,8 +19,8 @@
 
 | Metric | Value | Delta |
 |--------|-------|-------|
-| Total Bit Positions | 12,157 | 0 |
-| Total Slots | 13,608 | 0 |
+| Total Bit Positions | 12,185 | 0 |
+| Total Slots | 13,644 | 0 |
 | Total Handovers | 2,586 | 0 |
 | Bus Clashes | 16 | 0 |
 | Device Clashes | 3 | 0 |
@@ -30,23 +30,23 @@
 
 | Slot Type | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| CDS | 1,225 | 9.0% | 0 |
-| DATA | 7,328 | 53.9% | 0 |
-| DRQ | 48 | 0.4% | 0 |
+| CDS | 1,233 | 9.0% | 0 |
+| DATA | 7,344 | 53.8% | 0 |
+| DRQ | 52 | 0.4% | 0 |
 | GUARD_0 | 287 | 2.1% | 0 |
 | GUARD_1 | 32 | 0.2% | 0 |
 | HANDOVER | 2,586 | 19.0% | 0 |
 | S0 | 996 | 7.3% | 0 |
 | S1 | 772 | 5.7% | 0 |
-| TAIL | 286 | 2.1% | 0 |
-| TX_PRESENT | 48 | 0.4% | 0 |
+| TAIL | 290 | 2.1% | 0 |
+| TX_PRESENT | 52 | 0.4% | 0 |
 
 ## Direction Distribution
 
 | Direction | Count | Percentage | Delta |
 |-----------|-------|------------|-------|
-| SINK | 1,559 | 11.5% | 0 |
-| SOURCE | 12,049 | 88.5% | 0 |
+| SINK | 1,567 | 11.5% | 0 |
+| SOURCE | 12,077 | 88.5% | 0 |
 
 ## Individual Test Results
 
@@ -98,10 +98,11 @@
 | simple_non_sequential_channels | 64 | 24 | 512 | 512 | 128 | 0 | 0 |
 | simple_2_channel | 64 | 24 | 496 | 496 | 128 | 0 | 0 |
 | fcp_guard_polarity_1 | 8 | 24 | 24 | 36 | 0 | 0 | 0 |
+| fcp_drq_tail | 8 | 24 | 28 | 40 | 0 | 0 | 0 |
 | dp_channels | 1 | 24 | 18 | 18 | 1 | 0 | 0 |
 | cds_guard_1 | 2 | 24 | 12 | 12 | 4 | 0 | 0 |
 | cds_guard_0 | 2 | 24 | 12 | 12 | 4 | 0 | 0 |
-| fcp_wide_drq | 8 | 24 | 24 | 40 | 0 | 0 | 0 |
+| fcp_wide_drq | 8 | 24 | 24 | 36 | 0 | 0 | 0 |
 | dp_tails | 1 | 24 | 8 | 8 | 1 | 0 | 0 |
 | sri_1 | 4 | 32 | 72 | 72 | 36 | 0 | 0 |
 | fcp_offset_nonzero | 16 | 24 | 34 | 52 | 0 | 0 | 0 |

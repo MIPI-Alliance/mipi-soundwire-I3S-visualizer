@@ -154,20 +154,37 @@ class Device:
     def _build_dp_slot(self, slot_type, direction):
         dp = self._active_port
         assert isinstance(dp, DataPort)
-        if slot_type == SlotType.TX_PRESENT:
-            data = BitSlotData(
-                sample_in_group=dp.state.sample_in_group,
-                channel=self._channel_from_index(dp.config, dp.state.channel_index),
-                bit=0,
+        if slot_type in (SlotType.DATA, SlotType.TX_PRESENT):
+            # Source fires on first UI (wide_bit_remaining == BitWidth_REG);
+            # sink fires on last UI (wide_bit_remaining == 0).
+            expected_wbr = dp.config.BitWidth_REG if direction == DirectionType.SOURCE else 0
+            fresh = (
+                dp.state.channel_group_base_channel == 0
+                and dp.state.channel_index == 0
+                and dp.state.sample_in_group == 0
+                and dp.state.bit_in_channel == dp.config.SampleSize_REG
+                and dp.state.samples_in_group_remaining == dp.config.SampleGrouping_REG
+                and dp.state.wide_bit_remaining == expected_wbr
+                and dp.state.txp_pending == dp.config._txp_enabled
             )
-            return BitSlotState(slot_type=slot_type, direction=direction, data=data)
-        if slot_type == SlotType.DATA:
-            data = BitSlotData(
-                sample_in_group=dp.state.sample_in_group,
-                channel=self._channel_from_index(dp.config, dp.state.channel_index),
-                bit=dp.state.bit_in_channel,
+            if slot_type == SlotType.TX_PRESENT:
+                data = BitSlotData(
+                    sample_in_group=dp.state.sample_in_group,
+                    channel=self._channel_from_index(dp.config, dp.state.channel_index),
+                    bit=0,
+                )
+            else:
+                data = BitSlotData(
+                    sample_in_group=dp.state.sample_in_group,
+                    channel=self._channel_from_index(dp.config, dp.state.channel_index),
+                    bit=dp.state.bit_in_channel,
+                )
+            return BitSlotState(
+                slot_type=slot_type,
+                direction=direction,
+                data=data,
+                fresh_transport=fresh,
             )
-            return BitSlotState(slot_type=slot_type, direction=direction, data=data)
         return BitSlotState(slot_type=slot_type, direction=direction)
 
     def _build_fcp_slot(self, slot_type, direction):
@@ -176,7 +193,15 @@ class Device:
     def _record_dp(self, slot_type, direction):
         slot = self._build_dp_slot(slot_type, direction)
         self._current_slot = slot
-        self._last_slot_per_port[id(self._active_port)] = slot
+        held_slot = BitSlotState(
+            slot_type=slot.slot_type,
+            direction=slot.direction,
+            device_num=slot.device_num,
+            dp_num=slot.dp_num,
+            data=slot.data,
+            fresh_transport=False,
+        )
+        self._last_slot_per_port[id(self._active_port)] = held_slot
 
     def _record_fcp(self, slot_type, direction):
         slot = self._build_fcp_slot(slot_type, direction)
@@ -206,9 +231,6 @@ class Device:
         """Hold the previously written bit on the bus for one more UI.
 
         Called for wide-bit repeat UIs (DATA, TX_PRESENT, or TAIL)."""
-        self._record_held()
-
-    def held_read_bit(self) -> None:
         self._record_held()
 
     def read_data_bit_to_fifo(self) -> None:

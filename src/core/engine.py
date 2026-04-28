@@ -14,7 +14,6 @@ from src.models import (
     SlotType,
     DirectionType,
 )
-from src.models.enums import TransportPhase
 from src.models.bit_slot import BitSlotState
 from src.models.bus_model import BusModel, BitInfo, ClashType
 from src.drawing.clash_detector import ClashDetector, SlotClashCategory
@@ -96,6 +95,7 @@ class BusModelBuilder:
         self.clash_detector.validate_txp_sinks()
         self.clash_detector.validate_drq_pairs()
         self.clash_detector.validate_drq_sinks()
+        self._detect_truncated_drq()
 
         # 5. Transfer clash information to bus model
         self._finalize_clashes()
@@ -391,22 +391,6 @@ class BusModelBuilder:
             row = bit_num // num_cols
             column = bit_num % num_cols
 
-            # Detect "DP is sitting at the post-initialize_transport state, about
-            # to emit the first bit of a new transport pattern." This unique
-            # state combination is set ONLY by initialize_transport (not by
-            # _advance_channel_group non-terminal or any other path).
-            dp_state = dp.state
-            pre_is_fresh_transport = (
-                dp_state.transport_phase in (TransportPhase.ACTIVE, TransportPhase.PENDING)
-                and dp_state.channel_group_base_channel == 0
-                and dp_state.channel_index == 0
-                and dp_state.sample_in_group == 0
-                and dp_state.bit_in_channel == dp.config.SampleSize_REG
-                and dp_state.samples_in_group_remaining == dp.config.SampleGrouping_REG
-                and dp_state.wide_bit_remaining == dp.config.BitWidth_REG
-                and dp_state.txp_pending == dp.config._txp_enabled
-            )
-
             # DP data path emits first
             device_obj = dp._device
             device_obj._active_port = dp
@@ -423,9 +407,9 @@ class BusModelBuilder:
                 and bit_slot.slot_type in (SlotType.DATA, SlotType.TX_PRESENT)
             )
 
-            # A new transport emission occurred IFF the pre-snapshot was in
+            # A new transport emission occurred IFF the slot was built in
             # the fresh-transport state AND this slot actually emitted data.
-            new_transport_emission = is_owned_data and pre_is_fresh_transport
+            new_transport_emission = is_owned_data and bit_slot.fresh_transport
 
             if new_transport_emission:
                 # Resume detection: in SRI, if the prior transport had emitted
@@ -521,8 +505,10 @@ class BusModelBuilder:
                 last_slot_was_tail = False
                 last_slot_was_guard = True  # Mark for handover if no tail
             else:
-                # Data bit (DATA, TX_PRESENT, or DRQ)
-                last_bit_was_driven = True
+                # Data bit (DATA, TX_PRESENT, or DRQ). Only SOURCE-direction
+                # slots drive the bus; SINK slots sample and shouldn't arm
+                # a handover on the next non-owned tick.
+                last_bit_was_driven = (effective_slot.direction == DirectionType.SOURCE)
                 last_slot_was_tail = False
                 last_slot_was_guard = False
 
@@ -600,7 +586,15 @@ class BusModelBuilder:
         # - Source data ports (PortDirection=False) RECEIVE DRQ (SINK)
         if slot_type == SlotType.DRQ:
             if bit_slot.direction == DirectionType.SOURCE:
-                self.clash_detector.add_drq_source(row, column, device)
+                # Validate pairing only at the last UI of the wide DRQ — the
+                # sink is sparse and only emits at the last UI, so earlier
+                # source UIs have no matching sink by design.
+                fcp_config = self.interface.flow_control_ports[dp_index].config
+                last_ui_column = fcp_config.FCP_HorizontalStart_REG + fcp_config.FCP_BitWidth_REG
+                self.clash_detector.add_drq_source(
+                    row, column, device,
+                    for_validation=(column == last_ui_column),
+                )
             else:
                 self.clash_detector.add_drq_sink(row, column, device)
 
@@ -908,6 +902,28 @@ class BusModelBuilder:
                                 f'DP{bit1.dp} (mode={bit1.port_mode}) vs '
                                 f'DP{bit2.dp} (mode={bit2.port_mode})'
                             )
+
+    def _detect_truncated_drq(self) -> None:
+        """Detect DRQ configurations where the wide bit can't fit in a row.
+
+        A wide DRQ must complete within a single row: the last UI is at column
+        FCP_HorizontalStart_REG + FCP_BitWidth_REG. If that falls past the row
+        end, the replay dies on row-wrap without ever emitting read_drq, so no
+        flow-control handshake ever completes. Flagged as a configuration error.
+        """
+        num_columns = self.interface.num_columns
+        for dp_index, dp in enumerate(self.interface.data_ports):
+            if not dp.config._drq_enabled:
+                continue
+            fcp_config = self.interface.flow_control_ports[dp_index].config
+            last_ui_column = fcp_config.FCP_HorizontalStart_REG + fcp_config.FCP_BitWidth_REG
+            if last_ui_column >= num_columns:
+                warning = (f"DP{dp_index}", last_ui_column, num_columns)
+                self.bus_model.drq_truncation_warnings.append(warning)
+                self.logger.warning(
+                    f'DRQ truncation: DP{dp_index} wide DRQ last UI at column '
+                    f'{last_ui_column} falls past row end ({num_columns} columns)'
+                )
 
     def _detect_interval_overflow(self) -> None:
         """Detect data ports whose bits don't fit within their configured interval.

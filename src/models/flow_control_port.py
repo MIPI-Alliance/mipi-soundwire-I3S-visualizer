@@ -49,7 +49,6 @@ class FlowControlPort:
     """
 
     def __init__(self, dataport: DataPort) -> None:
-        # parent DP: reads FlowMode_REG, PortDirection_REG, Interval_REG, interval_skipped
         self._dataport = dataport
         self.config = FlowControlPortConfig()
         self.state = FlowControlPortState()
@@ -64,16 +63,13 @@ class FlowControlPort:
         state = self.state
         dp_config = self._dataport.config
         device = self._dataport._device
-        drq_is_source = not dp_config._is_source   # DP Sink → DRQ Source
+        drq_is_source = not dp_config._is_source
 
         if state.drq_sent and state.wide_bit_remaining >= 0:
             if drq_is_source:
                 device.held_write_bit()
-            else:
-                # Sink DRQ: record on every UI (visualizer treats the whole
-                # wide-bit window as one DRQ slot). Real hardware samples on
-                # the last UI; subclasses may override.
-                device.held_read_bit()
+            elif state.wide_bit_remaining == 0:
+                device.read_drq()
             self._advance_wide_bit()
             self._advance_column()
             return
@@ -85,7 +81,7 @@ class FlowControlPort:
                 and state.column == self.config.FCP_HorizontalStart_REG):
             if drq_is_source:
                 device.write_drq()
-            else:
+            elif self.config.FCP_BitWidth_REG == 0:
                 device.read_drq()
             self._arm_drq_repeat()
             self._advance_column()
@@ -120,7 +116,6 @@ class FlowControlPort:
         self.state.column = 0
         self.state.guard_pending = False
         self.state.tail_remaining = 0
-        # Force-exit any in-progress DRQ wide-bit, repeat doesn't survive row wraps.
         self.state.wide_bit_remaining = -1
         self.state.row_in_interval += 1
         if self.state.row_in_interval > self._dataport.config.Interval_REG:
@@ -132,14 +127,14 @@ class FlowControlPort:
         self.state.wide_bit_remaining -= 1
 
     def _arm_drq_repeat(self) -> None:
-        """Latch fresh DRQ: mark sent, arm guards/tails, set wide-bit counter, advance."""
+        """Latch fresh DRQ."""
         self.state.drq_sent = True
         self._arm_guard_tail()
         self.state.wide_bit_remaining = self.config.FCP_BitWidth_REG
         self._advance_wide_bit()
 
     def _arm_guard_tail(self) -> None:
-        """Arm post-DRQ state (guard + tails) after a SOURCE DRQ."""
+        """Arm guard/tail slots."""
         self.state.guard_pending = False
         self.state.tail_remaining = 0
         if self._dataport.config._is_source:
