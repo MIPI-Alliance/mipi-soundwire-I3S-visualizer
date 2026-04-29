@@ -262,12 +262,12 @@ class DataPort:
         transport_pattern_complete = (self.state.channel_group_base_channel + self.config._effective_channel_grouping
                             >= self.config._num_channels)
 
-        if transport_pattern_complete and not self.config.SubRowInterval_REG:
-            self.state.transport_phase = TransportPhase.PATTERN_DONE
-            return
-
         if transport_pattern_complete:
-            self.state.initialize_transport(self.config)
+            if self.config.SubRowInterval_REG:
+                self.state.initialize_transport(self.config)
+            else:
+                self.state.transport_phase = TransportPhase.PATTERN_DONE
+                return
         else:
             self.state.channel_group_base_channel += self.config._effective_channel_grouping
             remaining_channels = self.config._num_channels - self.state.channel_group_base_channel
