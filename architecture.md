@@ -469,7 +469,7 @@ This matches real hardware, where the DP tracks only its position within the cur
 
 ### Counter Cascade
 
-The state machine is a nested counter cascade. Each `_advance_*` method decrements its counter; on exhaustion, the counter rolls over and the next-outer counter advances:
+The state machine is a nested counter cascade. Each `_advance_*` method checks its counter: if zero, reset from config and cascade to the next-outer counter; otherwise decrement. Counters are monotonically non-negative (no transient `-1` sentinels):
 
 ```
 wide_bit → bit_in_channel → channel → sample → channel_group → transport completion
@@ -477,39 +477,43 @@ wide_bit → bit_in_channel → channel → sample → channel_group → transpo
 
 ```python
 def _advance_wide_bit(self) -> None:
-    self.state.wide_bit_remaining -= 1
-    if self.state.wide_bit_remaining < 0:
+    if self.state.wide_bit_remaining == 0:
         self.state.wide_bit_remaining = self.config.BitWidth_REG
         self._advance_bit_in_channel()
+    else:
+        self.state.wide_bit_remaining -= 1
 
 def _advance_bit_in_channel(self) -> None:
     if self.state.txp_pending:
         self.state.txp_pending = False
         return                       # TxP fires once per (channel, sample); no bit decrement
-    self.state.bit_in_channel -= 1
-    if self.state.bit_in_channel < 0:
+    if self.state.bit_in_channel == 0:
         self.state.bit_in_channel = self.config.SampleSize_REG
         self._advance_channel()
+    else:
+        self.state.bit_in_channel -= 1
 
 def _advance_channel(self) -> None:
-    self.state.channel_index += 1
-    self.state.channels_in_group_remaining -= 1
     self.state.txp_pending = self.config._txp_enabled   # Re-arm for next (channel, sample)
-    if self.state.channels_in_group_remaining < 0:
+    if self.state.channels_in_group_remaining == 0:
         self.state.channel_index = self.state.channel_group_base_channel
         self.state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
         self._advance_sample()
+    else:
+        self.state.channel_index += 1
+        self.state.channels_in_group_remaining -= 1
 
 def _advance_sample(self) -> None:
-    self.state.sample_in_group += 1
-    self.state.samples_in_group_remaining -= 1
-    if self.state.samples_in_group_remaining < 0:
+    if self.state.samples_in_group_remaining == 0:
         self.state.sample_in_group = 0
         self.state.samples_in_group_remaining = self.config.SampleGrouping_REG
         self._advance_channel_group()
+    else:
+        self.state.sample_in_group += 1
+        self.state.samples_in_group_remaining -= 1
 ```
 
-`_advance_channel_group` either starts the next CG in the same transport, or — if the pattern is complete — ends the transport (non-SRI) or resets for the next transport in the same row (SRI). Inter-group spacing is set up via `spacing_slots_remaining = Spacing_REG - 1` (the counter decrements to 0 before phase returns to ACTIVE).
+`_advance_channel_group` first checks whether the transport pattern is complete and not in SRI — if so, it sets `transport_phase = PATTERN_DONE` and returns. Otherwise it re-inits the transport (SRI re-entry) or advances to the next channel group, then sets `spacing_slots_remaining = Spacing_REG - 1` with phase `SPACING` (counter decrements to 0 before phase returns to ACTIVE), or `ROW_DONE` when `Spacing_REG` is 0.
 
 Every new interval triggers `_start_interval` on `DataPort`, which latches the skipping decision (via `_advance_skipping_accumulator`) and calls `state.initialize_transport(config)` to seed the transport-scope fields (including `transport_phase = PENDING`). The PENDING → ACTIVE promotion now happens lazily on first emission inside `clock_tick()`, not eagerly at interval start — see "Transport Phase Lifecycle" below.
 
@@ -614,8 +618,8 @@ FlowControlPort
 
 `clock_tick()` evaluates three paths in strict order:
 
-1. **Wide-bit replay** — `drq_sent and wide_bit_remaining >= 0`: a prior DRQ is still on the bus. Source DRQ drives `device.held_write_bit()` every UI. Sink DRQ is sparse on the bus like sink DP data — it calls `device.read_drq()` only on the **last** UI of the wide bit (`wide_bit_remaining == 0`, hardware's sample point) and emits nothing on held UIs. Then `_advance_wide_bit()` (pure decrement) and advance column.
-2. **Fresh DRQ trigger** — `_drq_enabled` AND `not dp.state.interval_skipped` AND `not drq_sent` AND column/row match `(FCP_HorizontalStart_REG, FCP_Offset_REG)`. Source DRQ writes `device.write_drq()`; sink DRQ calls `device.read_drq()`. Then `_arm_drq_repeat()` sets `drq_sent`, primes guard/tail pending via `_arm_guard_tail()`, seeds `wide_bit_remaining = FCP_BitWidth_REG`, and calls `_advance_wide_bit()` once for this emission.
+1. **Wide-bit replay** — `drq_sent and wide_bit_remaining > 0`: a prior DRQ is still on the bus. Source DRQ drives `device.held_write_bit()` every UI. Sink DRQ is sparse on the bus like sink DP data — it calls `device.read_drq()` only on the **last** UI of the wide bit (`wide_bit_remaining == 1`, hardware's sample point) and emits nothing on held UIs. Then `_advance_wide_bit()` (pure decrement) and advance column.
+2. **Fresh DRQ trigger** — `_drq_enabled` AND `not dp.state.interval_skipped` AND `not drq_sent` AND column/row match `(FCP_HorizontalStart_REG, FCP_Offset_REG)`. Source DRQ writes `device.write_drq()`; sink DRQ calls `device.read_drq()` (only when `FCP_BitWidth_REG == 0`; wide sink DRQ reads at the last replay UI instead). Then `_arm_drq_repeat()` sets `drq_sent`, primes guard/tail pending via `_arm_guard_tail()`, and seeds `wide_bit_remaining = FCP_BitWidth_REG` (the count of replay UIs still to emit).
 3. **Drain** — otherwise, emit one guard via `device.write_guard0()`/`write_guard1()` (flipping `guard_pending`) or one tail via `device.write_tail()` (first) / `device.held_write_bit()` (subsequent), then advance column. Drain is a no-op on sink DRQ (guard/tail only apply to source DRQ).
 
 DRQ direction is inverted relative to DP data direction: Sink DP → DRQ SOURCE (FCP writes onto bus); Source DP → DRQ SINK (FCP samples bus). `Device._drq_direction()` resolves this from the parent DP's `PortDirection_REG` when building the DRQ slot.
@@ -623,9 +627,9 @@ DRQ direction is inverted relative to DP data direction: Sink DP → DRQ SOURCE 
 ### Lifecycle
 
 - **`_advance_column`** → wraps to `_advance_row` at the right edge.
-- **`_advance_row`** → clears `guard_pending`/`tail_remaining` and forces `wide_bit_remaining = -1` so any in-progress DRQ replay terminates at the row boundary (row wrap doesn't carry a replay forward). `drq_sent` persists across rows so a DRQ can only fire once per interval.
+- **`_advance_row`** → clears `guard_pending`/`tail_remaining` and sets `wide_bit_remaining = 0` so any in-progress DRQ replay terminates at the row boundary (the `wide_bit_remaining > 0` gate fails on next tick). `drq_sent` persists across rows so a DRQ can only fire once per interval.
 - **`_start_interval`** → calls `FlowControlPortState.initialize_transport()`, which clears `drq_sent` so the next interval's DRQ can fire and zeros `wide_bit_remaining`.
-- **`_advance_wide_bit`** → pure decrement; terminal (unlike DP's cascade). When `wide_bit_remaining` drops below 0, the replay sentinel `(drq_sent and wide_bit_remaining >= 0)` naturally fails on next tick.
+- **`_advance_wide_bit`** → pure decrement; terminal (unlike DP's cascade). `wide_bit_remaining` counts from `FCP_BitWidth_REG` down to 0 across replay ticks and stays non-negative throughout — no sentinel value.
 
 Because FCP owns its own row/interval counters, the engine no longer passes `column` / `row_in_interval` into `clock_tick()` and no longer orchestrates per-row or per-interval reset callbacks.
 

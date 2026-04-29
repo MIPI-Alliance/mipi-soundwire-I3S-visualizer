@@ -41,6 +41,15 @@ class FlowControlPortConfig:
     FCP_GuardEnable_REG: bool
     FCP_GuardPolarity_REG: bool
 
+    def reset_to_defaults(self) -> None:
+        """Populate every register with a zero/False default."""
+        self.FCP_HorizontalStart_REG = 0
+        self.FCP_BitWidth_REG = 0
+        self.FCP_TailWidth_REG = 0
+        self.FCP_Offset_REG = 0
+        self.FCP_GuardEnable_REG = False
+        self.FCP_GuardPolarity_REG = False
+
 class FlowControlPort:
     """SWI3S Flow Control Port — config + state + algorithm.
         initialize()         initialize before use
@@ -65,10 +74,10 @@ class FlowControlPort:
         device = self._dataport._device
         drq_is_source = not dp_config._is_source
 
-        if state.drq_sent and state.wide_bit_remaining >= 0:
+        if state.drq_sent and state.wide_bit_remaining > 0:
             if drq_is_source:
                 device.held_write_bit()
-            elif state.wide_bit_remaining == 0:
+            elif state.wide_bit_remaining == 1:
                 device.read_drq()
             self._advance_wide_bit()
             self._advance_column()
@@ -116,14 +125,14 @@ class FlowControlPort:
         self.state.column = 0
         self.state.guard_pending = False
         self.state.tail_remaining = 0
-        self.state.wide_bit_remaining = -1
+        self.state.wide_bit_remaining = 0
         self.state.row_in_interval += 1
         if self.state.row_in_interval > self._dataport.config.Interval_REG:
             self.state.row_in_interval = 0
             self._start_interval()
 
     def _advance_wide_bit(self) -> None:
-        """Next wide-bit UI; cascades to _advance_bit_in_channel."""
+        """Next wide-bit UI."""
         self.state.wide_bit_remaining -= 1
 
     def _arm_drq_repeat(self) -> None:
@@ -131,7 +140,6 @@ class FlowControlPort:
         self.state.drq_sent = True
         self._arm_guard_tail()
         self.state.wide_bit_remaining = self.config.FCP_BitWidth_REG
-        self._advance_wide_bit()
 
     def _arm_guard_tail(self) -> None:
         """Arm guard/tail slots."""

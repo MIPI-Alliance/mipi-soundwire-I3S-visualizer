@@ -80,6 +80,28 @@ class DataPortConfig:
     PortMode_REG: int
     ScramblerEn_REG: bool
 
+    def reset_to_defaults(self) -> None:
+        """Populate every register with a zero/False default."""
+        self.EnableCh_REG = 0
+        self.ChannelGrouping_REG = 0
+        self.Spacing_REG = 0
+        self.SampleSize_REG = 0
+        self.SampleGrouping_REG = 0
+        self.Interval_REG = 0
+        self.SkippingNumerator_REG = 0
+        self.Offset_REG = 0
+        self.HorizontalStart_REG = 0
+        self.HorizontalCount_REG = 0
+        self.TailWidth_REG = 0
+        self.BitWidth_REG = 0
+        self.PortDirection_REG = False
+        self.GuardEnable_REG = False
+        self.GuardPolarity_REG = False
+        self.SubRowInterval_REG = False
+        self.FlowMode_REG = 0
+        self.PortMode_REG = 0
+        self.ScramblerEn_REG = False
+
     @property
     def _num_channels(self) -> int:
         """Count of enabled channels."""
@@ -219,51 +241,55 @@ class DataPort:
 
     def _advance_wide_bit(self) -> None:
         """Next wide-bit UI; cascades to _advance_bit_in_channel."""
-        self.state.wide_bit_remaining -= 1
-        if self.state.wide_bit_remaining < 0:
+        if self.state.wide_bit_remaining == 0:
             self.state.wide_bit_remaining = self.config.BitWidth_REG
             self._advance_bit_in_channel()
+        else:
+            self.state.wide_bit_remaining -= 1
 
     def _advance_bit_in_channel(self) -> None:
         """Next bit; cascades to _advance_channel."""
         if self.state.txp_pending:
             self.state.txp_pending = False
             return
-        self.state.bit_in_channel -= 1
-        if self.state.bit_in_channel < 0:
+        if self.state.bit_in_channel == 0:
             self.state.bit_in_channel = self.config.SampleSize_REG
             self._advance_channel()
+        else:
+            self.state.bit_in_channel -= 1
 
     def _advance_channel(self) -> None:
         """Next channel; cascades to _advance_sample."""
-        self.state.channel_index += 1
-        self.state.channels_in_group_remaining -= 1
         self.state.txp_pending = self.config._txp_enabled
-        if self.state.channels_in_group_remaining < 0:
+        if self.state.channels_in_group_remaining == 0:
             self.state.channel_index = self.state.channel_group_base_channel
             self.state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
             self._advance_sample()
+        else:
+            self.state.channel_index += 1
+            self.state.channels_in_group_remaining -= 1
 
     def _advance_sample(self) -> None:
         """Next sample; cascades to _advance_channel_group."""
-        self.state.sample_in_group += 1
-        self.state.samples_in_group_remaining -= 1
-        if self.state.samples_in_group_remaining < 0:
+        if self.state.samples_in_group_remaining == 0:
             self.state.sample_in_group = 0
             self.state.samples_in_group_remaining = self.config.SampleGrouping_REG
             self._advance_channel_group()
+        else:
+            self.state.sample_in_group += 1
+            self.state.samples_in_group_remaining -= 1
 
     def _advance_channel_group(self) -> None:
         """Next channel group (or next transport in SRI)."""
         transport_pattern_complete = (self.state.channel_group_base_channel + self.config._effective_channel_grouping
                             >= self.config._num_channels)
 
+        if transport_pattern_complete and not self.config.SubRowInterval_REG:
+            self.state.transport_phase = TransportPhase.PATTERN_DONE
+            return
+
         if transport_pattern_complete:
-            if self.config.SubRowInterval_REG:
-                self.state.initialize_transport(self.config)
-            else:
-                self.state.transport_phase = TransportPhase.PATTERN_DONE
-                return
+            self.state.initialize_transport(self.config)
         else:
             self.state.channel_group_base_channel += self.config._effective_channel_grouping
             remaining_channels = self.config._num_channels - self.state.channel_group_base_channel
@@ -272,15 +298,14 @@ class DataPort:
             self.state.channels_in_group_remaining = remaining_channels - 1
             self.state.channel_index = self.state.channel_group_base_channel
 
-        if (not transport_pattern_complete) or self.config.SubRowInterval_REG:
-            if self.config.Spacing_REG != 0:
-                self.state.spacing_slots_remaining = self.config.Spacing_REG - 1
-                if self.config.Spacing_REG > 1:
-                    self.state.transport_phase = TransportPhase.SPACING
-                else:
-                    self.state.transport_phase = TransportPhase.ACTIVE
+        if self.config.Spacing_REG != 0:
+            self.state.spacing_slots_remaining = self.config.Spacing_REG - 1
+            if self.config.Spacing_REG > 1:
+                self.state.transport_phase = TransportPhase.SPACING
             else:
-                self.state.transport_phase = TransportPhase.ROW_DONE
+                self.state.transport_phase = TransportPhase.ACTIVE
+        else:
+            self.state.transport_phase = TransportPhase.ROW_DONE
 
     def _pop_guard_tail(self) -> None:
         """Pop guard/tail slots."""
