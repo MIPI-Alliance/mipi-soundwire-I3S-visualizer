@@ -80,28 +80,6 @@ class DataPortConfig:
     PortMode_REG: int
     ScramblerEn_REG: bool
 
-    def reset_to_defaults(self) -> None:
-        """Populate every register with a zero/False default."""
-        self.EnableCh_REG = 0
-        self.ChannelGrouping_REG = 0
-        self.Spacing_REG = 0
-        self.SampleSize_REG = 0
-        self.SampleGrouping_REG = 0
-        self.Interval_REG = 0
-        self.SkippingNumerator_REG = 0
-        self.Offset_REG = 0
-        self.HorizontalStart_REG = 0
-        self.HorizontalCount_REG = 0
-        self.TailWidth_REG = 0
-        self.BitWidth_REG = 0
-        self.PortDirection_REG = False
-        self.GuardEnable_REG = False
-        self.GuardPolarity_REG = False
-        self.SubRowInterval_REG = False
-        self.FlowMode_REG = 0
-        self.PortMode_REG = 0
-        self.ScramblerEn_REG = False
-
     @property
     def _num_channels(self) -> int:
         """Count of enabled channels."""

@@ -96,10 +96,8 @@ class Interface:
             for i in range(self.NUM_DATA_PORTS)
         ]
 
-        for dp in self.data_ports:
-            dp.config.reset_to_defaults()
-        for fcp in self.flow_control_ports:
-            fcp.config.reset_to_defaults()
+        from src.config.defaults import reset_port_configs
+        reset_port_configs(self)
 
         # Initialize all field values to defaults (kept separate from
         # device/DP/FCP construction so reload paths can re-use it).

@@ -41,15 +41,6 @@ class FlowControlPortConfig:
     FCP_GuardEnable_REG: bool
     FCP_GuardPolarity_REG: bool
 
-    def reset_to_defaults(self) -> None:
-        """Populate every register with a zero/False default."""
-        self.FCP_HorizontalStart_REG = 0
-        self.FCP_BitWidth_REG = 0
-        self.FCP_TailWidth_REG = 0
-        self.FCP_Offset_REG = 0
-        self.FCP_GuardEnable_REG = False
-        self.FCP_GuardPolarity_REG = False
-
 class FlowControlPort:
     """SWI3S Flow Control Port — config + state + algorithm.
         initialize()         initialize before use
