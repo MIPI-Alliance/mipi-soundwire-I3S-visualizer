@@ -33,11 +33,9 @@ class PortMode(IntEnum):
 
 class TransportPhase(Enum):
     """Lifecycle phase for a DataPort's transport pattern."""
-    ACTIVE       = 1  # Emitting data inside the transport window
-    SPACING      = 2  # Inter-CG / inter-transport gap (spacing counter > 0)
-    ROW_DONE     = 3  # No more data on this row; interval still alive
-    PATTERN_DONE = 4  # Transport pattern complete (or skipped interval)
-    PENDING      = 5  # Transport armed, awaiting phase resolution
+    PENDING = 1  # Idle: waiting for gate (not-yet-started, mid-pattern pause, or pattern done this Interval)
+    ACTIVE  = 2  # Transporting
+    SPACING = 3  # In inter-CG / inter-pattern gap UIs
 
 
 class SlotType(Enum):

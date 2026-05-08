@@ -819,8 +819,8 @@ class ParameterPanel(ctk.CTkFrame):
             if transport_width == 0 or available_cols < transport_width:
                 sample_groups_per_row = 0
             elif config.Spacing_REG == 0:
-                # Hardware sets ROW_DONE after the first transport, so only
-                # one fits per row regardless of leftover columns.
+                # Spacing=0 pauses transport until the next Row, so only
+                # one transport fits per row regardless of leftover columns.
                 sample_groups_per_row = 1
             else:
                 gap = config.Spacing_REG - 1

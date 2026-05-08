@@ -6,11 +6,9 @@ Classes:
     DataPort:       Combines config, state, and algorithm
 
 `transport_phase: TransportPhase` tracks the transport lifecycle:
-    PENDING      Awaiting first read/write in the interval
-    ACTIVE       Inside the transport window
-    SPACING      Channel group spacing / SRI inter-transport spacing
-    ROW_DONE     Row's window done; transport still alive across row wrap
-    PATTERN_DONE Transport complete or interval skipped
+    PENDING      Idle: waiting for gate (not-yet-started, mid-pattern pause, or pattern done)
+    ACTIVE       Transporting
+    SPACING      In inter-CG / inter-pattern gap UIs
 
 Normal vs SRI:
     - Normal: One transport per SSP interval; channel groups
@@ -46,7 +44,7 @@ class DataPortState:
 
     def initialize_transport(self, config: DataPortConfig) -> None:
         """Initialize transport state for a new transport pattern."""
-        self.transport_phase: TransportPhase = TransportPhase.PENDING
+        self.transport_phase: TransportPhase = TransportPhase.ACTIVE
         self.spacing_slots_remaining: int = 0
         self.sample_in_group: int = 0
         self.samples_in_group_remaining: int = config.SampleGrouping_REG
@@ -132,31 +130,28 @@ class DataPort:
         """Advance the DataPort by one UI.
 
         Three paths:
-          1. In transport window and inside the horizontal window on an owned slot —
-             write or read the bus, advance the cascade, arm guard/tail, advance column, return.
-          2. In transport window but window-exhausted or in SPACING — update phase /
-             spacing counter, then fall through to (3).
-          3. Not owned — pop guard and tail armed by a prior owned
+          1. Gate satisfied and on an owned slot — write or read the bus,
+             advance the cascade, arm guard/tail, advance column, return.
+          2. Gate satisfied but in SPACING — tick the spacing counter,
+             transition to ACTIVE when it hits zero, then fall through to (3).
+          3. Gate not satisfied — pop guard and tail armed by a prior owned
              source slot, then advance column.
         """
         cfg, s = self.config, self.state
         in_transport_window = (
             cfg._num_channels > 0
             and not s.interval_skipped
-            and s.transport_phase not in (TransportPhase.ROW_DONE, TransportPhase.PATTERN_DONE)
+            and s.channel_group_base_channel < cfg._num_channels
             and s.row_in_interval >= cfg.Offset_REG
-            and s.column >= cfg.HorizontalStart_REG
+            and cfg.HorizontalStart_REG <= s.column <= cfg._horizontal_end
         )
 
         if in_transport_window:
-            if s.column > cfg._horizontal_end:
-                s.transport_phase = TransportPhase.ROW_DONE
-            elif s.transport_phase == TransportPhase.SPACING:
+            if s.transport_phase == TransportPhase.SPACING:
                 s.spacing_slots_remaining -= 1
                 if s.spacing_slots_remaining == 0:
                     s.transport_phase = TransportPhase.ACTIVE
-            else:
-                s.transport_phase = TransportPhase.ACTIVE
+            elif s.transport_phase == TransportPhase.ACTIVE:
                 if cfg._is_source:
                     if s.wide_bit_remaining == cfg.BitWidth_REG:
                         if s.txp_pending:
@@ -209,7 +204,7 @@ class DataPort:
         s.guard_pending = False
         s.tail_remaining = 0
 
-        if s.transport_phase == TransportPhase.ROW_DONE:
+        if s.transport_phase == TransportPhase.PENDING and s.channel_group_base_channel < self.config._num_channels:
             s.transport_phase = TransportPhase.ACTIVE
 
         s.row_in_interval += 1
@@ -265,16 +260,16 @@ class DataPort:
     def _advance_channel_group(self) -> None:
         """Next channel group (or next transport in SRI)."""
         cfg, s = self.config, self.state
-        transport_pattern_complete = (s.channel_group_base_channel + cfg._effective_channel_grouping >= cfg._num_channels)
+        s.channel_group_base_channel += cfg._effective_channel_grouping
+        transport_pattern_complete = s.channel_group_base_channel >= cfg._num_channels
 
         if transport_pattern_complete:
             if cfg.SubRowInterval_REG:
                 s.initialize_transport(cfg)
             else:
-                s.transport_phase = TransportPhase.PATTERN_DONE
+                s.transport_phase = TransportPhase.PENDING
                 return
         else:
-            s.channel_group_base_channel += cfg._effective_channel_grouping
             remaining_channels = cfg._num_channels - s.channel_group_base_channel
             if remaining_channels > cfg._effective_channel_grouping:
                 remaining_channels = cfg._effective_channel_grouping
@@ -288,7 +283,7 @@ class DataPort:
             else:
                 s.transport_phase = TransportPhase.ACTIVE
         else:
-            s.transport_phase = TransportPhase.ROW_DONE
+            s.transport_phase = TransportPhase.PENDING
 
     def _pop_guard_tail(self) -> None:
         """Pop guard/tail slots."""
