@@ -610,16 +610,26 @@ class CSVHandler:
                     manager_values.append(str(is_manager))
                 writer.writerow([DATA_PORT_IN_MANAGER] + manager_values)
 
-                # Write data port parameters using field mapping
+                # Write data port parameters using field mapping.
+                # C15: when FlowMode is Normal (0) or Tx-Controlled (1) the FCP is
+                # not in use, so emit 0/False for all six FCP_* fields regardless
+                # of any stale config value. This prevents stale FCP register
+                # values from round-tripping through a save and later tripping
+                # the C15 validator.
                 for csv_field, attr_name, field_type, _ in CSVHandler.DATAPORT_FIELD_MAP:
                     values = []
+                    is_fcp_field = csv_field in CSVHandler._FCP_CSV_FIELDS
                     for dp_index, data_port in enumerate(interface.data_ports):
-                        source_config = (
-                            interface.flow_control_ports[dp_index].config
-                            if csv_field in CSVHandler._FCP_CSV_FIELDS
-                            else data_port.config
-                        )
-                        value = getattr(source_config, attr_name)
+                        if is_fcp_field and data_port.config.FlowMode_REG in (0, 1):
+                            # FCP disabled for this DP: force zero/False on the wire.
+                            value: Any = False if field_type == FieldType.BOOL else 0
+                        else:
+                            source_config = (
+                                interface.flow_control_ports[dp_index].config
+                                if is_fcp_field
+                                else data_port.config
+                            )
+                            value = getattr(source_config, attr_name)
                         # Format based on field type
                         if field_type == FieldType.BINARY_INT:
                             values.append(bin(value))

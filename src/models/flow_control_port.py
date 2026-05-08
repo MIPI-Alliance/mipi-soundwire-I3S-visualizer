@@ -60,45 +60,45 @@ class FlowControlPort:
 
     def clock_tick(self) -> None:
         """Advance the Flow Control Port by one UI."""
-        state = self.state
-        dp_config = self._dataport.config
+        cfg, s = self.config, self.state
+        dp_cfg = self._dataport.config
         device = self._dataport._device
-        drq_is_source = not dp_config._is_source
+        drq_is_source = not dp_cfg._is_source
 
-        if state.drq_sent and state.wide_bit_remaining > 0:
+        if s.drq_sent and s.wide_bit_remaining > 0:
             if drq_is_source:
                 device.held_write_bit()
-            elif state.wide_bit_remaining == 1:
+            elif s.wide_bit_remaining == 1:
                 device.read_drq()
             self._advance_wide_bit()
             self._advance_column()
             return
 
-        if (dp_config._drq_enabled
+        if (dp_cfg._drq_enabled
                 and not self._dataport.state.interval_skipped
-                and not state.drq_sent
-                and state.row_in_interval == self.config.FCP_Offset_REG
-                and state.column == self.config.FCP_HorizontalStart_REG):
+                and not s.drq_sent
+                and s.row_in_interval == cfg.FCP_Offset_REG
+                and s.column == cfg.FCP_HorizontalStart_REG):
             if drq_is_source:
                 device.write_drq()
-            elif self.config.FCP_BitWidth_REG == 0:
+            elif cfg.FCP_BitWidth_REG == 0:
                 device.read_drq()
             self._arm_drq_repeat()
             self._advance_column()
             return
 
-        if state.guard_pending:
-            if self.config.FCP_GuardPolarity_REG:
+        if s.guard_pending:
+            if cfg.FCP_GuardPolarity_REG:
                 device.write_guard1()
             else:
                 device.write_guard0()
-            state.guard_pending = False
-        elif state.tail_remaining > 0:
-            if state.tail_remaining == self.config.FCP_TailWidth_REG:
+            s.guard_pending = False
+        elif s.tail_remaining > 0:
+            if s.tail_remaining == cfg.FCP_TailWidth_REG:
                 device.write_tail()
             else:
                 device.held_write_bit()
-            state.tail_remaining -= 1
+            s.tail_remaining -= 1
         self._advance_column()
 
     def _start_interval(self) -> None:
@@ -113,13 +113,14 @@ class FlowControlPort:
 
     def _advance_row(self) -> None:
         """Next row; cascades to _start_interval."""
-        self.state.column = 0
-        self.state.guard_pending = False
-        self.state.tail_remaining = 0
-        self.state.wide_bit_remaining = 0
-        self.state.row_in_interval += 1
-        if self.state.row_in_interval > self._dataport.config.Interval_REG:
-            self.state.row_in_interval = 0
+        s = self.state
+        s.column = 0
+        s.guard_pending = False
+        s.tail_remaining = 0
+        s.wide_bit_remaining = 0
+        s.row_in_interval += 1
+        if s.row_in_interval > self._dataport.config.Interval_REG:
+            s.row_in_interval = 0
             self._start_interval()
 
     def _advance_wide_bit(self) -> None:
@@ -128,16 +129,18 @@ class FlowControlPort:
 
     def _arm_drq_repeat(self) -> None:
         """Latch fresh DRQ."""
-        self.state.drq_sent = True
+        s = self.state
+        s.drq_sent = True
         self._arm_guard_tail()
-        self.state.wide_bit_remaining = self.config.FCP_BitWidth_REG
+        s.wide_bit_remaining = self.config.FCP_BitWidth_REG
 
     def _arm_guard_tail(self) -> None:
         """Arm guard/tail slots."""
-        self.state.guard_pending = False
-        self.state.tail_remaining = 0
+        cfg, s = self.config, self.state
+        s.guard_pending = False
+        s.tail_remaining = 0
         if self._dataport.config._is_source:
             return
-        if self.config.FCP_GuardEnable_REG:
-            self.state.guard_pending = True
-        self.state.tail_remaining = self.config.FCP_TailWidth_REG
+        if cfg.FCP_GuardEnable_REG:
+            s.guard_pending = True
+        s.tail_remaining = cfg.FCP_TailWidth_REG

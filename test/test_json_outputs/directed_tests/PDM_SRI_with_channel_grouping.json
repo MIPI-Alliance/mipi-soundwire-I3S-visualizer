@@ -615,5 +615,11 @@
   "bus_clashes": [],
   "device_clashes": [],
   "read_overlaps": [],
-  "warnings": {}
+  "warnings": {
+    "validation": [
+      0,
+      1,
+      2
+    ]
+  }
 }

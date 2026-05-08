@@ -37,7 +37,7 @@ DisplayFields,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb
 FlowMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
 PortMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
-FCP_HorizontalStart_REG,0,4,4,4,0,0,0,0,0,0,0,0
+FCP_HorizontalStart_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0

@@ -396,10 +396,12 @@ class DataPortConfig:
 
     @property
     def _effective_channel_grouping(self) -> int:
-        """ChannelGrouping_REG clamped to num_channels when register is 0 or oversized."""
-        if self.ChannelGrouping_REG == 0 or self.ChannelGrouping_REG > self._num_channels:
-            return self._num_channels
-        return self.ChannelGrouping_REG
+        """ChannelGrouping_REG clamped to num_channels when register is 0.
+
+        ChannelGrouping_REG must be <= NumChannels (configuration constraint,
+        enforced by the validator). A value of 0 means "one group of all channels".
+        """
+        return self._num_channels if self.ChannelGrouping_REG == 0 else self.ChannelGrouping_REG
 
     @property
     def _is_source(self) -> bool:

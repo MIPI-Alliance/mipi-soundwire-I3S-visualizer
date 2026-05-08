@@ -9,7 +9,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,384
+RowRate,384.0
 Description,SRI with multi-transport-per-row where third transport's first bit lands at _HorizontalEnd and subsequent column is past it - pins behavior of L489 inner SRI sub-check (column > _HorizontalEnd inside ACTIVE block)
 RowsToDraw,3
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
@@ -42,4 +42,4 @@ FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,Fals
 Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
 EnforceHandover,True,False,False,False,False,False,False,False,False,False,False,False
 Enabled,True,False,False,False,False,False,False,False,False,False,False,False
-DisplayFields,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb
+DisplayFields,sc,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb

@@ -186,8 +186,10 @@ class DataPortValidator:
         columns_after_data = self.interface.num_columns - 1 - last_data_column
 
         self._check_offset_within_interval(result, config)
+        self._check_channel_grouping_within_num_channels(result, config, num_channels)
         self._check_sri_interval_zero(result, config)
         self._check_sri_skipping_disabled(result, config)
+        self._check_sri_equal_spacing(result, config, drive_in_group)
         self._check_sri_pattern_fits(result, config, drive_in_group)
         self._check_horizontal_start_within_columns(result, config)
         self._check_horizontal_count_within_columns(result, config)
@@ -195,7 +197,9 @@ class DataPortValidator:
         self._check_tail_fits_row(result, config, columns_after_data)
         self._check_bitwidth_fits_remaining_columns(result, config)
         self._check_bitwidth_fits_horizontal_count(result, config)
-        self._check_horizontal_count_divisible_by_bitwidth(result, config)
+        self._check_no_wide_bit_straddles_window(
+            result, config, num_channels, effective_channel_grouping
+        )
         self._check_guard_fits_row(result, config, columns_after_data)
         self._check_sink_no_guard(result, config)
         self._check_sink_no_tail(result, config)
@@ -204,13 +208,15 @@ class DataPortValidator:
             fcp_config = self.interface.get_fcp(data_port.dp_index).config
             self._check_fcp_offset_within_interval(result, config, fcp_config)
             self._check_fcp_fits_row(result, fcp_config)
+        else:
+            self._check_fcp_registers_zero_when_disabled(result, data_port, config)
 
     # Shared settings-scope helpers.
 
     @staticmethod
     def _effective_channel_grouping(config: Any, num_channels: int) -> int:
-        """Channels per group (clamped to num_channels when register is 0 or oversized)."""
-        if config.ChannelGrouping_REG == 0 or config.ChannelGrouping_REG > num_channels:
+        """Channels per group (clamped to num_channels when register is 0)."""
+        if config.ChannelGrouping_REG == 0:
             return num_channels
         return config.ChannelGrouping_REG
 
@@ -266,6 +272,16 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
+    def _check_channel_grouping_within_num_channels(self, result: ValidationResult,
+                                                    config: Any, num_channels: int) -> None:
+        """ChannelGrouping_REG shall be less than or equal to NumChannels."""
+        if num_channels > 0 and config.ChannelGrouping_REG > num_channels:
+            result.add_error(
+                'ChannelGrouping_REG',
+                f"ChannelGrouping ({config.ChannelGrouping_REG}) exceeds NumChannels ({num_channels})",
+                ErrorSeverity.ERROR
+            )
+
     def _check_sri_interval_zero(self, result: ValidationResult, config: Any) -> None:
         """In SRI mode (SubRowInterval_REG=1), Interval_REG shall be 0 (one-row interval)."""
         if config.SubRowInterval_REG and config.Interval_REG != 0:
@@ -281,6 +297,77 @@ class DataPortValidator:
             result.add_error(
                 'SkippingNumerator',
                 f"SRI mode does not support skipping; SkippingNumerator_REG should be 0 (currently {config.SkippingNumerator_REG})",
+                ErrorSeverity.ERROR
+            )
+
+    def _check_sri_equal_spacing(self, result: ValidationResult, config: Any,
+                                  drive_in_group: int) -> None:
+        """In SRI mode, Transport Patterns shall be equally spaced across Row boundaries (C14).
+
+        Three sub-rules, each emitted as a distinct error for diagnostic clarity:
+
+          1. Spacing_REG >= 2.
+             Spacing=0 permits at most one Transport Pattern per Row (defeating
+             SRI); Spacing=1 places patterns back-to-back, violating equal-
+             spacing across Row boundaries.
+
+          2. NumColumns is an integer multiple of the TP cycle length.
+             TP_cycle_length = (TP payload UIs) + (Spacing - 1). Requiring
+             NumColumns (not HorizontalCount+1) to be a multiple of the TP
+             cycle ensures Transport Patterns land at the same column
+             position every Row; the last TP of a Row may place its payload
+             at the end of the Horizontal Window with its gap UIs straddling
+             into the cross-Row structural area — sub-rule 3 ensures that
+             cross-Row gap matches the in-Row inter-pattern gap.
+
+          3. NumColumns - (HorizontalCount + 1) == Spacing - 1.
+             The unused Row UIs outside the Horizontal Window equal the in-Row
+             inter-pattern gap, so the gap that crosses the Row boundary matches
+             the gap between consecutive patterns inside the Row.
+        """
+        if not config.SubRowInterval_REG:
+            return
+
+        # Sub-rule 1: Spacing >= 2.
+        if config.Spacing_REG < 2:
+            result.add_error(
+                'Spacing',
+                f"SRI mode requires Spacing_REG >= 2 (currently {config.Spacing_REG}); "
+                f"Spacing=0 defeats SRI and Spacing=1 violates equal-spacing across Row boundaries",
+                ErrorSeverity.ERROR
+            )
+            # Sub-rules 2 and 3 are meaningful only when Spacing >= 2 (they
+            # depend on a well-defined inter-pattern gap). Return early to
+            # avoid emitting derivative errors that would confuse the user.
+            return
+
+        window_size = config.HorizontalCount_REG + 1
+        tp_cycle_length = drive_in_group + config.Spacing_REG - 1
+        num_columns = self.interface.num_columns
+
+        # Sub-rule 2: NumColumns holds an integer number of TP cycles so
+        # Transport Patterns align to the same column position every Row.
+        if tp_cycle_length > 0 and num_columns % tp_cycle_length != 0:
+            result.add_error(
+                'HorizontalCount',
+                f"SRI mode requires NumColumns ({num_columns}) to be a "
+                f"multiple of the TP cycle length ({tp_cycle_length} = "
+                f"{drive_in_group} payload + {config.Spacing_REG - 1} gap); "
+                f"remainder {num_columns % tp_cycle_length} would cause "
+                f"Transport Patterns to land at different column positions "
+                f"from one Row to the next",
+                ErrorSeverity.ERROR
+            )
+
+        # Sub-rule 3: unused Row columns match the in-Row inter-pattern gap.
+        unused_columns = self.interface.num_columns - window_size
+        expected_gap = config.Spacing_REG - 1
+        if unused_columns != expected_gap:
+            result.add_error(
+                'HorizontalCount',
+                f"SRI mode requires NumColumns-(HorizontalCount+1) ({unused_columns}) "
+                f"to equal Spacing_REG-1 ({expected_gap}); cross-Row gap must "
+                f"match in-Row gap so Transport Patterns remain equally spaced",
                 ErrorSeverity.ERROR
             )
 
@@ -367,14 +454,84 @@ class DataPortValidator:
                 ErrorSeverity.ERROR
             )
 
-    def _check_horizontal_count_divisible_by_bitwidth(self, result: ValidationResult, config: Any) -> None:
-        """In non-SRI mode, (HorizontalCount + 1) shall be a multiple of (BitWidth + 1)."""
-        if not config.SubRowInterval_REG and (config.HorizontalCount_REG + 1) % (config.BitWidth_REG + 1) != 0:
-            result.add_error(
-                'HorizontalCount',
-                'HorizontalCount + 1 should be a multiple of BitWidth + 1',
-                ErrorSeverity.ERROR
-            )
+    def _check_no_wide_bit_straddles_window(self, result: ValidationResult, config: Any,
+                                            num_channels: int,
+                                            effective_channel_grouping: int) -> None:
+        """Outside SRI mode, no Wide Bit shall straddle the end of a Horizontal Window (C07).
+
+        Simulates the non-SRI Transport Pattern UI-by-UI starting at HorizontalStart.
+        Each bit occupies BitWidth+1 contiguous UIs; when a bit begins, there must be
+        at least BitWidth+1 UIs remaining before the row's Horizontal Window end, or
+        the bit's UIs would straddle into the next row.
+
+        Channel groups within a row are separated by Spacing-1 gap UIs (when
+        Spacing_REG != 0); when Spacing_REG == 0, each channel group starts a fresh
+        row at HorizontalStart. Guard/Tail UIs live AFTER the last data UI and are
+        covered by _check_tail_fits_row / _check_guard_fits_row; they do not appear
+        inside the data-UI stream for this check.
+
+        Only wide bits (BitWidth_REG > 0) can straddle; narrow bits (BitWidth_REG == 0)
+        occupy a single UI. Bit = 0 case is skipped for efficiency.
+        """
+        # Only applies outside SRI, with at least one bit to transport, and only when
+        # BitWidth > 0 (a single-UI bit cannot straddle by definition).
+        if config.SubRowInterval_REG:
+            return
+        if num_channels == 0 or effective_channel_grouping == 0:
+            return
+        if config.BitWidth_REG == 0:
+            return
+
+        h_start = config.HorizontalStart_REG
+        row_end = h_start + config.HorizontalCount_REG  # inclusive last column of window
+        bit_ui_span = config.BitWidth_REG + 1
+        spacing_gap = config.Spacing_REG - 1 if config.Spacing_REG != 0 else 0
+
+        # Total channel groups in the Transport Pattern.
+        num_groups = (num_channels + effective_channel_grouping - 1) // effective_channel_grouping
+        # Bits per channel group.
+        bits_per_group = (
+            (config.SampleSize_REG + 1)
+            * (config.SampleGrouping_REG + 1)
+            * effective_channel_grouping
+        )
+
+        col = h_start
+        for group_idx in range(num_groups):
+            for bit_idx in range(bits_per_group):
+                # If the previous bit landed exactly at row_end, col is now past
+                # row_end — wrap to the next row before placing this bit.
+                if col > row_end:
+                    col = h_start
+                # Check this bit's UIs fit entirely within the current row's window.
+                # If col..col+bit_ui_span-1 would cross row_end, the bit straddles.
+                if col + bit_ui_span - 1 > row_end:
+                    result.add_error(
+                        'HorizontalCount',
+                        f"Wide Bit straddles Horizontal Window end: bit {bit_idx} of "
+                        f"channel group {group_idx} starts at column {col} with "
+                        f"BitWidth+1={bit_ui_span} UIs, but only "
+                        f"{row_end - col + 1} UI(s) remain before row end "
+                        f"(HorizontalStart={h_start}, HorizontalCount+1="
+                        f"{config.HorizontalCount_REG + 1})",
+                        ErrorSeverity.ERROR
+                    )
+                    return
+                col += bit_ui_span
+
+            # End of channel group. Insert inter-group spacing (or wrap to next row).
+            if group_idx == num_groups - 1:
+                break  # pattern complete
+
+            if config.Spacing_REG == 0:
+                # No inter-group spacing: next channel group starts a fresh row.
+                col = h_start
+            else:
+                # Emit Spacing-1 gap UIs; they may wrap into the next row.
+                col += spacing_gap
+                if col > row_end:
+                    # Gap (or part of it) spills past row end → wraps to next row.
+                    col = h_start
 
     def _check_guard_fits_row(self, result: ValidationResult, config: Any, columns_after_data: int) -> None:
         """A post-data guard bit shall have at least one column remaining after the last data slot (source DP only)."""
@@ -425,6 +582,38 @@ class DataPortValidator:
             result.add_error(
                 'FCP_HorizontalStart_REG',
                 "FCP bits would overflow row",
+                ErrorSeverity.ERROR
+            )
+
+    def _check_fcp_registers_zero_when_disabled(self, result: ValidationResult,
+                                                data_port: 'DataPort', config: Any) -> None:
+        """When FlowMode_REG is Normal (0) or Tx-Controlled (1) the FCP is not in
+        use and all six FCP registers shall be 0 (C15).
+
+        FCP_HorizontalStart_REG, FCP_BitWidth_REG, FCP_TailWidth_REG,
+        FCP_Offset_REG, FCP_GuardEnable_REG, FCP_GuardPolarity_REG.
+        """
+        fcp_config = self.interface.get_fcp(data_port.dp_index).config
+        non_zero: List[str] = []
+        if fcp_config.FCP_HorizontalStart_REG:
+            non_zero.append(f"FCP_HorizontalStart_REG={fcp_config.FCP_HorizontalStart_REG}")
+        if fcp_config.FCP_BitWidth_REG:
+            non_zero.append(f"FCP_BitWidth_REG={fcp_config.FCP_BitWidth_REG}")
+        if fcp_config.FCP_TailWidth_REG:
+            non_zero.append(f"FCP_TailWidth_REG={fcp_config.FCP_TailWidth_REG}")
+        if fcp_config.FCP_Offset_REG:
+            non_zero.append(f"FCP_Offset_REG={fcp_config.FCP_Offset_REG}")
+        if fcp_config.FCP_GuardEnable_REG:
+            non_zero.append(f"FCP_GuardEnable_REG={fcp_config.FCP_GuardEnable_REG}")
+        if fcp_config.FCP_GuardPolarity_REG:
+            non_zero.append(f"FCP_GuardPolarity_REG={fcp_config.FCP_GuardPolarity_REG}")
+
+        if non_zero:
+            result.add_error(
+                'FCP',
+                f"DP{data_port.dp_index}: FlowMode={config.FlowMode_REG} "
+                f"(FCP not in use) requires all FCP registers to be 0; "
+                f"non-zero: {', '.join(non_zero)}",
                 ErrorSeverity.ERROR
             )
 
