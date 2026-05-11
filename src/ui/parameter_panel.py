@@ -38,7 +38,7 @@ from src.ui.helpers import (
     MIN_ROWS_IN_FRAME,
     MAX_ROWS_IN_FRAME,
 )
-from src.ui.theme import get_theme_colors
+from src.ui.theme import get_theme_colors, FOCUS_BORDER_COLOR
 
 if TYPE_CHECKING:
     from src.ui.app_ui import UIManager
@@ -216,10 +216,21 @@ class ParameterPanel(ctk.CTkFrame):
             border_width=CHECKBOX_BORDER_WIDTH,
             border_color="#979DA2"
         )
+        self._attach_focus_highlight(entry)
         # Trigger refresh on focus-out or Enter key
-        entry.bind('<FocusOut>', lambda e: self._on_value_change())
+        entry.bind('<FocusOut>', lambda e: self._on_value_change(), add=True)
         entry.bind('<Return>', lambda e: self._on_value_change())
         return entry
+
+    def _attach_focus_highlight(self, entry: ctk.CTkEntry) -> None:
+        saved = {'border_color': entry.cget('border_color')}
+        def on_focus_in(_event: tk.Event) -> None:
+            saved['border_color'] = entry.cget('border_color')
+            entry.configure(border_color=FOCUS_BORDER_COLOR)
+        def on_focus_out(_event: tk.Event) -> None:
+            entry.configure(border_color=saved['border_color'])
+        entry.bind('<FocusIn>', on_focus_in, add=True)
+        entry.bind('<FocusOut>', on_focus_out, add=True)
 
     def _create_wrapped_checkbox(
         self,
@@ -301,6 +312,7 @@ class ParameterPanel(ctk.CTkFrame):
                 border_width=CHECKBOX_BORDER_WIDTH, border_color="#979DA2"
             )
             entry.grid(row=0, column=count + 1, padx=ENTRY_PADX, pady=ENTRY_PADY)
+            self._attach_focus_highlight(entry)
             self.dp_name_entries.append(entry)
 
         # "Other Parameters" header
@@ -566,8 +578,23 @@ class ParameterPanel(ctk.CTkFrame):
         # System SSP Interval - label centered under buttons, value under entry column (same row)
         # Placed below the Maximize Frame button
         btn_col = Interface.NUM_DATA_PORTS + 2
+
+        bw_label = ctk.CTkLabel(
+            self, text='Raw Bus Bandwidth [MHz]:', anchor=tk.CENTER,
+            font=(APP_FONT, self.ui.config.text_size)
+        )
+        bw_label.grid(row=NUM_DP_ENTRY_ROWS + 8, column=btn_col, columnspan=2)
+        self.frame_labels.append(bw_label)
+
+        self.bandwidth_value_label = ctk.CTkLabel(
+            self, text=self._format_bandwidth(), anchor=tk.CENTER,
+            font=(APP_FONT, self.ui.config.text_size)
+        )
+        self.bandwidth_value_label.grid(row=NUM_DP_ENTRY_ROWS + 8, column=entry_col)
+        self.frame_labels.append(self.bandwidth_value_label)
+
         ssp_label = ctk.CTkLabel(
-            self, text='System SSP Interval:', anchor=tk.CENTER,
+            self, text='System SSP Interval [Rows]:', anchor=tk.CENTER,
             font=(APP_FONT, self.ui.config.text_size)
         )
         ssp_label.grid(row=NUM_DP_ENTRY_ROWS + 9, column=btn_col, columnspan=2)
@@ -597,13 +624,13 @@ class ParameterPanel(ctk.CTkFrame):
             )
             return btn
 
-        # Buttons moved up one row (gap between Maximize Frame and SSP Interval)
-        create_btn('Load Init (CSV)', 'reset', NUM_DP_ENTRY_ROWS + 2)
-        create_btn('Reset', 'reset_all', NUM_DP_ENTRY_ROWS + 3)
-        create_btn('Load Settings (CSV)', 'load_csv', NUM_DP_ENTRY_ROWS + 4)
-        create_btn('Save Settings (CSV)', 'save_csv', NUM_DP_ENTRY_ROWS + 5)
-        create_btn('Save Output (SVG)', 'save_svg', NUM_DP_ENTRY_ROWS + 6)
-        create_btn('Save Output (JSON)', 'save_json', NUM_DP_ENTRY_ROWS + 7)
+        # Buttons shifted up to make room for Raw Bus Bandwidth above SSP Interval
+        create_btn('Load Init (CSV)', 'reset', NUM_DP_ENTRY_ROWS + 1)
+        create_btn('Reset', 'reset_all', NUM_DP_ENTRY_ROWS + 2)
+        create_btn('Load Settings (CSV)', 'load_csv', NUM_DP_ENTRY_ROWS + 3)
+        create_btn('Save Settings (CSV)', 'save_csv', NUM_DP_ENTRY_ROWS + 4)
+        create_btn('Save Output (SVG)', 'save_svg', NUM_DP_ENTRY_ROWS + 5)
+        create_btn('Save Output (JSON)', 'save_json', NUM_DP_ENTRY_ROWS + 6)
 
         # Toggle/maximize button (after the save buttons)
         self.toggle_button = ctk.CTkButton(
@@ -612,7 +639,7 @@ class ParameterPanel(ctk.CTkFrame):
             font=(APP_FONT, self.ui.config.text_size + 1)
         )
         self.toggle_button.grid(
-            column=btn_col, columnspan=2, row=NUM_DP_ENTRY_ROWS + 8,
+            column=btn_col, columnspan=2, row=NUM_DP_ENTRY_ROWS + 7,
             sticky=tk.N + tk.S + tk.E + tk.W,
             padx=40, pady=1
         )
@@ -625,6 +652,10 @@ class ParameterPanel(ctk.CTkFrame):
         """Handle any parameter value change - triggers debounced refresh."""
         if 'on_value_change' in self.callbacks:
             self.callbacks['on_value_change']()
+
+    def _format_bandwidth(self) -> str:
+        # row_rate is in kHz; bandwidth in MHz = row_rate * num_columns / 1000
+        return f"{self.interface.row_rate * self.interface.num_columns / 1000:g}"
 
     def _on_channel_click(self, dp_index: int) -> None:
         """Handle click on NumChannels entry."""
@@ -771,6 +802,7 @@ class ParameterPanel(ctk.CTkFrame):
 
         # Update SSP label
         self.ssp_value_label.configure(text=str(self.interface.interval_lcm))
+        self.bandwidth_value_label.configure(text=self._format_bandwidth())
 
         # Update PHY3-dependent widget states
         self.update_phy3_dependent_widgets()

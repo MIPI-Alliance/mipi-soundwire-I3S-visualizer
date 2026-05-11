@@ -707,11 +707,12 @@ class MinimalApp(ctk.CTkFrame):
 
     def _scroll_start(self, event) -> None:
         """Handle scroll start."""
+        self._scroll_mark_x = event.x
         self.frame_canvas.scan_mark(event.x, event.y)
 
     def _scroll_move(self, event) -> None:
         """Handle scroll move."""
-        self.frame_canvas.scan_dragto(event.x, event.y, gain=2)
+        self.frame_canvas.scan_dragto(self._scroll_mark_x, event.y, gain=2)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         """Handle mouse wheel/trackpad scrolling.

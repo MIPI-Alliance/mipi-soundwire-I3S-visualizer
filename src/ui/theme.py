@@ -25,6 +25,9 @@ except ImportError:
 DARK_GRAY = '#707070'
 LIGHT_GRAY = '#707070'
 
+# Focus-accent border color for entry widgets (light, dark) — Microsoft-blue family
+FOCUS_BORDER_COLOR = ("#0078D4", "#4DA6FF")
+
 
 # =============================================================================
 # Color Utility Functions
