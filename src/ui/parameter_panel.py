@@ -224,9 +224,14 @@ class ParameterPanel(ctk.CTkFrame):
 
     def _attach_focus_highlight(self, entry: ctk.CTkEntry) -> None:
         saved = {'border_color': entry.cget('border_color')}
+        def select_all() -> None:
+            entry.select_range(0, 'end')
+            entry.icursor('end')
         def on_focus_in(_event: tk.Event) -> None:
             saved['border_color'] = entry.cget('border_color')
             entry.configure(border_color=FOCUS_BORDER_COLOR)
+            # after_idle so the click's cursor placement doesn't clear the selection
+            entry.after_idle(select_all)
         def on_focus_out(_event: tk.Event) -> None:
             entry.configure(border_color=saved['border_color'])
         entry.bind('<FocusIn>', on_focus_in, add=True)
@@ -580,7 +585,7 @@ class ParameterPanel(ctk.CTkFrame):
         btn_col = Interface.NUM_DATA_PORTS + 2
 
         bw_label = ctk.CTkLabel(
-            self, text='Raw Bus Bandwidth [MHz]:', anchor=tk.CENTER,
+            self, text='Raw Bus Bandwidth [Mbps]:', anchor=tk.CENTER,
             font=(APP_FONT, self.ui.config.text_size)
         )
         bw_label.grid(row=NUM_DP_ENTRY_ROWS + 8, column=btn_col, columnspan=2)
@@ -654,7 +659,7 @@ class ParameterPanel(ctk.CTkFrame):
             self.callbacks['on_value_change']()
 
     def _format_bandwidth(self) -> str:
-        # row_rate is in kHz; bandwidth in MHz = row_rate * num_columns / 1000
+        # row_rate is in kHz; bandwidth in Mbps = row_rate * num_columns / 1000
         return f"{self.interface.row_rate * self.interface.num_columns / 1000:g}"
 
     def _on_channel_click(self, dp_index: int) -> None:
@@ -713,6 +718,14 @@ class ParameterPanel(ctk.CTkFrame):
 
     def update_ui(self) -> None:
         """Sync model values to UI widgets."""
+        # Snapshot focus/selection so the wholesale delete+insert below
+        # doesn't clobber a newly-focused entry's auto-select-all.
+        focused = self.focus_get()
+        had_selection = (
+            isinstance(focused, (tk.Entry, ctk.CTkEntry))
+            and bool(getattr(focused, 'selection_present', lambda: False)())
+        )
+
         # Update data port names from viz config
         for count, entry in enumerate(self.dp_name_entries):
             entry.delete(0, tk.END)
@@ -806,6 +819,12 @@ class ParameterPanel(ctk.CTkFrame):
 
         # Update PHY3-dependent widget states
         self.update_phy3_dependent_widgets()
+
+        # Restore selection on the entry that had focus, so auto-select-all
+        # survives a refresh triggered by focusing in.
+        if had_selection and isinstance(focused, (tk.Entry, ctk.CTkEntry)):
+            focused.select_range(0, 'end')
+            focused.icursor('end')
 
     def _calculate_sample_rate(self, dp_index: int) -> str:
         """Calculate sample rate for a data port."""
