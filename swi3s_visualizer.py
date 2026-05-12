@@ -21,7 +21,7 @@ import json
 import sys
 from pathlib import Path
 
-APP_VERSION = '2.1.10'
+APP_VERSION = '2.1.11'
 
 
 def parse_args() -> argparse.Namespace:

@@ -9,7 +9,7 @@ of the original visualizer.
 from __future__ import annotations
 
 import tkinter as tk
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import customtkinter as ctk
 
@@ -372,9 +372,16 @@ class ParameterPanel(ctk.CTkFrame):
 
         # =====================================================================
         # NumChannels Entries (row 2) - Read-only, Clickable
+        # Created like DeviceNumber (no focus highlight / value-change bindings)
+        # so the channel dialog round-trip doesn't leave the text selected.
         # =====================================================================
         for entry_column, data_port in enumerate(self.interface.data_ports):
-            entry = self._create_entry(self, dp_entry_validate_funcs[1])
+            entry = ctk.CTkEntry(
+                self, width=self.ui.config.entry_width * PIXELS_PER_CHAR,
+                fg_color=self.ui.config.preferred_gray, justify=tk.CENTER,
+                font=("TkDefaultFont", self.ui.config.text_size),
+                border_width=CHECKBOX_BORDER_WIDTH, border_color="#979DA2"
+            )
             entry.grid(row=2, column=entry_column + 1, padx=ENTRY_PADX, pady=ENTRY_PADY)
             entry.configure(state='readonly')
             entry.bind('<Button-1>', lambda e, idx=entry_column: self._on_channel_click(idx))
@@ -479,6 +486,72 @@ class ParameterPanel(ctk.CTkFrame):
         # Action Buttons
         # =====================================================================
         self._create_action_buttons()
+
+        # =====================================================================
+        # Up/Down arrow navigation between entries in the same grid column
+        # =====================================================================
+        self._wire_vertical_nav()
+
+    def _wire_vertical_nav(self) -> None:
+        """Bind arrow keys to move focus between editable entries in the grid.
+
+        Up/Down jump to the nearest entry in the same column.
+        Left/Right jump to the nearest entry in the same row, but only when the
+        cursor is already at the near edge of the current entry and no text is
+        selected — so normal text-cursor movement still works inside a field.
+        """
+        entries: List[ctk.CTkEntry] = []
+        entries.extend(self.dp_name_entries)
+        entries.extend(self.dp_entry_boxes)
+        entries.extend(self.interface_entries.values())
+
+        positioned: List[Tuple[int, int, ctk.CTkEntry]] = []
+        for entry in entries:
+            if str(entry.cget('state')) != 'normal':
+                continue
+            info = entry.grid_info()
+            if 'row' in info and 'column' in info:
+                positioned.append((int(info['row']), int(info['column']), entry))
+
+        def move_v(source: ctk.CTkEntry, direction: int) -> str:
+            info = source.grid_info()
+            cur_row = int(info['row'])
+            cur_col = int(info['column'])
+            candidates = [
+                (row, col, e) for row, col, e in positioned
+                if col == cur_col and (row - cur_row) * direction > 0
+            ]
+            if candidates:
+                target = min(candidates, key=lambda p: abs(p[0] - cur_row))
+                target[2].focus_set()
+            return 'break'
+
+        def move_h(source: ctk.CTkEntry, direction: int) -> Optional[str]:
+            if bool(getattr(source, 'selection_present', lambda: False)()):
+                return None  # let default clear the selection first
+            pos = int(source.index(tk.INSERT))
+            length = len(source.get())
+            at_edge = (direction < 0 and pos == 0) or (direction > 0 and pos == length)
+            if not at_edge:
+                return None  # normal cursor movement inside the field
+            info = source.grid_info()
+            cur_row = int(info['row'])
+            cur_col = int(info['column'])
+            candidates = [
+                (row, col, e) for row, col, e in positioned
+                if row == cur_row and (col - cur_col) * direction > 0
+            ]
+            if candidates:
+                target = min(candidates, key=lambda p: abs(p[1] - cur_col))
+                target[2].focus_set()
+                return 'break'
+            return None
+
+        for _, _, entry in positioned:
+            entry.bind('<Up>', lambda e, w=entry: move_v(w, -1))
+            entry.bind('<Down>', lambda e, w=entry: move_v(w, 1))
+            entry.bind('<Left>', lambda e, w=entry: move_h(w, -1))
+            entry.bind('<Right>', lambda e, w=entry: move_h(w, 1))
 
     def _create_interface_widgets(self) -> None:
         """Create interface parameter labels and entries."""
