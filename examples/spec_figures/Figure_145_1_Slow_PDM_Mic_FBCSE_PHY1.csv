@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,1
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,False
-RowRate,384
+RowRate,384.0
 Description,"Figure 145 illustrates that the absence of HandOver UIs with FBCSE PHY1 means that multiple streams can be packed efficiently without the need to increase bit clock frequency or use sample grouping, which would increase
 latency."
 RowsToDraw,4

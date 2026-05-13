@@ -82,6 +82,11 @@ class CSVLoadResult:
     unrecognized_fields: List[Tuple[int, str]] = field(default_factory=list)
     missing_fields: List[str] = field(default_factory=list)
     error_message: Optional[str] = None
+    # AppVersion string as written into the file, or None if the field wasn't present.
+    # Callers compare against MIN_COMPATIBLE_CSV_VERSION in src/version.py and
+    # warn when the file is older. Bump that constant (and revisit callers) when
+    # the CSV format gets a breaking change.
+    file_app_version: Optional[str] = None
 
 
 # =============================================================================
@@ -392,6 +397,12 @@ class CSVHandler:
                     if field_name == CSVFields.SAVE_FILE_USING_EXCESS_ONE:
                         continue
 
+                    # AppVersion is special: captured into the result so callers
+                    # can warn on legacy files or format mismatches.
+                    if field_name == 'AppVersion':
+                        result.file_app_version = row[1] if len(row) > 1 else ''
+                        continue
+
                     # Try interface parameter (exact match)
                     if field_name in CSVHandler._interface_field_dict:
                         found_interface_fields.add(field_name)
@@ -576,10 +587,15 @@ class CSVHandler:
             OSError: If file cannot be written
         """
         from src.config.constants import SpecialDevices
+        from src.version import APP_VERSION
         logger = logging.getLogger('swi3s_visualizer.io')
         try:
             with io.open(filename, 'w', encoding='utf8') as outfile:
                 writer = csv.writer(outfile, delimiter=',', lineterminator='\n')
+
+                # Stamp the current app version so future converters can detect
+                # files that predate a format change.
+                writer.writerow(['AppVersion', APP_VERSION])
 
                 # Write interface parameters using field map
                 for csv_field, attr_name, field_type in CSVHandler.INTERFACE_FIELD_MAP:

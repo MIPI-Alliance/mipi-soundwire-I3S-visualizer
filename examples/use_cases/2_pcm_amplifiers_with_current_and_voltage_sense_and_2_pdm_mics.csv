@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,15
 SkippingDenominator_REG,1
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,2 PCM amplifiers with current & voltage and 2 PDM microphones use case.
 RowsToDraw,65
 DeviceNumber_REG,0,0,0,0,1,1,0,2,3,0,0,0

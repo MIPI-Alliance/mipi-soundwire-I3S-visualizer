@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,23
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,False
-RowRate,3072
+RowRate,3072.0
 Description,Tests multiple intervals with non-zero offset - data at rows 1 5 9 not 0 4 8
 RowsToDraw,12
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0

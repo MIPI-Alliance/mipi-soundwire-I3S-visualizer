@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,5
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,"Figure 143 shows a simple Transport Pattern for transporting PDM data streams, e.g., from digital microphones.
 The samples are both produced and transported at a rate of one per Row, which results in low latency, but also lower
 bandwidth efficiency because of many HandOvers."

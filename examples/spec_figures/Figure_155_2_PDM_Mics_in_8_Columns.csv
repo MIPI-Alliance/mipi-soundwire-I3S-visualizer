@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,7
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,Figure 155 shows a typical example of 2 PDM Mic streams in a system using PHY3 (DLV) and 8 columns.
 RowsToDraw,7
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0

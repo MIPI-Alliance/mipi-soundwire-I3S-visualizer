@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,19
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,1
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,Figure 153 shows an example Transport Pattern with mixed PCM and PDM streams with PHY Tail bits. The Sync1 and Control Data Stream bits are followed by Tail bits in Columns 1 and 4 respectively. The Tail bits that would follow Manager Payload data bits in column 17 are suppressed because the Manager owns the next UI (column 18 for Sync0). The Tail bit is present in column 10 of Row4 because the Manager is ending its ownership of the bus. The Peripheral Payload data fitted into columns 12 through 15 of Row 4 is followed by a Tail bit before the bus is handed over to the Manager for the Sync0 in column 18.
 RowsToDraw,8
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0

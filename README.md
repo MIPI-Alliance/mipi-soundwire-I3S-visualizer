@@ -122,6 +122,22 @@ FlowMode_REG,0,1,2,...
 
 See `examples/` for example configurations.
 
+The first row of a saved CSV is always `AppVersion,<version>`, written so
+future converters can detect files that predate a format change. Loading a
+CSV with no AppVersion field — or with a version different from the running
+app — produces a warning; the load still proceeds.
+
+### Converting v1.74 CSVs
+
+The `csv_converter/` tool reads v1.74-format CSVs and writes the current
+format. See `csv_converter/README.md` for the full field mapping, defaults
+for new fields, and usage.
+
+```bash
+python3 csv_converter/convert_174.py <input.csv>         # → <input>_converted.csv
+python3 csv_converter/convert_174.py <input_dir>         # → <input_dir>_converted/
+```
+
 ### JSON Output
 
 The JSON frame model output contains:
@@ -166,6 +182,9 @@ mipi-soundwire-I3S-visualizer/
 │   ├── directed_tests/    # Targeted feature tests
 │   ├── spec_figures/      # Configurations from spec figures
 │   └── use_cases/         # Real-world use case examples
+├── csv_converter/         # CLI to convert v1.74 CSVs to the current format
+│   ├── convert_174.py
+│   └── README.md
 ├── test/
 │   ├── testsuite.py       # Test runner with summary generation
 │   ├── summary.md         # Test statistics (generated after each run)

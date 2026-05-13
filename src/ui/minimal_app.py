@@ -21,6 +21,7 @@ import customtkinter as ctk
 
 from src.models import Interface
 from src.models.bus_model import BusModel, BusModelJSONEncoder
+from src.models.enums import DisplayField
 from src.core.engine import BusModelBuilder
 from src.io.csv_handler import CSVHandler
 from src.viz import VizConfig
@@ -474,6 +475,7 @@ class MinimalApp(ctk.CTkFrame):
 
     def _load_csv(self, filename: str) -> None:
         """Load interface configuration from CSV file."""
+        from src.version import APP_VERSION, MIN_COMPATIBLE_CSV_VERSION, parse_version
         result = CSVHandler.load_csv(filename, self.interface, self.viz_config)
         if result.success:
             # Update parameter panel with loaded viz_config
@@ -487,6 +489,33 @@ class MinimalApp(ctk.CTkFrame):
 
             # Update file status notification
             self._set_file_status("Loaded", filename)
+
+            # Version warning. Files without AppVersion predate its introduction
+            # and warrant a warning. Files stamped by any version in the
+            # [MIN_COMPATIBLE_CSV_VERSION, APP_VERSION] range are compatible
+            # and silent. Bump MIN_COMPATIBLE_CSV_VERSION when the format gets
+            # a breaking change.
+            if result.file_app_version is None:
+                messagebox.showwarning(
+                    'File Version',
+                    "The CSV file has no AppVersion field; assuming it is a legacy file.\n"
+                    "If this was saved by the v1.74 visualizer, run csv_converter/convert_174.py first."
+                )
+            else:
+                try:
+                    file_ver = parse_version(result.file_app_version)
+                    if file_ver < parse_version(MIN_COMPATIBLE_CSV_VERSION):
+                        messagebox.showwarning(
+                            'File Version',
+                            f"CSV was saved by app version {result.file_app_version}; "
+                            f"conversion may be required (min compatible: {MIN_COMPATIBLE_CSV_VERSION})."
+                        )
+                except ValueError:
+                    messagebox.showwarning(
+                        'File Version',
+                        f"CSV AppVersion '{result.file_app_version}' could not be parsed; "
+                        f"this app is {APP_VERSION}."
+                    )
 
             if result.unrecognized_fields:
                 field_list = "\n".join([f"  Line {line}: '{name}'" for line, name in result.unrecognized_fields[:10]])
@@ -614,6 +643,7 @@ class MinimalApp(ctk.CTkFrame):
             dp_viz.name = f'DP{dp_index}'
             dp_viz.enabled = False
             dp_viz.enable_handover = True
+            dp_viz.display_fields = DisplayField.SAMPLE | DisplayField.CHANNEL
 
         # Reset interface "Other Parameters" to defaults
         self.interface.NumColumns_REG = 15  # 16 columns

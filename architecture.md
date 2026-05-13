@@ -131,6 +131,11 @@ src/
     └── dataport_viz.py     # VizConfig, DataPortVizConfig
 ```
 
+Outside `src/`, the repo also ships a standalone `csv_converter/` tool
+that reads legacy v1.74 CSVs and writes current-format files. It imports
+from `src.io.csv_handler` and `src.version` so it stays aligned with the
+live format. See `csv_converter/README.md`.
+
 ---
 
 ## Data Flow

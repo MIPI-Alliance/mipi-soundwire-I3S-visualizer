@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,"Figure 10 shows an example Transport Pattern with the same 4x 1-bit PDM streams as in Figure 9, but
 using sample grouping to transmit blocks of 4 bits from each stream, once every 4 Rows."
 RowsToDraw,6

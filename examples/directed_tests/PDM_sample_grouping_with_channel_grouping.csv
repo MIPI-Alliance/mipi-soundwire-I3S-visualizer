@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,23
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,"Here we have four PDM devices. Each has 2 channels enabled. We are sample grouping 2 samples per transport.
 This is read by an 8-channel sink dataport that then uses sample grouping and channel grouping."
 RowsToDraw,3

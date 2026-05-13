@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,31
 SkippingDenominator_REG,1
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,1536
+RowRate,1536.0
 Description,"Sub Row Interval test with two PDM mics, each mic writes twice per row.
 The sink data port SRI and channel grouping to read 4 times per row into a 4-channel data port."
 RowsToDraw,2

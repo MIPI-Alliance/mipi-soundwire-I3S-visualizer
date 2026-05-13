@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,15
 SkippingDenominator_REG,1
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,"Figure 11 - The audio streams in this Transport Pattern are:
 2 channels of 48 kHz × 24 bits (D1 and D2).
 4 channels of 48 kHz × 16 bits (D3, D4, D5, and D6).

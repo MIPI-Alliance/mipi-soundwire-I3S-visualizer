@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,1
 SkippingDenominator_REG,1
 PHY3Enabled,False
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,False
-RowRate,3072
+RowRate,3072.0
 Description,"Figure 159 and Figure 160 show example Transport Patterns where the Payload bandwidth remains unchanged, but the Control Data Stream bandwidth is reduced."
 RowsToDraw,4
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0

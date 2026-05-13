@@ -21,7 +21,7 @@ import json
 import sys
 from pathlib import Path
 
-APP_VERSION = '2.1.11'
+from src.version import APP_VERSION
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,6 +122,24 @@ def run_headless(args: argparse.Namespace) -> int:
     if not result.success:
         print(f"Error loading CSV: {result.error_message}", file=sys.stderr)
         return 1
+
+    # Version warning. Silent for files in [MIN_COMPATIBLE_CSV_VERSION, APP_VERSION].
+    # Update MIN_COMPATIBLE_CSV_VERSION in src/version.py when the format gets
+    # a breaking change so older files get flagged for conversion.
+    from src.version import MIN_COMPATIBLE_CSV_VERSION, parse_version
+    if result.file_app_version is None:
+        print("Warning: CSV has no AppVersion field; assuming legacy file "
+              "(run csv_converter/convert_174.py for v1.74 files)",
+              file=sys.stderr)
+    else:
+        try:
+            if parse_version(result.file_app_version) < parse_version(MIN_COMPATIBLE_CSV_VERSION):
+                print(f"Warning: CSV was saved by app version {result.file_app_version}; "
+                      f"conversion may be required (min compatible: {MIN_COMPATIBLE_CSV_VERSION})",
+                      file=sys.stderr)
+        except ValueError:
+            print(f"Warning: CSV AppVersion '{result.file_app_version}' could not be parsed",
+                  file=sys.stderr)
 
     # Warn about unrecognized fields
     if result.unrecognized_fields:

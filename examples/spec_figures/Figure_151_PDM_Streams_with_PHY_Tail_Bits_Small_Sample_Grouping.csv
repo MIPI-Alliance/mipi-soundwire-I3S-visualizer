@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,1
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,Figure 151 shows an example of trade-off between bandwidth and latency for PDM microphones in an environment that needs PHY Tail bits.
 RowsToDraw,7
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0

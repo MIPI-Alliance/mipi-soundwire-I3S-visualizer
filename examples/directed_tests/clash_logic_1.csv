@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,31
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -9,7 +10,7 @@ CDS_GuardEnabled_REG,True
 CDS_GuardPolarity_REG,True
 CDS_TailWidth_REG,1
 EnforceCDSHandover,True
-RowRate,3072
+RowRate,3072.0
 Description,"Test various clasg scenarios.
 We should see 14 bus clashes and 1 internal clash in the manager"
 RowsToDraw,12

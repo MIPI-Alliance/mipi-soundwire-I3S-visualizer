@@ -1,3 +1,4 @@
+AppVersion,2.1.12
 NumColumns_REG,23
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -9,12 +10,12 @@ CDS_GuardEnabled_REG,False
 CDS_GuardPolarity_REG,False
 CDS_TailWidth_REG,0
 EnforceCDSHandover,False
-RowRate,3072
+RowRate,3072.0
 Description,Tests FCP offset different from data offset - DRQ at row 4 while data at row 2
 RowsToDraw,16
-Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
-EnableCh_REG,0b1,0b1,0,0,0,0,0,0,0,0,0,0
+ManagerDataport,False,False,False,False,False,False,False,False,False,False,False,False
+EnableCh_REG,0b1,0b1,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0
 SampleSize_REG,7,7,0,0,0,0,0,0,0,0,0,0
 SampleGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ChannelGrouping_REG,0,0,0,0,0,0,0,0,0,0,0,0
@@ -27,13 +28,9 @@ TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 SkippingNumerator_REG,0,0,0,0,0,0,0,0,0,0,0,0
 PortDirection_REG,False,True,False,False,False,False,False,False,False,False,False,False
-EnforceHandover,False,False,False,False,False,False,False,False,False,False,False,False
 GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
 GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
 SubRowInterval_REG,False,False,False,False,False,False,False,False,False,False,False,False
-ManagerDataport,False,False,False,False,False,False,False,False,False,False,False,False
-Enabled,True,True,False,False,False,False,False,False,False,False,False,False
-DisplayFields,scb,scb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb
 FlowMode_REG,2,2,0,0,0,0,0,0,0,0,0,0
 PortMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
@@ -43,3 +40,7 @@ FCP_TailWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_Offset_REG,4,4,0,0,0,0,0,0,0,0,0,0
 FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
+Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
+EnforceHandover,False,False,False,False,False,False,False,False,False,False,False,False
+Enabled,True,True,False,False,False,False,False,False,False,False,False,False
+DisplayFields,scb,scb,cb,cb,cb,cb,cb,cb,cb,cb,cb,cb
