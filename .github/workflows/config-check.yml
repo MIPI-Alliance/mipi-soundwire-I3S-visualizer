@@ -1,0 +1,12 @@
+name: config-check
+
+# Validates this repository against its declared identity in .mipi/project.yml
+# (license <-> CLA <-> visibility), fail-closed, via the org reusable workflow.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  config-check:
+    uses: MIPI-Alliance/.github/.github/workflows/config-check.yml@main
