@@ -2,5 +2,7 @@
 # Each line is a file pattern followed by one or more owners.
 
 # These owners will be the default owners for everything in the repo.
-*	@roderickhogan @cirrus-jon @NielWarren
+# The @MIPI-Alliance/oss-maintainers team lets org admins approve PRs across
+# MIPI OSS projects; the named maintainers remain default owners as well.
+*	@roderickhogan @cirrus-jon @NielWarren @MIPI-Alliance/oss-maintainers
 
