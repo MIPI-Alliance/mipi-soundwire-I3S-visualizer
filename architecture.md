@@ -1,757 +1,399 @@
-# SWI3S Visualizer Architecture
+# SWI3S Studio — Architecture
 
-This document describes the architecture of the SWI3S Visualizer, a tool for visualizing MIPI SoundWire I3S data port configurations.
+A desktop **MIPI SoundWire I3S (SWI3S)** bus analyzer. It decodes captured PHY2
+traffic (clock + bidirectional data), reconstructs the control protocol and audio
+payload, and visualizes the 2D bus structure, the per-device register maps, and the
+decoded audio, out-of-core over large captures.
 
-## Table of Contents
+It has two engines, complementary and non-overlapping:
 
-1. [Overview](#overview)
-2. [Module Organization](#module-organization)
-3. [Data Flow](#data-flow)
-4. [Core Components](#core-components)
-   - [Model Layer](#model-layer)
-   - [Core Engine](#core-engine)
-   - [UI Layer](#ui-layer)
-5. [DataPort Architecture (Detailed)](#dataport-architecture-detailed)
-6. [FlowControlPort Architecture](#flowcontrolport-architecture)
-7. [Validators](#validators)
-8. [Key Design Patterns](#key-design-patterns)
-9. [Performance Optimizations](#performance-optimizations)
-10. [Appendix: SlotType Reference](#appendix-slottype-reference)
+- the **C++ wire decode** (`native/swi3score/core/`): NRZS, 8b/10b, CRC-16, Command
+  Transport Protocol, register snoop, SSP anchoring, LFSR descramble, audio sample
+  reconstruction, column auto-detect.
+- the **2D layout model** (`swi3s_studio/swviz/`): DataPort / FlowControlPort placement
+  (the normative §14.2.5 cascade), register/config model, CSV/JSON schema, slot
+  colouring, clash detection.
 
----
-
-## Overview
-
-The SWI3S Visualizer is a Python application that renders SoundWire I3S data port configurations. It supports:
-
-- **GUI Mode**: Interactive tkinter / customtkinter interface for real-time visualization
-- **Headless Mode**: Command-line batch processing for automated testing
-
-The architecture follows a clean separation between:
-- **Model Layer** (`src/models/`): Pure hardware models and algorithms, no UI dependencies
-- **Core Engine** (`src/core/`): Business logic that transforms configuration into bus model
-- **UI Layer** (`src/ui/`): Presentation and user interaction
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Entry Point                              │
-│                   swi3s_visualizer.py                           │
-│            (CLI parsing, mode selection)                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-    ┌─────────────────┐             ┌─────────────────┐
-    │   Headless Mode │             │    GUI Mode     │
-    │  (batch JSON)   │             │   (tkinter)     │
-    └────────┬────────┘             └────────┬────────┘
-             │                               │
-             └───────────────┬───────────────┘
-                             ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │                    Core Engine                               │
-    │               BusModelBuilder                                │
-    │    (Transforms Interface + VizConfig → BusModel)            │
-    └─────────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │                    Model Layer                               │
-    │   Interface, DataPort, FlowControlPort, Device, BusModel    │
-    │          (Pure data, no UI dependencies)                     │
-    └─────────────────────────────────────────────────────────────┘
-```
+The C++ `CDataPort`/`CFlowControlPort` placement is verified bit-exact against the
+Python placement model, so **one** placement engine (the C++ core) drives *both* audio
+reconstruction and the 2D grid — the algorithm is not duplicated.
 
 ---
 
-## Module Organization
+## 1. Decisions of record
 
-```
-src/
-├── __init__.py
-├── config/                 # Constants and configuration
-│   ├── __init__.py
-│   └── constants.py        # SpecialDevices, CSVFields, ranges
-│
-├── core/                   # Core engine (UI-independent)
-│   ├── __init__.py
-│   └── engine.py           # BusModelBuilder
-│
-├── drawing/                # Rendering support
-│   ├── __init__.py
-│   ├── canvas_renderer.py  # Tkinter canvas drawing
-│   └── clash_detector.py   # Bus clash detection (uses SlotOccupancyType)
-│
-├── io/                     # File I/O
-│   ├── __init__.py
-│   ├── csv_handler.py      # CSV load/save
-│   └── json_handler.py     # JSON export
-│
-├── models/                 # Data models (NO UI CODE — see CLAUDE.md policy)
-│   ├── __init__.py
-│   ├── bit_slot.py         # BitSlotData, BitSlotState
-│   ├── bus_model.py        # BusModel, BitInfo, ClashType
-│   ├── dataport.py         # DataPort, DataPortConfig, DataPortState
-│   ├── flow_control_port.py # FlowControlPort, FlowControlPortConfig, FlowControlPortState
-│   ├── device.py           # Device abstraction
-│   ├── enums.py            # SlotType, DirectionType, FlowMode, TransportPhase, PortMode, DisplayField
-│   ├── frame.py            # FrameModel (legacy grid representation, still used by renderer/json_handler)
-│   ├── interface.py        # Interface configuration (owns data_ports + flow_control_ports)
-│   └── manager.py          # System slot layout
-│
-├── ui/                     # User interface
-│   ├── __init__.py
-│   ├── minimal_app.py      # Main application window
-│   ├── app_ui.py           # UI composition
-│   ├── frame_renderer.py   # Frame visualization
-│   ├── parameter_panel.py  # Configuration widgets
-│   ├── error_panel.py      # Notifications/warnings
-│   ├── helpers.py          # UI utilities, tooltips
-│   ├── constants.py        # UI-specific constants
-│   ├── theme.py            # Color themes
-│   ├── dialogs/            # Modal dialogs
-│   │   ├── channel_selector.py
-│   │   ├── device_selector.py
-│   │   ├── flow_mode.py
-│   │   ├── guard_selector.py
-│   │   ├── port_mode.py
-│   │   └── display_options.py
-│   └── widgets/            # Reusable widgets
-│       └── tooltip.py
-│
-├── utils/                  # Utilities
-│   ├── __init__.py
-│   ├── descriptors.py      # ValidatedInt, ValidatedBool
-│   ├── logging_config.py   # Logging setup
-│   ├── platform.py         # Platform detection
-│   └── validators.py       # Ranges + settings validators (see Validators section)
-│
-└── viz/                    # Visualization config
-    ├── __init__.py
-    └── dataport_viz.py     # VizConfig, DataPortVizConfig
-```
-
-Outside `src/`, the repo also ships a standalone `csv_converter/` tool
-that reads legacy v1.74 CSVs and writes current-format files. It imports
-from `src.io.csv_handler` and `src.version` so it stays aligned with the
-live format. See `csv_converter/README.md`.
-
----
-
-## Data Flow
-
-### Configuration Loading
-
-```
-CSV File
-    │
-    ▼
-CSVHandler.load_csv()
-    │
-    ├──► Interface (hardware registers)
-    │        ├── NumColumns_REG, PHY3Enabled, etc.
-    │        ├── data_ports: List[DataPort]
-    │        └── flow_control_ports: List[FlowControlPort]  (parallel to data_ports)
-    │
-    └──► VizConfig (visualization settings)
-             ├── rows_to_draw
-             └── data_ports: List[DataPortVizConfig]  (enable_handover defaults True)
-```
-
-### Frame Building
-
-```
-Interface + VizConfig
-    │
-    ▼
-BusModelBuilder.build()
-    │
-    ├── 1. Validate interface configuration (InterfaceValidator)
-    │
-    ├── 2. Add system slots (S0, S1, CDS, tails, handovers)
-    │
-    ├── 3. Process data ports by device priority
-    │       │
-    │       └── For each enabled data port:
-    │               │
-    │               ├── DataPortValidator.validate() — ranges + settings
-    │               │
-    │               ├── dp.initialize()   # Seed DP state, advance into interval 0
-    │               ├── fcp.initialize()  # Seed FCP state
-    │               │
-    │               └── For each bit position (row, column):
-    │                       │
-    │                       ├── dp.clock_tick()   # DP advances one UI, drives device.write_*/read_*/held_*
-    │                       ├── fcp.clock_tick()  # FCP advances one UI, drives device.write_drq/read_drq/held_*
-    │                       │
-    │                       │   Before each tick, engine sets device._active_port and clears
-    │                       │   device._current_slot; each write_*/read_*/held_* hook records
-    │                       │   a BitSlotState into _current_slot. None after the tick = EMPTY.
-    │                       │
-    │                       └── Both written to BusModel; bus model's SAME_DEVICE clash
-    │                           detector surfaces any (DP, FCP) overlap
-    │
-    ├── 4. Generate handover indicators (post-processing pass)
-    │
-    ├── 5. Validate TxP/DRQ pairs
-    │
-    └── 6. Finalize clashes and warnings
-            │
-            ▼
-        BusModel
-            ├── bits: List[BitInfo]
-            ├── bus_clashes, device_clashes
-            ├── txp_mismatches, drq_mismatches
-            └── validation_issues
-```
-
-### Rendering (GUI Mode)
-
-```
-BusModel
-    │
-    ▼
-FrameRenderer.render()
-    │
-    ├── Iterate rows
-    │       │
-    │       └── Get bits for row from BusModel
-    │               │
-    │               └── Merge consecutive same-slot bits
-    │                       │
-    │                       └── Draw on canvas
-    │
-    └── Apply clash highlighting
-```
-
----
-
-## Core Components
-
-### Model Layer
-
-The model layer is **strictly UI-independent**. No tkinter imports, no dialogs, no message boxes. This allows:
-- Headless batch processing
-- Unit testing without GUI
-- Future web or CLI interfaces
-
-Additionally, `dataport.py` and `flow_control_port.py` are **hardware models** (see `CLAUDE.md` — Hardware Model Policy). They hold only state a real chip would hold — registers, transport/row counters, phase, channel/bit pointers. No engine-helper state (cross-interval counters, transport-index tracking, or flags that exist solely to signal the engine) lives in these modules.
-
-#### Interface (`src/models/interface.py`)
-
-Top-level configuration container:
-
-```python
-class Interface:
-    # Frame structure
-    NumColumns_REG: int          # Columns per row (excess-1)
-    phy3_enabled: bool           # PHY3 mode (S0/S1 enabled)
-
-    # System slot timing
-    s0_width, s1_width: int
-    CDS_BitWidth_REG: int
-    tail_width: int
-
-    # Device management
-    devices: Dict[int, Device]   # Device number → Device
-    data_ports: List[DataPort]              # 12 DPs (derived property)
-    flow_control_ports: List[FlowControlPort]  # 12 FCPs, parallel index
-```
-
-The parallel `flow_control_ports` list is owned by `Interface` (not `DataPort`) so that the DP stays a pure hardware model. Each FCP stores a back-reference to its parent DP to read `FlowMode_REG`, `PortDirection_REG`, and `Interval_REG`.
-
-#### Device (`src/models/device.py`)
-
-Device abstraction for grouping data ports:
-
-```python
-class Device:
-    device_num: int              # -1=Manager, -2=Universal, 0-11=Peripheral
-    _data_ports: List[DataPort]
-
-    @property
-    def priority(self) -> int:   # Processing order (Manager=0, then peripherals)
-```
-
-Special device numbers:
-- `-1` (MANAGER): System manager, processes first
-- `-2` (UNIVERSAL): CDS system slots
-- `-3` (VISUALIZER): Handover indicators (post-processing)
-- `0-11`: Peripheral devices
-
-#### BusModel (`src/models/bus_model.py`)
-
-Sequential bus representation:
-
-```python
-@dataclass
-class BitInfo:
-    bit_index: int               # Global index (row * num_columns + column)
-    slot: SlotType               # DATA, GUARD_0/1, TAIL, CDS, DRQ, TX_PRESENT, etc.
-    direction: DirectionType     # SOURCE (write) or SINK (read)
-    device: int                  # Device number
-    dp: Optional[int]            # Data port index (None for system slots)
-    sample, channel, bit: int    # Data position within stream
-    clash: ClashType             # NONE, SAME_DEVICE, DIFFERENT_DEVICE
-
-@dataclass
-class BusModel:
-    num_rows, num_columns: int
-    bits: List[BitInfo]
-    bus_clashes: List[int]
-    device_clashes: List[int]
-    validation_issues: List[Tuple[str, ValidationResult]]
-    # ... other validation categories
-```
-
-### Core Engine
-
-#### BusModelBuilder (`src/core/engine.py`)
-
-Transforms configuration into bus model. Composes DP and FCP emissions — both are iterated once per column:
-
-```python
-class BusModelBuilder:
-    def __init__(self, interface, num_rows, viz_config):
-        self.interface = interface
-        self.num_rows = num_rows
-        self.viz_config = viz_config
-        self.clash_detector = ClashDetector(interface.num_columns)
-        self.bus_model = BusModel(num_rows, interface.num_columns)
-        self._dp_validator = DataPortValidator(interface)  # Reused across DPs
-
-    def build(self) -> BusModel:
-        self._validate_interface()
-        self._add_system_slots()
-        for device in priority_order:
-            for dp in device.data_ports:
-                self._process_data_port(dp)        # Iterates DP + FCP in lock-step
-        self._generate_viz_handovers()
-        self._finalize_clashes()
-        return self.bus_model
-```
-
-The engine maintains a small amount of state per DP for visualization-only concerns that the hardware model intentionally does NOT track — most notably a transport index used to reconstruct absolute sample ordinals, and the bits-emitted counter used to detect SRI row-cut resumes (see [DataPort Architecture](#dataport-architecture-detailed)).
-
-### UI Layer
-
-#### FrameRenderer (`src/ui/frame_renderer.py`)
-
-Canvas-based frame visualization:
-
-```python
-class FrameRenderer:
-    def render(self, bus_model: BusModel, canvas: tk.Canvas):
-        for row in range(bus_model.num_rows):
-            bits = bus_model.get_bits_in_row(row)
-            merged = self._merge_consecutive_bits(bits)
-            for merged_bit in merged:
-                self._draw_slot(canvas, merged_bit)
-```
-
----
-
-## DataPort Architecture (Detailed)
-
-The `DataPort` class (`src/models/dataport.py`) implements the hardware state machine that advances one UI per call. The engine invokes `dp.clock_tick()` for every column; the DP drives `device.write_*`/`read_*`/`held_*` hooks which record the `BitSlotState` the visualizer renders into `Device._current_slot`.
-
-### Class Structure
-
-```
-DataPort
-    │
-    ├── config: DataPortConfig    # Register values + derived properties
-    ├── state: DataPortState      # Runtime state (column, row, phase, counters)
-    │
-    └── Public API:
-            initialize()         → hardware init / arm first interval
-            clock_tick()         → advance one UI; drives device.write_*/read_*/held_* for the current slot
-
-Consumers that need row-within-interval or interval-skipped status read `dp.state.row_in_interval` / `dp.state.interval_skipped` directly — there are no pass-through properties on `DataPort`.
-```
-
-There is no separate algorithm class — the state machine methods live directly on `DataPort`. Bus I/O is delegated to the parent `Device` via no-arg methods (`device.write_data_bit_from_fifo()`, `device.held_write_bit()`, `device.read_data_bit_to_fifo()`, `device.write_txp()`, `device.read_txp()`, `device.write_guard0/1()`, `device.write_tail()`). Each hook records a `BitSlotState` into `Device._current_slot` describing the slot the DP just drove; the default `held_write_bit` hook extends the most recent slot recorded for the active port (stored per-port in `Device._last_slot_per_port`). Sink wide bits are **sparse** on the bus: the DP records exactly one bit slot per wide bit, on the **last** UI (when `wide_bit_remaining == 0`, matching real hardware's sample point); held UIs emit nothing. The engine sets `Device._active_port` before each tick and reads `_current_slot` after — `None` means EMPTY. Hardware-realistic harnesses can subclass `Device` to additionally drive a real bus.
-
-### DataPortConfig
-
-Holds register values and derived properties. Derived values (like enabled channel count, effective channel grouping) live as `@property` methods so they always reflect the current register state:
-
-```python
-class DataPortConfig:
-    # Hardware registers (from CSV / UI)
-    EnableCh_REG: int            # 16-bit channel enable bitmask (plain int)
-    SampleSize_REG: int          # Bits per sample (excess-1)
-    Interval_REG: int            # Rows per interval
-    HorizontalStart_REG: int
-    HorizontalCount_REG: int     # Excess-1: window = [HStart, HStart + HCount]
-    ChannelGrouping_REG: int
-    Spacing_REG: int
-    SubRowInterval_REG: bool
-    FlowMode_REG: int            # 0=Normal, 1=TxCtrl, 2=RxCtrl, 3=Async
-    PortDirection_REG: bool      # True=Sink, False=Source
-    # ... plus BitWidth_REG, Offset_REG, TailWidth_REG, GuardEnable_REG,
-    #         GuardPolarity_REG, SkippingNumerator_REG, PortMode_REG, ScramblerEn_REG
-
-    # `EnableCh_REG` is a plain int bitmask; no cache.
-
-    @property
-    def _num_channels(self) -> int:
-        """Count of enabled channels (popcount of EnableCh_REG)."""
-        return bin(self.EnableCh_REG).count('1')
-
-    @property
-    def _effective_channel_grouping(self) -> int:
-        """ChannelGrouping_REG clamped to num_channels when register is 0.
-
-        ChannelGrouping_REG must be <= NumChannels (configuration constraint,
-        enforced by the validator). A value of 0 means "one group of all channels".
-        """
-        return self._num_channels if self.ChannelGrouping_REG == 0 else self.ChannelGrouping_REG
-
-    @property
-    def _is_source(self) -> bool:
-        """True iff this DP drives data onto the bus (PortDirection_REG: False=source, True=sink)."""
-        return not self.PortDirection_REG
-
-    @property
-    def _txp_enabled(self) -> bool:
-        """True iff FlowMode prepends a TX_PRESENT slot before each (channel, sample)'s DATA bits."""
-        return self.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC)
-
-    @property
-    def _drq_enabled(self) -> bool:
-        """True iff FlowMode activates the FCP's DRQ path."""
-        return self.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
-```
-
-### DataPortState
-
-Mutable runtime state. `DataPortState.initialize(config)` seeds every field from the current register values (delegating transport-scope fields to `initialize_transport(config)`); `DataPort.initialize()` chains it with the first interval-start (`_start_interval`) so the DP is ready to emit:
-
-```python
-class DataPortState:
-    # Position (column is row-local; row_in_interval is interval-local)
-    column: int
-    row_in_interval: int
-
-    # Transport lifecycle
-    transport_phase: TransportPhase # PENDING | ACTIVE | SPACING | ROW_DONE | PATTERN_DONE
-    interval_skipped: bool          # Latched by _advance_skipping_accumulator at interval start
-
-    # Skipping accumulator persists across intervals (not reset per interval)
-    skipping_accumulator: int
-
-    # Transport-scope counters (set by DataPortState.initialize_transport)
-    sample_in_group: int            # 0..SampleGrouping_REG within current transport
-    samples_in_group_remaining: int
-    channel_index: int
-    channel_group_base_channel: int
-    channels_in_group_remaining: int
-    bit_in_channel: int             # Current bit position within (channel, sample)
-    wide_bit_remaining: int         # Innermost cascade counter
-    txp_pending: bool               # True → next emission is TX_PRESENT (not DATA)
-    spacing_slots_remaining: int
-
-    # Post-data emission (primed after each owned source-port slot; drained
-    # by _pop_guard_tail on subsequent not-owned columns)
-    guard_pending: bool             # One GUARD UI pending
-    tail_remaining: int             # Remaining TAIL UIs (fresh tail on first, held on rest)
-```
-
-There is no `channel_group_size` state field — the current group size comes from `config._effective_channel_grouping`, computed on demand.
-
-**Sample tracking is external to DataPort.** `DataPortState` holds only `sample_in_group` (transport-scoped, 0..SG). The engine maintains a per-DP transport counter by observing DP state transitions. Fresh-transport detection is produced by the model itself (not re-derived in the engine): `Device._build_dp_slot` tests the unique post-`initialize_transport` signature when building a DATA or TX_PRESENT slot and stamps `BitSlotState.fresh_transport = True`. The test is direction-aware — a source fires on the first UI of a wide bit (`wide_bit_remaining == BitWidth_REG`), a sink fires on the last UI (`wide_bit_remaining == 0`), matching each direction's actual emission point. The engine reads `bit_slot.fresh_transport` off the tick result and distinguishes SRI row-cut resumptions from genuine new transports by comparing bits-emitted to the full transport bit count. The absolute/global sample ordinal in labels is reconstructed externally:
-
-```
-bits_per_transport = _num_channels
-                   × (SampleSize_REG + 1 + (1 if _txp_enabled else 0))
-                   × (SampleGrouping_REG + 1)
-                   × (BitWidth_REG + 1)
-
-global_sample = max(0, transport_index_at_emit - 1) × (SampleGrouping_REG + 1)
-              + sample_in_group
-```
-
-This matches real hardware, where the DP tracks only its position within the current transport pattern and has no knowledge of cross-interval sample ordinals (those are a DMA/source-side concept).
-
-### Counter Cascade
-
-The state machine is a nested counter cascade. Each `_advance_*` method checks its counter: if zero, reset from config and cascade to the next-outer counter; otherwise decrement. Counters are monotonically non-negative (no transient `-1` sentinels):
-
-```
-wide_bit → bit_in_channel → channel → sample → channel_group → transport completion
-```
-
-```python
-def _advance_wide_bit(self) -> None:
-    if self.state.wide_bit_remaining == 0:
-        self.state.wide_bit_remaining = self.config.BitWidth_REG
-        self._advance_bit_in_channel()
-    else:
-        self.state.wide_bit_remaining -= 1
-
-def _advance_bit_in_channel(self) -> None:
-    if self.state.txp_pending:
-        self.state.txp_pending = False
-        return                       # TxP fires once per (channel, sample); no bit decrement
-    if self.state.bit_in_channel == 0:
-        self.state.bit_in_channel = self.config.SampleSize_REG
-        self._advance_channel()
-    else:
-        self.state.bit_in_channel -= 1
-
-def _advance_channel(self) -> None:
-    self.state.txp_pending = self.config._txp_enabled   # Re-arm for next (channel, sample)
-    if self.state.channels_in_group_remaining == 0:
-        self.state.channel_index = self.state.channel_group_base_channel
-        self.state.channels_in_group_remaining = self.config._effective_channel_grouping - 1
-        self._advance_sample()
-    else:
-        self.state.channel_index += 1
-        self.state.channels_in_group_remaining -= 1
-
-def _advance_sample(self) -> None:
-    if self.state.samples_in_group_remaining == 0:
-        self.state.sample_in_group = 0
-        self.state.samples_in_group_remaining = self.config.SampleGrouping_REG
-        self._advance_channel_group()
-    else:
-        self.state.sample_in_group += 1
-        self.state.samples_in_group_remaining -= 1
-```
-
-`_advance_channel_group` first checks whether the transport pattern is complete and not in SRI — if so, it sets `transport_phase = PATTERN_DONE` and returns. Otherwise it re-inits the transport (SRI re-entry) or advances to the next channel group, then sets `spacing_slots_remaining = Spacing_REG - 1` with phase `SPACING` (counter decrements to 0 before phase returns to ACTIVE), or `ROW_DONE` when `Spacing_REG` is 0.
-
-Every new interval triggers `_start_interval` on `DataPort`, which latches the skipping decision (via `_advance_skipping_accumulator`) and calls `state.initialize_transport(config)` to seed the transport-scope fields (including `transport_phase = PENDING`). The PENDING → ACTIVE promotion now happens lazily on first emission inside `clock_tick()`, not eagerly at interval start — see "Transport Phase Lifecycle" below.
-
-### Transport Phase Lifecycle
-
-`TransportPhase` has five values:
-
-| Phase | Meaning |
+| Area | Decision |
 |---|---|
-| `PENDING` | Transport-scope counters seeded; persists until the first bit actually emits |
-| `ACTIVE` | Emitting data inside the horizontal window |
-| `SPACING` | Inter-channel-group / SRI inter-transport gap (counter > 0) |
-| `ROW_DONE` | Horizontal window closed on this row; transport still alive |
-| `PATTERN_DONE` | Transport complete or interval skipped |
+| GUI / rendering | **PySide6 (Qt 6)** + **pyqtgraph**; `QGraphicsView` for the 2D grid; Qt model/view for tables |
+| Decode engine | **Reuse the verified C++ decode** via a **pybind11** module (`swi3score`); the per-UI hot loop stays in C++ |
+| Column-count / CDS alignment | **Not signalled on the wire** — recovered by *hypothesize-and-validate* (`CColumnDetector`): score each candidate (even count 2–32 × Column-0 phase) by CRC-valid CDS command phases; best wins. **Commit-independent** — needs only some CRC-valid CDS traffic. |
+| Inputs | **Logic 2 `.sal` project**, **per-channel `<SALEAE>` binary** pair, **Saleae digital CSV** (`Time,Clock,Data`), **visualizer CSV/JSON config**. (`.sal` is wired to Open via `ingest/saleae_sal` — pick the clock/data channels; v0 and single-/multi-chunk v3 digital blobs decode, with v0 pre-trigger times rebased so they don't wrap.) |
+| Capture scale | **Minutes / multi-GB** — out-of-core: memory-map inputs, streaming decode, on-disk indexed results, render from pyramids |
+| Live capture | **Offline first**, architected live-ready (streaming decode, bounded buffers, partial results) |
+| Platforms | **macOS-first, fully cross-platform** (Qt + portable pybind11 build); package later (PyInstaller/briefcase) |
+| Register map | **Extracted from the SWI3S spec** → structured JSON; single source of truth for the register view *and* address→field-name resolution |
+| Results store | **Apache Arrow/Parquet** (commands) + **`np.memmap`** arrays with **min/max pyramids** (audio) + an **event log with checkpoints** (register state) |
+| Saleae plugin | **Kept**, as a separate build target sharing the same core lib |
 
-`PENDING` is set by `DataPortState.initialize_transport` whenever the transport-scope fields are (re-)seeded. It is a **meaningful** phase that can be visible at `clock_tick` time: `DataPort._start_interval` does **not** promote it, and `clock_tick`'s emit branch is the sole promoter (PENDING → ACTIVE on the first bit that actually goes on the bus). This keeps the "armed but not yet emitting" window observable — important when an interval arms mid-row but the first emission slot is still several columns away.
+---
 
-`ROW_DONE` means the window closed mid-pattern — on row wrap it flips back to `ACTIVE` so the fresh row resumes emission. This covers both SRI row-cuts and non-SRI multi-row transports. `PATTERN_DONE` persists until the next row-counter rollover, where `_start_interval` arms a fresh transport (or latches `interval_skipped` if the skipping accumulator says this interval is skipped).
-
-**Normal Mode** (one transport per interval):
-
-```
-Row N:     [ACTIVE] ─(all CGs done)─> [PATTERN_DONE]
-              │
-              v
-         [ROW_DONE]    (column > _horizontal_end on this row)
-              │
-         (row wrap, still mid-interval)
-              v
-          [ACTIVE]     (next row resumes window)
-
-Row wrap:  [PATTERN_DONE] ─(row-counter rollover → _start_interval)─> [ACTIVE]
-```
-
-**SRI Mode** (multiple transports per row):
+## 2. Layered architecture
 
 ```
-Col C:   [ACTIVE] ─(CG done)─> [SPACING] ─(counter == 0)─> [ACTIVE] ...
-                                    │
-                                    └──(column > _horizontal_end)──> [ROW_DONE]
-                                                                         │
-                                                          (row wrap)     v
-                                                                    [ACTIVE]
+┌────────────┐   ┌─────────────────────────┐   ┌──────────────────┐   ┌────────────────┐
+│  ingest    │──►│  swi3score (C++/pybind11)│──►│  results store   │──►│  UI (PySide6)  │
+│  (python)  │   │  decode loop (verbatim,  │   │  (python)        │   │  dockable      │
+│  .sal      │   │   Saleae deps removed)   │   │  Arrow + memmap  │   │  panels +      │
+│  CSV       │   │  register model, SSP,    │   │  pyramids +      │   │  one shared    │
+│  config    │   │  descramble, audio       │   │  time index +    │   │  time cursor   │
+│            │   │  via ISampleSource       │   │  reg-event log   │   │                │
+└────────────┘   └─────────────────────────┘   └──────────────────┘   └────────────────┘
 ```
 
-### clock_tick() Flow
-
-`clock_tick()` is the single public entry point for UI advance. It has three paths, gated by a positive `in_transport_window` check (`num_channels > 0` AND `not interval_skipped` AND `transport_phase ∉ {ROW_DONE, PATTERN_DONE}` AND `row_in_interval >= Offset_REG` AND `column >= HorizontalStart_REG`):
-
-1. **Window-exhausted / SPACING** — in transport window but past `_horizontal_end` or in SPACING: flip phase (→ROW_DONE / decrement spacing_slots / →ACTIVE), fall through to drain.
-2. **Owned slot** — DATA or TX_PRESENT. Source drives `device.write_txp()`/`write_data_bit_from_fifo()` on the first UI of the wide bit (`wide_bit_remaining == BitWidth_REG`) and `device.held_write_bit()` on subsequent UIs. Sink calls `device.read_txp()`/`device.read_data_bit_to_fifo()` on the **last** UI of the wide bit (`wide_bit_remaining == 0`, hardware's actual sample point) and emits nothing on held UIs — so sink wide bits are sparse on the bus (one recorded slot per wide bit, not one per UI). If this branch runs while `transport_phase == PENDING`, the phase is promoted to `ACTIVE` before the hook fires. Then `_advance_wide_bit()`, `_arm_guard_tail()`, advance column, return.
-3. **Drain** — not owned (gated, window-exhausted, or SPACING): `_pop_guard_tail()` emits any pending GUARD (one UI) then TAIL (`TailWidth_REG` UIs; fresh `write_tail()` on first, `held_write_bit()` on rest). Always advance column.
-
-Each hook records a `BitSlotState` into `Device._current_slot`; `held_write_bit` reuses the most recent slot recorded for the active port (stored in `Device._last_slot_per_port`, with `fresh_transport` forced to `False` on the held copy so only the originating emission carries that flag). The `_last_slot_per_port` cache is cleared at the start of each `_process_data_port` run so state cannot leak across ports. Sinks have no held variant — sink wide bits are sparse (one slot on the last UI, nothing on the others). The engine reads `_current_slot` after each tick and treats `None` as `EMPTY`. Hardware-realistic harnesses subclass `Device` to additionally drive a real bus.
-
-The wide-bit hold is handled by the innermost cascade counter (`wide_bit_remaining`): the same bit emits for `BitWidth_REG + 1` UIs before the bit cursor advances.
-
-### Channel Grouping
-
-Channel grouping creates a burst/space pattern within the transport:
+Module map (proposed package `swi3s_studio/`):
 
 ```
-ChannelGrouping=2, NumChannels=4, Spacing=2
-
-[Ch0][Ch1] [--] [--] [Ch2][Ch3] [--] [--]
-└─group 1─┘ └spacing─┘ └─group 2─┘ └spacing─┘
-```
-
-With sample grouping, each channel group processes multiple samples before spacing:
-
-```
-ChannelGrouping=2, SampleGrouping=1 (2 samples), Spacing=2
-
-[Ch0.S0][Ch1.S0][Ch0.S1][Ch1.S1] [--][--] [Ch2.S0][Ch3.S0][Ch2.S1][Ch3.S1]
-└────────────── group 1 ───────────────┘ └────── group 2 ─────────────────┘
+swi3s_studio/
+  core/            # thin python wrapper over the swi3score pybind11 module
+  ingest/          # SalReader, CsvReader, ConfigReader -> ISampleSource
+  store/           # CommandStore (Arrow), AudioStore (memmap+pyramid), RegisterTimeline, TimeIndex
+  model/           # Interface, DataPort, FlowControlPort, Device, BusModel (adapted from visualizer)
+                   # RegisterMap (driven by data/registers.json), provenance tracking
+  analysis/        # link_control, cds_meaning, bus_timing (measured setup/hold eye),
+                   # compare, responses (incl. per-device ping), errors
+  dsp/             # band-limited polyphase resampler + PDM→PCM decimation (resample.py)
+  timing/          # ported SWI3S PHY timing calculator (compute + worst-corner)
+  ui/
+    main_window.py # dockable layout, menu, session
+    grid_view.py   # 2D bus grid (QGraphicsView)
+    symbol_view.py # color-coded 8b/10b CDS symbols
+    command_table.py
+    register_view.py
+    audio_view.py  # pyqtgraph waveforms + WAV export + QAudioSink playback
+    eye_view.py    # measured setup/hold + eye histograms
+    timeline.py    # whole-capture overview ribbon
+    cursor.py      # shared TimeCursor + VisibleRange (synchronized navigation)
+  export/          # WAV, CSV/Arrow, SVG/PNG
+  data/
+    registers.json # register map from the SWI3S spec (source of truth)
+  app.py           # entry point
+native/
+  swi3score/       # pybind11 bindings + ISampleSource/Decoder
+    core/          # vendored SWI3S decode core (was SwI3sAnalyzer/source) — standalone
+  CMakeLists.txt   # builds the python module (scikit-build-core)
+tests/
 ```
 
 ---
 
-## FlowControlPort Architecture
+## 3. Shared decode core
 
-The `FlowControlPort` class (`src/models/flow_control_port.py`) emits DRQ + optional guards/tails in `RX_CONTROLLED` / `ASYNC` flow modes. It is an **independent peer** of the DataPort on the bus — both are iterated by the engine in lock-step, and any overlap is surfaced by the bus model's SAME_DEVICE clash detector (no arbitration lives in the core loop).
+The decode classes are **vendored** in `native/swi3score/core/` (so the repo builds
+standalone; see that folder's README for provenance + the file list). They are
+already almost SDK-free — they use `LogicPublicTypes.h` only for `U8`/`U16`/`BitState`.
+The *single* coupling to Saleae is `CBitstreamDecoder`, which pulls bits from
+`AnalyzerChannelData` (not vendored; replaced by `ISampleSource`).
 
-The FCP mirrors the DataPort's hardware-model structure: it owns its own `column` / `row_in_interval` tracking, exposes a single `initialize()` / `clock_tick()` public API, and uses a DRQ replay sentinel (`drq_sent and wide_bit_remaining >= 0`). Its emissions are recorded into `Device._current_slot` through the same hooks the DP uses (DRQ-specific `write_drq`/`read_drq`, and shared `held_write_bit`/`write_guard0/1`/`write_tail`) — the engine sets `Device._active_port = fcp` before each FCP tick so the hooks know whose slot they are building.
+**Refactor:** introduce an abstract sample source
 
-### Class Structure
-
+```cpp
+class ISampleSource {
+public:
+    // Advance to the next clock edge; report whether it was rising and the
+    // data-line level for the UI it ends. Returns false at end of capture.
+    virtual bool NextUi(bool& rising, bool& dataHigh, uint64_t& sampleNumber) = 0;
+    virtual uint64_t SampleRateHz() const = 0;
+    virtual ~ISampleSource() = default;
+};
 ```
-FlowControlPort
-    │
-    ├── config: FlowControlPortConfig   # FCP-specific registers (FCP_*_REG)
-    ├── state: FlowControlPortState     # column, row_in_interval, drq_sent,
-    │                                   #   wide_bit_remaining, guard_pending, tail_remaining
-    ├── _dataport: DataPort             # Back-ref for FlowMode / PortDirection / Interval / _is_source
-    │
-    └── Public API:
-            initialize()         → reset FCP state
-            clock_tick()         → advance one UI; drives device.write_drq/read_drq/held_*/write_guard0_1/write_tail
-```
 
-### Emission Priority
+`CBitstreamDecoder` is rewritten against `ISampleSource` (it already exposes the
+exact edge/level/rewind semantics the decoder needs). **Everything downstream is
+reused verbatim**: `CNrzsDecoder`, `C8b10bDecoder`, `CColumnDetector`,
+`CCommandTransportParser`, `CRegisterModel`, `CDataPort`, `CFlowControlPort`,
+`CPayloadEngine`, `CDescrambler`, `CCrc16`, `SwI3sProtocolDefs`.
 
-`clock_tick()` evaluates three paths in strict order:
+The core is built **twice** from one source tree:
+- **`swi3score`** — pybind11 python module for Studio (no Saleae SDK).
+- **`SwI3sAnalyzer`** — the Saleae plugin (adds the `AnalyzerChannelData` sample
+  source + FrameV2 emission). Unchanged behaviour.
 
-1. **Wide-bit replay** — `drq_sent and wide_bit_remaining > 0`: a prior DRQ is still on the bus. Source DRQ drives `device.held_write_bit()` every UI. Sink DRQ is sparse on the bus like sink DP data — it calls `device.read_drq()` only on the **last** UI of the wide bit (`wide_bit_remaining == 1`, hardware's sample point) and emits nothing on held UIs. Then `_advance_wide_bit()` (pure decrement) and advance column.
-2. **Fresh DRQ trigger** — `_drq_enabled` AND `not dp.state.interval_skipped` AND `not drq_sent` AND column/row match `(FCP_HorizontalStart_REG, FCP_Offset_REG)`. Source DRQ writes `device.write_drq()`; sink DRQ calls `device.read_drq()` (only when `FCP_BitWidth_REG == 0`; wide sink DRQ reads at the last replay UI instead). Then `_arm_drq_repeat()` sets `drq_sent`, primes guard/tail pending via `_arm_guard_tail()`, and seeds `wide_bit_remaining = FCP_BitWidth_REG` (the count of replay UIs still to emit).
-3. **Drain** — otherwise, emit one guard via `device.write_guard0()`/`write_guard1()` (flipping `guard_pending`) or one tail via `device.write_tail()` (first) / `device.held_write_bit()` (subsequent), then advance column. Drain is a no-op on sink DRQ (guard/tail only apply to source DRQ).
+### Column-count / CDS-column detection
 
-DRQ direction is inverted relative to DP data direction: Sink DP → DRQ SOURCE (FCP writes onto bus); Source DP → DRQ SINK (FCP samples bus). `Device._drq_direction()` resolves this from the parent DP's `PortDirection_REG` when building the DRQ slot.
+SWI3S does **not** signal the column count on the wire — the spec (`{ASW3713}`)
+says a receiver must "try all possible Column Counts until it reattaches" — so
+`CColumnDetector` recovers it by **hypothesize-and-validate**. This is
+**commit-independent**: commits are just one CDS command; detection keys off *any*
+CRC-valid Control-Data-Stream traffic (pings, register ops, config, …).
 
-### Lifecycle
+From a bounded leading window of raw data-line levels (one per UI, starting on the
+first rising clock edge; `kDetectWindow` UIs), it tries every legal PHY2 count
+(even, 2–32) × every Column-0 **phase offset** (even offsets only — Column 0 lands
+on a rising edge, so it falls on an even window index; the offset disambiguates
+*which* rising-edge UI opens the row when >2 columns fall on rising edges). For each
+`(count, offset)` it lifts the Column-0 bit at indices where `(i − offset) % count
+== 0`, **NRZS-decodes** it against the preceding UI (same level → 1, toggle → 0),
+and feeds the reconstructed CDS bit stream to `CCommandTransportParser`; the score
+is the number of **CRC-16-valid** command phases. Highest score wins (a wrong
+count/phase almost never validates a CRC); below ~2 valid phases it returns nothing
+and the decoder falls back to the cold-start column count (so a *truly silent* CDS
+also falls back). Column 0 then recurs every `column_count` UIs from that anchor;
+the Raw-Capture view marks each Row-Sync-Point rising edge from the same segment
+geometry (`session.cds_column_samples`). A mid-stream geometry change re-runs the
+same detection (resync watchdog), producing one segment per width.
 
-- **`_advance_column`** → wraps to `_advance_row` at the right edge.
-- **`_advance_row`** → clears `guard_pending`/`tail_remaining` and sets `wide_bit_remaining = 0` so any in-progress DRQ replay terminates at the row boundary (the `wide_bit_remaining > 0` gate fails on next tick). `drq_sent` persists across rows so a DRQ can only fire once per interval.
-- **`_start_interval`** → calls `FlowControlPortState.initialize_transport()`, which clears `drq_sent` so the next interval's DRQ can fire and zeros `wide_bit_remaining`.
-- **`_advance_wide_bit`** → pure decrement; terminal (unlike DP's cascade). `wide_bit_remaining` counts from `FCP_BitWidth_REG` down to 0 across replay ticks and stays non-negative throughout — no sentinel value.
+### pybind11 surface
 
-Because FCP owns its own row/interval counters, the engine no longer passes `column` / `row_in_interval` into `clock_tick()` and no longer orchestrates per-row or per-interval reset callbacks.
-
----
-
-## Validators
-
-`src/utils/validators.py` splits validation into two deliberately separated categories:
-
-### Range checks — hardware register bit-field bounds
-
-Each register's value is checked against its declared min/max (e.g., `SampleSize_REG` in `[0, 31]`, `ChannelGrouping_REG` in `[0, 15]`). In real hardware these bounds are enforced by the register bit widths themselves; we check them because the visualizer lets users type arbitrary values via UI / CSV.
-
-Range checks are shallow — one `_check_range()` call per register, no cross-field logic.
-
-### Settings checks — spec-level semantic requirements
-
-Each rule is a single method with a docstring written as a SHALL-statement, suitable for lifting into written requirements. There are 17 rules today (14 DataPort + 2 FCP + 1 Interface):
-
-- `_check_offset_within_interval`, `_check_sri_interval_zero`, `_check_sri_skipping_disabled`, `_check_sri_pattern_fits`
-- `_check_horizontal_start_within_columns`, `_check_horizontal_count_within_columns`, `_check_horizontal_window_within_columns`
-- `_check_tail_fits_row`, `_check_bitwidth_fits_remaining_columns`, `_check_bitwidth_fits_horizontal_count`, `_check_horizontal_count_divisible_by_bitwidth`, `_check_guard_fits_row`
-- `_check_sink_no_guard`, `_check_sink_no_tail`
-- `_check_fcp_offset_within_interval`, `_check_fcp_fits_row`
-- `_check_phy3_requires_even_columns`
-
-All settings checks produce `ErrorSeverity.ERROR`. Shared computations (`_effective_channel_grouping`, `_drive_in_group`, `_last_data_column`) are hoisted into helpers so each rule method stays atomic.
-
-Each validator has a single `validate()` entry point that runs `_validate_ranges()` then `_validate_settings()` and returns a combined `ValidationResult`. Validation does not gate engine emission — results are stored on `bus_model.validation_issues` for UI display.
-
----
-
-## Key Design Patterns
-
-### 1. Hardware-Model Purity
-
-`DataPort` and `FlowControlPort` hold only state real hardware would hold. Anything the engine or renderer needs that isn't hardware-natural (cross-interval sample counters, transport indices, SRI-resume flags) is computed externally in the engine, NOT added to the model. This keeps the model layer independently testable against spec behavior and makes it safe to reuse in headless tools.
-
-### 2. Counter Cascade
-
-Both DataPort and FlowControlPort use the same pattern: each `_advance_*` method owns one counter, decrements it, and cascades to the next outer counter on rollover. State seeds live on the config (e.g., `SampleSize_REG`, `BitWidth_REG`, `_effective_channel_grouping`) — the `_advance_*` method resets its counter from config on rollover rather than relying on an external "reset" pass.
-
-### 3. Lightweight Derived Properties
-
-`EnableCh_REG` is a plain `int` bitmask on `DataPortConfig`. `_num_channels` is a popcount (`bin(EnableCh_REG).count('1')`) computed on demand — fast enough that no cache is needed. The channel-index → channel-number mapping (previously a cached tuple on the config) now lives as `Device._channel_from_index(config, index)`, called only when the device builds a DATA/TX_PRESENT slot.
-
-Other lightweight derived properties (`_effective_channel_grouping`, `_is_source`, `_txp_enabled`, `_drq_enabled`, `_horizontal_end`) are also computed on each access — cheap enough that caching would be premature.
-
-### 4. Enum-Based Type Safety
-
-Enums replace string comparisons for type safety and performance. `clash_detector.py` uses `SlotOccupancyType` internally:
+The per-UI loop must **not** cross the Python boundary. The core runs the whole
+decode and emits results in **batches** (or writes the results store directly
+from C++ via Arrow C-data / memmap buffers). Sketch:
 
 ```python
-class SlotOccupancyType(Enum):
-    WRITE = "write"
-    READ = "read"
-    GUARD = "guard"
-    TAIL = "tail"
-    HANDOVER = "handover"
-    TXP_SOURCE = "txp_source"
-    TXP_SINK = "txp_sink"
-    DRQ_SOURCE = "drq_source"
-    DRQ_SINK = "drq_sink"
+import swi3score
+dec = swi3score.Decoder(source, settings)     # source = ingest.ISampleSource impl
+dec.on_commands(callback_or_arrow_sink)        # batched
+dec.on_register_events(sink)
+dec.on_audio(sink)                             # per-(dp,channel) arrays
+dec.run()                                      # streaming, single pass
 ```
 
-The bus slot-type enum is `SlotType` in `src/models/enums.py`.
+Settings mirror the plugin: column-count (auto/forced), config CSV (mid-stream),
+decode-audio, PHY mode (PHY1/2 now, PHY3 stub).
 
-### 5. Separation of Concerns
+### Performance & language choice
 
-- **Configuration** (`DataPortConfig`, `FlowControlPortConfig`): What the hardware registers say
-- **State** (`DataPortState`, `FlowControlPortState`): Where the state machine is now
-- **Algorithm** (methods on `DataPort` / `FlowControlPort`): How to compute the next slot
-- **Validation** (`src/utils/validators.py`): Whether the configuration is sane — split into ranges and settings
-- **Visualization** (`DataPortVizConfig`): How to display it (enable_handover, display fields, etc.)
+**One scalar loop in C++; everything else Python.** The C++/Python boundary is drawn
+at exactly one place — the **per-UI decode loop** — and that placement *is* the
+performance story. The loop runs once per unit interval (tens to hundreds of millions
+of times on a multi-GB capture) doing branchy, stateful, bit-level work: data-line
+sampling, NRZS, 8b/10b + CRC-16, the command-transport parser, the register model, the
+`CDataPort` placement cascade, the LFSR descrambler, and audio reconstruction. Measured,
+the C++ core decodes **~35M UIs/s** (≈1.9 s for a 65M-UI / 31M-audio-sample capture), and
+it **releases the GIL**, so decode runs on a worker thread with a responsive UI.
+
+Everything *around* the loop is already Python and stays there — none of it is on the
+hot path: ingest (edge arrays), the results store (NumPy `lexsort`/grouping), all
+analysis (`bus_timing` etc., already NumPy-vectorized), PDM decimation (FFT), and the UI.
+
+**Why not all-Python.** A pure-CPython port of the per-UI loop is bytecode- and
+method-call-bound (~2–10 µs/UI vs ~30 ns in C++) → roughly **50–200× slower**. That turns
+a ~2 s decode into minutes, and a "minutes of audio" multi-GB capture into many minutes to
+hours — which breaks the core design point (interactive over multi-GB) — and, holding the
+GIL, it would freeze the UI unless carefully chunked. NumPy only partly helps: the
+*stateless, streaming* stages (level sampling, NRZS, 8b/10b table-lookups over the whole
+symbol array) vectorize well, but the parts that dominate are inherently **sequential and
+stateful** — the self-syncing descrambler, CDS framing / comma re-sync, dual-ranked
+register commit + SSP anchoring, the placement cascade — and don't vectorize. A heavy
+NumPy rewrite might reach ~10–30× slower, at the cost of a large rewrite *and* losing the
+single C++ core shared with the Saleae Logic 2 plugin. So the boundary sits where it does
+deliberately: **C++ for the one scalar state machine NumPy can't touch, Python for
+everything that's either vectorizable or off the hot path.**
 
 ---
 
-## Performance Optimizations
+## 4. Memory architecture (multi-GB)
 
-### 1. Popcount for Enabled-Channel Count
+The design principle: **no view cost scales with capture size.**
 
-`DataPortConfig._num_channels` is read many times per frame. It is implemented as a single Python `bin(EnableCh_REG).count('1')` — no cache, no invalidation hook, and cheap enough that an explicit cache was measured to not help. The per-emission channel-index → channel-number lookup happens in `Device._channel_from_index()` and only runs when a DATA or TX_PRESENT slot is built (not every UI).
+1. **Inputs are edge-based, not per-sample.** A `.sal` stores per-channel
+   *transition* lists; the decoder consumes clock edges + data level, which *is*
+   the transition data. We memory-map the transition arrays and stream them — a
+   full raw-sample buffer never exists. (CSV is parsed streaming into the same
+   edge form.)
 
-### 2. Reusable Validator
+2. **Decode is single-pass and streaming**, writing typed event streams to an
+   **out-of-core results store**:
 
-`DataPortValidator` is created once in `BusModelBuilder.__init__()` and reused across all data ports in a build:
+   | Stream | Volume | Storage |
+   |---|---|---|
+   | Commands (phases) | sparse (thousands–millions) | **Arrow/Parquet**, memory-mapped, filterable |
+   | Audio samples | large | per-`(dp,channel)` **`np.memmap`** + **min/max pyramid** |
+   | Register events (writes/commits) | sparse | event log + **periodic state checkpoints** |
+   | CDS symbols | enormous | **not persisted** — re-decoded per visible window on demand, cached |
 
-```python
-# Created once
-self._dp_validator = DataPortValidator(interface)
+3. **Time index.** A `sample → file offset` index per stream gives O(log n) range
+   queries, so every panel pulls only what's on screen.
 
-# Reused per DP
-for dp in data_ports:
-    self._dp_validator.validate(dp, dp_index)
-```
+4. **Waveform pyramids (mip-maps).** For audio, precompute min/max per bin at
+   several zoom levels; pan/zoom renders from pre-binned data and never touches
+   the full array (the technique pro waveform viewers use to stay smooth).
 
-### 3. Inline Counter Cascade
+5. **Register state at time T.** Reconstructed by replaying register events from
+   the nearest checkpoint up to T — powering the "register map at the cursor"
+   view and dual-rank staged/committed display in O(checkpoint interval).
 
-The `_advance_*` cascade avoids method-call overhead by cascading only on rollover. In steady state a single emission costs one decrement and one compare (the innermost `_advance_wide_bit`).
+6. **Symbol viewer.** Persisting every 8b/10b symbol is infeasible at multi-GB.
+   Instead, the core can **seek the sample source and re-decode a window** on
+   demand (cheap, edge-based); recently viewed windows are cached.
 
 ---
 
-## Appendix: SlotType Reference
+## 5. UI
 
-| SlotType | Value | Description |
-|----------|-------|-------------|
-| EMPTY | -1 | Position not owned |
-| DATA | 0 | Regular data bit |
-| GUARD_0 | 1 | Guard bit (polarity 0) |
-| TAIL | 2 | Tail bit |
-| HANDOVER | 3 | Direction change indicator |
-| CDS | 4 | Control Data Stream |
-| S0 | 5 | S0 synchronization (PHY3) |
-| S1 | 6 | S1 synchronization (PHY3) |
-| GUARD_1 | 7 | Guard bit (polarity 1) |
-| CLASH | 8 | Bus clash marker |
-| TX_PRESENT | 9 | TxP flow control bit |
-| DRQ | 10 | Data request flow control bit |
+Dockable panels (IDE / Saleae style) bound by **one shared time cursor +
+visible-range model** (`ui/cursor.py`). Selecting an item in any panel drives the
+others — Wireshark-style linked navigation.
+
+- **2D Bus Grid** (`QGraphicsView`): the Rows×Columns layout *at the cursor time*,
+  color-coded slots (Data / TxPresent / Guard / Tail / DRQ / CDS / empty). Reuses
+  the visualizer's placement output (from the core) + clash detector, rendered on
+  a `QGraphicsScene` (zoom/pan; SVG/PNG export).
+- **CDS Symbol viewer**: 8b/10b symbols color-coded **per spec** — K.28.7 comma,
+  Robust Tokens, D-codes, K-codes, disparity — time-aligned, click-to-inspect
+  (raw 10b, decoded byte/token, running disparity).
+- **Command table** (virtual `QAbstractTableModel`): timestamp, phase, device(s),
+  opcode, **address resolved to register + field name** (from `registers.json`),
+  data, CRC ok/bad, peripheral/manager response. Filter + search + bookmarks.
+- **Register-map view** (per device): every register; **color-coded by
+  provenance** —
+  - *Cold Reset* (reset value, untouched) — neutral
+  - *Bus Write* (CRC-valid WriteA32) — with value + write timestamp;
+    dual-rank shows staged `_NEXT` vs committed `_CURR`
+  - *Bus Read* (CRC-valid Read's returned data) — the timeline's read colour; a
+    read updates the rank it addresses (`_NEXT` alias → `_NEXT`, `_CURR` → `_CURR`)
+  - *CSV Import* (expected config overlaid for Compare) — distinct color
+  Field tooltips decode bit ranges. (The earlier in-view "what-if" register editing
+  was dropped; the register map is now read-only — the Visualization mode is where
+  configs are authored.)
+- **Audio viewer** (pyqtgraph): multi-track waveforms per `(dp,channel)`, smooth
+  zoom/scroll from the pyramid; region-select → **WAV export**; in-app **playback**
+  via `QAudioSink`. Sample rate derived from RowRate + DP params (existing
+  `SampleRateHz`). A **PDM** data port (1-bit `sample_size`) is a bipolar *density*
+  code, not a 1-bit two's-complement sample, so it is decoded to PCM at store-build
+  time: `{0,1}→±1`, band-limited polyphase decimation to ~48 kHz (`dsp/resample.py`),
+  then DC-blocked (mic density bias) and scaled — see `store.audio_store.decode_pdm`.
+- **Eye Diagram** (pyqtgraph): measured **setup/hold** timing straight off the
+  capture's clock/data edges (`analysis/bus_timing.py`) — per-polarity setup/hold
+  histograms + a data-edge "eye", gated on real data transitions, with a margin
+  verdict. Aggregate over the capture (no time cursor); rendered lazily on first show.
+- **Statistics** panel: derived measurements (row/clock rate, per-DP SSP interval &
+  bandwidth, bus-config segments, link `PM_Action` events).
+- **Timeline overview ribbon**: whole-capture minimap with markers for commits,
+  SSPs, PHY/link events, and errors; click to seek.
+
+---
+
+## 6. Link bring-up, PHY, and modes
+
+- **From t=0**: decode link bring-up & timing (PHY selection, calibration,
+  Announce/SSPA, ExitDormant) and learn the full configuration by snoop. The core
+  already parses Announce/Commit/CalibratePhy phases; a small **link/PHY state
+  machine** tracks PHY selection + timings on top.
+- **Mid-stream**: column auto-detect + per-DP config from an imported visualizer
+  CSV (already supported by the core).
+- **PHY1/PHY2 selectable now; PHY3 stubbed** (DLV / S0-S1 / recovered clock,
+  multi-lane) — the `ISampleSource` + PHY state machine leave room for it.
+
+---
+
+## 7. Register map
+
+`data/registers.json` is extracted from the SWI3S specification: every block (SLC base
+`0x1000`, Data Port `0x2000 +
+0x100·n`, FCP), each register's offset/abs-address/name/reset/access, dual-rank
+flag, and per-field bit-range/reset/access/description (excess-1 noted where the
+hardware uses it). It is the **single source of truth** for:
+
+- the register-map view (names, fields, reset values, layout), and
+- command-table **address → field-name** resolution.
+
+The target device for any access is selected by the **Phase Header Device Mask**,
+not the address; the 32-bit address is an offset within that peripheral's
+identical register space (so one map describes all devices).
+
+---
+
+## 8. Reuse map
+
+| From | Reused as |
+|---|---|
+| C++ analyzer decode (all of `source/*` except the Saleae glue) | the `swi3score` core, verbatim behind `ISampleSource` |
+| `CWavWriter`, `SampleRateHz` | audio export + sample-rate math |
+| Visualizer `models/` (DataPort, FCP, Device, BusModel, Interface, bit_slot) | `model/` for grid + register state |
+| Visualizer CSV/JSON schema (`config/constants.py` CSVFields) | `ingest` config reader (mid-stream config) |
+| Visualizer `drawing/clash_detector`, slot/color semantics, `theme.py` | grid rendering on QGraphics |
+| Plugin test vectors / `model_dump.py` cross-checks | golden tests |
+
+The DataPort placement algorithm has **one** implementation (the C++ core); the
+visualizer's Python version remains the cross-check oracle in tests.
+
+---
+
+## 9. Additional features (from other bus tools)
+
+> Status: all of the below are **implemented** except the dark/light theme toggle
+> (the app is dark-themed). See the README for how each is surfaced in the UI.
+
+- Wireshark-style **filter expressions** + bookmarks on the command table.
+- **Measurements**: row rate, SSP intervals, derived sample rate, per-DP
+  bandwidth / slot utilization.
+- A dedicated **error lane**: CRC, disparity, unexpected-token, device-mask
+  cardinality violations — flagged on the timeline + table.
+- **Config-vs-decoded overlay** and **capture diff**.
+- **Session/workspace save** (loaded capture source + view state) as JSON.
+- **Exports**: WAV (audio), CSV/Arrow (commands), SVG/PNG (grid).
+- A **synthetic `.sal` generator** (extending the plugin's simulation work) to
+  test the whole pipeline, including large files.
+- Dark/light theme.
+
+---
+
+## 10. Build & packaging
+
+- `native/CMakeLists.txt` builds `swi3score` as a pybind11 module via
+  **scikit-build-core**, producing a wheel. Reuses the existing CMake patterns but
+  drops the Saleae SDK dependency for the core. The Saleae plugin stays a separate
+  CMake target over the same sources.
+- App packaged later with PyInstaller / briefcase; macOS-first, cross-platform CI
+  builds the native module per OS.
+
+---
+
+## 11. Testing / headless
+
+See [`docs/TESTING.md`](docs/TESTING.md) for the layers, coverage matrix, and
+conventions. In brief:
+
+- **Headless `pytest`.** Golden tests decode a known `.sal` / synthetic stream and
+  assert commands + audio. GUI suites run under the Qt offscreen platform.
+- **Placement cross-check**: the C++ grid output is compared against the Python
+  placement model across the directed-test configs.
+- **Performance**: decode throughput, pan/zoom latency, and memory ceiling on a
+  synthetic large capture.
+
+---
+
+## 12. Modes
+
+A top **mode switcher** (`ui/mode_controller.py`) swaps the central page and dock set
+per mode; all three share one workspace file.
+
+- **Visualization** — the authoring editor: `model/bus_config.py` (Interface + 12
+  DataPort/FCP, the `_REG` config vocabulary, serialised to v2.0 CSV) and
+  `ui/authoring/`. Placement, clash detection, and validation come from the SWI3S
+  Visualizer engine under `swi3s_studio/swviz/`, driven by `model/viz_engine.py`: it
+  builds a merged `BusModel`, and `GridView.set_bus_model` renders its bits
+  (CDS/S0/S1/guards/tails/handovers + data) and clash markers. An authored config can
+  be pushed into Analysis ▸ Compare as the expected config. The engine is covered by a
+  JSON parity testsuite (`tests/test_visualizer_engine.py`).
+- **Timing** — the PHY margin calculator: `swi3s_studio/timing/` (`calculator.py`,
+  `delta_tpd.py`), surfaced by `ui/timing_view.py` as a text margin readout (the four
+  MP/PM setup/hold inequalities term-by-term, F_max, the binding constraint, and an
+  optional per-inequality worst-PVT corner). No plots.
+- **Analysis** — the protocol analyzer.
+
+The bus-grid renderer (`ui/grid_view.py`) is shared between the authored (planned) and
+decoded views, and its placement is regression-tested against the Visualizer's config
+corpus (`tests/visualizer/`, `test_visualizer_placement.py`).
+
+The renderer has two input paths. **Analysis mode** feeds it the C++ core's grid via
+`GridView.set_cells`: each data row split into a **Source half (top)** / **Sink half
+(bottom)**, multi-emit `GridCell`s (`isSource`), samples merged across bit columns and
+labelled per display fields (`C<ch>B<bit>` default; `S<sample>C<channel>` when
+Sample+Channel; `T1`/`T0` in PortMode test modes), TxPresent `TxP<ch>`, DRQ, guards
+`G0`/`G1`, tail squiggles, scrambler corner squares, full-height CDS, the Source/Sink
+key column, and handover arrows. **Visualization mode** feeds it the Visualizer
+engine's `BusModel` via `GridView.set_bus_model`: the model supplies the
+CDS/S0/S1/guard/tail/handover system bits with device, and the renderer draws those and
+overlays clash X-markers (bus red / device yellow / read blue) from the model's clash
+lists. Analysis-mode decode keeps the C++ core for throughput.

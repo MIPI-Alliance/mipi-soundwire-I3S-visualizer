@@ -1,0 +1,486 @@
+{
+  "_meta": {
+    "spec": "MIPI SoundWire I3S (SWI3S) Specification, Version 1.1 Revision 06 (2026-05-03)",
+    "source_tables": ["163","164","166","167","168","169","170","171"],
+    "source_sections": ["15.2.1","15.2.2","15.2.3","15.2.4","15.2.5"],
+    "conventions": [
+      "All offsets are within ONE peripheral device. Target device is selected by the 12-bit Device Mask in the Phase Header, NOT by the address. Every peripheral has the identical numeric layout (Table 163).",
+      "Region bases (Table 164): PHY1=0x100, PHY2=0x200, PHY3=0x300, SLC=0x1000, CDS=0x1100, DataPorts DP0..DP31=0x2000+0x100*n.",
+      "dual_ranked=true: listed offset is the _NEXT register; _CURR is at offset+0x40. Commit (SSCR/DSCR) copies _NEXT->_CURR; a direct write to _CURR also copies to _NEXT. _NEXT cleared only by Cold Reset; some _CURR (e.g. EnableCh) also cleared by Warm Reset.",
+      "excess1 fields: actual = stored+1 (SampleSize, SampleGrouping, Interval, HorizontalCount, BitWidth, ConverterClockDiv; NumColumns: ColumnCount=NumColumns+1).",
+      "Endianness: SLC ManufacturerID/PartID/SkippingDenominator are MSB-first (hi byte at lower addr). DP Interval/Offset/ConverterClockDiv/SkippingNumerator and FCP_Offset are LSB-first (lo byte at lower addr).",
+      "Local 0x0-0x7FFFFFFF complete in-Phase; Remote 0x80000000-0xFFFFFFFF may be buffered/deferred (Table 163).",
+      "INCONSISTENCY: DP FlowMode (0x0E[1:0]) is in the single-ranked map (Table 166) yet Table 168 marks its access 'Dual'; no _CURR address is given, so it is represented single-ranked here."
+    ]
+  },
+  "blocks": [
+    {
+      "name": "SLC",
+      "description": "System & Link Control",
+      "base_offset": "0x1000",
+      "instances": "one per device",
+      "abs_address_formula": "0x1000 + offset",
+      "registers": [
+        {"offset":"0x00","abs_address":"0x1000","name":"ID0","reset":"see fields","access":"RO","dual_ranked":false,"fields":[
+          {"name":"Version","bits":"[7:4]","reset":"0b1001","access":"RO","valid":"b1001=v1.1,b1000=v1.0","description":"SWI3S protocol version."},
+          {"name":"DeviceNumber","bits":"[3:0]","reset":"ImpDef","access":"RO","valid":"0-11","description":"Static device number; indexes the Device Mask."}
+        ]},
+        {"offset":"0x01","abs_address":"0x1001","name":"ManufacturerID_H","reset":"PerMfr","access":"RO","dual_ranked":false,"fields":[
+          {"name":"ManufacturerID[15:8]","bits":"[7:0]","reset":"PerMfr","access":"RO","description":"MSByte of MIPI manufacturer code (MSB-first)."}
+        ]},
+        {"offset":"0x02","abs_address":"0x1002","name":"ManufacturerID_L","reset":"PerMfr","access":"RO","dual_ranked":false,"fields":[
+          {"name":"ManufacturerID[7:0]","bits":"[7:0]","reset":"PerMfr","access":"RO","description":"LSByte of MIPI manufacturer code."}
+        ]},
+        {"offset":"0x03","abs_address":"0x1003","name":"PartID_H","reset":"ImpDef","access":"RO","dual_ranked":false,"fields":[
+          {"name":"PartID[15:8]","bits":"[7:0]","reset":"ImpDef","access":"RO","description":"MSByte of part ID (MSB-first)."}
+        ]},
+        {"offset":"0x04","abs_address":"0x1004","name":"PartID_L","reset":"ImpDef","access":"RO","dual_ranked":false,"fields":[
+          {"name":"PartID[7:0]","bits":"[7:0]","reset":"ImpDef","access":"RO","description":"LSByte of part ID."}
+        ]},
+        {"offset":"0x05","abs_address":"0x1005","name":"Class","reset":"ImpDef","access":"RO","dual_ranked":false,"fields":[
+          {"name":"Class","bits":"[7:0]","reset":"ImpDef","access":"RO","valid":"0x00=none,0x01=SDCA,0x02-0x0F=Rsvd","description":"Device class."}
+        ]},
+        {"offset":"0x06-0x0F","abs_address":"0x1006","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (10 bytes)."}
+        ]},
+        {"offset":"0x10","abs_address":"0x1010","name":"WakeControl","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"WakeReqEnable","bits":"[0]","reset":0,"access":"RW","description":"Enable LC_Request to exit Sleeping/Dormant (Optional)."}
+        ]},
+        {"offset":"0x11","abs_address":"0x1011","name":"PM","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"PM_Action","bits":"[3:0]","reset":"0x0","access":"RW","valid":"0x0=Stay_Attached,0x2=Force_Resync,0x3=Test_Detach,0x4=Enter_Dormant,0x8=Enter_Sleeping,0xC=Enter_Cold_Standby","description":"Peripheral Management Action (Table 20). Single-ranked but the action fires on the next SSCR/DSCR Commit; values 0x2/0x3/0x4 self-clear to Stay_Attached afterwards."}
+        ]},
+        {"offset":"0x12","abs_address":"0x1012","name":"SkippingDenominator_H","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"SkippingDenominator[11:8]","bits":"[3:0]","reset":"ImpDef","access":"RW","description":"High nibble (MSB-first) of skip denominator; Optional (all 12 bits or none)."}
+        ]},
+        {"offset":"0x13","abs_address":"0x1013","name":"SkippingDenominator_L","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"SkippingDenominator[7:0]","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"Low byte of skip denominator."}
+        ]},
+        {"offset":"0x14","abs_address":"0x1014","name":"SyncPointOffset","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:3]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"SyncPointOffset","bits":"[2:0]","reset":0,"access":"RW","valid":"0-5","description":"Rows subtracted from Row_Delay to form Sync_Point_Delay."}
+        ]},
+        {"offset":"0x15-0x1F","abs_address":"0x1015","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (11 bytes)."}
+        ]},
+        {"offset":"0x20","abs_address":"0x1020","name":"ForceRemoteFail","reset":"-","access":"W1Action","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"ForceRemoteFail","bits":"[0]","reset":"-","access":"W1Action","description":"Write 1 aborts outstanding remote op as failed (Conditional)."}
+        ]},
+        {"offset":"0x21","abs_address":"0x1021","name":"DevStat","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"DevStat_LostLock","bits":"[1]","reset":0,"access":"RW1C","description":"Detached due to lost clock recovery (Conditional: PHY3)."},
+          {"name":"DevStat_BadCommandConfidence","bits":"[0]","reset":0,"access":"RW1C","description":"Detached due to lost command confidence."}
+        ]},
+        {"offset":"0x22","abs_address":"0x1022","name":"IntStat_Link","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"IntStat_RemoteDisabled","bits":"[7]","reset":0,"access":"RW1C","description":"Remote access FSM entered Remote_Disabled (Conditional)."},
+          {"name":"IntStat_BadCRC","bits":"[6]","reset":0,"access":"RW1C","description":"CRC mismatch on a Manager/Peripheral packet."},
+          {"name":"IntStat_AbandonedPhase","bits":"[5]","reset":0,"access":"RW1C","description":"Phase abandoned due to a new valid Header."},
+          {"name":"IntStat_UnexpectedNewHeader","bits":"[4]","reset":0,"access":"RW1C","description":"Valid Phase Header detected during an ongoing Phase."},
+          {"name":"IntStat_BadHD10","bits":"[3]","reset":0,"access":"RW1C","description":"Corrupted HD10 token decoded to nearest HD10."},
+          {"name":"IntStat_CalibrationReq","bits":"[2]","reset":0,"access":"RW1C","description":"Peripheral requests a Calibration command (Conditional: PHY3)."},
+          {"name":"IntStat_Bad8b10b","bits":"[1]","reset":0,"access":"RW1C","description":"CDS word not mappable to a valid byte."},
+          {"name":"IntStat_MissedRowSync","bits":"[0]","reset":0,"access":"RW1C","description":"Missed Row Sync edge (Conditional: PHY3)."}
+        ]},
+        {"offset":"0x23","abs_address":"0x1023","name":"Reserved","reset":"-","access":"RO","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"RO","description":"Reserved."}]},
+        {"offset":"0x24","abs_address":"0x1024","name":"IntStat_PhyCal","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"IntStat_BadPhyCalPair","bits":"[0]","reset":0,"access":"RW1C","description":"Mismatch in R/not-R PHY-cal data (Conditional: InitCal/TrimCal)."}
+        ]},
+        {"offset":"0x25","abs_address":"0x1025","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (2 bytes)."}]},
+        {"offset":"0x26","abs_address":"0x1026","name":"IntCascade_DFI","reset":"-","access":"RO","dual_ranked":false,"fields":[
+          {"name":"IntCascade_DFI<n>","bits":"[7:1]","reset":"-","access":"RO","description":"OR of interrupts from Hub DFI1..7 (bit n = DFIn). bit0 Reserved."},
+          {"name":"Reserved","bits":"[0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x27","abs_address":"0x1027","name":"IntCascade_Misc","reset":"-","access":"RO","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"IntCascade_ImpDef","bits":"[1]","reset":"-","access":"RO","description":"OR of IntStat_ImpDef_*."},
+          {"name":"IntCascade_SDCA","bits":"[0]","reset":"-","access":"RO","description":"OR of the 64 IntStat_SDCA_* interrupts."}
+        ]},
+        {"offset":"0x28-0x2B","abs_address":"0x1028","name":"IntCascade_DP","reset":"-","access":"RO","dual_ranked":false,"fields":[
+          {"name":"IntCascade_DP<n>","bits":"[7:0]","reset":"-","access":"RO","description":"OR of DPn_IntStat_* for n=0..31 (0x28:DP0-7, 0x29:DP8-15, 0x2A:DP16-23, 0x2B:DP24-31)."}
+        ]},
+        {"offset":"0x2C-0x31","abs_address":"0x102C","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (6 bytes)."}]},
+        {"offset":"0x32","abs_address":"0x1032","name":"IntEn_Link","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"IntEn_RemoteDisabled","bits":"[7]","reset":0,"access":"RW","description":"Enable for IntStat_RemoteDisabled."},
+          {"name":"IntEn_BadCRC","bits":"[6]","reset":0,"access":"RW","description":"Enable for IntStat_BadCRC."},
+          {"name":"IntEn_AbandonedPhase","bits":"[5]","reset":0,"access":"RW","description":"Enable for IntStat_AbandonedPhase."},
+          {"name":"IntEn_UnexpectedNewHeader","bits":"[4]","reset":0,"access":"RW","description":"Enable for IntStat_UnexpectedNewHeader."},
+          {"name":"IntEn_BadHD10","bits":"[3]","reset":0,"access":"RW","description":"Enable for IntStat_BadHD10."},
+          {"name":"IntEn_CalibrationReq","bits":"[2]","reset":0,"access":"RW","description":"Enable for IntStat_CalibrationReq."},
+          {"name":"IntEn_Bad8b10b","bits":"[1]","reset":0,"access":"RW","description":"Enable for IntStat_Bad8b10b."},
+          {"name":"IntEn_MissedRowSync","bits":"[0]","reset":0,"access":"RW","description":"Enable for IntStat_MissedRowSync."}
+        ]},
+        {"offset":"0x33","abs_address":"0x1033","name":"Reserved","reset":"-","access":"RW","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"RW","description":"Reserved."}]},
+        {"offset":"0x34","abs_address":"0x1034","name":"IntEn_PhyCal","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"IntEn_BadPhyCalPair","bits":"[0]","reset":0,"access":"RW","description":"Enable for IntStat_BadPhyCalPair."}
+        ]},
+        {"offset":"0x35-0x3F","abs_address":"0x1035","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (11 bytes)."}]},
+        {"offset":"0x40-0x47","abs_address":"0x1040","name":"IntStat_SDCA","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"IntStat_SDCA_<63:00>","bits":"[7:0]","reset":0,"access":"RW1C","description":"64 SDCA interrupt-status bits across 8 bytes (0x40=SDCA07:00 ... 0x47=SDCA63:56). Conditional (SDCA)."}
+        ]},
+        {"offset":"0x48-0x4B","abs_address":"0x1048","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (4 bytes)."}]},
+        {"offset":"0x4C-0x4F","abs_address":"0x104C","name":"IntStat_ImpDef","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"IntStat_ImpDef_<31:00>","bits":"[7:0]","reset":0,"access":"RW1C","description":"32 ImpDef interrupt-status bits across 4 bytes (0x4C=ImpDef07:00 ... 0x4F=ImpDef31:24)."}
+        ]},
+        {"offset":"0x50-0x57","abs_address":"0x1050","name":"IntEn_SDCA","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"IntEn_SDCA_<63:00>","bits":"[7:0]","reset":0,"access":"RW","description":"Enables for the 64 IntStat_SDCA bits (8 bytes)."}
+        ]},
+        {"offset":"0x58-0x5B","abs_address":"0x1058","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (4 bytes)."}]},
+        {"offset":"0x5C-0x5F","abs_address":"0x105C","name":"IntEn_ImpDef","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"IntEn_ImpDef_<31:00>","bits":"[7:0]","reset":0,"access":"RW","description":"Enables for the 32 IntStat_ImpDef bits (4 bytes)."}
+        ]},
+        {"offset":"0x60","abs_address":"0x1060","name":"EC_BadCommandConfidence","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_BadCommandConfidence","bits":"[7:0]","reset":"0x00","access":"RO","description":"Error counter; bit0 Mandatory, [7:1] Optional."}
+        ]},
+        {"offset":"0x61","abs_address":"0x1061","name":"EC_LostLock","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_LostLock","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for LostLock events (Conditional: PHY3)."}
+        ]},
+        {"offset":"0x62","abs_address":"0x1062","name":"EC_MissedRowSync","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_MissedRowSync","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for MissedRowSync events (Conditional: PHY3)."}
+        ]},
+        {"offset":"0x63","abs_address":"0x1063","name":"EC_Bad8b10b","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_Bad8b10b","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for Bad8b10b events."}
+        ]},
+        {"offset":"0x64","abs_address":"0x1064","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved."}]},
+        {"offset":"0x65","abs_address":"0x1065","name":"EC_BadHD10","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_BadHD10","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for BadHD10 events."}
+        ]},
+        {"offset":"0x66","abs_address":"0x1066","name":"EC_UnexpectedNewHeader","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_UnexpectedNewHeader","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for UnexpectedNewHeader events."}
+        ]},
+        {"offset":"0x67","abs_address":"0x1067","name":"EC_AbandonedPhase","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_AbandonedPhase","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for AbandonedPhase events."}
+        ]},
+        {"offset":"0x68","abs_address":"0x1068","name":"EC_BadCRC","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_BadCRC","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for BadCRC events."}
+        ]},
+        {"offset":"0x69","abs_address":"0x1069","name":"EC_BadPhyCalPair","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_BadPhyCalPair","bits":"[7:0]","reset":"0x00","access":"RO","description":"Counter for BadPhyCalPair events (Conditional)."}
+        ]},
+        {"offset":"0x6A-0x6F","abs_address":"0x106A","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (6 bytes)."}]},
+        {"offset":"0x70-0x7F","abs_address":"0x1070","name":"ImpDef","reset":"ImpDef","access":"ImpDef","dual_ranked":false,"fields":[{"name":"ImpDef","bits":"[7:0]","reset":"ImpDef","access":"ImpDef","description":"Implementation-defined (16 bytes)."}]},
+        {"offset":"0x80","abs_address":"0x1080","curr_offset":"0xC0","curr_abs_address":"0x10C0","name":"UI_RateRange","reset":"PHY2:0","access":"PHY1/2:RO; PHY3:RO-or-Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"UI_RateRange","bits":"[4:0]","reset":"PHY1:0,PHY2:0,PHY3:20","access":"Dual/RO","description":"Unit-interval rate range (Table 28). RO:0 on PHY1/PHY2 (0=not provided)."}
+        ]},
+        {"offset":"0x81","abs_address":"0x1081","curr_offset":"0xC1","curr_abs_address":"0x10C1","name":"NumColumns","reset":"PHY2:1(=2 columns)","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"NumColumns","bits":"[4:0]","reset":"PHY1:1,PHY2:1,PHY3:3","access":"Dual","valid":"PHY1/2: even ColumnCount only","excess1":true,"description":"ColumnCount = NumColumns+1 (1->2cols ... 31->32cols)."}
+        ]},
+        {"offset":"0x82","abs_address":"0x1082","curr_offset":"0xC2","curr_abs_address":"0x10C2","name":"RowRateRange","reset":"PHY2:0","access":"RO-or-Dual","dual_ranked":true,"fields":[
+          {"name":"RowRateRange","bits":"[7:0]","reset":"PHY1:0,PHY2:0,PHY3:0x3A","access":"Dual/RO","description":"Row-rate range (Table 29). 0 on PHY1/PHY2 = Manager has not provided row rate."}
+        ]},
+        {"offset":"0x83","abs_address":"0x1083","curr_offset":"0xC3","curr_abs_address":"0x10C3","name":"ShortProtocolSpacer","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"ShortProtocolSpacer","bits":"[0]","reset":0,"access":"Dual","valid":"0=PM spacer 20 Rows,1=PM spacer 10 Rows","description":"Sets Peripheral-to-Manager Protocol Spacer size (Table 68)."}
+        ]},
+        {"offset":"0x84-0xAF","abs_address":"0x1084","curr_offset":"0xC4","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved dual-ranked range (44 bytes)."}]},
+        {"offset":"0xB0-0xBF","abs_address":"0x10B0","curr_offset":"0xF0","name":"ImpDef","reset":"ImpDef","access":"ImpDef","dual_ranked":true,"fields":[{"name":"ImpDef","bits":"[7:0]","reset":"ImpDef","access":"ImpDef","description":"Implementation-defined dual-ranked (16 bytes)."}]}
+      ]
+    },
+    {
+      "name": "CDS",
+      "description": "Control Data Stream transport (one per device). PHY-specific CDS bit placement and drive. Dual-ranked _NEXT shown; _CURR = _NEXT + 0x40 (Dual-CURR-is-RO). Tables 173/174.",
+      "base_offset": "0x1100",
+      "instances": "one per device",
+      "abs_address_formula": "0x1100 + offset",
+      "registers": [
+        {"offset":"0x84","abs_address":"0x1184","curr_offset":"0xC4","name":"CDS_HorizontalStart","reset":"PHY1/2:0,PHY3:2","access":"Dual-CURR-RO","dual_ranked":true,"fields":[
+          {"name":"CDS_HorizontalStart","bits":"[4:0]","reset":"-","access":"RW","description":"First UI (column) in the Row used for the CDS. PHY1/2: RO 0; PHY3: writable (reset 2)."},
+          {"name":"Reserved","bits":"[7:5]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x86","abs_address":"0x1186","curr_offset":"0xC6","name":"CDS_DriveType","reset":"0x00","access":"Dual-CURR-RO","dual_ranked":true,"fields":[
+          {"name":"CDS_DriveType","bits":"[7]","reset":0,"access":"RW","valid":"0=Special_PassiveOne_ActiveZero,1=Normal_ActiveOne_ActiveZero","description":"0=CDS=1 driven high-Z (bus-keeper holds) — affects NRZS decode; 1=actively driven. PHY3 mandatory, PHY1/2 optional."},
+          {"name":"Reserved","bits":"[6:0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x87","abs_address":"0x1187","curr_offset":"0xC7","name":"CDS_BitWidth_Guard_Tail","reset":"0x00","access":"Dual-CURR-RO","dual_ranked":true,"fields":[
+          {"name":"CDS_BitWidth","bits":"[7:5]","reset":0,"access":"RW","excess1":true,"description":"UIs per CDS bit (excess-1: 0->1 UI .. 7->8 UI)."},
+          {"name":"CDS_EndDriveEarly","bits":"[4]","reset":0,"access":"RW","valid":"0=full_UI,1=stop_half_UI_early","description":"Stop driving CDS 1/2 UI early (mandatory PHY3)."},
+          {"name":"CDS_GuardEnable","bits":"[3]","reset":0,"access":"RW","valid":"0=no_guard,1=add_guard_bit","description":"Add a 1-UI guard bit after the CDS bit."},
+          {"name":"CDS_GuardPolarity","bits":"[2]","reset":0,"access":"RW","valid":"0=drive_0,1=drive_1","description":"Guard bit polarity."},
+          {"name":"CDS_TailWidth","bits":"[1:0]","reset":0,"access":"RW","valid":"0=0UI,1=1UI,2=2UI,3=Reserved","description":"Tail UIs after the CDS (or guard) bit. PHY1: RO 0."}
+        ]},
+        {"offset":"0x89","abs_address":"0x1189","curr_offset":"0xC9","name":"CDS_ApertureAdjust","reset":"0x00","access":"Dual-CURR-RO","dual_ranked":true,"fields":[
+          {"name":"CDS_ApertureAdjust","bits":"[7:3]","reset":0,"access":"RW","description":"5-bit two's-complement sampling-point offset (optional)."},
+          {"name":"Reserved","bits":"[2:0]","reset":"-","access":"-","description":"Reserved."}
+        ]}
+      ]
+    },
+    {
+      "name": "PHY1",
+      "description": "PHY1 (FBCSE) electrical control (one per device). Dual-ranked _NEXT shown; _CURR = _NEXT + 0x40. Tables 176/177. NOTE: PHY selection itself (PHY1/2/3) is NOT register-visible — it is set by Cold Start LC_PHY physical signaling.",
+      "base_offset": "0x100",
+      "instances": "one per device",
+      "abs_address_formula": "0x100 + offset",
+      "registers": [
+        {"offset":"0x80","abs_address":"0x180","curr_offset":"0xC0","name":"PHY1_RiseFallTime","reset":"0x44","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY1_RiseFallTimeGRamp","bits":"[7:4]","reset":4,"access":"RW","description":"Output rise/fall time for the Conductance Ramp."},
+          {"name":"PHY1_RiseFallTimeVRamp","bits":"[3:0]","reset":4,"access":"RW","description":"Output rise/fall time for the Voltage Ramp."}
+        ]},
+        {"offset":"0x81","abs_address":"0x181","curr_offset":"0xC1","name":"PHY1_DriveImpedance","reset":"0x40","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY1_DriveImpedance","bits":"[6:4]","reset":4,"access":"RW","description":"Series output resistance (reset 4 = 44.5 ohm)."},
+          {"name":"Reserved","bits":"[7]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"Reserved_lo","bits":"[3:0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x82","abs_address":"0x182","curr_offset":"0xC2","name":"PHY1_RampType","reset":"0x06","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY1_FirstBitRampType","bits":"[3:2]","reset":1,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type when previous bit not owned by this device."},
+          {"name":"PHY1_AdjBitRampType","bits":"[1:0]","reset":2,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type between adjacent bits owned by this device."},
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."}
+        ]}
+      ]
+    },
+    {
+      "name": "PHY2",
+      "description": "PHY2 (FBCSE) electrical control (one per device). Same layout as PHY1 (often aliased to the same storage). Tables 176/177.",
+      "base_offset": "0x200",
+      "instances": "one per device",
+      "abs_address_formula": "0x200 + offset",
+      "registers": [
+        {"offset":"0x80","abs_address":"0x280","curr_offset":"0xC0","name":"PHY2_RiseFallTime","reset":"0x44","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY2_RiseFallTimeGRamp","bits":"[7:4]","reset":4,"access":"RW","description":"Output rise/fall time for the Conductance Ramp."},
+          {"name":"PHY2_RiseFallTimeVRamp","bits":"[3:0]","reset":4,"access":"RW","description":"Output rise/fall time for the Voltage Ramp."}
+        ]},
+        {"offset":"0x81","abs_address":"0x281","curr_offset":"0xC1","name":"PHY2_DriveImpedance","reset":"0x40","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY2_DriveImpedance","bits":"[6:4]","reset":4,"access":"RW","description":"Series output resistance (reset 4 = 44.5 ohm)."},
+          {"name":"Reserved","bits":"[7]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"Reserved_lo","bits":"[3:0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x82","abs_address":"0x282","curr_offset":"0xC2","name":"PHY2_RampType","reset":"0x06","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY2_FirstBitRampType","bits":"[3:2]","reset":1,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type when previous bit not owned by this device."},
+          {"name":"PHY2_AdjBitRampType","bits":"[1:0]","reset":2,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type between adjacent bits owned by this device."},
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."}
+        ]}
+      ]
+    },
+    {
+      "name": "PHY3",
+      "description": "PHY3 (DLV, differential low-voltage) electrical + calibration control (one per device). 0x00-0x09 single-ranked (calibration bounds); 0x80-0x88 dual-ranked (_CURR = _NEXT + 0x40). Tables 178/179/180.",
+      "base_offset": "0x300",
+      "instances": "one per device",
+      "abs_address_formula": "0x300 + offset",
+      "registers": [
+        {"offset":"0x00","abs_address":"0x300","name":"PHY3_CalibrationDelayMin","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"PHY3_CalibrationDelayMin","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"Minimum acceptable calibration delay (used by InitCal/TrimCal)."}
+        ]},
+        {"offset":"0x04","abs_address":"0x304","name":"PHY3_CalibrationDelayMax","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"PHY3_CalibrationDelayMax","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"Maximum acceptable calibration delay."}
+        ]},
+        {"offset":"0x08","abs_address":"0x308","name":"PHY3_CalibrationImpDef_L","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"PHY3_CalibrationImpDef[7:0]","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"ImpDef calibration params, low byte (LSB-first)."}
+        ]},
+        {"offset":"0x09","abs_address":"0x309","name":"PHY3_CalibrationImpDef_H","reset":"ImpDef","access":"RW","dual_ranked":false,"fields":[
+          {"name":"PHY3_CalibrationImpDef[15:8]","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"ImpDef calibration params, high byte."}
+        ]},
+        {"offset":"0x80","abs_address":"0x380","curr_offset":"0xC0","name":"PHY3_RiseFallTime","reset":"0x44","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY3_RiseFallTimeGRamp","bits":"[7:4]","reset":4,"access":"RW","description":"Output rise/fall time for the G-Ramp."},
+          {"name":"PHY3_RiseFallTimeVRamp","bits":"[3:0]","reset":4,"access":"RW","description":"Output rise/fall time for the V-Ramp."}
+        ]},
+        {"offset":"0x81","abs_address":"0x381","curr_offset":"0xC1","name":"PHY3_DriveLevels","reset":"0x63","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY3_Hysteresis","bits":"[7:6]","reset":1,"access":"RW","description":"Receiver hysteresis control (reset 1 = 5-15% of VSEOS)."},
+          {"name":"PHY3_DriveImpedance","bits":"[5:3]","reset":4,"access":"RW","description":"Single-ended series output resistance (reset 4 = 44.5 ohm)."},
+          {"name":"PHY3_SEOutputSwing","bits":"[2:0]","reset":3,"access":"RW","description":"Nominal single-ended output swing (reset 3 = 200 mV)."}
+        ]},
+        {"offset":"0x82","abs_address":"0x382","curr_offset":"0xC2","name":"PHY3_RampType","reset":"0x06","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY3_CalibRampType","bits":"[5:4]","reset":0,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type for CDS=0 bits during Calibration Measurement."},
+          {"name":"PHY3_FirstBitRampType","bits":"[3:2]","reset":1,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type when previous bit not owned by this device."},
+          {"name":"PHY3_AdjBitRampType","bits":"[1:0]","reset":2,"access":"RW","valid":"0=Disable,1=G-Ramp,2=V-Ramp,3=Reserved","description":"Ramp type between adjacent bits owned by this device."},
+          {"name":"Reserved","bits":"[7:6]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x88","abs_address":"0x388","curr_offset":"0xC8","name":"PHY3_CalibrationDelay","reset":"ImpDef","access":"RW","dual_ranked":true,"fields":[
+          {"name":"PHY3_CalibrationDelay","bits":"[7:0]","reset":"ImpDef","access":"RW","description":"Calibration delay result (written by Manager during InitCal/TrimCal)."}
+        ]}
+      ]
+    },
+    {
+      "name": "DP",
+      "description": "Data Port (one block per implemented Data Port DP0..DP31)",
+      "base_offset": "0x2000",
+      "instances": "DP0..DP31 (n = 0..31)",
+      "stride": "0x100",
+      "abs_address_formula": "0x2000 + 0x100*n + offset",
+      "abs_address_note": "abs_address column shows DP0 (n=0). For DPn add 0x100*n.",
+      "registers": [
+        {"offset":"0x00","abs_address":"0x2000","name":"IntStat","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"IntStat_PortImpDef_1","bits":"[7]","reset":0,"access":"RW1C","description":"ImpDef port interrupt #1 (Conditional)."},
+          {"name":"IntStat_PortImpDef_0","bits":"[6]","reset":0,"access":"RW1C","description":"ImpDef port interrupt #0 (Conditional)."},
+          {"name":"Reserved","bits":"[5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"IntStat_FlowControlFail","bits":"[4]","reset":0,"access":"RW1C","description":"Flow-control mismatch (Conditional: Sink DP w/ flow control)."},
+          {"name":"IntStat_UnexpectedSSP","bits":"[3]","reset":0,"access":"RW1C","description":"Unexpected SSP indication detected."},
+          {"name":"IntStat_PortNotReady","bits":"[2]","reset":0,"access":"RW1C","description":"PortReady 1->0 (Optional)."},
+          {"name":"IntStat_PortReady","bits":"[1]","reset":0,"access":"RW1C","description":"PortReady 0->1."},
+          {"name":"IntStat_TestFail","bits":"[0]","reset":0,"access":"RW1C","description":"Channel received wrong data in test mode (Conditional)."}
+        ]},
+        {"offset":"0x01-0x03","abs_address":"0x2001","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (3 bytes)."}]},
+        {"offset":"0x04","abs_address":"0x2004","name":"DevStat","reset":"0x00","access":"RW1C","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:1]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"DevStat_ReceivedSSP","bits":"[0]","reset":0,"access":"RW1C","description":"Set on any SSP indication (expected or not)."}
+        ]},
+        {"offset":"0x05","abs_address":"0x2005","name":"PortStatus","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"PortReady","bits":"[1]","reset":0,"access":"RO","description":"PortSyncOK AND (PrepareCh==ReadyCh) for all channels."},
+          {"name":"PortSyncOK","bits":"[0]","reset":0,"access":"RO","description":"Interval machine synchronized (after SSP, or Interval=1 Row, or SubRowInterval=1)."}
+        ]},
+        {"offset":"0x06","abs_address":"0x2006","name":"ReadyCh_L","reset":"ImpDef","access":"RO","dual_ranked":false,"fields":[
+          {"name":"ReadyCh<7:0>","bits":"[7:0]","reset":"ImpDef","access":"RO","description":"Audio-ready per channel 0..7 (bit c = Channelc)."}
+        ]},
+        {"offset":"0x07","abs_address":"0x2007","name":"ReadyCh_H","reset":"ImpDef","access":"RO","dual_ranked":false,"fields":[
+          {"name":"ReadyCh<15:8>","bits":"[7:0]","reset":"ImpDef","access":"RO","description":"Audio-ready per channel 8..15."}
+        ]},
+        {"offset":"0x08","abs_address":"0x2008","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved."}]},
+        {"offset":"0x09","abs_address":"0x2009","name":"SampleSizeGrouping","reset":"see fields","access":"RW","dual_ranked":false,"fields":[
+          {"name":"SampleGrouping","bits":"[7:5]","reset":0,"access":"RW","excess1":true,"valid":"0->1 .. 7->8 frames/interval","description":"Sample frames per Transport Interval (Conditional)."},
+          {"name":"SampleSize","bits":"[4:0]","reset":"ImpDef","access":"RW","excess1":true,"valid":"0->1bit .. 31->32bit","description":"Data bits per sample (a bit may span >1 UI per BitWidth)."}
+        ]},
+        {"offset":"0x0A","abs_address":"0x200A","name":"CommitGroupMemb","reset":"0b0001","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"CommitGroupMemb","bits":"[3:0]","reset":"0b0001","access":"RW","valid":"bitmask CG3..CG0","description":"Which Commit Groups this DP belongs to (reset = CG0 only)."}
+        ]},
+        {"offset":"0x0B","abs_address":"0x200B","name":"PortControl","reset":"see fields","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"ScramblerEn","bits":"[3]","reset":1,"access":"RW","description":"Enable payload LFSR scrambler (1=active)."},
+          {"name":"PortDirection","bits":"[2]","reset":"ImpDef","access":"RO/RW","valid":"0=Source,1=Sink","description":"Source puts data on bus; Sink reads from bus."},
+          {"name":"PortMode","bits":"[1:0]","reset":0,"access":"RW","valid":"0=Normal,1=Rsvd,2=Test0s,3=Test1s","description":"Payload data source/mode (Table 157)."}
+        ]},
+        {"offset":"0x0C","abs_address":"0x200C","name":"SkippingNumerator_L","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"SkippingNumerator[7:0]","bits":"[7:0]","reset":0,"access":"RW","description":"Low byte (LSB-first) of skip numerator; 0=no skipping (Optional, all 12 bits or none)."}
+        ]},
+        {"offset":"0x0D","abs_address":"0x200D","name":"SkippingNumerator_H","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"SkippingNumerator[11:8]","bits":"[3:0]","reset":0,"access":"RW","description":"High nibble of skip numerator."}
+        ]},
+        {"offset":"0x0E","abs_address":"0x200E","name":"FlowControl","reset":"see fields","access":"RW","dual_ranked":false,"fields":[
+          {"name":"FlowControlDelay","bits":"[7]","reset":1,"access":"RW","valid":"0=N+1,1=N+2","description":"Latency from FCP_DRQ to TxPresent (Conditional: FlowMode 2/3)."},
+          {"name":"Reserved","bits":"[6:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"FCP_ScramblerEn","bits":"[3]","reset":1,"access":"RW","description":"Enable scrambler on 1-bit FCP (Conditional: FlowMode 2/3)."},
+          {"name":"Reserved","bits":"[2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"FlowMode","bits":"[1:0]","reset":0,"access":"RW(Table168 says Dual)","valid":"0=Normal,1=TxCtl,2=RxCtl,3=Async","description":"Flow-control mode. See INCONSISTENCY note in _meta."}
+        ]},
+        {"offset":"0x0F","abs_address":"0x200F","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved."}]},
+        {"offset":"0x10","abs_address":"0x2010","name":"IntEn","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
+          {"name":"IntEn_PortImpDef_1","bits":"[7]","reset":0,"access":"RW","description":"Enable IntStat_PortImpDef_1."},
+          {"name":"IntEn_PortImpDef_0","bits":"[6]","reset":0,"access":"RW","description":"Enable IntStat_PortImpDef_0."},
+          {"name":"Reserved","bits":"[5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"IntEn_FlowControlFail","bits":"[4]","reset":0,"access":"RW","description":"Enable IntStat_FlowControlFail."},
+          {"name":"IntEn_UnexpectedSSP","bits":"[3]","reset":0,"access":"RW","description":"Enable IntStat_UnexpectedSSP."},
+          {"name":"IntEn_PortNotReady","bits":"[2]","reset":0,"access":"RW","description":"Enable IntStat_PortNotReady."},
+          {"name":"IntEn_PortReady","bits":"[1]","reset":0,"access":"RW","description":"Enable IntStat_PortReady."},
+          {"name":"IntEn_TestFail","bits":"[0]","reset":0,"access":"RW","description":"Enable IntStat_TestFail."}
+        ]},
+        {"offset":"0x11-0x1F","abs_address":"0x2011","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (15 bytes)."}]},
+        {"offset":"0x20-0x2F","abs_address":"0x2020","name":"EC_TestFailCh","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_TestFailCh<c>","bits":"[7:0]","reset":0,"access":"RO","description":"Per-channel test-fail counters c=0..15 (0x20=Ch0 .. 0x2F=Ch15). Source DP uses Ch0 for FCP_DRQ errors."}
+        ]},
+        {"offset":"0x30","abs_address":"0x2030","name":"EC_UnexpectedSSP","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_UnexpectedSSP","bits":"[7:0]","reset":0,"access":"RO","description":"Counter for unexpected-SSP events."}
+        ]},
+        {"offset":"0x31","abs_address":"0x2031","name":"EC_FlowControlFail","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"EC_FlowControlFail","bits":"[7:0]","reset":0,"access":"RO","description":"Counter for flow-control-fail events (Conditional)."}
+        ]},
+        {"offset":"0x32-0x3E","abs_address":"0x2032","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (13 bytes)."}]},
+        {"offset":"0x3F","abs_address":"0x203F","name":"COUNT_ReceivedSSP","reset":"0x00","access":"RO","dual_ranked":false,"fields":[
+          {"name":"COUNT_ReceivedSSP","bits":"[7:0]","reset":0,"access":"RO","description":"Counts DevStat_ReceivedSSP events (all SSP indications)."}
+        ]},
+        {"offset":"0x40-0x6F","abs_address":"0x2040","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (48 bytes). NOTE: dual-ranked _CURR copies of 0x00-0x2F would map here per offset+0x40 convention, but the single-ranked status/EC registers above are not dual-ranked."}]},
+        {"offset":"0x70-0x7F","abs_address":"0x2070","name":"ImpDef","reset":"ImpDef","access":"ImpDef","dual_ranked":false,"fields":[{"name":"ImpDef","bits":"[7:0]","reset":"ImpDef","access":"ImpDef","description":"Implementation-defined (16 bytes)."}]},
+        {"offset":"0x80","abs_address":"0x2080","curr_offset":"0xC0","curr_abs_address":"0x20C0","name":"BitWidth_HorizontalStart","reset":"0x00","access":"PHY1:RO;PHY2/3:Dual","dual_ranked":true,"fields":[
+          {"name":"BitWidth","bits":"[7:6]","reset":0,"access":"Dual","excess1":true,"valid":"0->1UI,1->2UI,2->3UI,3=Rsvd","description":"UIs per data bit (wide bits). RO=0 on PHY1."},
+          {"name":"Reserved","bits":"[5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"HorizontalStart","bits":"[4:0]","reset":0,"access":"Dual","valid":"0-31","description":"First owned UI (column) in any qualifying Row."}
+        ]},
+        {"offset":"0x81","abs_address":"0x2081","curr_offset":"0xC1","curr_abs_address":"0x20C1","name":"EnableCh0_HorizontalCount","reset":"see fields","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"EnableCh0","bits":"[7]","reset":0,"access":"Dual","description":"Enable channel 0. _CURR cleared by Warm+Cold reset; _NEXT by Cold only."},
+          {"name":"PrepareCh0","bits":"[6]","reset":"ImpDef","access":"Dual","description":"Prepare channel 0 (start collateral analog)."},
+          {"name":"Reserved","bits":"[5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"HorizontalCount","bits":"[4:0]","reset":0,"access":"Dual","excess1":true,"valid":"0->1UI .. 31->32UI","description":"Number of owned UIs in the Row (last col = HStart+HCount)."}
+        ]},
+        {"offset":"0x82","abs_address":"0x2082","curr_offset":"0xC2","curr_abs_address":"0x20C2","name":"TailWidth_SubRow_Spacing","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"TailWidth","bits":"[7:6]","reset":0,"access":"Dual","valid":"0=none,1=1UI,2=2UI,3=Rsvd","description":"Tail UIs after last driven bit (Conditional: Source DP)."},
+          {"name":"SubRowInterval","bits":"[5]","reset":0,"access":"Dual","valid":"0=Interval in Rows,1=sub-row","description":"Sub-row interval mode (Optional)."},
+          {"name":"Reserved","bits":"[4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"Spacing","bits":"[3:0]","reset":0,"access":"Dual","valid":"0=NextRow,1=NextCol,2=1blank,3=2blank","description":"UIs between channel groups / between sub-row intervals."}
+        ]},
+        {"offset":"0x83","abs_address":"0x2083","curr_offset":"0xC3","curr_abs_address":"0x20C3","name":"Offset_Interval_LO","reset":"see fields","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Offset[3:0]","bits":"[7:4]","reset":"ImpDef","access":"Dual","description":"Low nibble of 12-bit Offset (LSB-first; see 0x85 for [11:4])."},
+          {"name":"Interval[3:0]","bits":"[3:0]","reset":"ImpDef","access":"Dual","excess1":true,"description":"Low nibble of 12-bit Interval (LSB-first; see 0x84 for [11:4])."}
+        ]},
+        {"offset":"0x84","abs_address":"0x2084","curr_offset":"0xC4","curr_abs_address":"0x20C4","name":"Interval_HI","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Interval[11:4]","bits":"[7:0]","reset":"ImpDef","access":"Dual","excess1":true,"valid":"0->1Row .. 4095->4096Rows","description":"Transport Interval (Rows), excess-1; [2:0] Mandatory,[11:3] Optional. Ignored if SubRowInterval=1."}
+        ]},
+        {"offset":"0x85","abs_address":"0x2085","curr_offset":"0xC5","curr_abs_address":"0x20C5","name":"Offset_HI","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Offset[11:4]","bits":"[7:0]","reset":"ImpDef","access":"Dual","valid":"0-4095 Rows","description":"Rows from start of Transport Interval to start of payload; [2:0] Mandatory."}
+        ]},
+        {"offset":"0x86","abs_address":"0x2086","curr_offset":"0xC6","curr_abs_address":"0x20C6","name":"EndDriveEarly_ApertureAdjust","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"EndDriveEarly","bits":"[7]","reset":0,"access":"Dual","valid":"0=full UI,1=stop 1/2UI early","description":"Release bus 1/2 UI early (Optional, Source DP)."},
+          {"name":"Reserved","bits":"[6:5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"ApertureAdjust","bits":"[4:0]","reset":0,"access":"Dual","valid":"signed 2s-complement, 1/p UI steps","description":"Sink sampling-point offset (Optional, Sink only)."}
+        ]},
+        {"offset":"0x87","abs_address":"0x2087","curr_offset":"0xC7","curr_abs_address":"0x20C7","name":"ChannelGrouping","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"ChannelGrouping","bits":"[3:0]","reset":0,"access":"Dual","valid":"0=all together,k=spacing every k channels","description":"Channels sent contiguously before inserting Spacing (Conditional)."}
+        ]},
+        {"offset":"0x88","abs_address":"0x2088","curr_offset":"0xC8","curr_abs_address":"0x20C8","name":"ConverterClockDiv_L","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"ConverterClockDiv[7:0]","bits":"[7:0]","reset":0,"access":"Dual","excess1":true,"description":"Low byte (LSB-first) of ADC/DAC clock divider (div by N+1) (Optional)."}
+        ]},
+        {"offset":"0x89","abs_address":"0x2089","curr_offset":"0xC9","curr_abs_address":"0x20C9","name":"ConverterClockDiv_H","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"ConverterClockDiv[15:8]","bits":"[7:0]","reset":0,"access":"Dual","description":"High byte of converter clock divider."}
+        ]},
+        {"offset":"0x8A","abs_address":"0x208A","curr_offset":"0xCA","curr_abs_address":"0x20CA","name":"Guard","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"GuardEnable","bits":"[1]","reset":0,"access":"Dual","description":"Enable 1-UI guard bit after last data bit (not scrambled) (Optional)."},
+          {"name":"GuardPolarity","bits":"[0]","reset":0,"access":"Dual","valid":"0=drive0,1=drive1","description":"Guard-bit value when GuardEnable=1."}
+        ]},
+        {"offset":"0x8B-0x8F","abs_address":"0x208B","curr_offset":"0xCB","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (5 bytes)."}]},
+        {"offset":"0x90","abs_address":"0x2090","curr_offset":"0xD0","curr_abs_address":"0x20D0","name":"EnableCh_L","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"EnableCh<7:1>","bits":"[7:1]","reset":0,"access":"Dual","description":"Enable channels 1..7 (bit c = Channelc). _NEXT cleared Cold only; _CURR Warm+Cold."},
+          {"name":"Reserved","bits":"[0]","reset":"-","access":"-","description":"Reserved (Ch0 enable is at 0x81[7])."}
+        ]},
+        {"offset":"0x91","abs_address":"0x2091","curr_offset":"0xD1","curr_abs_address":"0x20D1","name":"EnableCh_H","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"EnableCh<15:8>","bits":"[7:0]","reset":0,"access":"Dual","description":"Enable channels 8..15."}
+        ]},
+        {"offset":"0x92","abs_address":"0x2092","curr_offset":"0xD2","curr_abs_address":"0x20D2","name":"PrepareCh_L","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"PrepareCh<7:1>","bits":"[7:1]","reset":"ImpDef","access":"Dual","description":"Prepare channels 1..7. (Ch0 prepare is at 0x81[6])."},
+          {"name":"Reserved","bits":"[0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0x93","abs_address":"0x2093","curr_offset":"0xD3","curr_abs_address":"0x20D3","name":"PrepareCh_H","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"PrepareCh<15:8>","bits":"[7:0]","reset":"ImpDef","access":"Dual","description":"Prepare channels 8..15."}
+        ]},
+        {"offset":"0x94-0x9F","abs_address":"0x2094","curr_offset":"0xD4","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (12 bytes)."}]},
+        {"offset":"0xA0","abs_address":"0x20A0","curr_offset":"0xE0","curr_abs_address":"0x20E0","name":"FCP_BitWidth_HorizontalStart","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"FCP_BitWidth","bits":"[7:6]","reset":0,"access":"Dual","excess1":true,"description":"FCP UIs/bit (Conditional: FlowMode 2/3)."},
+          {"name":"Reserved","bits":"[5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"FCP_HorizontalStart","bits":"[4:0]","reset":0,"access":"Dual","valid":"0-31","description":"FCP first owned UI."}
+        ]},
+        {"offset":"0xA1","abs_address":"0x20A1","curr_offset":"0xE1","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved."}]},
+        {"offset":"0xA2","abs_address":"0x20A2","curr_offset":"0xE2","curr_abs_address":"0x20E2","name":"FCP_TailWidth","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"FCP_TailWidth","bits":"[7:6]","reset":0,"access":"Dual","valid":"0=none,1=1UI,2=2UI,3=Rsvd","description":"FCP tail UIs (Conditional: Sink DP & FlowMode 2/3)."},
+          {"name":"Reserved","bits":"[5:0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0xA3","abs_address":"0x20A3","curr_offset":"0xE3","curr_abs_address":"0x20E3","name":"FCP_Offset_LO","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"FCP_Offset[3:0]","bits":"[7:4]","reset":"ImpDef","access":"Dual","description":"Low nibble of FCP Offset (LSB-first; [11:4] at 0xA5)."},
+          {"name":"Reserved","bits":"[3:0]","reset":"-","access":"-","description":"Reserved."}
+        ]},
+        {"offset":"0xA4","abs_address":"0x20A4","curr_offset":"0xE4","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved."}]},
+        {"offset":"0xA5","abs_address":"0x20A5","curr_offset":"0xE5","curr_abs_address":"0x20E5","name":"FCP_Offset_HI","reset":"ImpDef","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"FCP_Offset[11:4]","bits":"[7:0]","reset":"ImpDef","access":"Dual","valid":"0-4095 Rows","description":"FCP payload start offset (same semantics as Offset)."}
+        ]},
+        {"offset":"0xA6","abs_address":"0x20A6","curr_offset":"0xE6","curr_abs_address":"0x20E6","name":"FCP_EndDriveEarly_ApertureAdjust","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"FCP_EndDriveEarly","bits":"[7]","reset":0,"access":"Dual","description":"FCP stop driving 1/2 UI early (Optional)."},
+          {"name":"Reserved","bits":"[6:5]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"FCP_ApertureAdjust","bits":"[4:0]","reset":0,"access":"Dual","valid":"signed 2s-complement","description":"FCP-DRQ sampling-point offset (Optional)."}
+        ]},
+        {"offset":"0xA7-0xA9","abs_address":"0x20A7","curr_offset":"0xE7","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (3 bytes)."}]},
+        {"offset":"0xAA","abs_address":"0x20AA","curr_offset":"0xEA","curr_abs_address":"0x20EA","name":"FCP_Guard","reset":"0x00","access":"Dual","dual_ranked":true,"fields":[
+          {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
+          {"name":"FCP_GuardEnable","bits":"[1]","reset":0,"access":"Dual","description":"FCP guard bit enable (Conditional)."},
+          {"name":"FCP_GuardPolarity","bits":"[0]","reset":0,"access":"Dual","valid":"0=drive0,1=drive1","description":"FCP guard-bit value."}
+        ]},
+        {"offset":"0xAB-0xAF","abs_address":"0x20AB","curr_offset":"0xEB","name":"Reserved","reset":"-","access":"-","dual_ranked":true,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (5 bytes)."}]},
+        {"offset":"0xB0-0xBF","abs_address":"0x20B0","curr_offset":"0xF0","name":"ImpDef","reset":"ImpDef","access":"ImpDef","dual_ranked":true,"fields":[{"name":"ImpDef","bits":"[7:0]","reset":"ImpDef","access":"ImpDef","description":"Implementation-defined dual-ranked (16 bytes)."}]}
+      ]
+    }
+  ]
+}

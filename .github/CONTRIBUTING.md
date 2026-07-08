@@ -34,7 +34,7 @@ comment on the pull request with:
    effort, using one of the issue templates.
 2. **Fork** the repository and create a topic branch for your change.
 3. Make your change with clear, focused commits and keep the code reviewable.
-4. Add or update tests where applicable (see the `test/` directory) and ensure the
+4. Add or update tests where applicable (see the `tests/` directory) and ensure the
    existing test suite passes.
 5. **Open a pull request** against `main` and complete the pull request checklist.
 

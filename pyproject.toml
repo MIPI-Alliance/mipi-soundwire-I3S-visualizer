@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swi3s-studio"
+version = "3.0.3"
+description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
+requires-python = ">=3.11"
+dependencies = [
+    "swi3score>=0.1.0",   # the C++ decode core (build from ./native)
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "numpy>=1.23",
+    "pyarrow>=12",
+]
+
+[project.gui-scripts]
+swi3s-studio = "swi3s_studio.app:main"
+
+[tool.setuptools]
+packages = [
+    "swi3s_studio",
+    "swi3s_studio.ingest",
+    "swi3s_studio.store",
+    "swi3s_studio.model",
+    "swi3s_studio.analysis",
+    "swi3s_studio.dsp",
+    "swi3s_studio.export",
+    "swi3s_studio.timing",
+    "swi3s_studio.ui",
+    "swi3s_studio.ui.authoring",
+    "swi3s_studio.swviz",            # first-party SWI3S Visualizer engine (was vendored)
+    "swi3s_studio.swviz.config",
+    "swi3s_studio.swviz.core",
+    "swi3s_studio.swviz.drawing",
+    "swi3s_studio.swviz.io",
+    "swi3s_studio.swviz.models",
+    "swi3s_studio.swviz.utils",
+    "swi3s_studio.swviz.viz",
+]
+# The Raven-extracted register map is installed alongside the app and located at
+# runtime via sys.prefix/share (see model/registers.py _default_registers_json).
+# Bundled peripheral register-map examples ship under share/swi3s-studio/regmaps
+# (see model/regmap_import.py library_dir).
+# (init.csv is a user-supplied local file, not packaged.)
+data-files = [
+    ["share/swi3s-studio", ["data/registers.json"]],
+    ["share/swi3s-studio/regmaps", ["data/regmaps/example_amp.json"]],
+]

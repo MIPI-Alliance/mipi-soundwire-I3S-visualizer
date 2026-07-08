@@ -1,0 +1,7 @@
+# rows 1
+0 0 2 DATA
+1 0 4 DATA
+1 0 5 TAIL
+2 0 7 DATA
+2 0 8 TAIL
+2 0 9 TAIL

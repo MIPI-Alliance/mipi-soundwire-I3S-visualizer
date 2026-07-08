@@ -1,354 +1,173 @@
-# SWI3S Traffic Visualizer
+# SWI3S Studio
 
-MIPI SoundWire I3S Traffic Visualizer - A tool for visualizing SoundWire I3S data port configurations.
+A **MIPI SoundWire I3S (SWI3S)** suite with three modes, selected from a switcher at
+the top of the window:
 
-## Overview
+- **Visualization** — plan a bus: author an Interface + up to 12 data ports, see the
+  placed Rows×Columns grid, and catch clashes / spec violations before you build.
+- **Timing** — dial in PHY settings: compute the SWI3S setup / hold / Z-handover
+  margins and F_max for your bus, term by term.
+- **Analysis** — confirm it works: decode a captured PHY2 bus (clock + bidirectional
+  data), reconstruct the Control Data Stream and audio payload, and explore it in
+  linked panes — 2D bus grid, per-device register maps, 8b/10b symbols, command table,
+  and decoded-audio waveforms with WAV export.
 
-This application provides both a graphical user interface (GUI) and command-line batch mode for:
+The three modes share one window, one bus-grid renderer, and one workspace file
+(capture source + authored config + timing inputs + view state). A Visualizer config
+can be pushed into Analysis as the *expected* config (**Compare ▸ Compare with
+Visualizer**).
 
-- Visualizing SoundWire I3S transport patterns
-- Configuring interface parameters (Columns per row, CDS, S0 & S1)
-- Configuring up to 12 data ports with PCM or PDM streams
-- Supporting Flow Control modes with TxP and DRQ bits
-- Detecting bus clashes and read/write conflicts
-- Exporting symbolic bus trafic to JSON for further analysis
-- Loading and saving configurations via CSV files
+See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for a pane-by-pane walkthrough (including
+partial captures and finding the SSP), [`architecture.md`](architecture.md) for the
+design, and [`docs/TESTING.md`](docs/TESTING.md) for the test strategy.
 
-## Requirements
+> **Successor to the SWI3S Traffic Visualizer.** SWI3S Studio grew out of, and
+> supersedes, the MIPI SoundWire I3S Traffic Visualizer — the **Visualization** mode
+> is that tool, and Studio adds the **Timing** and **Analysis** modes around it. It is
+> this repository's next major line (v3); the visualizer's v1/v2 releases remain
+> available as their `v1.*` / `v2.*` tags.
 
-- **Python 3.13+** (recommended for macOS - required for GUI to work properly)
-- **Python 3.10+** (minimum for all platforms - uses `int.bit_count()`)
+## Tech
 
-### macOS Installation
+PySide6 (Qt 6) + pyqtgraph UI · pybind11 C++ decode core · Apache Arrow + NumPy memmap
+results store · macOS-first, cross-platform.
 
-Python 3.11/3.12 on macOS has a known issue where button clicks don't work in the GUI. **Python 3.13+ is required.**
+## Layout
 
-1. **Install Python 3.13+** from [python.org](https://www.python.org/downloads/)
-   - Download the macOS installer
-   - Run the installer (this installs Python system-wide)
+```
+swi3s_studio/   Python app: ingest, store, model, analysis, dsp, timing, ui
+  ui/                  three-mode UI (Visualizer editor, Timing readout, Analysis panes)
+  ui/grid_view.py      shared bus-grid renderer (decoded + authored)
+  model/bus_config.py  authored Interface + 12 DataPort/FCP config (v2.0 CSV)
+  swviz/               SWI3S Visualizer engine (placement / clash / warnings)
+  timing/              SWI3S PHY timing calculator
+native/         swi3score C++ decode core + pybind11 bindings (scikit-build-core)
+data/registers.json    SWI3S register map (source of truth)
+docs/           USER_GUIDE, TESTING, saleae_sal_format, STYLE_GUIDE
+tests/          Python suites + run_all.sh
+architecture.md
+```
 
-2. **Verify installation:**
-   ```bash
-   python3.13 --version
-   ```
+## Running
 
-3. **Setup the app** (one time, from the app folder):
-   ```bash
-   python3.13 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+Requires Python 3.11+ with the data stack (`numpy`, `pyarrow`) and Qt GUI stack
+(`PySide6`, `pyqtgraph`).
 
-4. **Run the app:**
-   ```bash
-   source .venv/bin/activate
-   python swi3s_visualizer.py
-   ```
+**Quick start (recommended).** A launch script does the whole setup — creates a
+`.venv`, installs the deps, builds the decode core, and starts the app. Re-run it any
+time; the venv and build are reused (pass `--rebuild` / `-Rebuild` to force a fresh
+build of the native core):
 
-### Linux/Windows Installation
+```bash
+./run.sh                              # macOS / Linux
+```
+```powershell
+.\run.ps1                             # Windows (PowerShell) — see the Windows note below
+```
+
+**Manual.** From the repo root:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python swi3s_visualizer.py
+source .venv/bin/activate            # Windows:  .venv\Scripts\activate
+python3 -m pip install -r requirements.txt
+python3 -m pip install ./native      # build the decode core (offline: bash native/build_local.sh)
+PYTHONPATH=. python3 -m swi3s_studio.app
 ```
 
-### Dependencies
+After pulling changes that touch `native/`, rebuild the core
+(`python3 -m pip install ./native`). The compiled module isn't tracked in git; the app
+reports an "out of date — rebuild" message if it detects a stale build.
 
-The app requires these Python packages (installed via requirements.txt):
-- **customtkinter** - Modern UI widgets
-- **canvasvg** - SVG export support
+### Windows
 
-## Quick Start
+- **Run the launcher.** `.\run.ps1` from a PowerShell prompt in the repo root does the
+  full setup. If you see *"running scripts is disabled on this system"*, either allow
+  local scripts once for your user (this only trusts local scripts — remote/unsigned
+  ones still require a signature):
 
-### GUI Mode
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+  ```
 
-After completing the installation above:
+  or run it without changing the policy: `powershell -ExecutionPolicy Bypass -File .\run.ps1`.
+- **A C++ compiler is needed to build the decode core.** Install the free
+  **[Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)** with
+  the *"Desktop development with C++"* workload (MSVC + Windows SDK). Without it,
+  `pip install .\native` fails with a "Microsoft Visual C++ 14.0 or greater is required"
+  error.
+- **Use the `py` launcher** to get a supported version if several Pythons are installed.
+  `run.ps1` auto-selects the newest **3.11–3.13** (PySide6/pyarrow/numpy have no 3.14+
+  wheels yet, so a 3.14 default would fail to install).
+- **Windows on ARM (Parallels, Surface Pro X).** Install the **x64** build of Python, not
+  the arm64 one: `pyarrow` ships no `win_arm64` wheel, so pip would try (and fail) to
+  build Arrow from source. Windows-on-ARM runs x64 Python fine under emulation, and all
+  wheels resolve as `win_amd64`. Get it from python.org (the "Windows installer (64-bit)")
+  or `winget install --id Python.Python.3.12 --architecture x64`.
+- **Long paths / OneDrive.** Cloning under a deeply nested or cloud-synced folder can
+  trip the build or file locks; a short local path like `C:\src\swi3s-studio` is safest.
+- **Running the tests on Windows.** Install `pytest` (one suite uses it) and set
+  `PYTHONUTF8=1` so the suites' Unicode console output (e.g. `▸`, `→`) doesn't trip the
+  legacy cp1252 code page when stdout is redirected:
+  `$env:PYTHONUTF8=1; .venv\Scripts\python -m pytest` (or run individual `tests\test_*.py`).
+
+
+## Opening captures
+
+**File ▸ Open Capture** reads a Logic 2 `.sal` project, a digital CSV (`Time, Ch…`
+columns), or a per-channel `<SALEAE>` binary pair. Clock vs data is auto-assigned by
+transition count (the forwarded clock toggles every UI, so it has the most edges), so
+file order doesn't matter; select both `.bin` files together to skip the second-file
+prompt. Sample rate is auto-detected from binary timestamps. Large captures decode on a
+worker thread behind a progress dialog. **File ▸ Load Demo** runs a synthetic capture:
+two devices × two stereo data ports on a 16-column grid with a §5.1.2 Cold Start in front.
+
+**File ▸ Open Capture with Config CSV…** opens a capture plus a Visualizer config CSV
+and decodes with that data-port config from row 0 — for a capture that begins *after*
+the setup commit, where the port geometry isn't on the wire to snoop. See the User
+Guide's *Partial captures & finding the SSP* for the full workflow.
+
+## Workspaces, compare, export
+
+- **Save / Open Workspace** — a JSON sidecar (capture source, config CSV, SSP row,
+  what-if overlay, bookmarks, cursor, authored config, timing inputs, view state);
+  results re-decode on open, so it stays portable.
+- **Compare** — diff an expected config (CSV or the authored config) against the decode:
+  differing grid cells outlined, a per-cell report, expected register values overlaid.
+- **Audio ▸ Per-Dataport Scrambler** — override the descrambler per (device, data port):
+  Auto / On / Off, then re-decode (fixes a mis-snooped `ScramblerEn`, which otherwise
+  turns the stream into noise).
+- **Export** — Audio as WAV (choose streams + range, optional band-limited resample),
+  Commands as CSV, Bus Grid as SVG/PNG. See [`PACKAGING.md`](PACKAGING.md) for a
+  standalone bundle.
+
+## Tests
 
 ```bash
-source .venv/bin/activate
-python swi3s_visualizer.py
+bash tests/run_all.sh                 # all Python suites (exit-code pass/fail summary)
+bash tests/run_all.sh --build         # rebuild the core first
+bash tests/run_all.sh --native        # also run the native C++ suite
 ```
 
-This opens the graphical interface where you can:
-- Adjust interface parameters in the top panel
-- Configure data ports in the middle panel
-- View traffic visualization in the canvas area
-- Save/load configurations via File menu
-
-### Batch Mode (Headless)
+A single suite runs directly (GUI suites need the Qt offscreen platform):
 
 ```bash
-source .venv/bin/activate
-
-# Generate JSON frame model from CSV configuration
-python swi3s_visualizer.py -c config.csv -o output.json
-
-# With verbose logging
-python swi3s_visualizer.py -c config.csv -o output.json -v
+PYTHONPATH=. python3 tests/test_swi3score.py
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 tests/test_gui_smoke.py
 ```
 
-## Command Line Options
+See [`docs/TESTING.md`](docs/TESTING.md) for the approach and coverage matrix.
 
-| Option | Description |
-|--------|-------------|
-| `-h, --help` | Show help message |
-| `-c FILE, --config FILE` | Load configuration from CSV file |
-| `-o FILE, --output FILE` | Output frame model to JSON file (implies headless mode) |
-| `-s FILE, --save-csv FILE` | Save configuration to CSV file |
-| `-r N, --rows N` | Number of rows to draw (0 = use CSV value) |
-| `-t MODE, --theme MODE` | UI theme: light, dark, or system |
-| `-v, --verbose` | Enable verbose debug logging |
+## Contributing
 
-## Configuration Files
-
-### CSV Format
-
-Configuration files use CSV format with interface parameters followed by data port parameters. Example structure:
-
-```csv
-NumColumns_REG,15
-SkippingDenominator_REG,16
-PHY3Enabled,True
-S0Width,1
-...
-Name,DP0,DP1,DP2,...,DP11
-DeviceNumber_REG,0,0,0,...
-EnableCh_REG,0b11111,0b11,0b0,...
-FlowMode_REG,0,1,2,...
-...
-```
-
-See `examples/` for example configurations.
-
-The first row of a saved CSV is always `AppVersion,<version>`, written so
-future converters can detect files that predate a format change. Loading a
-CSV with no AppVersion field — or with a version different from the running
-app — produces a warning; the load still proceeds.
-
-### Converting v1.74 CSVs
-
-The `csv_converter/` tool reads v1.74-format CSVs and writes the current
-format. See `csv_converter/README.md` for the full field mapping, defaults
-for new fields, and usage.
-
-```bash
-python3 csv_converter/convert_174.py <input.csv>         # → <input>_converted.csv
-python3 csv_converter/convert_174.py <input_dir>         # → <input_dir>_converted/
-```
-
-### JSON Output
-
-The JSON frame model output contains:
-- Per-slot ownership and state information
-- TxP and DRQ bit locations (for Flow Control modes)
-- Clash detection results
-
-## Project Structure
-
-```
-mipi-soundwire-I3S-visualizer/
-├── swi3s_visualizer.py    # Main entry point (CLI + GUI launcher)
-├── src/
-│   ├── config/            # Constants and configuration
-│   │   └── constants.py   # SpecialDevices, CSVFields, ranges
-│   ├── core/              # Core engine (BusModelBuilder)
-│   │   └── engine.py      # Builds BusModel from configuration
-│   ├── drawing/           # Canvas rendering and clash detection
-│   │   ├── canvas_renderer.py
-│   │   └── clash_detector.py
-│   ├── io/                # CSV and JSON handlers
-│   │   ├── csv_handler.py
-│   │   └── json_handler.py
-│   ├── models/            # Data models (Interface, DataPort, FCP, BusModel)
-│   │   ├── dataport.py    # DataPort state machine (hardware model)
-│   │   ├── flow_control_port.py  # FCP state machine (parallel peer of DP)
-│   │   ├── interface.py   # Top-level configuration
-│   │   ├── bus_model.py   # Sequential bit representation
-│   │   ├── device.py      # Device abstraction
-│   │   └── enums.py       # SlotType, DirectionType, FlowMode, TransportPhase, PortMode, DisplayField
-│   ├── ui/                # UI components
-│   │   ├── minimal_app.py # Main application window
-│   │   ├── frame_renderer.py
-│   │   ├── parameter_panel.py
-│   │   ├── error_panel.py
-│   │   └── dialogs/       # Modal dialogs
-│   ├── utils/             # Validators, logging, platform utilities
-│   │   └── validators.py
-│   └── viz/               # Visualization configuration
-│       └── dataport_viz.py
-├── examples/              # Example CSV configurations (also used as tests)
-│   ├── directed_tests/    # Targeted feature tests
-│   ├── spec_figures/      # Configurations from spec figures
-│   └── use_cases/         # Real-world use case examples
-├── csv_converter/         # CLI to convert v1.74 CSVs to the current format
-│   ├── convert_174.py
-│   └── README.md
-├── test/
-│   ├── testsuite.py       # Test runner with summary generation
-│   ├── summary.md         # Test statistics (generated after each run)
-│   └── test_json_outputs/ # Expected JSON outputs for tests
-├── requirements.txt       # Python dependencies
-├── architecture.md        # Detailed architecture documentation
-├── LICENSE.md             # BSD 3-Clause License
-└── README.md              # This file
-```
-
-## Running Tests
-
-```bash
-source .venv/bin/activate
-cd test
-rm -rf temp && python testsuite.py
-```
-
-The test suite:
-1. Runs each CSV configuration through the visualizer in batch mode
-2. Compares generated JSON output against reference JSON files
-3. Generates a detailed `summary.md` with test statistics
-4. Cleans up temporary files after completion
-
-To regenerate all reference files after intentional changes:
-
-```bash
-source .venv/bin/activate
-cd test
-python testsuite.py --regenerate
-```
-
-## Key Concepts
-
-### Interface Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `NumColumns_REG` | Number of columns per row (excess-1 encoded) |
-| `PHY3Enabled` | Enable S0/S1 bit slots |
-| `SkippingDenominator_REG` | Skipping interval denominator |
-| `CDS_BitWidth_REG` | Control Data Stream bit width |
-| `S0Width` | S0 width |
-| `S1TailWidth_REG` | S1 tail width |
-
-### Data Port Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `EnableCh_REG` | Channel enables (e.g., 0b11111 for channels 0-4) |
-| `SampleSize_REG` | Sample width in bits (excess-1 encoded) |
-| `SampleGrouping_REG` | Samples grouped per transport (excess-1 encoded) |
-| `ChannelGrouping_REG` | Channels grouped before spacing |
-| `Spacing_REG` | Slots between channel groups |
-| `Interval_REG` | Rows per interval (excess-1 encoded) |
-| `Offset_REG` | Row offset for first transport |
-| `HorizontalStart_REG` | Starting column |
-| `HorizontalCount_REG` | Columns owned per row |
-| `PortDirection_REG` | 1 = Sink, 0 = Source |
-| `SubRowInterval_REG` | Enable Sub-Row Interval mode |
-| `FlowMode_REG` | Flow control mode |
-
-### Flow Control Port (FCP) Parameters
-
-Each data port has an associated FCP that emits DRQ + optional guards/tails in
-RX_CONTROLLED or ASYNC flow modes. FCP is a parallel peer of the DataPort on
-the bus, not a sub-component:
-
-| Parameter | Description |
-|-----------|-------------|
-| `FCP_HorizontalStart_REG` | Column where the DRQ fires |
-| `FCP_Offset_REG` | Row within the interval where the DRQ fires |
-| `FCP_BitWidth_REG` | Wide-bit replay count for the DRQ (excess-1) |
-| `FCP_TailWidth_REG` | Tail bits after the DRQ |
-| `FCP_GuardEnable_REG` | Enable guard bit after the DRQ |
-| `FCP_GuardPolarity_REG` | Guard polarity (0 or 1) |
-
-### Flow Control Modes
-
-| Mode | Value | Description |
-|------|-------|-------------|
-| Normal | 0 | Standard data transfer without flow control bits |
-| Tx Controlled | 1 | Source sends TxPresent bit per channel indicating valid data |
-| Rx Controlled | 2 | Sink sends DRQ bit indicating readiness to receive |
-| Asynchronous | 3 | Both TxP and DRQ bits for bidirectional flow control |
-
-### Configuration Validation
-
-Configurations are validated by `DataPortValidator` and `InterfaceValidator`
-(`src/utils/validators.py`) before the engine runs. Validators fall into two
-categories:
-
-- **Range checks** — register bit-field bounds. In hardware these are enforced
-  by the registers themselves; the visualizer checks them because the UI/CSV
-  accept arbitrary values.
-- **Settings checks** — semantic rules that cross fields. These map
-  one-to-one to SWI3S specification requirements.
-
-#### Data Port Range Checks
-
-Bounds-checked register fields: `DeviceNumber`, `NumChannels`,
-`ChannelGrouping_REG`, `Spacing_REG`, `SampleSize_REG`, `SampleGrouping_REG`,
-`Interval_REG`, `SkippingNumerator_REG`, `Offset_REG`, `HorizontalStart_REG`,
-`HorizontalCount_REG`. When `FlowMode_REG` activates the FCP (RX_CONTROLLED or
-ASYNC): `FCP_HorizontalStart_REG`, `FCP_BitWidth_REG`, `FCP_TailWidth_REG`,
-`FCP_Offset_REG`.
-
-#### Data Port Settings Checks
-
-Each row is one `_check_*` method in `DataPortValidator`.
-
-| Check | Rule |
-|-------|------|
-| Offset within interval | `Offset_REG ≤ Interval_REG` |
-| SRI interval zero | SRI mode (`SubRowInterval_REG=1`) → `Interval_REG = 0` |
-| SRI skipping disabled | SRI mode → `SkippingNumerator_REG = 0` |
-| SRI pattern fits | SRI: `HorizontalCount` large enough to emit one complete channel group |
-| HorizontalStart within columns | `HorizontalStart_REG < NumColumns` |
-| HorizontalCount within columns | `HorizontalCount_REG < NumColumns` |
-| Horizontal window within columns | `HorizontalStart_REG + HorizontalCount_REG < NumColumns` |
-| Tail fits row | `TailWidth_REG` fits in columns after last data slot (source DP only) |
-| BitWidth fits remaining columns | `BitWidth_REG` fits in row tail (source DP only) |
-| BitWidth fits HorizontalCount | `BitWidth_REG ≤ HorizontalCount_REG` |
-| HorizontalCount divisible by BitWidth | non-SRI: `(HorizontalCount + 1) % (BitWidth + 1) == 0` |
-| Guard fits row | Guard has ≥1 column after last data slot (source DP only) |
-| Sink no guard | Sink DP shall not enable Guard |
-| Sink no tail | Sink DP shall not have Tail |
-| FCP offset within interval | `FCP_Offset_REG ≤ Interval_REG` |
-| FCP fits row | FCP (DRQ + optional guard + tails) fits starting at `FCP_HorizontalStart_REG` |
-
-#### Interface Settings Checks
-
-| Check | Rule |
-|-------|------|
-| PHY3 requires even columns | When PHY3 is disabled (FBSCE PHYs used), `NumColumns` must be even |
-
-### Clash Detection
-
-The visualizer detects several types of issues:
-
-| Issue Type | Severity | Description |
-|------------|----------|-------------|
-| Bus Clashes | Critical | Multiple sources writing to the same bit slot |
-| Device Clashes | Warning | Same device writing to same slot from different DPs |
-| Read Overlaps | Info | Multiple sinks reading the same bit slot |
-| TxP Mismatches | Warning | TxP source bits without matching sink bits |
-| DRQ Mismatches | Warning | DRQ source/sink validation errors |
-| Scrambler Mismatches | Warning | Source and sink have different scrambler settings |
-| Test Mode Mismatches | Warning | Different test modes at same bit position |
-| Interval Overflow | Warning | Data port bits don't fit in configured interval |
-| Display Truncation | Info | Data port interval extends beyond displayed rows |
-
-## Architecture
-
-See [architecture.md](architecture.md) for detailed documentation of the codebase structure, including:
-
-- Module organization and dependencies
-- Data flow from CSV to rendered frame
-- DataPort state machine implementation
-- Performance optimizations
-- Key design patterns
+This is a MIPI Alliance Open Source Software project. Contributions go through pull
+requests reviewed per [`GOVERNANCE.md`](GOVERNANCE.md); non-members must sign the
+[CLA](.github/CLA.md) (the CLA Assistant bot prompts on your first PR). See
+[`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md) for the full flow and
+[`.github/SECURITY.md`](.github/SECURITY.md) for reporting vulnerabilities.
 
 ## License
 
-BSD 3-Clause License. See LICENSE.md for details.
+BSD 3-Clause License — see [`LICENSE.md`](LICENSE.md).
+Copyright (c) MIPI Alliance and other contributors.
 
-Copyright (c) 2020-2026, MIPI Alliance and other contributors.
