@@ -1,3 +1,20 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "cirrus-jon",
+      "id": 124624591,
+      "comment_id": 4926202377,
+      "created_at": "2026-07-09T14:37:31Z",
+      "repoId": 197462522,
+      "pullRequestNo": 7
+    },
+    {
+      "name": "cirrus-jon",
+      "id": 124624591,
+      "comment_id": 4927453547,
+      "created_at": "2026-07-09T16:41:42Z",
+      "repoId": 197462522,
+      "pullRequestNo": 7
+    }
+  ]
 }
