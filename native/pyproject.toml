@@ -1,0 +1,13 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "swi3score"
+version = "0.1.0"
+description = "SWI3S PHY2 decode core (pybind11) — shared with the Saleae plugin"
+requires-python = ">=3.9"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"

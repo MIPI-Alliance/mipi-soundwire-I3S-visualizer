@@ -1,0 +1,128 @@
+name: CI
+
+# Enforce the quality floor on every push + PR: build the native decode core and run
+# the full pytest suite (goldens included) across the supported OS/Python range, plus a
+# report-only lint/type pass and a perf-regression gate. Mirrors the local flow
+# (conftest sets the offscreen Qt platform + short demo). See docs/DEVELOPMENT.md.
+# quoted so YAML doesn't coerce the bareword `on` to boolean true.
+"on":
+  push:
+    branches: ["main", "release/**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: "1"                 # suites print ▸/→; avoids cp1252 errors on Windows
+  PYTHONPATH: "."                 # import swi3s_studio from the repo (native installed via pip)
+  PYQTGRAPH_QT_LIB: "PySide6"
+  QT_QPA_PLATFORM: "offscreen"    # headless Qt (conftest also sets this defensively)
+
+jobs:
+  test:
+    name: test ${{ matrix.os }} py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # The matrix is a DELIBERATE set, recorded here because it and the hand-run gate
+      # cover different things and each was once assumed to cover everything:
+      #   * 3.11 is the floor the README promises; 3.13 is the ceiling run.ps1 will select.
+      #   * windows 3.14 mirrors what the release gate actually validates by hand (the
+      #     Windows VM's venv is 3.14). Without it, the configuration we ship-test on was
+      #     in NO CI job, while 3.12/3.13 were in no hand run.
+      #   * Linux 3.14 is deliberately absent: the PySide6/pyarrow wheel situation there is
+      #     unverified, and a red job nobody can reproduce locally teaches nothing. Revisit
+      #     when a Linux user reports 3.14, or when the wheels are confirmed.
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.14" }
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          # setup-python installs x64 on the windows runner -> pyarrow/PySide6 wheels
+          # resolve (win_amd64); the arm64 wheel gap in the README doesn't apply here.
+      # PySide6's offscreen platform still dlopen's a few system libs on headless Linux.
+      - name: Install Qt runtime deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Build the native decode core
+        shell: bash
+        run: python -m pip install ./native      # scikit-build-core fetches cmake/ninja
+      - name: Run tests (excludes perf)
+        shell: bash
+        run: python -m pytest -q -m "not perf"
+
+  perf:
+    name: perf regression gate
+    runs-on: ubuntu-latest       # one consistent runner — perf ceilings are cliff detectors
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install Qt runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+      - name: Install deps + native core
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest ./native
+      - name: Run perf benchmarks
+        run: python -m pytest -q -m perf
+
+  coverage:
+    name: coverage report (non-gating)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install Qt runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+      - name: Install deps + native core
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest pytest-cov ./native
+      - name: Coverage (report only; no threshold yet)
+        run: python -m pytest -q -m "not perf" --cov=swi3s_studio --cov-report=term-missing:skip-covered
+
+  lint:
+    name: lint + type
+    runs-on: ubuntu-latest
+    # BLOCKING as of 3.0.12. It was `continue-on-error: true` ("advisory until the codebase
+    # is clean") from 3.0.7 until 3.0.12, and the workflow did not execute at all in that
+    # window — so nobody discovered the codebase was NOT clean. The first published PR of
+    # the v3 line reported 445 ruff findings to reviewers. The tree is clean now; keep it
+    # that way here.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install linters
+        run: python -m pip install --upgrade pip ruff mypy
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy (must not regress vs tools/mypy_baseline.json)
+        # NOT `|| true`. That discarded the result even when the job ran, so the type state
+        # was unmeasured rather than clean — it was 448 errors in 29 files when first
+        # measured. Fixing that is not release-blocking work; letting it GROW is what this
+        # catches. Improve a file and re-baseline with `python3 tools/mypy_gate.py --update`.
+        run: python3 tools/mypy_gate.py

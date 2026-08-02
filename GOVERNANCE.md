@@ -9,7 +9,7 @@ for Software Development Projects*.
 ### Maintainer
 The Maintainer is responsible for accepting contributions, managing branches, and
 making releases of the project. The Maintainer may also act as a Reviewer or a
-Developer. The current code owners are listed in [CODEOWNERS](CODEOWNERS).
+Developer. The current code owners are listed in [CODEOWNERS](.github/CODEOWNERS).
 
 ### Reviewer
 Reviewers review patches submitted by Developers before they are merged by the

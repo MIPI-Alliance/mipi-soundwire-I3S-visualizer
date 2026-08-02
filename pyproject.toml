@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swi3s-studio"
+version = "3.0.12"
+description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
+requires-python = ">=3.11"
+dependencies = [
+    "swi3score>=0.1.0",   # the C++ decode core (build from ./native)
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "numpy>=1.23",
+    "pyarrow>=12",
+    "psutil>=5.9",     # actual-free-memory for the large-capture open guard
+]
+
+[project.gui-scripts]
+swi3s-studio = "swi3s_studio.app:main"
+
+[tool.setuptools]
+packages = [
+    "swi3s_studio",
+    "swi3s_studio.ingest",
+    "swi3s_studio.store",
+    "swi3s_studio.model",
+    "swi3s_studio.analysis",
+    "swi3s_studio.dsp",
+    "swi3s_studio.export",
+    "swi3s_studio.timing",
+    "swi3s_studio.ui",
+    "swi3s_studio.ui.authoring",
+    "swi3s_studio.swviz",            # first-party SWI3S Visualizer engine (was vendored)
+    "swi3s_studio.swviz.config",
+    "swi3s_studio.swviz.core",
+    "swi3s_studio.swviz.drawing",
+    "swi3s_studio.swviz.io",
+    "swi3s_studio.swviz.models",
+    "swi3s_studio.swviz.utils",
+    "swi3s_studio.swviz.viz",
+]
+# The Raven-extracted register map is installed alongside the app and located at
+# runtime via sys.prefix/share (see model/registers.py _default_registers_json).
+# Bundled peripheral register-map examples ship under share/swi3s-studio/regmaps
+# (see model/regmap_import.py library_dir).
+# (init.csv is a user-supplied local file, not packaged.)
+data-files = [
+    ["share/swi3s-studio", ["data/registers.json"]],
+    ["share/swi3s-studio/regmaps", ["data/regmaps/example_amp.json"]],
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "perf: performance-regression benchmark with a wall-clock ceiling (run: -m perf)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# `scratch` is local debris (gitignored). It is listed HERE, not left to .gitignore,
+# because ruff only honours .gitignore inside a git repository — and the Windows test VM's
+# tree is an scp'd copy with no .git. The same commit therefore linted CLEAN on macOS and
+# reported 95 findings on Windows, which makes a release gate worthless. Ruff's own defaults
+# already cover .venv / build / dist / __pycache__ / .mypy_cache, so this is the only gap.
+extend-exclude = ["native/build", "build", "dist", "scratch"]
+
+
+[tool.ruff.lint]
+# Real errors (F) + import hygiene (I) are what this ruleset is for; pure layout
+# preferences are not. E501 (long lines), E402 (guarded imports) and E741 (ambiguous
+# names) were already silenced. E701/E702 (colon / semicolon one-liners) and E731
+# (assigned lambda) now join them: the tree deliberately uses compact one-liners for Qt
+# setup and short test fixtures, ruff has no SAFE autofix for any of them, and
+# hand-splitting ~190 statements would change no behaviour while touching 30+ files.
+# With these ignored the tree is CLEAN, which is what makes the advisory lint job
+# flippable to blocking (see docs/TECH_DEBT.md) — a gate that catches real defects is
+# worth more than uniform statement-per-line style.
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E402", "E741", "E701", "E702", "E731"]
+
+[tool.mypy]
+# 3.12, not our 3.11 floor. mypy follows imports into installed stubs, and modern ones use
+# 3.12+ syntax: on the Windows VM (Python 3.14) numpy's stubs use a `type` statement, which
+# under python_version="3.11" was a FATAL syntax error that aborted the entire check after
+# one error — the gate saw "205 -> 1" and reported a regression. Assuming 3.12 semantics
+# costs us nothing here (nothing in this tree depends on 3.11-vs-3.12 typing differences)
+# and makes the check reproducible on both platforms, which a release gate requires.
+python_version = "3.12"
+ignore_missing_imports = true       # PySide6 / pyqtgraph / pyarrow ship partial stubs
+check_untyped_defs = false          # lenient start — the tree isn't fully annotated yet
+warn_unused_ignores = false
+exclude = ["native/build", "build", "dist", "scratch"]
+
+[tool.coverage.run]
+source = ["swi3s_studio"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+

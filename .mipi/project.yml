@@ -1,5 +1,0 @@
-# Declarative project identity — validated by config-check (fail-closed).
-project_type: oss-public
-license: BSD-3-Clause
-cla: true
-history: []

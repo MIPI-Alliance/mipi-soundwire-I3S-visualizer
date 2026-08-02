@@ -1,8 +1,0 @@
-# Lines starting with '#' are comments.
-# Each line is a file pattern followed by one or more owners.
-
-# These owners will be the default owners for everything in the repo.
-# The @MIPI-Alliance/repo-maintainers team lets org admins approve PRs across
-# MIPI projects; the named maintainers remain default owners as well.
-*	@roderickhogan @cirrus-jon @NielWarren @MIPI-Alliance/repo-maintainers
-

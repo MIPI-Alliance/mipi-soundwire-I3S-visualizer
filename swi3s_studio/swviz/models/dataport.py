@@ -1,0 +1,349 @@
+"""DataPort configuration and state management.
+
+Classes:
+    DataPortState:  Runtime state
+    DataPortConfig: Configuration and register values
+    DataPort:       Combines config, state, and algorithm
+
+`transport_phase: TransportPhase` tracks the transport lifecycle:
+    PENDING      Idle: waiting for gate (not-yet-started, mid-pattern pause,
+                 or pattern done)
+    ACTIVE       Transporting
+    SPACING      In inter-CG / inter-pattern gap UIs
+
+Normal vs SRI:
+    - Normal: One transport per SSP interval; channel groups
+      structure the burst/space pattern within the transport.
+    - SRI:    Multiple transports per row.
+
+Counter cascade:
+    wide_bit -> bit_in_channel -> channel -> sample -> channel_group
+    -> transport completion
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from .enums import FlowMode, TransportPhase
+
+if TYPE_CHECKING:
+    from .device import Device
+
+class DataPortState:
+    """DataPort State."""
+
+    def __init__(self, config: DataPortConfig) -> None:
+        self.initialize(config)
+
+    def initialize(self, config: DataPortConfig) -> None:
+        """Initialize state."""
+        self.column: int = 0
+        self.row_in_interval: int = 0
+        self.interval_skipped: bool = False
+        self.skipping_accumulator: int = 0
+        self.guard_pending: bool = False
+        self.tail_remaining: int = 0
+        self.initialize_transport(config)
+
+    def initialize_transport(self, config: DataPortConfig) -> None:
+        """Initialize transport state for a new transport pattern."""
+        self.transport_phase: TransportPhase = TransportPhase.ACTIVE
+        self.spacing_slots_remaining: int = 0
+        self.sample_in_group: int = 0
+        self.samples_in_group_remaining: int = config.SampleGrouping_REG
+        self.channel_group_base_channel: int = 0
+        self.channel_index: int = 0
+        self.channels_in_group_remaining: int = config._effective_channel_grouping - 1
+        self.bit_in_channel: int = config.SampleSize_REG
+        self.wide_bit_remaining: int = config.BitWidth_REG
+        self.txp_pending: bool = config._txp_enabled
+
+class DataPortConfig:
+    """Configuration and register state for a DataPort.
+
+    NOTE: register values here are NOT range-checked at assignment — this is a
+    plain hardware-state container that accepts whatever the loader/UI writes
+    (mirroring real registers, which can hold out-of-spec values). Range and
+    semantic validation lives in `utils/validators.py` (DataPortValidator), run
+    explicitly by the engine; do not add validation here or it will diverge.
+    """
+
+    EnableCh_REG: int
+    ChannelGrouping_REG: int
+    Spacing_REG: int
+    SampleSize_REG: int
+    SampleGrouping_REG: int
+    Interval_REG: int
+    SkippingNumerator_REG: int
+    Offset_REG: int
+    HorizontalStart_REG: int
+    HorizontalCount_REG: int
+    TailWidth_REG: int
+    BitWidth_REG: int
+    PortDirection_REG: bool
+    GuardEnable_REG: bool
+    GuardPolarity_REG: bool
+    SubRowInterval_REG: bool
+    FlowMode_REG: int
+    PortMode_REG: int
+    ScramblerEn_REG: bool
+
+    @property
+    def _num_channels(self) -> int:
+        """Count of enabled channels. int.bit_count() is a C-level popcount — far
+        cheaper than bin(x).count('1') (no string alloc) on this per-tick hot path,
+        and stateless so it stays correct when EnableCh_REG is edited in place (no
+        cache to invalidate)."""
+        return self.EnableCh_REG.bit_count()
+
+    @property
+    def _horizontal_end(self) -> int:
+        """Last column of the horizontal window."""
+        return self.HorizontalStart_REG + self.HorizontalCount_REG
+
+    @property
+    def _is_source(self) -> bool:
+        """PortDirection_REG=True means SINK"""
+        return not self.PortDirection_REG
+
+    @property
+    def _txp_enabled(self) -> bool:
+        """True if FlowMode activates the TX_PRESENT bit. Per {ASW5203} TX_PRESENT
+        is present in ALL three flow-controlled modes: TX_CONTROLLED and ASYNC carry
+        data-validity, and RX_CONTROLLED carries a copy of the FCP_DRQ received 1 or
+        2 Intervals earlier. Only NORMAL (no flow control) omits it."""
+        return self.FlowMode_REG in (
+            FlowMode.TX_CONTROLLED, FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
+
+    @property
+    def _drq_enabled(self) -> bool:
+        """True if FlowMode activates the FCP's DRQ path (RX_CONTROLLED or ASYNC)."""
+        return self.FlowMode_REG in (FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
+
+    @property
+    def _effective_channel_grouping(self) -> int:
+        """Channels per group, clamped to the enabled-channel count. A group can't
+        hold more channels than exist; without the clamp a ChannelGrouping larger
+        than num_channels would walk channel_index past the enabled channels
+        (IndexError in Device._channel_from_index). The engine intentionally ignores
+        the validator, so clamp here at the source (mirrors C++ CDataPort). Floored
+        at 1 so the group-countdown seed (grouping-1) can't go negative when no
+        channels are enabled."""
+        n = self._num_channels
+        grouping = (n if self.ChannelGrouping_REG == 0 else self.ChannelGrouping_REG)
+        return (max(1, min(grouping, n)) if n else 1)
+
+class DataPort:
+    """SWI3S Data Port — config + state + algorithm.
+        initialize()         initialize before use
+        clock_tick()         advance one UI; engine derives BitSlotState from state
+    """
+
+    state: DataPortState
+
+    def __init__(self, device: 'Device', dp_index: int) -> None:
+        self._device = device
+        self.dp_index = dp_index
+        self.config = DataPortConfig()
+
+    def initialize(self) -> None:
+        """Initialize before dataport use."""
+        self.state = DataPortState(self.config)
+        self._num_cols = self._device.num_columns
+        self._start_interval()
+
+    def clock_tick(self) -> None:
+        """Advance the DataPort by one UI.
+
+        Three paths:
+          1. Gate satisfied and on an owned slot — write or read the bus,
+             advance the cascade, arm guard/tail, advance column, return.
+          2. Gate satisfied but in SPACING — tick the spacing counter,
+             transition to ACTIVE when it hits zero, then fall through to (3).
+          3. Gate not satisfied — pop guard and tail armed by a prior owned
+             source slot, then advance column.
+        """
+        cfg, s = self.config, self.state
+        nch = cfg._num_channels
+        in_transport_window = (
+            nch > 0
+            and not s.interval_skipped
+            and s.channel_group_base_channel < nch
+            and s.row_in_interval >= cfg.Offset_REG
+            and cfg.HorizontalStart_REG <= s.column
+            and s.column <= cfg._horizontal_end
+        )
+
+        if in_transport_window:
+            if s.transport_phase == TransportPhase.SPACING:
+                s.spacing_slots_remaining -= 1
+                if s.spacing_slots_remaining == 0:
+                    s.transport_phase = TransportPhase.ACTIVE
+            elif s.transport_phase == TransportPhase.ACTIVE:
+                if cfg._is_source:
+                    if s.wide_bit_remaining == cfg.BitWidth_REG:
+                        if s.txp_pending:
+                            self._device.write_txp()
+                        else:
+                            self._device.write_data_bit_from_fifo()
+                    else:
+                        self._device.held_write_bit()
+                else:
+                    if s.wide_bit_remaining == 0:
+                        if s.txp_pending:
+                            self._device.read_txp()
+                        else:
+                            self._device.read_data_bit_to_fifo()
+
+                self._advance_wide_bit()
+                self._arm_guard_tail()
+                self._advance_column()
+                return
+
+        self._pop_guard_tail()
+        self._advance_column()
+
+    def _start_interval(self) -> None:
+        """Start the next interval."""
+        self.state.interval_skipped = self._advance_skipping_accumulator()
+        self.state.initialize_transport(self.config)
+
+    def _advance_skipping_accumulator(self) -> bool:
+        """Advance skipping accumulator. Returns True iff interval should be skipped."""
+        cfg, s = self.config, self.state
+        if cfg.SkippingNumerator_REG == 0:
+            return False
+        s.skipping_accumulator += cfg.SkippingNumerator_REG
+        if s.skipping_accumulator < self._device.SkippingDenominator_REG:
+            return False
+        s.skipping_accumulator -= self._device.SkippingDenominator_REG
+        return True
+
+    def _advance_column(self) -> None:
+        """Next column; cascades to _advance_row."""
+        self.state.column += 1
+        if self.state.column >= self._num_cols:
+            self._advance_row()
+
+    def _advance_row(self) -> None:
+        """Next row; cascades to _start_interval."""
+        s = self.state
+        s.column = 0
+        s.guard_pending = False
+        s.tail_remaining = 0
+
+        if s.transport_phase == TransportPhase.SPACING:
+            s.transport_phase = TransportPhase.ACTIVE
+            s.spacing_slots_remaining = 0
+
+        if (s.transport_phase == TransportPhase.PENDING
+                and s.channel_group_base_channel < self.config._num_channels):
+            s.transport_phase = TransportPhase.ACTIVE
+
+        s.row_in_interval += 1
+
+        if s.row_in_interval > self.config.Interval_REG:
+            s.row_in_interval = 0
+            self._start_interval()
+
+    def _advance_wide_bit(self) -> None:
+        """Next wide-bit UI; cascades to _advance_bit_in_channel."""
+        s = self.state
+        if s.wide_bit_remaining == 0:
+            s.wide_bit_remaining = self.config.BitWidth_REG
+            self._advance_bit_in_channel()
+        else:
+            s.wide_bit_remaining -= 1
+
+    def _advance_bit_in_channel(self) -> None:
+        """Next bit; cascades to _advance_channel."""
+        s = self.state
+        if s.txp_pending:
+            s.txp_pending = False
+            return
+        if s.bit_in_channel == 0:
+            s.bit_in_channel = self.config.SampleSize_REG
+            self._advance_channel()
+        else:
+            s.bit_in_channel -= 1
+
+    def _advance_channel(self) -> None:
+        """Next channel; cascades to _advance_sample."""
+        cfg, s = self.config, self.state
+        s.txp_pending = cfg._txp_enabled
+        if s.channels_in_group_remaining == 0:
+            s.channel_index = s.channel_group_base_channel
+            group_channels = min(cfg._effective_channel_grouping,
+                                 cfg._num_channels - s.channel_group_base_channel)
+            s.channels_in_group_remaining = max(0, group_channels - 1)
+            self._advance_sample()
+        else:
+            s.channel_index += 1
+            s.channels_in_group_remaining -= 1
+
+    def _advance_sample(self) -> None:
+        """Next sample; cascades to _advance_channel_group."""
+        cfg, s = self.config, self.state
+        if s.samples_in_group_remaining == 0:
+            s.sample_in_group = 0
+            s.samples_in_group_remaining = cfg.SampleGrouping_REG
+            self._advance_channel_group()
+        else:
+            s.sample_in_group += 1
+            s.samples_in_group_remaining -= 1
+
+    def _advance_channel_group(self) -> None:
+        """Next channel group (or next transport in SRI)."""
+        cfg, s = self.config, self.state
+        s.channel_group_base_channel += cfg._effective_channel_grouping
+        transport_pattern_complete = s.channel_group_base_channel >= cfg._num_channels
+
+        if transport_pattern_complete:
+            if cfg.SubRowInterval_REG:
+                s.initialize_transport(cfg)
+            else:
+                s.transport_phase = TransportPhase.PENDING
+                return
+        else:
+            remaining_channels = cfg._num_channels - s.channel_group_base_channel
+            if remaining_channels > cfg._effective_channel_grouping:
+                remaining_channels = cfg._effective_channel_grouping
+            s.channels_in_group_remaining = remaining_channels - 1
+            s.channel_index = s.channel_group_base_channel
+
+        if cfg.Spacing_REG != 0:
+            s.spacing_slots_remaining = cfg.Spacing_REG - 1
+            if cfg.Spacing_REG > 1:
+                s.transport_phase = TransportPhase.SPACING
+            else:
+                s.transport_phase = TransportPhase.ACTIVE
+        else:
+            s.transport_phase = TransportPhase.PENDING
+
+    def _pop_guard_tail(self) -> None:
+        """Pop guard/tail slots."""
+        cfg, s = self.config, self.state
+        if s.guard_pending:
+            if cfg.GuardPolarity_REG:
+                self._device.write_guard1()
+            else:
+                self._device.write_guard0()
+            s.guard_pending = False
+        elif s.tail_remaining > 0:
+            if s.tail_remaining == cfg.TailWidth_REG:
+                self._device.write_tail()
+            else:
+                self._device.held_write_bit()
+            s.tail_remaining -= 1
+
+    def _arm_guard_tail(self) -> None:
+        """Arm guard/tail slots."""
+        cfg, s = self.config, self.state
+        s.guard_pending = False
+        s.tail_remaining = 0
+        if not cfg._is_source:
+            return
+        if cfg.GuardEnable_REG:
+            s.guard_pending = True
+        s.tail_remaining = cfg.TailWidth_REG

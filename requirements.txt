@@ -1,22 +1,28 @@
-# SWI3S Visualizer Requirements
+# SWI3S Studio dependencies.
 #
-# Required Python version: 3.8+
+# Install into ONE Python interpreter — the app needs the data stack AND the Qt
+# GUI stack in the same interpreter:
 #
-# IMPORTANT: Tk 9.0+ is required on macOS for button events to work properly.
-# - Python 3.13+ includes Tk 9.0 by default
-# - Python 3.11/3.12 on macOS ships with Tk 8.6 which has event handling bugs
-# - Check your Tk version: python3 -c "import tkinter; print(tkinter.TkVersion)"
+#     python3 -m pip install -r requirements.txt
 #
-# On macOS with older Python, install Python 3.13+ from python.org or use:
-#   brew install python-tk@3.13
+# Then build the native decode core and run the app (see README ▸ Running):
 #
-# Install packages with the same Python you'll use to run the app:
-#   python3 -m pip install -r requirements.txt
-#   python3 swi3s_visualizer.py
+#     python3 -m pip install ./native      # builds the swi3score C++ module
+#     PYTHONPATH=. python3 -m swi3s_studio.app
 
-customtkinter>=5.0.0
-canvasvg>=1.0.0
+# Runtime — data + model
+numpy>=1.24
+pyarrow>=14.0
 
-# Note: tkinter is also required (standard library)
-# - Included with Python on macOS/Windows
-# - On Linux: sudo apt-get install python3-tk
+# Runtime — memory headroom for the large-capture open guard (ingest/saleae_sal.py).
+# Optional in the sense that the guard falls back to a conservative fixed budget
+# without it, but then it cannot see ACTUAL free memory — declare it so the accurate
+# path is the normal one.
+psutil>=5.9
+
+# Runtime — Qt GUI
+PySide6>=6.6
+pyqtgraph>=0.13
+
+# Build — native swi3score decode core (pybind11); required by `pip install ./native`
+pybind11>=2.11
