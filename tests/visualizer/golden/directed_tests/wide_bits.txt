@@ -1,0 +1,7 @@
+# rows 1
+0 0 4 DATA
+1 0 8 DATA
+1 0 9 DATA
+2 0 12 DATA
+2 0 13 DATA
+2 0 14 DATA

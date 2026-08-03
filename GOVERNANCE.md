@@ -27,7 +27,8 @@ acceptance, and code should always be made reviewable before being merged.
 
 There is no difference in the acceptance process between contributions from MIPI
 Member companies and non-members, except that non-members must sign the project
-[CLA](.github/CLA.md). See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
+[CLA](.github/CLA.md). The MIPI Alliance organisation-level contributing guide, which
+GitHub shows when a pull request is opened, describes the submission flow.
 
 ## Managing Releases
 
@@ -66,5 +67,6 @@ specification version that happen to share the same number.
 
 ## Security
 
-Security issues are handled per [SECURITY.md](.github/SECURITY.md) and Annex D.6 of
+Security issues are handled per the MIPI Alliance organisation-level security policy,
+reachable from this repository's **Security** tab, and Annex D.6 of
 the MIPI policy.

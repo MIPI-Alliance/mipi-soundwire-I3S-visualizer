@@ -1,0 +1,299 @@
+# Development & Release Workflow
+
+How SWI3S Studio is developed, tested, reviewed, and released. For setup/build see the
+[README](../README.md); for the test strategy see [TESTING.md](TESTING.md); for the
+design see [architecture.md](architecture.md).
+
+## Branch model
+
+- **`main`** is always the latest *released* state (it carries the most recent `vX.Y.Z`
+  tag). It is protected — changes reach it only by merging a release branch.
+- **`release/X.Y.Z`** — every release cuts the branch for the **next** version. All work
+  toward that version (features, fixes, review follow-ups) lands on this branch via PRs,
+  runs through CI, and is reviewed there. At release time it merges to `main` and is
+  tagged.
+
+**On every release, create the next version's branch.** Immediately after tagging
+`vX.Y.Z`, branch `release/X.Y.(Z+1)` off `main` and bump the version
+(`swi3s_studio/__init__.py::__version__`, `pyproject.toml::version`,
+`swi3s_studio/swviz/version.py::APP_VERSION`) so dev builds identify as the next version.
+Branch names use `release/…`, never `vX.Y.Z`, so they don't collide with the release tag.
+
+## CI (`.github/workflows/ci.yml`)
+
+**Where it runs:** on **this repository**, where Actions is enabled — confirmed 2026-08-01,
+when the first published PR of the v3 line ran the workflow and reported 445 ruff findings.
+It had been configured since 3.0.7 without ever executing, which is how those accumulated
+unnoticed.
+
+Jobs (on every push to `main`/`release/**` and every PR):
+
+- **`test`** — builds the native core and runs the full pytest suite (goldens included)
+  across ubuntu (3.11/3.12/3.13), windows (3.12 **and 3.14**) and macos (3.12). Excludes
+  perf. The matrix is deliberate and its rationale is commented in the workflow.
+- **`perf`** — the perf-regression gate (`-m perf`) on one consistent runner.
+- **`coverage`** — full suite with a coverage report (non-gating; no threshold yet).
+- **`lint`** — `ruff` + the `mypy` non-regression gate. **Blocking as of 3.0.12.**
+
+### Neither gate subsumes the other — run both
+
+This is the trap that cost five releases' worth of lint debt. CI and the hand-run gate cover
+different things, and each was assumed to cover everything:
+
+| | CI | `tools/gate.py` |
+|---|---|---|
+| pytest, perf gate | ✅ (6 configs) | ✅ (macOS, Windows) |
+| ruff, mypy | ✅ | ✅ |
+| Linux, Python 3.12/3.13 | ✅ | ❌ |
+| process-isolated per-suite pass | ❌ | ✅ |
+| stale-ABI assertion | ❌ | ✅ |
+
+The **release gate is `tools/gate.py`, run by hand on macOS and Windows** at the release
+commit (checklist step 2). CI is a second, differently-shaped net — useful, not sufficient.
+Making `test`, `perf` and `lint` required checks on `main` is the natural next step once
+branch protection is configured.
+
+## Running tests locally
+
+```bash
+bash tests/run_all.sh                 # per-suite pass/fail summary + test counts
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest -m "not perf" -q   # full suite
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest -m perf -q         # perf gate
+```
+
+The runner and CI run the same tests — `run_all.sh` is a pytest wrapper (one process per
+suite, so you get per-suite results and a teardown crash can't be masked by whichever
+suites shared a process). `tests/test_collection.py` fails the build if any test file
+collects zero tests.
+
+`tests/conftest.py` sets the offscreen Qt platform, a short demo, and a test-scoped
+QSettings identity. After editing `native/`, rebuild the core (`pip install ./native` or
+`bash native/build_local.sh`) or ~half the suite fails an ABI check.
+
+## Performance
+
+See the maintainers' performance notes for the full loop — the recurring
+whole-capture-scan regression class, the three layers of defense (CI cliff-detectors,
+release-time interaction profiling on a large capture, the periodic deep-review
+Workflow), the interaction latency budgets, and the UI shots review checklist.
+
+- Hot paths are guarded by **wall-clock ceilings** in `tests/test_perf.py` (marked
+  `perf`). They are *cliff detectors*, not micro-benchmarks — ceilings are generous
+  (several x observed) so they catch order-of-magnitude regressions, not runner jitter.
+- When you optimize (or touch) a hot path, add/adjust a ceiling so the win is defended.
+  For a **per-interaction** op (cursor move / toggle / re-decode), drive the ceiling with
+  a large synthetic capture (`_big_capture()`), not the demo — the demo is too small to
+  expose an O(#UIs) scan.
+- Capture memory scales with bus *activity* (edge arrays), not duration x sample rate —
+  keep it that way; prefer windowed/on-demand work over full-capture materialization.
+
+## Code review (per release cycle)
+
+The review that gates a release runs on the release branch/PR, not post-hoc on `main`:
+
+1. **Parallel subsystem reviews** — decode/ingest, swviz-engine/model, and UI/rendering,
+   each with a correctness-first + performance lens (delegated to cheaper models to
+   control cost). Reviewers read the actual code and verify claims by running it.
+2. **A cross-subsystem "coupling / architecture" lens.** Per-subsystem reviews miss bugs
+   that span layers — e.g. the 3.0.6 DP-label bug (an engine label doubling as a
+   regex-parsed serialization key *and* a display string) slipped because no single
+   reviewer owned the seam. Explicitly review the contracts *between* subsystems.
+3. **Feed prior findings forward** — hand the last cycle's findings (and this register)
+   to the reviewers so a fixed class of bug can't quietly return.
+4. **Adversarially verify** high-impact findings before acting; rank most-severe first.
+5. **Report the declared gates' state, first.** Every lens states whether
+   `bash tests/gate.sh` passes at the reviewed commit, before reporting findings. A red
+   declared gate blocks the review regardless of what else was found. The 3.0.11 review ran
+   four lenses and found three real defects while the tree carried 445 ruff findings and 448
+   mypy errors — because the brief said "verify by running tests" and lint/type was in no
+   lens's scope. One of those findings (an f-string with no placeholder) was introduced by
+   that very cycle and passed four reviewers.
+
+## Mechanical sweeps (auto-fixers, formatters, bulk renames)
+
+A sweep is not a normal change: it is large, looks cosmetic, and green tests prove less
+than they appear to. Rules, learned from the 3.0.12 ruff sweep (226 auto-fixes, 126 files):
+
+- **Land sweeps at the START of a cycle, never in a release commit.** A release tree should
+  not mix feature work with mechanical churn, and a reviewer cannot see the former through
+  the latter.
+- **Prove behaviour preservation, don't assert it.** Compare the parsed AST before/after for
+  every changed file. Where an AST legitimately differs (isort reorders statements), say so
+  and account for it. For "whitespace only" claims, prove it: re-apply just that whitespace
+  to the old source and show the ASTs then match.
+- **Check the hazard the tests cannot see.** `conftest.py` sets `QT_QPA_PLATFORM` and
+  `PYQTGRAPH_QT_LIB` itself, so import reordering that moves an `os.environ` line relative
+  to a Qt import passes every test and breaks only the real launch. Grep the diff for moved
+  env-var lines and import the real entry points.
+- **Never bulk-apply `--unsafe-fixes`.** Ruff flags them unsafe because they can change
+  behaviour. Handle each by hand or leave it.
+- **Some fixes are wrong.** `app = QApplication(...)` in a test looks unused but keeps the
+  object alive — rename to `_app`, don't delete. An `F401` in a package `__init__` may be a
+  deliberate re-export. Decide per case; verify with a repo-wide search before removing.
+- **The published reference model** (`swviz/models/dataport.py`, `flow_control_port.py`)
+  needs the AST proof *and* a zero-comment check — see the reference-model section above.
+- **Prefer ignoring a style rule to churning the tree for it.** 194 layout findings were
+  silenced in `[tool.ruff.lint] ignore` with a written rationale rather than hand-splitting
+  ~190 statements across 30+ files. A clean tree is what makes the gate blockable; uniform
+  statement-per-line style is not worth a 30-file diff.
+
+## Golden tests
+
+`test_visualizer_engine.py` compares `viz_engine.model_json(csv)` to
+`tests/visualizer/golden_json/**`. **Never regenerate goldens without a diff review** —
+when output changes, explain *why* first. A golden diff has already caught a fix landing
+in the wrong layer; that's the point.
+
+Regenerating the authoring-render golden is the one place a test file is still executed
+directly, because the regenerator lives behind a flag in its `__main__`:
+
+```bash
+PYTHONPATH=. python3 tests/test_authoring_render_golden.py --regen
+```
+
+Every other suite runs through pytest only (see [TESTING.md](TESTING.md) §6).
+
+## The swviz reference model is a published spec deliverable
+
+`swi3s_studio/swviz/models/dataport.py` and `flow_control_port.py` are the golden reference
+model for the SWI3S transport algorithm, **published in the MIPI specification**. Two rules
+follow, enforced by `tests/test_reference_model_clean.py`:
+
+- **No `#` comments, at all.** The spec text is the explanation. Implementation rationale
+  goes in `docs/` or in the test that covers the behaviour — never in the deliverable.
+- **Keep the module and class docstrings.** They are the documentation form these files do
+  use, so the no-comment rule must not be met by deleting docs instead.
+
+This is easy to violate by accident, because a comment looks free and no other test can
+see one. v2.1.12 shipped a single comment in each file; by 3.0.11 `dataport.py` had 21
+lines carrying `#` and `flow_control_port.py` had 4, arrived via three unrelated commits —
+a perf hoist (`43779d7`), the spacing row-boundary fix (`f680b14`), and the
+partial-channel-group fix. Each was locally defensible; the sum was ~20 lines of
+implementation commentary inside a spec artefact.
+
+If you are about to explain something in one of those two files, that explanation belongs
+somewhere else: the spacing row-boundary rationale lives in
+the maintainers' spacing row-boundary write-up, and the partial-channel-group rationale in
+`tests/test_transport_slot_budget.py`.
+
+Note the perf caches in both files (`self._num_cols`, hoisted `nch`) are themselves
+optimisations rather than reference algorithm — worth weighing whenever the model is next
+re-published.
+
+## Release checklist
+
+1. Land all planned work + review follow-ups on `release/X.Y.Z`.
+2. **The gate — one command:**
+
+   ```bash
+   bash tests/gate.sh          # macOS / Linux
+   .\tests\gate.ps1            # Windows (PowerShell)
+   ```
+
+   Both are thin wrappers around **`tools/gate.py`** — one implementation, so the two
+   platforms cannot diverge. It rebuilds the native core and **asserts** `score_abi` against
+   `session.py::_REQUIRED_SCORE_ABI` (a stale `.pyd`/`.so` has faked a green Windows result
+   before), then runs the suite, the perf gate, a per-suite pass (one process per file),
+   ruff, and the mypy ratchet — aggregating failures so you see all of them, not just the
+   first. Exit 0 is the gate.
+
+   It was briefly a bash script, which made it Unix-only and so re-created the very gap it
+   exists to close: no `bash` on PATH on the Windows VM, and `native/build_local.sh` is a
+   Unix compile path (Windows builds through pip/MSVC). If you extend the gate, extend
+   `tools/gate.py`, never a wrapper.
+
+   **`NOT RUN HERE` in the summary is not a pass.** The mypy ratchet compares against a
+   baseline recorded in a specific environment; mypy's findings depend on the stub versions
+   it reads, so numpy 2.4.4 (macOS) and 2.5.1 (the VM) give 205 and 222 errors for the
+   *identical* tree. Rather than fail on an environment difference or pretend it checked,
+   the step reports NOT COMPARABLE and the gate lists it. Run the ratchet where the baseline
+   was taken, or re-baseline there (`python3 tools/mypy_gate.py --update`).
+
+   The gate lives in that script, not in this list. It used to be prose here while
+   `ci.yml` declared its own set; they drifted, the lint/type half was in CI but not here,
+   and 445 ruff findings plus 448 mypy errors accumulated over five releases before the
+   first public PR reported them. `tests/test_release_gate.py` now fails the build if
+   `ci.yml` declares a check `tools/gate.py` does not run.
+
+   **A green CI is not a green gate.** CI runs on the public repo only, and covers neither
+   the perf gate nor Windows; the gate covers neither Linux nor Python 3.12/3.13. Run both.
+3. Merge `release/X.Y.Z` → `main`.
+4. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
+   use a GPG-signed tag + the governed PR flow — see [GOVERNANCE.md](../GOVERNANCE.md)).
+5. Publish the release (`gh release create vX.Y.Z --latest --notes-file …`).
+6. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model).
+
+Cut the tag *once, after the cycle settles* — re-pointing a published tag (as happened
+repeatedly during 3.0.6) is a smell that the release was tagged too early.
+
+### Pre-flight before publishing a release
+
+Publishing is the first time this code meets an audience that cannot see how it was made, so
+two things matter: the checks must be green, and the tree must carry nothing that only makes
+sense inside the project's development environment.
+
+1. **The gate must be green**, lint included. That step was once missing, and the first
+   published PR of the v3 line greeted reviewers with 445 `ruff` findings.
+2. **Scan the exact tree you will publish for leakage:**
+
+   ```bash
+   python3 tools/leak_scan.py            # the working tree
+   python3 tools/leak_scan.py <sha>      # a specific commit's tree
+   ```
+
+   "Leak" is **broader than secrets.** Anything that reveals or depends on the development
+   environment is one, because a reader here cannot verify it and should not have to:
+
+   - **Machine and account identifiers** — user names, absolute home paths, host names, lab
+     or VM addresses, key file names.
+   - **Infrastructure names** — git hosts, repository names, CI hosts, internal tooling.
+   - **Process detail that assumes a second repository** — wording that refers to a release,
+     tag or review that happened somewhere the reader cannot see, or branch and tag names
+     that do not exist here. Describe what a reader can check in *this* tree instead.
+     (Phrase the rule, don't quote the phrases: a document that lists the exact wording it
+     forbids will trip the scanner that enforces it.)
+   - **Third-party material** — customer or partner names, and capture files that are not
+     cleared for release.
+   - **Credentials**, of any kind.
+
+   The scanner's built-in patterns are structural (private IP addresses, home-directory
+   paths, key file names, private-key headers) so they are safe to publish. Site-specific
+   names go in a file named by `$SWI3S_LEAK_PATTERNS`, kept **outside** the repository — a
+   published list of the strings you are trying not to publish is itself the leak. This
+   document used to contain exactly that list.
+3. **Check what this repository will run** — its Actions state and required checks may differ
+   from where the work was staged, and a check that is advisory in one place may gate in
+   another.
+4. **Build the tree with the tool, never by hand:**
+
+   ```bash
+   git fetch <publish remote>                 # the graft in step 3 of the tool needs it
+   python3 tools/publish_tree.py <sha>        # prune, graft, scan, and run the suite on it
+   ```
+
+   Publishing is a tree **replacement** onto a repository that has its own history, so a file
+   added there by its maintainers is invisible from here and a naive replacement deletes it.
+   That is not hypothetical: an upstream pull request had aligned that repository with its
+   organisation's project template, and the tree built from here would have reverted the whole
+   thing — silently, because a revert and an absence look identical in a tree replacement.
+
+   The rule is **one-directional ownership.** A short declared set of paths belongs upstream;
+   this tree does not carry them at all, and the tool grafts them in from the upstream ref.
+   Carrying our own copy would be worse than dropping them: dropping shows up in a diff,
+   overwriting does not. The tool refuses to build a tree if the upstream ref is unavailable,
+   if a declared file is missing there, or if this tree carries a copy of one.
+5. Push the release branch's **content tip** — the last real commit of the release, not a
+   merge commit — and never force-push `main`.
+
+The published tree is the release tree **minus** the maintainers' tier and **plus** the
+upstream-owned layer. Both halves are derivable, so the tag can state the relationship rather
+than asking a reader to trust a hand-assembled snapshot — but it does mean the published tree
+is no longer byte-identical to what the tag names, and the tag annotation must say so. Fix
+anything you find in the NEXT cycle rather than patching the published copy: a tree that
+differs from the tag claiming to describe it in ways the tag does not state makes both
+untrustworthy.
+
+## Deferred work
+
+Findings consciously deferred from a review cycle live in the maintainers' tech-debt register so
+they aren't lost between releases. Pick one strategic item per cycle.
