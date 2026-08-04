@@ -4,5 +4,5 @@
 # These owners will be the default owners for everything in the repo.
 # The @MIPI-Alliance/repo-maintainers team lets org admins approve PRs across
 # MIPI projects; the named maintainers remain default owners as well.
-*	@roderickhogan @cirrus-jon @NielWarren @MIPI-Alliance/repo-maintainers
+*	@roderickhogan @cirrus-jon @nielwarren582 @MIPI-Alliance/repo-maintainers
 
