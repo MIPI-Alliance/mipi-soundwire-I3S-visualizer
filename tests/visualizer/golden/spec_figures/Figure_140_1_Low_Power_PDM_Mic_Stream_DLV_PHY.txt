@@ -1,0 +1,6 @@
+# rows 5
+3 0 4 DATA
+3 1 4 DATA
+3 2 4 DATA
+3 3 4 DATA
+3 4 4 DATA

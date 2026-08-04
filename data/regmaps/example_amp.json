@@ -1,0 +1,60 @@
+{
+  "_meta": {
+    "schema": "swi3s-studio-regmap/1",
+    "name": "example_amp",
+    "note": "Synthetic example peripheral register map (a small Class-D-style audio amp). Demonstrates the normalized format the importer produces; not a real device."
+  },
+  "registers": [
+    {
+      "name": "SW_RESET",
+      "address": "0x10000001",
+      "reset": "0x00",
+      "access": "RW",
+      "fields": [
+        { "name": "sw_reset", "bits": "[0]", "reset": 0, "access": "RW" }
+      ]
+    },
+    {
+      "name": "ENABLE",
+      "address": "0x10000002",
+      "reset": "0x02",
+      "access": "RW",
+      "fields": [
+        { "name": "amp_en", "bits": "[7]", "reset": 0, "access": "RW" },
+        { "name": "amp_mute", "bits": "[6]", "reset": 0, "access": "RW" },
+        { "name": "chan_sel", "bits": "[5:4]", "reset": 0, "access": "RW" },
+        { "name": "i2c_gbl_en", "bits": "[1]", "reset": 1, "access": "RW" },
+        { "name": "boost_en", "bits": "[0]", "reset": 0, "access": "RW" }
+      ]
+    },
+    {
+      "name": "AMP_LEVEL",
+      "address": "0x10000007",
+      "reset": "0x0A",
+      "access": "RW",
+      "fields": [
+        { "name": "amp_lvl", "bits": "[5:0]", "reset": 10, "access": "RW" }
+      ]
+    },
+    {
+      "name": "VOLUME",
+      "address": "0x10000008",
+      "reset": "0x0C",
+      "access": "RW",
+      "fields": [
+        { "name": "volume", "bits": "[7:0]", "reset": 12, "access": "RW" }
+      ]
+    },
+    {
+      "name": "STATUS",
+      "address": "0x10000010",
+      "reset": "0x00",
+      "access": "R",
+      "fields": [
+        { "name": "otp_alert", "bits": "[2]", "reset": 0, "access": "R" },
+        { "name": "ovp_alert", "bits": "[1]", "reset": 0, "access": "R" },
+        { "name": "amp_active", "bits": "[0]", "reset": 0, "access": "R" }
+      ]
+    }
+  ]
+}
