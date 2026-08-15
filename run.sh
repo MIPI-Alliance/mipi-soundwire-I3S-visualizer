@@ -103,11 +103,13 @@ source "$VENV/bin/activate"
 
 # Install/refresh deps only when requirements change (a stamp keeps re-runs fast).
 STAMP="$VENV/.deps-stamp"
+installed_deps=0
 if [ ! -f "$STAMP" ] || [ requirements.txt -nt "$STAMP" ]; then
     echo "Installing Python dependencies..."
     python -m pip install --upgrade pip >/dev/null
     python -m pip install -r requirements.txt
     touch "$STAMP"
+    installed_deps=1
 fi
 
 # Build the native decode core when it's missing, out of date, or --rebuild was asked
@@ -151,6 +153,17 @@ if [ "$need_native" = 1 ]; then
         exit 1
     fi
     touch "$NATIVE_STAMP"
+fi
+
+# Say that the launch has started. Everything above prints as it works, so without this
+# the last thing on screen is a pip line and the window is the next event - which reads as
+# a stall, especially right after an install: the OS verifies the ~450 MB of Qt libraries
+# the first time they are loaded, so the window can take a while. A warm start is ~1s.
+if [ "$installed_deps" = 1 ]; then
+    echo "Starting SWI3S Studio - the first launch after an install is slow while the OS"
+    echo "verifies the newly installed Qt libraries. Later runs start in about a second."
+else
+    echo "Starting SWI3S Studio..."
 fi
 
 exec env PYTHONPATH=. python -m swi3s_studio.app

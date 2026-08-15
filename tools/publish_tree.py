@@ -35,6 +35,7 @@ but a fixture or module is not, and only running the suite proves which is which
 """
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import subprocess
@@ -52,6 +53,15 @@ _INTERNAL = "docs/internal/"
 _UPSTREAM_OWNED = (
     ".mipi/project.yml",
     ".github/workflows/config-check.yml",
+    # CODEOWNERS names PEOPLE, so it changes upstream without anything here
+    # moving, and a stale copy silently un-names a maintainer. It did: this tree
+    # carried "@NielWarren" while upstream had corrected it to "@nielwarren582",
+    # and the v3.0.13 preview would have reverted that — a one-token diff nobody
+    # reviews closely, in the file that decides who must approve a pull request.
+    #
+    # It is the clearest case for the rule: who maintains that repository is
+    # THEIR decision, not a value this tree should hold an opinion about.
+    "CODEOWNERS",
 )
 
 
@@ -159,6 +169,56 @@ def main() -> int:
     print("  test suite on the assembled tree (this is the slow one) ...")
     env = dict(os.environ, PYTHONPATH=".", QT_QPA_PLATFORM="offscreen",
                PYQTGRAPH_QT_LIB="PySide6", PYTHONUTF8="1")
+
+    # The assembled tree has NO built native core — the .so is gitignored, so
+    # `git archive` cannot carry it. Python then resolves `import swi3score`
+    # from wherever else it can, which in practice is a months-old copy in
+    # site-packages: the suite runs green or red against a binary that has
+    # nothing to do with this tree. That is the "a stale binary has faked a
+    # green result" failure mode gate.py exists to prevent, reappearing in the
+    # one check gate.py does not cover.
+    #
+    # Copy the core the caller just built and ASSERT it is the right one, the
+    # same way gate.py does, rather than letting the import silently wander.
+    #
+    # Copied OUTSIDE the assembled tree and put on PYTHONPATH. It is a build
+    # artefact of this check, not a file being published, and ANYWHERE inside
+    # `dest` — even a dot-directory — is walked by
+    # test_every_tracked_path_is_classified, which correctly fails an
+    # unclassified path. Keeping it out of the tree is what that test wants and
+    # what the published tree should contain.
+    corelib = tempfile.mkdtemp(prefix="swi3s-native-core-")
+    core = sorted(glob.glob(os.path.join(_ROOT, "swi3score*.so"))
+                  + glob.glob(os.path.join(_ROOT, "swi3score*.pyd")))
+    if not core:
+        failures.append("no built native core beside this checkout — run "
+                        "`bash native/build_local.sh` first, or the suite below "
+                        "silently tests whatever swi3score site-packages holds")
+    else:
+        for c in core:
+            shutil.copy2(c, corelib)
+        env["PYTHONPATH"] = os.pathsep.join([".", corelib])
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import swi3score, swi3s_studio.session as s;"
+             "print(swi3score.__file__, swi3score.score_abi, s._REQUIRED_SCORE_ABI)"],
+            cwd=dest, env=env, capture_output=True, text=True)
+        if probe.returncode != 0:
+            failures.append(f"native core will not import on the assembled tree: "
+                            f"{probe.stderr.strip().splitlines()[-1:] or ['?']}")
+        else:
+            path, abi, want = probe.stdout.split()
+            # Must be the copy just staged — NOT a stray site-packages build.
+            if not os.path.realpath(path).startswith(os.path.realpath(corelib)):
+                failures.append(f"the suite would import swi3score from {path}, not the "
+                                f"core built beside this checkout — it would not be "
+                                f"testing this tree")
+            elif abi != want:
+                failures.append(f"score_abi {abi} != session.py's required {want} — "
+                                f"the native core is stale, rebuild it")
+            else:
+                print(f"    native core score_abi={abi} (asserted, freshly built)")
+
     suite = subprocess.run([sys.executable, "-m", "pytest", "-q", "--no-header",
                             "-m", "not perf"], cwd=dest, env=env,
                            capture_output=True, text=True)

@@ -146,6 +146,24 @@ static const U32 kNumColumns_Next    = 0x1081;  // [4:0], Column Count = +1
 static const U32 kRowRateRange_Next  = 0x1082;  // [7:0]
 static const U32 kShortSpacer_Next   = 0x1083;  // bit0
 
+// Control Data Stream block (base 0x1100), one per device. The CDS is
+// time-multiplexed, so every source that drives it has its OWN copy of these
+// registers in its own block — there is no bus-wide CDS register.
+//
+// THE MANAGER HAS NO BLOCK HERE. A config's per-source CDS list carries 13 entries
+// (Manager + Device 0..11), but only the twelve peripherals are addressable; the
+// Manager's own CDS behaviour is not expressible as a peripheral register write and
+// so has no representation in this map. registersFromConfig therefore emits entries
+// for devices only, and BuildConfig can never recover the Manager's value from the
+// wire. See the manager-slot notes in Decoder.cpp / bus_config.py.
+static const U32 kCdsBase              = 0x1100;
+static const U32 kCdsHorizontalStart_N = 0x1184;  // [4:0]
+static const U32 kCdsDriveType_N       = 0x1186;  // bit7: 0=Special(passive 1), 1=Normal
+static const U32 kCdsBitWidthGuardTail_N = 0x1187;  // [7:5]=BitWidth(ex-1), bit4=EndDriveEarly,
+                                                    // bit3=GuardEnable, bit2=GuardPolarity,
+                                                    // [1:0]=TailWidth
+static const U32 kCdsApertureAdjust_N  = 0x1189;  // [7:0]
+
 // Data Port blocks: DPn at 0x2000 + 256*n, n = 0..31.
 static const U32 kDpBase   = 0x2000;
 static const U32 kDpStride = 0x100;

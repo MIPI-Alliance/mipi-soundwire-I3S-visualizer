@@ -66,11 +66,23 @@ def _link_control_rows(session) -> List[Row]:
 
 
 def _region_rows(session) -> List[Row]:
-    """The Regions section body: one block per bus-config geometry (a 'region' is a
-    span of constant column count; >1 means the bus reconfigured mid-capture, e.g.
-    cold-start 2col → 8col). Lists each region's measured clock/UI/row rate; with a
-    single geometry, the headline rates once."""
+    """The Regions section body: the bus-config summary, then one block per bus-config
+    geometry (a 'region' is a span of constant column count; >1 means the bus
+    reconfigured mid-capture, e.g. cold-start 2col → 8col). Lists each region's measured
+    clock/UI/row rate; with a single geometry, the headline rates once.
+
+    Bus configs comes FIRST because it says how many regions there are and what
+    geometries they use — the frame a reader needs before the per-region rates mean
+    anything. Behind the rates it read as a footnote to them."""
     rows: List[Row] = []
+    segs = getattr(session, "segments", []) or []
+    if segs:
+        counts = sorted({int(s.get("column_count", 0)) for s in segs})
+        rows.append(("Bus configs", str(len(segs))))
+        rows.append(("  column counts", ", ".join(f"{c}col" for c in counts)))
+        if len(segs) > 1:
+            rows.append(("  reconfigurations", str(len(segs) - 1)))
+
     # FBCSE is a forwarded-clock DDR link (clock = UI rate / 2, two UIs per clock cycle);
     # DLV has no forwarded clock — its RECOVERED clock runs at the full bit/UI rate. So the
     # "clock" figure is UI/2 for FBCSE, UI for DLV.
@@ -96,14 +108,6 @@ def _region_rows(session) -> List[Row]:
         rows.append(("UI rate", f"{session.ui_rate_hz / 1e6:.4f} MHz"))
         rows.append(("Row rate", f"{session.row_rate_khz:.3f} kHz"))
         rows.append(("Columns", str(session.column_count)))
-
-    segs = getattr(session, "segments", []) or []
-    if segs:
-        counts = sorted({int(s.get("column_count", 0)) for s in segs})
-        rows.append(("Bus configs", str(len(segs))))
-        rows.append(("  column counts", ", ".join(f"{c}col" for c in counts)))
-        if len(segs) > 1:
-            rows.append(("  reconfigurations", str(len(segs) - 1)))
     return rows
 
 
@@ -187,6 +191,47 @@ def _rw_detail_rows(cmds: List[dict], *, reading: bool) -> List[Row]:
     return rows
 
 
+_RESP_REMOTE_READ_DEFERRED = 5      # per core/SwI3sResponseNames.h: token 5 on a Read phase
+
+
+def _fold_deferred_reads(cmds: List[dict]) -> List[dict]:
+    """One logical read, one entry — even when the wire carried it as two phases.
+
+    A DEFERRED read is two command records: the ReadSetup answered REMOTE_READ_DEFERRED
+    carrying no data, then a later ReadData carrying the payload and inheriting the setup's
+    address and byte count. Grouped by the raw wire name, that showed as a permanent
+    "ReadA32 / 0 bytes read" group next to a separate "ReadData" group holding the real
+    bytes — two rows a reader has no way to connect, for one read they asked for. An
+    IMMEDIATE read is a single record and is untouched here.
+
+    The delivery is folded back into its setup, contributing its payload so the byte totals
+    land on the read that requested them. Input dicts are never mutated.
+
+    An ORPHAN delivery — a capture that starts after the setup, so nothing to fold into —
+    stays a record of its own rather than being dropped. Losing it would under-report a read
+    that genuinely happened, which is worse than showing it unpaired.
+    """
+    out: List[dict] = []
+    awaiting: dict = {}                     # device tuple -> index in `out` of its setup
+    for c in cmds:
+        name = str(c.get("command", ""))
+        devs = tuple(_devices_of(c) or [-1])
+        if name == "ReadData":
+            i = awaiting.pop(devs, None)
+            if i is not None:
+                merged = dict(out[i])
+                merged["read_data"] = c.get("read_data")
+                merged["read_data_crc_valid"] = c.get("read_data_crc_valid")
+                out[i] = merged
+                continue                    # not a command in its own right
+        elif name == "ReadA32" and c.get("peripheral_response") == _RESP_REMOTE_READ_DEFERRED:
+            # Keyed on the DEFERRED response, not on "has no data": a READ_FAILED setup also
+            # carries none, and must not swallow an unrelated later delivery.
+            awaiting[devs] = len(out)
+        out.append(c)
+    return out
+
+
 def _command_detail_rows(kind: str, cmds: List[dict]) -> List[Row]:
     """The expandable breakdown for one command kind (empty = nothing to expand)."""
     if kind == "Ping":
@@ -211,7 +256,11 @@ def _command_rows(session) -> List[Row]:
     rows.append(("Errors", str(count_errors(session.commands))))
 
     by_kind: dict = {}
-    for c in session.commands:
+    # Grouped on LOGICAL command identity, so a deferred read is one entry rather than a
+    # "ReadA32 / 0 bytes" row beside an unconnected "ReadData" row. Count/Errors above stay
+    # on the raw wire records — they describe what was decoded, not how it is grouped (and
+    # the two already differed, since records with no command name are skipped below).
+    for c in _fold_deferred_reads(session.commands):
         k = c.get("command", "")
         if k:
             by_kind.setdefault(k, []).append(c)
@@ -265,11 +314,57 @@ def _data_port_rows(session, store) -> List[Row]:
     return rows
 
 
+def _peripheral_report_rows(session) -> List[Row]:
+    """The Peripheral Reports section body: what each device said about ITSELF.
+
+    Every ``IntStat_*`` / ``DevStat_*`` bit and ``EC_*`` counter the Manager read back,
+    decoded from the replies (see :mod:`.port_status`). Faults and ImpDef/SDCA
+    interrupts each get a top-level, always-visible row — the point is that a raised bit
+    prompts investigation without anyone expanding anything — and the live state folds
+    away per port."""
+    from .port_status import summarize
+
+    s = summarize(session.commands)
+    if not s.reads:
+        return []
+    rows: List[Row] = [("status registers read", f"{s.reads:,}")]
+    rows.append(("faults reported", f"{len(s.faults)}" if s.faults else "none",
+                 "fail" if s.faults else "pass"))
+    for (port, name), (count, first_row, value) in sorted(s.faults.items()):
+        detail = f"{value}" if name.startswith(("EC_", "COUNT_")) else f"{count}×"
+        rows.append((f"  {port} {name}", f"{detail}, from row {first_row:,}", "fail"))
+    if s.vendor:
+        # ImpDef is the spec's term (SDCA fields land in the same bucket — class-defined
+        # rather than implementation-defined), so name whichever actually fired instead of
+        # "vendor", which is not a term the specification uses.
+        kinds = sorted({("SDCA" if "SDCA" in name else "ImpDef") for _p, name in s.vendor})
+        rows.append((f"{' / '.join(kinds)} interrupts", str(len(s.vendor))))
+        for (port, name), (count, first_row, _v) in sorted(s.vendor.items()):
+            # The spec assigns no meaning, so report it rather than colouring it as a fault
+            # we cannot diagnose. Nothing is appended to say so: the FIELD NAME already
+            # carries ImpDef/SDCA, and repeating it after the name adds no information.
+            rows.append((f"  {port} {name}", f"{count}× at row {first_row:,}"))
+    for port in sorted(s.state):
+        live = s.state[port]
+        events = {n: v for (p, n), v in s.events.items() if p == port}
+        if not live and not events:
+            continue
+        rows.append((f"{port} reported state", f"{s.per_port.get(port, 0):,} reads", "group"))
+        # Latched lifecycle events (RW1C) get a count of the polls that found them set;
+        # live RO fields get their latest reading, which is all such a field means.
+        for name in sorted(events):
+            rows.append((f"    {name}", f"{events[name][0]}×", "detail"))
+        for name in sorted(live):
+            rows.append((f"    {name}", str(live[name]), "detail"))
+    return rows
+
+
 def capture_measurements(session, store=None) -> List[Row]:
-    """The full Statistics table: four ordered, collapsible sections (Link Control,
-    Regions, Commands, Data Ports), each led by a ``(title, "", "header")`` row. Pass
-    the already-built AudioStore as `store` to avoid rebuilding it here — rebuilding a
-    multi-million-sample store on the GUI thread froze the UI at load."""
+    """The full Statistics table: five ordered, collapsible sections (Link Control,
+    Regions, Commands, Peripheral Reports, Data Ports), each led by a
+    ``(title, "", "header")`` row. Pass the already-built AudioStore as `store` to avoid
+    rebuilding it here — rebuilding a multi-million-sample store on the GUI thread froze
+    the UI at load."""
     rows: List[Row] = []
 
     def section(title: str, body: List[Row]) -> None:
@@ -280,6 +375,7 @@ def capture_measurements(session, store=None) -> List[Row]:
     section("Link Control", _link_control_rows(session))
     section("Regions", _region_rows(session))
     section("Commands", _command_rows(session))
+    section("Peripheral Reports", _peripheral_report_rows(session))
     section("Data Ports", _data_port_rows(session, store))
     return rows
 

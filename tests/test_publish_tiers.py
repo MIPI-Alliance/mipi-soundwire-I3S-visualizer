@@ -29,15 +29,35 @@ _INTERNAL = "docs/internal/"
 _PUBLIC_ROOTS = (
     "README.md", "LICENSE.md", "GOVERNANCE.md", "CODEOWNERS", ".gitignore", ".github/",
     ".mipi/",                                # upstream-owned; present only once published
+    "CLAUDE.md",                             # agent guidance: published deliberately, since
+                                             # an outside contributor using an agent needs
+                                             # the same gate and reference-model rules a
+                                             # maintainer does. Keep it free of anything
+                                             # site-specific — it ships.
     "pyproject.toml", "requirements.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
-    "flow_control.csv",                      # fixture referenced by Demo.cpp + 3 tests
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
     "docs/",                                 # docs/internal/ is carved out below
 )
 
 # Files the UPSTREAM project owns, declared in tools/publish_tree.py and grafted in at
 # publish time. They must be ABSENT here and PRESENT once published — see the test below.
-_UPSTREAM_OWNED = (".mipi/project.yml", ".github/workflows/config-check.yml")
+def _upstream_owned() -> tuple[str, ...]:
+    """Read the list from the publish tool rather than restating it.
+
+    Two hand-maintained copies drift, and the drift is invisible: a path added to
+    the tool but not here would be grafted with nothing asserting it arrived, and
+    one added here but not to the tool would fail a published tree for a file
+    nothing grafts. Importing by path keeps one definition.
+    """
+    import importlib.util
+    path = os.path.join(_ROOT, "tools", "publish_tree.py")
+    spec = importlib.util.spec_from_file_location("publish_tree", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._UPSTREAM_OWNED
+
+
+_UPSTREAM_OWNED = _upstream_owned()
 
 
 # The enforcing files necessarily CONTAIN the path they forbid, exactly as the leak scanner
@@ -135,6 +155,33 @@ def test_dev_docs_never_reaches_a_tree():
     assert "dev_docs/" in _read(".gitignore"), "dev_docs/ must be gitignored"
     assert not [p for p in _files() if p.startswith("dev_docs/")], \
         "dev_docs/ is present in the tree — it is local-only by definition"
+
+
+def test_the_governance_files_upstream_owns_are_actually_declared():
+    """Reading the list from the tool removed the drift, and with it the guard.
+
+    `_UPSTREAM_OWNED` is now imported rather than restated, so the two copies
+    cannot disagree — but a path DELETED from the tool would also vanish from the
+    assertion, and the file would be dropped on the next publish with nothing
+    complaining. So name the governance paths independently here.
+
+    These three are the ones whose content is a decision of the upstream project
+    rather than of this codebase. CODEOWNERS is the sharpest case and the reason
+    this test exists: it names PEOPLE, so it changes upstream with nothing here
+    moving. A stale copy in this tree carried "@NielWarren" after upstream had
+    corrected it to "@nielwarren582", and the v3.0.13 preview would have reverted
+    that — a one-token diff, in the file deciding who must approve a PR.
+
+    Deliberately NOT the whole governance layer: GOVERNANCE.md, LICENSE.md and
+    the CLA files are identical in both trees and shared by agreement, so
+    carrying them is not a divergence risk.
+    """
+    for path in ("CODEOWNERS", ".mipi/project.yml",
+                 ".github/workflows/config-check.yml"):
+        assert path in _UPSTREAM_OWNED, (
+            f"{path} is owned by the upstream project but is not declared in "
+            f"tools/publish_tree.py::_UPSTREAM_OWNED. Publishing would either "
+            f"overwrite their copy with ours or drop it entirely.")
 
 
 def test_upstream_owned_files_are_absent_here_and_present_once_published():

@@ -74,7 +74,7 @@ def test_phy3_audio_bit_exact_with_phy2():
     s3 = Session.from_demo(400, cold_start=True, phy=3)
 
     def vals(s, dev, dp):
-        return [a["value"] for a in s.decoder.audio() if a["device"] == dev and a["dp"] == dp]
+        return [a["value"] for a in s.audio if a["device"] == dev and a["dp"] == dp]
 
     for dp in (0, 1, 2, 3):
         a2, a3 = vals(s2, 0, dp), vals(s3, 0, dp)

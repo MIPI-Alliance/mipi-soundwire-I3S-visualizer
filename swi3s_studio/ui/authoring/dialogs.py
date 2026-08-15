@@ -30,21 +30,92 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from ...model.bus_config import (
+    CDS_DRIVE_NORMAL,
+    CDS_DRIVE_SPECIAL,
+    CDS_EDE_FULL_UI,
+    CDS_EDE_HALF_EARLY,
+)
+from ..theme import VizTheme
+
 MANAGER = -1                              # device id for the Manager
 _SELECTED = "#4CAF50"                     # green
 _UNSELECTED = "#808080"                   # grey
-# Rounded buttons, matching the original Visualizer dialogs. No horizontal padding:
-# these toggle buttons use fixed widths (device=38, channel=28, flow-mode=…), and
-# padding would eat into that and clip the label (border-radius alone rounds them).
+# ONE SELECTED COLOUR, AND "OFF" GETS IT TOO. A previous revision gave a selected
+# "Off"/"0" its own blue-grey, on the reasoning that green reads as on/active and thirteen
+# green "Off" buttons look like everything is enabled. That reasoning was wrong, and the
+# cure was worse than the disease:
+#
+# GREEN HERE MEANS "THIS IS THE CHOSEN OPTION IN THIS GROUP", not "this feature is on".
+# That is how every other selector in this file already uses it — GuardSelectorDialog shows
+# a green "Off" for the very same Off/G0/G1 choice, PortModeSelectorDialog a green
+# "Normal (Off)", DeviceSelectorDialog a green device number with no on/off sense at all.
+# So the second colour did not add a distinction; it broke an existing convention, and it
+# broke it INCONSISTENTLY — the per-source CDS guard dialog was blue-grey while the per-DP
+# guard dialog one click away stayed green for the identical three options.
+#
+# The label carries the value ("Off" says off) and the colour carries the selection. Where a
+# whole-bus summary is wanted, it belongs in TEXT: CDS Settings already shows "off" /
+# "all Normal" / "all Full" beside each per-source row, which says what a highlight colour
+# was being stretched to imply.
 _BTN_BASE = "border:none; border-radius:8px; font-weight:500;"
 _SEL_CSS = f"background:{_SELECTED}; color:white; {_BTN_BASE}"
 _UNSEL_CSS = f"background:{_UNSELECTED}; color:white; {_BTN_BASE}"
+
+
+class _ElidingLabel(QLabel):
+    """A label that shortens its own text to fit, keeping the whole of it in the tooltip.
+
+    For the per-source summaries, whose length is UNBOUNDED: "Manager tail 3; 12 devices
+    tail 3" already needs more room than the dialog has, and a guard config with three
+    polarities across twelve devices is longer still. So no fixed dialog width is safe, and
+    the alternatives are both worse — letting the summary widen the window reintroduces the
+    jumpy layout, and letting Qt squeeze the label truncates it with no indication that
+    anything is missing (which is how "Enforce CDS Handc…" shipped).
+
+    Eliding is honest: the ellipsis says there is more, the tooltip has it, and the dialog
+    behind the button is the real source of detail anyway.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self._full = text
+        self.setMinimumWidth(40)      # never collapse to nothing under layout pressure
+
+    def setText(self, text: str) -> None:      # noqa: N802 (Qt signature)
+        self._full = text
+        self.setToolTip(text)
+        self._apply_elide()
+
+    def full_text(self) -> str:
+        """The unelided string — what a test should assert on, not the displayed text."""
+        return self._full
+
+    def resizeEvent(self, event) -> None:      # noqa: N802 (Qt signature)
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        super().setText(self.fontMetrics().elidedText(
+            self._full, Qt.ElideRight, max(0, self.width() - 2)))
+
+
+def _action_btn(text: str) -> QPushButton:
+    """A rounded push button for an action ("Per source…"), as opposed to `_toggle_btn`'s
+    pick-one-of-N. Styled because the platform default is a square bordered button, which
+    next to the rounded toggles and the rounded OK/Cancel read as an unstyled leftover."""
+    b = QPushButton(text)
+    b.setFixedHeight(28)
+    b.setStyleSheet(
+        "QPushButton { border:none; border-radius:8px; padding:4px 12px;"
+        " background:#6b6b6b; color:white; }"
+        "QPushButton:hover { background:#7a7a7a; }")
+    return b
 
 
 def _toggle_btn(text: str) -> QPushButton:
@@ -445,101 +516,505 @@ class DataPortIdentityDialog(QDialog):
 _CDS_SOURCE_LABELS = ["Manager"] + [f"Device {i}" for i in range(12)]
 
 
-class CdsGuardDialog(QDialog):
-    """Per-source CDS guard selection — one Off/G0/G1 toggle row per source (the
-    CDS is time-multiplexed, so the Manager and each of devices 0-11 drive their
-    own guard). Mirrors GuardSelectorDialog's toggle+refresh style, replicated per
-    row. On accept, `self.guard` holds the updated 13-entry list (0/1/2)."""
+class _CdsPerSourceDialog(QDialog):
+    """One pick-one-of-N row per CDS source (Manager + Device 0-11).
 
-    def __init__(self, parent, guard: List[int]) -> None:
+    ONE BASE FOR THREE DIALOGS. Guard, tail width and drive type are the same control:
+    thirteen rows, one row of toggles each, differing only in the option list. They were
+    two hand-written copies before drive type made it three, and every layout defect below
+    existed in both copies — so the fixes are made once, here.
+
+    WHAT WAS WRONG, all of it visible only by rendering the dialog and looking at it:
+
+      * THE VERTICAL SCROLLBAR SAT ON TOP OF THE LAST COLUMN. The scroll area was sized to
+        its contents, leaving no room for its own scrollbar, so the bar overlapped the
+        right-hand button ("Guard 1", tail "3"). Width now reserves the scrollbar extent.
+      * A HORIZONTAL SCROLLBAR APPEARED for the same reason, over the bottom row, scrolling
+        content that already fitted. Disabled outright — the rows are fixed-width.
+      * THE LAST ROW WAS CUT THROUGH THE MIDDLE, because the height was a flat 320 px with
+        no relation to the row pitch. The visible height is now a whole number of rows.
+      * (A fifth defect was reported here and turned out not to be one: a selected "Off"
+        rendering in the same green as a selected setting. Green marks the CHOSEN option in
+        a group throughout this file — GuardSelectorDialog has always shown a green "Off"
+        for the same Off/G0/G1 choice — so giving it a second colour broke a convention
+        rather than clarifying one. See the note on `_SEL_CSS`.)
+
+    AND ONE UX GAP: thirteen sources x three or four options is up to fifty-two clicks for
+    a config that is almost always uniform, with no way to say "all of them". An "All
+    sources" strip at the top sets every row at once, so the common case is one click and
+    the per-row grid is for the exceptions.
+
+    Subclasses declare `TITLE`, `PROMPT`, `OPTIONS` ((value, label) pairs) and `BTN_W`;
+    the accepted result is `self.values`.
+    """
+
+    TITLE = ""
+    PROMPT = ""
+    OPTIONS: tuple = ()
+    BTN_W = 76
+    # Optional per-value tooltip, for a field whose LABEL deliberately omits the detail
+    # (see CdsEndDriveEarlyDialog, whose values name a behaviour and not a duration).
+    TOOLTIPS: dict = {}
+
+    def __init__(self, parent, values: List[int]) -> None:
         super().__init__(parent)
-        self.setWindowTitle("CDS Guard Selection")
-        self.guard = list(guard)
-        self._rows: List[dict[str, QPushButton]] = []
+        self.setWindowTitle(self.TITLE)
+        self.values = list(values)
+        self._rows: List[dict] = []
 
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("Select Guard per source:"))
-        scroll, grid = _scrollable_row_grid(self)
+        root.addWidget(QLabel(self.PROMPT))
+
+        # ONE GRID, NO SCROLL AREA. Thirteen rows at ~34 px is a ~560 px dialog, which
+        # fits any display this app runs on — and the scroll area it replaces was the
+        # direct cause of three separate defects: its bar drew over the last button
+        # column, a horizontal bar appeared over the bottom row scrolling content that
+        # already fitted, and its flat 320 px height cut the last visible row in half.
+        # A fourth was alignment: the "All sources" strip sat outside the scrolled grid,
+        # so the two never lined up. In one grid they cannot disagree.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+
+        # "All sources" FIRST, because it is what the common (uniform) config wants —
+        # thirteen sources x three or four options is up to 52 clicks otherwise, with no
+        # way to say "all of them". Rendered as action buttons, not toggles: it is a verb
+        # ("set every row to this"), not a state, and nothing about it stays selected.
+        all_lab = QLabel("All sources")
+        all_lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(all_lab, 0, 0)
+        every_label = [all_lab]
+        every_btn = []
+        for col, (value, text) in enumerate(self.OPTIONS, start=1):
+            b = _action_btn(text)
+            b.setToolTip(self.TOOLTIPS.get(value, ""))
+            b.clicked.connect(lambda _c=False, v=value: self._set_all(v))
+            grid.addWidget(b, 0, col)
+            every_btn.append(b)
+        grid.addWidget(_hline(), 1, 0, 1, len(self.OPTIONS) + 1)
+
         for i, label in enumerate(_CDS_SOURCE_LABELS):
-            grid.addWidget(QLabel(label), i, 0)
-            g0 = _toggle_btn("Guard 0"); g0.clicked.connect(lambda _c=False, r=i: self._pick(r, 1))
-            g1 = _toggle_btn("Guard 1"); g1.clicked.connect(lambda _c=False, r=i: self._pick(r, 2))
-            off = _toggle_btn("Off"); off.clicked.connect(lambda _c=False, r=i: self._pick(r, 0))
-            # Toggle buttons carry no h-padding (fixed-width, see _BTN_BASE), so widen
-            # them enough that "Guard 0"/"Guard 1" aren't cramped against the edges.
-            for b in (off, g0, g1):
-                b.setFixedWidth(76)
-            for col, b in enumerate((off, g0, g1), start=1):
-                grid.addWidget(b, i, col)
-            self._rows.append({"off": off, "g0": g0, "g1": g1})
-        root.addWidget(scroll)
+            lab = QLabel(label)
+            lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(lab, i + 2, 0)
+            every_label.append(lab)
+            btns = {}
+            for col, (value, text) in enumerate(self.OPTIONS, start=1):
+                b = _toggle_btn(text)
+                b.setToolTip(self.TOOLTIPS.get(value, ""))
+                b.clicked.connect(lambda _c=False, r=i, v=value: self._pick(r, v))
+                grid.addWidget(b, i + 2, col)
+                btns[value] = b
+                every_btn.append(b)
+            self._rows.append(btns)
+
+        root.addLayout(grid)
+        root.addStretch(1)
         root.addWidget(_OkCancel(self))
         self._refresh()
-        _fit_title(self)
+        self.adjustSize()
+        _fit_uniform(every_btn, self.BTN_W)
+        # AND THE LABEL COLUMN, for the same reason. Widening the buttons above hands the
+        # grid's spare width to the button columns, so column 0 collapses to its widest
+        # DEVICE label — and "All sources" is wider than "Device 11", so the strip header
+        # clipped by 3 px at the very font this dialog was designed on. The column is sized
+        # from the labels it actually holds.
+        grid.setColumnMinimumWidth(0, max(lab.sizeHint().width() for lab in every_label))
+        self.setFixedWidth(max(self.sizeHint().width(), _title_width(self)))
 
     def _pick(self, row: int, value: int) -> None:
-        self.guard[row] = value
+        self.values[row] = value
+        self._refresh()
+
+    def _set_all(self, value: int) -> None:
+        self.values = [value] * len(self.values)
         self._refresh()
 
     def _refresh(self) -> None:
         for row, btns in enumerate(self._rows):
-            val = self.guard[row]
-            btns["off"].setStyleSheet(_SEL_CSS if val == 0 else _UNSEL_CSS)
-            btns["g0"].setStyleSheet(_SEL_CSS if val == 1 else _UNSEL_CSS)
-            btns["g1"].setStyleSheet(_SEL_CSS if val == 2 else _UNSEL_CSS)
+            current = self.values[row]
+            for value, b in btns.items():
+                b.setStyleSheet(_SEL_CSS if value == current else _UNSEL_CSS)
 
 
-class CdsTailDialog(QDialog):
-    """Per-source CDS tail-width selection — one 0/1/2/3 toggle row per source. On
-    accept, `self.tail` holds the updated 13-entry list of widths."""
+class CdsGuardDialog(_CdsPerSourceDialog):
+    """Per-source CDS guard (Off / G0 / G1). The CDS is time-multiplexed, so the Manager
+    and each of devices 0-11 drive their own guard polarity without a bus clash.
 
-    def __init__(self, parent, tail: List[int]) -> None:
+    `self.guard` is kept as an alias of `self.values` so existing callers are unchanged."""
+
+    TITLE = "CDS Guard Selection"
+    PROMPT = "Select Guard per source:"
+    OPTIONS = ((0, "Off"), (1, "Guard 0"), (2, "Guard 1"))
+    BTN_W = 76
+
+    @property
+    def guard(self) -> List[int]:
+        return self.values
+
+    @guard.setter
+    def guard(self, v: List[int]) -> None:
+        self.values = list(v)
+
+
+class CdsTailDialog(_CdsPerSourceDialog):
+    """Per-source CDS tail width (0-3 UI). `self.tail` aliases `self.values`."""
+
+    TITLE = "CDS Tail Width"
+    PROMPT = "Select Tail Width per source:"
+    OPTIONS = ((0, "0"), (1, "1"), (2, "2"), (3, "3"))
+    BTN_W = 34
+
+    @property
+    def tail(self) -> List[int]:
+        return self.values
+
+    @tail.setter
+    def tail(self, v: List[int]) -> None:
+        self.values = list(v)
+
+
+class CdsDriveTypeDialog(_CdsPerSourceDialog):
+    """Per-source CDS_DriveType (registers.json CDS 0x86 bit 7).
+
+    Per source because the register is in each device's own CDS block — the CDS is
+    time-multiplexed and each source drives it under its own configuration, so one device
+    may hold a passive 1 while another drives both levels.
+
+    Normal and Special are two ways of driving, not a feature being on or off. The button
+    text leads with the register value, since that is what a reader programs."""
+
+    TITLE = "CDS Drive Type"
+    PROMPT = "Select Drive Type per source:"
+    OPTIONS = ((CDS_DRIVE_NORMAL, "1 · Normal"), (CDS_DRIVE_SPECIAL, "0 · Special"))
+    BTN_W = 96
+
+    @property
+    def drive_type(self) -> List[int]:
+        return self.values
+
+    @drive_type.setter
+    def drive_type(self, v: List[int]) -> None:
+        self.values = list(v)
+
+
+class CdsEndDriveEarlyDialog(_CdsPerSourceDialog):
+    """Per-source CDS_EndDriveEarly (CDS block 0x87 bit 4 _NEXT / 0xC7 _CURR).
+
+    Spec v1.1 r08, Table 176, verbatim:
+
+        0: Drive to the end of the UI.
+        1: Stop driving before the end of the last UI.
+
+    Per source because the register is in each device's own CDS block. PHY3 mandatory,
+    PHY2 optional, PHY1 read-only 0 — PHY1 needs no handover UIs at all, its own output
+    timing already satisfying t_ZD,min >= t_DZ,max.
+
+    NO DURATION IN THE LABEL, which is why they are bare verbs. An earlier version read
+    "1/2 UI early", carried over from the r06 extract; r08 deleted that idea deliberately —
+    its revision history records "remove the idea of the time being explicitly a 'half UI'",
+    the granularity is now BITS rather than UIs (Sec. 10.1.14, "Scope of
+    EndDriveEarly"), and the amount is ImpDef
+    inside a PHY-specific bound (PHY2: from Per_tZD_Actual + Per_tRampTime_Actual + 3.0 ns to
+    UI - 2.0 ns, Table 132). A label naming a duration the spec no longer guarantees is worse
+    than one naming none. `data/registers.json` has since been re-extracted to r08 and agrees.
+
+    Full is the ordinary behaviour and Early is the feature being turned on, but both are
+    just the chosen option here — the summary in CDS Settings ("All Full" / "All Early" /
+    "2 devices Early") is where the bus-wide state is stated, not the button colour."""
+
+    TITLE = "CDS End Drive Early"
+    PROMPT = "Select End Drive Early per source:"
+    # "Full" / "Early" — the behaviour, not a duration. See the class docstring.
+    OPTIONS = ((CDS_EDE_FULL_UI, "Full"), (CDS_EDE_HALF_EARLY, "Early"))
+    BTN_W = 76
+    # The spec's own encoding, on each button's tooltip — the labels say nothing about WHEN
+    # the drive stops, so this is where a reader finds out.
+    TOOLTIPS = {
+        CDS_EDE_FULL_UI: "0: Drive to the end of the UI",
+        CDS_EDE_HALF_EARLY: "1: Stop driving before the end of the last UI\n"
+                            "(exact point is PHY-specific and ImpDef)",
+    }
+
+
+# CDS Settings' per-source rows: summary key -> the attribute holding the list, and ->
+# the dialog that edits it. Two small tables rather than a dict literal repeated in three
+# methods; adding a per-source field means one line in each.
+_CDS_SETTINGS_KINDS = {
+    "drive": "drive_type",
+    "ede": "end_drive_early",
+    "guard": "guard",
+    "tail": "tail",
+}
+_CDS_SETTINGS_DIALOGS = {
+    "drive": CdsDriveTypeDialog,
+    "ede": CdsEndDriveEarlyDialog,
+    "guard": CdsGuardDialog,
+    "tail": CdsTailDialog,
+}
+
+
+class CdsSettingsDialog(QDialog):
+    """Every CDS setting behind one entry point.
+
+    The interface column had grown a CDS row per setting — bit width, guard, tail,
+    handover — each a different control shape, and drive type would have been the fifth.
+    They belong together (one register block, one region of the frame), so the panel now
+    carries a single "CDS Settings" row that opens this, and the per-source dialogs open
+    FROM here rather than from their own panel rows.
+
+    TWO SCALARS AND THREE PER-SOURCE LISTS, laid out in that order and separated. Bit width
+    and handover are bus-wide; guard, tail and drive type each live in a device's own CDS
+    block, so they get a "Per source…" button and a summary of the current state. Grouping
+    them makes the shape of the register block legible instead of five unrelated rows.
+
+    NOTHING IS COMMITTED UNTIL OK, including a change made two dialogs deep: the per-source
+    dialogs edit copies handed back through `guard` / `tail` / `drive_type`, so cancelling
+    the outer dialog discards them.
+
+    ONE GRID, TWO COLUMNS, FIXED WIDTH. The first version used a QFormLayout with
+    `addRow("", w)` for the note and the checkbox, which parked both in the narrow VALUE
+    column: the note wrapped to three lines with half the dialog empty beside it, and the
+    checkbox's own text ran off the right edge and was CLIPPED ("Enforce CDS Handc…"). The
+    dialog also re-widened when the note changed length, so picking a value made the window
+    jump. Now every label is right-aligned in column 0, every control sits in column 1, the
+    note and dividers SPAN both, and the width is fixed — nothing moves, nothing is cut off.
+
+    On accept: `bit_width`, `enforce_handover`, `guard`, `tail`, `drive_type`.
+    """
+
+    # Fixed, so no selection can resize the window. Wide enough for the footnote at two
+    # lines; test_cds_settings_dialog_fits_its_content measures the real content against it
+    # rather than trusting the number to stay right as wording changes.
+    _WIDTH = 470
+
+    def __init__(self, parent, *, bit_width: int, drive_type: List[int],
+                 enforce_handover: bool, guard: List[int], tail: List[int],
+                 end_drive_early: List[int]) -> None:
         super().__init__(parent)
-        self.setWindowTitle("CDS Tail Width")
+        self.setWindowTitle("CDS Settings")
+        self.bit_width = int(bit_width)
+        self.enforce_handover = bool(enforce_handover)
+        self.guard = list(guard)
         self.tail = list(tail)
-        self._rows: List[List[QPushButton]] = []
+        self.drive_type = list(drive_type)
+        self.end_drive_early = list(end_drive_early)
 
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("Select Tail Width per source:"))
-        scroll, grid = _scrollable_row_grid(self)
-        for i, label in enumerate(_CDS_SOURCE_LABELS):
-            grid.addWidget(QLabel(label), i, 0)
-            btns = []
-            for w in range(4):
-                b = _toggle_btn(str(w)); b.setFixedWidth(28)
-                b.clicked.connect(lambda _c=False, r=i, ww=w: self._pick(r, ww))
-                grid.addWidget(b, i, w + 1)
-                btns.append(b)
-            self._rows.append(btns)
-        root.addWidget(scroll)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        self._grid = grid
+        self._row = 0
+
+        # ---- bus-wide ----
+        self._add_label("Bit Width")
+        self._bit: dict = {}
+        grid.addWidget(_toggle_strip(range(8), str, self._pick_bit, self._bit, 30),
+                       self._row, 1)
+        self._row += 1
+
+        # "Enforce Handover", not "Enforce CDS Handover": the window is titled CDS Settings
+        # and every other row here drops the prefix (Bit Width, Drive Type, Guard, …), so
+        # keeping it on one row made that row look like it meant something different.
+        self._add_label("Enforce Handover")
+        self._handover = QCheckBox()
+        self._handover.setChecked(self.enforce_handover)
+        # LEFT-ALIGNED, AND THE INDICATOR TOO. Two separate things had to be said:
+        #
+        # `alignment=Qt.AlignLeft` places the WIDGET, because column 1 carries the stretch
+        # and a small widget dropped into it centres itself in the whole column.
+        #
+        # The stylesheet override places the INDICATOR inside that widget. The authoring
+        # panel sets `QCheckBox::indicator { subcontrol-position: center }` on purpose — its
+        # own bool rows centre a checkbox inside a fixed 64 px band — and this dialog
+        # inherits that rule from its parent. Centring makes the drawn position depend on
+        # the widget's width, so with a different font the indicator drifts off the column
+        # edge that every other control lines up on. Pinning it left removes the dependency
+        # instead of tuning a number. Measuring the WIDGET, as the first test did, cannot
+        # see this: the widget was aligned and the visible square was not.
+        self._handover.setStyleSheet(
+            "QCheckBox::indicator { subcontrol-position: left center; }")
+        grid.addWidget(self._handover, self._row, 1, alignment=Qt.AlignLeft)
+        self._row += 1
+
+        self._span(_hline())
+
+        # ---- per source (Manager + Device 0-11) ----
+        # Drive type first: it is the one whose consequence the footnote explains.
+        self._summaries: dict = {}
+        per_source_btns: list = []
+        for label, kind in (("Drive Type", "drive"), ("End Drive Early", "ede"),
+                            ("Guard", "guard"), ("Tail Width", "tail")):
+            self._add_label(label)
+            cell = QHBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.setSpacing(10)
+            btn = _action_btn("Per source…")
+            per_source_btns.append(btn)
+            btn.clicked.connect(lambda _c=False, k=kind: self._open_per_source(k))
+            summary = _ElidingLabel()
+            summary.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+            cell.addWidget(btn)
+            cell.addWidget(summary, 1)
+            host = QWidget()
+            host.setLayout(cell)
+            grid.addWidget(host, self._row, 1)
+            self._summaries[kind] = summary
+            self._row += 1
+
+        root.addLayout(grid)
+        root.addStretch(1)
         root.addWidget(_OkCancel(self))
         self._refresh()
-        _fit_title(self)
+        # All three read "Per source…", so this only has to beat the font — but sizing them
+        # as a GROUP is what keeps the value column aligned if one ever says something else.
+        _fit_uniform(per_source_btns, 110)
+        self.setFixedWidth(max(self._WIDTH, _title_width(self)))
 
-    def _pick(self, row: int, width: int) -> None:
-        self.tail[row] = width
+    def _add_label(self, text: str) -> None:
+        lab = QLabel(text)
+        lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._grid.addWidget(lab, self._row, 0)
+
+    def _span(self, w: QWidget) -> None:
+        """Add a widget across both columns — dividers and the footnote, which have no
+        label and must not be squeezed into the value column."""
+        self._grid.addWidget(w, self._row, 0, 1, 2)
+        self._row += 1
+
+    def _pick_bit(self, value: int) -> None:
+        self.bit_width = int(value)
+        self._refresh()
+
+    def _open_per_source(self, kind: str) -> None:
+        attr = _CDS_SETTINGS_KINDS[kind]
+        d = _CDS_SETTINGS_DIALOGS[kind](self, list(getattr(self, attr)))
+        if d.exec():
+            setattr(self, attr, list(d.values))
         self._refresh()
 
     def _refresh(self) -> None:
-        for row, btns in enumerate(self._rows):
-            val = self.tail[row]
-            for w, b in enumerate(btns):
-                b.setStyleSheet(_SEL_CSS if w == val else _UNSEL_CSS)
+        for value, btn in self._bit.items():
+            btn.setStyleSheet(_SEL_CSS if value == self.bit_width else _UNSEL_CSS)
+        self._bit[self.bit_width].setToolTip(
+            f"Register value {self.bit_width} — excess-1, so "
+            f"{self.bit_width + 1} UI per CDS bit")
+        for kind, attr in _CDS_SETTINGS_KINDS.items():
+            self._summaries[kind].setText(cds_summary(getattr(self, attr), kind))
+
+    def accept(self) -> None:
+        self.enforce_handover = bool(self._handover.isChecked())
+        super().accept()
 
 
-def _scrollable_row_grid(dlg: QDialog) -> tuple[QScrollArea, QGridLayout]:
-    """A compact per-source grid (label + toggle buttons per row) inside a scroll
-    area — 13 rows (Manager + Device 0-11) is too tall to lay out flat like the
-    single-row selector dialogs."""
-    grid = QGridLayout()
-    grid.setHorizontalSpacing(6)
-    grid.setVerticalSpacing(4)
+def _fit_uniform(buttons, floor: int = 0) -> int:
+    """Give every button in `buttons` one width: the widest sizeHint in the group.
+
+    A CONSTANT CANNOT DO THIS. `BTN_W = 76` was measured on one platform's font, and the
+    Windows CI job runs a wider one — "Guard 0" needs 80 px there, so Qt shrank the button
+    and clipped its own label. The dialog geometry test caught it correctly; the number was
+    the defect.
+
+    Sizing to the group's widest sizeHint keeps the three properties that test pins:
+    every button is at least as wide as its content (nothing clips), they are all EQUAL
+    (the value column stays aligned), and the width does not depend on which value is
+    selected — the selected and unselected stylesheets differ in colour only, so sizeHint
+    is unaffected. `floor` keeps the familiar proportions where the text is narrow.
+    """
+    width = max([floor] + [b.sizeHint().width() for b in buttons])
+    for b in buttons:
+        b.setFixedWidth(width)
+    return width
+
+
+def _toggle_strip(values, text_of, on_pick, store: dict, width: int) -> QWidget:
+    """A left-packed row of pick-one-of-N toggles, registered in `store` by value."""
+    box = QHBoxLayout()
+    box.setContentsMargins(0, 0, 0, 0)
+    box.setSpacing(4)
+    for value in values:
+        b = _toggle_btn(text_of(value))
+        b.setFixedWidth(width)
+        b.clicked.connect(lambda _c=False, v=value: on_pick(v))
+        box.addWidget(b)
+        store[value] = b
+    box.addStretch(1)
     host = QWidget()
-    host.setLayout(grid)
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QFrame.NoFrame)
-    scroll.setWidget(host)
-    scroll.setMinimumHeight(320)
-    return scroll, grid
+    host.setLayout(box)
+    return host
 
+
+def _title_width(dlg: QDialog) -> int:
+    """Never narrower than the window title, whose bar also holds the traffic lights."""
+    return dlg.fontMetrics().horizontalAdvance(dlg.windowTitle()) + 150
+
+
+def _hline() -> QFrame:
+    """A divider in the THEME's border colour, not a hardcoded grey — a literal here stays
+    dark when the app is switched to the Light theme."""
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setStyleSheet(f"color:{VizTheme.BORDER};")
+    return line
+
+
+# kind -> (the value worth naming, all-default text, all-odd text, per-source suffix).
+# For fields whose two values are "ordinary" and "notable"; see `cds_summary`.
+_EXCEPTION_SUMMARY = {
+    "drive": (CDS_DRIVE_SPECIAL, "all Normal", "all Special", " Special"),
+    "ede": (CDS_EDE_HALF_EARLY, "All Full", "All Early", " Early"),
+}
+
+
+def cds_summary(values: List[int], kind: str) -> str:
+    """One-line summary of a per-source CDS list, e.g. 'Manager G0; 2 devices G1'.
+
+    Lives here beside the dialogs that render it rather than on the panel, because the
+    panel's row tooltip and the settings dialog's inline summaries show the same string and
+    a second copy would drift.
+
+    DRIVE TYPE CANNOT USE THE any() SHORTCUT the guard and tail share. Guard and tail encode
+    "not set" as 0, so an all-zero list means off; drive type encodes SPECIAL as 0, so the
+    same test would report a bus where every source holds a passive one as "off" — the exact
+    opposite of the truth. End-drive-early is the other way round (0 IS its ordinary value),
+    which is exactly why both go through a declared table rather than a zero test.
+    """
+    # TWO-VALUED FIELDS REPORT THE EXCEPTION against their ordinary value, rather than
+    # listing thirteen sources. Both of them read the "interesting" state as the one worth
+    # naming — Special for the drive type, stopping early for end-drive-early.
+    if kind in _EXCEPTION_SUMMARY:
+        odd_value, all_default, all_odd, suffix = _EXCEPTION_SUMMARY[kind]
+        odd = [i for i, v in enumerate(values) if int(v) == odd_value]
+        if not odd:
+            return all_default
+        if len(odd) == len(values):
+            return all_odd
+        parts = []
+        if 0 in odd:
+            parts.append("Manager")
+        devs = [i - 1 for i in odd if i > 0]
+        if devs:
+            parts.append(f"{len(devs)} device" + ("s" if len(devs) > 1 else ""))
+        return " + ".join(parts) + suffix
+
+    if not any(values):
+        return "off"
+    if kind == "guard":
+        def fmt(v):
+            return "G0" if v == 1 else "G1"
+    else:
+        def fmt(v):
+            return f"tail {v}"
+    groups: dict[int, List[int]] = {}
+    parts = []
+    if values[0]:
+        parts.append(f"Manager {fmt(values[0])}")
+    for i, v in enumerate(values[1:], start=1):
+        if v:
+            groups.setdefault(v, []).append(i - 1)
+    for v, devs in groups.items():
+        noun = "device" if len(devs) == 1 else "devices"
+        parts.append(f"{len(devs)} {noun} {fmt(v)}")
+    return "; ".join(parts) if parts else "off"

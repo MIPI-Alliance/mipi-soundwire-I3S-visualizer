@@ -38,9 +38,16 @@ def _edges(n=5000, seed=3, step=40):
     return np.cumsum(np.random.default_rng(seed).integers(1, step, size=n)).astype(np.uint64)
 
 
-def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE):
-    """A minimal two-channel .sal (meta.json + two digital blobs)."""
-    p = tmp_path / "cap.sal"
+def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE, *,
+               compress: bool = False, name: str = "cap.sal"):
+    """A minimal two-channel .sal (meta.json + two digital blobs).
+
+    `compress` writes DEFLATE members instead of the default STORED. It matters: the span
+    walk seeks with ZipExtFile.seek(), which is a real seek only on a STORED member and
+    read-and-discard on a compressed one. A STORED-only fixture therefore never exercises
+    the path a real Logic 2 capture takes.
+    """
+    p = tmp_path / name
     meta = {
         "data": {"legacySettings": {"sampleRate": {"digital": rate}}},
         "binData": [
@@ -49,7 +56,8 @@ def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE):
         ],
     }
     import json
-    with zipfile.ZipFile(p, "w") as z:
+    mode = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    with zipfile.ZipFile(p, "w", mode) as z:
         z.writestr("meta.json", json.dumps(meta))
         z.writestr("digital-0.bin", ch0)
         z.writestr("digital-1.bin", ch1)
@@ -127,6 +135,41 @@ def test_capture_span_samples_streams_without_inflating(tmp_path):
     path = _write_sal(tmp_path, blob, blob)
     span = ss.capture_span_samples(path)
     assert span >= int(e[-1]), f"span {span} < last edge {int(e[-1])}"
+
+
+def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
+    """The span walk must give the same answer on a DEFLATE archive as on a STORED one.
+
+    Every other fixture here is written STORED, where ZipExtFile.seek() is a real seek. On a
+    compressed member it is read-and-discard, and the walk also re-seeks to zero for each
+    candidate start offset — so the compressed path has different performance AND a different
+    code path through zipfile, and was untested. A real Logic 2 capture is compressed."""
+    e = _edges()
+    blob = sb.build_channel_v3(False, e, chunk_size=250)
+    stored = _write_sal(tmp_path, blob, blob, name="stored.sal")
+    packed = _write_sal(tmp_path, blob, blob, compress=True, name="packed.sal")
+    import zipfile as _z
+    with _z.ZipFile(packed) as z:                     # the fixture really is compressed
+        assert z.getinfo("digital-0.bin").compress_type == _z.ZIP_DEFLATED
+    assert ss.capture_span_samples(packed) == ss.capture_span_samples(stored) >= int(e[-1])
+
+
+def test_capture_span_channels_filter_restricts_the_walk(tmp_path):
+    """`channels=` must limit which blobs are walked — that is the fix for the pre-flight
+    span read blocking the GUI, and a filter that is silently ignored would look identical
+    from the outside. Asserted by giving the two channels DIFFERENT lengths: filtering to the
+    shorter one must return the shorter span, not the max over both."""
+    short = _edges(n=200)
+    long_ = _edges(n=2000)
+    b_short = sb.build_channel_v3(False, short, chunk_size=250)
+    b_long = sb.build_channel_v3(False, long_, chunk_size=250)
+    path = _write_sal(tmp_path, b_short, b_long)
+    both = ss.capture_span_samples(path)
+    only0 = ss.capture_span_samples(path, channels=[0])
+    only1 = ss.capture_span_samples(path, channels=[1])
+    assert only1 > only0, (only0, only1)              # the fixture's premise
+    assert both == only1, "unfiltered span should be the max over channels"
+    assert only0 == pytest.approx(int(short[-1]), rel=0.05) or only0 >= int(short[-1])
 
 
 # ----------------------------------------------------------------------- estimation

@@ -488,3 +488,64 @@ def test_override_does_not_promote_other_staged_registers():
     assert f.curr_value(0x2080) == 0                     # NEXT edit does NOT promote to CURR
     assert f.value(0x2083) == 0x0F and f.curr_value(0x2083) == 0, \
         "override must not promote OTHER staged registers to _CURR"
+
+
+def test_a_register_array_expands_to_one_register_per_index():
+    """The spec's tables collapse a run of addresses into one row — Table 166's
+    "0x20-0x2F  EC_TestFailCh<c>" is sixteen whole-byte per-channel counters, one per
+    address. The loader used to drop any row whose offset was a range, so those addresses
+    resolved to NOTHING: the per-channel test-fail counters, the SDCA and ImpDef interrupt
+    status, and the DP interrupt cascade were all invisible to the register view and to the
+    peripheral-report analysis."""
+    rm = RegisterMap.load()
+    for ch in (0, 3, 15):
+        r = rm.resolve(0x2020 + ch)
+        assert r and r.dp_index == 0 and r.register.name == f"EC_TestFailCh{ch}"
+        # A whole-byte saturating counter, not a bit field.
+        assert [(f.hi, f.lo) for f in r.register.fields] == [(7, 0)]
+    assert "EC_TestFailCh3=7" in rm.field_summary(0x2023, 7)
+
+
+def test_a_bit_array_numbers_its_members_ascending_from_the_lowest_address():
+    """IntStat_SDCA spreads 64 interrupt bits over 0x40-0x47 and IntStat_ImpDef 32 over
+    0x4C-0x4F, ascending: the lowest-numbered member is at the LOWEST address and at bit 0
+    (Table 169's own column layout). Getting the direction wrong would name every raised
+    interrupt after a different one."""
+    rm = RegisterMap.load()
+    assert "IntStat_SDCA00=1" in rm.field_summary(0x1040, 0x01)
+    assert "IntStat_SDCA07=1" in rm.field_summary(0x1040, 0x80)
+    assert "IntStat_SDCA63=1" in rm.field_summary(0x1047, 0x80)
+    assert "IntStat_ImpDef08=1" in rm.field_summary(0x104D, 0x01)
+    assert "IntStat_ImpDef31=1" in rm.field_summary(0x104F, 0x80)
+    # The enable arrays mirror the status ones.
+    assert "IntEn_SDCA56=1" in rm.field_summary(0x1057, 0x01)
+    assert "IntEn_ImpDef24=1" in rm.field_summary(0x105F, 0x01)
+
+
+def test_the_dp_interrupt_cascade_corrects_a_spec_typo():
+    """Table 169 prints `IntCascade_DP11` at 0x2A bit 1 — a duplicate of the label at 0x29
+    bit 3. Every other bit of both bytes ascends unbroken, so bit 1 of 0x2A is DP17, and
+    the generated names say so rather than reproducing the defect."""
+    rm = RegisterMap.load()
+    assert "IntCascade_DP17=1" in rm.field_summary(0x102A, 0x02)
+    assert "IntCascade_DP11=1" in rm.field_summary(0x1029, 0x08)   # the correct DP11
+    assert "IntCascade_DP31=1" in rm.field_summary(0x102B, 0x80)
+
+
+def test_filler_ranges_resolve_without_flooding_the_register_list():
+    """Reserved / ImpDef runs have nothing to index, so they stay the ONE row the spec
+    table shows (the register view lists them once, not forty-eight times) while every
+    address inside still resolves — a write into Reserved space is then identifiable as
+    Reserved instead of unknown."""
+    rm = RegisterMap.load()
+    for addr in (0x2040, 0x2055, 0x206F):                  # DP 0x40-0x6F, 48 Reserved bytes
+        r = rm.resolve(addr)
+        assert r and r.register.name == "Reserved"
+    reserved = [s for s in rm.blocks["DP"] if s.name == "Reserved" and s.offset == 0x40]
+    assert len(reserved) == 1 and reserved[0].span == 48
+    # DP 0x70-0x7F is vendor space, and this capture's DUT writes 0x70.
+    assert rm.resolve(0x2070).register.name == "ImpDef"
+    # A dual-ranked filler range aliases its _CURR across the WHOLE span, not just its
+    # first byte: DP 0xB0-0xBF ImpDef_NEXT aliases to 0xF0-0xFF.
+    curr = rm.resolve(0x2000 + 0xFF)
+    assert curr and curr.register.name == "ImpDef" and curr.rank == "CURR"
