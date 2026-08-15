@@ -502,14 +502,55 @@ def test_studio_ui_batch(win):
     win.cursor.set_sample(0)
 
 
+def test_the_demo_arrives_on_first_analyzer_entry_not_at_startup():
+    """Constructing the window must decode NOTHING. The demo's decode was ~2.3 GB of the
+    ~2.6 GB the app sat at on launch, and every session paid it — including the default
+    Bus Visualizer ones that never open the Analyzer, and every File ▸ Open that replaced
+    it seconds later. It now arrives on the first switch to Bus Analyzer, exactly once."""
+    from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
+
+    w = MainWindow()
+    assert w._session is None, "MainWindow.__init__ decoded a capture"
+    assert w._demo_preload_pending
+    w._mode_mgr.switch_to(ANALYSIS)
+    first = w._session
+    assert first is not None, "entering Bus Analyzer did not preload the demo"
+    assert not w._demo_preload_pending
+    # Leaving and coming back must NOT decode again — a new Session object would mean it did.
+    w._mode_mgr.switch_to(VISUALIZATION)
+    w._mode_mgr.switch_to(ANALYSIS)
+    assert w._session is first, "re-entering Bus Analyzer re-decoded the demo"
+    w.close()
+
+
+def test_a_loaded_capture_is_never_replaced_by_the_deferred_demo():
+    """The deferred preload must not fire over a capture the user opened. Opening from the
+    Visualizer switches into the Analyzer, which is the same code path the preload hangs
+    off — so if the pending flag outlived the load, opening a file would show the demo."""
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui.mode_controller import ANALYSIS
+
+    w = MainWindow()
+    assert w._demo_preload_pending
+    sess = Session.from_demo(8)                   # stands in for an opened capture
+    w.load_session(sess)                          # switches to Analyzer itself
+    assert w._session is sess
+    assert not w._demo_preload_pending
+    w._mode_mgr.switch_to(ANALYSIS)               # explicit re-entry, for good measure
+    assert w._session is sess, "the deferred demo replaced the loaded capture"
+    w.close()
+
+
 def test_load_demo_async_when_event_loop_live():
     """When the event loop is running, load_demo goes through the async worker + progress
     dialog (same as an external capture), instead of blocking the GUI thread — the 1 s demo
     is seconds of synthesis + decode. Before the loop starts / in headless tests it stays
-    synchronous so a freshly built window has its session ready. Pumps events to completion.
-    (conftest sets SWI3S_DEMO_SAMPLES=300, so the pumped decode is quick.)"""
+    synchronous, so a headless load_demo() returns with the session ready. Pumps events to
+    completion. (conftest sets SWI3S_DEMO_SAMPLES=300, so the pumped decode is quick.)"""
     import time
-    w = MainWindow()                                    # __init__ preload: synchronous (flag off)
+    w = MainWindow()                                    # constructor loads nothing now
+    assert w._session is None and getattr(w, "_load_thread", None) is None
+    w.load_demo()                                       # loop not live yet => synchronous
     assert w._session is not None and getattr(w, "_load_thread", None) is None
     MainWindow._event_loop_live = True
     try:
@@ -542,6 +583,7 @@ def test_cursor_cascade_coalesces_when_event_loop_live():
     cursor LINE still moves on every change. Headless / tests keep it synchronous."""
     import time
     w = MainWindow()
+    w.load_demo()                                    # no longer preloaded in __init__
     s = w._session
     assert s is not None
     N = int(s.capture.clock_edges[-1])

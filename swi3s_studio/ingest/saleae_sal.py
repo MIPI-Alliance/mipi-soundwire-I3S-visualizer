@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import zipfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -241,16 +241,31 @@ def _v3_span_streaming(fh, size: int, want_start: bool = False):
     return fail
 
 
-def capture_span_samples(path: str) -> int:
-    """Total length of the capture in samples (0 if it can't be determined).
+def capture_span_samples(path: str, channels: Optional[Sequence[int]] = None) -> int:
+    """Length of the capture in samples (0 if it can't be determined).
 
-    Read from the v3 block chain's last ``B_end`` by streaming block headers — no
-    delta decoding and no blob inflation — so it is safe to call on a capture far
-    too large to open. v0 blobs have no such index and contribute 0."""
+    Read from the v3 block chain's last ``B_end`` by streaming block headers — no delta
+    decoding and no whole-blob `read()` — so it is safe to ask about a capture far too large
+    to open. v0 blobs have no such index and contribute 0.
+
+    ``channels`` restricts the walk to those device channels. **Pass it whenever the caller
+    knows which channels it will load.** Without it every digital channel in the archive is
+    walked, and on a compressed archive that is not cheap: the walk seeks with
+    ``ZipExtFile.seek()``, which for a DEFLATE member is implemented as read-and-discard (and
+    re-reads from zero for each candidate start offset), so an 8-channel capture pays that
+    cost six times over for channels nobody asked for. That is what made a pre-flight span
+    read block the GUI for ~2 s on a multi-hundred-MB `.sal`.
+
+    Only STORED members get a true seek, which is why a test fixture written with
+    ``ZIP_STORED`` shows none of this — see `tests/test_sal_large_capture.py`.
+    """
     info = read_info(path)
+    want = None if channels is None else {int(c) for c in channels}
     best = 0
     with zipfile.ZipFile(path) as z:
-        for name in info.digital_files.values():
+        for ch, name in info.digital_files.items():
+            if want is not None and int(ch) not in want:
+                continue
             try:
                 size = z.getinfo(name).file_size
                 with z.open(name) as fh:
@@ -260,11 +275,12 @@ def capture_span_samples(path: str) -> int:
     return best
 
 
-def _capture_span_samples(info: "SalInfo", path: str) -> int:
+def _capture_span_samples(info: "SalInfo", path: str,
+                          channels: Optional[Sequence[int]] = None) -> int:
     """Span helper used by the load guard; tolerates any read failure (the guard
     then just falls back to the whole-capture estimate, which is conservative)."""
     try:
-        return capture_span_samples(path)
+        return capture_span_samples(path, channels=channels)
     except Exception:
         return 0
 
@@ -519,7 +535,8 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         peak = cost.est_peak_bytes
         if window is not None:
             span = max(0, int(window[1]) - int(window[0]))
-            total = _capture_span_samples(info, path)
+            total = _capture_span_samples(info, path,
+                                         channels=[clock_channel, data_channel])
             if total > 0:
                 frac = min(1.0, span / float(total))
                 # Streaming: no inflated-blob term, just the window's own edges plus

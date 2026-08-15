@@ -14,7 +14,7 @@ older v1.73 files are auto-converted on import). Wire a `parse_version` comparis
 into `csv_handler.load_csv` if/when a breaking format change needs to reject old files.
 """
 
-APP_VERSION = '3.0.12'      # pinned to swi3s_studio.__version__ by tests
+APP_VERSION = '3.0.13'      # pinned to swi3s_studio.__version__ by tests
 MIN_COMPATIBLE_CSV_VERSION = '2.1.11'
 
 

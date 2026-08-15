@@ -497,7 +497,7 @@ class AudioStore:
         # straddles it when it holds both g and g+1.
         pos = np.searchsorted(bin_start, gaps, side="right") - 1
         out_x, out_lo, out_hi = [], [], []
-        cut = {}
+        cut: Dict[int, list] = {}
         for g, j in zip(gaps.tolist(), pos.tolist()):
             if 0 <= j < len(lo) and bin_start[j] <= g < bin_stop[j] - 1:
                 cut.setdefault(j, []).append(g)

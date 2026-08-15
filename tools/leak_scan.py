@@ -30,10 +30,29 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _HOME = "/" + "Users/"
 _WINHOME = r"C:\\" + r"Users\\"
 
+# A dotted spec-section citation looks exactly like a 10.0.0.0/8 address:
+# "§10.1.4.4.2" matched the private-IP pattern and failed the gate. Narrowed
+# rather than allowlisted — an allowlist entry would have to name the file, and
+# the next §10.x citation anywhere else would fail again.
+#
+# Two structural discriminators, neither of which a real address can satisfy:
+#   * a section citation is introduced by §, so reject that prefix;
+#   * an IPv4 address has exactly FOUR octets, so reject a fifth (§10.1.4.4.2).
+# A genuine 10.x address in prose is still caught: it has four octets and no §.
+#
+# The fifth-octet guard is `(?!\.\d)`, NOT `(?![.\d])`. The stricter form also
+# rejected a trailing sentence period — "the host is 10.1.4.4." stopped being a
+# finding, which is a real address in ordinary prose. Only a dot FOLLOWED BY A
+# DIGIT means "this is not an address".
+_IPV4_TAIL = r"(?!\.?\d)(?!\.\d)"   # no 5th octet; a sentence-final '.' is fine
+
 _STRUCTURAL: list[tuple[str, str]] = [
-    (r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "private IP address (10.0.0.0/8)"),
-    (r"\b192\.168\.\d{1,3}\.\d{1,3}\b", "private IP address (192.168.0.0/16)"),
-    (r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b", "private IP address (172.16.0.0/12)"),
+    (r"(?<!§)\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b" + _IPV4_TAIL,
+     "private IP address (10.0.0.0/8)"),
+    (r"\b192\.168\.\d{1,3}\.\d{1,3}\b" + _IPV4_TAIL,
+     "private IP address (192.168.0.0/16)"),
+    (r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b" + _IPV4_TAIL,
+     "private IP address (172.16.0.0/12)"),
     (_HOME + r"[A-Za-z0-9._-]+", "absolute home path (reveals a user name)"),
     (_WINHOME + r"[A-Za-z0-9._-]+", "absolute Windows home path (reveals a user name)"),
     (r"\bid_(?:rsa|ed25519|ecdsa|dsa)\b", "SSH key file name"),

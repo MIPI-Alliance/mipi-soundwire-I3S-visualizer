@@ -363,6 +363,39 @@ bool CRegisterModel::BuildConfig(SwI3sConfig& out) const
         if (out.SkippingDenominator == 0) out.SkippingDenominator = 1;
     }
 
+    // --- Control Data Stream, recovered PER DEVICE ---
+    //
+    // The CDS is time-multiplexed and each source drives it under its own copy of the
+    // registers, so this reads every device that has been written to and files the value
+    // in that device's own per-source slot (device d -> slot d+1).
+    //
+    // THE MANAGER'S SLOT (0) STAYS AT ITS DEFAULT and cannot be recovered: only
+    // peripherals have an addressable register block, so nothing on the wire says how the
+    // Manager drives the CDS. Leaving it at the default is the honest answer — inferring
+    // it from a peripheral's value would invent a fact the capture does not contain.
+    //
+    // CDS_BitWidth is bus-wide in the config but per-device on the wire; taken from `rep`
+    // like the geometry above, for the same reason (identical across the link).
+    if (has(rep, reg::kCdsBitWidthGuardTail_N)) {
+        out.CdsBitWidth = (get(rep, reg::kCdsBitWidthGuardTail_N) >> 5) & 0x7;
+    }
+    for (const auto& kv : mDev) {
+        const int dev = kv.first;
+        if (dev < 0 || dev + 1 >= SwI3sConfig::kCdsSources) continue;
+        const int src = dev + 1;
+        if (has(dev, reg::kCdsDriveType_N)) {
+            out.CdsDriveType[src] = (get(dev, reg::kCdsDriveType_N) >> 7) & 0x1;
+        }
+        if (has(dev, reg::kCdsBitWidthGuardTail_N)) {
+            const U8 b = get(dev, reg::kCdsBitWidthGuardTail_N);
+            out.CdsEndDriveEarly[src] = (b >> 4) & 0x1;
+            const bool en = ((b >> 3) & 0x1) != 0;
+            const bool pol = ((b >> 2) & 0x1) != 0;
+            out.CdsGuard[src] = en ? (pol ? 2 : 1) : 0;
+            out.CdsTailWidth[src] = b & 0x3;
+        }
+    }
+
     // Every enabled dataport across every device. Start empty and append only the
     // enabled ports — do NOT pre-fill kMaxPeripherals disabled placeholders, which
     // padded config_dataports() with phantom entries and skewed the positional

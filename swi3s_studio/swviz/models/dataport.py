@@ -91,10 +91,7 @@ class DataPortConfig:
 
     @property
     def _num_channels(self) -> int:
-        """Count of enabled channels. int.bit_count() is a C-level popcount — far
-        cheaper than bin(x).count('1') (no string alloc) on this per-tick hot path,
-        and stateless so it stays correct when EnableCh_REG is edited in place (no
-        cache to invalidate)."""
+        """Count of enabled channels."""
         return self.EnableCh_REG.bit_count()
 
     @property
@@ -104,15 +101,12 @@ class DataPortConfig:
 
     @property
     def _is_source(self) -> bool:
-        """PortDirection_REG=True means SINK"""
+        """Return True if this is a source DP."""
         return not self.PortDirection_REG
 
     @property
     def _txp_enabled(self) -> bool:
-        """True if FlowMode activates the TX_PRESENT bit. Per {ASW5203} TX_PRESENT
-        is present in ALL three flow-controlled modes: TX_CONTROLLED and ASYNC carry
-        data-validity, and RX_CONTROLLED carries a copy of the FCP_DRQ received 1 or
-        2 Intervals earlier. Only NORMAL (no flow control) omits it."""
+        """True if FlowMode activates the TX_PRESENT bit."""
         return self.FlowMode_REG in (
             FlowMode.TX_CONTROLLED, FlowMode.RX_CONTROLLED, FlowMode.ASYNC)
 
@@ -130,14 +124,13 @@ class DataPortConfig:
         the validator, so clamp here at the source (mirrors C++ CDataPort). Floored
         at 1 so the group-countdown seed (grouping-1) can't go negative when no
         channels are enabled."""
-        n = self._num_channels
-        grouping = (n if self.ChannelGrouping_REG == 0 else self.ChannelGrouping_REG)
-        return (max(1, min(grouping, n)) if n else 1)
+        grouping = (self._num_channels if self.ChannelGrouping_REG == 0 else self.ChannelGrouping_REG)
+        return (max(1, min(grouping, self._num_channels)) if self._num_channels else 1)
 
 class DataPort:
     """SWI3S Data Port — config + state + algorithm.
         initialize()         initialize before use
-        clock_tick()         advance one UI; engine derives BitSlotState from state
+        clock_tick()         advance one UI; the bit-slot state follows from state
     """
 
     state: DataPortState
@@ -150,7 +143,6 @@ class DataPort:
     def initialize(self) -> None:
         """Initialize before dataport use."""
         self.state = DataPortState(self.config)
-        self._num_cols = self._device.num_columns
         self._start_interval()
 
     def clock_tick(self) -> None:
@@ -165,11 +157,10 @@ class DataPort:
              source slot, then advance column.
         """
         cfg, s = self.config, self.state
-        nch = cfg._num_channels
         in_transport_window = (
-            nch > 0
+            cfg._num_channels > 0
             and not s.interval_skipped
-            and s.channel_group_base_channel < nch
+            and s.channel_group_base_channel < cfg._num_channels
             and s.row_in_interval >= cfg.Offset_REG
             and cfg.HorizontalStart_REG <= s.column
             and s.column <= cfg._horizontal_end
@@ -223,7 +214,7 @@ class DataPort:
     def _advance_column(self) -> None:
         """Next column; cascades to _advance_row."""
         self.state.column += 1
-        if self.state.column >= self._num_cols:
+        if self.state.column >= self._device.num_columns:
             self._advance_row()
 
     def _advance_row(self) -> None:
@@ -274,9 +265,9 @@ class DataPort:
         s.txp_pending = cfg._txp_enabled
         if s.channels_in_group_remaining == 0:
             s.channel_index = s.channel_group_base_channel
-            group_channels = min(cfg._effective_channel_grouping,
-                                 cfg._num_channels - s.channel_group_base_channel)
-            s.channels_in_group_remaining = max(0, group_channels - 1)
+            s.channels_in_group_remaining = min(
+                cfg._effective_channel_grouping,
+                cfg._num_channels - s.channel_group_base_channel) - 1
             self._advance_sample()
         else:
             s.channel_index += 1

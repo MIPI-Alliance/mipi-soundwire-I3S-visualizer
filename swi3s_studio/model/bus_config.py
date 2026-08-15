@@ -28,6 +28,109 @@ NUM_DATA_PORTS = 12
 CDS_NUM_SOURCES = 13                          # Manager + Device 0..11
 CDS_GUARD_OFF, CDS_GUARD_G0, CDS_GUARD_G1, CDS_GUARD_GX = 0, 1, 2, 3
 
+# CDS_DriveType (registers.json CDS block, offset 0x86 bit 7 — the spec's own encoding,
+# NOT a Studio invention): 0 = Special (PassiveOne / ActiveZero), where a CDS bit of 1 is
+# left high-Z and the Manager's bus keeper holds the level, which affects NRZS decode;
+# 1 = Normal, where both levels are actively driven. PHY3 mandates Normal; PHY1/2 make it
+# optional.
+#
+# PER SOURCE, like the guard and the tail. The register lives in each device's own CDS
+# block, so the Manager and each of devices 0-11 carry their own value — it is not one
+# bus-wide bit. Stored as a CDS_NUM_SOURCES list on the same index convention (0 =
+# Manager, i = Device i-1).
+CDS_DRIVE_SPECIAL, CDS_DRIVE_NORMAL = 0, 1
+CDS_DRIVE_LABELS = {CDS_DRIVE_SPECIAL: "Special (passive 1)",
+                    CDS_DRIVE_NORMAL: "Normal (actively driven)"}
+
+# CDS_EndDriveEarly (CDS block 0x87 bit 4). Spec v1.1 r08 Table 176, verbatim:
+#   0: Drive to the end of the UI.
+#   1: Stop driving before the end of the last UI.
+# Per source for the same reason as the drive type — the register is in each device's own
+# CDS block. PHY3 mandatory, PHY2 optional, PHY1 read-only 0.
+#
+# NO DURATION IS NAMED ANYWHERE, deliberately. r08 removed the "half UI" idea from the
+# normative text, made the granularity BITS rather than UIs (a Wide Bit / guard / tail group
+# gets one early release, Sec. 10.1.14 "Scope of EndDriveEarly"), and left the exact point
+# ImpDef inside a PHY-specific bound (PHY2: Per_tZD_Actual + Per_tRampTime_Actual + 3.0 ns
+# to UI - 2.0 ns,
+# Table 132). The constant is still spelled HALF_EARLY because renaming it would touch every
+# call site for no gain -- the NAME is a register value, the meaning is above.
+#
+# HERE THE REGISTER'S RESET *IS* THE RIGHT DEFAULT, unlike CDS_DriveType: 0 means drive to
+# the end of the UI, which is the ordinary behaviour, so every source defaults to 0 with no
+# deviation to justify. The two fields sit next to each other and default oppositely
+# relative to their resets, which is worth knowing before "fixing" one to match the other.
+#
+# NOT the same field as the timing calculator's `Man_ede` / `Per_ede`. Those model the
+# EndDriveEarly proposal for a DATA handover (swi3s_studio/timing/); this is the CDS bit's
+# own register. Same idea, different register, different consumer.
+CDS_EDE_FULL_UI, CDS_EDE_HALF_EARLY = 0, 1
+CDS_EDE_LABELS = {CDS_EDE_FULL_UI: "Full", CDS_EDE_HALF_EARLY: "Early"}
+
+# Per-source CDS fields that serialise as ONE plain 13-wide integer CSV row:
+# (csv_key, attribute, default per source). The guard is NOT here — it splits into an
+# enable row and a polarity row to mirror its two registers, and is handled on its own.
+#
+# A TABLE BECAUSE THE FIFTH ONE SHOULD BE ONE LINE. Drive type was added as four hand-
+# written edits across two files (read, write, default, dict) and End Drive Early would
+# have been four more; every one of them is a place to forget. Both engines' CSV loops
+# read this shape, so adding a field is now: one entry here, one in the swviz handler's
+# equivalent, and a dialog.
+_CDS_PER_SOURCE_INT_ROWS = (
+    ("CDS_TailWidthPerSource", "cds_tail", 0),
+    ("CDS_DriveTypePerSource", "cds_drive_type", CDS_DRIVE_NORMAL),
+    ("CDS_EndDriveEarlyPerSource", "cds_end_drive_early", CDS_EDE_FULL_UI),
+)
+
+
+def _cds_flag(values, odd_value: int, name: str) -> str:
+    """One CDS cell flag, or "" — `name` when every source is at `odd_value`, `name`+"x" when
+    only some are.
+
+    The trailing `x` is the convention the guard labels already use (`Gx` for "the sources
+    disagree", GridView._cds_guard_core), reused rather than reinvented: the CDS bit is ONE
+    cell driven by whoever holds it in turn, so "some of them" is a state the label has to be
+    able to say.
+    """
+    kinds = {int(v) == odd_value for v in values}
+    if kinds == {True}:
+        return name
+    return f"{name}x" if True in kinds else ""
+
+
+def cds_symbol(drive_type, end_drive_early=None) -> str:
+    """What a CDS cell is labelled: "CDS", or "CDS" over a line of flags.
+
+    TWO LINES, because one did not fit. `CDS_SPx` needs 58 px in a 44 px column and overflowed
+    the cell, and end-drive-early had no representation at all — a per-device setting with real
+    decode consequences, invisible on the grid. So the cell now reads
+
+        CDS            (nothing unusual: every source drives both levels for the full UI)
+        CDS / SP       (every source leaves a CDS 1 high-Z for the bus keeper)
+        CDS / SPx      (only some do)
+        CDS / SP EDE   (...and every source also stops driving before the UI ends)
+        CDS / SPx EDEx (both, and the sources disagree about both)
+
+    The flags line is omitted entirely when there is nothing to say, which is the common case
+    and every one of the 89 example configs — annotating the ordinary setting would put a
+    suffix on all of them and mean nothing.
+
+    Returned with a newline rather than as a tuple so the one string stays the cell's label
+    end to end; the renderer splits it to insert a merged run's " x{n}" into the first line,
+    and sizes the CDS column to whichever line is wider (see GridView._cds_label).
+
+    Both arguments accept a bare int as well as a list, so a caller holding one device's value
+    (or a legacy scalar) does not have to wrap it.
+    """
+    def _as_list(v):
+        return [v] if isinstance(v, (int, bool)) else list(v)
+
+    flags = [_cds_flag(_as_list(drive_type), CDS_DRIVE_SPECIAL, "SP")]
+    if end_drive_early is not None:
+        flags.append(_cds_flag(_as_list(end_drive_early), CDS_EDE_HALF_EARLY, "EDE"))
+    line2 = " ".join(f for f in flags if f)
+    return f"CDS\n{line2}" if line2 else "CDS"
+
 
 def cds_src_index(device_number: int) -> int:
     """Per-source index for a source: Manager (device_number -1) -> 0, Device d -> d+1."""
@@ -82,7 +185,7 @@ IFACE_FIELDS = [
     ("S1TailWidth_REG", "s1_tail_width", "int"),
     ("EnforceS1Handover", "enforce_s1_handover", "bool"),
     ("CDS_BitWidth_REG", "cds_bit_width", "int"),
-    # CDS guard/tail are per-source now (see to_csv/from_csv_text); the legacy
+    # CDS guard/tail/drive-type are per-source (see to_csv/from_csv_text); the legacy
     # CDS_GuardEnabled_REG / CDS_GuardPolarity_REG / CDS_TailWidth_REG keys are written
     # (derived) and read (migrated) there, not through this scalar map.
     ("EnforceCDSHandover", "enforce_cds_handover", "bool"),
@@ -197,6 +300,17 @@ class BusConfig:
     # (below) for the legacy consumers + CSV back-compat.
     cds_guard: List[int] = field(default_factory=lambda: [0] * CDS_NUM_SOURCES)
     cds_tail: List[int] = field(default_factory=lambda: [0] * CDS_NUM_SOURCES)
+    # Per-source CDS_DriveType (see the constants above): the register is in each device's
+    # own CDS block, so this is a 13-entry list on the same index convention as the guard
+    # and the tail. Defaults to Normal for EVERY source — deliberately NOT the register's
+    # reset of 0 (Special), because a config that never mentions the field must keep
+    # reading the way it always has; seeding Special would relabel every existing file.
+    cds_drive_type: List[int] = field(
+        default_factory=lambda: [CDS_DRIVE_NORMAL] * CDS_NUM_SOURCES)
+    # Per-source CDS_EndDriveEarly (see the constants above): 0 full UI, 1 stop half a UI
+    # early. Defaults to the register's reset here, which happens to be the right default.
+    cds_end_drive_early: List[int] = field(
+        default_factory=lambda: [CDS_EDE_FULL_UI] * CDS_NUM_SOURCES)
     enforce_cds_handover: bool = True
     rows_to_draw: int = 64
     description: str = ""
@@ -326,7 +440,10 @@ class BusConfig:
         # — they're derived from these on load.
         w.writerow(["CDS_GuardEnabledPerSource"] + ["1" if g != 0 else "0" for g in self.cds_guard])
         w.writerow(["CDS_GuardPolarityPerSource"] + ["1" if g == CDS_GUARD_G1 else "0" for g in self.cds_guard])
-        w.writerow(["CDS_TailWidthPerSource"] + [str(int(t)) for t in self.cds_tail])
+        # The plain 13-wide integer rows (tail, drive type, end-drive-early). Always
+        # written, so a saved file is explicit rather than relying on a reader's default.
+        for key, attr, _default in _CDS_PER_SOURCE_INT_ROWS:
+            w.writerow([key] + [str(int(v)) for v in getattr(self, attr)])
         if self.description:
             w.writerow(["Description", self.description])
         for key, attr, kind in DP_FIELDS:
@@ -372,9 +489,19 @@ class BusConfig:
         # CDS guard/tail: prefer the per-source rows; else migrate the legacy globals
         # onto ALL sources (Manager + all 12 devices share the CDS — see below). Guard
         # arrives as split enable + polarity rows; recombine into cds_guard (0/1/2).
-        got_guard = got_tail = False
+        got_guard = False
         guard_en = guard_pol = None
+        mgr_flags = None            # ManagerDataport, resolved after the loop (see below)
         legacy = {"en": False, "pol": False, "tw": 0}
+        # The plain 13-wide rows, driven off one table (see _CDS_PER_SOURCE_INT_ROWS) so a
+        # new per-source field is an entry there rather than another branch here.
+        int_rows = {k: (a, d) for k, a, d in _CDS_PER_SOURCE_INT_ROWS}
+        got_int_row = set()
+        # CDS_DriveType also has a SCALAR spelling that broadcasts to every source. It
+        # existed only briefly (the field was scalar before it was understood to live in
+        # each device's own CDS block), so this is cheap insurance for a file saved in
+        # between rather than a format we support.
+        legacy_drive = None
         for row in csv.reader(io.StringIO(text)):
             if not row:
                 continue
@@ -386,10 +513,19 @@ class BusConfig:
             elif key == "CDS_GuardPolarityPerSource":
                 guard_pol = [_parse(row[i + 1] if i + 1 < len(row) else "", "bool")
                              for i in range(CDS_NUM_SOURCES)]
-            elif key == "CDS_TailWidthPerSource":
+            elif key in int_rows:
+                attr, default = int_rows[key]
+                target = getattr(cfg, attr)
                 for i in range(CDS_NUM_SOURCES):
-                    cfg.cds_tail[i] = _parse(row[i + 1] if i + 1 < len(row) else "", "int")
-                got_tail = True
+                    raw = row[i + 1] if i + 1 < len(row) else ""
+                    # A SHORT OR BLANK CELL TAKES THE FIELD'S DEFAULT, not _parse's 0. On
+                    # CDS_DriveType 0 means Special, so a truncated row read as zeros would
+                    # silently relabel the whole bus — the one case where "missing" and
+                    # "zero" are not the same answer.
+                    target[i] = _parse(raw, "int") if raw.strip() else default
+                got_int_row.add(key)
+            elif key == "CDS_DriveType":
+                legacy_drive = _parse(row[1] if len(row) > 1 else "", "int")
             elif key == "CDS_GuardEnabled_REG":
                 legacy["en"] = _parse(row[1] if len(row) > 1 else "", "bool")
             elif key == "CDS_GuardPolarity_REG":
@@ -407,17 +543,35 @@ class BusConfig:
                     raw = row[i + 1] if i + 1 < len(row) else ""
                     setattr(cfg.dataports[i], attr, _parse(raw, kind))
             elif key == "ManagerDataport":
-                # Manager ports are written as device 0 + this flag (the Visualizer's
-                # convention); restore device -1 so the round trip preserves them.
-                # Written after DeviceNumber_REG, so this correctly overrides the 0.
-                for i in range(NUM_DATA_PORTS):
-                    raw = row[i + 1] if i + 1 < len(row) else ""
-                    if _parse(raw, "bool"):
-                        cfg.dataports[i].device_number = -1
+                # Manager ports are written as device 0 plus this flag, because
+                # DeviceNumber_REG is a REGISTER and cannot hold the -1 sentinel — the two
+                # rows are not rival encodings of one thing, they are a register value and a
+                # role the register cannot express.
+                #
+                # RECORDED, NOT APPLIED, so the outcome does not depend on row order. This
+                # used to assign device -1 immediately, on the stated assumption that the
+                # flag row is "written after DeviceNumber_REG" — true of files this class
+                # writes, false of a hand-edited or third-party one, and in that case the
+                # later DeviceNumber row silently overwrote the Manager assignment. swviz's
+                # loader has always been order-independent, so the same file decoded two
+                # ways depending on which engine read it. Resolved after the loop.
+                mgr_flags = [_parse(row[i + 1] if i + 1 < len(row) else "", "bool")
+                             for i in range(NUM_DATA_PORTS)]
             elif key == "DisplayFields":
                 for i in range(NUM_DATA_PORTS):
                     raw = row[i + 1] if i + 1 < len(row) else ""
                     cfg.dataports[i].display_fields = _disp_bits(raw)
+        # MANAGER WINS, whichever row came first. DeviceNumber_REG carries a register value
+        # (0-11); ManagerDataport says the port is in the Manager, which that register cannot
+        # encode. So the flag is not overridden BY the number — it decides whether the number
+        # applies at all, and applying it last is what makes the read order-independent.
+        # Mirrors swviz's CSVHandler, which reaches the same answer by skipping the number
+        # for a slot already marked Manager.
+        if mgr_flags is not None:
+            for i, is_mgr in enumerate(mgr_flags):
+                if is_mgr:
+                    cfg.dataports[i].device_number = -1
+
         # Recombine the split guard rows into cds_guard (0=off, 1=G0, 2=G1). A missing
         # polarity row defaults to G0 for the enabled entries.
         if guard_en is not None:
@@ -432,15 +586,24 @@ class BusConfig:
         # single-guard output while letting the CDS dialog show every source sharing it.
         if not got_guard and legacy["en"]:
             cfg.cds_guard = [CDS_GUARD_G1 if legacy["pol"] else CDS_GUARD_G0] * CDS_NUM_SOURCES
-        if not got_tail and legacy["tw"]:
+        if "CDS_TailWidthPerSource" not in got_int_row and legacy["tw"]:
             cfg.cds_tail = [int(legacy["tw"])] * CDS_NUM_SOURCES
+        if "CDS_DriveTypePerSource" not in got_int_row and legacy_drive is not None:
+            cfg.cds_drive_type = [int(legacy_drive)] * CDS_NUM_SOURCES
         return cfg
 
     # ---- workspace (dict) serialisation ----
     _IFACE_ATTRS = ("num_columns", "row_rate_khz", "skipping_denominator",
                     "phy3_enabled", "s0_width", "s1_tail_width", "enforce_s1_handover",
-                    "cds_bit_width", "cds_guard", "cds_tail",
+                    "cds_bit_width", "cds_guard", "cds_tail", "cds_drive_type",
+                    "cds_end_drive_early",
                     "enforce_cds_handover", "rows_to_draw", "description")
+
+    # Attributes carrying a PER-SOURCE list rather than a scalar. `from_dict` copies these
+    # (so a loaded workspace never shares the caller's list) and tolerates a scalar, which
+    # a workspace written before the attribute became per-source would hold.
+    _IFACE_LIST_ATTRS = ("cds_guard", "cds_tail", "cds_drive_type",
+                         "cds_end_drive_early")
 
     def to_dict(self) -> dict:
         d = {a: getattr(self, a) for a in self._IFACE_ATTRS}
@@ -452,8 +615,14 @@ class BusConfig:
     def from_dict(cls, d: dict) -> "BusConfig":
         cfg = cls()
         for a in cls._IFACE_ATTRS:
-            if a in d:
-                setattr(cfg, a, list(d[a]) if a in ("cds_guard", "cds_tail") else d[a])
+            if a not in d:
+                continue
+            if a in cls._IFACE_LIST_ATTRS:
+                v = d[a]
+                setattr(cfg, a, [int(v)] * CDS_NUM_SOURCES
+                        if isinstance(v, (int, bool)) else list(v))
+            else:
+                setattr(cfg, a, d[a])
         # Migrate an old workspace that predates per-source CDS guard/tail — the
         # global value is shared by ALL sources (Manager + all 12 devices).
         if "cds_guard" not in d and d.get("cds_guard_enabled"):
@@ -472,12 +641,25 @@ class BusConfig:
         `config_dataports()`), so an analyzed capture's bus grid can be exported as
         a visualizer settings CSV. The decoder's dataport vector is sparse and may
         exceed 12; pack the ENABLED ports into the 12 visualizer columns, preserving
-        each port's device number and logical DP number."""
+        each port's device number and logical DP number.
+
+        The CDS fields come across as per-source lists, so a capture's snooped CDS state
+        reaches the exported CSV. Their MANAGER slot (index 0) is always the default:
+        only peripherals have an addressable CDS register block, so nothing on the wire
+        says how the Manager drives the CDS. A missing key keeps the constructed default,
+        which is what a capture that never wrote the CDS should read as.
+        """
         cfg = cls()
         for a in ("num_columns", "skipping_denominator", "phy3_enabled",
-                  "row_rate_khz", "description"):
+                  "row_rate_khz", "description", "cds_bit_width"):
             if a in d:
                 setattr(cfg, a, d[a])
+        for a in cls._IFACE_LIST_ATTRS:
+            if a in d and d[a]:
+                v = list(d[a])
+                # Tolerate a short list rather than truncating the 13 slots to it.
+                setattr(cfg, a, [v[i] if i < len(v) else getattr(cfg, a)[i]
+                                 for i in range(CDS_NUM_SOURCES)])
         names = {f.name for f in fields(DataPortConfig)}
         enabled = [dd for dd in d.get("dataports", []) if dd.get("enabled")]
         for i, dd in enumerate(enabled[:NUM_DATA_PORTS]):

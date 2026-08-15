@@ -192,6 +192,7 @@ def test_command_filter_survives_a_redecode():
     from swi3s_studio.session import Session
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
+    win.load_demo()                                # the demo is no longer preloaded in __init__
     win._cmd_proxy.set_kinds({"WriteA32"})
     assert win._cmd_proxy._kinds == {"WriteA32"}
     win.load_session(win._session)                 # re-decode: same session object

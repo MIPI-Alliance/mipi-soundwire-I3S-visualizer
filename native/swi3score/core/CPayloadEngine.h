@@ -98,7 +98,9 @@ public:
 
     // Re-anchor all dataports to a Stream Synchronization Point observed on the
     // bus: each port's row counter is set so this row is row_in_interval == 0.
-    void SyncToSSP();
+    // Returns true if any SKIPPING port was mid-pattern when the SSP arrived — an
+    // unexpected SSP per Section 9.1.6.2.1, which re-phases its skip pattern.
+    bool SyncToSSP();
 
     // The column the next tick lands on (last SetStartColumn), so a checkpoint can
     // record it and a windowed re-decode can rebuild the same port phase.

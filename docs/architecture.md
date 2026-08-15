@@ -361,6 +361,13 @@ The target device for any access is selected by the **Phase Header Device Mask**
 not the address; the 32-bit address is an offset within that peripheral's
 identical register space (so one map describes all devices).
 
+Extracted at **v1.1 r08**. `_meta` records the spec revision, the source tables, and the
+conventions — read it before trusting a citation, because **table and section numbers are not
+stable keys**: r08 moved the register content from Chapter 15 to Chapter 14 and renumbered
+tables 163–171 → 165–182 *without moving a single register*. The map is keyed on register/field
+**name + block + offset + bit range**, which have been stable, and `_meta.conventions` lists
+the r06 → r08 field deltas that were applied.
+
 ---
 
 ## 8. Reuse map
@@ -431,16 +438,28 @@ per mode; all three share one workspace file.
 
 - **Visualization** — the authoring editor: `model/bus_config.py` (Interface + 12
   DataPort/FCP, the `_REG` config vocabulary, serialised to v2.0 CSV) and
-  `ui/authoring/`. Placement, clash detection, and validation come from the SWI3S
+  `ui/authoring/`. The CDS carries four **per-source** settings (guard, tail width, drive
+  type, end-drive-early — 13 entries each: Manager + Device 0–11, since each register lives
+  in a device's own CDS block), edited through one *CDS Settings* dialog and written as
+  13-wide CSV rows. Placement, clash detection, and validation come from the SWI3S
   Visualizer engine under `swi3s_studio/swviz/`, driven by `model/viz_engine.py`: it
   builds a merged `BusModel`, and `GridView.set_bus_model` renders its bits
   (CDS/S0/S1/guards/tails/handovers + data) and clash markers. An authored config can
   be pushed into Analysis ▸ Compare as the expected config. The engine is covered by a
   JSON parity testsuite (`tests/test_visualizer_engine.py`).
 - **Timing** — the PHY margin calculator: `swi3s_studio/timing/` (`calculator.py`,
-  `delta_tpd.py`), surfaced by `ui/timing_view.py` as a text margin readout (the four
-  MP/PM setup/hold inequalities term-by-term, F_max, the binding constraint, and an
-  optional per-inequality worst-PVT corner). No plots.
+  `delta_tpd.py`, `spec_source.py`), surfaced by `ui/timing_view.py` as a text margin
+  readout. **17 inequalities**, numbered in display order: setup and hold for MP, PM and
+  PP, each in both launch forms (`t_DD` and the handover's `t_ZD`); the three handover
+  non-contention legs; and the bus keeper once per releasing device (one keeper, two legs —
+  a min over the pair is not affine and defeated the corner search). Every leg is evaluated
+  at **its own** worst PVT corner by `find_worst_corner_rows`, which is why each row can
+  read a different end of the same input row. `spec_source.py` holds the per-side spec
+  presets — SWI3S PHY1/PHY2, two proposed PHY2 revisions, SoundWire 1.3 — plus the
+  normalisation that puts a mixed bus on one timing graph, and the divergences it declines
+  to reconcile. Terms are ordered as a physical time trace and each is clickable: the view
+  keys a term to the **input row** it reads (`_term_key`) and washes every occurrence.
+  No plots.
 - **Analysis** — the protocol analyzer.
 
 The bus-grid renderer (`ui/grid_view.py`) is shared between the authored (planned) and
@@ -458,3 +477,38 @@ engine's `BusModel` via `GridView.set_bus_model`: the model supplies the
 CDS/S0/S1/guard/tail/handover system bits with device, and the renderer draws those and
 overlays clash X-markers (bus red / device yellow / read blue) from the model's clash
 lists. Analysis-mode decode keeps the C++ core for throughput.
+
+One label does NOT come through the bit model. The CDS cell reads **`CDS` over a flags line**
+carrying the two per-source settings the grid can show — `SP`/`SPx` for a drive type of Special
+(a CDS bit of 1 left high-Z for the Manager's bus keeper, which NRZS decode sees) and
+`EDE`/`EDEx` for end-drive-early, the trailing `x` meaning the sources disagree, as `Gx` already
+does for the guard. The flags line is omitted when there is nothing to say, which is every
+example config. It moves no cell, so `set_bus_model` takes it as a `cds_symbol` argument, and it
+is part of the render **content key** for that reason: nothing else in the key changes when only
+the drive type does, so without it the redraw would be skipped as unchanged.
+
+The grid is otherwise a uniform `_CW` per column, and the CDS run is the **one exception**:
+`_size_cds_columns` gives it the extra width its label needs, measured from the rendered text,
+and `_cx`/`_colw`/`_span_w` make every drawing site width-aware. Widening only that column keeps
+the horizontal room a 32-column view needs; `_col_extra` is empty on every path that draws no
+flags, so those render byte-identically to before.
+
+### The CDS across the CSV ↔ register boundary
+
+The CDS crosses in **both** directions (`score_abi` 10):
+
+| direction | path | what carries |
+|---|---|---|
+| config → registers | `SwI3sConfig::LoadCsv` → `registersFromConfig` | `0x1186` drive type, `0x1187` bit width / end-drive-early / guard enable+polarity / tail, per device |
+| registers → config | `CRegisterModel::BuildConfig` → `configToDict` → `BusConfig.from_decoder_config` | the same fields back into the per-source lists, so a decoded capture exports an authoring CSV with its CDS intact |
+
+Each source drives the time-multiplexed CDS under **its own** copy of the registers, so
+per-source slot `d+1` is device `d`'s. **The Manager's slot (index 0) has no register and never
+will:** only peripherals are addressable, so nothing on the wire says how the Manager drives
+the CDS. It round-trips through the CSV and stays at its default on any decoded path — a limit
+of the encoding, not an omission, and asserted as such.
+
+A device that never wrote its CDS registers keeps the **config** default (drive type Normal)
+rather than the register *reset* (0 = Special). Those differ deliberately, and the choice here
+is to report only what the capture actually programmed; reading the reset instead would relabel
+every capture that ignores the CDS as passively driven.

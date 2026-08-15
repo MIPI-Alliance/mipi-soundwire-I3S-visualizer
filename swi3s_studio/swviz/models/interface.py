@@ -60,6 +60,18 @@ class Interface:
     s1_width: int = ValidatedInt('s1_width', MIN_S1_WIDTH, MAX_S1_WIDTH, 'S1 width')  # type: ignore[assignment]
     CDS_BitWidth_REG: int = ValidatedInt('CDS_BitWidth_REG', MIN_CDS_WIDTH, MAX_CDS_WIDTH, 'CDS width')  # type: ignore[assignment]
     CDS_TailWidth_REG: int = ValidatedInt('CDS_TailWidth_REG', MIN_CDS_TAIL_WIDTH, MAX_CDS_TAIL_WIDTH, 'CDS tail width')  # type: ignore[assignment]
+    # CDS_DriveType: 0 = Special (a CDS 1 is left high-Z, bus keeper holds), 1 = Normal
+    # (both levels actively driven). The register is in each device's own CDS block, so
+    # the authoritative value is the per-source list below; this scalar is the MANAGER's,
+    # derived on load for the same reason CDS_GuardPolarity_REG is. It does not move any
+    # column, so the placement engine ignores both — they are carried so the CSV
+    # round-trips and the renderer can annotate the Special case.
+    CDS_DriveType_REG: int = ValidatedInt('CDS_DriveType_REG', 0, 1, 'CDS drive type')  # type: ignore[assignment]
+    # CDS_EndDriveEarly (0x87 bit 4): 0 = drive the full UI, 1 = stop half a UI early.
+    # Mandatory on PHY3. Per source like the drive type; this scalar is the Manager's,
+    # derived on load. The placement engine ignores it — it changes when a driver lets go
+    # inside a UI, not which column anything occupies.
+    CDS_EndDriveEarly_REG: int = ValidatedInt('CDS_EndDriveEarly_REG', 0, 1, 'CDS end drive early')  # type: ignore[assignment]
     tail_width: int = ValidatedInt('tail_width', MIN_TAIL_WIDTH, MAX_TAIL_WIDTH, 'Tail width')  # type: ignore[assignment]
     SkippingDenominator_REG: int = ValidatedInt('SkippingDenominator_REG', MIN_SKIPPING_DENOMINATOR, MAX_SKIPPING_DENOMINATOR, 'Skipping denominator')  # type: ignore[assignment]
     row_rate: float = ValidatedFloat('row_rate', MIN_ROW_RATE, MAX_ROW_RATE, 'Row rate')  # type: ignore[assignment]
@@ -118,6 +130,9 @@ class Interface:
         self.CDS_GuardPolarity_REG = False
         self.CDS_BitWidth_REG = Interface.MIN_CDS_WIDTH
         self.CDS_TailWidth_REG = Interface.MIN_CDS_TAIL_WIDTH
+        # The Manager's, derived from CDS_DriveType_PerSource on load (see the field).
+        self.CDS_DriveType_REG = 1
+        self.CDS_EndDriveEarly_REG = 0
         self.tail_width = Interface.MIN_TAIL_WIDTH
         self.SkippingDenominator_REG = 1
         self.row_rate = 3072.0
@@ -132,6 +147,15 @@ class Interface:
         # aggregates the engine's column budget is computed from.
         self.CDS_Guard_PerSource: List[int] = [0] * 13
         self.CDS_Tail_PerSource: List[int] = [0] * 13
+        # Per-source CDS_DriveType, same 13-entry convention: 1 Normal, 0 Special. All
+        # Normal, deliberately NOT the register's reset of 0 — a CSV with no such row is
+        # every file written before the field existed, and must keep reading as it did.
+        self.CDS_DriveType_PerSource: List[int] = [1] * 13
+        # Per-source CDS_EndDriveEarly: 0 full UI, 1 stop half a UI early. Here the
+        # register's reset of 0 IS the sensible default (full-UI drive is the ordinary
+        # behaviour), unlike CDS_DriveType above where it is not — the two neighbours
+        # default oppositely relative to their resets on purpose.
+        self.CDS_EndDriveEarly_PerSource: List[int] = [0] * 13
 
     @property
     def data_ports(self) -> List['DataPort']:

@@ -164,10 +164,30 @@ They split into three bands:
 - `test_authoring.py` — `BusConfig` ↔ the v2.0 CSV (the engine + C++ core read it) + dict
   round-trips; an authored config is placed by the `grid_from_csv` cascade (and yields register
   writes), including wide-bit held-column identity; every data port gets a name in the CSV.
-- `test_timing.py` — the ported SWI3S timing `compute()` matches the source `swtiming`
-  exactly (the source validated it against two reference spreadsheets); `find_worst_corner`
-  never improves a margin; `TimingView` renders the four inequalities + binding summary and
-  round-trips its inputs.
+- `test_timing.py` — `find_worst_corner` never improves a margin; `TimingView` renders the
+  inequality headings + binding summary and round-trips its inputs. Also the conventions
+  that carry no number and so would fail silently: every leg's terms read in **physical
+  time order** (receiver window last, clock lane before data, a peripheral launcher's
+  launch between its two crossings), **A drives and B samples** on all four P→P legs, the
+  1)–17) numbering matches the display order, every printed symbol **resolves to an input
+  row** (or a declared row-less key), and the term highlight's **click regions agree with
+  the painted glyphs** at every sample point on every row — the invariant that catches a
+  hit-test laying out at a different font from the paint path.
+- `test_timing_vs_reference.py` — **the divergence log, executable.** The same timing model
+  lives twice: here, and in the `timing-analysis` project's `swtiming/emit_ede.py` (which
+  generates the EDE paper's numeric macros). This asserts every leg pair under one matched
+  configuration with each delta DECLARED — six agree exactly, the peripheral-launched legs
+  differ by the Fig. 174 anchor conversion (1.667 ns), P→P hold by that plus the
+  P→P slew split this model declines to make. A delta that MOVES fails. It used to say the
+  two matched "exactly"; they do not, and the deltas are deliberate — see `docs/anchors.md`.
+  SKIPS when the reference project is not beside this one (`SWI3S_TIMING_ANALYSIS` overrides
+  the path). It is not vendored: a stale copy asserting agreement is worse than no test.
+  Beware three traps it documents — the two models name legs by OPPOSITE conventions
+  (`emit_ede.setup_mp` is this project's `PM_setup_ho`); each reference leg carries its own
+  corner in its default arguments rather than a global one; and where the reference HARDCODES
+  a worst corner by omitting a term, this project shows the term and lets the search find it,
+  so comparing at the nominal invents a divergence (that is how a 9 ns keeper "omission" was
+  briefly reported).
 - `test_visualizer_engine.py` — **the authoritative Bus-Visualizer parity test.** Bus-Visualizer
   mode is driven by the *first-party Visualizer engine* (`swi3s_studio/swviz/`, via
   `model/viz_engine.py`). For all **89** example configs this builds the merged `BusModel`
@@ -350,7 +370,9 @@ Use this to spot gaps. "Layer" indicates where the assertion bites.
 | Placement parity (89 configs, fast check) | `Decoder` `layoutGrid`, `grid_from_csv` | `test_visualizer_placement` | binding vs golden |
 | Bus model → JSON export | `model/viz_engine.model_json` | `test_visualizer_engine` | app |
 | Authoring panel + Use-as-Expected | `ui/authoring`, `ui/main_window` | `test_modes_gui` | GUI |
-| SWI3S timing margins (compute, F_max, corner) | `timing/calculator`, `timing/delta_tpd` | `test_timing` (parity to source) | app |
+| SWI3S timing margins (compute, F_max, corner) | `timing/calculator`, `timing/delta_tpd` | `test_timing`, `test_timing_cross_spec` | app |
+| Divergence from the reference analysis | `timing/*` vs `timing-analysis/swtiming` | `test_timing_vs_reference` (skips if absent) | app |
+| Displayed equation sums to the margin printed beside it | `timing/calculator` | `test_timing_cross_spec` | app |
 | Timing view (margins text + round-trip) | `ui/timing_view` | `test_timing` | GUI |
 | Workspace (mode + authoring + timing) | `workspace`, `ui/main_window` | `test_modes_gui`, `test_workspace` | app + GUI |
 

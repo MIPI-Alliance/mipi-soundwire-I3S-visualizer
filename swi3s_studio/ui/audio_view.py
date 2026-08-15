@@ -10,6 +10,8 @@ not). X axes are linked across tracks; Y is fit to the data explicitly.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QIODevice, QPointF, QRectF, QSize, Qt, QTimer, Signal
@@ -252,12 +254,12 @@ class AudioView(QWidget):
         # Playback settings (output device, bit depth, decimation) live in the
         # Audio menu, not on this toolbar — see MainWindow. They're held here as
         # plain state the menu sets via the setters below.
-        self._audio_devices = []
+        self._audio_devices: list[Any] = []
         self._device_index = 0          # index into _audio_devices (-1 / 0 = default)
         self._depth = 16                # playback bit depth: 16 or 24
         # Decimation is per-(device, dataport): {(dev, dp): target Hz}; a stream with
         # no entry plays at its native rate. Set from the Audio ▸ Decimation menu.
-        self._play_rate_targets = {}
+        self._play_rate_targets: dict[tuple, float] = {}
         self._media_devices = None
         if _HAVE_AUDIO:
             # A live QMediaDevices instance is what makes the backend actually notice
@@ -310,13 +312,13 @@ class AudioView(QWidget):
 
         self._store = None
         self._vzoom = False       # Vertical Zoom: fit Y to visible data vs full-scale ±1
-        self._plots = []          # (plotitem, curve, dev, dp, ch, n)
-        self._checks = {}         # (dev, dp, ch) -> QCheckBox
-        self._lane_colors = {}    # (dev, dp, ch) -> QColor (stable; checkbox + curve)
+        self._plots: list[tuple] = []            # (plotitem, curve, dev, dp, ch, n)
+        self._checks: dict[tuple, Any] = {}      # (dev, dp, ch) -> QCheckBox
+        self._lane_colors: dict[tuple, Any] = {}   # (dev, dp, ch) -> QColor (stable; checkbox + curve)
         self._link = None
-        self._cursor_lines = []   # InfiniteLine per plot, parallel to self._plots
-        self._bm_marks = []       # [(sample, label)] to draw across every track
-        self._bm_lines = {}       # (id(plot), label) -> InfiniteLine; reused across calls/plots
+        self._cursor_lines: list[Any] = []       # InfiniteLine per plot, parallel to self._plots
+        self._bm_marks: list[tuple] = []         # [(sample, label)] to draw across every track
+        self._bm_lines: dict[tuple, Any] = {}    # (id(plot), label) -> InfiniteLine; reused across calls/plots
         self._cursor_sample = 0
         self._row_label = None    # fn(sample) -> 0-based display row, for the hover readout
         # The X axis is in CAPTURE-sample space (not per-channel audio index), so each

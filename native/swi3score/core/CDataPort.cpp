@@ -47,6 +47,7 @@ void CDataPort::Initialize(int startColumn)
     mRowInInterval = 0;
     mIntervalSkipped = false;
     mSkippingAccumulator = 0;
+    mSkipAccumAtBoundary = 0;
     mGuardPending = false;
     mTailRemaining = 0;
     initializeTransport();
@@ -55,18 +56,25 @@ void CDataPort::Initialize(int startColumn)
 
 void CDataPort::SyncToSSP()
 {
-    // The SSP defines row_in_interval == 0 and clears accumulated skipping.
+    // The SSP defines row_in_interval == 0 and clears accumulated skipping
+    // (Section 9.1.6.2.1). The interval that BEGINS at the SSP is then started like
+    // any other: it spends the accumulator's first step (A += Numerator) and takes
+    // its own skip decision, exactly as Initialize() does. Clearing the accumulator
+    // WITHOUT starting the interval left that step unspent, so every later decision
+    // landed one interval late -- the decode read the interval the device had
+    // skipped (idle bus, sample of 0) and skipped the next one, dropping the sample
+    // that was really transported there.
     mRowInInterval = 0;
     mSkippingAccumulator = 0;
     mGuardPending = false;
     mTailRemaining = 0;
-    mIntervalSkipped = false;
-    initializeTransport();
+    startInterval();
 }
 
 CDataPort::State CDataPort::SaveState() const
 {
     return { mColumn, mRowInInterval, mIntervalSkipped, mSkippingAccumulator,
+             mSkipAccumAtBoundary,
              mGuardPending, mTailRemaining, static_cast<int>(mPhase),
              mSpacingSlotsRemaining, mSampleInGroup, mSamplesInGroupRemaining,
              mChannelGroupBaseChannel, mChannelIndex, mChannelsInGroupRemaining,
@@ -79,6 +87,7 @@ void CDataPort::RestoreState(const State& s)
     mRowInInterval = s.rowInInterval;
     mIntervalSkipped = s.intervalSkipped;
     mSkippingAccumulator = s.skippingAccumulator;
+    mSkipAccumAtBoundary = s.skipAccumAtBoundary;
     mGuardPending = s.guardPending;
     mTailRemaining = s.tailRemaining;
     mPhase = static_cast<Phase>(s.phase);
@@ -108,6 +117,7 @@ bool CDataPort::advanceSkippingAccumulator()
 
 void CDataPort::startInterval()
 {
+    mSkipAccumAtBoundary = mSkippingAccumulator;
     mIntervalSkipped = advanceSkippingAccumulator();
     initializeTransport();
 }

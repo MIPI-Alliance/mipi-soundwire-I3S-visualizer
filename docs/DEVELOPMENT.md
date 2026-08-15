@@ -176,9 +176,16 @@ somewhere else: the spacing row-boundary rationale lives in
 the maintainers' spacing row-boundary write-up, and the partial-channel-group rationale in
 `tests/test_transport_slot_budget.py`.
 
-Note the perf caches in both files (`self._num_cols`, hoisted `nch`) are themselves
-optimisations rather than reference algorithm — worth weighing whenever the model is next
-re-published.
+**What is NOT enforced: the docstrings' content.** These two files are authored externally
+and arrive as whole-file drops, so this repository owns the code path they sit on and not
+their prose. A third rule briefly rejected docstrings that named this codebase (module and
+test paths, a comparison to the C++ core, "the engine"); it is withdrawn, because holding it
+means rewriting the author's words on every drop or carrying a divergent copy, and the next
+drop undoes either one. Raise it in review of the incoming drop instead — and do not
+"fix" such a docstring here, because that is the change that silently diverges the file.
+Speed is likewise not a goal of this model: three hoists that existed only for it were
+removed in 3.0.13, at a cost of 7% on an engine build three orders of magnitude inside its
+ceiling. The partial-channel-group clamp is not in that category.
 
 ## Release checklist
 

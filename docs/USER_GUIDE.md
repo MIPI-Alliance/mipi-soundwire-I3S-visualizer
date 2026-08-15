@@ -11,20 +11,38 @@ window, one bus-grid renderer, and one workspace file.
 - **Visualization** — plan a bus. Author an Interface + up to 12 data ports in a
   table; the Rows×Columns grid re-places live and a notifications list flags clashes
   and spec violations. The **Control Data Stream** (Column 0) is configured **per
-  source** — an independent guard (Guard 0 / Guard 1 / Off), tail width, and handover
-  for the Manager and each device — rendered as one full-height universal symbol when
-  every source shares it and split into labelled **M/P** glyphs when they diverge.
+  source** — an independent guard (Guard 0 / Guard 1 / Off), tail width, **drive type**
+  (Normal / Special) and **end-drive-early** (Full / Early) for the Manager and each
+  device, all reached through one **CDS Settings** dialog — rendered as one full-height
+  universal symbol when every source shares it and split into labelled **M/P** glyphs when
+  they diverge. Where a source departs from the ordinary case the CDS cell annotates it on a
+  second line (`SP` for a Special drive type, `EDE` for an early release; a trailing `x`
+  means the sources disagree).
   Load/Save the config as CSV; export the placed frame as JSON; push it into Analysis as
   the *expected* config (**File ▸ Analyzer ▸ Import Visualizer CSV**, choosing the
   current authoring, to compare and/or impose it).
-- **Timing** — dial in the PHY. Pick **PHY1** or **PHY2** (they share the setup/hold
-  inequality structure; only the spec values differ); the **Specification** column is
-  read-only and only the **Example** column is editable. Enter bus length, per-lane slew,
-  supply/noise, and output/input/Z-handover timing; read the four MP/PM setup/hold
-  inequalities term by term with margins, F_max, and the binding constraint (each
-  inequality evaluated at its own worst PVT corner).
+- **Timing** — dial in the PHY. Pick a spec source **per side** (Manager and Peripheral
+  independently): SWI3S **PHY1** or **PHY2**, the two **proposed** PHY2 revisions, or
+  **SoundWire 1.3** at 1.8 V / 1.2 V — so a mixed SWI3S ↔ SoundWire bus is expressible, and
+  the cross-spec divergences it cannot reconcile are surfaced as caveats rather than hidden.
+  The **Specification** column is read-only; only the **Example** column is editable. Enter
+  bus length, per-lane slew, supply/noise, and output/input/Z-handover timing, and choose
+  the Manager's **data launch** (analog delay, or a 2× / 4× clock grid), whether a
+  **handover UI** is allocated, and where the two peripherals sit for the **P→P** legs.
+  Read **17 numbered inequalities** term by term with margins, F_max and the binding
+  constraint, each evaluated at its own worst PVT corner: setup and hold for
+  Manager→Peripheral, Peripheral→Manager and Peripheral A→Peripheral B (each in both launch
+  forms, `t_DD` and the handover's `t_ZD`), the three handover non-contention legs, and the
+  bus keeper per releasing device. Titles name who owes what to whom — *Manager Holding for
+  Peripheral*, *Peripheral A Setup for Peripheral B* — and the terms read in physical time
+  order, so a row can be followed from the clock edge to the receiver's window.
+  **Click any term** — a symbol or a substituted number — to highlight that parameter
+  everywhere it acts: every inequality that reads it, both substitution rows, and its input
+  row above. Click it again, or any blank space, to clear; several can be traced at once.
 - **Analysis** — confirm it works. Decode a captured PHY1/PHY2 (forwarded-clock) or
-  PHY3/DLV (recovered-clock) bus and explore it in the linked panes below.
+  PHY3/DLV (recovered-clock) bus and explore it in the linked panes below. Entering this
+  mode with nothing open decodes the synthetic demo capture (a progress dialog, a second
+  or two) so there is something to explore; open a real capture and it is replaced.
 
 All Analysis panes share **one time cursor**: selecting a command, clicking the grid
 or a waveform, scrubbing the timeline, or picking a symbol moves the cursor, and every

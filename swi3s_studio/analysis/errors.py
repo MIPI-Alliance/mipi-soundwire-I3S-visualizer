@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Tuple
 
+from . import port_status
+
 _SINGLE_DEVICE_PHASES = {"Write", "ReadSetup", "ReadData", "CalibratePhy"}
 # Peripheral Response error tokens (Table 67).
 _PERIPH_ERRORS = {12: "PROTOCOL_ERROR", 13: "COMMAND_ERROR",
@@ -14,6 +16,7 @@ def _device_count(mask: int) -> int:
 
 
 _ENABLECH_CURR_MSG = "Write to EnableCh_CURR with Interval != 1 Row"
+_UNEXPECTED_SSP_MSG = "SSP mid skip pattern (accumulated skipping != 0)"
 
 
 def command_error(cmd: dict) -> Optional[str]:
@@ -22,14 +25,24 @@ def command_error(cmd: dict) -> Optional[str]:
     Flags CRC failures, device-mask cardinality (Section 8.1.2.2:
     Write/Read/CalibratePhy must select exactly one device; other commands must
     select at least one), a commit with no commit-group selected (it would commit
-    nothing), peripheral error-response tokens, and a decoder-flagged
+    nothing), peripheral error-response tokens, a decoder-flagged
     EnableCh_CURR write with Interval != 1 Row (native Decoder::feed /
-    CommandRec::enablechCurrError — unsafe per the SWI3S spec).
+    CommandRec::enablechCurrError — unsafe per the SWI3S spec), an SSP-generating
+    command whose SSP landed while a Payload Interval Skipping port was part-way through
+    its skip pattern (Section 9.1.6.2.1 — CommandRec::unexpectedSspError), and a Read
+    whose reply carried a peripheral-reported fault or ImpDef/SDCA interrupt (see
+    :mod:`.port_status` — the device's own account, which no amount of correct wire
+    decoding can substitute for).
     """
     if cmd.get("enablech_curr_error"):
         return _ENABLECH_CURR_MSG
+    if cmd.get("unexpected_ssp_error"):
+        return _UNEXPECTED_SSP_MSG
     if cmd.get("has_manager_packet") and not cmd.get("crc_valid"):
         return "CRC error"
+    reported = port_status.fault_label(cmd)
+    if reported:
+        return reported
     phase = cmd.get("phase", "")
     n = _device_count(cmd.get("device_mask", 0))
     if phase in _SINGLE_DEVICE_PHASES:

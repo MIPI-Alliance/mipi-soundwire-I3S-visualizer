@@ -79,6 +79,25 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         }
     };
 
+    // Per-SOURCE setter for the 13-wide CDS rows (index 0 = Manager, i = Device i-1).
+    // A SHORT OR BLANK CELL KEEPS THE FIELD'S DEFAULT rather than reading as 0: on
+    // CDS_DriveType 0 means Special, so a row truncated by a hand edit would otherwise
+    // relabel the whole bus as passively driven. Same rule as both Python engines.
+    auto setCds = [](const std::vector<std::string>& v, std::vector<int>& dst) {
+        for (int i = 0; i < SwI3sConfig::kCdsSources; ++i) {
+            size_t col = static_cast<size_t>(i) + 1;
+            if (col < v.size() && !v[col].empty()) dst[i] = parseInt(v[col]);
+        }
+    };
+    // The guard arrives as two rows mirroring its two registers; recombined after the loop
+    // into CdsGuard (0 off, 1 G0, 2 G1).
+    std::vector<int> guardEn, guardPol;
+    // Legacy pre-per-source scalars, broadcast to every source only if no per-source row
+    // appeared. Every device may use the CDS regardless of its data ports, so a global
+    // value is SHARED by all sources — matching the Python loaders.
+    int legacyGuardEn = -1, legacyGuardPol = -1, legacyTail = -1;
+    bool gotTail = false, gotGuard = false;
+
     std::string line;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -95,6 +114,19 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         else if (key == "PHY3Enabled")          PHY3Enabled = parseBool(val);
         else if (key == "RowRate")              RowRateKHz = atof(val.c_str());
         else if (key == "Description")          description = val;
+
+        // Control Data Stream. CDS_BitWidth is bus-wide; the rest are per source because
+        // each register lives in that source's own CDS block (0x1100).
+        else if (key == "CDS_BitWidth_REG")     CdsBitWidth = parseInt(val);
+        else if (key == "CDS_GuardEnabledPerSource")  { guardEn.assign(SwI3sConfig::kCdsSources, 0);  setCds(v, guardEn);  gotGuard = true; }
+        else if (key == "CDS_GuardPolarityPerSource") { guardPol.assign(SwI3sConfig::kCdsSources, 0); setCds(v, guardPol); }
+        else if (key == "CDS_TailWidthPerSource")     { setCds(v, CdsTailWidth); gotTail = true; }
+        else if (key == "CDS_DriveTypePerSource")     setCds(v, CdsDriveType);
+        else if (key == "CDS_EndDriveEarlyPerSource") setCds(v, CdsEndDriveEarly);
+        // Legacy scalars from a pre-per-source file.
+        else if (key == "CDS_GuardEnabled_REG")  legacyGuardEn  = parseBool(val) ? 1 : 0;
+        else if (key == "CDS_GuardPolarity_REG") legacyGuardPol = parseBool(val) ? 1 : 0;
+        else if (key == "CDS_TailWidth_REG")     legacyTail     = parseInt(val);
 
         // Per-dataport fields.
         else if (key == "EnableCh_REG")         setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.EnableCh = static_cast<U16>(parseInt(s)); });
@@ -127,8 +159,45 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         else if (key == "FCP_Offset_REG")       setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.FCP_Offset = parseInt(s); });
         else if (key == "FCP_GuardEnable_REG")  setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.FCP_GuardEnable = parseBool(s); });
         else if (key == "FCP_GuardPolarity_REG")setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.FCP_GuardPolarity = parseBool(s); });
+        // A MANAGER data port. Read into its own field and decoded after the loop, because
+        // DeviceNumber_REG and ManagerDataport are two rows of one encoding and applying the
+        // flag inline would depend on which row the writer happened to emit first.
+        else if (key == "ManagerDataport")      setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.managerDp = parseBool(s); });
         // Other visualizer-only fields (Name, RowRate, RowsToDraw, S0Width,
-        // DisplayFields, DeviceNumber_REG, ManagerDataport, ...) are ignored.
+        // DisplayFields, ...) are ignored.
+    }
+
+    // Recombine the split guard rows (0 off, 1 G0, 2 G1); a missing polarity row leaves the
+    // enabled entries at G0.
+    if (gotGuard) {
+        for (int i = 0; i < SwI3sConfig::kCdsSources; ++i) {
+            const bool en = guardEn[i] != 0;
+            const bool pol = (i < static_cast<int>(guardPol.size())) && guardPol[i] != 0;
+            CdsGuard[i] = en ? (pol ? 2 : 1) : 0;
+        }
+    } else if (legacyGuardEn > 0) {
+        CdsGuard.assign(SwI3sConfig::kCdsSources, legacyGuardPol > 0 ? 2 : 1);
+    }
+    if (!gotTail && legacyTail > 0) {
+        CdsTailWidth.assign(SwI3sConfig::kCdsSources, legacyTail);
+    }
+
+    // Decode the manager sentinel. DeviceNumber_REG is a 0..11 register and cannot hold -1,
+    // so a config CSV writes the manager as device 0 plus ManagerDataport=True and expects a
+    // reader to recombine them. This half was missing, and 0 is a REAL peripheral address, so
+    // every manager data port impersonated device 0:
+    //   * grid cells attributed the manager's ports to device 0, indistinguishable from a
+    //     genuine device-0 port with the same number, and disagreeing with the reference
+    //     model, which decodes the pair correctly;
+    //   * registersFromConfig emitted the manager's port configuration as register writes
+    //     ADDRESSED TO device 0 — 103 writes to device 0 against 23 for its peers on a config
+    //     with four manager ports, including two conflicting values for DP0's FlowMode.
+    // Both loops there already skip deviceNum < 0, so restoring the sentinel is all that is
+    // needed: a manager data port is not addressable as a peripheral register write.
+    for (SwI3sDpConfig& d : dps) {
+        if (d.managerDp) {
+            d.deviceNum = -1;
+        }
     }
 
     return true;
