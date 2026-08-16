@@ -13,7 +13,7 @@ matching samples wherever they are.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
@@ -127,7 +127,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._rate = 0.0
         self._samples: List[dict] = []
         self._starts = np.zeros(0, dtype=np.int64)  # cached start_sample of each loaded row
-        self._lane_colors = {}                 # (device, dp, channel) -> QColor
+        self._lane_colors: Dict[tuple, Any] = {}   # (device, dp, channel) -> QColor
         self._suppress_scroll = False          # gate edge-loads during programmatic scroll
         self._suppress_select = False          # gate the selection echo during a programmatic
         #                                        select_sample (see _on_select)

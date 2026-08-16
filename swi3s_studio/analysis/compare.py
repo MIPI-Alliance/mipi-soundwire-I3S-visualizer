@@ -68,7 +68,7 @@ def grid_diff_report(cells: List[dict], max_lines: int = 60) -> Tuple[str, str]:
     """(summary, detail) text for a diffed grid. Summary is a one-liner with the
     per-category counts; detail lists each differing cell as decoded vs expected,
     grouped by category and capped at `max_lines`."""
-    cats = {"changed": [], "decoded_only": [], "expected_only": []}
+    cats: Dict[str, list] = {"changed": [], "decoded_only": [], "expected_only": []}
     for c in cells:
         d = c.get("diff")
         if d in cats:

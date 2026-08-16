@@ -75,6 +75,22 @@ def test_per_config_rates_when_bus_reconfigures():
     assert c1 > c0 and abs(c0 - 3.072) < 0.01 and abs(c1 - 12.288) < 0.01
 
 
+def test_bus_configs_leads_the_regions_section():
+    """Bus configs comes FIRST in Regions: it says how many regions there are and which
+    geometries they use, which is the frame the per-region rates are read against. Behind
+    them it read as a footnote to the last region rather than a summary of all of them."""
+    sess = Session.from_demo(300)
+    rows = capture_measurements(sess)
+    labels = [m for (m, *_rest) in rows]
+    start = labels.index("Regions")                      # the section header row
+    body = labels[start + 1:]
+    assert body[0] == "Bus configs", body[:4]
+    assert body[1] == "  column counts", body[:4]
+    # ...and it is ahead of every per-region / rate row, not merely ahead of the first.
+    assert body.index("Bus configs") < min(
+        i for i, m in enumerate(body) if m.startswith(("Region ", "Clock", "UI rate")))
+
+
 def test_ping_period_in_rows():
     """Ping cadence is reported in bus rows (min/max/mean of the gap between consecutive
     Ping commands) — independent of the per-section clock rate. The demo pings on a fixed
@@ -90,3 +106,75 @@ def test_ping_period_in_rows():
         assert "rows" in d["  mean"]
     else:                                    # no cadence to report on a 1-ping capture
         assert "Ping period" not in d
+
+
+def _demo_reads():
+    from swi3s_studio.session import Session
+    s = Session.from_demo(4000, cold_start=True)
+    return s, [c for c in s.commands if "Read" in str(c.get("command", ""))]
+
+
+def test_demo_carries_an_immediate_and_a_deferred_read():
+    """The demo emits both read shapes, and they decode.
+
+    Until 3.0.13 no demo emitted a Read of any kind, so nothing exercised the ReadSetup /
+    ReadData transport at all — which is why the statistics split below went unnoticed and
+    why a packetless ReadData read as CRC-invalid to one test's weaker predicate.
+
+    Pins the frame as well as the decode. An earlier version of the demo's payload helper
+    stopped at the data CRC and omitted the PM spacer + Manager Response that CLOSE the
+    phase; the immediate read then produced no record at all and no error — the next
+    command's comma abandoned the phase mid-spacer. Counting errors would not have caught
+    that. Counting RECORDS does."""
+    _s, reads = _demo_reads()
+    kinds = [(c.get("command"), c.get("peripheral_response")) for c in reads]
+    assert ("ReadA32", 0) in kinds, f"no immediate read (READ_DATA_NOW): {kinds}"
+    assert ("ReadA32", 5) in kinds, f"no deferred setup (REMOTE_READ_DEFERRED): {kinds}"
+    assert ("ReadData", 0) in kinds, f"no deferred delivery: {kinds}"
+
+    imm = next(c for c in reads if c.get("command") == "ReadA32"
+               and c.get("peripheral_response") == 0)
+    dat = next(c for c in reads if c.get("command") == "ReadData")
+    assert imm.get("read_data") == b"\x5a\xa5", imm.get("read_data")
+    assert dat.get("read_data") == b"\xc3\x3c", dat.get("read_data")
+    assert imm.get("read_data_crc_valid") and dat.get("read_data_crc_valid")
+    # The delivery inherits the SETUP's address, which is how the two are paired.
+    setup = next(c for c in reads if c.get("command") == "ReadA32"
+                 and c.get("peripheral_response") == 5)
+    assert dat.get("address") == setup.get("address"), (dat.get("address"),
+                                                        setup.get("address"))
+    # A ReadData has no Manager Packet, so it carries no CRC to be valid or invalid.
+    assert dat.get("has_manager_packet") is False
+
+
+def test_deferred_read_is_one_statistics_group_not_two():
+    """A deferred read is two wire records but ONE logical read, and the statistics group by
+    logical identity. Grouped by the raw wire name it showed as "ReadA32 / 0 bytes read"
+    beside an unconnected "ReadData" group holding the real bytes — two rows a reader cannot
+    join up, for one read they asked for."""
+    from swi3s_studio.analysis import measurements as M
+    s, _reads = _demo_reads()
+    rows = M._command_rows(s)
+    labels = [str(r[0]).strip() for r in rows]
+    assert "ReadA32" in labels, labels
+    assert "ReadData" not in labels, "the delivery is still its own group: " + str(labels)
+
+    i = labels.index("ReadA32")
+    assert rows[i][1] == "2", f"expected 2 logical reads, got {rows[i][1]}"
+    # 2 bytes from the immediate read + 2 delivered for the deferred one, on the read that
+    # requested them — the whole point of folding.
+    byte_rows = [r for r in rows[i:i + 4] if "bytes read" in str(r[0])]
+    assert byte_rows and byte_rows[0][1] == "4", byte_rows
+
+
+def test_folding_keeps_an_orphan_delivery():
+    """A capture that starts after the ReadSetup has a delivery with nothing to fold into.
+    It must still count: dropping it would under-report a read that genuinely happened."""
+    from swi3s_studio.analysis.measurements import _fold_deferred_reads
+    orphan = [{"command": "ReadData", "device_mask": 1, "read_data": b"\x01\x02"}]
+    assert len(_fold_deferred_reads(orphan)) == 1
+    # And a FAILED setup (READ_FAILED = 4, not DEFERRED = 5) must not swallow a later
+    # unrelated delivery.
+    seq = [{"command": "ReadA32", "device_mask": 1, "peripheral_response": 4},
+           {"command": "ReadData", "device_mask": 1, "read_data": b"\x03"}]
+    assert len(_fold_deferred_reads(seq)) == 2

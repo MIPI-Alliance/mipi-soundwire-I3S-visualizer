@@ -58,6 +58,67 @@ void appendWriteA32(std::vector<bool>& bits, U16 devMask, U32 addr,
     appendSymbol(bits, C8b10bDecoder::EncodeToken(0));  // WRITE_OK
 }
 
+// The Mgr-owned spacer + read payload + its own CRC + the tail that CLOSES the phase, shared
+// by an immediate ReadSetup and a ReadData delivery.
+//
+// The tail is not optional and is easy to leave off. After the data + 2 CRC bytes the parser
+// goes eReadPmSpacer -> eReadMgrResp and only emits the command record on the MANAGER's
+// response symbol (READ_DATA_OK). A first version of this helper stopped at the CRC, so the
+// immediate read decoded into NOTHING AT ALL — no record, no error — because the next
+// command's comma arrived mid-spacer and abandoned the phase in progress. The deferred pair
+// happened to survive only because idle fill followed it. Silent, and invisible to any
+// assertion that counts errors rather than records.
+void appendReadPayload(std::vector<bool>& bits, const U8* data, int n)
+{
+    appendSymbol(bits, 0x155);                                    // Mgr-owned data spacer
+    for (int i = 0; i < n; ++i) appendSymbol(bits, C8b10bDecoder::EncodeByte(data[i]));
+    U16 crc = CCrc16::Compute(data, (size_t)n);
+    appendSymbol(bits, C8b10bDecoder::EncodeByte(crc >> 8));
+    appendSymbol(bits, C8b10bDecoder::EncodeByte(crc & 0xFF));
+    int pm = swi3s::kSpacerBitsPM / swi3s::kSymbolBits;            // 20/10 = 2 symbols
+    if (pm < 1) pm = 1;
+    for (int i = 0; i < pm; ++i) appendSymbol(bits, 0x155);        // Peripheral -> Manager
+    appendSymbol(bits, C8b10bDecoder::EncodeToken(0));             // READ_DATA_OK -> emits
+}
+
+// ReadSetup (ReadA32). `respToken` is what the PERIPHERAL answers:
+//   0 = READ_DATA_NOW         -> the data follows in this same phase (IMMEDIATE read)
+//   5 = REMOTE_READ_DEFERRED  -> no data now; the parser stashes the byte count + address
+//                                (mPendingReadCount/Addr) for a later ReadData phase.
+// Packet is opcode, Read Byte Count (excess-1), then Addr[31:24..07:00] big-endian.
+void appendReadSetup(std::vector<bool>& bits, U16 devMask, U32 addr, int nbytes,
+                     int respToken, const U8* data = nullptr)
+{
+    appendSymbol(bits, C8b10bDecoder::CommaSymbol());
+    const int len = 6;
+    int hdr[6] = { swi3s::kPhaseReadSetup, (devMask >> 8) & 0xF, (devMask >> 4) & 0xF,
+                   devMask & 0xF, (len >> 4) & 0xF, len & 0xF };
+    for (int t : hdr) appendSymbol(bits, C8b10bDecoder::EncodeToken(t));
+    std::vector<U8> pkt = { (U8)swi3s::kOpReadA32, (U8)(nbytes - 1),
+                            (U8)(addr >> 24), (U8)(addr >> 16), (U8)(addr >> 8), (U8)addr };
+    for (U8 b : pkt) appendSymbol(bits, C8b10bDecoder::EncodeByte(b));
+    U16 crc = CCrc16::Compute(pkt.data(), pkt.size());
+    appendSymbol(bits, C8b10bDecoder::EncodeByte(crc >> 8));
+    appendSymbol(bits, C8b10bDecoder::EncodeByte(crc & 0xFF));
+    appendSymbol(bits, 0x155);                                    // MP spacer
+    appendSymbol(bits, C8b10bDecoder::EncodeToken(respToken));
+    if (respToken == 0 && data) appendReadPayload(bits, data, nbytes);
+}
+
+// The deferred delivery. A ReadData phase has NO Manager Packet at all — packetLength 0,
+// then the MP spacer, then the peripheral's READ_DATA_NOW, then the payload. It inherits
+// the byte count and address from the ReadSetup that deferred.
+void appendReadData(std::vector<bool>& bits, U16 devMask, const U8* data, int n)
+{
+    appendSymbol(bits, C8b10bDecoder::CommaSymbol());
+    int hdr[6] = { swi3s::kPhaseReadData, (devMask >> 8) & 0xF, (devMask >> 4) & 0xF,
+                   devMask & 0xF, 0, 0 };                         // packetLength == 0
+    for (int t : hdr) appendSymbol(bits, C8b10bDecoder::EncodeToken(t));
+    appendSymbol(bits, 0x155);                                    // MP spacer
+    appendSymbol(bits, C8b10bDecoder::EncodeToken(0));            // READ_DATA_NOW
+    appendReadPayload(bits, data, n);
+}
+
 // A Ping (GetStatus) whose PingInfo field reports only the peripherals that are
 // ACTUALLY on this demo's bus.
 //
@@ -155,21 +216,24 @@ struct SspaSchedule
     bool  on = false;
     long  period = 0;       // target rows between SSPAs (~100 ms of this region's rows)
     long  anchor = 0;       // a row known to be row_in_interval == 0
-    long  alignment = 1;    // LCM of (Interval + 1) over the enabled ports
+    long  alignment = 1;    // LCM of the enabled ports' transport pattern periods
     long  lastSsp = 0;      // SSP row of the previous SSPA (or the region's anchor)
     U16   devMask = 0;
     U8    group = 0;
     U8    rowDelay = 0;
 };
 
-// LCM of (Interval + 1) over every enabled port — the row period after which all ports
-// are back at the same point in their transport pattern.
+// LCM of every enabled port's transport pattern period — the row period after which all
+// ports are back at the same point in their transport pattern. That is Interval + 1 Rows
+// for a plain port, and Interval x SkippingDenominator for a skipping one (see
+// SwI3sConfig::patternRows): an SSPA must land on a multiple of THIS, or it restarts a
+// skipping port's pattern part-way through and shifts which intervals transport.
 long intervalAlignment(const SwI3sConfig& cfg)
 {
     long lcm = 1;
     for (const SwI3sDpConfig& d : cfg.dps) {
         if (!d.Enabled || d.numChannels() <= 0 || d.Interval < 0) continue;
-        lcm = std::lcm(lcm, (long)d.Interval + 1);
+        lcm = std::lcm(lcm, cfg.patternRows(d));
     }
     return (lcm > 0) ? lcm : 1;
 }
@@ -543,6 +607,21 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
     // Pinging here too (else confidence lapses after 8192 Rows -> a spurious re-hunt),
     // plus this region's own periodic SSPAs (its geometry -> its own alignment/cadence).
     SspaSchedule sspa16 = makeSspaSchedule(cfg16, ssp2, totalRows, 16, dev, group, rowDelay);
+    // A DEFERRED Read, emitted here because no demo carried one and nothing tested the
+    // path: ReadSetup answered REMOTE_READ_DEFERRED (no data), then the ReadData delivery
+    // inheriting its byte count + address. An IMMEDIATE read goes first for contrast — the
+    // two shapes produce a DIFFERENT NUMBER OF COMMAND RECORDS from the same logical read,
+    // which is what per-command statistics group by.
+    //
+    // Appended BEFORE the idle fill on purpose: fillIdleWithPings pads to `totalRows`, so
+    // whatever these consume it emits less idle to reach the same total. The demo's row
+    // count, audio timing and SSP rows are therefore unchanged — only the command list
+    // grows. Adding them after the fill would have shifted every downstream row.
+    const U8 immData[2] = { 0x5A, 0xA5 };
+    const U8 defData[2] = { 0xC3, 0x3C };
+    appendReadSetup(bits, dev, 0x0000'2040u, 2, 0, immData);      // immediate: one record
+    appendReadSetup(bits, dev, 0x0000'2044u, 2, 5);               // deferred: no data yet
+    appendReadData(bits, dev, defData, 2);                        // ... delivered here
     fillIdleWithPings(bits, totalRows, &sspa16);
 
     // Enabled ports (BuildConfig order = decoder payload order) for each geometry.
@@ -669,7 +748,7 @@ double flowDemoFreq(int deviceNum, int channel)
 // Flow-control demo: four PERIPHERAL data ports, one per flow mode, on four devices —
 // the four ports a bus sniffer actually sees (the manager's own DPs are configured
 // off-bus and never appear, so the capture collapses to these four). Mirrors
-// flow_control.csv's visible DP4-7:
+// tests/fixtures/flow_control_demo.csv's visible DP4-7:
 //
 //   dev0  DP  NORMAL         1ch (ch4)     Interval 31 -> 48 ksps, every interval
 //         transports (no TX_PRESENT, no gating) — the reference stream.
@@ -1441,8 +1520,128 @@ std::vector<bool> MakeEnableChCurrWriteLevels(int samplesPerChannel, int interva
     return levels;
 }
 
+// Test fixture for Payload Interval Skipping (see Demo.h). One unscrambled 16-bit PCM
+// source port on an 8-column bus, Interval = 32 Rows, carrying a RAMP (sample n has value
+// n) so a dropped or duplicated sample shows up as a wrong value rather than as plausible
+// audio. `numerator`/`denominator` are the skipping ratio; the port transports
+// (D - N) of every D intervals and leaves the rest idle.
+//
+// The generator's ports are Initialize()d and deliberately NOT SyncToSSP()d: Initialize is
+// the path the placement cross-check pins against the normative Python model, so the
+// decode's SSP re-anchor has to AGREE with it rather than share a mistake with it. Periodic
+// SSPAs land only on rows Interval x SkippingDenominator apart (the pattern period, where
+// the accumulated skipping is back at 0), so re-anchoring must be a no-op. With
+// `misalignedSspa` they land one Interval off that — still on a row where
+// row_in_interval == 0, so the ONLY thing wrong is the skipping phase, which is exactly
+// the unexpected SSP of Section 9.1.6.2.1.
+std::vector<bool> MakeSkippingLevels(int samplesPerChannel, int numerator, int denominator,
+                                     bool misalignedSspa)
+{
+    const U16 dev = 0x001;
+    const U8  group = 0x01, rowDelay = 14;
+    const int kSS = 15, kInt = 31, cols = 8;   // 16-bit PCM; 32 Rows/Interval on an 8-col bus
+    if (samplesPerChannel < 8) samplesPerChannel = 8;
+    if (denominator < 1) denominator = 1;
+    if (numerator < 0) numerator = 0;
+    const PortGeom g = {0, kSS, 1, 0, kInt, 0, 0};
+
+    CRegisterModel regs;
+    std::vector<bool> bits;
+    for (int i = 0; i < 8; ++i) appendSymbol(bits, 0x155);
+    appendPing(bits);
+    emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {(U8)(cols - 1)});
+    // SLC_SkippingDenominator is MSB-first: [11:8] at the LOWER address (0x1012), [7:0] at
+    // 0x1013 — the opposite order to DPn_SkippingNumerator below. Both orderings are called
+    // out as exceptions in the register tables, so write them as two explicit bytes.
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomHi, {(U8)((denominator >> 8) & 0x0F)});
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomLo, {(U8)(denominator & 0xFF)});
+    emitPortWrites(bits, regs, dev, g);
+    // 0x0B = 0x00: ScramblerEn off (its reset is 1), SOURCE, PortMode 0. Unscrambled so a
+    // mis-phased skip surfaces as the wrong sample VALUE, not as descrambler noise.
+    emitWrite(bits, regs, dev, swi3s::reg::kDpBase + swi3s::reg::kDpScramDirMode, {0x00});
+    // DPn_SkippingNumerator is LSB-first: [7:0] at 0x0C, [11:8] in 0x0D[3:0].
+    emitWrite(bits, regs, dev, swi3s::reg::kDpBase + swi3s::reg::kDpSkipNumLo,
+              {(U8)(numerator & 0xFF), (U8)((numerator >> 8) & 0x0F)});
+    appendPing(bits);
+    long sspBit = (long)appendSscr(bits, dev, group, rowDelay);
+    regs.Commit(group);
+    SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
+    if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
+    const long ssp = sspBit + 1 + (long)rowDelay;
+
+    // Rows enough for `samplesPerChannel` TRANSPORTED samples: only (D - N) of every D
+    // intervals carry one.
+    const long denom = cfg.SkippingDenominator;
+    const long num = (numerator < denom) ? numerator : 0;
+    const long usable = denom - num;
+    const long intervals = (usable > 0)
+        ? (samplesPerChannel * denom + usable - 1) / usable + 2
+        : samplesPerChannel + 2;
+    const long totalRows = ssp + intervals * (kInt + 1);
+
+    SspaSchedule sspa = makeSspaSchedule(cfg, ssp, totalRows, cols, dev, group, rowDelay);
+    // Shift the SSPA cadence one Interval off the pattern boundary. The generator's own
+    // ports are unaffected (they never re-anchor), so the wire keeps the true pattern and
+    // the decode meets an SSP where its accumulated skipping is NOT 0.
+    if (misalignedSspa) sspa.anchor += (kInt + 1);
+    fillIdleWithPings(bits, totalRows, &sspa);
+
+    std::vector<const SwI3sDpConfig*> dps;
+    for (const SwI3sDpConfig& d : cfg.dps)
+        if (d.Enabled && d.numChannels() > 0) dps.push_back(&d);
+    const int N = (int)dps.size();
+    auto key = [](int p, int ch) { return p * 32 + ch; };
+
+    std::map<int, U64> curSample, sampleIndex;
+    std::vector<CDataPort> ports;
+    int columnCount = 2;
+    bool portReady = false;
+    std::vector<bool> levels;
+    bool cur = false;
+
+    for (long r = 0; r < totalRows; ++r) {
+        if (r == ssp) {
+            columnCount = cols;
+            ports.assign(N, CDataPort());
+            for (int p = 0; p < N; ++p) {
+                ports[p].Configure(*dps[p], cols, cfg.SkippingDenominator);
+                ports[p].Initialize();          // NOT SyncToSSP -- see the comment above
+            }
+            portReady = true;
+        }
+        for (int c = 0; c < columnCount; ++c) {
+            DpEmit es[8];
+            if (portReady) for (int p = 0; p < N; ++p) es[p] = ports[p].clock_tick();
+            bool level;
+            if (c == swi3s::kCdsColumn) {
+                bool bit = (r < (long)bits.size()) ? (bool)bits[r] : true;
+                level = bit ? cur : !cur;
+            } else {
+                level = cur;                    // a skipped interval drives nothing: line holds
+                if (portReady) {
+                    for (int p = 0; p < N; ++p) {
+                        const DpEmit& e = es[p];
+                        if (e.sampleHere && e.slot == SwI3sSlot::Data) {
+                            int ch = e.channel, b = e.bitInChannel, k = key(p, ch);
+                            int ss = dps[p]->SampleSize;
+                            if (b == ss)
+                                curSample[k] = sampleIndex[k]++ & ((1ull << (ss + 1)) - 1);
+                            level = ((curSample[k] >> b) & 1) != 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            levels.push_back(level);
+            cur = level;
+        }
+    }
+    return levels;
+}
+
 // ===========================================================================
 // PHY3 (DLV) demo. Mirrors MakeDemoLevels' audio content (2x 16-bit PCM @48 kHz,
+
 // 2x 1-bit PDM @3.072 MHz; DP0/DP2 unscrambled, DP1/DP3 scrambled) but over DLV
 // framing instead of FBCSE. Returned as per-UI LOGICAL differential levels (1 =
 // DP high/DN low, 0 = DP low/DN high); the Python side turns these into the

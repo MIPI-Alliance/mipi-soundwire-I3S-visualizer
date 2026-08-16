@@ -165,7 +165,7 @@ def _exact_offsets(main_syms: np.ndarray, sub_syms: np.ndarray,
         return [], False
     hay = np.ascontiguousarray(main_syms, dtype=np.uint8).tobytes()
     needle = np.ascontiguousarray(sub_syms, dtype=np.uint8).tobytes()
-    out = []
+    out: list[int] = []
     start = 0
     while True:
         i = hay.find(needle, start)
@@ -206,7 +206,7 @@ def _collapse(offsets: list, scores: list, m: int) -> list:
     """Collapse overlapping hits (offsets within `m` of each other — the same
     occurrence) to the single best-scoring one; return [(offset, score)] by offset."""
     order = sorted(range(len(offsets)), key=lambda k: offsets[k])
-    kept = []
+    kept: list[tuple] = []
     for k in order:
         o, sc = offsets[k], scores[k]
         if kept and o - kept[-1][0] < m:

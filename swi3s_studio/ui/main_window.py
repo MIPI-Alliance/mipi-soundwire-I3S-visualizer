@@ -15,7 +15,7 @@ import inspect
 import os
 import sys
 import tempfile
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import swi3score
@@ -64,7 +64,7 @@ from ..export import write_commands_csv
 from ..ingest import saleae_binary
 from ..model import RegisterMap, viz_engine
 from ..model.bookmarks import BookmarkSet
-from ..model.bus_config import BusConfig, demo_config
+from ..model.bus_config import BusConfig, cds_symbol, demo_config
 from ..session import Session
 from ..workspace import Workspace, session_from_source
 from .audio_view import AudioView
@@ -173,6 +173,22 @@ def _fmt_duration(seconds: float) -> str:
     if a >= 1e-6:
         return f"{seconds * 1e6:,.3f} µs"
     return f"{seconds * 1e9:,.1f} ns"
+
+
+def _authored_slot_names(cfg) -> dict:
+    """{slot index: user-assigned port name} for the Bus-Visualizer colour key. Skips the
+    default "DP{i}" placeholder so the key falls back to the device-qualified number,
+    which identifies the port where a bare "DP0" cannot (several devices may each own a
+    DP0). Best-effort: a config shape without names just yields an empty map."""
+    names = {}
+    try:
+        for i, dp in enumerate(cfg.dataports):
+            name = (getattr(dp, "name", "") or "").strip()
+            if name and name != f"DP{i}":
+                names[i] = name
+    except Exception:  # noqa: BLE001 — the key degrades to numbers; never break the render
+        return {}
+    return names
 
 
 def _factory_takes_decoder_ready(factory) -> bool:
@@ -627,7 +643,7 @@ class MainWindow(QMainWindow):
         # No status-bar strip — it wasted vertical space and only showed the mode /
         # a hint. Keep a hidden label so the existing status-message API
         # (self._status.setText(...)) still works without rendering anything.
-        self._status = QLabel("Bus Visualizer — demo capture ready in Bus Analyzer")
+        self._status = QLabel("Bus Visualizer")
         self._build_menu()
 
         # Three-mode shell: a top segmented switcher swaps the central page and the
@@ -656,15 +672,15 @@ class MainWindow(QMainWindow):
             except (AttributeError, RuntimeError):       # older Qt without the signal
                 pass
 
-        # Preload the demo capture into the Analyzer session in the background (it's
-        # near-instant), staying in the Bus Visualizer default — so switching to Bus
-        # Analyzer shows the decoded demo immediately, with the title reading its name.
-        try:
-            self.load_session(
-                Session.from_demo(_demo_samples(), cold_start=True, register_map=self._rmap),
-                switch_mode=False)
-        except Exception:  # noqa: BLE001 - never let a demo-decode hiccup block startup
-            pass
+        # The demo capture is decoded on FIRST ENTRY to Bus Analyzer, not here. It used to
+        # be preloaded at startup so the mode switch was instant, but a 1 s demo is ~25M UIs
+        # of 500 MS/s wire and holding its decode cost ~2.3 GB of the ~2.6 GB the app sat at
+        # on launch — paid by everyone, including the (default) Bus Visualizer sessions that
+        # never open the Analyzer, and by anyone whose next act is File ▸ Open. Synthesis +
+        # decode is a couple of seconds and goes through the same worker + progress path as
+        # a real capture, so deferring it costs the first switch and nothing else.
+        # Cleared by load_session: once ANY capture is loaded there is nothing to preload.
+        self._demo_preload_pending = True
 
         # The colour-caching views (notably the bus grid, whose palette constants are
         # captured at import — before app startup applies the saved palette) must be
@@ -690,8 +706,10 @@ class MainWindow(QMainWindow):
         if mode == VISUALIZATION:
             self._refresh_authored_grid()
             self._apply_viz_split_sizes()
-        elif analysing and self._session is not None:
-            self._apply_grid_for_sample(self.cursor.sample)
+        elif analysing:
+            self._preload_demo_if_pending()
+            if self._session is not None:
+                self._apply_grid_for_sample(self.cursor.sample)
         # First time into Analysis, lay out the default arrangement (Bus Grid active,
         # bottom row ~25% tall, Register Map ~33% wide). Deferred so the window has a
         # real geometry; later visits restore the user's own arrangement.
@@ -862,7 +880,10 @@ class MainWindow(QMainWindow):
             self._viz_grid.set_bus_model([], {}, cfg.column_count(), 1)
             self._authoring.set_issues([Issue(ERROR, "Engine", f"could not build: {exc}")])
             return
-        self._viz_grid.set_bus_model(cells, clashes, ncols, nrows)
+        self._viz_grid.set_bus_model(cells, clashes, ncols, nrows,
+                                     slot_names=_authored_slot_names(cfg),
+                                     cds_symbol=cds_symbol(cfg.cds_drive_type,
+                                                            cfg.cds_end_drive_early))
         self._authoring.set_issues(issues)
 
     def _on_issue_activated(self, cells: list) -> None:
@@ -1759,6 +1780,31 @@ class MainWindow(QMainWindow):
         """Alias for load_demo (PHY2) — kept for the app's --demo-bringup flag."""
         self.load_demo(phy=2)
 
+    def _preload_demo_if_pending(self) -> None:
+        """Decode the demo capture the first time Bus Analyzer is entered with nothing
+        loaded — the deferred half of what used to happen in __init__ (see the flag there).
+
+        Fires at most once, and never over a real capture: `load_session` clears the flag,
+        so opening a file from any mode and then switching to the Analyzer shows the file,
+        not the demo. The `_session` check is belt-and-braces for the same thing.
+
+        A load already in flight is left to finish and the flag is NOT spent: `_load_async`
+        coalesces with latest-wins, so queueing a demo behind (say) File ▸ Open would
+        discard the capture the user actually asked for. If that load fails, the next
+        switch into the Analyzer preloads as usual.
+
+        A decode hiccup must not leave the mode switch half-done, so it is swallowed here
+        exactly as it was at startup — the Analyzer simply opens empty."""
+        if not getattr(self, "_demo_preload_pending", False):
+            return
+        if self._session is not None or getattr(self, "_load_thread", None) is not None:
+            return
+        self._demo_preload_pending = False      # one attempt, before it can re-enter
+        try:
+            self.load_demo()
+        except Exception:  # noqa: BLE001 - never let a demo-decode hiccup block the switch
+            pass
+
     # Per-mode last-opened-file directory: the Analyzer (captures, .sal export, sub-
     # capture) and the Visualizer (config CSVs) browse independently, so opening one
     # doesn't jump the other's dialog to an unrelated folder. Keys are QSettings
@@ -1853,19 +1899,49 @@ class MainWindow(QMainWindow):
         with it AND seed the bus grid + register map from it (Provenance.CSV — "CSV Import"),
         so a post-commit capture matches the CSV. Runs the re-decode on the worker thread
         (same path as the Scrambler override); the cursor and bookmarks are kept."""
-        # A config CSV is imposed as ONE config from row 0. A capture that reconfigures
-        # mid-stream (e.g. a DLV cold start: Safe-Lock-4 -> 16-col) has several — so the
-        # single config can only match one region and will misframe the others (their
-        # commands go CRC-red). Warn before imposing.
+        # A config CSV is imposed as ONE config from row 0. Two ways that can quietly not
+        # mean what the user expects — collected into ONE prompt rather than two in a row:
+        #
+        #  * a capture that reconfigures mid-stream (e.g. a DLV cold start: Safe-Lock-4 ->
+        #    16-col) has several configs, so the single imposed one can match only one region
+        #    and will misframe the others (their commands go CRC-red);
+        #  * a port whose columns lie beyond the capture's decoded width is simply NOT
+        #    PLACED. That was silent: the grid just came back narrower with fewer ports, which
+        #    reads as "the config didn't load" rather than "this config is wider than this
+        #    capture". Same family as the warning above, same import path.
         if self._session is not None:
+            concerns = []
             widths = sorted({int(s.get("column_count", 0)) for s in self._session.segments})
             if len(widths) > 1:
-                resp = QMessageBox.warning(
-                    self, "Import Visualizer CSV",
+                concerns.append(
                     f"This capture reconfigures mid-stream ({len(self._session.segments)} "
                     f"regions, column widths {', '.join(map(str, widths))}). A config CSV is "
                     "imposed from row 0, so it can match only one region and will misframe "
-                    "the others (their commands turn red).\n\nImpose it anyway?",
+                    "the others (their commands turn red).")
+            cap_cols = int(getattr(self._session, "column_count", 0) or 0)
+            if cap_cols > 0:
+                try:
+                    cfg = self._bus_config_from_csv(csv)
+                except Exception:                     # noqa: BLE001 — unreadable CSV is
+                    cfg = None                        # reported by the caller, not here
+                if cfg is not None:
+                    # horizontal_count is excess-1, so the last column owned is start+count.
+                    over = [(i, dp) for i, dp in enumerate(cfg.dataports)
+                            if dp.enabled and dp.enable_ch
+                            and dp.horizontal_start + dp.horizontal_count >= cap_cols]
+                    if over:
+                        names = ", ".join(
+                            f"{dp.name or f'DP{i}'} (cols "
+                            f"{dp.horizontal_start}-{dp.horizontal_start + dp.horizontal_count})"
+                            for i, dp in over)
+                        concerns.append(
+                            f"{len(over)} port(s) in this config need columns beyond the "
+                            f"capture's decoded width of {cap_cols}: {names}. They will not "
+                            "be placed, and the grid will come back without them.")
+            if concerns:
+                resp = QMessageBox.warning(
+                    self, "Import Visualizer CSV",
+                    "\n\n".join(concerns) + "\n\nImpose it anyway?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if resp != QMessageBox.Yes:
                     return
@@ -2085,7 +2161,11 @@ class MainWindow(QMainWindow):
             return None                       # can't estimate — let the load proceed
         if budget <= 0 or cost.fits_in(budget):
             return None
-        span = saleae_sal.capture_span_samples(path)
+        # Restricted to the two channels being loaded: the walk seeks with ZipExtFile.seek(),
+        # which on a DEFLATE member is read-and-discard, so walking every channel in the
+        # archive blocked the GUI for ~2 s here — on exactly the large captures this prompt
+        # exists to serve.
+        span = saleae_sal.capture_span_samples(path, channels=[clk, dat])
         rate = cost.sample_rate_hz or 1
         total_s = span / rate if span else 0.0
         # Suggest the largest window predicted to fit, rounded down to a whole second.
@@ -3016,6 +3096,9 @@ class MainWindow(QMainWindow):
         # so this method doesn't recompute them here and freeze the UI. None → compute
         # lazily (the synchronous demo path).
         extras = extras or {}
+        # Any real load settles the question the startup demo preload existed to answer, so
+        # entering the Analyzer later must not decode a demo over this capture.
+        self._demo_preload_pending = False
         # A re-decode (SSP step, register/scrambler override, Port-Samples collect) mutates
         # the SAME session in place and reloads it, so `session is` the previous one — keep
         # the command filter across it. A genuinely NEW capture clears filters below.
@@ -3566,7 +3649,7 @@ class MainWindow(QMainWindow):
             return _fmt_duration(s / rate) if rate else f"{int(s):,} smp"
 
         # Group members by their stable group letter (items() is creation-ordered A1,A2,B1…).
-        groups = {}
+        groups: Dict[str, dict] = {}
         for bm in self._bookmarks.items:            # `items` is a property (all bookmarks)
             groups.setdefault(bm.group, {})[bm.index] = bm
         for g in sorted(groups):

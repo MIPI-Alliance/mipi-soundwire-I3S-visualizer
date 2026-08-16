@@ -244,6 +244,7 @@ def test_gui_exposes_open_visualizer_config():
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
+    win.load_demo()                                # the demo is no longer preloaded in __init__
     # The GUI Apply Config CSV wrapper folded into open_visualizer_config; the session
     # method it drives still exists (exercised by the tests above).
     assert hasattr(win, "open_visualizer_config")
@@ -343,3 +344,55 @@ def test_visualizer_file_dir_memory_independent_of_analyzer():
         assert win._last_capture_dir("visualizer") == newdir
         assert win._last_capture_dir("analyzer") == adir
         assert os.path.exists(save_path)   # the save actually wrote the CSV
+
+
+def test_imposing_a_wider_config_warns_instead_of_silently_dropping_ports(monkeypatch):
+    """A config whose ports need columns beyond the capture's decoded width has those ports
+    simply NOT PLACED. That used to be silent: the grid came back narrower with fewer ports,
+    which reads as "the config didn't load" rather than "this config is wider than this
+    capture". Now it is one prompt, and declining aborts.
+
+    Asserted on the MESSAGE, not just the prompt count, so a future refactor that keeps
+    prompting but stops naming the offending ports still fails. Both answers are exercised:
+    an abort-only test cannot tell "declining works" from "the spy never fired at all"."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.load_demo()
+    cap_cols = int(win._session.column_count)
+    assert cap_cols > 0, "demo decoded no columns — test premise gone"
+
+    cfg = demo_config()
+    dp = cfg.dataports[1]
+    dp.enabled = True
+    dp.enable_ch = 0b11
+    dp.name = "TooWide"
+    dp.horizontal_start = cap_cols - 1        # ... so start+count runs past the capture
+    dp.horizontal_count = 3                   # excess-1: owns 4 columns
+
+    seen, started = {}, []
+    # _load_async is the real gate: it is what launches the re-decode. Spying on a name
+    # that does not exist would make the abort assertion vacuous.
+    assert hasattr(win, "_load_async")
+    monkeypatch.setattr(win, "_load_async", lambda *a, **k: started.append(True))
+    answer = [QMessageBox.No]
+
+    def fake_warning(_parent, title, text, *a, **k):
+        seen["title"], seen["text"] = title, text
+        return answer[0]
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(fake_warning))
+
+    with tempfile.TemporaryDirectory() as d:
+        path = cfg.to_csv_file(os.path.join(d, "wide.csv"))
+        win._apply_config_csv_path(path)                     # declined
+        assert seen, "no warning shown — the drop is still silent"
+        assert "beyond the capture's decoded width" in seen["text"], seen["text"]
+        assert str(cap_cols) in seen["text"], seen["text"]
+        assert "TooWide" in seen["text"], "the offending port is not named: " + seen["text"]
+        assert not started, "declining the prompt must abort before the re-decode"
+
+        answer[0] = QMessageBox.Yes
+        win._apply_config_csv_path(path)                     # accepted
+        assert started, "accepting the prompt must proceed to the re-decode"

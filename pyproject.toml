@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.0.12"
+version = "3.0.15"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
 requires-python = ">=3.11"
 dependencies = [

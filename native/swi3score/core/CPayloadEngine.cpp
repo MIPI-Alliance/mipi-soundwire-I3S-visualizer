@@ -108,8 +108,9 @@ void CPayloadEngine::Reset()
     Configure(mCfg);
 }
 
-void CPayloadEngine::SyncToSSP()
+bool CPayloadEngine::SyncToSSP()
 {
+    bool midSkipCycle = false;
     for (DpRuntime& rt : mDps) {
         // Is this port ALREADY at its sync point? An SSPA re-asserts the phase the ports
         // are running at (it must land on a row where row_in_interval == 0, or it would
@@ -121,6 +122,11 @@ void CPayloadEngine::SyncToSSP()
         // move the phase (SSCR to a new phase, a manual SSP row, a misplaced SSPA) really
         // does invalidate the pipeline, so keep clearing in that case.
         const bool alreadyAtSsp = (rt.port.SaveState().rowInInterval == 0);
+        // A skipping port has a SECOND alignment to satisfy: its pattern repeats every
+        // Interval x SkippingDenominator Rows, so a row that is interval-aligned can still
+        // be mid-skip-cycle. Reported by the caller, and asked BEFORE the re-anchor clears
+        // the accumulator (Section 9.1.6.2.1).
+        if (!rt.port.SkipPatternAtCycleStart()) midSkipCycle = true;
         rt.port.SyncToSSP();
         rt.pending.clear();        // re-anchoring drops in-flight (shifted) bits
         if (rt.hasFcp) {
@@ -133,6 +139,7 @@ void CPayloadEngine::SyncToSSP()
             }
         }
     }
+    return midSkipCycle;
 }
 
 std::vector<CDataPort::State> CPayloadEngine::SaveState() const

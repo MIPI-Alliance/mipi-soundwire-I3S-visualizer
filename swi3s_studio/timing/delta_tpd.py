@@ -16,18 +16,53 @@ setup and hold inequalities (which is handled by the caller).
 
 Notation:
 
-- ``Δ_cross,MP`` = MP differential.  Dimensionless coefficient × t_RF_Man.
-  Both clock and data are driven by the Manager in MP, so a single t_RF
-  applies; the binding metric is the DIFFERENCE between data and clock
-  threshold-crossing times at the Peripheral RX.
+- ``Δ_cross,MP`` = MP differential.  Both lanes are Manager-driven, so the
+  binding metric is the DIFFERENCE between the two threshold-crossing times
+  at the Peripheral RX: a LATE crossing minus an EARLY one.
+
+  Which lane carries which is NOT fixed, and this is the part that misleads.
+  A data edge's direction follows the bit pattern, so either lane may rise or
+  fall on any given UI; the coefficients are therefore named for EDGE
+  POLARITY (``mp_late_rise``, ``mp_early_fall``), not for a lane.  The
+  rising-late/falling-early pairing dominates the other three enumerated
+  pairings for ANY positive t_RF pair, so the polarity choice needs no
+  runtime search — but the LANE the late edge sits on flips with direction:
+
+    setup — the DATA must arrive late and the CLOCK sample early, so the
+            late crossing scales with t_RF_Man_DATA.
+    hold  — the CLOCK must sample late and the DATA transition early, so the
+            late crossing scales with t_RF_Man_CLK.
+
+  At equal per-lane t_RF the two are identical, which is why one coefficient
+  served both for so long.  Unequal — legal, since Table 127's RFT constrains
+  only the Peripheral and the Manager has no normative per-output slew
+  control — they diverge by up to ~9.5 ns, so ``delta_cross_MP_ns`` takes the
+  direction explicitly rather than assuming a lane.
 
 - ``Σ_cross,PM,setup`` = PM setup SUM.  The clock travels Mgr→Per (forward
   leg, slew rate t_RF_Man) and the data travels Per→Mgr (backward leg,
   slew rate t_RF_Per).  The penalty is the SUM of the two per-leg
   threshold-crossing offsets — a true sum, not a difference, hence Σ.
-  The dataclass exposes a per-leg dimensionless coefficient
-  ``sigma_pm_setup``; the caller forms the total
-      Σ_cross,PM,setup [ns] = sigma_pm_setup · (t_RF_Man + t_RF_Per).
+
+  The ground shift is ONE physical quantity δ = V_Per_gnd − V_Man_gnd with
+  |δ| ≤ α and either sign.  TX and RX roles swap on the return leg, so the
+  forward leg sees V_IH,eff + δ and the backward leg sees V_IH,eff − δ.
+  That antisymmetry is forced by the topology, not chosen — which is why δ
+  cancels here while α accumulates in the MP differential below.
+
+  The cancellation is EXACT only when the ramp is linear *and* the two legs
+  carry equal t_RF.  A linear ramp makes t_cross affine in the threshold, so
+  ±δ cancels — but only against an equal weight; unequal t_RF weights the
+  legs differently and leaves a residue linear in δ.  An exponential ramp
+  makes t_cross convex, so by Jensen the ±δ pair sums to strictly MORE than
+  the δ=0 value even at equal t_RF.  Σ_setup is a penalty, so the binding δ
+  maximises the sum; convexity puts that maximum at an endpoint δ = ±α, so
+  ``sigma_pm_setup_ns`` takes the max over the two polarities and no interior
+  search is needed.  Assuming cancellation instead understates the penalty by
+  up to ~0.6 ns (exp ramp, α = 0.10, t_RF = 5 ns).
+
+  ``sigma_pm_setup`` remains the δ=0 per-leg coefficient for reporting; it is
+  NOT sufficient to form the total — call ``sigma_pm_setup_ns``.
 
 - ``Σ_cross,PM,hold`` = PM hold SUM.  Two cases; the binding one is
   MIN over them.  rr (NEW HIGH after OLD LOW) is symmetric in
@@ -57,6 +92,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 RampShape = Literal["linear", "exp"]
+MPDirection = Literal["setup", "hold"]
 
 # Exponential-ramp normalization. t_RF is defined as the 20%-80% V_DD slew
 # time (matches the SWI3S V_OL/V_OH endpoints, Table 123). Under
@@ -95,7 +131,10 @@ def _t_cross_frac_falling(V_th: float, V_DD: float, shape: RampShape) -> float:
 def per_tdd_offset_frac(shape: RampShape) -> float:
     """V=0 → V_OL slew portion baked into the spec Per_t_DD measurement
     (Fig 174), as a fraction of t_RF. Linear: V_OL/swing = 0.20/0.60 = 1/3.
-    Exp: time from V=0 to V_OL=0.20·V_DD = -ln(0.8)/ln(4) ≈ 0.1610."""
+    Exp: time from V=0 to V_OL=0.20·V_DD = -ln(0.8)/ln(4) ≈ 0.1610.
+
+    FIGURE 174 is the authority here, not Table 129's wording, which describes a 0 % anchor
+    and would make this fraction zero. See `output_anchor_frac` and docs/anchors.md."""
     if shape == "linear":
         return 1.0 / 3.0
     return -math.log(0.80) / _LN4
@@ -117,9 +156,12 @@ class DeltaTpdEnvelope:
     falling_min: float                       # earliest V_IL crossing
 
     # Per-leg t_cross coefficients at the binding corners (V=0/V=V_DD anchor).
-    # Multiply by t_RF in ns to get the per-leg crossing time.
-    mp_clk_slow: float        # MP +α corner: rising clock slow at V_IH,eff,+α
-    mp_data_fast: float       # MP +α corner: falling data fast at V_IL,eff,+α
+    # Multiply by t_RF in ns to get the per-leg crossing time.  Named for EDGE
+    # POLARITY, not for a lane: a data edge's direction follows the bit pattern,
+    # so either lane can carry either polarity, and which lane holds the LATE
+    # edge flips between setup and hold (see delta_cross_MP_ns).
+    mp_late_rise: float       # MP +α corner: rising crossing, slow, at V_IH,eff,+α
+    mp_early_fall: float      # MP +α corner: falling crossing, fast, at V_IL,eff,+α
 
     # MP differential at the worst correlated corner (= Δ_cross,MP).
     # Total ns penalty = correlated_diff · t_RF_Man (Mgr drives both lanes in MP).
@@ -127,13 +169,26 @@ class DeltaTpdEnvelope:
     # Uncorrelated MP bound (paranoia bound; independent corners per lane).
     uncorrelated_diff: float
 
-    # PM SETUP per-leg coefficient (Σ_cross,PM,setup).  Symmetric in
+    # PM SETUP per-leg coefficient (Σ_cross,PM,setup) at δ=0.  Symmetric in
     # single-shape mode; sigma_pm_setup_clk == sigma_pm_setup_data ==
     # sigma_pm_setup.  Splits when ramp shape differs between Mgr and Per.
-    # Total ns penalty = sigma_pm_setup_clk · t_RF_Man + sigma_pm_setup_data · t_RF_Per.
+    # REPORTING ONLY — these ignore the ground shift, so they understate the
+    # penalty under an exp ramp or unequal per-leg t_RF.  Form the total with
+    # sigma_pm_setup_ns(), which maximises over the δ = ±α polarities.
     sigma_pm_setup: float
     sigma_pm_setup_clk: float
     sigma_pm_setup_data: float
+
+    # PM SETUP per-leg coefficients at the two ground-shift polarities.
+    # δ = V_Per_gnd − V_Man_gnd is one physical quantity: the forward (clock)
+    # leg sees V_IH,eff + δ and the backward (data) leg sees V_IH,eff − δ.
+    # ``_dgnd_pos`` is the leg's coefficient when its own threshold is raised
+    # by α, ``_dgnd_neg`` when lowered — so a single physical polarity pairs
+    # clk_dgnd_pos with data_dgnd_neg, and vice versa.
+    sigma_pm_setup_clk_dgnd_pos: float
+    sigma_pm_setup_clk_dgnd_neg: float
+    sigma_pm_setup_data_dgnd_pos: float
+    sigma_pm_setup_data_dgnd_neg: float
 
     # PM hold rr per-leg coefficient (NEW HIGH after OLD LOW; both
     # legs rising at V_IH; symmetric).  Splits across legs when shape
@@ -150,24 +205,112 @@ class DeltaTpdEnvelope:
     sigma_pm_hold_rf_clk: float
     sigma_pm_hold_rf_data: float
 
+    def delta_cross_MP_lanes(
+        self, *, direction: MPDirection,
+    ) -> tuple[tuple[str, float], tuple[str, float]]:
+        """Δ_cross,MP as ((lane, coefficient), (lane, coefficient)), dimensionless.
+
+        The pair the caller must multiply by that lane's t_RF and SUM to reproduce
+        `delta_cross_MP_ns` exactly, the LATE leg subtracted and the EARLY leg added
+        -- both coefficients are returned POSITIVE so the caller carries the sign in the
+        operator, which is what the differential actually says: a late crossing costs and
+        an early one credits. Exists so a displayed inequality can show
+        `coefficient x t_RF` per lane instead of one pre-multiplied nanosecond value
+        -- the ns form hides both the per-lane t_RF and, here, the fact that WHICH
+        lane carries the late crossing swaps with the direction.
+        """
+        if direction == "setup":
+            return (("Man DATA", self.mp_late_rise),
+                    ("Man CLK", self.mp_early_fall))
+        return (("Man CLK", self.mp_late_rise),
+                ("Man DATA", self.mp_early_fall))
+
+    def sigma_pm_setup_lanes(
+        self, tRF_Man_ns: float, tRF_Per_ns: float,
+    ) -> tuple[float, float]:
+        """(clock, data) coefficients of the delta-GND polarity Σ_setup SELECTS.
+
+        Σ_setup is a max over two polarities, so the coefficients are not fixed --
+        which pair is in force depends on the two t_RF values. Returning the winning
+        pair keeps a displayed `coefficient x t_RF` identical to the ns value rather
+        than merely close to it.
+        """
+        pos = (self.sigma_pm_setup_clk_dgnd_pos, self.sigma_pm_setup_data_dgnd_neg)
+        neg = (self.sigma_pm_setup_clk_dgnd_neg, self.sigma_pm_setup_data_dgnd_pos)
+        return pos if (pos[0] * tRF_Man_ns + pos[1] * tRF_Per_ns) >= (
+            neg[0] * tRF_Man_ns + neg[1] * tRF_Per_ns) else neg
+
+    def sigma_pm_hold_lanes(
+        self, tRF_Man_ns: float, tRF_Per_ns: float,
+    ) -> tuple[float, float]:
+        """(clock, data) coefficients of the case Σ_hold SELECTS -- a min, so the
+        rf pair in practice (see `sigma_pm_hold_ns`), but chosen rather than assumed."""
+        rr = (self.sigma_pm_hold_rr_clk, self.sigma_pm_hold_rr_data)
+        rf = (self.sigma_pm_hold_rf_clk, self.sigma_pm_hold_rf_data)
+        return rr if (rr[0] * tRF_Man_ns + rr[1] * tRF_Per_ns) <= (
+            rf[0] * tRF_Man_ns + rf[1] * tRF_Per_ns) else rf
+
     def delta_cross_MP_ns(
-        self, tRF_Man_CLK_ns: float, tRF_Man_DATA_ns: float
+        self, tRF_Man_CLK_ns: float, tRF_Man_DATA_ns: float,
+        *, direction: MPDirection,
     ) -> float:
         """Δ_cross,MP in ns with per-lane t_RF on the Mgr side.
-        Clock and data lanes are both Mgr-driven in MP, but may have
-        independent t_RF settings (Table 127 RFT only constrains the
-        Peripheral; the Manager has no normative per-output slew control,
-        so per-driver mismatch is allowed)."""
-        return self.mp_clk_slow * tRF_Man_CLK_ns - self.mp_data_fast * tRF_Man_DATA_ns
+
+        Both lanes are Mgr-driven in MP but may have independent t_RF (Table 127
+        RFT constrains only the Peripheral; the Manager has no normative
+        per-output slew control, so per-driver mismatch is allowed). The
+        differential is a LATE crossing minus an EARLY one, and WHICH LANE holds
+        the late crossing depends on the direction:
+
+          setup — the data must arrive late and the clock sample early, so the
+                  late (rising) crossing scales with t_RF_Man_DATA.
+          hold  — the clock must sample late and the data transition early, so
+                  the late (rising) crossing scales with t_RF_Man_CLK.
+
+        Identical at equal per-lane t_RF. Unequal, they differ by up to ~9.5 ns,
+        and using the hold assignment for setup understates a setup PENALTY.
+        Taking a max over both instead would be wrong in the other direction --
+        it would make hold pessimistic -- so the caller states which it wants.
+        """
+        if direction == "setup":
+            return (self.mp_late_rise * tRF_Man_DATA_ns
+                    - self.mp_early_fall * tRF_Man_CLK_ns)
+        return (self.mp_late_rise * tRF_Man_CLK_ns
+                - self.mp_early_fall * tRF_Man_DATA_ns)
 
     def sigma_pm_setup_ns(self, tRF_Man_ns: float, tRF_Per_ns: float) -> float:
-        """Σ_cross,PM,setup in ns: clock leg (Mgr) + data leg (Per)."""
-        return self.sigma_pm_setup_clk * tRF_Man_ns + self.sigma_pm_setup_data * tRF_Per_ns
+        """Σ_cross,PM,setup in ns: clock leg (Mgr) + data leg (Per), at the
+        worse of the two ground-shift polarities.
+
+        One physical δ = V_Per_gnd − V_Man_gnd raises one leg's threshold and
+        lowers the other's, so the two candidate sums are (clk+α, data−α) and
+        (clk−α, data+α).  Σ_setup is a penalty and the sum is convex in δ, so
+        the worst case is the larger endpoint — max, not min.  Reduces to the
+        δ=0 value exactly for a linear ramp with equal per-leg t_RF, which is
+        the only case where ±δ truly cancels.
+        """
+        pos = (self.sigma_pm_setup_clk_dgnd_pos * tRF_Man_ns
+               + self.sigma_pm_setup_data_dgnd_neg * tRF_Per_ns)
+        neg = (self.sigma_pm_setup_clk_dgnd_neg * tRF_Man_ns
+               + self.sigma_pm_setup_data_dgnd_pos * tRF_Per_ns)
+        return max(pos, neg)
 
     def sigma_pm_hold_ns(self, tRF_Man_ns: float, tRF_Per_ns: float) -> float:
         """Σ_cross,PM,hold in ns: min over the rr,hold case (symmetric) and
         the rf,hold case (asymmetric ε-mismatch corner with non-cancelling ΔGND).
-        Smaller sum = data invalidates sooner at Mgr = tighter hold margin."""
+        Smaller sum = data invalidates sooner at Mgr = tighter hold margin.
+
+        This sum is a CREDIT (it is ADDED to the hold margin), so unlike
+        Σ_setup the binding case is the MINIMUM — and reducing α makes it
+        GROW.  That is the same statement as a shrinking penalty: less noise,
+        more margin.  Do not read the term magnitudes as if they all moved
+        together; the invariant is on the margins (∂margin/∂α ≤ 0).
+
+        The rr case is evaluated at δ=0, which is exact only for equal per-leg
+        t_RF; it is left that way because rr never binds — its per-leg
+        coefficients dominate rf's on BOTH legs, so min() always selects rf
+        (pinned by test_hold_rr_never_binds_so_its_dgnd_simplification_is_inert).
+        """
         sigma_rr_ns = (self.sigma_pm_hold_rr_clk * tRF_Man_ns
                       + self.sigma_pm_hold_rr_data * tRF_Per_ns)
         sigma_rf_ns = (self.sigma_pm_hold_rf_clk * tRF_Man_ns
@@ -253,25 +396,33 @@ def compute_delta_tpd_envelope(
     V_DD_TX_corr = vdd_minus
 
     # Per-leg t_cross at the MP +α correlated corner (V=0/V=V_DD anchor).
-    mp_clk_slow = _t_cross_frac_rising(
+    mp_late_rise = _t_cross_frac_rising(
         V_IH_eff_correlated, V_DD_TX_corr, s) * (1.0 + tRF_tolerance)
-    mp_data_fast = _t_cross_frac_falling(
+    mp_early_fall = _t_cross_frac_falling(
         V_IL_eff_correlated, V_DD_TX_corr, s) * (1.0 - tRF_tolerance)
-    correlated_diff = mp_clk_slow - mp_data_fast
+    correlated_diff = mp_late_rise - mp_early_fall
 
     uncorrelated_diff = rising_max - falling_min
 
     # --- PM SETUP per-leg coefficient ---
-    # Forward (clock at Per RX): effective threshold = V_IH + ΔGND
-    # Backward (data at Mgr RX): effective threshold = V_IH − ΔGND (sign
-    # flip because ΔGND is V_RX_gnd − V_TX_gnd and TX/RX swap on return).
-    # ΔGND drops out of the two-leg sum, so Σ_setup depends only on the
-    # V_IH-corner and TX-swing geometry.  V=0 anchor: both legs rising at
-    # slow t_RF (worst-case late) with (1+τ) per-edge scaling.
+    # Forward (clock at Per RX): effective threshold = V_IH + δ
+    # Backward (data at Mgr RX): effective threshold = V_IH − δ (sign
+    # flip because δ is V_RX_gnd − V_TX_gnd and TX/RX swap on return).
+    # V=0 anchor: both legs rising at slow t_RF (worst-case late) with
+    # (1+τ) per-edge scaling.
+    #
+    # δ cancels in the two-leg sum ONLY for a linear ramp at equal per-leg
+    # t_RF.  Emit the δ=0 coefficient for reporting plus the ±α pair, and let
+    # sigma_pm_setup_ns() take the worse polarity — that stays exact under a
+    # convex (exp) ramp and under unequal t_RF, where cancellation fails.
     pm_setup_VIH_eff = V_IH_max_frac * vdd_plus
     pm_setup_V_DD = vdd_minus
     sigma_pm_setup = _t_cross_frac_rising(
         pm_setup_VIH_eff, pm_setup_V_DD, s) * (1.0 + tRF_tolerance)
+    sigma_pm_setup_dgnd_pos = _t_cross_frac_rising(
+        pm_setup_VIH_eff + alpha, pm_setup_V_DD, s) * (1.0 + tRF_tolerance)
+    sigma_pm_setup_dgnd_neg = _t_cross_frac_rising(
+        pm_setup_VIH_eff - alpha, pm_setup_V_DD, s) * (1.0 + tRF_tolerance)
 
     # --- PM hold rr (NEW HIGH after OLD LOW) ---
     # Both legs rising at V_IH; symmetric ε MIN corner.  Both legs at fast
@@ -300,13 +451,17 @@ def compute_delta_tpd_envelope(
         rising_min=rising_min,
         falling_max=falling_max,
         falling_min=falling_min,
-        mp_clk_slow=mp_clk_slow,
-        mp_data_fast=mp_data_fast,
+        mp_late_rise=mp_late_rise,
+        mp_early_fall=mp_early_fall,
         correlated_diff=correlated_diff,
         uncorrelated_diff=uncorrelated_diff,
         sigma_pm_setup=sigma_pm_setup,
         sigma_pm_setup_clk=sigma_pm_setup,
         sigma_pm_setup_data=sigma_pm_setup,
+        sigma_pm_setup_clk_dgnd_pos=sigma_pm_setup_dgnd_pos,
+        sigma_pm_setup_clk_dgnd_neg=sigma_pm_setup_dgnd_neg,
+        sigma_pm_setup_data_dgnd_pos=sigma_pm_setup_dgnd_pos,
+        sigma_pm_setup_data_dgnd_neg=sigma_pm_setup_dgnd_neg,
         sigma_pm_hold_rr=sigma_pm_hold_rr,
         sigma_pm_hold_rr_clk=sigma_pm_hold_rr,
         sigma_pm_hold_rr_data=sigma_pm_hold_rr,
@@ -332,7 +487,7 @@ def compute_delta_tpd_envelope_per_device(
 ) -> DeltaTpdEnvelope:
     """Per-device-shape envelope.
 
-    MP coefficients (mp_clk_slow, mp_data_fast, correlated_diff,
+    MP coefficients (mp_late_rise, mp_early_fall, correlated_diff,
     uncorrelated_diff) take Man_shape: in MP both lanes are Mgr-driven,
     so the Mgr ramp shape sets both per-leg t_cross values.
 
@@ -358,13 +513,17 @@ def compute_delta_tpd_envelope_per_device(
         rising_min=env_man.rising_min,
         falling_max=env_man.falling_max,
         falling_min=env_man.falling_min,
-        mp_clk_slow=env_man.mp_clk_slow,
-        mp_data_fast=env_man.mp_data_fast,
+        mp_late_rise=env_man.mp_late_rise,
+        mp_early_fall=env_man.mp_early_fall,
         correlated_diff=env_man.correlated_diff,
         uncorrelated_diff=env_man.uncorrelated_diff,
         sigma_pm_setup=env_man.sigma_pm_setup,
         sigma_pm_setup_clk=env_man.sigma_pm_setup,
         sigma_pm_setup_data=env_per.sigma_pm_setup,
+        sigma_pm_setup_clk_dgnd_pos=env_man.sigma_pm_setup_clk_dgnd_pos,
+        sigma_pm_setup_clk_dgnd_neg=env_man.sigma_pm_setup_clk_dgnd_neg,
+        sigma_pm_setup_data_dgnd_pos=env_per.sigma_pm_setup_data_dgnd_pos,
+        sigma_pm_setup_data_dgnd_neg=env_per.sigma_pm_setup_data_dgnd_neg,
         sigma_pm_hold_rr=env_man.sigma_pm_hold_rr,
         sigma_pm_hold_rr_clk=env_man.sigma_pm_hold_rr,
         sigma_pm_hold_rr_data=env_per.sigma_pm_hold_rr,
@@ -381,11 +540,11 @@ if __name__ == "__main__":
         print(f"rising_min          = {env.rising_min:+.4f} · t_RF")
         print(f"falling_max         = {env.falling_max:+.4f} · t_RF")
         print(f"falling_min         = {env.falling_min:+.4f} · t_RF")
-        print(f"mp_clk_slow         = {env.mp_clk_slow:+.4f}")
-        print(f"mp_data_fast        = {env.mp_data_fast:+.4f}")
+        print(f"mp_late_rise         = {env.mp_late_rise:+.4f}")
+        print(f"mp_early_fall        = {env.mp_early_fall:+.4f}")
         print(f"Δ_cross,MP corr     = {env.correlated_diff:+.4f}  (× t_RF_Man → ns)")
         print(f"Δ_cross,MP uncorr   = {env.uncorrelated_diff:+.4f}")
-        print(f"σ_PM,setup per-leg  = {env.sigma_pm_setup:+.4f}")
+        print(f"σ_PM,setup per-leg  = {env.sigma_pm_setup:+.4f}  (δ=0, reporting only)")
         print(f"σ_PM,hold rr        = {env.sigma_pm_hold_rr:+.4f}")
         print(f"σ_PM,hold rf clk    = {env.sigma_pm_hold_rf_clk:+.4f}")
         print(f"σ_PM,hold rf data   = {env.sigma_pm_hold_rf_data:+.4f}")

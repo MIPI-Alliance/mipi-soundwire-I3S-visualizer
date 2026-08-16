@@ -212,8 +212,9 @@ def test_hits_are_dropped_when_the_scene_is_rebuilt(session, qapp):
 
 
 def test_engine_mode_has_no_dp_hits(session, qapp):
-    """The Visualizer grid colours by dp NUMBER with no device, so a swatch there
-    can't identify a (device, dp) port — it must not become clickable."""
+    """The Visualizer grid's swatches are not click targets: label fields are chosen from
+    the authoring panel in that mode, so only the Analyzer grid maps a swatch back to a
+    (device, dp) port. (Its colours key on the config slot — see test_grid_dp_colors.)"""
     from swi3s_studio.ui.grid_view import GridView
 
     gv = GridView()

@@ -45,7 +45,7 @@ class FlowControlPortConfig:
 class FlowControlPort:
     """SWI3S Flow Control Port — config + state + algorithm.
         initialize()         initialize before use
-        clock_tick()         advance one UI; engine derives BitSlotState from state
+        clock_tick()         advance one UI; the bit-slot state follows from state
     """
 
     state: FlowControlPortState

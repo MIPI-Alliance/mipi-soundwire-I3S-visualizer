@@ -777,6 +777,30 @@ std::vector<std::tuple<int, std::uint32_t, int>> registersFromConfig(const SwI3s
             emit(dev, r::kSkippingDenomLo, cfg.SkippingDenominator & 0xFF);
             emit(dev, r::kSkippingDenomHi, (cfg.SkippingDenominator >> 8) & 0xF);
         }
+
+        // --- Control Data Stream, per source ---
+        //
+        // Each source drives the time-multiplexed CDS under its OWN copy of these
+        // registers, so the value written to device d comes from per-source slot d+1.
+        //
+        // THE MANAGER'S SLOT (index 0) IS NOT EMITTED, and cannot be: only peripherals
+        // have an addressable register block, so how the Manager itself drives the CDS is
+        // not expressible as a register write. It round-trips through the CSV and is
+        // invisible here — a real limit of the encoding, not an omission.
+        //
+        // Emitted for every device that owns an enabled dataport, matching the geometry
+        // registers above. A device may legally use the CDS with no data port of its own,
+        // and such a device gets no CDS write here — the same conservative rule the
+        // geometry already follows, since `deviceSeen` is the only roster available.
+        const int src = dev + 1;
+        emit(dev, r::kCdsDriveType_N, (cfg.CdsDriveType[src] & 0x1) << 7);
+        const int guard = cfg.CdsGuard[src];              // 0 off, 1 G0, 2 G1
+        emit(dev, r::kCdsBitWidthGuardTail_N,
+             ((cfg.CdsBitWidth & 0x7) << 5) |
+             ((cfg.CdsEndDriveEarly[src] & 0x1) << 4) |
+             ((guard != 0 ? 1 : 0) << 3) |
+             ((guard == 2 ? 1 : 0) << 2) |
+             (cfg.CdsTailWidth[src] & 0x3));
     }
 
     // Per dataport: invert decodeDp's exact bit packing (see CRegisterModel.cpp).
@@ -996,9 +1020,9 @@ void Decoder::run()
     mPendingImmediateReconfig = false;
     mPendingSspCmdIndex = -1;
     // Manual SSP: reduce the chosen bus row modulo the LCM of the enabled ports'
-    // interval periods (Interval + 1 rows each), so we re-anchor at the FIRST
-    // congruent row near the decode start — making the chosen row (and every period
-    // from it) row_in_interval == 0 across the whole capture, not just after it.
+    // transport pattern periods, so we re-anchor at the FIRST congruent row near the
+    // decode start — making the chosen row (and every period from it) row_in_interval ==
+    // 0 across the whole capture, not just after it.
     mSspSyncRow = -1;
     if (mSettings.sspRow >= 0 && mEngine.Enabled()) {
         long period = 1;
@@ -1007,7 +1031,7 @@ void Decoder::run()
             // CSV is unvalidated, and std::lcm(period, 0) == 0 would make the modulo
             // below divide by zero (SIGFPE).
             if (dc.Enabled && dc.numChannels() > 0 && dc.Interval >= 0)
-                period = std::lcm(period, static_cast<long>(dc.Interval) + 1);
+                period = std::lcm(period, mConfig.patternRows(dc));
         if (period < 1) period = 1;          // defensive: never modulo by 0
         mSspSyncRow = ((mSettings.sspRow % period) + period) % period;
         // A reduced row of 0 means the SSP falls on the decode-start row. The feed()
@@ -1287,12 +1311,12 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
                     mPendingSspCommit = willCommit;
                     mPendingSspSyncPoint = cmd.hasSyncPoint;   // DSCR (false) commits but no re-anchor
                     mPendingSspGroup = cmd.groupMask;
-                    // Remember this commit's command so its effectiveRow can be filled
-                    // in when the SSP fires (the authoritative commit point). recordCommand
-                    // just appended it, so it's the last element. SSPA re-anchors aren't
-                    // commits -> no marker.
-                    mPendingSspCmdIndex = willCommit
-                        ? static_cast<long>(mCommands.size()) - 1 : -1;
+                    // Remember the command that generated this SSP. A commit uses it to
+                    // record effectiveRow (the authoritative commit point, written only in
+                    // the commit branch below); either kind uses it to carry an
+                    // unexpected-SSP flag, so an SSPA needs the marker too. recordCommand
+                    // just appended it, so it's the last element.
+                    mPendingSspCmdIndex = static_cast<long>(mCommands.size()) - 1;
                 }
             }
         }
@@ -1387,7 +1411,17 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
             }
             // Re-anchor the ports' interval timing only for events that generate an SSP
             // (SSCR / SSPA). A DSCR is synced but must NOT reset the SSP, so it skips this.
-            if (mEngine.Enabled() && mPendingSspSyncPoint) { mEngine.SyncToSSP(); recordSync(evUi); }
+            if (mEngine.Enabled() && mPendingSspSyncPoint) {
+                const bool midSkipCycle = mEngine.SyncToSSP();
+                recordSync(evUi);
+                // Flag the SSP that landed mid-skip-pattern on the command that generated
+                // it (CommandRec::unexpectedSspError). Only meaningful for a port that was
+                // already running: a commit that (re)configured the ports this same row
+                // Initialized them, which leaves the accumulator at the top of its cycle.
+                if (midSkipCycle && mPendingSspCmdIndex >= 0 &&
+                    mPendingSspCmdIndex < static_cast<long>(mCommands.size()))
+                    mCommands[mPendingSspCmdIndex].unexpectedSspError = true;
+            }
             // Checkpoint the post-re-anchor phase so a windowed re-decode can restore it
             // (every commit/SSP gets one, bounding fast-forward regardless of spacing).
             if (mEngine.Enabled()) snapshotCheckpoint(evUi);

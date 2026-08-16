@@ -75,6 +75,27 @@ DATA_PORT_FCP_GUARD_POLARITY = CSVFields.DP_FCP_GUARD_POLARITY_REG
 CDS_GUARD_ENABLE_PER_SOURCE = 'CDS_GuardEnabledPerSource'
 CDS_GUARD_POLARITY_PER_SOURCE = 'CDS_GuardPolarityPerSource'
 CDS_TAIL_PER_SOURCE = 'CDS_TailWidthPerSource'
+# Drive type and end-drive-early are per source for the same reason: each register sits in
+# a device's own CDS block. Drive type: 1 Normal, 0 Special (a CDS 1 left high-Z for the
+# Manager's bus keeper). End drive early: 0 full UI, 1 stop half a UI early.
+CDS_DRIVE_TYPE_PER_SOURCE = 'CDS_DriveTypePerSource'
+CDS_EDE_PER_SOURCE = 'CDS_EndDriveEarlyPerSource'
+# The scalar spelling of the drive type, read only (never written) — see the load path.
+_CDS_DRIVE_TYPE_SCALAR = 'CDS_DriveType'
+
+# The plain 13-wide integer rows: csv_key -> (Interface attribute, default per source).
+# ONE TABLE so a new per-source CDS field is an entry rather than a fourth near-identical
+# branch in the load loop and another writerow in the save loop. Mirrors
+# bus_config._CDS_PER_SOURCE_INT_ROWS, which is the same list for the other engine.
+#
+# The defaults differ in kind and both are deliberate: CDS_DriveType defaults to 1 AGAINST
+# its register reset (a file with no row must keep reading as it always did), while
+# CDS_EndDriveEarly defaults to 0 WITH its reset (full-UI drive is the ordinary case).
+_CDS_INT_PER_SOURCE = {
+    CDS_TAIL_PER_SOURCE: ('CDS_Tail_PerSource', 0),
+    CDS_DRIVE_TYPE_PER_SOURCE: ('CDS_DriveType_PerSource', 1),
+    CDS_EDE_PER_SOURCE: ('CDS_EndDriveEarly_PerSource', 0),
+}
 # Scalar CDS guard/tail registers: still READ from legacy v2 files (to derive the
 # per-source rows), and derived FROM the per-source rows on every load for the engine
 # layout — but no longer WRITTEN (the per-source rows are authoritative).
@@ -396,9 +417,10 @@ class CSVHandler:
         found_dataport_fields: set = set()
         found_dataport_viz_fields: set = set()
         found_cds_guard_per_source = False
-        found_cds_tail_per_source = False
+        found_cds_int_rows: set = set()      # which of _CDS_INT_PER_SOURCE were present
         cds_guard_enable_ps = None      # split guard rows, recombined after the loop
         cds_guard_polarity_ps = None
+        legacy_cds_drive = None         # the brief scalar spelling; broadcast if seen
 
         try:
             with open(filename, encoding='utf8') as data_file:
@@ -437,7 +459,8 @@ class CSVHandler:
                     # CDS_GuardEnabled/Polarity_REG scalars); they're recombined into
                     # CDS_Guard_PerSource (0=off, 1=G0, 2=G1) after the loop.
                     if field_name in (CDS_GUARD_ENABLE_PER_SOURCE,
-                                      CDS_GUARD_POLARITY_PER_SOURCE, CDS_TAIL_PER_SOURCE):
+                                      CDS_GUARD_POLARITY_PER_SOURCE,
+                                      *_CDS_INT_PER_SOURCE):
                         values = row[1:]
                         if len(values) != CDS_NUM_SOURCES:
                             result.error_message = (
@@ -445,11 +468,17 @@ class CSVHandler:
                                 f"per-source values, found {len(values)}"
                             )
                             return result
-                        if field_name == CDS_TAIL_PER_SOURCE:
+                        if field_name in _CDS_INT_PER_SOURCE:
+                            attr, default = _CDS_INT_PER_SOURCE[field_name]
+                            target = getattr(interface, attr)
                             for src_index, raw_value in enumerate(values):
-                                interface.CDS_Tail_PerSource[src_index] = \
+                                # A blank cell takes the FIELD's default, not 0: on
+                                # CDS_DriveType 0 means Special, so reading a gap as zero
+                                # would silently relabel the bus.
+                                target[src_index] = (
                                     CSVHandler.parse_value(raw_value, FieldType.INT)
-                            found_cds_tail_per_source = True
+                                    if str(raw_value).strip() else default)
+                            found_cds_int_rows.add(field_name)
                         elif field_name == CDS_GUARD_ENABLE_PER_SOURCE:
                             cds_guard_enable_ps = [CSVHandler.parse_value(v, FieldType.BOOL)
                                                    for v in values]
@@ -457,6 +486,15 @@ class CSVHandler:
                         else:  # CDS_GUARD_POLARITY_PER_SOURCE
                             cds_guard_polarity_ps = [CSVHandler.parse_value(v, FieldType.BOOL)
                                                      for v in values]
+                        continue
+
+                    # A SCALAR CDS_DriveType row broadcasts to every source. That spelling
+                    # existed only briefly, before the register was understood to live in
+                    # each device's own CDS block; caught here so such a file loads with a
+                    # sensible value instead of landing in unrecognized_fields.
+                    if field_name == _CDS_DRIVE_TYPE_SCALAR:
+                        legacy_cds_drive = CSVHandler.parse_value(
+                            row[1] if len(row) > 1 else "1", FieldType.INT)
                         continue
 
                     # Try interface viz parameter (exact match)
@@ -572,8 +610,14 @@ class CSVHandler:
                     g = (2 if interface.CDS_GuardPolarity_REG else 1) \
                         if interface.CDS_GuardEnabled_REG else 0
                     interface.CDS_Guard_PerSource = [g] * 13
-                if not found_cds_tail_per_source:
+                if CDS_TAIL_PER_SOURCE not in found_cds_int_rows:
                     interface.CDS_Tail_PerSource = [interface.CDS_TailWidth_REG] * 13
+                # No per-source drive row: broadcast the scalar if the file carried one,
+                # else leave reset_to_defaults' all-Normal in place. End-drive-early has no
+                # legacy spelling to migrate — it was per-source from the start.
+                if (CDS_DRIVE_TYPE_PER_SOURCE not in found_cds_int_rows
+                        and legacy_cds_drive is not None):
+                    interface.CDS_DriveType_PerSource = [int(legacy_cds_drive)] * 13
 
                 # The per-source rows are authoritative; derive the scalar CDS
                 # registers FROM them for the engine layout (guard column presence /
@@ -581,6 +625,12 @@ class CSVHandler:
                 interface.CDS_GuardEnabled_REG = any(v != 0 for v in interface.CDS_Guard_PerSource)
                 interface.CDS_GuardPolarity_REG = (interface.CDS_Guard_PerSource[0] == 2)
                 interface.CDS_TailWidth_REG = max(interface.CDS_Tail_PerSource)
+                # The Manager's, like CDS_GuardPolarity_REG above — not an any()/max(),
+                # because "some source drives specially" is not a value a single register
+                # can hold and the renderer reads the whole list anyway.
+                interface.CDS_DriveType_REG = int(interface.CDS_DriveType_PerSource[0])
+                interface.CDS_EndDriveEarly_REG = int(
+                    interface.CDS_EndDriveEarly_PerSource[0])
 
                 # Check for missing expected fields
                 expected_interface = set(CSVHandler._interface_field_dict.keys())
@@ -706,8 +756,9 @@ class CSVHandler:
                                 + ['1' if v != 0 else '0' for v in interface.CDS_Guard_PerSource])
                 writer.writerow([CDS_GUARD_POLARITY_PER_SOURCE]
                                 + ['1' if v == 2 else '0' for v in interface.CDS_Guard_PerSource])
-                writer.writerow([CDS_TAIL_PER_SOURCE]
-                                + [str(int(v)) for v in interface.CDS_Tail_PerSource])
+                for csv_field, (attr, _default) in _CDS_INT_PER_SOURCE.items():
+                    writer.writerow([csv_field]
+                                    + [str(int(v)) for v in getattr(interface, attr)])
 
                 # Write device assignment fields (from interface, not dataport)
                 # DeviceNumber_REG

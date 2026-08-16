@@ -39,7 +39,23 @@ def test_decode_demo_capture_ceiling():
 
 def test_engine_build_ceiling():
     """Build the visualizer bus model at a moderate row count with several data ports —
-    guards the engine's per-tick placement loop (O(rows x cols x DPs)) + the popcount."""
+    guards the engine's per-tick placement loop (O(rows x cols x DPs)) + the popcount.
+
+    Speed is NOT a goal of the Python model. swi3score, the C++ core, is the fast
+    implementation; swviz/models/dataport.py is a functional model of a hardware
+    implementation, published in the MIPI specification, and it optimises for a spec
+    reader's comprehension instead. Three hoists that existed here purely for speed
+    (a `_num_cols` cached in initialize(), and locals for `_num_channels` in
+    clock_tick() and _effective_channel_grouping()) were removed for that reason; they
+    cost ~7% on the build below, which is three orders of magnitude clear of the
+    ceiling and therefore irrelevant.
+
+    An earlier version of this docstring argued the opposite — it named the three
+    hoists and warned that they "read as redundant, so they get removed by
+    well-meaning cleanups". That framing sent three successive review drops into the
+    same argument. The ceiling below is a runaway guard (an accidental O(n^2), a
+    re-decode per tick), not a defence of micro-optimisation.
+    """
     from swi3s_studio.swviz.core.engine import BusModelBuilder
     from swi3s_studio.swviz.models.interface import Interface
     from swi3s_studio.swviz.viz import VizConfig

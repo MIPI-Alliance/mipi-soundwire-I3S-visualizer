@@ -176,9 +176,16 @@ somewhere else: the spacing row-boundary rationale lives in
 the maintainers' spacing row-boundary write-up, and the partial-channel-group rationale in
 `tests/test_transport_slot_budget.py`.
 
-Note the perf caches in both files (`self._num_cols`, hoisted `nch`) are themselves
-optimisations rather than reference algorithm — worth weighing whenever the model is next
-re-published.
+**What is NOT enforced: the docstrings' content.** These two files are authored externally
+and arrive as whole-file drops, so this repository owns the code path they sit on and not
+their prose. A third rule briefly rejected docstrings that named this codebase (module and
+test paths, a comparison to the C++ core, "the engine"); it is withdrawn, because holding it
+means rewriting the author's words on every drop or carrying a divergent copy, and the next
+drop undoes either one. Raise it in review of the incoming drop instead — and do not
+"fix" such a docstring here, because that is the change that silently diverges the file.
+Speed is likewise not a goal of this model: three hoists that existed only for it were
+removed in 3.0.13, at a cost of 7% on an engine build three orders of magnitude inside its
+ceiling. The partial-channel-group clamp is not in that category.
 
 ## Release checklist
 
@@ -217,11 +224,41 @@ re-published.
 
    **A green CI is not a green gate.** CI runs on the public repo only, and covers neither
    the perf gate nor Windows; the gate covers neither Linux nor Python 3.12/3.13. Run both.
-3. Merge `release/X.Y.Z` → `main`.
-4. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
+3. **Run the gate on the Windows VM, BEFORE tagging.** Not after, and not "if there is
+   time": this step is the one the checklist keeps losing and it has cost two consecutive
+   releases. 3.0.13 and 3.0.14 were both tagged, published and opened as pull requests on a
+   macOS-only gate, and both were red on Windows within minutes — first a dialog button
+   clipped by 4 px, then, after a fix verified against a *simulated* wide font, the same
+   dialog's label column clipped by 53 px. Neither defect is visible on this platform's
+   metrics, and neither was a subtle one; they were simply never run.
+
+   The VM is a separate machine reached over SSH, with its address and key recorded in the
+   maintainer's own configuration rather than here — it is not a git checkout, so ship the
+   exact tree (`git archive <sha>`), extract it beside the working copy rather than over it,
+   and point `$env:PYTHON` at the established venv (3.14) so `tests/gate.ps1` uses the
+   interpreter that already has the built core. Its Python is deliberately a version no CI
+   job and no macOS run covers.
+
+   **When a re-run is required, and when it is not.** Gate the commit you will tag. If
+   something changes after that run, re-run it when the change touches anything the guest
+   would **execute or import** — product code, tests, tooling the gate calls, CI config,
+   packaging. PROSE does not earn a cycle, wherever it lives: what a documentation change can
+   break is a leak or a tier violation, and both are checked on the machine you are sitting
+   at, not by a second platform. Note the delta in the release notes instead.
+
+   (The first wording of this rule said "touches the published tree", which would have
+   demanded a Windows run for editing this paragraph. Stated as a rule at all because the
+   alternative is either a regress of 15-minute runs or a shrug, and the shrug is how this
+   step went missing in the first place.)
+
+   **A simulated font is not this step.** Scaling the application font locally is worth doing
+   — it is how both defects were finally reproduced — but a point size is not a width, and a
+   fix verified that way shipped broken once already.
+4. Merge `release/X.Y.Z` → `main`.
+5. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
    use a GPG-signed tag + the governed PR flow — see [GOVERNANCE.md](../GOVERNANCE.md)).
-5. Publish the release (`gh release create vX.Y.Z --latest --notes-file …`).
-6. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model).
+6. Publish the release (`gh release create vX.Y.Z --latest --notes-file …`).
+7. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model).
 
 Cut the tag *once, after the cycle settles* — re-pointing a published tag (as happened
 repeatedly during 3.0.6) is a smell that the release was tagged too early.
