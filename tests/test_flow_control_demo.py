@@ -21,10 +21,14 @@ detection). Before the fix, dev1's WriteA32(0x2090, 0x60) forged a comma and its
 config block was dropped.
 """
 import math
+import os
 from collections import defaultdict
 
 import pytest
 import swi3score
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FIXTURES = os.path.join(_HERE, "fixtures")
 
 # Per-(device, channel) tone table. MUST match Demo.cpp flowDemoFreq() exactly.
 _FLOW_FREQ = {
@@ -133,7 +137,7 @@ def test_flow_all_modes_deliver_full_rate():
     from swi3s_studio.session import Session
     s = Session.from_demo(4000, cold_start=True, variant="flow_control")
     counts = defaultdict(int)
-    for a in s.decoder.audio():
+    for a in s.audio:                      # the Session's copy (decoder's is released)
         counts[a["device"]] += 1
     # per-channel counts (dev0/1 have 1/2 ch; dev2/3 have 2 ch) -> normalize to per-channel
     nch = {0: 1, 1: 2, 2: 2, 3: 2}
@@ -175,7 +179,7 @@ def test_flow_drq_cells_on_bus_grid():
                 if hasattr(swi3score, "SLOT_NAMES") else 6)
     s = Session.from_demo(4000, cold_start=True, variant="flow_control")
     # Navigate to the audio phase (a DRQ-mode sample) — the cold-start start has none.
-    a = [x for x in s.decoder.audio() if x["device"] == 2]
+    a = [x for x in s.audio if x["device"] == 2]      # Session copy, not the decoder's
     mid = int(a[len(a) // 2]["start_sample"])
     cells = s.grid_cells_at(mid, rows=32)
     drq = [c for c in cells if c["slot"] == drq_slot]
@@ -236,10 +240,21 @@ def test_flow_delay_decoded_from_registers():
 def test_flow_control_delay_round_trips_through_registers():
     """A config CSV's DPn_FlowControlDelay must survive registers_from_csv — it is bit 7
     of 0x0E, and the register emit used to drop it (forcing 0), which made a config-CSV
-    baseline mismatch a real decode for RX/ASYNC ports. flow_control.csv leaves it at the
-    reset default (1), so every 0x0E register for a DRQ mode must carry bit 7 set."""
+    baseline mismatch a real decode for RX/ASYNC ports. The demo's config leaves it at the
+    reset default (1), so every 0x0E register for a DRQ mode must carry bit 7 set.
+
+    Resolved from __file__, not the working directory. registers_from_csv returns [] for a
+    path it cannot open rather than raising, so a CWD-relative name failed here as
+    `assert []` — reading like a decode regression instead of a missing file.
+
+    The fixture lives under tests/fixtures/ rather than visualizer_examples/ deliberately:
+    three suites glob that corpus recursively, and this config is the only one whose
+    DataPortNumber differs from its slot index (four peripherals each using their own DP0),
+    which trips a cross-engine divergence recorded in the maintainers' debt register."""
     import swi3score
-    regs = swi3score.registers_from_csv("flow_control.csv")
+    csv = os.path.join(_FIXTURES, "flow_control_demo.csv")
+    assert os.path.isfile(csv), f"missing fixture {csv}"
+    regs = swi3score.registers_from_csv(csv)
     flow0e = [(dev, val) for dev, addr, val in regs if (addr & 0xFF) == 0x0E]
     assert flow0e, "no 0x0E (FlowMode) registers emitted"
     # RX/ASYNC ports (mode 2/3 in the low bits) must carry FlowControlDelay=1 (bit 7).
@@ -282,7 +297,7 @@ def test_audio_idle_cds_is_d10_2_not_flat(phy, variant):
     from swi3s_studio.session import Session
 
     s = Session.from_demo(400, cold_start=True, phy=phy, variant=variant)
-    a = list(s.decoder.audio())
+    a = list(s.audio)                                 # Session copy, not the decoder's
     mid = int(a[len(a) // 2]["start_sample"])
     raws = [int(sy.get("raw", -1)) & 0x3FF for sy in s.symbols_around(mid, max_symbols=1500)]
     c = Counter(raws)
@@ -296,3 +311,53 @@ def test_audio_idle_cds_is_d10_2_not_flat(phy, variant):
     assert longest <= 12, (
         f"{longest} consecutive all-ones (0x3FF) symbols — the idle CDS regressed to a "
         f"flat line (an undriven PingInfo field is at most 12 in a row)")
+
+
+def test_manager_dataports_emit_no_peripheral_registers():
+    """A MANAGER data port is not addressable as a peripheral register write, and must not be
+    emitted as one.
+
+    A config CSV encodes the manager as device 0 + ManagerDataport=True, because
+    DeviceNumber_REG holds 0..11 and cannot carry the -1 sentinel. The C++ CSV reader took
+    only the first half until 3.0.13 and explicitly documented ManagerDataport as ignored, so
+    every manager port impersonated device 0 — which is a REAL peripheral address, and this
+    fixture has a genuine device-0 port as well. The result was 103 register writes addressed
+    to device 0 against 23 for each of its peers, including two conflicting values for the
+    same DP0 FlowMode register.
+
+    The emitter itself was always correct: both loops in registersFromConfig skip
+    deviceNum < 0. Only the sentinel had to survive the parse.
+    """
+    import swi3score
+    csv = os.path.join(_FIXTURES, "flow_control_demo.csv")
+    regs = swi3score.registers_from_csv(csv)
+
+    # Guard the fixture's shape by reading its own encoding, so the test cannot quietly stop
+    # covering the case: at least one ENABLED port must be flagged ManagerDataport.
+    rows = {}
+    with open(csv, encoding="utf-8") as f:
+        for line in f:
+            cells = line.rstrip("\n").split(",")
+            rows[cells[0]] = cells[1:]
+    managed = [m == "True" for m in rows["ManagerDataport"]]
+    enabled = [e == "True" for e in rows["Enabled"]]
+    assert any(m and e for m, e in zip(managed, enabled)), \
+        "fixture no longer declares an enabled manager data port — this test is now blind"
+    assert any(not m and e for m, e in zip(managed, enabled)), \
+        "fixture has no enabled PERIPHERAL port, so device 0 collision cannot occur"
+
+    devices = sorted({dev for dev, _a, _v in regs})
+    assert devices == [0, 1, 2, 3], f"expected writes to devices 0-3 only, got {devices}"
+
+    per_device = {d: sum(1 for dev, _a, _v in regs if dev == d) for d in devices}
+    assert len(set(per_device.values())) == 1, (
+        "device 0 carries a different number of register writes from its peers, which is how "
+        f"the manager's ports leaking onto it looked: {per_device}")
+
+    seen = defaultdict(int)
+    for dev, addr, _val in regs:
+        seen[(dev, addr)] += 1
+    duplicates = sorted(k for k, n in seen.items() if n > 1)
+    assert not duplicates, (
+        "the same (device, address) is written more than once, so one port's configuration "
+        f"overwrites another's: {[f'dev{d} 0x{a:04X}' for d, a in duplicates]}")

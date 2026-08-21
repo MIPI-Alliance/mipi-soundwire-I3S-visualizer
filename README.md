@@ -228,7 +228,8 @@ tests/          Python suites + run_all.sh
 
 ## Opening captures
 
-**File ▸ Analyzer ▸ Open Capture** reads a Logic 2 `.sal` project, a digital CSV
+**File ▸ Analyzer ▸ Open Capture** reads a Logic 2 `.sal` project (internal blob versions
+3 and 4, plus the documented v0 Binary export), a digital CSV
 (`Time, Ch…` columns), a simulation `.vcd`, a per-channel `<SALEAE>` binary pair, or a
 Tektronix analog scope export — a `.wfm` channel pair or an analog `.csv` (volts). Analog
 sources are thresholded to logic automatically (mid-rail + 10% hysteresis); digital-vs-
@@ -237,7 +238,11 @@ auto-assigned by transition count (the forwarded clock toggles every UI, so it h
 most edges), so file order doesn't matter; select both files of a `.bin`/`.wfm` pair
 together to skip the second-file prompt (an analog CSV with more than two channels prompts
 for which is clock vs data). Sample rate is auto-detected from timestamps. Large captures
-decode on a worker thread behind an n/N progress dialog. **File ▸ Load Demo Capture ▸
+decode on a worker thread behind an n/N progress dialog. A `.sal` too big to hold in
+memory is not attempted: the peak is predicted from the ZIP directory before anything is
+inflated, and past an absolute budget you are offered a **time window** instead — so a
+machine with more RAM does not silently load more. **Open Capture Time Window…** asks for
+one on purpose at any size; see `docs/USER_GUIDE.md` ▸ *Large captures*. **File ▸ Load Demo Capture ▸
 PHY1/PHY2/PHY3** runs a synthetic capture for the chosen PHY, each with a §5.1.2 Cold Start
 spliced in front and the same audio content (so they decode identically): PHY1 a slow
 4-column FBCSE bus whose ports are repositioned mid-capture, PHY2 an FBCSE bus stepping

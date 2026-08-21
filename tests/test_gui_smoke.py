@@ -502,14 +502,55 @@ def test_studio_ui_batch(win):
     win.cursor.set_sample(0)
 
 
+def test_the_demo_arrives_on_first_analyzer_entry_not_at_startup():
+    """Constructing the window must decode NOTHING. The demo's decode was ~2.3 GB of the
+    ~2.6 GB the app sat at on launch, and every session paid it — including the default
+    Bus Visualizer ones that never open the Analyzer, and every File ▸ Open that replaced
+    it seconds later. It now arrives on the first switch to Bus Analyzer, exactly once."""
+    from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
+
+    w = MainWindow()
+    assert w._session is None, "MainWindow.__init__ decoded a capture"
+    assert w._demo_preload_pending
+    w._mode_mgr.switch_to(ANALYSIS)
+    first = w._session
+    assert first is not None, "entering Bus Analyzer did not preload the demo"
+    assert not w._demo_preload_pending
+    # Leaving and coming back must NOT decode again — a new Session object would mean it did.
+    w._mode_mgr.switch_to(VISUALIZATION)
+    w._mode_mgr.switch_to(ANALYSIS)
+    assert w._session is first, "re-entering Bus Analyzer re-decoded the demo"
+    w.close()
+
+
+def test_a_loaded_capture_is_never_replaced_by_the_deferred_demo():
+    """The deferred preload must not fire over a capture the user opened. Opening from the
+    Visualizer switches into the Analyzer, which is the same code path the preload hangs
+    off — so if the pending flag outlived the load, opening a file would show the demo."""
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui.mode_controller import ANALYSIS
+
+    w = MainWindow()
+    assert w._demo_preload_pending
+    sess = Session.from_demo(8)                   # stands in for an opened capture
+    w.load_session(sess)                          # switches to Analyzer itself
+    assert w._session is sess
+    assert not w._demo_preload_pending
+    w._mode_mgr.switch_to(ANALYSIS)               # explicit re-entry, for good measure
+    assert w._session is sess, "the deferred demo replaced the loaded capture"
+    w.close()
+
+
 def test_load_demo_async_when_event_loop_live():
     """When the event loop is running, load_demo goes through the async worker + progress
     dialog (same as an external capture), instead of blocking the GUI thread — the 1 s demo
     is seconds of synthesis + decode. Before the loop starts / in headless tests it stays
-    synchronous so a freshly built window has its session ready. Pumps events to completion.
-    (conftest sets SWI3S_DEMO_SAMPLES=300, so the pumped decode is quick.)"""
+    synchronous, so a headless load_demo() returns with the session ready. Pumps events to
+    completion. (conftest sets SWI3S_DEMO_SAMPLES=300, so the pumped decode is quick.)"""
     import time
-    w = MainWindow()                                    # __init__ preload: synchronous (flag off)
+    w = MainWindow()                                    # constructor loads nothing now
+    assert w._session is None and getattr(w, "_load_thread", None) is None
+    w.load_demo()                                       # loop not live yet => synchronous
     assert w._session is not None and getattr(w, "_load_thread", None) is None
     MainWindow._event_loop_live = True
     try:
@@ -542,6 +583,7 @@ def test_cursor_cascade_coalesces_when_event_loop_live():
     cursor LINE still moves on every change. Headless / tests keep it synchronous."""
     import time
     w = MainWindow()
+    w.load_demo()                                    # no longer preloaded in __init__
     s = w._session
     assert s is not None
     N = int(s.capture.clock_edges[-1])
@@ -618,3 +660,183 @@ def test_no_worker_respawns_after_join_worker_threads():
     w._start_tx_persist_worker(w._session, 0, object())
     assert getattr(w, "_tx_persist_thread", None) is None, \
         "a TX-persist thread was spawned after join_worker_threads()"
+
+
+def test_locate_subcapture_refuses_a_second_search_while_one_runs(monkeypatch):
+    """Re-invoking Locate Sub-Capture mid-search must not start a second worker.
+
+    The search runs for seconds on a worker thread, which is ample time to pick the menu
+    item again. Without a guard the second call overwrote _locate_thread / _locate_worker /
+    _locate_dlg / _locate_path while the first worker was still running: its still-connected
+    done/failed slots then read the SECOND search's state (a result reported against the
+    wrong file), and the first QThread was never joined — the destroyed-while-running abort
+    join_worker_threads() exists to prevent, which the other two workers already guard
+    against (_load_async, _start_tx_persist_worker).
+
+    The refusal must come BEFORE the file dialog, so nobody chooses a file only to be told
+    no; that is what asserting on the dialog not opening pins.
+    """
+    import swi3s_studio.ui.main_window as mw
+    w = MainWindow()
+    try:
+        opened, told = [], []
+        monkeypatch.setattr(mw.QFileDialog, "getOpenFileNames",
+                            lambda *a, **k: (opened.append(1), ([], ""))[1])
+        monkeypatch.setattr(mw.QMessageBox, "information",
+                            lambda *a, **k: told.append(a[1] if len(a) > 1 else ""))
+        w._session = object()             # past the "no capture" check; unused on this path
+        in_flight = object()
+        w._locate_thread = in_flight      # a search is already running
+
+        w.locate_subcapture()
+
+        assert not opened, "the file dialog opened while a search was already running"
+        assert told, "the second search was refused without telling the user why"
+        assert w._locate_thread is in_flight, \
+            "the running search's thread was overwritten by a second invocation"
+    finally:
+        w._locate_thread = None           # the sentinel is not a real QThread
+        w._session = None
+        w.join_worker_threads()
+
+
+def test_locate_subcapture_does_not_start_while_closing(monkeypatch):
+    """Once join_worker_threads() has run, a late menu action must not spawn a search —
+    the same _closing rule _run_pending_load and _start_tx_persist_worker follow."""
+    import swi3s_studio.ui.main_window as mw
+    w = MainWindow()
+    opened = []
+    monkeypatch.setattr(mw.QFileDialog, "getOpenFileNames",
+                        lambda *a, **k: (opened.append(1), ([], ""))[1])
+    w._session = object()
+    w.join_worker_threads()               # sets _closing
+    w.locate_subcapture()
+    assert not opened, "a sub-capture search was started while the window was closing"
+    assert getattr(w, "_locate_thread", None) is None, \
+        "a locate thread was spawned after join_worker_threads()"
+    w._session = None
+
+
+def test_rebuilding_the_playback_menus_does_not_accumulate_action_groups():
+    """QMenu.clear() destroys the actions, NOT the groups — those are children of the WINDOW.
+
+    So rebinding self._play_device_group / _play_depth_group / _play_rate_groups only dropped
+    the last PYTHON reference to a C++ object Qt still owned: 4 groups after construction, 104
+    after 50 rebuilds, 4004 after 2000. Empty shells at ~1.6 KB per rebuild, but unbounded
+    across a session — and the decimation menu is rebuilt per capture load and per re-decode,
+    one group per (device, dataport) audio stream.
+
+    NOTE THE FLUSH: deleteLater() posts a DeferredDelete event, and QApplication.processEvents()
+    does NOT run those. Without sendPostedEvents the count still reads 104 and the fix looks
+    broken — which it did, on the first attempt at this check.
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QActionGroup
+
+    app = QApplication.instance() or QApplication([])
+    w = MainWindow()
+    try:
+        def count():
+            return sum(isinstance(k, QActionGroup) for k in w.children())
+
+        at_start = count()
+        for _ in range(50):
+            w._build_audio_playback_menu()
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        assert count() == at_start, (
+            f"{count() - at_start} QActionGroups survived 50 menu rebuilds "
+            f"(started at {at_start})")
+    finally:
+        w.join_worker_threads()
+        w.close()
+
+
+def test_the_rows_to_draw_field_fits_its_widest_value_at_a_wider_font():
+    """A pixel constant sized this field: setFixedWidth(64), for a validator that permits
+    five digits. That is the shape of the defects that shipped 3.0.13 and 3.0.14 red on
+    Windows — a width tuned on macOS metrics, clipped by the runner's font.
+
+    THE STRESS FONT IS DERIVED FROM METRICS, not a point size, following the convention
+    test_authoring.py established for the same class of bug: grow the size until "10240"
+    reaches a width a wider platform would plausibly produce. The font must be set on the
+    APPLICATION before the window is built, since the minimum is computed from the field's
+    font at construction.
+    """
+    from PySide6.QtGui import QFont, QFontMetrics
+
+    app = QApplication.instance() or QApplication([])
+    base = QFont(app.font())
+    TARGET_PX = 90              # comfortably past the 63 px "10240" needs at 16pt monospace
+    try:
+        wide = QFont(base)
+        for pt in range(base.pointSize() or 9, 72):
+            wide.setPointSize(pt)
+            if QFontMetrics(wide).horizontalAdvance("10240") >= TARGET_PX:
+                break
+        else:
+            raise AssertionError("no point size up to 72 makes '10240' reach the stress width")
+        app.setFont(wide)
+        w = MainWindow()
+        try:
+            edit = w._grid_rows_edit
+            need = edit.fontMetrics().horizontalAdvance("10240")
+            assert edit.minimumWidth() >= need, (
+                f"'10240' needs {need} px but the field's minimum is "
+                f"{edit.minimumWidth()} px — it would clip")
+            assert edit.maximumWidth() > need, \
+                "the field is still capped, which is what caused the clipping"
+        finally:
+            w.join_worker_threads()
+            w.close()
+    finally:
+        app.setFont(base)
+
+
+def test_a_capture_that_fits_can_still_be_windowed_on_purpose(win, tmp_path, monkeypatch):
+    """Analyzer ▸ Open Capture Time Window must offer a window even when size would not.
+
+    The size-triggered prompt in _sal_window_prompt was the ONLY route to a windowed load,
+    so a capture the app was willing to open whole could not be sliced at all -- and on a
+    machine with plenty of free memory that is every capture. "It fits" answers a question
+    about capacity, not about staying interactive, and a user who already knows they want
+    20 s out of 176 had no way to say so.
+
+    Drives the prompt against a fixture that comfortably FITS: without force it must stay
+    silent, with force it must ask for a range.
+    """
+    import json
+    import zipfile
+
+    import numpy as np
+
+    from swi3s_studio.ingest import saleae_binary as sb
+    from swi3s_studio.ingest import saleae_sal as ss
+
+    rate = 500_000_000
+    e = np.cumsum(np.random.default_rng(3).integers(1, 40, size=5000)).astype(np.uint64)
+    path = str(tmp_path / "fits.sal")
+    meta = {"data": {"legacySettings": {"sampleRate": {"digital": rate}}},
+            "binData": [{"type": "Digital", "file": "digital-0.bin", "deviceChannel": 0},
+                        {"type": "Digital", "file": "digital-1.bin", "deviceChannel": 1}]}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("meta.json", json.dumps(meta))
+        z.writestr("digital-0.bin", sb.build_channel_v3(False, e, chunk_size=250))
+        z.writestr("digital-1.bin", sb.build_channel_v3(False, e + 1, chunk_size=250))
+
+    assert ss.estimate_cost(path, channels=[0, 1]).fits_in(ss.memory_budget()), \
+        "the fixture must FIT, or this test proves nothing"
+    assert win._sal_window_prompt(path, 0, 1) is None, \
+        "a capture that fits must not be interrupted by the size prompt"
+
+    calls = []
+
+    def fake_get_double(*args, **kwargs):
+        calls.append(args[2] if len(args) > 2 else "")
+        return 0.0, False                    # user backs out of the range dialog
+
+    monkeypatch.setattr(QInputDialog, "getDouble", fake_get_double)
+    got = win._sal_window_prompt(path, 0, 1, force=True)
+    assert calls, "force=True did not ask for a range"
+    assert got == "cancel", "backing out of the range dialog must cancel, not load whole"
+    assert callable(getattr(win, "open_capture_window", None)), \
+        "no menu entry point for a forced window"

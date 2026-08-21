@@ -14,9 +14,29 @@ Nothing could have caught that, because "the gate" existed only as English. It i
   * the docs repeat any of the stale "CI runs nowhere" claims, or stop saying where CI
     actually does run (that claim went stale silently, and had already reached a release
     tag annotation that was about to be signed).
+
+THIS FILE HAS TWO HALVES, and the second exists because the first is not enough. Drift
+guards read SOURCE TEXT, which is the right tool for "does ci.yml still name this check" and
+"do the docs still say where CI runs" — claims about documents. It is the wrong tool for the
+gate's own control flow, and for a full release cycle that was all this file had: every
+assertion was a substring search, and nothing imported or called either tool. A review
+demonstrated the cost on tools/gate.py by changing `main()` to print its failures and then
+`return 0`, leaving the literal "return 1" behind as a comment for the grep to find — all 17
+tests still passed in 0.08 s. `bash tests/gate.sh` would have printed FAIL and exited 0, and
+exit 0 IS the gate. tools/mypy_gate.py was in the same position for the same reason (nothing
+called it), so its ratchet is covered here too.
+
+So the behavioural half below EXECUTES both tools with their slow parts stubbed: the exit
+code is asserted from a seeded outcome, not read off the source. Checked against real
+mutations rather than assumed — `return 0` in place of `return 1` fails four of these, and a
+regression predicate that can never be true fails three more, including the one guarding
+`--allow-incomparable` against being widened past the environment case.
 """
+import importlib.util
+import json
 import os
 import re
+import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CI = os.path.join(_ROOT, ".github", "workflows", "ci.yml")
@@ -358,3 +378,171 @@ def test_ci_installs_numpy_for_the_type_check():
     assert any("numpy" in c for c in install), \
         "the lint job must install numpy, or mypy type-checks against no array stubs: " \
         + str(install)
+
+
+# --------------------------------------------------------------------------------------
+# BEHAVIOURAL HALF — the tools are executed, not grepped.
+#
+# Both are loaded by path (tools/ is not a package) and their slow work is replaced: the
+# gate's check_* functions become no-ops so main() only aggregates, and mypy_gate's
+# _run_mypy returns synthetic counts against a synthetic baseline. What is left is exactly
+# the logic a release depends on — "did anything fail, and does that reach the exit code".
+# --------------------------------------------------------------------------------------
+
+_GATE_CHECKS = ("check_native", "check_pytest", "check_per_suite",
+                "check_tool", "check_mypy", "check_leaks")
+
+
+def _load_tool(filename: str):
+    """Import tools/<filename> as a module object, by path."""
+    path = os.path.join(_ROOT, "tools", filename)
+    spec = importlib.util.spec_from_file_location(filename[:-3], path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_gate(failed=(), not_run=(), argv=("tools/gate.py",)):
+    """Run gate.main() with every check stubbed out and the outcome seeded.
+
+    Seeding the two lists the checks would have appended to isolates the aggregation from
+    the checks themselves — the checks have their own tests (the suite they run), while
+    "a non-empty _FAILED must exit nonzero" has had none.
+    """
+    g = _load_tool("gate.py")
+    for name in _GATE_CHECKS:
+        assert hasattr(g, name), f"gate.py no longer defines {name} — update this test"
+        setattr(g, name, lambda *a, **k: None)
+    g._FAILED[:] = list(failed)
+    g._NOT_RUN[:] = list(not_run)
+    saved = sys.argv
+    sys.argv = list(argv)
+    try:
+        return g.main()
+    finally:
+        sys.argv = saved
+
+
+def test_the_gate_exits_zero_only_when_nothing_failed():
+    assert _run_gate() == 0, "a gate with no failures must exit 0"
+
+
+def test_the_gate_exits_nonzero_when_a_check_failed():
+    """The mutation that proved this file was untested: main() printing FAIL and returning 0.
+    `exit 0 is the gate` is the sentence in CLAUDE.md this asserts."""
+    assert _run_gate(failed=["pytest not-perf"]) == 1, \
+        "a failed check must make the gate exit nonzero"
+
+
+def test_the_gate_reports_every_failure_so_one_cannot_hide_the_rest(capsys):
+    """The aggregating design: checks all run and every failure is named. A gate that stopped
+    at the first red would send someone round the loop once per defect."""
+    rc = _run_gate(failed=["native build", "ruff", "leak scan"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL (3)" in out, out
+    for name in ("native build", "ruff", "leak scan"):
+        assert name in out, f"{name} missing from the summary:\n{out}"
+
+
+def test_a_not_run_check_is_named_and_does_not_by_itself_fail(capsys):
+    """NOT RUN HERE is a third outcome: it must be printed (never silently dropped), and it
+    is not a failure — the reader decides what unrun coverage means for a tag."""
+    rc = _run_gate(not_run=["mypy ratchet (environment differs from the baseline)"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NOT RUN HERE (1)" in out, out
+    assert "mypy ratchet" in out
+
+
+def test_an_unrun_check_never_masks_a_real_failure(capsys):
+    """Both sections must appear together. A run that skipped a check AND failed another
+    must not report only the skip."""
+    rc = _run_gate(failed=["pytest perf"], not_run=["leak scan: site-specific patterns"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "NOT RUN HERE (1)" in out and "FAIL (1)" in out, out
+
+
+def test_quick_mode_still_cannot_pass_with_a_failure(capsys):
+    """--quick drops perf and the per-suite pass, which is why it says so in the summary —
+    but it must not soften the verdict on what it DID run."""
+    rc = _run_gate(failed=["ruff"], argv=("tools/gate.py", "--quick"))
+    assert rc == 1
+    assert "FAIL (1)" in capsys.readouterr().out
+
+
+# --- the mypy ratchet -------------------------------------------------------------------
+
+_BASE_ENV = {"mypy": "1.11.0", "numpy": "2.1.0"}
+# Real tracked paths: the ratchet fails a baseline naming a file that no longer exists, so a
+# made-up path would fail every case for the wrong reason.
+_F1 = os.path.join("swi3s_studio", "__init__.py")
+_F2 = os.path.join("swi3s_studio", "session.py")
+
+
+def _run_ratchet(counts, baseline, tmp_path, argv=("tools/mypy_gate.py",), base_env=None):
+    """Run mypy_gate.main() against synthetic counts and a synthetic baseline file."""
+    m = _load_tool("mypy_gate.py")
+    m._run_mypy = lambda: (dict(counts), "<mypy output>")
+    m._env_fingerprint = lambda: dict(_BASE_ENV)
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({
+        "env": dict(_BASE_ENV if base_env is None else base_env),
+        "total": sum(baseline.values()),
+        "per_file": dict(baseline),
+    }), encoding="utf-8")
+    m._BASELINE = str(path)
+    saved = sys.argv
+    sys.argv = list(argv)
+    try:
+        return m.main()
+    finally:
+        sys.argv = saved
+
+
+def test_the_ratchet_passes_an_unchanged_count(tmp_path):
+    assert _run_ratchet({_F1: 3}, {_F1: 3}, tmp_path) == 0
+
+
+def test_the_ratchet_fails_a_file_that_gained_an_error(tmp_path):
+    """The mutation here was `regressions = []`, which reported no regression whatever mypy
+    found. One more error in one file must fail."""
+    assert _run_ratchet({_F1: 4}, {_F1: 3}, tmp_path) == 1
+
+
+def test_the_ratchet_fails_new_debt_in_a_file_absent_from_the_baseline(tmp_path):
+    """Per-file, not a total: a clean file acquiring errors is a regression even when some
+    other file improved enough to keep the total flat."""
+    assert _run_ratchet({_F1: 1, _F2: 2}, {_F1: 3}, tmp_path) == 1
+
+
+def test_the_ratchet_passes_an_improvement(tmp_path):
+    assert _run_ratchet({_F1: 1}, {_F1: 3}, tmp_path) == 0
+
+
+def test_the_ratchet_reports_an_incomparable_environment_as_three(tmp_path):
+    """Exit 3 is neither pass nor fail, so tools/gate.py can list it as NOT RUN HERE instead
+    of failing a build over a stub version or implying the comparison happened."""
+    assert _run_ratchet({_F1: 3}, {_F1: 3}, tmp_path,
+                        base_env={"mypy": "9.9.9", "numpy": "0.0.1"}) == 3
+
+
+def test_allow_incomparable_maps_only_the_environment_case_to_success(tmp_path):
+    assert _run_ratchet({_F1: 3}, {_F1: 3}, tmp_path,
+                        argv=("tools/mypy_gate.py", "--allow-incomparable"),
+                        base_env={"mypy": "9.9.9", "numpy": "0.0.1"}) == 0
+
+
+def test_allow_incomparable_does_not_swallow_a_regression(tmp_path):
+    """The escape hatch CI needs, and the one way it must never be widened. This is the case
+    the textual test claimed to pin by checking where the flag's name appeared in the file."""
+    assert _run_ratchet({_F1: 4}, {_F1: 3}, tmp_path,
+                        argv=("tools/mypy_gate.py", "--allow-incomparable")) == 1
+
+
+def test_the_ratchet_fails_a_baseline_naming_a_deleted_file(tmp_path):
+    """A stale entry lets a recreated file inherit a count nobody reviewed (found in the
+    3.0.12 review): fewer errors than the stale number read as 'improved' and exited 0."""
+    gone = os.path.join("swi3s_studio", "no_such_module_here.py")
+    assert _run_ratchet({_F1: 3}, {_F1: 3, gone: 4}, tmp_path) == 1

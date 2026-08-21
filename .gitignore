@@ -64,3 +64,12 @@ tests/visualizer/previous_stats.json
 # Local-only working notes: session logs, review transcripts, one-off analyses,
 # probe scripts. Tier 0 — never committed to any remote. See docs/DEVELOPMENT.md.
 dev_docs/
+
+# Coverage artefacts. `.coverage` is a binary database that a `git add -A` right after a
+# coverage run WILL sweep into the tree — it did, in 3.0.13, and reached a pushed commit
+# before the tier test caught it. The gate could not: it lists TRACKED files, and the file
+# was untracked at gate time and tracked by the very `git add -A` that followed.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

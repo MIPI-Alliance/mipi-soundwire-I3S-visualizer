@@ -72,8 +72,15 @@ def test_sspas_are_well_formed(sessions, name, _kw, _n):
 @pytest.mark.parametrize("name,_kw,_n", _DEMOS, ids=[d[0] for d in _DEMOS])
 def test_sspas_do_not_corrupt_the_capture(sessions, name, _kw, _n):
     """Adding SSPAs must not introduce a single CRC error anywhere: a mis-sized or
-    mis-framed SSPA would desync the 8b10b stream and redden later commands too."""
-    bad = [c for c in sessions[name].commands if not c.get("crc_valid", True)]
+    mis-framed SSPA would desync the 8b10b stream and redden later commands too.
+
+    The `has_manager_packet` guard is the same rule `analysis/errors.py` applies, and it
+    matters: a ReadData phase carries NO Manager Packet, so there is no CRC over it and
+    `crc_valid` stays at its unset default. Without the guard this flagged a perfectly good
+    deferred-read delivery as corrupt — found the moment a demo first emitted one (3.0.13).
+    A phase with nothing to check cannot fail the check."""
+    bad = [c for c in sessions[name].commands
+           if c.get("has_manager_packet") and not c.get("crc_valid", True)]
     assert not bad, f"{name}: {len(bad)} CRC-invalid command(s)"
 
 

@@ -4,8 +4,9 @@
 # Compiles the C++ decode core (reused verbatim from the Saleae plugin) + the
 # ISampleSource/Decoder/Demo + pybind11 bindings straight into an importable
 # extension. The normal build path is `pip install ./native` (scikit-build-core);
-# use this when PyPI is unreachable. Requires clang++, Python dev headers, and
-# pybind11 headers (auto-discovered, incl. the copy bundled with torch).
+# use this when PyPI is unreachable. Requires a C++ compiler (clang++ preferred,
+# g++ accepted, $CXX honoured), Python dev headers, and pybind11 headers
+# (auto-discovered, incl. the copy bundled with torch).
 #
 # Usage:  ./build_local.sh   then   PYTHONPATH=.. python3 -c "import swi3score"
 set -euo pipefail
@@ -14,19 +15,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Decode core is vendored in-repo (see CMakeLists.txt / swi3score/core/README.md).
 PLUGIN_SRC="$HERE/swi3score/core"
 
-PYBIND="${PYBIND11_INCLUDE:-$(python3 -c 'import pybind11; print(pybind11.get_include())' 2>/dev/null || true)}"
+# EVERY PYTHON FACT BELOW MUST COME FROM ONE INTERPRETER — the one that will import the result.
+# `python3` off PATH is not it: a gate or a venv drives this script with a different build, and
+# taking pybind11 from one Python while taking EXT_SUFFIX from another produces a module named
+# for an interpreter that cannot load it. $PYTHON is set by tools/gate.py; the fallback is for
+# a bare shell invocation.
+PY="${PYTHON:-python3}"
+
+PYBIND="${PYBIND11_INCLUDE:-$("$PY" -c 'import pybind11; print(pybind11.get_include())' 2>/dev/null || true)}"
 if [ -z "${PYBIND}" ] || [ ! -f "${PYBIND}/pybind11/pybind11.h" ]; then
     # Fall back to the pybind11 headers bundled inside an installed torch.
-    PYBIND="$(python3 - <<'PY' 2>/dev/null || true
+    PYBIND="$("$PY" - <<'PYEOF' 2>/dev/null || true
 import os, importlib.util
 s = importlib.util.find_spec("torch")
 print(os.path.join(os.path.dirname(s.origin), "include") if s else "")
-PY
+PYEOF
 )"
 fi
 [ -f "${PYBIND}/pybind11/pybind11.h" ] || { echo "pybind11 headers not found; set PYBIND11_INCLUDE" >&2; exit 1; }
 
-PYINC="${PYTHON_INCLUDE:-$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')}"
+PYINC="${PYTHON_INCLUDE:-$("$PY" -c 'import sysconfig; print(sysconfig.get_path("include"))')}"
 # Check the HEADERS, not just the directory. sysconfig reports the include path of the
 # BASE prefix, which for a venv on a system Python without its -devel package is a
 # /usr/include/pythonX.Y that doesn't exist — the compile would then fail 20 lines in
@@ -50,16 +58,36 @@ See the README ("No root / no sudo") for the full recipe.
 EOF
     exit 1
 fi
-SUFFIX="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+SUFFIX="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 OUT="$HERE/../swi3score${SUFFIX}"
+
+# THE COMPILER AND THE LINK FLAGS ARE PLATFORM-SPECIFIC, and this script called itself a Unix
+# build path while assuming macOS on both counts: it hardcoded clang++, which Ubuntu does not
+# install with build-essential (that is g++), and it passed `-undefined dynamic_lookup`, a
+# Mach-O flag GNU ld rejects outright. The Ubuntu guest's first gate run failed here — and
+# since gate.py returns early on a build failure, the ABI assert after it never ran, so the
+# suite went on to test whatever core happened to be installed already.
+CXX="${CXX:-$(command -v clang++ || command -v g++ || true)}"
+[ -n "$CXX" ] || { echo "no C++ compiler found; install clang++ or g++, or set CXX" >&2; exit 1; }
+
+# Left unquoted at the call site so an empty value expands to nothing; a bash array would need
+# the ${a[@]+"${a[@]}"} dance to survive `set -u` under macOS's bash 3.2.
+LINK_FLAGS=""
+case "$(uname -s)" in
+    # Mach-O resolves the Python symbols at load time against the running interpreter, so the
+    # extension links without libpython. ELF needs no equivalent: undefined symbols in a
+    # shared object are permitted by default.
+    Darwin) LINK_FLAGS="-undefined dynamic_lookup" ;;
+esac
 
 echo "pybind11 : $PYBIND"
 echo "python   : $PYINC"
+echo "compiler : $CXX"
 echo "output   : $OUT"
 
 # -O3 + LTO: decode is per-clock-edge (millions of UIs), and the hot loop spans
 # several .cpp files, so cross-TU inlining matters. Portable (no -march=native).
-clang++ -O3 -flto -std=c++17 -shared -fPIC -undefined dynamic_lookup -fvisibility=hidden \
+"$CXX" -O3 -flto -std=c++17 -shared -fPIC $LINK_FLAGS -fvisibility=hidden \
     -I"$PYBIND" -I"$PYINC" \
     -I"$HERE/swi3score/compat" -I"$HERE/swi3score" -I"$PLUGIN_SRC" \
     "$HERE/swi3score/bindings.cpp" \

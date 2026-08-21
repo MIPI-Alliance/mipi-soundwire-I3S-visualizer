@@ -25,11 +25,19 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import swi3score
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetricsF,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+)
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView
 
 from ..model.grid_slots import GridSlot
@@ -90,6 +98,11 @@ def bookmark_pair_color(label: str) -> QColor:
     letter = (str(label) or "A")[:1].upper()
     idx = (ord(letter) - 65) if "A" <= letter <= "Z" else 0
     return QColor(_DP_PALETTE[idx % len(_DP_PALETTE)])
+
+
+def _dev_tag(device: int) -> str:
+    """Short device tag for a colour-key label: the Manager sentinel reads "Mgr"."""
+    return "Mgr" if int(device) < 0 else f"D{int(device)}"
 
 # Slot enum ints, from the shared GridSlot vocabulary (model/grid_slots.py). 1–6
 # (Data..Drq) coincide with the C++ SwI3sSlot enum, so decode-path cells render
@@ -155,11 +168,13 @@ class GridView(QGraphicsView):
         self.setBackgroundBrush(_BG)
         self._stream_colors: dict = {}
         self._stream_channels: dict = {}
-        self._by_dp = False        # engine mode colours by dp number (like the Visualizer)
+        self._by_slot = False      # engine mode colours by config slot (like the Visualizer)
+        self._slot_port: Dict[int, Tuple[int, int]] = {}   # slot -> (device, logical dp)
+        self._slot_names: Dict[int, str] = {}              # slot -> user name (see set_bus_model)
         self._dp_display: Dict[Tuple[int, int], dict] = {}
         # [(QRectF in scene coords, (device, dp))] for the top colour-key swatches —
         # rebuilt by _draw_top_key, consumed by mousePressEvent. Empty in engine
-        # (Visualizer) mode, where the key is coloured by dp number with no device.
+        # (Visualizer) mode, where label fields are edited from the authoring panel.
         self._key_hits: List[Tuple[QRectF, Tuple[int, int]]] = []
         self._sys_slots: List[tuple] = []
         self._engine_mode = False
@@ -170,6 +185,18 @@ class GridView(QGraphicsView):
         # "P Mix" when a present peripheral isn't guarding a given column (see
         # _draw_cds_system). Rebuilt in set_bus_model; empty otherwise.
         self._present_periph: set = set()
+        # What a CDS cell is labelled. "CDS" normally; "CDS_SP" when the config sets
+        # CDS_DriveType to Special, where a CDS bit of 1 is left high-Z for the Manager's
+        # bus keeper to hold rather than actively driven — a decode-visible difference
+        # (NRZS) worth seeing on the cell. Held as ONE attribute rather than passed down
+        # the drawing calls because three separate paths draw a CDS cell (the merged
+        # run in _draw_row, _sys_full's synthesized block, and the TX raster's column 0)
+        # and a literal in each is how they would drift apart. Only the Visualizer path
+        # sets it; the analyzer and TX map leave it at the default. See bus_config.cds_symbol.
+        self._cds_symbol = "CDS"
+        # column -> extra width, for the CDS run only (see _size_cds_columns). Empty means a
+        # uniform _CW grid, which is every path that draws no CDS flags.
+        self._col_extra: Dict[int, float] = {}
         self._show_key = True       # draw the top DP colour-key band (see set_show_key)
         self._tx_raster_key = None  # last-rendered set_tx_raster() content key (see there)
         self._content_key = None    # last-rendered set_cells/set_bus_model content key
@@ -246,8 +273,12 @@ class GridView(QGraphicsView):
         return _KEY_H if self._show_key else 0
 
     def stream_color(self, device: int, dp: int) -> QColor:
-        key = dp if self._by_dp else (device, dp)
-        return self._stream_colors.get(key, _CDS_FILL)
+        """Colour for a decoded (device, dp) stream. Analysis-mode accessor: the engine
+        grid's map is keyed by config slot, which a (device, dp) pair cannot name when
+        two slots share a number, so it returns the empty fill there."""
+        if self._by_slot:
+            return _CDS_FILL
+        return self._stream_colors.get((device, dp), _CDS_FILL)
 
     def show_message(self, text: str, subtext: str = "") -> None:
         """Replace the grid with a centred message — used to render a non-grid
@@ -302,8 +333,16 @@ class GridView(QGraphicsView):
         self._dp_display = dp_display or {}
         self._sys_slots = list(system_slots or [])
         self._engine_mode = False
+        # Back to the plain symbol: this is the decoded (analyzer) grid, which reads a
+        # capture rather than an authored config, so it has no CDS_DriveType to honour.
+        # Reset explicitly — the attribute survives a mode switch otherwise, and the
+        # Visualizer's "CDS_SP" would leak onto an analyzer grid.
+        self._cds_symbol = "CDS"
         self._clashes = {}
         self._assign_stream_colors(cells)
+        # No CDS flags on the decoded path (see set_cells), so this is a no-op there — called
+        # anyway so a future analyzer-side label cannot forget it.
+        self._size_cds_columns(cells, self._cds_label(1))
 
         rows = max((c["row"] for c in cells), default=-1) + 1
         cols = max(column_count, (max((c["col"] for c in cells), default=-1) + 1))
@@ -325,29 +364,44 @@ class GridView(QGraphicsView):
         self._finalize_scene(reset_scroll=True)
 
     def set_bus_model(self, cells: List[dict], clashes: dict, column_count: int,
-                      num_rows: int) -> None:
+                      num_rows: int, slot_names: Optional[Dict[int, str]] = None,
+                      cds_symbol: str = "CDS") -> None:
         """Render from the Visualizer engine's BusModel (via viz_engine.render_payload):
         the cells already include the CDS/S0/S1/handover system bits with device, so
         the per-source-port handover heuristic + CDS-block synthesis are suppressed
-        and clash markers (X) are drawn from the model's clash lists."""
+        and clash markers (X) are drawn from the model's clash lists.
+
+        ``slot_names`` maps a config-slot index to the port's user-assigned name, used to
+        label the colour key; without it the key falls back to "Mgr·DP0"/"D1·DP0".
+
+        ``cds_symbol`` is what the CDS cells are labelled — "CDS", or "CDS_SP" when the
+        config sets CDS_DriveType to Special. It is a rendering label only: no cell moves,
+        which is why it arrives here rather than through the engine's bit model."""
         # Content cache (see set_cells): skip the full rebuild when the model + clashes
-        # are unchanged, as on a cursor move within one config region.
+        # are unchanged, as on a cursor move within one config region. THE CDS SYMBOL IS
+        # IN THE KEY: nothing else in the key moves when only CDS_DriveType is toggled, so
+        # without it the redraw would be skipped as unchanged and the label would not
+        # appear until some other edit happened to invalidate the cache.
         try:
             key = ("model", int(column_count), int(num_rows), self._show_key,
-                   _cells_key(cells), _freeze(clashes or {}))
+                   _cells_key(cells), _freeze(clashes or {}), _freeze(slot_names or {}),
+                   str(cds_symbol))
         except TypeError:
             key = None
         if key is not None and key == self._content_key:
             return
         self._content_key = key
+        self._cds_symbol = str(cds_symbol)
         self._scene.clear()
         self._key_hits = []   # swatch rects died with the scene
         self._tx_raster_key = None   # scene no longer holds the cached TX raster
         self._dp_display = {}
+        self._slot_names = {int(k): str(v) for k, v in (slot_names or {}).items()}
         self._sys_slots = []
         self._engine_mode = True
         self._clashes = clashes or {}
-        self._assign_stream_colors(cells, by_dp=True)
+        self._assign_stream_colors(cells, by_slot=True)
+        self._size_cds_columns(cells, self._cds_label(1))
         # Peripheral roster present on the bus: any device>=0 driving anything
         # (data/guard/tail/handover). Drives the CDS "P Mix" guard label.
         self._present_periph = {c["device"] for c in cells if c.get("device", -1) >= 0}
@@ -405,6 +459,8 @@ class GridView(QGraphicsView):
         self._dp_display = {}
         self._sys_slots = []
         self._cell_at = {}
+        self._cds_symbol = "CDS"     # a capture raster, not an authored config
+        self._col_extra = {}         # ...and a uniform grid
         if tx is None or cols <= 0 or nrows <= 0:
             self._finalize_scene(reset_scroll=True)
             return
@@ -509,36 +565,106 @@ class GridView(QGraphicsView):
             self.horizontalScrollBar().setValue(int(r.left()))
             self.verticalScrollBar().setValue(int(r.top()))
 
+    # ---- column geometry: every column is _CW WIDE EXCEPT the CDS run ----
+    #
+    # `CDS_SPx` needs 58 px in a 44 px cell and overflowed, and the fix is to widen the ONE
+    # column that carries a long label rather than every column — widening the grid uniformly
+    # costs horizontal room on a view whose whole job is fitting 32 columns on screen.
+    #
+    # `_col_extra` maps a column index to the pixels it gains, and `_col_off` is its running
+    # prefix sum so `_cx` stays O(1). Both are rebuilt per render (see `_size_cds_columns`) and
+    # empty by default, so every path that never widens anything behaves exactly as before.
     def _cx(self, c: int) -> float:
-        return _ROWHDR_W + c * _CW
+        return _ROWHDR_W + c * _CW + self._col_off(c)
+
+    def _col_off(self, c: int) -> float:
+        """Total extra width of the columns BEFORE `c`."""
+        if not self._col_extra:
+            return 0.0
+        return sum(v for k, v in self._col_extra.items() if k < c)
+
+    def _colw(self, c: int) -> float:
+        """Width of column `c`."""
+        return _CW + self._col_extra.get(c, 0.0)
+
+    def _span_w(self, c: int, n: int) -> float:
+        """Width of `n` columns starting at `c` — the widened ones included."""
+        return sum(self._colw(c + k) for k in range(max(1, n)))
+
+    def _grid_w(self, cols: int) -> float:
+        """Total width of `cols` columns."""
+        return cols * _CW + sum(v for k, v in self._col_extra.items() if k < cols)
+
+    def _size_cds_columns(self, cells: List[dict], label: str) -> None:
+        """Give the CDS columns enough width for `label`, and nothing else any.
+
+        Sized from the RENDERED text, not from a character count: the label is two lines
+        ("CDS" over its flags) and the wider line decides. Split across the run when the CDS
+        spans several columns, so a wide-bit CDS grows less per column or not at all.
+        """
+        self._col_extra = {}
+        cds_cols = sorted({c["col"] for c in cells if c.get("is_cds")})
+        if not cds_cols or "\n" not in label:
+            return
+        fm = QFontMetricsF(self._f_label)
+        need = max(fm.horizontalAdvance(line) for line in label.split("\n")) + 8
+        span = len(cds_cols)
+        if need <= span * _CW:
+            return
+        extra = (need - span * _CW) / span
+        for c in cds_cols:
+            self._col_extra[c] = extra
 
     def _cy(self, r: int) -> float:
         return self._key_band() + _COLHDR_H + r * _RH
 
     # ---- colour assignment ----
-    def _assign_stream_colors(self, cells: List[dict], by_dp: bool = False) -> None:
-        """by_dp=True (engine/Bus-Visualizer): colour by DP NUMBER (`palette[dp%12]`,
-        key "DP{n}") exactly like the Visualizer's frame_renderer. by_dp=False
-        (Analysis): colour each (device, dp) stream distinctly by appearance."""
-        self._by_dp = by_dp
-        if by_dp:
-            dps = sorted({c["dp"] for c in cells if not c["is_cds"] and c["dp"] >= 0})
-            self._stream_colors = {dp: QColor(_DP_PALETTE[dp % len(_DP_PALETTE)])
-                                   for dp in dps}
+    def _assign_stream_colors(self, cells: List[dict], by_slot: bool = False) -> None:
+        """by_slot=True (engine/Bus-Visualizer): colour by the port's CONFIG SLOT
+        (`palette[slot%12]`), which is what the Visualizer's frame_renderer does — there
+        `dp` *was* the slot index. Studio's cells carry the logical DataPortNumber instead,
+        and several slots may share one number (each device may use its own DP0), so
+        keying on the number collapsed distinct ports onto one colour and one swatch.
+        by_slot=False (Analysis): colour each (device, dp) stream distinctly."""
+        self._by_slot = by_slot
+        if by_slot:
+            slots = sorted({self._slot_of(c) for c in cells
+                            if not c["is_cds"] and self._slot_of(c) >= 0})
+            self._stream_colors = {s: QColor(_DP_PALETTE[s % len(_DP_PALETTE)])
+                                   for s in slots}
+            # Slot -> (device, logical dp) for the key's label, taken from the cells so
+            # no extra plumbing is needed; every drawn slot has at least one cell here.
+            self._slot_port = {}
+            for c in cells:
+                s = self._slot_of(c)
+                if s >= 0 and s not in self._slot_port:
+                    self._slot_port[s] = (int(c["device"]), int(c["dp"]))
         else:
             streams = sorted({(c["device"], c["dp"]) for c in cells
                               if not c["is_cds"] and c["dp"] >= 0 and c["device"] >= 0})
             # Key each stream's colour by its (device, dp) VALUE, not appearance order, so
             # a port keeps its colour when other ports enable/disable (see dp_stream_color).
             self._stream_colors = {sd: dp_stream_color(sd[0], sd[1]) for sd in streams}
+            self._slot_port = {}
         chans: dict = {}
         for c in cells:
-            if not c["is_cds"] and c["dp"] >= 0 and c["channel"] >= 0 and (by_dp or c["device"] >= 0):
-                chans.setdefault(c["dp"] if by_dp else (c["device"], c["dp"]), set()).add(c["channel"])
+            key = self._slot_of(c) if by_slot else (c["device"], c["dp"])
+            ok = (not c["is_cds"] and c["dp"] >= 0 and c["channel"] >= 0
+                  and (self._slot_of(c) >= 0 if by_slot else c["device"] >= 0))
+            if ok:
+                chans.setdefault(key, set()).add(c["channel"])
         self._stream_channels = chans
 
+    @staticmethod
+    def _slot_of(cell: dict) -> int:
+        """A cell's config-slot index. Engine cells carry ``dp_index``; hand-built and
+        decoded cells don't, and there the logical number IS the slot (identity mapping),
+        so falling back to ``dp`` reproduces the previous behaviour rather than raising."""
+        v = cell.get("dp_index")
+        return int(cell["dp"]) if v is None else int(v)
+
     def _color(self, cell: dict) -> QColor:
-        key = cell["dp"] if self._by_dp else (cell["device"], cell["dp"])
+        key = self._slot_of(cell) if self._by_slot else (cell["device"], cell["dp"])
         return self._stream_colors.get(key, _CDS_FILL)
 
     def _dp_disp(self, cell: dict) -> Tuple[int, bool]:
@@ -556,14 +682,15 @@ class GridView(QGraphicsView):
     def _draw_row(self, r: int, row_cells: List[dict], cols: int,
                   cds_labels: dict) -> None:
         # CDS full-height cells — merge consecutive CDS columns into one "CDS"
-        # (or "CDS x{n}") cell with bit dividers, like the Visualizer.
+        # (or "CDS x{n}") cell with bit dividers, like the Visualizer. The base symbol
+        # is "CDS_SP" instead when the config drives the CDS passively (see _cds_symbol).
         cds_cols = sorted(c["col"] for c in row_cells if c["is_cds"])
         i = 0
         while i < len(cds_cols):
             n = 1
             while i + n < len(cds_cols) and cds_cols[i + n] == cds_cols[i] + n:
                 n += 1
-            label = cds_labels.get(r) or ("CDS" if n == 1 else f"CDS x{n}")
+            label = cds_labels.get(r) or self._cds_label(n)
             cell = {"row": r, "col": cds_cols[i], "is_cds": True, "slot": 0,
                     "dp": -1, "channel": -1, "is_source": True}
             self._full_cell(r, cds_cols[i], n - 1, _BG, label, _LABEL, cell)
@@ -635,10 +762,26 @@ class GridView(QGraphicsView):
                 elif kind == "guard":
                     self._sys_full(r, col, "G0")
                 else:                                  # 'cds'
-                    self._sys_full(r, col, "CDS")
+                    self._sys_full(r, col, self._cds_label(1), is_cds=True)
 
-    def _sys_full(self, r: int, col: int, label: str) -> None:
-        cell = {"row": r, "col": col, "is_cds": label == "CDS", "slot": 0,
+    def _cds_label(self, n: int) -> str:
+        """The CDS cell's label for a run of `n` merged columns.
+
+        `_cds_symbol` is "CDS" or two lines — "CDS" over its flags ("SP", "SPx EDEx", …). A
+        merged run's " x{n}" belongs on the FIRST line beside the name, not appended to the
+        flags, so the two are composed here rather than by string concatenation at the call
+        site (which is what produced "CDS\nSPx x2")."""
+        head, _, flags = self._cds_symbol.partition("\n")
+        if n > 1:
+            head = f"{head} x{n}"
+        return f"{head}\n{flags}" if flags else head
+
+    def _sys_full(self, r: int, col: int, label: str, *, is_cds: bool = False) -> None:
+        # `is_cds` is PASSED, not inferred from the label. It used to read
+        # `label == "CDS"`, which silently became False the moment the label could also
+        # be "CDS_SP" — turning the CDS column into an ordinary system cell for exactly
+        # the configs the new label exists to mark.
+        cell = {"row": r, "col": col, "is_cds": is_cds, "slot": 0,
                 "dp": -1, "channel": -1, "is_source": True}
         self._full_cell(r, col, 0, _BG, label, _LABEL, cell)
 
@@ -824,15 +967,20 @@ class GridView(QGraphicsView):
         return label
 
     # ---- cell primitives ----
-    def _bit_dividers(self, x: float, y: float, h: float, extra: int) -> None:
+    def _bit_dividers(self, x: float, y: float, h: float, extra: int, c: int = -1) -> None:
         """Short vertical lines marking the bit-column boundaries inside a merged
-        (wide) cell — 25% height up from the bottom (Visualizer _draw_bit_rect)."""
+        (wide) cell — 25% height up from the bottom (Visualizer _draw_bit_rect).
+
+        `c` is the cell's first COLUMN, so a boundary lands where the column actually is: with
+        a widened CDS run the columns are no longer a uniform _CW apart, and stepping by _CW
+        would draw the dividers away from the cell's own bit edges. -1 keeps the uniform step
+        for callers that have only an x (the TX raster, whose grid never widens)."""
         if extra <= 0:
             return
         pen = QPen(_LINE, 1)
         y1 = y + h * 0.75
         for k in range(1, extra + 1):
-            lx = x + k * _CW
+            lx = x + (self._span_w(c, k) if c >= 0 else k * _CW)
             self._scene.addLine(lx, y1, lx, y + h, pen)
 
     def _half_cell(self, r: int, c: int, extra: int, is_src: bool,
@@ -843,12 +991,12 @@ class GridView(QGraphicsView):
         w = (extra + 1) * _CW
         rect = self._scene.addRect(QRectF(x, y, w, _HALF), QPen(_LINE, 1), QBrush(color))
         self._diff(rect, cell)
-        self._bit_dividers(x, y, _HALF, extra)
+        self._bit_dividers(x, y, _HALF, extra, c)
         if scrambler:
             # scrambler indicator: a black square flush in the cell's top-left
             # corner (touching the top and left borders) per scrambled bit column
             for k in range(extra + 1):
-                sx = x + k * _CW
+                sx = x + self._span_w(c, k)
                 self._scene.addRect(QRectF(sx, y, 6, 6),
                                     QPen(Qt.NoPen), QBrush(QColor(0, 0, 0)))
         if label:
@@ -858,10 +1006,10 @@ class GridView(QGraphicsView):
                    label: str, ink: QColor, cell: dict) -> None:
         x = self._cx(c)
         y = self._cy(r)
-        w = (extra + 1) * _CW
+        w = self._span_w(c, extra + 1)
         rect = self._scene.addRect(QRectF(x, y, w, _RH), QPen(_LINE, 1), QBrush(fill))
         self._diff(rect, cell)
-        self._bit_dividers(x, y, _RH, extra)
+        self._bit_dividers(x, y, _RH, extra, c)
         if label:
             self._text(label, x, y, w, _RH, ink)
 
@@ -881,7 +1029,7 @@ class GridView(QGraphicsView):
         else:
             y0 = self._cy(r) + (0 if is_src else _HALF)
             h, fill = _HALF, color
-        w = cols * _CW
+        w = self._span_w(c, cols)
         rect = self._scene.addRect(QRectF(x, y0, w, h), QPen(_LINE, 1), QBrush(fill))
         self._diff(rect, cell)
         if label:
@@ -957,6 +1105,24 @@ class GridView(QGraphicsView):
         # (full rich-text/QTextDocument engine): ~2x cheaper per label and these are all
         # plain strings. It has no document margin, matching the setDocumentMargin(0) the
         # rich-text path used, so placement/boundingRect are identical.
+        # MULTI-LINE IS DRAWN LINE BY LINE. A QGraphicsSimpleTextItem holding a "\n" renders
+        # the block correctly but LEFT-ALIGNS each line inside it, so the CDS cell's "CDS" sat
+        # flush against its wider "SPx EDEx" instead of centred over it. One item per line
+        # costs a second item on the one column that has two lines, and centres both.
+        if "\n" in text:
+            lines = text.split("\n")
+            items = []
+            for line in lines:
+                it = self._scene.addSimpleText(line, font or self._f_label)
+                it.setBrush(color)
+                items.append(it)
+            lh = max(i.boundingRect().height() for i in items)
+            top = y + (h - lh * len(items)) / 2
+            for k, it in enumerate(items):
+                bw = it.boundingRect().width()
+                ix = x + w - bw - 3 if align_right else x + (w - bw) / 2
+                it.setPos(ix, top + k * lh)
+            return
         t = self._scene.addSimpleText(text, font or self._f_label)
         t.setBrush(color)
         br = t.boundingRect()
@@ -967,7 +1133,7 @@ class GridView(QGraphicsView):
         gy0 = self._cy(0)
         # column numbers (no background band — straight on the dark canvas)
         for c in range(cols):
-            self._text(str(c), self._cx(c), gy0 - _COLHDR_H, _CW, _COLHDR_H,
+            self._text(str(c), self._cx(c), gy0 - _COLHDR_H, self._colw(c), _COLHDR_H,
                        _LABEL, font=self._f_num)
         # row numbers down the left gutter
         for r in range(rows):
@@ -978,32 +1144,40 @@ class GridView(QGraphicsView):
         if not self._show_key or not self._stream_colors:
             return
         items = list(self._stream_colors.items())
-        single_dev = self._by_dp or len({k[0] for k in self._stream_colors}) == 1
+        single_dev = (len({d for d, _ in self._slot_port.values()}) == 1 if self._by_slot
+                      else len({k[0] for k in self._stream_colors}) == 1)
         sw_w, sw_h, gap = 46, 18, 8
         total = len(items) * (sw_w + gap) - gap
         gx0 = self._cx(0)
-        start = gx0 + max(0, (cols * _CW - total) / 2)
+        start = gx0 + max(0, (self._grid_w(cols) - total) / 2)
         y = (_KEY_H - sw_h) / 2
         cur = start
         self._key_hits = []          # [(QRectF, (device, dp))] — see mousePressEvent
         for key, color in items:
             rect = QRectF(cur, y, sw_w, sw_h)
             self._scene.addRect(rect, QPen(_LINE), QBrush(color))
-            if self._by_dp:
-                label = f"DP{key}"
+            if self._by_slot:
+                # One swatch per config slot. Label it with the port's own identity, not
+                # its slot number: several slots can share a DataPortNumber, so "DP0" x4
+                # would name the colours no better than merging them did.
+                dev, dp = self._slot_port.get(key, (-1, key))
+                label = (self._slot_names.get(key) or "").strip()
+                if not label:
+                    label = f"DP{dp}" if single_dev else f"{_dev_tag(dev)}·DP{dp}"
             else:
                 dev, dp = key
                 name = ((self._dp_display.get((dev, dp)) or {}).get("name") or "").strip()
                 label = name or (f"DP{dp}" if single_dev else f"D{dev}·DP{dp}")
                 # Only the decoded (analyzer) grid keys by (device, dp) and can map a
-                # swatch back to a real port; engine mode colours by dp number alone.
+                # swatch back to a real port; engine mode's label chooser is the
+                # authoring panel, so its swatches stay non-clickable.
                 self._key_hits.append((rect, (int(dev), int(dp))))
             self._text(label, cur, y, sw_w, sw_h, QColor(0, 0, 0), font=self._f_key)
             cur += sw_w + gap
 
     def _draw_frame(self, rows: int, cols: int, key_column: bool = True) -> None:
         gx0, gy0 = self._cx(0), self._cy(0)
-        grid_w = cols * _CW
+        grid_w = self._grid_w(cols)
         grid_h = rows * _RH
         right = gx0 + grid_w
         # The Source/Sink key column is per-row handover info for the config layout;

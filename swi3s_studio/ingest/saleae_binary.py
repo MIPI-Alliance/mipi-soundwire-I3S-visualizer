@@ -11,14 +11,15 @@ The writer round-trips the same format, so tests can synthesise capture files.
 The Logic 2 project ``.sal`` (a ZIP of ``meta.json`` + per-channel ``digital-N.bin``)
 is handled by ``saleae_sal``, which reuses :func:`parse_channel` for version-0
 digital blobs and :func:`parse_channel_v3` for Logic 2's **version-3 compressed
-internal** format (reverse-engineered below). Other versions raise
-:class:`UnsupportedSaleaeVersion`.
+internal** format (reverse-engineered below). Version 4 is the SAME format with the
+version field bumped -- see _V3_LIKE_VERSIONS for the evidence -- so it goes through
+the same reader. Other versions raise :class:`UnsupportedSaleaeVersion`.
 
 Version-3 layout (little-endian), reverse-engineered from Logic 2 captures and
 **validated to the sample against a Logic CSV export** (see the maintainers' .sal format notes)::
 
     0   char[8]  "<SALEAE>"
-    8   u32      version  (== 3)
+    8   u32      version  (== 3, or 4: identical format, see _V3_LIKE_VERSIONS)
     12  u32      type     (== 100, digital)
     16  u8       initial_state (0/1)
     17  f64      sample_rate
@@ -65,14 +66,15 @@ _HEADER = struct.Struct("<8s i i I d d Q")
 
 class UnsupportedSaleaeVersion(Exception):
     """A <SALEAE> blob whose version we don't decode. We handle version 0 (the
-    documented export) and version 3 (Logic 2's compressed internal `.sal`
-    format); anything else lands here."""
+    documented export) and versions 3 and 4 (Logic 2's compressed internal `.sal`
+    format, which are the same format under two version numbers); anything else
+    lands here."""
 
     def __init__(self, version: int, label: str = ""):
         self.version = version
         super().__init__(
             f"{label or 'channel'}: unsupported <SALEAE> digital format "
-            f"(version {version}). SWI3S Studio reads version 0 and 3; "
+            f"(version {version}). SWI3S Studio reads versions 0, 3 and 4; "
             f"in Logic 2 use Export → Raw data → Binary (or CSV) and open that.")
 
 
@@ -93,12 +95,26 @@ class DigitalChannelSamples:
 
 
 _V3_VERSION = 3
+_V4_VERSION = 4
+# Logic 2 bumped the digital blob's version from 3 to 4 with NO change to the format:
+# verified against a capture exported both ways, the 26-byte block header, the block chain
+# and the base-128 delta codec are all identical, and a v3 decode of a v4 blob reproduced the
+# v0 export's transition deltas EXACTLY on both channels (19,170,748 and 6,633,392
+# transitions, samples equal after the constant frame offset the metadata header carries at
+# byte 42). v4 also stamps per-block `level` correctly (306/306 blocks agreeing with the
+# decoded parity, 208 of them nonzero), so the windowed fast path in saleae_sal is sound on
+# it too. Only the version number moved, so the readers accept the SET rather than one value
+# -- and an unknown version still raises UnsupportedSaleaeVersion rather than being decoded
+# hopefully, because that is the difference between a clean refusal and a silently wrong bus.
+_V3_LIKE_VERSIONS = frozenset({_V3_VERSION, _V4_VERSION})
 _V3_TYPE_DIGITAL = 100
 # Public aliases for the v3 codec surface, so exporters (sal_export, saleae_sal)
 # don't reach into these privates. The codec + block-chain layout lives here (one
 # owner); callers pick the header (minimal round-trip vs full Logic-2).
 SALEAE_MAGIC = _MAGIC
 V3_VERSION = _V3_VERSION
+V4_VERSION = _V4_VERSION
+V3_LIKE_VERSIONS = _V3_LIKE_VERSIONS
 V3_TYPE_DIGITAL = _V3_TYPE_DIGITAL
 # Each transition-data block is prefixed by a 26-byte header:
 #   u64 A_start | u64 B_end | u16 level | u64 byte_count
@@ -167,6 +183,38 @@ def decode_v3_deltas(buf: bytes, off: int, nbytes: int):
 
 
 _v3_decode_deltas = decode_v3_deltas    # internal alias (pre-public name)
+
+# A v3 code is one MSB byte (>= 0x40), zero or more INTERIOR bytes (>= 0x80), then a terminal
+# byte (< 0x80) — so its digit count is (interiors + 2). 128**9 is exactly 2**63, which means
+# 10 base-128 digits overflow the int64 arithmetic BOTH fast paths use, and 11 wrap right
+# around: a crafted 11-digit code decodes to 1, which then satisfies the block chain's own
+# `sum == B_end - A_start` check against a crafted B_end of 1 and hands back a SILENTLY EMPTY
+# channel. A 10-digit code wraps NEGATIVE, which no unsigned B_end can match, so the chain
+# check alone already refused that one — but the streaming decoder in saleae_sal calls the
+# block decoder WITHOUT a chain check, and there a negative delta would flow through
+# cumsum into the uint64 sample cast as garbage. So the limit here is the arithmetic's, not
+# the chain's: nine digits (seven interiors) is the most int64 can hold.
+_V3_MAX_INTERIOR_RUN = 7
+
+
+def _v3_has_overlong_code(bb: np.ndarray) -> bool:
+    """True if `bb` contains a delta code too long for int64 to hold.
+
+    Counts the longest run of bytes >= 0x80 instead of re-deriving code boundaries, which
+    makes it independent of where the slice starts — the caller may be mid-chunk — and lets it
+    guard the NATIVE decoder too, which shares the same int64 arithmetic and cannot be checked
+    from Python any other way. No real capture comes close: the smallest delta that needs ten
+    digits is 2**63 samples, which is 585 years at 500 MS/s.
+    """
+    if bb.size == 0:
+        return False
+    high = bb >= 0x80
+    if not high.any():
+        return False
+    # Longest run of True: reset a running count at every False.
+    idx = np.arange(bb.size, dtype=np.int64)
+    last_low = np.maximum.accumulate(np.where(~high, idx, np.int64(-1)))
+    return bool(int((idx - last_low).max()) > _V3_MAX_INTERIOR_RUN)
 
 
 def _v3_decode_block_np(bb: np.ndarray, require_all: bool):
@@ -303,7 +351,7 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
     if len(data) < 16 or data[:8] != _MAGIC:
         raise ValueError(f"{label or 'data'}: not a Saleae binary capture (bad identifier)")
     version, ctype = struct.unpack_from("<II", data, 8)
-    if version != _V3_VERSION:
+    if version not in _V3_LIKE_VERSIONS:          # 3 and 4 are the same format (see the set)
         raise UnsupportedSaleaeVersion(version, label)
     if ctype != _V3_TYPE_DIGITAL:
         raise ValueError(f"{label or 'data'}: not a digital channel (type={ctype})")
@@ -312,7 +360,19 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
     buf8 = np.frombuffer(data, np.uint8) if _native_v3 is not None else None
 
     def decode_run(body, cnt):
-        """Decode one block's delta run to an int64 array — native if available."""
+        """Decode one block's delta run to an int64 array — native if available.
+
+        REJECTS AN OVER-LONG CODE FIRST, for both paths: they share the int64 arithmetic that
+        an 11-digit code wraps to 1, and the chain check below compares that 1 against a
+        B_end from the same (crafted) header, so it cannot catch it. Returning None here
+        makes walk() treat the block as "not a chain", which is the right outcome either way
+        — a spurious zero-qword in the metadata keeps scanning, and a genuinely corrupt
+        payload ends with MalformedSaleaeV3 rather than an empty channel that looks decoded.
+        """
+        bb = (buf8[body:body + cnt] if buf8 is not None
+              else np.frombuffer(data, np.uint8, count=cnt, offset=body))
+        if _v3_has_overlong_code(bb):
+            return None
         if _native_v3 is not None:
             return _native_v3(buf8, body, cnt)
         return _v3_decode_deltas_np(data, body, cnt)
@@ -347,6 +407,8 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
             elif a != prev_b:                       # blocks must chain
                 return None
             run = decode_run(body, cnt)                   # int64 array (native or numpy)
+            if run is None:                               # over-long code: not a valid chain
+                return None
             if int(run.sum()) != (b - a):
                 return None
             deltas.append(run)
@@ -441,7 +503,7 @@ def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
     if len(data) < 16 or data[:8] != _MAGIC:
         raise ValueError(f"{label or 'data'}: not a Saleae binary capture (bad identifier)")
     version, ctype = struct.unpack_from("<II", data, 8)
-    if version != _V3_VERSION:
+    if version not in _V3_LIKE_VERSIONS:          # 3 and 4 are the same format (see the set)
         raise UnsupportedSaleaeVersion(version, label)
     if ctype != _V3_TYPE_DIGITAL:
         raise ValueError(f"{label or 'data'}: not a digital channel (type={ctype})")
@@ -508,7 +570,7 @@ def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
 
 
 def build_channel_v3(initial_state: bool, transition_samples: np.ndarray,
-                     chunk_size: int = 0) -> bytes:
+                     chunk_size: int = 0, version: int = _V3_VERSION) -> bytes:
     """Serialise a version-3 digital blob (inverse of :func:`parse_channel_v3`).
 
     Writes a minimal header (`<SALEAE>` · version · type) followed by the
@@ -522,7 +584,7 @@ def build_channel_v3(initial_state: bool, transition_samples: np.ndarray,
     :func:`build_logic2_channel_v3` instead."""
     s = np.ascontiguousarray(transition_samples, dtype=np.uint64).astype(np.int64)
     out = bytearray(_MAGIC)
-    out += struct.pack("<II", _V3_VERSION, _V3_TYPE_DIGITAL)
+    out += struct.pack("<II", int(version), _V3_TYPE_DIGITAL)
 
     if s.size == 0:                               # no transitions: one empty block
         out += struct.pack("<QQHQ", 0, 0, int(bool(initial_state)), 0)
@@ -549,7 +611,8 @@ V3_LOGIC_BLOCK_DELTAS = 4096
 def build_logic2_channel_v3(initial_state: bool, transition_samples: np.ndarray, *,
                             sample_rate_hz: float, unix_ms: int, frac_ms: float,
                             capture_end: int,
-                            block_deltas: int = V3_LOGIC_BLOCK_DELTAS) -> bytes:
+                            block_deltas: int = V3_LOGIC_BLOCK_DELTAS,
+                            version: int = _V3_VERSION) -> bytes:
     """Build one Logic-2-openable version-3 <SALEAE> digital blob (full metadata
     header + block chain). Unlike :func:`build_channel_v3` (minimal header, internal
     round-trip), this writes the header Logic requires:
@@ -590,7 +653,7 @@ def build_logic2_channel_v3(initial_state: bool, transition_samples: np.ndarray,
     nblocks = len(list(range(0, deltas.size, block_deltas))) or 1
 
     out = bytearray(_MAGIC)
-    out += struct.pack("<II", _V3_VERSION, _V3_TYPE_DIGITAL)
+    out += struct.pack("<II", int(version), _V3_TYPE_DIGITAL)
     # Fixed metadata: constant flag, sample rate, capture wall-clock time.
     out += struct.pack("<B", 1)
     out += struct.pack("<d", float(sample_rate_hz))

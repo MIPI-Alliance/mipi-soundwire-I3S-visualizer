@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 
 import numpy as np
+import pytest
 
 from swi3s_studio import decode_capture
 from swi3s_studio.ingest import digital_csv, saleae_binary, saleae_sal, transitions
@@ -278,7 +279,14 @@ def test_digital_csv_negative_pretrigger():
 def test_real_sal_if_present():
     """Exercise any real Logic 2 .sal files in ~/Downloads (best effort). The
     clock channel is typically multi-chunk; assert it decodes to a clean,
-    strictly-monotonic transition stream."""
+    strictly-monotonic transition stream.
+
+    A big capture is expected to be REFUSED rather than loaded whole — est_peak_bytes
+    carries the decode transient and the budget is capped absolutely, so a multi-GB file
+    raises SalTooLargeError on any machine. That is the guard working, not a failure, so
+    the assertion moves to a windowed load of the same file: it still proves the file
+    decodes, and it covers the streaming window path on real Logic 2 data at the same time.
+    """
     import glob
     paths = sorted(glob.glob(os.path.expanduser("~/Downloads/*.sal")))
     if not paths:
@@ -291,12 +299,23 @@ def test_real_sal_if_present():
         if len(info.channels) < 2:
             print(f"   {name}: {len(info.channels)} digital ch — skipped (need 2)")
             continue
+        clk_ch, dat_ch = info.channels[0], info.channels[1]
         try:
-            cap = saleae_sal.load_capture(p, info.channels[0], info.channels[1])
+            try:
+                cap = saleae_sal.load_capture(p, clk_ch, dat_ch)
+                how = "whole"
+            except saleae_sal.SalTooLargeError as exc:
+                # Too big to open whole: the guard refused before allocating, which is the
+                # documented behaviour. Prove it decodes through a window instead.
+                span = saleae_sal.capture_span_samples(p, channels=[clk_ch, dat_ch])
+                assert span > 0, f"{name}: refused ({exc}) and no block index to window by"
+                hi = min(span, int(0.2 * info.sample_rate_hz) or span)
+                cap = saleae_sal.load_capture(p, clk_ch, dat_ch, window=(0, hi))
+                how = f"window 0-{hi/info.sample_rate_hz:.3f}s (refused whole)"
             assert np.all(np.diff(cap.clock_edges) > 0)      # strictly increasing
             assert np.all(np.diff(cap.data_edges) > 0)
             print(f"   {name}: decoded ({cap.clock_edges.size} clk / "
-                  f"{cap.data_edges.size} dat edges, {cap.sample_rate_hz/1e6:g} MHz)")
+                  f"{cap.data_edges.size} dat edges, {cap.sample_rate_hz/1e6:g} MHz, {how})")
         except saleae_binary.UnsupportedSaleaeVersion as exc:
             print(f"   {name}: clean error — {type(exc).__name__}")
 
@@ -336,3 +355,150 @@ def test_digital_csv_auto_clock_and_rate():
         assert counts[1] > counts[0], counts
         got = digital_csv.infer_sample_rate(p)
         assert got == rate, (got, rate)
+
+
+def test_a_v3_delta_code_too_long_for_int64_is_refused():
+    """The v3 fast paths do int64 arithmetic, and 128**9 is exactly 2**63.
+
+    So a code with 10 base-128 digits overflows and 11 wraps right around to 1 — at which
+    point the block chain's own `sum == B_end - A_start` check is satisfied by a crafted
+    B_end of 1, and `parse_channel_v3` returns a channel with NO transitions and no error.
+    A silently empty channel is the worst possible outcome for an analyzer: the capture looks
+    decoded.
+
+    Not reachable from a real capture — the smallest delta needing ten digits is 2**63
+    samples, 585 years at 500 MS/s — so this is about a corrupt or crafted file failing
+    loudly. Both fast paths are covered: the check counts interior bytes on the raw block, so
+    it guards the native decoder too, which shares the same overflow and cannot be checked
+    from Python any other way.
+    """
+    import struct
+
+    import numpy as np
+
+    from swi3s_studio.ingest import saleae_binary as sb
+
+    def code(digits):
+        """One v3 code on the wire: MSB byte | 0x40, interiors | 0x80, raw terminal."""
+        return bytes([0x40 | digits[0]] + [0x80 | d for d in digits[1:-1]] + [digits[-1]])
+
+    def blob(a, b, payload):
+        head = sb.SALEAE_MAGIC + struct.pack("<II", sb.V3_VERSION, sb.V3_TYPE_DIGITAL)
+        return head + struct.pack("<QQHQ", a, b, 0, len(payload)) + payload
+
+    # The detector's boundary: nine digits is the most int64 holds (seven interior bytes).
+    for digits, overlong in ((2, False), (5, False), (9, False), (10, True), (11, True)):
+        wire = np.frombuffer(code([1] + [0] * (digits - 1)), dtype=np.uint8)
+        assert sb._v3_has_overlong_code(wire) is overlong, f"{digits} digits"
+
+    # The crafted file that used to decode to an empty channel with no error.
+    crafted = blob(0, 1, code([1] + [0] * 10))          # 11 digits -> wraps to 1
+    try:
+        channel = sb.parse_channel_v3(crafted, "crafted")
+    except sb.MalformedSaleaeV3:
+        pass                                            # the required outcome
+    else:
+        raise AssertionError(
+            "an 11-digit delta code was accepted, yielding "
+            f"{len(channel.transition_samples)} transitions — a silently empty channel")
+
+    # A legal nine-digit delta must still decode: the guard is about the arithmetic's limit,
+    # not about long codes being suspicious.
+    digits = [1] + [0] * 8
+    value = 0
+    for d in digits:
+        value = value * 128 + d
+    value += 1
+    ok = sb.parse_channel_v3(blob(0, value, code(digits)), "legal")
+    assert ok.transition_samples.size == 0, \
+        "one delta is the gap to capture end, which is dropped — so no transitions"
+
+
+# --- Logic 2 version 4 -------------------------------------------------------
+# v4 is v3 with the version field bumped and NOTHING else changed. Established by
+# exporting one capture both ways and decoding the v4 blob with the v3 reader: the block
+# chain tiles identically (306 blocks from offset 59 in both), and the transitions matched
+# the v0 Binary export EXACTLY on both channels — 19,170,748 clock and 6,633,392 data
+# transitions, delta arrays equal, absolute samples equal after the constant frame offset
+# the metadata header carries at byte 42. See saleae_binary._V3_LIKE_VERSIONS.
+
+
+@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize("chunk", [0, 50])
+def test_v3_and_v4_blobs_decode_identically(version, chunk):
+    """The reader must treat 3 and 4 as one format, whole-blob and windowed.
+
+    Parametrised over the version so the two are asserted to produce the SAME transitions
+    from the same input rather than merely each being self-consistent — a reader that
+    special-cased v4 into a subtly different path would pass a v4-only test.
+    """
+    e = np.cumsum(np.random.default_rng(5).integers(1, 300, size=800)).astype(np.uint64)
+    blob = saleae_binary.build_channel_v3(False, e, chunk_size=chunk, version=version)
+    assert saleae_binary.peek_version(blob) == version, "builder ignored version="
+
+    ch = saleae_binary.parse_channel_v3(blob, "ch")
+    assert np.array_equal(ch.transition_samples, e), f"v{version} whole-blob decode"
+
+    lo, hi = int(e[len(e) // 4]), int(e[3 * len(e) // 4])
+    win = saleae_binary.parse_channel_v3_window(blob, lo, hi, "ch")
+    assert np.array_equal(win.transition_samples, e[(e > lo) & (e < hi)]), \
+        f"v{version} windowed decode"
+    assert win.initial_state == bool(int(np.count_nonzero(e <= lo)) & 1), \
+        f"v{version} windowed initial level"
+
+
+@pytest.mark.parametrize("version", [3, 4])
+def test_a_v4_sal_loads_and_streams_a_window(tmp_path, version):
+    """End to end through load_capture, including the streaming window path.
+
+    The window path has its own version gate (_v3_span_streaming refuses anything outside
+    V3_LIKE_VERSIONS before it even looks for the chain) — which is what made a v4 .sal
+    unopenable, since that function is also what capture_span_samples uses to answer "how
+    long is this?". A Logic-2-shaped blob is used so the header-level fast path applies:
+    v4 stamps per-block `level` correctly (306/306 blocks agreed with the decoded parity on
+    the real capture, 208 nonzero), so the fast path is sound on it.
+    """
+    rate = 500_000_000                       # the rate the reported v4 capture was taken at
+    e = np.cumsum(np.random.default_rng(6).integers(1, 300, size=2000)).astype(np.uint64)
+    end = int(e[-1]) + 1000
+    kw = dict(sample_rate_hz=rate, unix_ms=1787088006852, frac_ms=0.767,
+              capture_end=end, block_deltas=250, version=version)
+    path = str(tmp_path / f"v{version}.sal")
+    meta = {"data": {"legacySettings": {"sampleRate": {"digital": rate}}},
+            "binData": [{"type": "Digital", "file": "digital-0.bin", "deviceChannel": 0},
+                        {"type": "Digital", "file": "digital-1.bin", "deviceChannel": 1}]}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("meta.json", json.dumps(meta))
+        z.writestr("digital-0.bin", saleae_binary.build_logic2_channel_v3(False, e, **kw))
+        z.writestr("digital-1.bin", saleae_binary.build_logic2_channel_v3(False, e + 1, **kw))
+
+    assert saleae_sal.capture_span_samples(path, channels=[0, 1]) == end, \
+        f"v{version}: the span walk did not accept the chain"
+
+    cap = saleae_sal.load_capture(path, 0, 1)
+    assert np.array_equal(cap.clock_edges.astype(np.int64), e.astype(np.int64))
+
+    lo, hi = int(e[500]), int(e[1500])
+    wcap = saleae_sal.load_capture(path, 0, 1, window=(lo, hi))
+    exp = e[(e > lo) & (e < hi)].astype(np.int64) - lo
+    assert np.array_equal(wcap.clock_edges.astype(np.int64), exp), \
+        f"v{version}: windowed load"
+
+
+def test_the_supported_version_set_is_exactly_three_and_four():
+    """Adding a version must be a deliberate act backed by evidence, not a drive-by.
+
+    v4 was accepted only after decoding a real v4 blob and matching a v0 export of the same
+    capture transition-for-transition on both channels. A future v5 might reuse the block
+    chain or might not, and the cost of guessing is asymmetric: refusing a readable file is
+    an inconvenience, while decoding a changed format produces a plausible WRONG bus, which
+    is the failure this project can least afford. So the set is pinned, and widening it means
+    coming back here and saying what was verified.
+    """
+    assert saleae_binary.V3_LIKE_VERSIONS == frozenset({3, 4})
+    blob = _HEADER.pack(b"<SALEAE>", 5, 100, 1, 0.0, 1.0, 0) + b"\x00" * 32
+    with pytest.raises(saleae_binary.UnsupportedSaleaeVersion) as ei:
+        saleae_binary.parse_channel_v3(blob, "ch")
+    assert ei.value.version == 5
+    assert "0, 3 and 4" in str(ei.value), \
+        "the error must name the versions actually supported, or it misdirects the user"

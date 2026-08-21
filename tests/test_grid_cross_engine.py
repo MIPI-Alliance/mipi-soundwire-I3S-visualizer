@@ -130,3 +130,58 @@ def test_txpresent_present_iff_flow_controlled():
                 f"C++ FlowMode={fm}: TX_PRESENT present={cpp_txp}, expected {expect_txp}")
             assert viz_txp == expect_txp, (
                 f"swviz FlowMode={fm}: TX_PRESENT present={viz_txp}, expected {expect_txp}")
+
+
+def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
+    """A cell's `dp` must be the DataPortNumber, identically in both engines.
+
+    The two definitions are indistinguishable across the whole example corpus, because every
+    config there numbers its ports by position. This fixture is the only one that separates
+    them — four peripheral ports each using their own DP0, on devices 0-3 — so it is named
+    explicitly rather than left to the corpus glob.
+
+    The C++ core always reported the logical number (`dpNumber >= 0 ? dpNumber : index`);
+    swviz's slot index reached the grid unmapped, so the same key meant a number from one
+    engine and an index from the other, and device 1's DP0 was labelled "DP5".
+
+    Asserted as an equivalence AND against the CSV's own declaration, so the test still bites
+    if both engines drift the same way — an equivalence check alone cannot see that.
+    """
+    csv = os.path.join(_HERE, "fixtures", "flow_control_demo.csv")
+    assert os.path.isfile(csv), f"missing fixture {csv}"
+    cfg = BusConfig.from_csv(csv)
+    rows = max(1, min(int(cfg.rows_to_draw), 64))
+
+    declared = {i: (dp.device_number, dp.dp_number)
+                for i, dp in enumerate(cfg.dataports) if dp.enabled}
+    numbers = [n for _dev, n in declared.values()]
+    assert numbers != sorted(set(declared)), \
+        "fixture no longer separates DataPortNumber from slot index — this test is now blind"
+
+    with tempfile.TemporaryDirectory() as d:
+        for i, path in _solo_paths(cfg, d):
+            dev_declared, dp_declared = declared[i]
+            cpp = {(c["device"], c["dp"]) for c in swi3score.grid_from_csv(path, rows)
+                   if c["dp"] >= 0 and not c.get("is_cds")}
+            viz = {(c["device"], c["dp"]) for c in viz_engine.render_payload(path, rows)[0]
+                   if c["dp"] >= 0 and not c.get("is_cds")}
+
+            # The fix: both engines report the DECLARED DataPortNumber, never the slot index.
+            for label, seen in (("C++", cpp), ("swviz", viz)):
+                assert {n for _dev, n in seen} == {dp_declared}, (
+                    f"slot {i} declares DataPortNumber={dp_declared} but {label} reports "
+                    f"dp={sorted({n for _dev, n in seen})} — a slot index leaked through")
+
+            # ...and on the device, INCLUDING the manager sentinel. A config encodes the
+            # manager as device 0 + ManagerDataport=True because DeviceNumber_REG holds 0..11
+            # and cannot carry -1; both engines must recombine that pair. The C++ core read
+            # only the first half until 3.0.13, so manager ports impersonated device 0 — a
+            # real peripheral address, and this config has a genuine device-0 port too.
+            assert cpp == viz, (
+                f"DP slot {i}: engines disagree on (device, dp): "
+                f"C++-only={sorted(cpp - viz)} swviz-only={sorted(viz - cpp)}")
+            assert viz == {(dev_declared, dp_declared)}, \
+                f"slot {i} should be ({dev_declared}, {dp_declared}), got {sorted(viz)}"
+
+    assert any(dev < 0 for dev, _n in declared.values()), \
+        "fixture no longer contains a manager data port — the sentinel case is now untested"

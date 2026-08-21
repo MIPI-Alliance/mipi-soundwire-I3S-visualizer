@@ -11,7 +11,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from .enums import DirectionType, DisplayField, SlotType
 
@@ -163,6 +163,11 @@ class BusModel:
     _bits_by_index: Dict[int, List[BitInfo]] = field(
         default_factory=dict, repr=False, compare=False)
 
+    # Ids of bits removed by remove_bits_matching but not yet dropped from `bits` — see
+    # compact(). Not part of equality/repr: it is bookkeeping, and it is empty in any
+    # model a caller reads, because compact() clears it.
+    _removed_ids: Set[int] = field(default_factory=set, repr=False, compare=False)
+
     # Clash tracking
     bus_clashes: List[int] = field(default_factory=list)
     device_clashes: List[int] = field(default_factory=list)
@@ -248,14 +253,39 @@ class BusModel:
         """
         start_idx = row * self.num_columns
         end_idx = start_idx + self.num_columns
+        self.compact()
         bits = [b for b in self.bits if start_idx <= b.bit_index < end_idx]
         return sorted(bits, key=lambda b: b.bit_index)
+
+    def compact(self) -> None:
+        """Apply any deferred removals to `bits`, in ONE pass.
+
+        Cheap and idempotent when nothing is pending, which is the common case. Call it
+        before reading `bits` directly if you have removed anything since the last read —
+        `remove_bits_matching` defers, and `BusModelBuilder.build()` calls this once
+        placement is finished so every downstream reader (its own mismatch detectors, the
+        renderer, the JSON handler, the goldens) sees an exact list.
+        """
+        if not self._removed_ids:
+            return
+        removed = self._removed_ids
+        self.bits = [b for b in self.bits if id(b) not in removed]
+        self._removed_ids = set()
 
     def remove_bits_matching(self, bit_index: int, device: int, slot_type: SlotType) -> int:
         """Remove bits at a given position matching device and slot type.
 
         This is used when a higher-priority slot (data bit) suppresses a
         lower-priority slot (guard or tail) from the same device.
+
+        DEFERRED, NOT IMMEDIATE. The position bucket is updated at once — so
+        `get_bits_at` and the clash logic are exact straight away — but `bits` is left
+        alone and the removal recorded for `compact()` to apply in a single pass.
+        Rebuilding `bits` here made this O(total bits placed) PER CALL, despite the
+        comment above claiming the bucket kept it cheap: 390 us at 20k bits, 800 us at 40k,
+        and it is called once per row for a very ordinary authoring pattern (a data write
+        suppressing its own guard), so a build went quadratic in the row count — 4.6 s at
+        8000 rows. Deferring makes the whole build one compaction instead of one per row.
 
         Args:
             bit_index: Global sequential index
@@ -267,7 +297,7 @@ class BusModel:
         """
         # Look only at the (small) bucket for this position. Early-out when nothing
         # matches (the common case: the engine tries both guard polarities but only
-        # one is present), so we never rebuild the full `bits` list needlessly.
+        # one is present), so nothing is recorded needlessly.
         bucket = self._bits_by_index.get(bit_index)
         if not bucket:
             return 0
@@ -277,8 +307,7 @@ class BusModel:
             return 0
         self._bits_by_index[bit_index] = [
             b for b in bucket if not (b.device == device and b.slot == slot_type)]
-        matched_ids = {id(b) for b in matched}
-        self.bits = [b for b in self.bits if id(b) not in matched_ids]
+        self._removed_ids.update(id(b) for b in matched)
         return len(matched)
 
     def add_read_overlap(self, bit_index: int) -> None:

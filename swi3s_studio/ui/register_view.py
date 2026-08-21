@@ -468,6 +468,18 @@ class RegisterView(QWidget):
         editable for a what-if override."""
         fields = ", ".join(f"{n}={f.value_label(v)}" for n, v, f in spec.decode(value)
                            if not n.lower().startswith("reserved"))
+        # A spec spanning several addresses is a Reserved / ImpDef filler run, shown as the
+        # one row the spec table shows. Give it its address RANGE and no value: the byte at
+        # its first address is not the range's value, and claiming otherwise would hide a
+        # stray write further into it. Such a write still decodes in the command table.
+        span = getattr(spec, "span", 1)
+        if span > 1:
+            item = QTreeWidgetItem(parent, [name, f"0x{addr:04X}-0x{addr + span - 1:04X}",
+                                            "", ""])
+            for c in range(4):
+                item.setForeground(c, QBrush(_PROV_COLOR[Provenance.DEFAULT]))
+            item.setToolTip(0, f"{tip}; {span} bytes")
+            return item
         item = QTreeWidgetItem(parent, [name, f"0x{addr:04X}", f"0x{value:02X}", fields])
         brush = QBrush(_PROV_COLOR[prov])
         for c in range(4):

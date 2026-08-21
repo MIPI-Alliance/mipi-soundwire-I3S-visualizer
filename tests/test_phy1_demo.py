@@ -43,7 +43,7 @@ def test_phy1_audio_decodes_clean():
     recover the full sample count across the mid-capture reconfigure (600 each)."""
     n = 600
     s = Session.from_demo(n, cold_start=True, phy=1)
-    au = s.decoder.audio()
+    au = s.audio                           # the Session's copy (decoder's is released)
     dp0 = [a["value"] for a in sorted((a for a in au if a["dp"] == 0),
                                       key=lambda a: a["start_sample"])]
     dp1 = [a for a in au if a["dp"] == 1]

@@ -117,6 +117,13 @@ struct CommandRec
     // 1 Row, i.e. the Interval register == 0) — otherwise it can land mid-interval and
     // desynchronize payload framing. See Decoder::feed's EnableCh_CURR check.
     bool enablechCurrError = false;
+    // ERROR: this command generated an SSP (SSCR / SSPA) that landed while a Payload
+    // Interval Skipping port was PART-WAY through its skip pattern — the accumulated
+    // effect of the SkippingNumerator was not already 0, which Section 9.1.6.2.1 calls an
+    // unexpected SSP. Legal SSP rows for a skipping port are Interval x
+    // SkippingDenominator Rows apart, not Interval Rows; an SSP anywhere else restarts the
+    // pattern and shifts which intervals transport from there on. See Decoder::feed.
+    bool unexpectedSspError = false;
     long busRow = 0;             // SWI3S bus row (Column-0 index) at phase start (SPM); continuous across segments
     // For a confirmed sync-point commit: the bus row where it actually TAKES EFFECT
     // (its SSP = command-end row + 1 + Row_Delay - SyncPointOffset), filled in by the
@@ -191,6 +198,30 @@ public:
 
     const std::vector<CommandRec>& commands() const { return mCommands; }
     const std::vector<AudioRec>&   audio() const { return mAudio; }
+
+    // Has releaseAudio() already dropped the samples? (See below — callers check this
+    // rather than inferring "no audio" from an empty audio().)
+    bool audioReleased() const { return mAudioReleased; }
+
+    // Drop the decoded audio samples and hand their memory back.
+    //
+    // The Python layer copies this whole vector into NumPy columns ONCE per decode, and
+    // every consumer past that point — audio store, playback, the plots, PDM decode, WAV
+    // export — reads the columns; a re-decode builds a whole new Decoder rather than
+    // re-reading this one. So after that copy the vector is a second reader's worth of
+    // memory for a reader that never arrives: 72 bytes per sample, 449 MB on a 6.24M-sample
+    // capture, beside the 349 MB of columns holding the same numbers.
+    //
+    // Irreversible for this Decoder, and deliberately so: audio() / audio_columns()
+    // afterwards is a bug in the caller, and the bindings report it rather than answer with
+    // an empty set — silently-empty audio is indistinguishable from a capture that carried
+    // none, which is exactly the class of failure this codebase keeps getting bitten by.
+    void releaseAudio()
+    {
+        mAudio.clear();
+        mAudio.shrink_to_fit();     // clear() alone keeps the capacity — the whole point
+        mAudioReleased = true;
+    }
     int columnCount() const { return mColumnCount; }
     double rowRateKHz() const { return mConfig.RowRateKHz; }
     double measuredUiRateHz() const { return mMeasuredUiRateHz; }
@@ -402,6 +433,7 @@ private:
 
     std::vector<CommandRec> mCommands;
     std::vector<AudioRec>   mAudio;
+    bool                    mAudioReleased = false;   // see releaseAudio()
 };
 
 // Re-decode the Control Data Stream into classified 8b/10b symbols over a fresh

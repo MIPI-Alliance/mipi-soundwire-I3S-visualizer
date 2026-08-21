@@ -48,6 +48,14 @@ def _env() -> dict[str, str]:
     e = dict(os.environ)
     e.update(PYTHONPATH=".", QT_QPA_PLATFORM="offscreen",
              PYQTGRAPH_QT_LIB="PySide6", PYTHONUTF8="1")
+    # $PYTHON NAMES THE INTERPRETER THIS GATE IS RUNNING, so a child script compiles for the
+    # right one. native/build_local.sh takes EXT_SUFFIX, the include path and pybind11's
+    # headers from a Python it invokes itself; left to find `python3` on PATH it picks the
+    # SYSTEM interpreter, which under a venv-driven gate is a different build of Python — on
+    # the Ubuntu guest that has no pybind11 at all and the build simply failed. Silently
+    # worse where the versions differ: the extension would be built with the wrong suffix
+    # for the interpreter that then imports it.
+    e.update(PYTHON=sys.executable)
     return e
 
 
@@ -85,6 +93,14 @@ def check_native() -> None:
     if _run(build, capture_output=True, text=True).returncode != 0:
         print("  build FAILED — re-run it directly to see the compiler output")
         _FAILED.append("native build")
+        # SAY WHAT THIS FAILURE TOOK WITH IT. Returning here skips the ABI assert, and the
+        # suite that follows then runs against whatever core is already installed — the exact
+        # stale-core hazard the assert exists to catch. A first run on a new platform failed
+        # here and reported one problem where there were two: a broken build, and 976 tests
+        # whose subject was unverified. Aggregation is deliberate (one red must not hide the
+        # rest), so do not abort — but never let the skipped assert go unmentioned.
+        _NOT_RUN.append("score_abi assert (the build failed; any tests below ran against "
+                        "whatever core was already installed)")
         return
 
     src = open(os.path.join(_ROOT, "swi3s_studio", "session.py"), encoding="utf-8").read()

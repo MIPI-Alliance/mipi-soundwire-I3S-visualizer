@@ -29,6 +29,7 @@ class CSVFields:
     CDS_GUARD_ENABLED_REG = 'CDS_GuardEnabled_REG'
     CDS_GUARD_POLARITY_REG = 'CDS_GuardPolarity_REG'
     CDS_TAIL_WIDTH_REG = 'CDS_TailWidth_REG'
+    CDS_DRIVE_TYPE = 'CDS_DriveType'
     ENFORCE_CDS_HANDOVER = 'EnforceCDSHandover'
 
     # Data port parameters (DP_ prefix distinguishes from interface fields)

@@ -19,6 +19,34 @@ design see [architecture.md](architecture.md).
 `swi3s_studio/swviz/version.py::APP_VERSION`) so dev builds identify as the next version.
 Branch names use `release/…`, never `vX.Y.Z`, so they don't collide with the release tag.
 
+### A corp push is a checkpoint, not a release
+
+A release branch may be **long-lived**. Work evolves on it locally, reaches the corp remote
+whenever it is convenient, and is published ONCE at the end — so three different things happen
+at three different cadences, and only the last of them is a release:
+
+| | when | what runs | what moves |
+|---|---|---|---|
+| **local commit** | continuously | the gate (`bash tests/gate.sh`) | nothing outside this machine |
+| **corp checkpoint** | whenever convenient | the gate | `release/X.Y.Z` on the corp remote. **No tag. `main` untouched.** |
+| **release** | once, at the end | the gate **and both test guests** | `main`, one tag, one published PR |
+
+Two rules follow, and both exist because 3.0.16 was tagged the moment its branch merged rather
+than when the cycle was actually finished:
+
+- **The version does not change during a cycle, and the changelog header keeps
+  `(in development)` until the release commit.** Finalising that header is part of releasing,
+  not part of working. All three version sites are pinned to each other by
+  `tests/test_release_gate.py`, so the marker is the only thing left to discipline.
+- **Tag once, at the end, and never re-point it.** The tag is the last step after the guests are
+  green, not a by-product of merging. If a checkpoint needs a name — a build handed to someone,
+  a bisect anchor — use a pre-release tag (`vX.Y.Z-rc1`), which is expected to be superseded and
+  so does not need re-pointing. Re-pointing a real tag is the 3.0.6 smell.
+
+The cost of getting this wrong is not academic: a tag cut early either has to be re-pointed, or
+the tree eventually published differs from what the tag claims to describe — and this document
+says elsewhere that such a mismatch makes both untrustworthy.
+
 ## CI (`.github/workflows/ci.yml`)
 
 **Where it runs:** on **this repository**, where Actions is enabled — confirmed 2026-08-01,
@@ -176,9 +204,16 @@ somewhere else: the spacing row-boundary rationale lives in
 the maintainers' spacing row-boundary write-up, and the partial-channel-group rationale in
 `tests/test_transport_slot_budget.py`.
 
-Note the perf caches in both files (`self._num_cols`, hoisted `nch`) are themselves
-optimisations rather than reference algorithm — worth weighing whenever the model is next
-re-published.
+**What is NOT enforced: the docstrings' content.** These two files are authored externally
+and arrive as whole-file drops, so this repository owns the code path they sit on and not
+their prose. A third rule briefly rejected docstrings that named this codebase (module and
+test paths, a comparison to the C++ core, "the engine"); it is withdrawn, because holding it
+means rewriting the author's words on every drop or carrying a divergent copy, and the next
+drop undoes either one. Raise it in review of the incoming drop instead — and do not
+"fix" such a docstring here, because that is the change that silently diverges the file.
+Speed is likewise not a goal of this model: three hoists that existed only for it were
+removed in 3.0.13, at a cost of 7% on an engine build three orders of magnitude inside its
+ceiling. The partial-channel-group clamp is not in that category.
 
 ## Release checklist
 
@@ -217,11 +252,63 @@ re-published.
 
    **A green CI is not a green gate.** CI runs on the public repo only, and covers neither
    the perf gate nor Windows; the gate covers neither Linux nor Python 3.12/3.13. Run both.
-3. Merge `release/X.Y.Z` → `main`.
-4. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
+3. **Run the gate on the test VMs, BEFORE tagging.** Not after, and not "if there is
+   time": this step is the one the checklist keeps losing and it has cost two consecutive
+   releases. 3.0.13 and 3.0.14 were both tagged, published and opened as pull requests on a
+   macOS-only gate, and both were red on Windows within minutes — first a dialog button
+   clipped by 4 px, then, after a fix verified against a *simulated* wide font, the same
+   dialog's label column clipped by 53 px. Neither defect is visible on this platform's
+   metrics, and neither was a subtle one; they were simply never run.
+
+   **It is one command, and it must not need supervising.** The maintainers' tier holds a
+   runner that gates a commit on every configured guest at once and prints a single verdict,
+   nonzero if any guest fails. Both guests run concurrently, because in series this is a
+   16-minute step and a 16-minute step is one that gets skipped. A guest with no host
+   configured is reported `UNTESTED`, which is not a pass — same principle as `NOT RUN HERE`.
+   There is also a queue watcher, so a run can be requested and its verdict collected later
+   rather than watched; it can be installed as a login agent so it is running after a reboot.
+   Prefer the direct run when you want the answer now; prefer the queue when the alternative
+   is skipping the step.
+
+   The guests are separate machines reached over SSH, with addresses and keys recorded in the
+   maintainer's own configuration rather than here — neither is a git checkout, so the runner
+   ships the exact tree (`git archive <sha>`) and extracts it beside the working copy rather
+   than over it. Windows runs the established 3.14 venv, deliberately a version no CI job and
+   no macOS run covers; Linux runs a venv the maintainer repoints between 3.11/3.12/3.13,
+   because "which interpreter" is the question that guest exists to answer.
+
+   **What the guests have actually caught**, beyond the two dialog defects: the offline core
+   build (`native/build_local.sh`) had never worked on Linux at all — it hardcoded `clang++`
+   and passed a Mach-O-only linker flag — and it compiled against whatever `python3` PATH
+   offered rather than the interpreter running the gate. Both were invisible here, and CI
+   cannot see them because CI builds the core through pip.
+
+   **When a re-run is required, and when it is not.** Gate the commit you will tag. If
+   something changes after that run, re-run it when the change touches anything the guest
+   would **execute or import** — product code, tests, tooling the gate calls, CI config,
+   packaging. PROSE does not earn a cycle, wherever it lives: what a documentation change can
+   break is a leak or a tier violation, and both are checked on the machine you are sitting
+   at, not by a second platform. Note the delta in the release notes instead.
+
+   (The first wording of this rule said "touches the published tree", which would have
+   demanded a Windows run for editing this paragraph. Stated as a rule at all because the
+   alternative is either a regress of 15-minute runs or a shrug, and the shrug is how this
+   step went missing in the first place.)
+
+   **A simulated font is not this step.** Scaling the application font locally is worth doing
+   — it is how both defects were finally reproduced — but a point size is not a width, and a
+   fix verified that way shipped broken once already.
+4. Merge `release/X.Y.Z` → `main`. **Only when the cycle is finished** — a release branch may be
+   long-lived, and pushing it to the corp remote along the way is a checkpoint, not a release
+   (see "A corp push is a checkpoint, not a release" under Branch model). Steps 4-6 are one
+   event at the end, not a habit.
+5. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
    use a GPG-signed tag + the governed PR flow — see [GOVERNANCE.md](../GOVERNANCE.md)).
-5. Publish the release (`gh release create vX.Y.Z --latest --notes-file …`).
-6. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model).
+   If signing fails with `gpg: signing failed: No agent running`, start the agent with
+   `gpgconf --launch gpg-agent` and retry — do NOT quietly fall back to an unsigned tag, which
+   is how v3.0.15's tag ended up unsigned.
+6. Publish the release (`gh release create vX.Y.Z --latest --notes-file …`).
+7. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model).
 
 Cut the tag *once, after the cycle settles* — re-pointing a published tag (as happened
 repeatedly during 3.0.6) is a smell that the release was tagged too early.

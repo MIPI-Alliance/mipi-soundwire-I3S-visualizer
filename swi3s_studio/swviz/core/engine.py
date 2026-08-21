@@ -175,6 +175,14 @@ class BusModelBuilder:
         self.clash_detector.validate_drq_sinks()
         self._detect_truncated_drq()
 
+        # PLACEMENT IS DONE, so apply the deferred guard/tail suppressions in one pass.
+        # remove_bits_matching only updates the position bucket (which the clash logic
+        # reads) and records the removal; everything from here on reads bus_model.bits
+        # directly — the mismatch detectors below, then the renderer, the JSON handler and
+        # the goldens — so the list has to be exact from this point. Doing it here rather
+        # than per removal is what keeps a build from going quadratic in the row count.
+        self.bus_model.compact()
+
         # 5. Transfer clash information to bus model
         self._finalize_clashes()
 
@@ -702,8 +710,17 @@ class BusModelBuilder:
             bit_in_sample = None
 
         # Check for clashes
+        # BRANCH ON THE BIT'S OWN DIRECTION, NOT THE PARENT DP'S REGISTER. For a DRQ the
+        # two disagree by definition: `direction` above takes bit_slot.direction, which
+        # device._drq_direction() defines as the OPPOSITE of the parent DP's data
+        # direction (a Sink DP's FCP DRIVES its DRQ; a Source DP samples it). Reading
+        # PortDirection_REG here therefore inverted the check for every DRQ bit — a real
+        # two-driver DRQ collision was recorded as a read overlap (and never added as a
+        # write), while several devices legally sampling one DRQ column was reported as a
+        # physical bus clash. Every other slot type is unaffected: for them `direction` is
+        # derived from PortDirection_REG, so the two forms agree.
         clash_type = ClashType.NONE
-        if not dp.config.PortDirection_REG:
+        if direction == DirectionType.SOURCE:
             has_clash, _, suppress_slots = self.clash_detector.check_write_clash(row, column, device)
             if has_clash:
                 clash_type = self._get_clash_type(bit_index)
