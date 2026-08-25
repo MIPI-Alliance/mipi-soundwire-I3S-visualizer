@@ -15,6 +15,7 @@ A one-row misplacement is not subtle: it drops the decoded tone SNR from ~33 dB 
 """
 import numpy as np
 import pytest
+from conftest import demo_transported_samples
 
 from swi3s_studio.session import Session
 
@@ -72,8 +73,15 @@ def test_sspas_are_well_formed(sessions, name, _kw, _n):
 @pytest.mark.parametrize("name,_kw,_n", _DEMOS, ids=[d[0] for d in _DEMOS])
 def test_sspas_do_not_corrupt_the_capture(sessions, name, _kw, _n):
     """Adding SSPAs must not introduce a single CRC error anywhere: a mis-sized or
-    mis-framed SSPA would desync the 8b10b stream and redden later commands too."""
-    bad = [c for c in sessions[name].commands if not c.get("crc_valid", True)]
+    mis-framed SSPA would desync the 8b10b stream and redden later commands too.
+
+    The `has_manager_packet` guard is the same rule `analysis/errors.py` applies, and it
+    matters: a ReadData phase carries NO Manager Packet, so there is no CRC over it and
+    `crc_valid` stays at its unset default. Without the guard this flagged a perfectly good
+    deferred-read delivery as corrupt — found the moment a demo first emitted one (3.0.13).
+    A phase with nothing to check cannot fail the check."""
+    bad = [c for c in sessions[name].commands
+           if c.get("has_manager_packet") and not c.get("crc_valid", True)]
     assert not bad, f"{name}: {len(bad)} CRC-invalid command(s)"
 
 
@@ -82,7 +90,14 @@ def test_sspas_do_not_corrupt_the_capture(sessions, name, _kw, _n):
 def test_audio_survives_the_sspa_reanchor(sessions, name, _kw, _n):
     """THE point of aligned placement: re-anchoring at a row the ports already treat as
     their sync point re-asserts the phase instead of shifting it, so every PCM stream
-    stays a clean single tone and yields exactly the expected sample count.
+    stays a clean single tone and yields the expected sample count.
+
+    DP0 SKIPS (13 of every 160 intervals — 44.1 kHz on 48 kHz opportunities), so its count is
+    the bound from conftest rather than _SAMPLES: the accumulator restarts at every SSP, which
+    is exactly what this test exercises, so the exact figure depends on how many SSPAs the
+    region held. DP1 does not skip and must recover every sample. Both must still be clean
+    tones — a re-anchor that shifted the transport phase, or restarted a skipping pattern
+    part-way through, drops the SNR from ~33 dB to ~13 dB.
 
     Excludes the flow-control demo, whose ports gate transport on DRQ/SourceReady and so
     don't produce a fixed-length pure tone."""
@@ -95,8 +110,14 @@ def test_audio_survives_the_sspa_reanchor(sessions, name, _kw, _n):
             a = store.samples(dev, dp, ch)
             if store.native_sample_bits(dev, dp, ch) == 1:
                 continue                     # PDM: density stream, not a tone here
-            assert len(a) == _SAMPLES, (
-                f"{name} dev{dev} dp{dp} ch{ch}: {len(a)} samples, expected {_SAMPLES}")
+            if dp == 0:                      # the skipping port
+                lo, hi = demo_transported_samples(_SAMPLES)
+                assert lo <= len(a) <= hi, (
+                    f"{name} dev{dev} dp{dp} ch{ch}: {len(a)} samples, expected {lo}..{hi} "
+                    f"of {_SAMPLES} opportunities at 13/160 skipping")
+            else:
+                assert len(a) == _SAMPLES, (
+                    f"{name} dev{dev} dp{dp} ch{ch}: {len(a)} samples, expected {_SAMPLES}")
             snr = _tone_snr(a)
             assert snr > 20.0, f"{name} dev{dev} dp{dp} ch{ch}: tone SNR {snr:.1f} dB"
             checked += 1

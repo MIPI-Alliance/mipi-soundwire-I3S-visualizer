@@ -22,11 +22,21 @@ import pytest
 
 from swi3s_studio.session import Session
 
-# Audio-mode PHYs that Session.from_demo can synthesize today. PHY1 (FBCSE-slow) isn't
-# built yet — add 1 here once it is and it inherits every invariant below.
-PHYS = [2, 3]
+# Audio-mode PHYs that Session.from_demo can synthesize. All three inherit every invariant
+# below. PHY1 (FBCSE-slow) was excluded on the premise that it "isn't built yet"; it has been
+# since 3.0.11, and adding it here passed 26 of 27 immediately — the one failure was an
+# assertion pinning the 4-port demo shape, not a PHY invariant (see test_audio_streams_present).
+PHYS = [1, 2, 3]
 _DEMO_SAMPLES = 1500          # spans the 4-col Safe-Lock → 16-col audio reconfigure and
 #                               leaves a deep region for drift/seek coverage.
+
+# The port set each demo synthesizes. NOT an invariant — demo shape, which is precisely why
+# hardcoding one set here excluded a whole PHY from the 26 checks that ARE invariant.
+_DEMO_STREAMS = {
+    1: [(0, 0), (0, 1), (0, 2)],                    # PHY1: 4-col bus, three ports
+    2: [(0, 0), (0, 1), (0, 2), (0, 3)],
+    3: [(0, 0), (0, 1), (0, 2), (0, 3)],
+}
 
 
 @pytest.fixture(scope="module", params=PHYS, ids=[f"phy{p}" for p in PHYS])
@@ -166,10 +176,24 @@ def test_row_math_matches_rsp_ground_truth(sess):
     assert np.all(np.diff([sess.bus_row_for_sample(int(m)) for m in marks]) == 1)  # one row per RSP
 
 
-def test_audio_streams_present(sess):
-    """Every PHY decodes the same four demo dataports — a guard that a shared decode
-    path didn't regress audio for one PHY while the other still worked."""
-    assert sess.audio_streams() == [(0, 0), (0, 1), (0, 2), (0, 3)]
+@pytest.mark.parametrize("phy", PHYS, ids=[f"phy{p}" for p in PHYS])
+def test_audio_streams_present(phy):
+    """Every PHY decodes its demo's full port set, and every stream carries samples — a
+    guard that a shared decode path didn't regress audio for one PHY while another worked.
+
+    Parametrized rather than taking the shared `sess`, because the expected set is per-PHY
+    and a Session does not record which PHY built it. The previous version hardcoded the
+    4-port PHY2/PHY3 shape, which is what kept PHY1 out of this file entirely.
+
+    Also asserts each stream is NON-EMPTY, which the set comparison alone never did: a port
+    that decoded zero samples still appeared in `audio_streams()` and passed."""
+    sess = Session.from_demo(_DEMO_SAMPLES, cold_start=True, phy=phy)
+    assert sess.audio_streams() == _DEMO_STREAMS[phy]
+    counts = {}
+    for a in sess.audio:                   # the Session's copy (decoder's is released)
+        counts[(a["device"], a["dp"])] = counts.get((a["device"], a["dp"]), 0) + 1
+    empty = [k for k in _DEMO_STREAMS[phy] if not counts.get(k)]
+    assert not empty, f"phy{phy}: stream(s) present but carrying no samples: {empty}"
 
 
 @pytest.mark.parametrize("phy", PHYS, ids=[f"phy{p}" for p in PHYS])

@@ -105,7 +105,31 @@ They split into three bands:
 - `test_ingest_formats.py` — synthesises a v0 `.sal`, a v3 `.sal`, and a digital CSV from
   the demo and checks each decodes to the same commands/columns; confirms a real Logic 2
   `.sal` (if present) is handled (single-chunk v3 decodes; multi-chunk raises a clear
-  error) rather than producing garbage.
+  error) rather than producing garbage. Also pins **v4**: Logic 2 bumped the blob version
+  with no format change, so the v4 tests are parametrised over BOTH versions and assert
+  they decode to the *same* transitions — a reader that special-cased v4 would pass a
+  v4-only test. The accepted set is asserted to be exactly `{3, 4}` and a v5 blob must
+  still be refused, because decoding a changed format yields a plausible wrong bus (see the
+  maintainers' .sal format notes). Also that a v3 delta code too long for int64 is
+  REFUSED: 128⁹ is exactly 2⁶³, so an 11-digit code wraps to 1 and satisfies the block
+  chain's own sum check against a crafted `B_end`, which used to yield a silently empty
+  channel. The guard counts interior bytes on the raw block, so it covers the native decoder
+  too (it shares the overflow and cannot be checked from Python any other way).
+- `test_digital_csv_bounded.py` — digital-CSV ingest is BOUNDED and BATCH-INVARIANT. It used
+  to build a Python list of every row plus three more full-length lists, peaking at ~12× the
+  file size (415 MB for a 34 MB / 2M-row export) with no guard, while the `.sal` path had a
+  fail-closed one. Now read in batches: ~2.5× the file size, with the shared
+  `memory_budget()` refusing what still would not fit. The interesting property is not "does
+  it load" but that a batch size forcing many boundaries gives byte-identical output to one
+  forcing none — the chunk-edge bug class every other reader here is checked for.
+- `test_bus_model_compaction.py` — bit removal is deferred but exact.
+  `remove_bits_matching` rebuilt the whole `bits` list per call, making a build quadratic in
+  the row count for an ordinary pattern (a data write suppressing its own guard, once per
+  row): 0.21 s at 500 rows, 2.18 s at 2000, **36.6 s at 8000**. It now updates the position
+  bucket at once and defers the rest to one `compact()`, which the builder calls when
+  placement finishes — 2.0 s at 8000 rows. Pins the contract that makes that safe: the
+  bucket the clash logic reads is exact immediately, `bits` is exact after compaction, and a
+  row read compacts for itself.
 - `test_register_model.py` — spec load, address → register/field resolution, provenance.
 - `test_responses.py` — response token → name by phase; labelled `response_summary`,
   including the per-device **Ping** breakdown collapsed into device ranges
@@ -148,6 +172,14 @@ They split into three bands:
   kinds, boolean and/or text, errors-only) and the title's filter indicator;
   bookmarks; **64-bit sample signals** (>2³¹); the Compare expected-config (CSV-Import)
   overlay; the audio cursor line + click-to-seek mapping.
+- `test_cursor_cost.py` — what a cursor move is ALLOWED TO DO, asserted as **counts, not
+  wall-clock times**: a move inside the Decoded-Samples window builds zero rows, a move
+  outside builds at most one window's worth, a config region above
+  `_TX_PERSIST_SYNC_MAX_UIS` goes to the worker thread while one below it stays inline, and
+  a hidden dock costs nothing. Counts are deterministic and identical on a loaded runner, so
+  they fail on drift where a ceiling only fails on a cliff — and a ceiling on a *function*
+  cannot say "and not on the GUI thread", which is the defect that froze a 4.7 s capture for
+  ~550 ms per move while `test_tx_persist_columns_ceiling` stayed green.
 - `test_phy_bringup_gui.py` — a capture with a §5.1.2 bring-up loads into Analysis with
   the timeline bring-up band + PHY label; a plain demo (no bring-up) stays in
   Visualization with the grid gated at t=0.
@@ -164,10 +196,40 @@ They split into three bands:
 - `test_authoring.py` — `BusConfig` ↔ the v2.0 CSV (the engine + C++ core read it) + dict
   round-trips; an authored config is placed by the `grid_from_csv` cascade (and yields register
   writes), including wide-bit held-column identity; every data port gets a name in the CSV.
-- `test_timing.py` — the ported SWI3S timing `compute()` matches the source `swtiming`
-  exactly (the source validated it against two reference spreadsheets); `find_worst_corner`
-  never improves a margin; `TimingView` renders the four inequalities + binding summary and
-  round-trips its inputs.
+- `test_timing.py` — `find_worst_corner` never improves a margin; `TimingView` renders the
+  inequality headings + binding summary and round-trips its inputs. Also the conventions
+  that carry no number and so would fail silently: every leg's terms read in **physical
+  time order** (receiver window last, clock lane before data, a peripheral launcher's
+  launch between its two crossings), **A drives and B samples** on all four P→P legs, the
+  1)–17) numbering matches the display order, every printed symbol **resolves to an input
+  row** (or a declared row-less key), and the term highlight's **click regions agree with
+  the painted glyphs** at every sample point on every row — the invariant that catches a
+  hit-test laying out at a different font from the paint path.
+- `test_delta_tpd_swing.py` — the crossing envelope's TX swing is a PARAMETER. `V_OH_frac` /
+  `V_OL_frac` were accepted, documented in the module's formula, threaded in from
+  `CalcInputs` — and ignored, because the linear helpers divided by a hardcoded `0.60`, which
+  is exactly the default `0.80 − 0.20`. `calculator.py` reads the same two fields for real, so
+  the two halves of one model disagreed about one knob with no shipped number wrong (nothing
+  sweeps them; neither has a `CalcRow`). Pins that every linear coefficient now moves with the
+  pair, that halving the swing doubles the crossing, that the default still gives the
+  tabulated 0.60 swing, that an inverted swing raises instead of dividing, and that the
+  exponential ramp stays independent of it **by design** — its shape is set by a time
+  constant, so there is no slope for the swing to define.
+- `test_timing_vs_reference.py` — **the divergence log, executable.** The same timing model
+  lives twice: here, and in the `timing-analysis` project's `swtiming/emit_ede.py` (which
+  generates the EDE paper's numeric macros). This asserts every leg pair under one matched
+  configuration with each delta DECLARED — six agree exactly, the peripheral-launched legs
+  differ by the Fig. 174 anchor conversion (1.667 ns), P→P hold by that plus the
+  P→P slew split this model declines to make. A delta that MOVES fails. It used to say the
+  two matched "exactly"; they do not, and the deltas are deliberate — see `docs/anchors.md`.
+  SKIPS when the reference project is not beside this one (`SWI3S_TIMING_ANALYSIS` overrides
+  the path). It is not vendored: a stale copy asserting agreement is worse than no test.
+  Beware three traps it documents — the two models name legs by OPPOSITE conventions
+  (`emit_ede.setup_mp` is this project's `PM_setup_ho`); each reference leg carries its own
+  corner in its default arguments rather than a global one; and where the reference HARDCODES
+  a worst corner by omitting a term, this project shows the term and lets the search find it,
+  so comparing at the nominal invents a divergence (that is how a 9 ns keeper "omission" was
+  briefly reported).
 - `test_visualizer_engine.py` — **the authoritative Bus-Visualizer parity test.** Bus-Visualizer
   mode is driven by the *first-party Visualizer engine* (`swi3s_studio/swviz/`, via
   `model/viz_engine.py`). For all **89** example configs this builds the merged `BusModel`
@@ -195,6 +257,12 @@ They split into three bands:
   pins `viz_engine.render_payload`'s issue list + clash cells + grid dims (the part the
   placement/model goldens don't cover), so a future placement-engine change can't silently
   shift the authoring warnings.
+- `test_drq_clash.py` — the DRQ clash verdict, hand-built because **no vendored golden carries
+  a DRQ collision**. A DRQ's direction is the inverse of its parent port's, so the engine's
+  clash branch has to read the bit's own direction; reading `PortDirection_REG` instead
+  swapped bus clash and read overlap for every DRQ, and moved no golden. Two Sink ports
+  driving one DRQ column must be a bus clash; two Source ports sampling it must be a read
+  overlap.
 - **`tools/viz_report.py`** — a dedicated one-command visualizer runner + report (not a
   CI gate; the pytest suites above are). Runs the regression + CSV round-trip over every
   example config and writes `tests/visualizer/summary.md`: aggregate stats (bit positions,
@@ -235,13 +303,17 @@ These are the recurring shapes that make the suite trustworthy rather than circu
 ## 5. Fixtures & test data
 
 - **Synthetic demo** — the workhorse; deterministic, in-repo, no external files. Always
-  prefer it for new tests.
-- **Real hardware captures** — large Logic 2 exports kept in `~/Downloads` (e.g.
-  `ColdStart_Lusk_768k_2col_768k_8col_pb_rec.{sal,csv}` + `_digital_{0,1}.bin`,
-  `ColdStart_768kHz_2col_Ping0x3.*`, `768k_8col_pb_rec.csv`). These exercise the messy
-  realities the demo can't: multi-GB size, negative pre-trigger origin, 2-col→8-col
-  reconfiguration, cold-start-preloaded config, real audio. **Tests reference them only
-  when present** (guarded by existence checks) so the suite stays green on a clean
+  prefer it for new tests. PHY1/2/3 each carry DP0 at **44.1 kHz by payload interval
+  skipping** (13 of every 160 intervals, Section 14.1.10) against DP1 at 48 kHz, so mixed
+  rates and skipping are exercised by default — see `tests/test_demo_skipping.py` and the
+  `demo_skipped_rate_hz` / `demo_transported_samples` helpers in `conftest.py`. A skipping
+  port's count is a BOUND, not a constant: the accumulator restarts at every SSP.
+- **Real hardware captures** — large Logic 2 exports kept outside the repository: a
+  cold-start capture that reconfigures 2-col to 8-col (as `.sal`, `.csv` and per-channel
+  `.bin`), a 2-column cold start carrying a Ping, and an 8-column playback/record CSV. These
+  exercise the messy realities the demo can't: multi-GB size, negative pre-trigger origin,
+  2-col→8-col reconfiguration, cold-start-preloaded config, real audio. **Tests reference
+  them only when present** (guarded by existence checks) so the suite stays green on a clean
   checkout. They are used heavily for *manual* validation during development; promoting a
   finding from a real capture into a deterministic synthetic regression test is preferred
   whenever feasible.
@@ -350,7 +422,9 @@ Use this to spot gaps. "Layer" indicates where the assertion bites.
 | Placement parity (89 configs, fast check) | `Decoder` `layoutGrid`, `grid_from_csv` | `test_visualizer_placement` | binding vs golden |
 | Bus model → JSON export | `model/viz_engine.model_json` | `test_visualizer_engine` | app |
 | Authoring panel + Use-as-Expected | `ui/authoring`, `ui/main_window` | `test_modes_gui` | GUI |
-| SWI3S timing margins (compute, F_max, corner) | `timing/calculator`, `timing/delta_tpd` | `test_timing` (parity to source) | app |
+| SWI3S timing margins (compute, F_max, corner) | `timing/calculator`, `timing/delta_tpd` | `test_timing`, `test_timing_cross_spec` | app |
+| Divergence from the reference analysis | `timing/*` vs `timing-analysis/swtiming` | `test_timing_vs_reference` (skips if absent) | app |
+| Displayed equation sums to the margin printed beside it | `timing/calculator` | `test_timing_cross_spec` | app |
 | Timing view (margins text + round-trip) | `ui/timing_view` | `test_timing` | GUI |
 | Workspace (mode + authoring + timing) | `workspace`, `ui/main_window` | `test_modes_gui`, `test_workspace` | app + GUI |
 
@@ -401,15 +475,24 @@ These are deliberately listed so an audit starts from an honest baseline:
   and in the release gate.)* `tests/test_perf.py` holds wall-clock cliff-detectors on a large
   synthetic capture, defined as their own CI
   gate (`-m perf`) and locally via `run_all.sh --perf`; see the maintainers' performance notes.
-  *Residual gap: pan/zoom interaction latency and memory ceilings are still measured by
-  hand at release time, not asserted.*
+  Since 3.0.17 it also holds an **end-to-end per-cursor-move budget** with every dock open,
+  on a fixture big enough to see the defects (`from_demo(20000)`: 10.2 M UIs, 408 commands,
+  3 config regions — the previous 314 k-UI fixture made a ~99 ms real-world regression show
+  as ~19 ms, i.e. it could not have caught the bug it existed for), and a **memory
+  prediction-vs-measurement** check that loads a `.sal` in a clean subprocess and compares
+  `est_peak_bytes` against that process's peak RSS in both directions. The subprocess is
+  load-bearing: `ru_maxrss` is a high-water mark, so building the fixture in the same
+  process hid most of the load and would have passed a 3x under-prediction.
+  *Residual gap: **wheel-zoom / drag-pan** latency is still hand-measured — the budget
+  covers cursor moves. And a wall clock loose enough for a shared runner catches ~+100 ms
+  additions, not smaller drift; that is what `test_cursor_cost.py`'s counts are for.*
 - **Real-capture decode is not pinned by CI** (the files live in `~/Downloads`, not the
   repo). The hardest decode paths — 2-col→8-col reconfiguration, cold-start-preloaded
   config, negative pre-trigger origin — are exercised manually. *Mitigation:* capture the
   essence of each as a synthetic regression where possible.
 - **GUI testing is smoke-level**, not interaction-level. It checks wiring and population,
   not pixel rendering, drag/zoom behaviour, or event-loop edge cases.
-- **Open correctness item:** the Lusk DP1 audio "cliff" at ~sample 7763 (see roadmap) is
+- **Open correctness item:** a DP1 audio "cliff" seen on one real capture (see roadmap) is
   understood-but-unresolved and has no test; the register-by-register Compare diff is
   known-unreliable when the visualizer and decoder number dataports differently (the grid
   diff is the trusted signal — documented in `compare_config`).

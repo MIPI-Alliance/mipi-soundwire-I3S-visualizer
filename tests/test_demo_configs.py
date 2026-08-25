@@ -12,6 +12,8 @@ These lock in three fixes:
   clock PLL's stable reference), using one capture sample rate throughout.
 """
 
+from conftest import demo_skipped_rate_hz
+
 from swi3s_studio.session import Session
 
 
@@ -89,8 +91,9 @@ def test_phy3_operational_row_rate_is_3072():
     assert abs(s.row_rate_khz - 3072.0) < 1.0, s.row_rate_khz
     assert abs(s.ui_rate_hz - 49_152_000) < 1e5, s.ui_rate_hz
     rates = s.decoder.audio_sample_rates()
-    assert abs(rates[(0, 0)] - 48_000) < 1.0                # PCM 48 kHz
-    assert abs(rates[(0, 2)] - 3_072_000) < 100.0           # PDM 3.072 MHz
+    assert abs(rates[(0, 0)] - demo_skipped_rate_hz()) < 1.0   # DP0 PCM, 44.1 kHz (skipping)
+    assert abs(rates[(0, 1)] - 48_000) < 1.0                   # DP1 PCM, 48 kHz
+    assert abs(rates[(0, 2)] - 3_072_000) < 100.0              # PDM 3.072 MHz
 
 
 def test_open_grid_in_visualizer_menu():

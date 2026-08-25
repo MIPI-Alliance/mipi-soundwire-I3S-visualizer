@@ -131,7 +131,7 @@ class NotificationsPanel(QWidget):
         v.addWidget(frame)
 
     def set_issues(self, issues: List[Issue]) -> None:
-        by = {ERROR: [], WARNING: [], INFO: []}
+        by: dict[str, list] = {ERROR: [], WARNING: [], INFO: []}
         for iss in issues:
             by.setdefault(iss.severity, by[INFO]).append(
                 (f"{iss.source}: {iss.message}", iss.cells))

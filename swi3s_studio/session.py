@@ -19,7 +19,7 @@ from .nputil import searchsorted as _searchsorted
 
 # ABI the Python side expects from the swi3score native module (see bindings.cpp
 # `score_abi`). Bump both together when a binding's return shape changes.
-_REQUIRED_SCORE_ABI = 8
+_REQUIRED_SCORE_ABI = 10
 
 
 def zero_based_row(bus_row, origin) -> int:
@@ -222,6 +222,16 @@ class Session:
 
     def _refresh_audio(self) -> None:
         self._audio_cols = self._build_audio_columns()
+        # The columns above are a FULL COPY of the decode's own audio vector, and that
+        # vector has no second reader: the audio store, playback, the plots, PDM decode and
+        # WAV export all consume the columns, `audio` below builds its dict list from them,
+        # and a re-decode constructs a new Decoder rather than re-reading this one. So hand
+        # the native memory back — 72 B/sample against the columns' 56, which was 449 MB of
+        # the ~1.8 GB a 1 s demo cost. `getattr`: an older core has no release_audio and
+        # simply keeps holding it, exactly as before (no ABI bump, nothing breaks).
+        release = getattr(self.decoder, "release_audio", None)
+        if callable(release):
+            release()
         self._audio_list: Optional[List[dict]] = None      # lazy dict-list cache
         self._mark_cache = None                            # lazy per-value read-mark index
         self._filtered_cache = None                         # invalidate _filtered_positions memo
@@ -549,7 +559,7 @@ class Session:
         self._rel_cmds = None                    # invalidate config-command cache
         self._eff_sorted = None                  # invalidate effective-sample sort cache
         self._reg_replay_cache = None            # invalidate register-replay sort cache
-        self._tx_persist_cache = {}               # invalidate tx_persist_columns memo (segments may move)
+        self._tx_persist_cache: Dict[tuple, tuple] = {}   # invalidate tx_persist_columns memo (segments may move)
         # Recovered-clock / RSP caches: a column-changing re-decode (config CSV or a
         # NumColumns register what-if on DLV) re-frames the rows, so the cached Row Sync
         # Points / marks would be stale. Drop them; they recompute lazily from the fresh
@@ -745,10 +755,11 @@ class Session:
     def from_demo(cls, audio_samples_per_channel: int = 32, *,
                   cold_start: bool = False, phy: int = 2, variant: str = "",
                   **kw) -> "Session":
-        """Synthetic demo session. `phy` = 2 (FBCSE) or 3 (DLV); with cold_start the
+        """Synthetic demo session. `phy` = 1 or 2 (FBCSE) or 3 (DLV); with cold_start the
         matching §5.1.2 bring-up selects that PHY on the wire (and, for PHY3, is what
-        makes the session pick the recovered-clock DLV decode path). `variant`
-        ="flow_control" selects the four-mode flow-control demo (PHY2 framing)."""
+        makes the session pick the recovered-clock DLV decode path). PHY1 is the slow
+        4-column variant and synthesizes three ports where 2 and 3 synthesize four.
+        `variant` ="flow_control" selects the four-mode flow-control demo (PHY2 framing)."""
         return cls(transitions.demo_capture(audio_samples_per_channel,
                                             cold_start=cold_start, phy=phy,
                                             variant=variant),

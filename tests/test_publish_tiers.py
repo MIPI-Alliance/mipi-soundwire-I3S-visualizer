@@ -29,20 +29,48 @@ _INTERNAL = "docs/internal/"
 _PUBLIC_ROOTS = (
     "README.md", "LICENSE.md", "GOVERNANCE.md", "CODEOWNERS", ".gitignore", ".github/",
     ".mipi/",                                # upstream-owned; present only once published
+    "CLAUDE.md",                             # agent guidance: published deliberately, since
+                                             # an outside contributor using an agent needs
+                                             # the same gate and reference-model rules a
+                                             # maintainer does. Keep it free of anything
+                                             # site-specific — it ships.
     "pyproject.toml", "requirements.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
-    "flow_control.csv",                      # fixture referenced by Demo.cpp + 3 tests
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
     "docs/",                                 # docs/internal/ is carved out below
 )
 
 # Files the UPSTREAM project owns, declared in tools/publish_tree.py and grafted in at
 # publish time. They must be ABSENT here and PRESENT once published — see the test below.
-_UPSTREAM_OWNED = (".mipi/project.yml", ".github/workflows/config-check.yml")
+def _upstream_owned() -> tuple[str, ...]:
+    """Read the list from the publish tool rather than restating it.
+
+    Two hand-maintained copies drift, and the drift is invisible: a path added to
+    the tool but not here would be grafted with nothing asserting it arrived, and
+    one added here but not to the tool would fail a published tree for a file
+    nothing grafts. Importing by path keeps one definition.
+    """
+    import importlib.util
+    path = os.path.join(_ROOT, "tools", "publish_tree.py")
+    spec = importlib.util.spec_from_file_location("publish_tree", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._UPSTREAM_OWNED
+
+
+_UPSTREAM_OWNED = _upstream_owned()
 
 
 # The enforcing files necessarily CONTAIN the path they forbid, exactly as the leak scanner
 # and the reference-model guard do. Self-exclusion, not an allowlist for real violations.
-_SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py"}
+# Files that must NAME the tier boundary to do their job: this test, the tool that prunes the
+# tier, and the leak scanner (which exempts the internal tier from published-only patterns, so
+# that a third-party capture name can be flagged in what ships while staying legitimate in an
+# internal record). Everything else citing docs/internal/ is a dead link once published.
+_SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py", "tools/leak_scan.py"}
+
+# The three patterns .gitignore uses for the compiled core, so the walk in _files() agrees
+# with the git listing about what is a build product rather than a tracked path.
+_BUILD_PRODUCT = re.compile(r"^swi3score.*\.(so|pyd|dylib)$")
 
 
 def _files() -> list[str]:
@@ -62,7 +90,16 @@ def _files() -> list[str]:
         dirs[:] = [d for d in dirs if d not in skip]
         # macOS AppleDouble sidecars are filesystem metadata git never tracks;
         # one undeletable leftover on the Windows VM failed this otherwise.
-        names = [n for n in names if not n.startswith('._')]
+        #
+        # The built native core is the same kind of thing: .gitignore keeps
+        # /swi3score*.{so,pyd,dylib} out of the listing above, but a walk has no such rule,
+        # and the gate REBUILDS that file into the tree root before running the suite. So on
+        # any tree without .git — both VM guests, and a published tree — the gate produced
+        # the very artefact that then failed this test as unclassified. Matching the
+        # gitignore patterns rather than the bare suffix, so a binary someone genuinely
+        # commits still has to be classified.
+        names = [n for n in names
+                 if not n.startswith('._') and not _BUILD_PRODUCT.match(n)]
         # POSIX separators: every rule below is a "docs/…" style prefix, so a
         # backslash path matches nothing and the whole file misfires on Windows.
         found += [os.path.relpath(os.path.join(base, n), _ROOT).replace(os.sep, "/")
@@ -137,6 +174,33 @@ def test_dev_docs_never_reaches_a_tree():
         "dev_docs/ is present in the tree — it is local-only by definition"
 
 
+def test_the_governance_files_upstream_owns_are_actually_declared():
+    """Reading the list from the tool removed the drift, and with it the guard.
+
+    `_UPSTREAM_OWNED` is now imported rather than restated, so the two copies
+    cannot disagree — but a path DELETED from the tool would also vanish from the
+    assertion, and the file would be dropped on the next publish with nothing
+    complaining. So name the governance paths independently here.
+
+    These three are the ones whose content is a decision of the upstream project
+    rather than of this codebase. CODEOWNERS is the sharpest case and the reason
+    this test exists: it names PEOPLE, so it changes upstream with nothing here
+    moving. A stale copy in this tree carried "@NielWarren" after upstream had
+    corrected it to "@nielwarren582", and the v3.0.13 preview would have reverted
+    that — a one-token diff, in the file deciding who must approve a PR.
+
+    Deliberately NOT the whole governance layer: GOVERNANCE.md, LICENSE.md and
+    the CLA files are identical in both trees and shared by agreement, so
+    carrying them is not a divergence risk.
+    """
+    for path in ("CODEOWNERS", ".mipi/project.yml",
+                 ".github/workflows/config-check.yml"):
+        assert path in _UPSTREAM_OWNED, (
+            f"{path} is owned by the upstream project but is not declared in "
+            f"tools/publish_tree.py::_UPSTREAM_OWNED. Publishing would either "
+            f"overwrite their copy with ours or drop it entirely.")
+
+
 def test_upstream_owned_files_are_absent_here_and_present_once_published():
     """Publishing is a tree REPLACEMENT onto a repository with its own history, so a file its
     maintainers added is invisible to us and a naive replacement DELETES it. That nearly
@@ -195,3 +259,27 @@ def test_no_sync_conflict_duplicates_are_tracked():
         "tracked path(s) look like file-sync conflict copies:\n  " + "\n  ".join(dups)
         + "\n\nDelete them and stage explicitly rather than with `git add -A`. If a name like "
           "this is deliberate, rename it — the pattern is indistinguishable from a conflict.")
+
+
+def test_the_tier_boundary_has_one_definition():
+    """`publish_tree` prunes the internal tier and `leak_scan` exempts it — from the same path.
+
+    Both must name it (they are in _SELF for that reason), which means the string exists twice
+    and can drift. A drift would be silent and asymmetric: the scanner would exempt a directory
+    the pruner still ships, or flag one it already removed, and either way the published tier
+    would not be the scanned tier. leak_scan's comment claims this test keeps them in sync, so
+    the test has to exist for the comment to be true.
+    """
+    import importlib.util
+
+    def load(name, rel):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(_ROOT, rel))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    pruner = load("_pt", "tools/publish_tree.py")
+    scanner = load("_ls", "tools/leak_scan.py")
+    assert scanner._INTERNAL_TIER == pruner._INTERNAL == _INTERNAL, (
+        f"tier boundary disagrees: leak_scan={scanner._INTERNAL_TIER!r} "
+        f"publish_tree={pruner._INTERNAL!r} test={_INTERNAL!r}")

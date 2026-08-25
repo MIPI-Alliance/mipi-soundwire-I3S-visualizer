@@ -12,6 +12,8 @@ Run: PYTHONPATH=. python3 -m pytest tests/test_phy1_demo.py
 """
 import math
 
+from conftest import demo_skipped_rate_hz, demo_transported_samples
+
 from swi3s_studio.session import Session
 
 
@@ -33,21 +35,31 @@ def test_phy1_operational_geometry_and_rates():
     assert abs(s.row_rate_khz - 1536.0) < 1.0, s.row_rate_khz
     assert s.audio_store().streams() == [(0, 0), (0, 1), (0, 2)]
     rates = s.decoder.audio_sample_rates()
-    assert abs(rates[(0, 0)] - 48_000) < 1.0            # DP0 PCM
-    assert abs(rates[(0, 1)] - 48_000) < 1.0            # DP1 PCM
+    # DP0 skips 13 of every 160 intervals, so it carries 44.1 kHz on 48 kHz transport
+    # opportunities; DP1 shares the column and does not skip. See conftest.
+    assert abs(rates[(0, 0)] - demo_skipped_rate_hz()) < 1.0     # DP0 PCM, 44.1 kHz
+    assert abs(rates[(0, 1)] - 48_000) < 1.0                     # DP1 PCM, 48 kHz
     assert abs(rates[(0, 2)] - 3_072_000) < 100.0       # DP2 PDM
 
 
 def test_phy1_audio_decodes_clean():
-    """DP0 (unscrambled PCM) decodes to the exact synthesized sine, and both PCM ports
-    recover the full sample count across the mid-capture reconfigure (600 each)."""
+    """DP0 (unscrambled PCM) decodes to the exact synthesized sine across the mid-capture
+    reconfigure.
+
+    DP0 SKIPS (13/160 -> 44.1 kHz) so it transports fewer samples than there were
+    opportunities; DP1 does not and recovers all of them. The sine is indexed in SAMPLES, so a
+    skipped interval advances nothing and the sequence continues — which is why the VALUES are
+    still exact, and why they are the assertion that matters here. A mis-phased skip would read
+    an idle interval as a sample and break the sequence at the first skip."""
     n = 600
     s = Session.from_demo(n, cold_start=True, phy=1)
-    au = s.decoder.audio()
+    au = s.audio                           # the Session's copy (decoder's is released)
     dp0 = [a["value"] for a in sorted((a for a in au if a["dp"] == 0),
                                       key=lambda a: a["start_sample"])]
     dp1 = [a for a in au if a["dp"] == 1]
-    assert len(dp0) == n and len(dp1) == n, (len(dp0), len(dp1))
+    lo, hi = demo_transported_samples(n)
+    assert lo <= len(dp0) <= hi, f"dp0 transported {len(dp0)}, expected {lo}..{hi} of {n}"
+    assert len(dp1) == n, len(dp1)
     amp = (1 << 15) * 0.45
     expect = [int(round(amp * math.sin(2 * math.pi * i / 64))) & 0xFFFF for i in range(8)]
     assert dp0[:8] == expect, (dp0[:8], expect)

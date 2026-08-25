@@ -15,7 +15,7 @@ import inspect
 import os
 import sys
 import tempfile
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import swi3score
@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QScrollBar,
     QSplitter,
     QStackedWidget,
+    QStyle,
     QTabBar,
     QToolButton,
     QVBoxLayout,
@@ -64,7 +65,7 @@ from ..export import write_commands_csv
 from ..ingest import saleae_binary
 from ..model import RegisterMap, viz_engine
 from ..model.bookmarks import BookmarkSet
-from ..model.bus_config import BusConfig, demo_config
+from ..model.bus_config import BusConfig, cds_symbol, demo_config
 from ..session import Session
 from ..workspace import Workspace, session_from_source
 from .audio_view import AudioView
@@ -95,11 +96,18 @@ from .timing_view import TimingView
 DEFAULT_GRID_ROWS = 64   # Bus Grid rows to draw (config layout + TX raster); 64 is a
                          # common payload repeat interval. User-settable per capture.
 
-# TX-map persistence scans a whole config region. Below this many UIs the scan is
-# sub-~0.3s, so compute it inline; above it (a long audio region — 100s of millions of
-# UIs, seconds of scan) run it on a worker thread so the grid doesn't freeze. Sized so
-# the demo + short captures stay synchronous and only genuinely large regions go async.
-_TX_PERSIST_SYNC_MAX_UIS = 32_000_000
+# TX-map persistence scans a whole config region. Below this many UIs the scan is short
+# enough to run inline; above it, run it on a worker thread so the grid doesn't freeze.
+#
+# CALIBRATED, NOT GUESSED. The scan measures ~32 ns/UI (19.2 M UIs of a real 4.7 s capture
+# took 616 ms), so the old 32 M admitted ~1.0 s of work to the GUI thread while its own
+# comment claimed "sub-~0.3s" -- and a 4.7 s capture's own region sat under the threshold,
+# making the first cursor move into it a ~550 ms freeze. The bound is the INLINE BUDGET:
+# what may run between a cursor move and a repaint, not what the scan can manage. Keep it
+# small enough that a miss is invisible; the async path exists for everything else and is
+# not a fallback to be avoided. test_perf.test_tx_persist_inline_threshold_stays_inline
+# holds the constant to a measured ceiling, so raising it fails the gate.
+_TX_PERSIST_SYNC_MAX_UIS = 2_000_000
 
 
 def _bundled_data_path(filename: str) -> str:
@@ -149,8 +157,19 @@ def _init_csv_path() -> str:
 # extend it by _SAMPLE_CHUNK rows whenever the user scrolls to either end (see
 # DecodedSampleView.edgeReached). QTableWidget item creation is ~11 µs/row, so the initial
 # window and chunks are sized to stay responsive rather than loading the whole capture.
-_SAMPLE_HALF_WINDOW = 4000     # rows loaded on each side of the cursor initially
-_SAMPLE_CHUNK = 4000           # rows added per scroll-to-edge
+#
+# Sized against the REBUILD, not the scroll. A cursor move that leaves the window re-centres
+# it, discarding every QTableWidgetItem and building 2 * half * len(_COLS) fresh ones; a move
+# INSIDE the window is only a select_sample and costs nothing (_refresh_samples_around). At
+# the original 4000 that rebuild was 48k items and profiled at ~99 ms of a 142 ms cursor move
+# on a 2520x1350 dpr-2.0 display — the whole of the "cursor jumps instantly, then it hangs"
+# report, since jumping out is exactly what triggers it. A screenful is ~40 rows, so several
+# hundred still absorbs ordinary arrow stepping without a rebuild while making the rebuild an
+# order of magnitude cheaper. Do NOT raise these to buy fewer rebuilds: the trade runs the
+# wrong way, because the rebuild is O(window) and the size only buys a *chance* of staying in.
+# test_perf.test_decoded_samples_rebuild_ceiling holds the ceiling and the bound on `half`.
+_SAMPLE_HALF_WINDOW = 500      # rows loaded on each side of the cursor initially
+_SAMPLE_CHUNK = 1000           # rows added per scroll-to-edge
 
 
 def _demo_samples() -> int:
@@ -173,6 +192,22 @@ def _fmt_duration(seconds: float) -> str:
     if a >= 1e-6:
         return f"{seconds * 1e6:,.3f} µs"
     return f"{seconds * 1e9:,.1f} ns"
+
+
+def _authored_slot_names(cfg) -> dict:
+    """{slot index: user-assigned port name} for the Bus-Visualizer colour key. Skips the
+    default "DP{i}" placeholder so the key falls back to the device-qualified number,
+    which identifies the port where a bare "DP0" cannot (several devices may each own a
+    DP0). Best-effort: a config shape without names just yields an empty map."""
+    names = {}
+    try:
+        for i, dp in enumerate(cfg.dataports):
+            name = (getattr(dp, "name", "") or "").strip()
+            if name and name != f"DP{i}":
+                names[i] = name
+    except Exception:  # noqa: BLE001 — the key degrades to numbers; never break the render
+        return {}
+    return names
 
 
 def _factory_takes_decoder_ready(factory) -> bool:
@@ -466,6 +501,7 @@ class MainWindow(QMainWindow):
         # doubles as the live "N of M (active filters)" indicator.
         self._expr_dialog = None
         self._expr_edit = None
+        self._expr_timer: Optional[QTimer] = None   # the filter debounce; built with the dialog
         self._cmd_proxy.rowsInserted.connect(self._update_cmd_title)
         self._cmd_proxy.rowsRemoved.connect(self._update_cmd_title)
         self._cmd_proxy.modelReset.connect(self._update_cmd_title)
@@ -627,7 +663,7 @@ class MainWindow(QMainWindow):
         # No status-bar strip — it wasted vertical space and only showed the mode /
         # a hint. Keep a hidden label so the existing status-message API
         # (self._status.setText(...)) still works without rendering anything.
-        self._status = QLabel("Bus Visualizer — demo capture ready in Bus Analyzer")
+        self._status = QLabel("Bus Visualizer")
         self._build_menu()
 
         # Three-mode shell: a top segmented switcher swaps the central page and the
@@ -656,15 +692,15 @@ class MainWindow(QMainWindow):
             except (AttributeError, RuntimeError):       # older Qt without the signal
                 pass
 
-        # Preload the demo capture into the Analyzer session in the background (it's
-        # near-instant), staying in the Bus Visualizer default — so switching to Bus
-        # Analyzer shows the decoded demo immediately, with the title reading its name.
-        try:
-            self.load_session(
-                Session.from_demo(_demo_samples(), cold_start=True, register_map=self._rmap),
-                switch_mode=False)
-        except Exception:  # noqa: BLE001 - never let a demo-decode hiccup block startup
-            pass
+        # The demo capture is decoded on FIRST ENTRY to Bus Analyzer, not here. It used to
+        # be preloaded at startup so the mode switch was instant, but a 1 s demo is ~25M UIs
+        # of 500 MS/s wire and holding its decode cost ~2.3 GB of the ~2.6 GB the app sat at
+        # on launch — paid by everyone, including the (default) Bus Visualizer sessions that
+        # never open the Analyzer, and by anyone whose next act is File ▸ Open. Synthesis +
+        # decode is a couple of seconds and goes through the same worker + progress path as
+        # a real capture, so deferring it costs the first switch and nothing else.
+        # Cleared by load_session: once ANY capture is loaded there is nothing to preload.
+        self._demo_preload_pending = True
 
         # The colour-caching views (notably the bus grid, whose palette constants are
         # captured at import — before app startup applies the saved palette) must be
@@ -690,8 +726,10 @@ class MainWindow(QMainWindow):
         if mode == VISUALIZATION:
             self._refresh_authored_grid()
             self._apply_viz_split_sizes()
-        elif analysing and self._session is not None:
-            self._apply_grid_for_sample(self.cursor.sample)
+        elif analysing:
+            self._preload_demo_if_pending()
+            if self._session is not None:
+                self._apply_grid_for_sample(self.cursor.sample)
         # First time into Analysis, lay out the default arrangement (Bus Grid active,
         # bottom row ~25% tall, Register Map ~33% wide). Deferred so the window has a
         # real geometry; later visits restore the user's own arrangement.
@@ -862,7 +900,10 @@ class MainWindow(QMainWindow):
             self._viz_grid.set_bus_model([], {}, cfg.column_count(), 1)
             self._authoring.set_issues([Issue(ERROR, "Engine", f"could not build: {exc}")])
             return
-        self._viz_grid.set_bus_model(cells, clashes, ncols, nrows)
+        self._viz_grid.set_bus_model(cells, clashes, ncols, nrows,
+                                     slot_names=_authored_slot_names(cfg),
+                                     cds_symbol=cds_symbol(cfg.cds_drive_type,
+                                                            cfg.cds_end_drive_early))
         self._authoring.set_issues(issues)
 
     def _on_issue_activated(self, cells: list) -> None:
@@ -901,9 +942,17 @@ class MainWindow(QMainWindow):
             "Visualizer CSV (*.csv);;All files (*)")
         if not path:
             return
+        self._remember_capture_dir(path, "visualizer")
+        self.open_visualizer_csv_path(path)
+
+    def open_visualizer_csv_path(self, path: str) -> None:
+        """Open a Visualizer config CSV by PATH — the dialog-free half of
+        open_visualizer_csv, so the `-c` command-line option and the menu item take the
+        same route (mode switch, then load). Kept separate rather than defaulting the
+        dialog's argument: a caller passing a path must never be able to raise a file
+        dialog, which is what would happen on an empty string."""
         if self._mode_mgr.current() != VISUALIZATION:
             self._mode_mgr.switch_to(VISUALIZATION)
-        self._remember_capture_dir(path, "visualizer")
         self._load_authoring_csv(path)
 
     def _load_authoring_csv(self, path: str) -> None:
@@ -1115,7 +1164,24 @@ class MainWindow(QMainWindow):
         rows_lbl = QLabel("Rows To Draw")
         self._grid_rows_edit = QLineEdit(str(self._grid_rows))
         self._grid_rows_edit.setValidator(QIntValidator(1, 10240, self))
-        self._grid_rows_edit.setFixedWidth(64)
+        # WIDTH FROM THE FONT, WITH THE OLD CONSTANT AS A FLOOR — the same correction 3.0.15
+        # made to the settings dialog ("the constant is a floor, and on this platform's
+        # metrics the answer is still exactly 470, so nothing moves where it was tuned").
+        # This was setFixedWidth(64) for a field whose validator permits five digits, which is
+        # the shape of the two defects that shipped 3.0.13 and 3.0.14 red on Windows: a pixel
+        # constant tuned against macOS metrics, clipped under the runner's wider font. At 16pt
+        # monospace "10240" needs 63 px of text alone, before frame and margins.
+        #
+        # A POINT SIZE IS NOT A WIDTH, so measure the widest string the validator allows. And a
+        # MINIMUM rather than a fixed width: the cap is what did the clipping.
+        _fm = self._grid_rows_edit.fontMetrics()
+        _margins = self._grid_rows_edit.textMargins()
+        _frame = 2 * self._grid_rows_edit.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth, None, self._grid_rows_edit)
+        self._grid_rows_edit.setMinimumWidth(max(
+            64,                                            # the tuned macOS value, as a floor
+            _fm.horizontalAdvance("10240")                 # the validator's widest value
+            + _margins.left() + _margins.right() + _frame + 8))   # frame, margins, caret
         self._grid_rows_edit.setToolTip("Number of bus rows to draw in the Bus Grid (1–10240)")
         self._grid_rows_edit.editingFinished.connect(self._on_grid_rows_edit)
 
@@ -1182,6 +1248,9 @@ class MainWindow(QMainWindow):
         # nothing to act on, so nothing in File is mode-gated.
         analyzer = f.addMenu("&Analyzer")
         analyzer.addAction("Open &Capture…", self.open_capture)
+        # A window is reachable on purpose, not only when the size guard forces one --
+        # otherwise a machine with plenty of free memory can never ask for a slice.
+        analyzer.addAction("Open Capture &Time Window…", self.open_capture_window)
         demo_menu = analyzer.addMenu("Open &Demo Capture")
         demo_menu.addAction("PHY1 (FBCSE)", lambda: self.load_demo(phy=1))
         demo_menu.addAction("PHY2 (FBCSE)", lambda: self.load_demo(phy=2))
@@ -1402,8 +1471,9 @@ class MainWindow(QMainWindow):
         return sub
 
     def _filter_expression_dialog(self) -> None:
-        """Non-modal dialog with the free-text boolean expression (filters live as
-        you type) — the one filter that can't be a menu item."""
+        """Non-modal dialog with the free-text boolean expression — the one filter that can't
+        be a menu item. Applies on a short pause rather than per character (see the debounce
+        below), or at once on Enter."""
         if self._expr_dialog is None:
             dlg = QDialog(self)
             dlg.setWindowTitle("Filter Expression")
@@ -1411,8 +1481,20 @@ class MainWindow(QMainWindow):
             lay.addWidget(QLabel("Filter commands (substring; and / or / parentheses):"))
             self._expr_edit = QLineEdit()
             self._expr_edit.setMinimumWidth(360)
-            self._expr_edit.textChanged.connect(
-                lambda t: (self._cmd_proxy.set_text(t), self._on_command_filter_changed()))
+            # DEBOUNCED, not applied per character. Every set_text invalidates the proxy
+            # filter, which re-tests EVERY source row; the first sweep after a model reset
+            # also has to build the row-text cache, so it is the expensive one (~1.2 s at
+            # 200k commands even after that build was made ~10x cheaper). Typing "write"
+            # would otherwise queue five sweeps, and the cheap ones still cost ~0.1 s each.
+            # A short pause is imperceptible when typing and collapses a burst into one.
+            self._expr_timer = QTimer(self)
+            self._expr_timer.setSingleShot(True)
+            self._expr_timer.setInterval(200)
+            self._expr_timer.timeout.connect(self._apply_expr_filter)
+            self._expr_edit.textChanged.connect(self._expr_timer.start)
+            # Enter applies immediately: someone who has finished typing should not wait out
+            # a timer they cannot see.
+            self._expr_edit.returnPressed.connect(self._apply_expr_filter)
             lay.addWidget(self._expr_edit)
             row = QHBoxLayout()
             row.addStretch(1)
@@ -1428,13 +1510,29 @@ class MainWindow(QMainWindow):
         self._expr_dialog.raise_()
         self._expr_edit.setFocus()
 
+    def _apply_expr_filter(self) -> None:
+        """Push the Filter Expression box into the proxy — one sweep, whenever it happens.
+
+        Called by the debounce timer, and directly by Enter and Clear All Filters, which must
+        not wait out a timer the user cannot see. Stops the timer first so an immediate apply
+        cannot be followed by a redundant queued one.
+        """
+        if self._expr_edit is None:
+            return
+        timer = getattr(self, "_expr_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._cmd_proxy.set_text(self._expr_edit.text())
+        self._on_command_filter_changed()
+
     def _clear_all_filters(self) -> None:
         self._kind_menu._clear()
         self._dev_menu._clear()
         self._group_menu._clear()
         self._errors_only_act.setChecked(False)        # toggled → set_errors_only(False)
         if self._expr_edit is not None:
-            self._expr_edit.clear()                    # textChanged → set_text("")
+            self._expr_edit.clear()                    # textChanged → starts the debounce
+            self._apply_expr_filter()                  # …but a Clear applies at once
         else:
             self._cmd_proxy.set_text("")
         self._on_command_filter_changed()
@@ -1497,12 +1595,34 @@ class MainWindow(QMainWindow):
         self._audio_view.refresh_devices()
         self._build_audio_playback_menu()
 
+    def _retire_action_groups(self, *groups) -> None:
+        """deleteLater() exclusive-action groups that are about to be replaced.
+
+        A QActionGroup parented to `self` OUTLIVES the menu it populated: QMenu.clear()
+        destroys the QActions (and a destroyed action removes itself from its group), but the
+        group is a child of the WINDOW, so rebinding the attribute just drops the last Python
+        reference to a C++ object Qt still owns. Measured: 4 groups after construction, 104
+        after 50 rebuilds of the playback menus, 4004 after 2000 — empty shells, ~1.6 KB per
+        rebuild, and unbounded across a session.
+
+        Small, but it is a per-capture-load drip: the decimation menu is rebuilt on every load
+        and every re-decode, one group per (device, dataport) audio stream, so a session
+        stepping the SSP through a multi-stream capture accumulates them steadily. Zero for a
+        capture with no audio.
+        """
+        for group in groups:
+            if group is not None:
+                group.deleteLater()
+
     def _build_audio_playback_menu(self) -> None:
         """Populate the Audio ▸ playback submenus (output device, bit depth,
         decimation) — moved off the Audio pane's toolbar to keep it uncluttered.
         Each is a checkable, mutually-exclusive group that sets the AudioView's
         playback state. Rebuilt on demand so a hot-plugged device shows up."""
         av = self._audio_view
+        # Retire the groups this rebuild is about to orphan — see _retire_action_groups.
+        self._retire_action_groups(getattr(self, "_play_device_group", None),
+                                  getattr(self, "_play_depth_group", None))
         # --- output device ---
         m = self._play_device_menu
         m.clear()
@@ -1545,6 +1665,9 @@ class MainWindow(QMainWindow):
         av = self._audio_view
         m = self._play_rate_menu
         m.clear()
+        # One group per stream, so this is where the per-load drip came from: the decimation
+        # menu is rebuilt on every capture load and every re-decode.
+        self._retire_action_groups(*getattr(self, "_play_rate_groups", ()))
         self._play_rate_groups = []          # keep the QActionGroups alive
         rates = [("Native (no resample)", None), ("8 kHz", 8000),
                  ("16 kHz", 16000), ("32 kHz", 32000), ("44.1 kHz", 44100),
@@ -1759,6 +1882,31 @@ class MainWindow(QMainWindow):
         """Alias for load_demo (PHY2) — kept for the app's --demo-bringup flag."""
         self.load_demo(phy=2)
 
+    def _preload_demo_if_pending(self) -> None:
+        """Decode the demo capture the first time Bus Analyzer is entered with nothing
+        loaded — the deferred half of what used to happen in __init__ (see the flag there).
+
+        Fires at most once, and never over a real capture: `load_session` clears the flag,
+        so opening a file from any mode and then switching to the Analyzer shows the file,
+        not the demo. The `_session` check is belt-and-braces for the same thing.
+
+        A load already in flight is left to finish and the flag is NOT spent: `_load_async`
+        coalesces with latest-wins, so queueing a demo behind (say) File ▸ Open would
+        discard the capture the user actually asked for. If that load fails, the next
+        switch into the Analyzer preloads as usual.
+
+        A decode hiccup must not leave the mode switch half-done, so it is swallowed here
+        exactly as it was at startup — the Analyzer simply opens empty."""
+        if not getattr(self, "_demo_preload_pending", False):
+            return
+        if self._session is not None or getattr(self, "_load_thread", None) is not None:
+            return
+        self._demo_preload_pending = False      # one attempt, before it can re-enter
+        try:
+            self.load_demo()
+        except Exception:  # noqa: BLE001 - never let a demo-decode hiccup block the switch
+            pass
+
     # Per-mode last-opened-file directory: the Analyzer (captures, .sal export, sub-
     # capture) and the Visualizer (config CSVs) browse independently, so opening one
     # doesn't jump the other's dialog to an unrelated folder. Keys are QSettings
@@ -1853,19 +2001,49 @@ class MainWindow(QMainWindow):
         with it AND seed the bus grid + register map from it (Provenance.CSV — "CSV Import"),
         so a post-commit capture matches the CSV. Runs the re-decode on the worker thread
         (same path as the Scrambler override); the cursor and bookmarks are kept."""
-        # A config CSV is imposed as ONE config from row 0. A capture that reconfigures
-        # mid-stream (e.g. a DLV cold start: Safe-Lock-4 -> 16-col) has several — so the
-        # single config can only match one region and will misframe the others (their
-        # commands go CRC-red). Warn before imposing.
+        # A config CSV is imposed as ONE config from row 0. Two ways that can quietly not
+        # mean what the user expects — collected into ONE prompt rather than two in a row:
+        #
+        #  * a capture that reconfigures mid-stream (e.g. a DLV cold start: Safe-Lock-4 ->
+        #    16-col) has several configs, so the single imposed one can match only one region
+        #    and will misframe the others (their commands go CRC-red);
+        #  * a port whose columns lie beyond the capture's decoded width is simply NOT
+        #    PLACED. That was silent: the grid just came back narrower with fewer ports, which
+        #    reads as "the config didn't load" rather than "this config is wider than this
+        #    capture". Same family as the warning above, same import path.
         if self._session is not None:
+            concerns = []
             widths = sorted({int(s.get("column_count", 0)) for s in self._session.segments})
             if len(widths) > 1:
-                resp = QMessageBox.warning(
-                    self, "Import Visualizer CSV",
+                concerns.append(
                     f"This capture reconfigures mid-stream ({len(self._session.segments)} "
                     f"regions, column widths {', '.join(map(str, widths))}). A config CSV is "
                     "imposed from row 0, so it can match only one region and will misframe "
-                    "the others (their commands turn red).\n\nImpose it anyway?",
+                    "the others (their commands turn red).")
+            cap_cols = int(getattr(self._session, "column_count", 0) or 0)
+            if cap_cols > 0:
+                try:
+                    cfg = self._bus_config_from_csv(csv)
+                except Exception:                     # noqa: BLE001 — unreadable CSV is
+                    cfg = None                        # reported by the caller, not here
+                if cfg is not None:
+                    # horizontal_count is excess-1, so the last column owned is start+count.
+                    over = [(i, dp) for i, dp in enumerate(cfg.dataports)
+                            if dp.enabled and dp.enable_ch
+                            and dp.horizontal_start + dp.horizontal_count >= cap_cols]
+                    if over:
+                        names = ", ".join(
+                            f"{dp.name or f'DP{i}'} (cols "
+                            f"{dp.horizontal_start}-{dp.horizontal_start + dp.horizontal_count})"
+                            for i, dp in over)
+                        concerns.append(
+                            f"{len(over)} port(s) in this config need columns beyond the "
+                            f"capture's decoded width of {cap_cols}: {names}. They will not "
+                            "be placed, and the grid will come back without them.")
+            if concerns:
+                resp = QMessageBox.warning(
+                    self, "Import Visualizer CSV",
+                    "\n\n".join(concerns) + "\n\nImpose it anyway?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if resp != QMessageBox.Yes:
                     return
@@ -2065,7 +2243,7 @@ class MainWindow(QMainWindow):
             return None
         return options[ci], options[disp.index(dat)]
 
-    def _sal_window_prompt(self, path: str, clk: int, dat: int):
+    def _sal_window_prompt(self, path: str, clk: int, dat: int, force: bool = False):
         """Pre-flight a .sal open and, when it won't fit in memory, offer a window.
 
         A .sal is a zip of delta-coded transitions: a ~280 MB file can hold 2.2 GB
@@ -2073,6 +2251,12 @@ class MainWindow(QMainWindow):
         and leaves the machine unresponsive with no error. The estimate below reads
         only the zip directory, so it costs nothing and happens BEFORE any
         allocation.
+
+        `force` asks for a window whatever the size predicts — the path behind
+        Open Time Window…. Without it this returns None for anything that fits, which
+        meant a capture the app WOULD load whole could not be windowed at all even by a
+        user who knew they wanted a slice of it. "It fits" is not "it stays interactive",
+        and the prompt was the only route to a window.
 
         Returns the (start_sample, end_sample) window to load, None for the whole
         capture, or the string "cancel" if the user backed out.
@@ -2082,40 +2266,75 @@ class MainWindow(QMainWindow):
             cost = saleae_sal.estimate_cost(path, channels=[clk, dat])
             budget = saleae_sal.memory_budget()   # shared with the loader's guard
         except Exception:
-            return None                       # can't estimate — let the load proceed
-        if budget <= 0 or cost.fits_in(budget):
+            if not force:
+                return None                   # can't estimate — let the load proceed
+            cost, budget = None, 0
+        if cost is not None and not force and (budget <= 0 or cost.fits_in(budget)):
             return None
-        span = saleae_sal.capture_span_samples(path)
-        rate = cost.sample_rate_hz or 1
+        # Restricted to the two channels being loaded: the walk seeks with ZipExtFile.seek(),
+        # which on a DEFLATE member is read-and-discard, so walking every channel in the
+        # archive blocked the GUI for ~2 s here — on exactly the large captures this prompt
+        # exists to serve.
+        span = saleae_sal.capture_span_samples(path, channels=[clk, dat])
+        rate = (cost.sample_rate_hz if cost else 0) or saleae_sal.read_info(path).sample_rate_hz or 1
         total_s = span / rate if span else 0.0
         # Suggest the largest window predicted to fit, rounded down to a whole second.
-        frac = budget / float(max(1, cost.est_edge_bytes * 2))
+        edge_bytes = max(1, (cost.est_edge_bytes if cost else 0) * 2)
+        frac = (budget / float(edge_bytes)) if budget > 0 else 1.0
         suggest_s = max(1.0, min(total_s or 10.0, (total_s or 10.0) * frac))
-        msg = (f"This capture is too large to open in full.\n\n"
-               f"{cost.summary()}\nAvailable: {budget / 1e9:.1f} GB\n\n")
+        title = "Open time window" if force else "Capture too large"
+        detail = (f"{cost.summary()}\n" if cost else "")
+        avail = (f"Available: {budget / 1e9:.1f} GB\n" if budget > 0 else "")
+        msg = ((f"Open part of this capture.\n\n{detail}{avail}\n" if force else
+                f"This capture is too large to open in full.\n\n{detail}{avail}\n"))
         if not span:
-            QMessageBox.warning(self, "Capture too large", msg +
+            QMessageBox.warning(self, title, msg +
                                 "A time window can't be offered (no block index in "
                                 "this file). Free memory, or export a shorter range "
                                 "from Logic 2.")
             return "cancel"
-        msg += (f"The capture is {total_s:.1f} s long. Open a time window instead?\n"
-                f"About {suggest_s:.0f} s is predicted to fit.")
-        if QMessageBox.question(self, "Capture too large", msg,
-                                QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
-            return "cancel"
-        start, ok = QInputDialog.getDouble(self, "Open window", "Start (seconds):",
+        msg += f"The capture is {total_s:.1f} s long."
+        if not force:
+            msg += (f" Open a time window instead?\n"
+                    f"About {suggest_s:.0f} s is predicted to fit.")
+            if QMessageBox.question(self, title, msg,
+                                    QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
+                return "cancel"
+        start, ok = QInputDialog.getDouble(self, title, "Start (seconds):",
                                            0.0, 0.0, max(0.0, total_s), 3)
         if not ok:
             return "cancel"
-        length, ok = QInputDialog.getDouble(self, "Open window", "Length (seconds):",
+        length, ok = QInputDialog.getDouble(self, title, "Length (seconds):",
                                             round(suggest_s, 3), 0.001,
                                             max(0.001, total_s - start), 3)
         if not ok:
             return "cancel"
         return (int(start * rate), int((start + length) * rate))
 
-    def _open_sal(self, path: str, config_csv: str = "") -> None:
+    def open_capture_window(self) -> None:
+        """Open a time window of a `.sal`, whatever its size predicts.
+
+        The size-triggered prompt in _sal_window_prompt was the ONLY route to a windowed
+        load, so a capture the app was willing to load whole could not be sliced even by a
+        user who knew they wanted a slice — and on a machine with plenty of free memory
+        that was every capture. "It fits" is a statement about capacity, not about staying
+        interactive.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open a time window of a Saleae project",
+            self._last_capture_dir(), filter="Saleae project (*.sal);;All files (*)")
+        if not path:
+            return
+        self._remember_capture_dir(path)
+        try:
+            self._open_sal(path, force_window=True)
+        except saleae_binary.UnsupportedSaleaeVersion as exc:
+            QMessageBox.warning(self, "Unsupported format", str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface ingest/decode errors
+            QMessageBox.critical(self, "Open failed", str(exc))
+
+    def _open_sal(self, path: str, config_csv: str = "",
+                  force_window: bool = False) -> None:
         from ..ingest import saleae_sal
         info = saleae_sal.read_info(path)
         if len(info.channels) < 2:
@@ -2129,7 +2348,7 @@ class MainWindow(QMainWindow):
             if picked is None:
                 return
             clk, dat, auto = picked[0], picked[1], False
-        window = self._sal_window_prompt(path, clk, dat)
+        window = self._sal_window_prompt(path, clk, dat, force=force_window)
         if window == "cancel":
             return
 
@@ -2367,6 +2586,28 @@ class MainWindow(QMainWindow):
         (the demo is ~24M UIs) doesn't beach-ball the GUI thread for several seconds."""
         if self._session is None:
             QMessageBox.information(self, "No capture", "Open a capture first.")
+            return
+        # ONE SEARCH AT A TIME, refused BEFORE the file dialog so nobody picks a file only to
+        # be told no. _load_async and _start_tx_persist_worker both guard their worker this
+        # way; this one did not, and a second invocation during the (multi-second) FFT search
+        # overwrote _locate_thread / _locate_worker / _locate_dlg / _locate_path while the
+        # first worker was still running. Its still-connected done/failed/progress slots then
+        # read the SECOND search's state — so a result could be reported against the wrong
+        # file — and the abandoned QThread was never joined, since _teardown_locate_thread
+        # waits on whatever _locate_thread now points at. That is the destroyed-while-running
+        # abort join_worker_threads() exists to prevent.
+        #
+        # QUEUEING WOULD BE WRONG HERE, unlike a re-decode. The other two workers coalesce to
+        # "latest wins" because their input is derived state the app can recompute; this one's
+        # input is a file the user chose, so silently dropping or deferring it is worse than
+        # saying the previous search is still running.
+        if getattr(self, "_closing", False):
+            return
+        if getattr(self, "_locate_thread", None) is not None:
+            QMessageBox.information(
+                self, "Search already running",
+                "A sub-capture search is already in progress. Wait for it to finish "
+                "before starting another.")
             return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Locate sub-capture (.sal, .csv, .vcd, or both .bin/.wfm files)",
@@ -3016,6 +3257,9 @@ class MainWindow(QMainWindow):
         # so this method doesn't recompute them here and freeze the UI. None → compute
         # lazily (the synchronous demo path).
         extras = extras or {}
+        # Any real load settles the question the startup demo preload existed to answer, so
+        # entering the Analyzer later must not decode a demo over this capture.
+        self._demo_preload_pending = False
         # A re-decode (SSP step, register/scrambler override, Port-Samples collect) mutates
         # the SAME session in place and reloads it, so `session is` the previous one — keep
         # the command filter across it. A genuinely NEW capture clears filters below.
@@ -3566,7 +3810,7 @@ class MainWindow(QMainWindow):
             return _fmt_duration(s / rate) if rate else f"{int(s):,} smp"
 
         # Group members by their stable group letter (items() is creation-ordered A1,A2,B1…).
-        groups = {}
+        groups: Dict[str, dict] = {}
         for bm in self._bookmarks.items:            # `items` is a property (all bookmarks)
             groups.setdefault(bm.group, {})[bm.index] = bm
         for g in sorted(groups):

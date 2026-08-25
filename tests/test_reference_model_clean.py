@@ -64,3 +64,21 @@ def test_reference_model_keeps_its_docstrings(rel):
     assert classes, f"{rel} defines no classes?"
     undocumented = [c.name for c in classes if not ast.get_docstring(c)]
     assert not undocumented, f"{rel}: classes lost their docstrings: {undocumented}"
+
+
+# Docstring CONTENT is deliberately NOT checked here, and the claim that it was has been
+# withdrawn rather than weakened.
+#
+# A guard existed for one cycle that rejected docstrings naming this codebase — test and
+# module paths, a comparison to the C++ core, a method of a module the specification does not
+# publish, "the engine". The rule was right about the artefact and wrong about who writes it.
+# These two files are authored externally and arrive as whole-file drops, so holding the line
+# means either rewriting the author's prose every drop or carrying a divergent copy, and the
+# next drop reverts both. Enforcement was tried first as an exemption list, which is worse
+# than nothing: it reads as coverage while the exemptions are where the real content is.
+#
+# So the rule now lives where it can be acted on — as review comments on the incoming drop.
+# What stays enforced above is what a whole-file drop cannot silently undo and what this repo
+# does own: no `#` comments (upstream ships none, and OUR edits are the ones that added 25),
+# and the module/class docstrings existing at all, so the comment rule is never satisfied by
+# deleting documentation instead of relocating it.

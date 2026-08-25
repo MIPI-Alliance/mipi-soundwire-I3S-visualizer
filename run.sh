@@ -103,11 +103,13 @@ source "$VENV/bin/activate"
 
 # Install/refresh deps only when requirements change (a stamp keeps re-runs fast).
 STAMP="$VENV/.deps-stamp"
+installed_deps=0
 if [ ! -f "$STAMP" ] || [ requirements.txt -nt "$STAMP" ]; then
     echo "Installing Python dependencies..."
     python -m pip install --upgrade pip >/dev/null
     python -m pip install -r requirements.txt
     touch "$STAMP"
+    installed_deps=1
 fi
 
 # Build the native decode core when it's missing, out of date, or --rebuild was asked
@@ -153,4 +155,42 @@ if [ "$need_native" = 1 ]; then
     touch "$NATIVE_STAMP"
 fi
 
-exec env PYTHONPATH=. python -m swi3s_studio.app
+# Say that the launch has started. Everything above prints as it works, so without this
+# the last thing on screen is a pip line and the window is the next event - which reads as
+# a stall, especially right after an install: the OS verifies the ~450 MB of Qt libraries
+# the first time they are loaded, so the window can take a while. A warm start is ~1s.
+# (Emitted below, once the arguments are known — a headless run opens no window, so neither
+# message would be true of it.)
+
+# FORWARD EVERY REMAINING ARGUMENT. This launcher swallowed them all until 3.0.18, so
+# `./run.sh --demo` silently opened an empty window and `./run.sh -c cfg.csv -o m.json` started
+# the UI instead of writing a model. Nothing noticed because there was nothing worth passing
+# until the app grew a real command line.
+#
+# `--rebuild` is THIS script's own flag (see the native build above) and must not reach the app;
+# it is stripped here rather than at the top, because the build step reads $1.
+app_args=()
+headless=0
+for a in "$@"; do
+    [ "$a" = "--rebuild" ] && continue
+    case "$a" in
+        -o|--output|-o=*|--output=*|-h|--help) headless=1 ;;
+    esac
+    app_args+=("$a")
+done
+
+# -o implies headless, so say nothing about a window that will not open. The app decides for
+# real; this only picks which message is honest.
+if [ "$headless" = 1 ]; then
+    :
+elif [ "$installed_deps" = 1 ]; then
+    echo "Starting SWI3S Studio - the first launch after an install is slow while the OS"
+    echo "verifies the newly installed Qt libraries. Later runs start in about a second."
+else
+    echo "Starting SWI3S Studio..."
+fi
+
+# Tell the app what to call itself in `usage:` — see cli.program_name(). Without this,
+# `./run.sh -h` printed `usage: swi3s-studio …`, naming a command that does not exist on a
+# fresh checkout, when the launcher is how this project is documented to be run.
+exec env PYTHONPATH=. SWI3S_LAUNCHER=./run.sh python -m swi3s_studio.app "${app_args[@]+"${app_args[@]}"}"

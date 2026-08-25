@@ -55,6 +55,7 @@ public:
         int  column, rowInInterval;
         bool intervalSkipped;
         int  skippingAccumulator;
+        int  skipAccumAtBoundary;
         bool guardPending;
         int  tailRemaining;
         int  phase;                      // Phase enum value
@@ -70,6 +71,16 @@ public:
     int RowInInterval() const { return mRowInInterval; }
     int Column() const { return mColumn; }
     bool IntervalSkipped() const { return mIntervalSkipped; }
+
+    // Is the skipping pattern back at the top of its cycle? An SSP may only arrive where
+    // the accumulated effect of the SkippingNumerator is already 0 (Section 9.1.6.2.1) —
+    // the pattern repeats every Interval x SkippingDenominator Rows, not every Interval —
+    // so an SSP anywhere else re-phases the skip pattern and garbles the audio from there
+    // on. Always true for a port that isn't skipping.
+    bool SkipPatternAtCycleStart() const
+    {
+        return mCfg.SkippingNumerator == 0 || mSkipAccumAtBoundary == 0;
+    }
 
 private:
     enum Phase { kActive, kSpacing, kPending };
@@ -104,6 +115,10 @@ private:
     int  mRowInInterval = 0;
     bool mIntervalSkipped = false;
     int  mSkippingAccumulator = 0;
+    // The accumulator as it stood at the START of the current interval, BEFORE that
+    // interval spent its SkippingNumerator step. This is the "accumulated effect" the
+    // SSP rule is written against; the live accumulator has already moved on.
+    int  mSkipAccumAtBoundary = 0;
     bool mGuardPending = false;
     int  mTailRemaining = 0;
 

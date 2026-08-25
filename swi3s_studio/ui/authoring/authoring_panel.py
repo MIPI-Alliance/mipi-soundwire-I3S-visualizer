@@ -42,8 +42,7 @@ from ...model.bus_config import NUM_DATA_PORTS, BusConfig
 from ..theme import VizTheme, authoring_stylesheet
 from .dialogs import (
     MANAGER,
-    CdsGuardDialog,
-    CdsTailDialog,
+    CdsSettingsDialog,
     ChannelSelectorDialog,
     DataPortIdentityDialog,
     DeviceSelectorDialog,
@@ -51,6 +50,7 @@ from .dialogs import (
     FlowModeSelectorDialog,
     GuardSelectorDialog,
     PortModeSelectorDialog,
+    cds_summary,
 )
 from .notifications import NotificationsPanel
 
@@ -117,6 +117,14 @@ _CHECK_ROWS = [
 _CLICK_NUMERIC = {"device_number", "num_channels"}
 
 # Interface ("Other Parameters") rows: (label, attr, kind, min, max, phy3_only).
+#
+# THE FOUR CDS ROWS ARE ONE ROW NOW. Bit width, guard, tail and handover were four
+# consecutive rows in three different control shapes, and CDS_DriveType would have been
+# a fifth — a third of the interface column spent on one register block. They collapse
+# to a single "CDS Settings" button opening CdsSettingsDialog, which owns all five and
+# reaches the per-source guard/tail dialogs from inside. `kind == "dialog"` is a row
+# whose widget is a button, carrying no attr of its own (hence the `cds_settings`
+# pseudo-attr, which nothing on BusConfig answers to — see _on_iface_edit's skip list).
 _IFACE_ROWS = [
     ("Num Columns (1-31)", "num_columns", "int", 1, 31, False),
     ("Skipping Denominator (1-4096)", "skipping_denominator", "int", 1, 4096, False),
@@ -124,13 +132,15 @@ _IFACE_ROWS = [
     ("S0 Width (1-8)", "s0_width", "int", 1, 8, True),
     ("S1 Tail Width (0-2)", "s1_tail_width", "int", 0, 2, True),
     ("Enforce S1 Handover", "enforce_s1_handover", "bool", 0, 0, True),
-    ("CDS Bit Width (0-7)", "cds_bit_width", "int", 0, 7, False),
-    ("CDS Guard Enabled", "cds_guard_enabled", "guard", 0, 0, False),
-    ("CDS Tail Enabled", "cds_tail_enabled", "tail", 0, 0, False),
-    ("Enforce CDS Handover", "enforce_cds_handover", "bool", 0, 0, False),
+    ("CDS Settings", "cds_settings", "dialog", 0, 0, False),
     ("Row Rate [kHz] (1-48000)", "row_rate_khz", "float", 1, 48000, False),
     ("Rows To Draw (1-10240)", "rows_to_draw", "int", 1, 10240, False),
 ]
+
+# Interface rows that are NOT a BusConfig attribute — a button that opens a dialog. Kept
+# as a set so every loop over _IFACE_ROWS that reads/writes the model can skip them by
+# one name rather than each testing the widget type.
+_IFACE_NON_ATTR = {"cds_settings"}
 
 _ENTRY_W = 48
 _ROW_H = 24                # uniform row height so the frozen label column and the
@@ -387,20 +397,29 @@ class AuthoringPanel(QWidget):
                 ch = QHBoxLayout(cell); ch.setContentsMargins(0, 0, 0, 0)
                 ch.addStretch(1); ch.addWidget(w); ch.addSpacing(10); ch.addStretch(1)
                 form.addWidget(cell, i, 1, alignment=Qt.AlignRight)
-            elif kind in ("guard", "tail"):
-                # CDS Guard Enabled / CDS Tail Enabled — a checkbox (its checked
-                # state = "any source drives it"), but CLICKING it opens the
-                # per-source selector dialog (Off/G0/G1, or width 0-3), matching
-                # the original Visualizer's guard-dialog pattern. Centre it in the
-                # 64px band like the other bool rows.
-                w = QCheckBox()
-                w.clicked.connect(self._open_cds_guard_dialog if kind == "guard"
-                                  else self._open_cds_tail_dialog)
-                cell = QWidget()
-                cell.setFixedWidth(64)
-                ch = QHBoxLayout(cell); ch.setContentsMargins(0, 0, 0, 0)
-                ch.addStretch(1); ch.addWidget(w); ch.addSpacing(10); ch.addStretch(1)
-                form.addWidget(cell, i, 1, alignment=Qt.AlignRight)
+            elif kind == "dialog":
+                # A row whose "value" is a button: clicking opens the dialog that owns that
+                # group of settings (today, CDS). Sized to the same 64px value column so the
+                # column stays aligned with the entry boxes above it.
+                #
+                # STYLED, because `authoring_stylesheet()` covers QLineEdit and QCheckBox but
+                # NOT QPushButton — so this fell through to the platform frame and drew a
+                # light bevel on three sides with a dark one on the fourth, which reads as a
+                # rendering fault next to the flat themed entries beside it. It takes the
+                # ENTRY look rather than the panel's accent-blue action style: it sits in a
+                # column of values, and an accent fill here would shout louder than the
+                # buttons that actually load and save files. Hover + a hand cursor carry the
+                # affordance that the border no longer does.
+                w = QPushButton("Open…")
+                w.setFixedWidth(64)
+                w.setCursor(Qt.PointingHandCursor)
+                w.setStyleSheet(
+                    f"QPushButton {{ background:{VizTheme.ENTRY_BG}; color:{VizTheme.TEXT};"
+                    f" border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER};"
+                    f" border-radius:{VizTheme.CORNER_RADIUS}px; padding:1px 4px; }}"
+                    f"QPushButton:hover {{ border-color:{VizTheme.ACCENT}; }}")
+                w.clicked.connect(self._open_cds_settings_dialog)
+                form.addWidget(w, i, 1, alignment=Qt.AlignRight)
             else:
                 w = QLineEdit()
                 w.setAlignment(Qt.AlignCenter)
@@ -601,6 +620,8 @@ class AuthoringPanel(QWidget):
             for _, mode in _CHECK_ROWS:
                 self._dp_check[mode][c].setChecked(self._check_state(dp, mode))
         for attr, (lab, w) in self._iface.items():
+            if attr in _IFACE_NON_ATTR:
+                continue          # a dialog button, not a value (see _IFACE_ROWS)
             val = getattr(self._cfg, attr)
             if isinstance(w, QCheckBox):
                 w.setChecked(bool(val))
@@ -608,8 +629,7 @@ class AuthoringPanel(QWidget):
                 w.setText(f"{val:g}")
             else:
                 w.setText(str(int(val)))
-        self._update_cds_guard_checkbox()
-        self._update_cds_tail_checkbox()
+        self._update_cds_settings_row()
         self._desc.setPlainText(self._cfg.description)
         self._loading = False
         self._update_phy3_enabled()
@@ -729,67 +749,46 @@ class AuthoringPanel(QWidget):
         self._populate()
         self.configChanged.emit()
 
-    def _open_cds_guard_dialog(self, *_a) -> None:
-        """Per-source CDS guard (Off/G0/G1) — opened by clicking the "CDS Guard
-        Enabled" checkbox. The CDS is time-multiplexed, so the Manager and each of
-        devices 0-11 carry their own guard polarity; `cds_guard_enabled` is just the
-        derived "any source drives a guard" summary the checkbox shows. The checkbox
-        is re-synced from the model after the dialog closes (and reverted if
-        cancelled), since clicking already flipped it."""
-        dlg = CdsGuardDialog(self, list(self._cfg.cds_guard))
+    def _open_cds_settings_dialog(self, *_a) -> None:
+        """Every CDS setting, behind the one "CDS Settings" row.
+
+        Bit width, drive type and handover are edited in the dialog itself; the
+        per-source guard/tail dialogs open from inside it. Nothing is written back
+        unless the dialog is accepted — including a guard change made two dialogs deep,
+        which is why the guard/tail lists come back through the dialog rather than being
+        applied by the inner one.
+
+        `cds_guard_enabled` / `cds_tail_enabled` remain READ-ONLY properties derived from
+        the per-source lists; assigning either raises, so the lists are what is set.
+        """
+        dlg = CdsSettingsDialog(self, bit_width=self._cfg.cds_bit_width,
+                                drive_type=list(self._cfg.cds_drive_type),
+                                end_drive_early=list(self._cfg.cds_end_drive_early),
+                                enforce_handover=self._cfg.enforce_cds_handover,
+                                guard=list(self._cfg.cds_guard),
+                                tail=list(self._cfg.cds_tail))
         if dlg.exec():
+            self._cfg.cds_bit_width = int(dlg.bit_width)
+            self._cfg.cds_drive_type = list(dlg.drive_type)
+            self._cfg.cds_end_drive_early = list(dlg.end_drive_early)
+            self._cfg.enforce_cds_handover = bool(dlg.enforce_handover)
             self._cfg.cds_guard = list(dlg.guard)
-            self.configChanged.emit()
-        self._update_cds_guard_checkbox()
-
-    def _update_cds_guard_checkbox(self) -> None:
-        """Sync the CDS Guard checkbox's checked state to cds_guard_enabled without
-        re-triggering its clicked handler (setChecked emits toggled, not clicked)."""
-        _lab, w = self._iface["cds_guard_enabled"]
-        w.setChecked(bool(self._cfg.cds_guard_enabled))
-        w.setToolTip(self._cds_summary(self._cfg.cds_guard, "guard")
-                     + ". Click to change per-source.")
-
-    def _open_cds_tail_dialog(self, *_a) -> None:
-        """Per-source CDS tail width (0-3) — opened by clicking the "CDS Tail
-        Enabled" checkbox, mirroring the guard dialog above. `cds_tail_enabled` is
-        the derived "any source has a non-zero tail" summary the checkbox shows."""
-        dlg = CdsTailDialog(self, list(self._cfg.cds_tail))
-        if dlg.exec():
             self._cfg.cds_tail = list(dlg.tail)
             self.configChanged.emit()
-        self._update_cds_tail_checkbox()
+        self._update_cds_settings_row()
 
-    def _update_cds_tail_checkbox(self) -> None:
-        """Sync the CDS Tail checkbox's checked state to cds_tail_enabled without
-        re-triggering its clicked handler (setChecked emits toggled, not clicked)."""
-        _lab, w = self._iface["cds_tail_enabled"]
-        w.setChecked(bool(self._cfg.cds_tail_enabled))
-        w.setToolTip(self._cds_summary(self._cfg.cds_tail, "tail")
-                     + ". Click to change per-source.")
-
-    @staticmethod
-    def _cds_summary(values: List[int], kind: str) -> str:
-        """One-line summary of a per-source CDS guard/tail list, e.g. 'Manager G0;
-        2 devices G1' or 'off' — used as the checkbox tooltip."""
-        if not any(values):
-            return "off"
-        if kind == "guard":
-            fmt = lambda v: "G0" if v == 1 else "G1"
-        else:
-            fmt = lambda v: f"tail {v}"
-        # Group device indices by their value so repeats collapse to a count.
-        groups: Dict[int, List[int]] = {}
-        parts = []
-        if values[0]:
-            parts.append(f"Manager {fmt(values[0])}")
-        for i, v in enumerate(values[1:], start=1):
-            if v:
-                groups.setdefault(v, []).append(i - 1)
-        for v, devs in groups.items():
-            noun = "device" if len(devs) == 1 else "devices"
-            parts.append(f"{len(devs)} {noun} {fmt(v)}")
-        return "; ".join(parts) if parts else "off"
+    def _update_cds_settings_row(self) -> None:
+        """Summarise the CDS on the row's tooltip, so the collapse into one row doesn't
+        cost the at-a-glance read the four separate rows gave."""
+        _lab, w = self._iface["cds_settings"]
+        w.setToolTip(
+            f"Bit width {self._cfg.cds_bit_width}"
+            f" · drive {cds_summary(self._cfg.cds_drive_type, 'drive')}"
+            f" · end drive early {cds_summary(self._cfg.cds_end_drive_early, 'ede')}"
+            f" · guard {cds_summary(self._cfg.cds_guard, 'guard')}"
+            f" · tail {cds_summary(self._cfg.cds_tail, 'tail')}"
+            f" · handover {'on' if self._cfg.enforce_cds_handover else 'off'}"
+            "\nClick to change.")
 
     def _on_iface_edit(self, *_a) -> None:
         if self._loading:
@@ -798,10 +797,10 @@ class AuthoringPanel(QWidget):
         # have a min > 0 (num_columns, skipping_denominator, row_rate_khz, …) and 0
         # would be out of range (and can divide-by-zero downstream).
         mins = {a: lo for _l, a, kind, lo, _h, _p in _IFACE_ROWS
-                if kind not in ("bool", "guard", "tail")}
+                if kind not in ("bool", "dialog")}
         for attr, (lab, w) in self._iface.items():
-            if attr in ("cds_guard_enabled", "cds_tail_enabled"):
-                continue          # CDS Guard/Tail: derived, set via their dialogs
+            if attr in _IFACE_NON_ATTR:
+                continue          # CDS Settings: a dialog button, owns no attr
             if isinstance(w, QCheckBox):
                 setattr(self._cfg, attr, w.isChecked())
             elif attr == "row_rate_khz":

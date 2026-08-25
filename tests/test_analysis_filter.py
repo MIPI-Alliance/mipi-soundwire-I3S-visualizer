@@ -192,6 +192,7 @@ def test_command_filter_survives_a_redecode():
     from swi3s_studio.session import Session
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
+    win.load_demo()                                # the demo is no longer preloaded in __init__
     win._cmd_proxy.set_kinds({"WriteA32"})
     assert win._cmd_proxy._kinds == {"WriteA32"}
     win.load_session(win._session)                 # re-decode: same session object
@@ -233,3 +234,60 @@ def test_row_sync_cursor_paths_land_on_rsp():
     pts = win._sscr_samples()
     assert pts and all(p == s.row_sync_sample(p) for p in pts), pts
     win.close()
+
+
+def test_search_text_matches_what_the_cells_display():
+    """The free-text filter must match what the user can SEE.
+
+    search_text() builds a row's searchable string from _display_text(cmd, column) rather than
+    self.data(self.index(row, col)) — twelve QModelIndex constructions and twelve role
+    dispatches per row was what made the first keystroke a multi-second GUI-thread freeze on a
+    large capture. Both now go through the one formatter, and this asserts they agree for
+    every row and every column of a real decode, so the speedup cannot have changed what is
+    searchable.
+    """
+    _app = QApplication.instance() or QApplication([])
+    from swi3s_studio.session import Session
+    s = Session.from_demo(4000)
+    model = CommandTableModel(list(s.commands), RegisterMap.load(), 1_000_000)
+    assert model.rowCount() > 0, "the demo produced no commands"
+    for row in range(model.rowCount()):
+        via_cells = " ".join(str(model.data(model.index(row, c)) or "")
+                             for c in range(model.columnCount())).lower()
+        assert model.search_text(row) == via_cells, f"row {row} searches differently than it reads"
+
+
+def test_the_expression_filter_is_debounced_and_applies_on_demand():
+    """Typing must not queue one whole-table sweep per character.
+
+    Each set_text invalidates the proxy filter, which re-tests every source row; the first
+    sweep after a model reset also fills the row-text cache. textChanged therefore only
+    RESTARTS a short timer, and the apply happens once when typing pauses — while Enter and
+    Clear All Filters apply immediately, because waiting out an invisible timer would read as
+    the box being broken.
+    """
+    _app = QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    try:
+        win.load_demo(2000)
+        win._filter_expression_dialog()               # builds the box, the timer and the wiring
+        assert win._expr_timer is not None and win._expr_timer.isSingleShot()
+
+        win._expr_edit.setText("wri")                 # three chars in one burst
+        assert win._expr_timer.isActive(), "textChanged must debounce, not apply"
+        assert win._cmd_proxy.describe_active() == "" or "wri" not in win._cmd_proxy.describe_active(), \
+            "the filter applied before the debounce elapsed"
+
+        win._apply_expr_filter()                      # what the timer (or Enter) does
+        assert not win._expr_timer.isActive(), "an immediate apply must cancel the pending tick"
+        assert win._cmd_proxy.rowCount() <= win._cmd_model.rowCount()
+
+        win._clear_all_filters()                      # must take effect at once, not in 200 ms
+        assert not win._expr_timer.isActive()
+        assert win._expr_edit.text() == ""
+        assert win._cmd_proxy.rowCount() == win._cmd_model.rowCount(), \
+            "Clear All Filters left the expression applied"
+    finally:
+        win.join_worker_threads()
+        win.close()
