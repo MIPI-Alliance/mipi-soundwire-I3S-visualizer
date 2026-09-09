@@ -94,6 +94,49 @@ def _grid_key(c: dict):
             c["is_cds"], c["is_source"], c["sample_here"])
 
 
+def test_a_malformed_column_count_cannot_reach_the_decoder_as_a_modulus():
+    """NumColumns_REG is not validated on the way in, and columnCount() is used as a MODULUS.
+
+    `LoadCsv` takes the field straight from parseInt, and `Decoder::run` computes
+    `mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount`. A CSV saying
+    `NumColumns_REG,-1` therefore made that a division by zero — undefined behaviour that
+    SPLITS BY PLATFORM in the worst direction: ARM64's sdiv quietly yields 0 and the capture
+    mis-decodes, while x86_64's idiv raises SIGFPE and kills the process. The maintainer's Mac
+    and both test guests are ARM64; the CI runners are x86_64, so the crash lands where nobody
+    is watching. A more negative value (-100 -> -99) skipped the crash and poisoned every
+    row/column calculation instead.
+
+    Clamped in columnCount() itself, so the live decode AND the audio engine (which hands the
+    same value to CDataPort/CFlowControlPort::Configure) both get a legal count. The grid paths
+    already applied this floor to their own local copy, which is why only the decode crashed.
+    A legal count must still pass through untouched — that is the other half of this test.
+    """
+    import numpy as np
+
+    clock = np.arange(0, 4000, 10, dtype=np.uint64)
+    data = np.arange(5, 4000, 40, dtype=np.uint64)
+    # (NumColumns_REG in the CSV, the column count the decoder must end up using)
+    cases = ((7, 8), (31, 32),           # legal: unchanged
+             (0, 2), (-1, 2), (-100, 2),  # below the protocol minimum -> kMinColumnCount
+             (32, 32), (5000, 32))        # above the maximum -> kMaxColumnCount
+    with tempfile.TemporaryDirectory() as d:
+        for num_columns, expected in cases:
+            path = os.path.join(d, f"nc{num_columns}.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"AppVersion,2.0.0\nNumColumns_REG,{num_columns}\n")
+            src = swi3score.TransitionSampleSource(clock, data, False, False, 100_000_000)
+            settings = swi3score.DecoderSettings()
+            settings.config_csv_path = path
+            settings.decode_audio = False
+            dec = swi3score.Decoder(src, settings)
+            dec.run()                    # must not divide by zero
+            assert dec.column_count == expected, \
+                f"NumColumns_REG={num_columns} gave column_count={dec.column_count}, " \
+                f"expected {expected}"
+            assert 2 <= dec.column_count <= 32, \
+                f"column_count {dec.column_count} is outside the protocol's own limits"
+
+
 def test_grid_dp_needs_enabled_channel():
     """A committed dataport with geometry set but NO channel enabled (EnableCh0=0)
     places NO data cells in the bus grid; enabling ch0 then places them. Guards against
@@ -244,6 +287,7 @@ def test_gui_exposes_open_visualizer_config():
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
+    win.load_demo()                                # the demo is no longer preloaded in __init__
     # The GUI Apply Config CSV wrapper folded into open_visualizer_config; the session
     # method it drives still exists (exercised by the tests above).
     assert hasattr(win, "open_visualizer_config")
@@ -343,3 +387,113 @@ def test_visualizer_file_dir_memory_independent_of_analyzer():
         assert win._last_capture_dir("visualizer") == newdir
         assert win._last_capture_dir("analyzer") == adir
         assert os.path.exists(save_path)   # the save actually wrote the CSV
+
+
+def test_imposing_a_wider_config_warns_instead_of_silently_dropping_ports(monkeypatch):
+    """A config whose ports need columns beyond the capture's decoded width has those ports
+    simply NOT PLACED. That used to be silent: the grid came back narrower with fewer ports,
+    which reads as "the config didn't load" rather than "this config is wider than this
+    capture". Now it is one prompt, and declining aborts.
+
+    Asserted on the MESSAGE, not just the prompt count, so a future refactor that keeps
+    prompting but stops naming the offending ports still fails. Both answers are exercised:
+    an abort-only test cannot tell "declining works" from "the spy never fired at all"."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.load_demo()
+    cap_cols = int(win._session.column_count)
+    assert cap_cols > 0, "demo decoded no columns — test premise gone"
+
+    cfg = demo_config()
+    dp = cfg.dataports[1]
+    dp.enabled = True
+    dp.enable_ch = 0b11
+    dp.name = "TooWide"
+    dp.horizontal_start = cap_cols - 1        # ... so start+count runs past the capture
+    dp.horizontal_count = 3                   # excess-1: owns 4 columns
+
+    seen, started = {}, []
+    # _load_async is the real gate: it is what launches the re-decode. Spying on a name
+    # that does not exist would make the abort assertion vacuous.
+    assert hasattr(win, "_load_async")
+    monkeypatch.setattr(win, "_load_async", lambda *a, **k: started.append(True))
+    answer = [QMessageBox.No]
+
+    def fake_warning(_parent, title, text, *a, **k):
+        seen["title"], seen["text"] = title, text
+        return answer[0]
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(fake_warning))
+
+    with tempfile.TemporaryDirectory() as d:
+        path = cfg.to_csv_file(os.path.join(d, "wide.csv"))
+        win._apply_config_csv_path(path)                     # declined
+        assert seen, "no warning shown — the drop is still silent"
+        assert "beyond the capture's decoded width" in seen["text"], seen["text"]
+        assert str(cap_cols) in seen["text"], seen["text"]
+        assert "TooWide" in seen["text"], "the offending port is not named: " + seen["text"]
+        assert not started, "declining the prompt must abort before the re-decode"
+
+        answer[0] = QMessageBox.Yes
+        win._apply_config_csv_path(path)                     # accepted
+        assert started, "accepting the prompt must proceed to the re-decode"
+
+
+def test_the_collision_check_sees_what_the_csv_will_encode():
+    """`duplicate_dp_numbers` and the CSV writer must agree about the device number.
+
+    The writer collapses anything outside {-1} u [0, 11] onto device 0, because the register
+    cannot hold the -1 Manager sentinel and has nowhere else to put an out-of-range value.
+    The checker used to key on the RAW attribute, so two ports at -2 and -9 sharing a
+    dp_number compared as different, passed the check, and were then merged by the export —
+    a real collision the user only saw after reloading. Both now go through
+    `csv_device_identity`.
+
+    The other half matters just as much: the Manager and a genuine device 0 sharing a
+    dp_number is LEGITIMATE (the flag distinguishes them on the wire and on reload), so
+    keying on the collapsed number alone would invent a collision.
+    """
+    from swi3s_studio.model.bus_config import csv_device_identity
+
+    # The encoding itself: the pair the CSV carries.
+    assert csv_device_identity(-1) == (0, True), "Manager encodes as device 0 + flag"
+    assert csv_device_identity(0) == (0, False)
+    assert csv_device_identity(7) == (7, False)
+    assert csv_device_identity(-2) == (0, False), "out of range has nowhere but device 0"
+    assert csv_device_identity(-9) == (0, False)
+
+    # 1. Out-of-range ports that the export would merge are reported BEFORE the export.
+    merged = demo_config()
+    merged.dataports[0].device_number = -2
+    merged.dataports[0].dp_number = 3
+    merged.dataports[1].device_number = -9
+    merged.dataports[1].dp_number = 3
+    dups = merged.duplicate_dp_numbers()
+    assert 0 in dups and 1 in dups, \
+        f"two ports the export merges onto device 0 must collide, got {dups}"
+
+    # 2. Manager + a real device 0 on the same dp_number is not a collision.
+    ok = demo_config()
+    ok.dataports[5].dp_number = 99            # move the slot that owns dp 5 by default
+    ok.dataports[0].device_number = -1
+    ok.dataports[0].dp_number = 5
+    ok.dataports[1].device_number = 0
+    ok.dataports[1].dp_number = 5
+    assert ok.duplicate_dp_numbers() == [], \
+        "the Manager and device 0 are distinct on the wire; this is not a clash"
+
+    # 3. And that pair still round-trips with the Manager intact.
+    with tempfile.TemporaryDirectory() as d:
+        back = BusConfig.from_csv(ok.to_csv_file(os.path.join(d, "mgr.csv")))
+    assert back.dataports[0].device_number == -1, "the Manager flag did not survive"
+    assert back.dataports[1].device_number == 0
+
+    # 4. An ordinary same-device collision is still caught.
+    same = demo_config()
+    same.dataports[0].device_number = 4
+    same.dataports[0].dp_number = 2
+    same.dataports[1].device_number = 4
+    same.dataports[1].dp_number = 2
+    assert {0, 1} <= set(same.duplicate_dp_numbers())

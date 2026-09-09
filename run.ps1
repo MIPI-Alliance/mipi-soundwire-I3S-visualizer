@@ -102,11 +102,13 @@ $python = Join-Path $venvDir "Scripts\python.exe"
 
 # Install/refresh deps only when requirements.txt is newer than the stamp.
 $stamp = Join-Path $venvDir ".deps-stamp"
+$installedDeps = $false
 if (-not (Test-Path $stamp) -or (Get-Item "requirements.txt").LastWriteTime -gt (Get-Item $stamp).LastWriteTime) {
     Write-Host "Installing Python dependencies..."
     & $python -m pip install --upgrade pip | Out-Null
     & $python -m pip install -r requirements.txt
     New-Item -ItemType File -Path $stamp -Force | Out-Null
+    $installedDeps = $true
 }
 
 # Build the native decode core when it's missing, out of date, or -Rebuild was asked
@@ -164,6 +166,17 @@ swi3score build failed. Not stamping - will retry next run.
         exit 1
     }
     New-Item -ItemType File -Path $nativeStamp -Force | Out-Null
+}
+
+# Say that the launch has started. Everything above prints as it works, so without this
+# the last thing on screen is a pip line and the window is the next event - which reads as
+# a stall, especially right after an install: the OS scans the several hundred MB of newly
+# written Qt libraries the first time they load. A warm start is ~1s.
+if ($installedDeps) {
+    Write-Host "Starting SWI3S Studio - the first launch after an install is slow while the OS"
+    Write-Host "verifies the newly installed Qt libraries. Later runs start in about a second."
+} else {
+    Write-Host "Starting SWI3S Studio..."
 }
 
 $env:PYTHONPATH = "."

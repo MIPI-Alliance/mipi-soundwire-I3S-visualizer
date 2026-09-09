@@ -13,7 +13,7 @@ matching samples wherever they are.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
@@ -127,7 +127,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._rate = 0.0
         self._samples: List[dict] = []
         self._starts = np.zeros(0, dtype=np.int64)  # cached start_sample of each loaded row
-        self._lane_colors = {}                 # (device, dp, channel) -> QColor
+        self._lane_colors: Dict[tuple, Any] = {}   # (device, dp, channel) -> QColor
         self._suppress_scroll = False          # gate edge-loads during programmatic scroll
         self._suppress_select = False          # gate the selection echo during a programmatic
         #                                        select_sample (see _on_select)
@@ -353,7 +353,20 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             self._suppress_scroll = prev
             self._suppress_select = prev_sel
         self._rebuild_starts()
-        sb.setValue(top_before + n)               # keep the previously-visible rows in place
+        # Re-anchor under the scroll guard. This setValue is programmatic, but the scrollbar
+        # is a separate object from the table, so the blockSignals() above never covered it —
+        # and once n rows have been inserted above, the new value can land within _EDGE_PAD of
+        # either end, which _on_scroll reads as the USER scrolling there and answers with
+        # another edgeReached. A scroll-to-top extend therefore also appended a chunk at the
+        # BOTTOM, doubling the work and, at _MAX_LOADED, evicting the rows the user had just
+        # scrolled up to reach. The old 4000-row window hid this: 12000 + 4000 was exactly
+        # _MAX_LOADED, so the stray append's own eviction put the row count back on the
+        # expected number and test_window_is_bounded_and_lazily_extends stayed green.
+        self._suppress_scroll = True
+        try:
+            sb.setValue(top_before + n)           # keep the previously-visible rows in place
+        finally:
+            self._suppress_scroll = prev
         if sel_sample is not None:
             self.select_sample(sel_sample, scroll=False)
         return evicted

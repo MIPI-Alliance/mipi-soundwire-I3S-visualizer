@@ -77,7 +77,7 @@ def test_prepend_cold_start_then_decode_and_still_decodes_audio():
 
 
 def test_real_world_cold_start_quirks():
-    """Regression for the ColdStart_Lusk capture: the real waveform has TWO long
+    """Regression for a real cold-start capture: the waveform has TWO long
     Bus-Reset highs (not one), a >48 µs recovery low, and a sub-sample glitch edge
     in the PHY-number burst. Earlier these made the decoder mis-detect PhyStart and
     drop/duplicate a bit. DN here has a single ~10 µs high over the 3rd of 4 bit

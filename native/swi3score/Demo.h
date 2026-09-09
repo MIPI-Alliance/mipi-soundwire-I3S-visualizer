@@ -77,6 +77,19 @@ std::vector<bool> MakeImmediateScramblerLevels(int samplesPerChannel = 32,
 // error iff `interval` != 0. Returns bus levels for MemorySampleSource.
 std::vector<bool> MakeEnableChCurrWriteLevels(int samplesPerChannel = 32, int interval = 0);
 
+// Test fixture for Payload Interval Skipping (Section 14.1.10). One unscrambled 16-bit PCM
+// source port on an 8-column bus, Interval = 32 Rows, with SkippingNumerator = `numerator`
+// and SkippingDenominator = `denominator` — so (D - N) of every D intervals transport and
+// the rest leave the bus idle. The payload is a RAMP (sample n has value n), so a decode
+// that skips the wrong interval reads an idle interval and drops a real sample, and the
+// values no longer count up. `samplesPerChannel` counts TRANSPORTED samples; enough rows
+// are generated to reach it. Periodic SSPAs land only where the accumulated skipping is
+// back at 0; with `misaligned_sspa` they land one Interval off that — a row where
+// row_in_interval is still 0, so the only thing wrong is the skipping phase (the unexpected
+// SSP of Section 9.1.6.2.1). Returns bus levels for MemorySampleSource.
+std::vector<bool> MakeSkippingLevels(int samplesPerChannel = 200, int numerator = 13,
+                                     int denominator = 160, bool misalignedSspa = false);
+
 } // namespace swi3score
 
 #endif // SWI3SCORE_DEMO_H

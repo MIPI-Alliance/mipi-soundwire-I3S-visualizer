@@ -49,6 +49,46 @@ def test_window_is_bounded_and_lazily_extends():
     assert len(set(starts)) == len(starts) or True        # dupes allowed (same-sample lanes), order matters
 
 
+def test_extending_the_window_does_not_re_enter_at_the_far_end():
+    """An edge load must not provoke a second one at the OPPOSITE end.
+
+    prepend_samples re-anchors the view with sb.setValue() after inserting rows. The
+    scrollbar is a separate object from the table, so the blockSignals() around the insert
+    never covered that call, and the new value can land within _EDGE_PAD of either end —
+    which _on_scroll read as the user scrolling there and answered with another edgeReached.
+    A scroll-to-TOP extend therefore also appended a chunk at the BOTTOM: double the row
+    building, and at _MAX_LOADED it evicted the very rows the user had scrolled up to reach.
+
+    test_window_is_bounded_and_lazily_extends could not see it. With the original 4000-row
+    window, 12000 + 4000 was exactly _MAX_LOADED, so the stray append's own eviction landed
+    the row count back on the expected number. This asserts the absence of the cascade
+    itself, and that `_sample_range` still describes what is actually loaded.
+    """
+    w, _ = _win()
+    sv = w._sample_view
+    assert w._sample_total > 4 * _SAMPLE_CHUNK, "demo too small to exercise both edges"
+
+    seen: list = []
+    sv.edgeReached.disconnect()
+    sv.edgeReached.connect(seen.append)          # observe re-entry instead of servicing it
+
+    for direction in (1, -1, -1, 1):
+        seen.clear()
+        before = sv._table.rowCount()
+        w._on_sample_edge(direction)
+        assert not seen, (
+            f"extending at {direction:+d} re-entered with {seen} — a programmatic re-anchor "
+            "is being read as a user scroll (see prepend_samples' scroll guard)")
+        grew = sv._table.rowCount() - before
+        assert grew in (0, _SAMPLE_CHUNK), (
+            f"extending at {direction:+d} added {grew} rows, not one chunk ({_SAMPLE_CHUNK})")
+
+    lo, hi = w._sample_range
+    assert hi - lo == sv._table.rowCount(), (
+        f"_sample_range spans {hi - lo} positions but {sv._table.rowCount()} rows are loaded — "
+        "the owner's idea of the window has drifted from the pane's")
+
+
 def test_edge_load_stops_at_extents():
     w, _ = _win()
     sv = w._sample_view

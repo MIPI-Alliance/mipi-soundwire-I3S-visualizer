@@ -1,6 +1,6 @@
 """Audio waveform must not draw across regions where no samples were decoded.
 
-Reported against spkr48k_pdm3072.sal: two active dataport regions separated by a
+Reported against a real capture: two active dataport regions separated by a
 stretch with no decoded samples (~103 s to ~133 s) were joined by a straight line
 in the Audio tab, implying audio values that were never on the bus.
 

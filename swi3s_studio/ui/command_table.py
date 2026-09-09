@@ -216,11 +216,25 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
     def search_text(self, row: int) -> str:
         """Lowercased, space-joined display text of a row, cached — so the free-text
         filter compares a prebuilt string instead of re-rendering every cell (register
-        labels, response decode, …) of every row on each keystroke."""
+        labels, response decode, …) of every row on each keystroke.
+
+        THE CACHE IS COLD AFTER EVERY MODEL RESET (set_commands / set_peripheral_maps), and
+        the first keystroke after one is what pays to fill it: QSortFilterProxyModel sweeps
+        EVERY source row on the first invalidateFilter, so the whole table is rendered on the
+        GUI thread in one go. Measured before this was factored out of data(): 0.58 s at 10k
+        commands, 2.9 s at 50k, 11.5 s at 200k — with the second keystroke at 0.14 s, because
+        by then the cache is warm. So it was a freeze once per load, not sustained lag.
+
+        Built via _display_text rather than self.data(self.index(row, c)) for that reason: the
+        index+role path cost twelve QModelIndex constructions and twelve role dispatches per
+        row on top of the formatting that is actually needed. The filter's own debounce (see
+        main_window's expression dialog) keeps the sweep to one per typing pause rather than
+        one per character.
+        """
         s = self._search_cache.get(row)
         if s is None:
-            s = " ".join(str(self.data(self.index(row, c)) or "")
-                         for c in range(self.columnCount())).lower()
+            cmd = self._cmds[row]
+            s = " ".join(str(self._display_text(cmd, n) or "") for n in _COLUMNS).lower()
             self._search_cache[row] = s
         return s
 
@@ -322,6 +336,21 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
             return None
         if role != Qt.DisplayRole:
             return None
+        return self._display_text(cmd, name)
+
+    def _display_text(self, cmd: dict, name: str):
+        """The DisplayRole text for one column of one command.
+
+        ONE DEFINITION, called by data() above and by search_text() below. The free-text
+        filter has to match what the user can SEE, so a second formatter here would be a
+        divergence waiting to happen — a column whose rendering changed would silently stop
+        being searchable the way it looks.
+
+        TAKES (cmd, name) RATHER THAN A QModelIndex, which is the point: search_text can then
+        build a row's text without constructing twelve QModelIndex objects and re-entering
+        data()'s role dispatch per cell. That was 2.4 M Qt round-trips for one keystroke on a
+        200k-command capture — see search_text for what it cost.
+        """
         data = _payload(cmd)
         if name == "Row":                                  # SWI3S bus row (0-based, Column-0 index)
             return f"{self._display_row(cmd):,}"

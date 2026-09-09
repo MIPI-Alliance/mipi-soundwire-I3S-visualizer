@@ -1,9 +1,9 @@
 """Native build configuration.
 
-A colleague's Linux build failed with `fatal error: Python.h: No such file or directory`
+A reported Linux build failed with `fatal error: Python.h: No such file or directory`
 ~20 lines into compiling bindings.cpp, on a machine with a perfectly good g++ (two of
-the thirteen objects had already compiled). The cause was in OUR CMakeLists, not their
-box: pybind11 fell back to the legacy FindPythonInterp/FindPythonLibs shim, which locates
+the thirteen objects had already compiled). The cause was in OUR CMakeLists, not that
+machine: pybind11 fell back to the legacy FindPythonInterp/FindPythonLibs shim, which locates
 the interpreter and the shared library but never checks that the development HEADERS
 exist. It therefore configured cleanly and handed the compiler an include directory with
 no Python.h in it.
@@ -170,7 +170,7 @@ def test_launcher_guard_covers_the_rebuild_path_too():
 
 
 def test_launcher_guidance_leads_with_the_no_root_options():
-    """The colleague who hit this can't sudo, so the sudo line must not be the only
+    """The reporting environment had no sudo, so the sudo line must not be the only
     advice — and the no-root routes should come first."""
     text = _run_sh()
     assert "Without root" in text

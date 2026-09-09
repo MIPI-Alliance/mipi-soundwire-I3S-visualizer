@@ -4,6 +4,8 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
+#include <stdexcept>          // requireAudio() throws
+
 #include "ISampleSource.h"
 #include "TransitionSampleSource.h"
 #include "DlvSampleSource.h"
@@ -50,6 +52,9 @@ static py::dict commandToDict(const CommandRec& c)
     // ERROR: a WriteA32 to an EnableCh _CURR (0xC1/0xD0/0xD1) register address while the
     // addressed port's Interval != 0 (Interval > 1 Row) — see CommandRec::enablechCurrError.
     d["enablech_curr_error"] = c.enablechCurrError;
+    // ERROR: this command's SSP landed while a skipping port was part-way through its skip
+    // pattern (Section 9.1.6.2.1) — see CommandRec::unexpectedSspError.
+    d["unexpected_ssp_error"] = c.unexpectedSspError;
     d["bus_row"] = c.busRow;
     d["effective_row"] = c.effectiveRow;   // SSP row a confirmed sync-commit takes effect (-1 otherwise)
     d["start_sample"] = c.startSample;
@@ -87,6 +92,18 @@ static py::dict configToDict(const SwI3sConfig& cfg)
     out["phy3_enabled"] = cfg.PHY3Enabled;
     out["row_rate_khz"] = cfg.RowRateKHz;
     out["description"] = cfg.description;
+    // Control Data Stream. Exported under the BusConfig attribute names so a decoded
+    // capture round-trips into an authoring CSV with its CDS settings intact — the other
+    // half of registersFromConfig, which writes them.
+    //
+    // THE MANAGER SLOT (index 0) IS ALWAYS THE DEFAULT on this path. Only peripherals have
+    // an addressable CDS block, so nothing on the wire reveals how the Manager drives the
+    // CDS; see CRegisterModel::BuildConfig.
+    out["cds_bit_width"] = cfg.CdsBitWidth;
+    out["cds_guard"] = py::cast(cfg.CdsGuard);
+    out["cds_tail"] = py::cast(cfg.CdsTailWidth);
+    out["cds_drive_type"] = py::cast(cfg.CdsDriveType);
+    out["cds_end_drive_early"] = py::cast(cfg.CdsEndDriveEarly);
     py::list dps;
     for (const auto& dp : cfg.dps) {
         py::dict e;
@@ -140,6 +157,17 @@ static py::dict audioToDict(const AudioRec& a)
     return d;
 }
 
+// Reading the decoded audio after release_audio() dropped it is a caller bug. Say so:
+// handing back an empty list would be indistinguishable from a capture that carried no
+// audio at all, which is a silent wrong answer rather than a loud one.
+static void requireAudio(const Decoder& d)
+{
+    if (d.audioReleased())
+        throw std::runtime_error(
+            "swi3score: the decoded audio was released (release_audio) after being copied "
+            "out. Read the copy — Session.audio_columns() / Session.audio — not the decoder.");
+}
+
 PYBIND11_MODULE(swi3score, m)
 {
     m.doc() = "SWI3S PHY2 decode core (reused from the Saleae plugin).";
@@ -155,7 +183,23 @@ PYBIND11_MODULE(swi3score, m)
     //    count). Setting it on an ABI-7 module silently does nothing — the Python side
     //    would show an "overridden" region badge over an unchanged decode — so it's a
     //    bump even though no return shape changed.
-    m.attr("score_abi") = 8;
+    // 9: commands() gained unexpected_ssp_error (an SSP that landed mid-skip-pattern,
+    //    Section 9.1.6.2.1), plus make_skipping_levels. errors.py reads the new key, so an
+    //    ABI-8 module would silently under-report.
+    // (NOT a bump: release_audio() / audio_released(). Purely additive, and the Python side
+    //  asks for it with getattr — an ABI-9 module just keeps holding the audio vector, which
+    //  is what it did before. Nothing's return shape moved.)
+    // 10: the Control Data Stream crossed the CSV <-> register boundary in BOTH directions.
+    //    registers_from_csv / config_registers now EMIT the per-source CDS registers (0x1186
+    //    drive type, 0x1187 bit width / end-drive-early / guard / tail), BuildConfig recovers
+    //    them from snooped writes, and configToDict exports them as cds_* lists.
+    //    A BUMP EVEN THOUGH NO RETURN SHAPE CHANGED, on the same reasoning as ABI 8: an
+    //    ABI-9 module silently omits the CDS registers from registers_from_csv, so Analysis
+    //    > Compare would report the whole CDS block as missing from the expected config —
+    //    a difference a user would chase as a real defect rather than a stale binary. The
+    //    configToDict keys alone would not have justified it (the Python side reads them
+    //    with `in`, so they degrade to defaults).
+    m.attr("score_abi") = 10;
 
     py::class_<ISampleSource>(m, "ISampleSource");
 
@@ -261,17 +305,40 @@ PYBIND11_MODULE(swi3score, m)
              py::arg("source"), py::arg("settings"),
              py::keep_alive<1, 2>())   // keep the source alive while the decoder lives
         .def("run", &Decoder::run, py::call_guard<py::gil_scoped_release>())
+        // WHY THIS ONE DOES NOT RELEASE THE GIL, unlike audio_columns() / bit_samples() /
+        // bit_samples_window() below. Those release around a fill loop that is pure C++ over
+        // raw buffers; this loop CREATES PYTHON OBJECTS (a dict per command), which requires
+        // the GIL by definition — a gil_scoped_release around it would be undefined
+        // behaviour, not an optimisation. A code review flagged the asymmetry as an
+        // oversight, so it is written down here rather than re-litigated.
+        //
+        // Periodic yield points (release/retake every N dicts) WERE tried, since Session
+        // builds this on the decode worker while the progress dialog wants the GIL. Reverted:
+        // no observable effect. Measured on a 400k-UI demo (7,560 commands) the whole call is
+        // ~10 ms, and a second Python thread got zero extra time slices at yield intervals of
+        // both 4096 and 256 — the windows are microseconds. At a command count where this
+        // would matter (~1M, so ~1.4 s) the binding is not the problem: the same commands
+        // retain ~841 B each on the Python side, which is the finding worth acting on.
         .def("commands", [](const Decoder& d) {
             py::list out;
             for (const auto& c : d.commands()) out.append(commandToDict(c));
             return out;
         })
         .def("audio", [](const Decoder& d) {
+            requireAudio(d);
             py::list out;
             for (const auto& a : d.audio()) out.append(audioToDict(a));
             return out;
         })
+        .def("release_audio", [](Decoder& d) { d.releaseAudio(); },
+             "Drop the decoded audio samples and return their memory (~72 B/sample). Call "
+             "AFTER copying them out with audio_columns(): every consumer downstream reads "
+             "that copy, and a re-decode builds a new Decoder. Irreversible for this "
+             "Decoder — audio()/audio_columns() then raise rather than report no audio.")
+        .def("audio_released", [](const Decoder& d) { return d.audioReleased(); },
+             "True once release_audio() has dropped the samples.")
         .def("audio_columns", [](const Decoder& d) {
+            requireAudio(d);
             // Columnar (struct-of-arrays) audio: the same data as audio() but as
             // NumPy arrays instead of N per-sample dicts. For dense captures (mic
             // arrays decode tens of millions of samples) building N Python dicts
@@ -696,8 +763,17 @@ PYBIND11_MODULE(swi3score, m)
           "row_columns lets build_dlv_capture_from_levels place edges at a constant row "
           "period so the UI/bit-clock rate rises at the commit (4 -> 16 columns).");
 
-    m.def("make_dscr_disable_levels", &MakeDscrDisableLevels,
-          py::arg("samples_per_channel") = 32, py::arg("disable_all") = false,
+    m.def("make_skipping_levels", &MakeSkippingLevels,
+          py::arg("samples_per_channel") = 200, py::arg("numerator") = 13,
+          py::arg("denominator") = 160, py::arg("misaligned_sspa") = false,
+          "Synthetic PHY2 stream exercising Payload Interval Skipping: one unscrambled "
+          "16-bit PCM source port (Interval = 32 Rows) carrying a RAMP, transporting "
+          "(denominator - numerator) of every denominator intervals and leaving the rest "
+          "idle, with periodic SSPAs on the pattern period. Sample n has value n, so a "
+          "decode that skips the wrong interval no longer counts up. misaligned_sspa puts "
+          "the SSPAs one Interval off the pattern boundary (an unexpected SSP).");
+
+    m.def("make_dscr_disable_levels", &MakeDscrDisableLevels,          py::arg("samples_per_channel") = 32, py::arg("disable_all") = false,
           "Test fixture: two 16-bit PCM ports; a DSCR disables dp1 (or both, disable_all) mid-stream.");
 
     m.def("make_immediate_scrambler_levels", &MakeImmediateScramblerLevels,

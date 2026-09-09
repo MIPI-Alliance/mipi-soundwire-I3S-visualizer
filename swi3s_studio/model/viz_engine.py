@@ -103,6 +103,42 @@ def render_payload(csv_path: str, num_rows: int | None = None):
     # divergence explicitly for the grid to honour (see GridView._draw_row).
     cds_split = (len(set(_iface.CDS_Guard_PerSource)) > 1
                  or len(set(_iface.CDS_Tail_PerSource)) > 1)
+
+    # A cell's `dp` is the LOGICAL DataPortNumber, not swviz's slot index. The two diverge
+    # whenever a config numbers a port differently from its position in the file — four
+    # peripherals each using their own DP0, for instance — and the C++ core already reports
+    # the logical number (Decoder.cpp: `dpNumber >= 0 ? dpNumber : slot index`). Without this
+    # map the same key meant two different things depending on which engine produced the
+    # cells, so the grid labelled device 1's DP0 as "DP5" and the cross-engine test compared
+    # a number against an index.
+    #
+    # Mapped HERE, at the single boundary both engines' cells pass through, because the index
+    # is a real index inside swviz: _detect_truncated_drq groups bits by it and looks them up
+    # by enumerate() position, so redefining it in the engine would silently stop that
+    # detection for precisely the configs this fixes. Every example config in the corpus uses
+    # the identity mapping, which is why 89 of them never caught this.
+    _logical_dp = [dpv.dp_number if getattr(dpv, "dp_number", -1) >= 0 else i
+                   for i, dpv in enumerate(_viz.data_ports)]
+
+    def _dp_of(slot_index):
+        if slot_index is None or slot_index < 0:
+            return -1
+        if slot_index >= len(_logical_dp):      # not expected; report rather than mislabel
+            return slot_index
+        return _logical_dp[slot_index]
+
+    # The SLOT index travels alongside the logical number, because they answer different
+    # questions and the grid needs both. `dp` identifies the port to a human (and to the
+    # C++ core, for cross-engine comparison); `dp_index` identifies the config ROW, which
+    # is what the colour key must key on. Several slots may legally share one
+    # DataPortNumber — "a device may not reuse a data-port number; the same number across
+    # different devices is fine" (BusConfig.duplicate_dp_numbers) — so a smart-amp config
+    # giving each of four devices its own DP0/DP1 has unique (device, dp) pairs but only
+    # two distinct numbers. Colouring by the number merged those eight ports into two
+    # colours; the slot index is 1:1 with a port and stays put as others enable/disable.
+    def _slot_of(slot_index):
+        return -1 if slot_index is None or slot_index < 0 else int(slot_index)
+
     cells = []
     for b in bm.bits:
         sv = b.slot.value
@@ -111,7 +147,8 @@ def render_payload(csv_path: str, num_rows: int | None = None):
         df_int = df.value if hasattr(df, "value") else (6 if df is None else int(df))
         cells.append({
             "row": b.row, "col": b.column,
-            "dp": -1 if b.dp is None else b.dp,
+            "dp": _dp_of(b.dp),
+            "dp_index": _slot_of(b.dp),
             "device": b.device,
             "channel": -1 if b.channel is None else b.channel,
             "sample": 0 if b.sample is None else b.sample,
@@ -133,9 +170,16 @@ def render_payload(csv_path: str, num_rows: int | None = None):
         clashes[(idx // ncols, idx % ncols)] = "bus"   # bus clash wins the colour
     # The engine labels per-DP notifications "DP{index}" (the Visualizer JSON format
     # recovers the index from that by regex — see BusModelJSONEncoder). For DISPLAY,
-    # relabel each with the port's device + slot + user-assigned name, e.g.
-    # "Dev0 DP3 (LeftMic)", so a notification clearly names its data port (and follows a
-    # rename). Model_json/goldens use the encoder directly, not this path.
+    # relabel each with the port's device + LOGICAL DataPortNumber + user-assigned name,
+    # e.g. "Dev0 DP3 (LeftMic)", so a notification clearly names its data port (and follows
+    # a rename). Model_json/goldens use the encoder directly, not this path.
+    #
+    # The number must come through _logical_dp for the same reason the cells do: on a config
+    # where DataPortNumber differs from the slot index, labelling by index named a port that
+    # does not exist. Fixing the cells alone left this path saying "Dev1 DP5" for device 1's
+    # DP0 — the identical defect one boundary over, which is exactly the trap the debt
+    # register's "label doubling as a serialization key" note warns about. The DICT KEY stays
+    # the engine's raw "DP{index}", because that is the string the engine actually emitted.
     issues = issues_from_model(bm)
     dp_labels = {}
     for i, dpv in enumerate(_viz.data_ports):
@@ -144,7 +188,7 @@ def render_payload(csv_path: str, num_rows: int | None = None):
         except Exception:
             dev = None
         dev_str = "Mgr" if dev == -1 else (f"Dev{dev}" if dev is not None else "")
-        label = f"{dev_str} DP{i}".strip()
+        label = f"{dev_str} DP{_dp_of(i)}".strip()
         name = getattr(dpv, "name", None)
         if name and name != f"DP{i}":            # a real rename, not the default label
             label += f" ({name})"

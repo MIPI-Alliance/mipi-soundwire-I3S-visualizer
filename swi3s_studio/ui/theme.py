@@ -74,6 +74,7 @@ class VizTheme:
     SYM_UNKNOWN: str
     SCROLL_HANDLE: str
     SCROLL_HANDLE_HOVER: str
+    HILITE_BG: str
     # Derived by apply_palette() rather than present in the palettes:
     GRID_BG: str
     SYM_COMMA: str
@@ -101,6 +102,7 @@ _DARK = {
     "SYM_INVALID": "#c8505a", "SYM_ROBUST": "#50a0dc", "SYM_DCODE": "#5abe82",
     "SYM_KCODE": "#aa78d2", "SYM_UNKNOWN": "#c8c8c8",
     "SCROLL_HANDLE": "#5a6068", "SCROLL_HANDLE_HOVER": "#6f7680",
+    "HILITE_BG": "#6f5410",
 }
 _LIGHT = {
     "WINDOW_BG": "#e7e9ec", "FRAME_BG": "#fafbfc", "ENTRY_BG": "#ffffff",
@@ -121,6 +123,7 @@ _LIGHT = {
     "SYM_INVALID": "#c0303a", "SYM_ROBUST": "#2f7fc0", "SYM_DCODE": "#2ea05e",
     "SYM_KCODE": "#7d52b8", "SYM_UNKNOWN": "#888888",
     "SCROLL_HANDLE": "#b8bdc4", "SCROLL_HANDLE_HOVER": "#a0a6ad",
+    "HILITE_BG": "#ffe7a3",
 }
 _PALETTES = {"dark": _DARK, "light": _LIGHT}
 

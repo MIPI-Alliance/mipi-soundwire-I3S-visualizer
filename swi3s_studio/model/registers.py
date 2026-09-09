@@ -118,6 +118,28 @@ def _parse_int(value) -> Optional[int]:
         return None
 
 
+def _parse_offset_span(value) -> Tuple[Optional[int], int]:
+    """An `offset` token to (first address, count of addresses it covers).
+
+    The spec's register tables collapse runs of consecutive addresses into one row —
+    "0x20-0x2F  EC_TestFailCh", "0x40-0x6F  [48 x Reserved]" — and this file mirrors that
+    notation. Returns (None, 0) for a token that is neither a number nor a range, so the
+    caller skips it rather than inventing an address.
+    """
+    single = _parse_int(value)
+    if single is not None:
+        return single, 1
+    if not isinstance(value, str):
+        return None, 0
+    m = re.match(r"\s*(0[xX][0-9a-fA-F]+|\d+)\s*-\s*(0[xX][0-9a-fA-F]+|\d+)\s*$", value)
+    if not m:
+        return None, 0
+    first, last = _parse_int(m.group(1)), _parse_int(m.group(2))
+    if first is None or last is None or last < first:
+        return None, 0
+    return first, last - first + 1
+
+
 def _parse_bits(bits: str) -> Tuple[int, int]:
     """'[7:5]' -> (7, 5); '[3]' -> (3, 3)."""
     m = re.match(r"\[(\d+)(?::(\d+))?\]", bits.strip())
@@ -186,6 +208,10 @@ class RegisterSpec:
     dual_ranked: bool
     curr_offset: Optional[int]
     fields: List[FieldSpec]
+    # Addresses this ONE spec covers, for a table row that collapses a run of identical
+    # bytes (Reserved / ImpDef filler). Defined register ARRAYS are expanded to one spec
+    # per address instead, so their per-index field names survive — see _expand_array.
+    span: int = 1
 
     def reset_byte(self) -> int:
         """Best-effort reset byte: register reset if numeric, else assembled
@@ -200,6 +226,69 @@ class RegisterSpec:
 
     def decode(self, byte_value: int) -> List[Tuple[str, int, FieldSpec]]:
         return [(f.name, f.extract(byte_value), f) for f in self.fields]
+
+
+def _expand_array(base: RegisterSpec, array: Optional[dict]) -> List[RegisterSpec]:
+    """Turn one table row into the RegisterSpecs it really describes.
+
+    A row covering several addresses is one of two things, and the ``array`` descriptor in
+    data/registers.json says which:
+
+    ``{"kind": "bits", "member": N, ...}``
+        A bit-per-member group spread over the range, 8 members to a byte, ascending with
+        the lowest-numbered member at the LOWEST address and at bit 0 — ``IntStat_SDCA``
+        (0x40 = SDCA07:00 … 0x47 = SDCA63:56), ``IntStat_ImpDef``, ``IntCascade_DP``.
+        Expands to one spec per address carrying 8 correctly-numbered single-bit fields.
+    ``{"kind": "register", "member": N, ...}``
+        One whole-byte register per member — ``DPn_EC_TestFailCh`` (0x20 = channel 0's
+        8-bit saturating counter … 0x2F = channel 15's). Expands to one spec per address.
+    absent
+        Filler (Reserved / ImpDef): identical bytes with nothing to index. Kept as the
+        SINGLE spec the table shows, spanning the range, so the register view lists one
+        row rather than fifty that all say "Reserved" — while every address in the span
+        still resolves, so a write into it is identifiable instead of unknown.
+
+    Bit ordering here is the spec's own table layout (Table 166 / Table 169), not an
+    inference. One correction: Table 169 prints ``IntCascade_DP11`` at 0x2A bit 1, a
+    duplicate of the label at 0x29 bit 3; every other bit of both bytes ascends
+    unbroken, so the generated name is DP17.
+    """
+    if not array or base.span <= 1:
+        return [base]
+    kind = array.get("kind")
+    member = array.get("member") or base.name
+    first = int(array.get("first", 0))
+    digits = int(array.get("digits", 0))
+    src = base.fields[0] if base.fields else None
+    out: List[RegisterSpec] = []
+
+    def index(n: int) -> str:
+        return f"{n:0{digits}d}" if digits else str(n)
+
+    for i in range(base.span):
+        if kind == "bits":
+            lo_n = first + i * 8
+            fields = [FieldSpec(
+                name=f"{member}{index(lo_n + b)}", hi=b, lo=b,
+                reset=(src.reset if src else 0), access=base.access,
+                description=(src.description if src else ""),
+            ) for b in range(8)]
+            name = f"{member}[{index(lo_n + 7)}:{index(lo_n)}]"
+        elif kind == "register":
+            name = f"{member}{index(first + i)}"
+            fields = [FieldSpec(
+                name=name, hi=7, lo=0, reset=(src.reset if src else 0),
+                access=base.access, description=(src.description if src else ""),
+            )]
+        else:
+            return [base]                     # unknown kind: leave the row as declared
+        out.append(RegisterSpec(
+            name=name, offset=base.offset + i, abs_address=base.abs_address + i,
+            reset=base.reset, access=base.access, dual_ranked=base.dual_ranked,
+            curr_offset=(base.curr_offset + i) if base.curr_offset is not None else None,
+            fields=fields, span=1,
+        ))
+    return out
 
 
 @dataclass
@@ -229,7 +318,7 @@ class RegisterMap:
             nxt: Dict[int, RegisterSpec] = {}
             cur: Dict[int, RegisterSpec] = {}
             for r in blk["registers"]:
-                offset = _parse_int(r.get("offset"))
+                offset, span = _parse_offset_span(r.get("offset"))
                 if offset is None:
                     continue
                 fields = []
@@ -247,17 +336,22 @@ class RegisterMap:
                         enum=_parse_enum(fdef.get("valid")),
                     ))
                 curr_off = _parse_int(r.get("curr_offset"))
-                spec = RegisterSpec(
+                base = RegisterSpec(
                     name=r.get("name", "?"), offset=offset,
                     abs_address=_parse_int(r.get("abs_address")) or 0,
                     reset=_parse_int(r.get("reset")), access=r.get("access", ""),
                     dual_ranked=bool(r.get("dual_ranked", False)),
-                    curr_offset=curr_off, fields=fields,
+                    curr_offset=curr_off, fields=fields, span=span,
                 )
-                regs.append(spec)
-                nxt[offset] = spec
-                if spec.dual_ranked:
-                    cur[curr_off if curr_off is not None else offset + CURR_RANK_OFFSET] = spec
+                for spec in _expand_array(base, r.get("array")):
+                    regs.append(spec)
+                    for k in range(spec.span):
+                        nxt[spec.offset + k] = spec
+                    if spec.dual_ranked:
+                        cbase = (spec.curr_offset if spec.curr_offset is not None
+                                 else spec.offset + CURR_RANK_OFFSET)
+                        for k in range(spec.span):
+                            cur[cbase + k] = spec
             rm.blocks[name] = regs
             rm._by_next[name] = nxt
             rm._by_curr[name] = cur

@@ -174,3 +174,50 @@ def test_pcm_play_decimation():
     exp = resampled_length(store.samples(0, 0, 0).size, native, target)
     assert dec_frames == exp, (dec_frames, exp)
     assert dec_frames < nat_frames               # decimated -> fewer frames
+
+
+def test_the_session_releases_the_native_audio_once_it_has_copied_it():
+    """The decode's own AudioSample vector is 72 B/sample and the Session copies all of it
+    into NumPy columns (56 B/sample) at load — 449 MB against 349 MB on the 6.24M-sample
+    demo, with no second reader for the native side. So the Session hands it back.
+
+    Everything the app actually reads must survive that: the columns, the dict-list `audio`
+    property built from them, the audio store, and WAV export (all fed by the columns; the
+    per-DP rates come from the snooped config, not the samples). And reading the decoder's
+    audio afterwards must RAISE — an empty list there would be indistinguishable from a
+    capture that carried no audio, which is a wrong answer that looks like data."""
+    import pytest
+
+    from swi3s_studio.session import Session
+
+    sess = Session.from_demo(32)
+    assert sess.decoder.audio_released(), "the Session kept the native audio vector"
+    with pytest.raises(RuntimeError, match="released"):
+        sess.decoder.audio()
+    with pytest.raises(RuntimeError, match="released"):
+        sess.decoder.audio_columns()
+
+    # The copy is intact, and every consumer downstream of it still works.
+    assert sess.audio_count > 0
+    assert sess.audio_columns()["dp"].shape[0] == sess.audio_count
+    assert len(sess.audio) == sess.audio_count            # dict list, from the columns
+    store = sess.audio_store()
+    assert store.streams() == [(0, 0), (0, 1), (0, 2), (0, 3)]
+    assert store.rate(0, 0) > 0                           # from audio_sample_rates (config)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dev0_dp0.wav")
+        store.export_wav(0, 0, path)
+        with wave.open(path, "rb") as w:
+            assert w.getnframes() > 0
+
+
+def test_a_redecode_releases_the_fresh_vector_too():
+    """Every decode copies and releases: a re-decode (scrambler/register what-if, SSP step)
+    builds a NEW Decoder, so the release has to happen per decode, not once per Session."""
+    from swi3s_studio.session import Session
+
+    sess = Session.from_demo(32)
+    before = sess.audio_count
+    sess.set_scrambler_overrides({(0, 0): True})          # forces a re-decode
+    assert sess.decoder.audio_released(), "the re-decode's vector was left behind"
+    assert sess.audio_count == before

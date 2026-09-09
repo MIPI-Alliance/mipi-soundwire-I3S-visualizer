@@ -34,8 +34,19 @@ def test_low_entropy_sub_is_bounded_not_a_hang():
     sub2 = Capture(clock_edges=sub.clock_edges, data_edges=sub.clock_edges,  # data toggles every edge
                    initial_clock=False, initial_data=True, sample_rate_hz=1_000_000)
     _ = locate_subcapture(main, sub2)
-    assert time.time() - t0 < 15.0, "low-entropy locate must be bounded, not a hang"
+    # A LOOSE BOUND HERE, THE TIGHT ONE IN THE PERF LANE. This file runs in the default suite
+    # on every CI config, and docs/TESTING.md's convention is that wall-clock CEILINGS belong
+    # behind the `perf` marker with generous margins, so runner jitter cannot redden an
+    # ordinary run. But the defect this pins was a HANG (minutes, O(N * hits)), and a hang is
+    # worth catching everywhere — so the bound that stays here is one no amount of jitter can
+    # reach while still failing a regression to that behaviour. The real ceiling
+    # (test_perf.py::test_low_entropy_locate_ceiling) is 15 s.
+    assert time.time() - t0 < 120.0, "low-entropy locate must be bounded, not a hang"
     assert isinstance(matches, list)
+    # STRUCTURALLY bounded too, not just fast: the cap on collected hits is what makes it
+    # quick, so assert the cap held rather than inferring it from the clock.
+    assert len(matches) <= 64, \
+        f"the match cap did not hold: {len(matches)} matches (max_matches defaults to 64)"
 
 
 RATE = transitions.DEFAULT_SAMPLE_RATE_HZ

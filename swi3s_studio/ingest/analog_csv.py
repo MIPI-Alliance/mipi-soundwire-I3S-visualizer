@@ -50,7 +50,7 @@ def is_analog_csv(path: str, max_scan_rows: int = 10_000) -> bool:
             for row in csv.reader(f):
                 if len(row) < 2:
                     continue
-                vals = []
+                vals: Optional[list] = []
                 for cell in row[1:]:                 # skip the time column
                     c = cell.strip()
                     if not c:

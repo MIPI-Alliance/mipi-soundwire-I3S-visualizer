@@ -1,10 +1,9 @@
 """Large-.sal guards: cost estimation, the refuse-before-OOM check, and windowed load.
 
-A .sal is a zip of delta-coded transitions, so it expands enormously: the reported
-spkr48k_pdm3072.sal is 291 MB on disk, 2.25 GB uncompressed, and ~2.25 bn transitions
-= ~18 GB of uint64 edge arrays. Opening it whole exhausted a 24 GB machine and left it
-unresponsive with no error, because every stage (zip inflate -> blob decode -> edge
-array) was whole-file.
+A .sal is a zip of delta-coded transitions, so it expands enormously: a reported capture
+was 291 MB on disk, 2.25 GB uncompressed, and ~2.25 bn transitions = ~18 GB of uint64
+edge arrays. Opening it whole exhausted a 24 GB machine and left it unresponsive with no
+error, because every stage (zip inflate -> blob decode -> edge array) was whole-file.
 
 Two defences, both covered here:
   1. estimate_cost() predicts the peak from the zip DIRECTORY only (no inflation), so
@@ -38,9 +37,16 @@ def _edges(n=5000, seed=3, step=40):
     return np.cumsum(np.random.default_rng(seed).integers(1, step, size=n)).astype(np.uint64)
 
 
-def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE):
-    """A minimal two-channel .sal (meta.json + two digital blobs)."""
-    p = tmp_path / "cap.sal"
+def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE, *,
+               compress: bool = False, name: str = "cap.sal"):
+    """A minimal two-channel .sal (meta.json + two digital blobs).
+
+    `compress` writes DEFLATE members instead of the default STORED. It matters: the span
+    walk seeks with ZipExtFile.seek(), which is a real seek only on a STORED member and
+    read-and-discard on a compressed one. A STORED-only fixture therefore never exercises
+    the path a real Logic 2 capture takes.
+    """
+    p = tmp_path / name
     meta = {
         "data": {"legacySettings": {"sampleRate": {"digital": rate}}},
         "binData": [
@@ -49,7 +55,8 @@ def _write_sal(tmp_path, ch0: bytes, ch1: bytes, rate: int = _RATE):
         ],
     }
     import json
-    with zipfile.ZipFile(p, "w") as z:
+    mode = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    with zipfile.ZipFile(p, "w", mode) as z:
         z.writestr("meta.json", json.dumps(meta))
         z.writestr("digital-0.bin", ch0)
         z.writestr("digital-1.bin", ch1)
@@ -92,16 +99,90 @@ def test_windowed_decode_drops_the_phantom_end_delta():
 
 def test_streaming_window_matches_in_memory_window():
     """The zip-streaming decoder (which never materialises the blob) must agree
-    exactly with the in-memory one."""
+    exactly with the in-memory one.
+
+    Pinned to the PARITY path (`trust_levels=False`), because build_channel_v3 stamps 0
+    for every non-first block and the header-level fast path correctly refuses such a
+    blob — see test_unstamped_block_levels_are_refused_rather_than_guessed.
+    """
     e = _edges()
     blob = sb.build_channel_v3(False, e, chunk_size=250)
     last = int(e[-1])
     for a, b in [(0, last + 1), (5000, 20000), (20000, 60000)]:
         ref = sb.parse_channel_v3_window(blob, a, b)
-        got = ss._decode_v3_window_streaming(io.BytesIO(blob), len(blob), a, b, "t")
+        got = ss._decode_v3_window_streaming(io.BytesIO(blob), len(blob), a, b, "t",
+                                             trust_levels=False)
         assert got is not None, "streaming decoder bailed on a valid v3 blob"
         assert np.array_equal(got[1], ref.transition_samples)
         assert got[0] == ref.initial_state
+
+
+def _logic2_blob(e, initial=False, block_deltas=250):
+    """A Logic-2-shaped v3 blob: full metadata header AND per-block `level` stamps."""
+    return sb.build_logic2_channel_v3(initial, e, sample_rate_hz=_RATE, unix_ms=0,
+                                     frac_ms=0.0, capture_end=int(e[-1]) + 1000,
+                                     block_deltas=block_deltas)
+
+
+@pytest.mark.parametrize("step", [40, 200, 5000])
+def test_streaming_window_reads_the_level_from_the_block_header(step, monkeypatch):
+    """On a Logic-2 blob the window's opening level comes from a block HEADER, and no
+    block before the window is decoded at all.
+
+    All a skipped block ever contributed was the line level at the window's start — one
+    bit — and deriving it by counting transitions is O(START OFFSET). On the reported
+    291 MB / 176 s capture that made the same 0.5 s window cost 0.85 s at the start and
+    28.07 s at 175.5 s, per channel. Each block header already carries `level`, the state
+    at that block's start, and the block containing s0 is decoded ANYWAY because it
+    overlaps the window — so its own transitions give the level at s0 and nothing earlier
+    matters. Verified on the real capture: header level agreed with the decoded parity on
+    400/400 blocks of both channels, and the fast path reproduced the parity path's
+    initial state AND samples byte-for-byte on every window tried.
+
+    `_count_and_discard` is booby-trapped here: reaching it means a skipped block is being
+    decoded again, which is the regression this exists to catch. The step sweep keeps
+    multi-byte delta codes in play (see _edges).
+    """
+    e = _edges(step=step)
+    blob = _logic2_blob(e)
+    last = int(e[-1])
+
+    def boom(*a, **k):
+        raise AssertionError("a skipped block was decoded — the header level was not used")
+
+    monkeypatch.setattr(ss, "_count_and_discard", boom)
+    for a, b in [(0, last + 1), (5000, 20000), (20000, 60000), (last // 2, last)]:
+        ref = sb.parse_channel_v3_window(blob, a, b)
+        got = ss._decode_v3_window_streaming(io.BytesIO(blob), len(blob), a, b, "t")
+        assert got is not None, "streaming decoder bailed on a Logic-2 v3 blob"
+        assert got[0] == ref.initial_state, f"window ({a},{b}) opened at the wrong level"
+        assert np.array_equal(got[1], ref.transition_samples), f"window ({a},{b}) samples"
+
+
+def test_unstamped_block_levels_are_refused_rather_than_guessed(tmp_path):
+    """A blob whose per-block levels aren't stamped must be DETECTED, not trusted.
+
+    build_channel_v3 writes `level` only on the first block and 0 on the rest, so reading
+    a later block's header would open the window at the wrong level — samples right,
+    polarity wrong, silently, which is the exact failure mode the parity walk was written
+    to avoid. The fast path therefore requires evidence of stamping (a nonzero level on
+    some skipped non-first block) and raises otherwise; load_capture retries by parity, so
+    the answer stays correct and only the speed is given up.
+    """
+    e = _edges()
+    blob = sb.build_channel_v3(False, e, chunk_size=250)
+    a, b = 20000, 60000
+    with pytest.raises(ss._UnstampedBlockLevels):
+        ss._decode_v3_window_streaming(io.BytesIO(blob), len(blob), a, b, "t")
+
+    # ...and the loader still gets it right, via the retry.
+    path = _write_sal(tmp_path, blob, sb.build_channel_v3(False, e + 1, chunk_size=250))
+    cap = ss.load_capture(path, 0, 1, window=(a, b))
+    ref = sb.parse_channel_v3_window(blob, a, b)
+    assert np.array_equal(cap.clock_edges.astype(np.int64),
+                          ref.transition_samples.astype(np.int64) - a)
+    assert bool(cap.initial_clock) == bool(ref.initial_state), (
+        "the retry lost the line level the parity walk exists to get right")
 
 
 def test_load_capture_window_is_rebased(tmp_path):
@@ -127,6 +208,41 @@ def test_capture_span_samples_streams_without_inflating(tmp_path):
     path = _write_sal(tmp_path, blob, blob)
     span = ss.capture_span_samples(path)
     assert span >= int(e[-1]), f"span {span} < last edge {int(e[-1])}"
+
+
+def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
+    """The span walk must give the same answer on a DEFLATE archive as on a STORED one.
+
+    Every other fixture here is written STORED, where ZipExtFile.seek() is a real seek. On a
+    compressed member it is read-and-discard, and the walk also re-seeks to zero for each
+    candidate start offset — so the compressed path has different performance AND a different
+    code path through zipfile, and was untested. A real Logic 2 capture is compressed."""
+    e = _edges()
+    blob = sb.build_channel_v3(False, e, chunk_size=250)
+    stored = _write_sal(tmp_path, blob, blob, name="stored.sal")
+    packed = _write_sal(tmp_path, blob, blob, compress=True, name="packed.sal")
+    import zipfile as _z
+    with _z.ZipFile(packed) as z:                     # the fixture really is compressed
+        assert z.getinfo("digital-0.bin").compress_type == _z.ZIP_DEFLATED
+    assert ss.capture_span_samples(packed) == ss.capture_span_samples(stored) >= int(e[-1])
+
+
+def test_capture_span_channels_filter_restricts_the_walk(tmp_path):
+    """`channels=` must limit which blobs are walked — that is the fix for the pre-flight
+    span read blocking the GUI, and a filter that is silently ignored would look identical
+    from the outside. Asserted by giving the two channels DIFFERENT lengths: filtering to the
+    shorter one must return the shorter span, not the max over both."""
+    short = _edges(n=200)
+    long_ = _edges(n=2000)
+    b_short = sb.build_channel_v3(False, short, chunk_size=250)
+    b_long = sb.build_channel_v3(False, long_, chunk_size=250)
+    path = _write_sal(tmp_path, b_short, b_long)
+    both = ss.capture_span_samples(path)
+    only0 = ss.capture_span_samples(path, channels=[0])
+    only1 = ss.capture_span_samples(path, channels=[1])
+    assert only1 > only0, (only0, only1)              # the fixture's premise
+    assert both == only1, "unfiltered span should be the max over channels"
+    assert only0 == pytest.approx(int(short[-1]), rel=0.05) or only0 >= int(short[-1])
 
 
 # ----------------------------------------------------------------------- estimation
@@ -236,3 +352,57 @@ def test_guard_fails_closed_when_memory_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(ss, "_FALLBACK_BUDGET", 1)
     with pytest.raises(ss.SalTooLargeError):
         ss.load_capture(path, 0, 1)
+
+
+def test_the_peak_estimate_carries_the_decode_transient():
+    """est_peak_bytes must include the edge-build transient, and only on the edge term.
+
+    load_capture applied _STREAM_TRANSIENT to the WINDOWED branch only -- the path that
+    allocates least -- while the whole-file branch, which allocates most, used the bare
+    sum. It therefore under-predicted the real peak by 1.9x-3.6x on measured captures:
+    0.314 GB predicted / 0.598 actual, 0.596 / 2.125, 0.275 / 0.921. On a 103 GB machine
+    that let a capture predicted at 20.29 GB reach ~60 GB resident with no prompt, and
+    macOS memory compression then made every navigation pay for it -- the minute-long
+    stall that no per-move Python tuning reaches.
+
+    The transient belongs on the edge arrays alone: building them holds the delta run, its
+    cumsum, the mask and the concatenate at once, while the inflated blob is one flat
+    allocation. Modelled that way the same three captures predict 0.733 / 2.134 / 0.948
+    against 0.598 / 2.125 / 0.921 actual -- within a few percent, erring high.
+    """
+    cost = ss.SalCost(file_bytes=1_000, uncompressed_bytes=2_000_000_000,
+                      est_transitions=1_000_000, est_edge_bytes=8_000_000,
+                      sample_rate_hz=_RATE)
+    assert cost.est_peak_bytes == int(2_000_000_000 + 8_000_000 * ss._STREAM_TRANSIENT)
+    assert ss._STREAM_TRANSIENT > 1.0, "a transient of 1 would restore the under-prediction"
+    # The blob term must NOT be multiplied: it is one allocation, not a pipeline.
+    assert cost.est_peak_bytes < int(
+        (2_000_000_000 + 8_000_000) * ss._STREAM_TRANSIENT), "transient applied to the blob too"
+
+
+def test_the_budget_is_capped_absolutely_not_just_by_free_ram(monkeypatch):
+    """A budget of 0.6 x free memory makes the failure mode scale WITH the hardware.
+
+    "Will it fit" and "will it stay interactive" are different questions and only the
+    first grows with RAM, so the better the machine the more the app loaded without ever
+    asking. That is how a 103 GB box loaded a capture whole and sat in continuous memory
+    compression while 16-32 GB machines were offered a time window for the same file and
+    never got into trouble -- the reported complaint being that the FASTER machine was
+    slower. An explicit max_bytes still overrides the cap, because a caller naming a
+    number has already made the decision.
+    """
+    for free_gb in (4, 16, 64, 103, 1024):
+        monkeypatch.setattr(ss, "available_memory_bytes", lambda g=free_gb: int(g * 1e9))
+        budget = ss.memory_budget()
+        assert budget <= ss._MAX_AUTO_BUDGET, (
+            f"{free_gb} GB free produced a {budget/1e9:.1f} GB budget — the cap is not applied")
+        assert budget == min(int(free_gb * 1e9 * ss._MEM_HEADROOM), ss._MAX_AUTO_BUDGET), (
+            f"{free_gb} GB free: the budget is neither the fraction nor the cap")
+    # The fraction still governs below the cap, and the cap still governs above it -- a
+    # constant would pass the equality above while breaking one of these.
+    monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(4e9))
+    assert ss.memory_budget() == int(4e9 * ss._MEM_HEADROOM) < ss._MAX_AUTO_BUDGET
+    monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(103e9))
+    assert ss.memory_budget() == ss._MAX_AUTO_BUDGET
+    monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(1024e9))
+    assert ss.memory_budget(max_bytes=64 << 30) == 64 << 30, "explicit max_bytes must win"

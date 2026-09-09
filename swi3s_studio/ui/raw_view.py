@@ -26,6 +26,8 @@ expected number of UIs late.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -63,7 +65,6 @@ _COMMIT_RING_MIN, _COMMIT_RING_MAX = 10.8, 16.2   # 10% smaller than the origina
 _CDS_Y_BOT, _CDS_Y_TOP, _CDS_Y_ARROW = -0.1, 2.5, 2.62
 _DP_BAND_LO, _DP_BAND_HI = 1.6, 2.4        # DP trace band (port dots stack within it)
 _DN_BAND_LO, _DN_BAND_HI = 0.1, 0.9        # DN trace band
-_MAX_PORT_MARKS = 4000                     # hide port dots above this many in view (too dense)
 _BIT_DOT, _MSB_DOT = 6, 9                   # bit-sample dot px size; larger for the MSB (interval start)
 _MAX_CH_LABELS = 48                          # per-lane cap: label MSBs with CHn only when few
 #                                              enough are in view to be legible (else too dense)
@@ -148,17 +149,17 @@ class RawCaptureView(QWidget):
         self._port_provider = None                   # fn(lo, hi) -> {sample,device,dp,channel,is_start}
         self._show_ports = False                     # off until the user asks (bit collection is lazy)
         self._cursor_sample = 0                       # last shared-cursor sample
-        self._bm_lines = {}                           # label -> draggable bookmark InfiniteLine
+        self._bm_lines: dict[str, Any] = {}      # label -> draggable bookmark InfiniteLine
         self._dp_is_data = False                     # which physical band the data line is drawn in
         self._top_name = "DP"                        # label for the top (data) trace; set per capture
         self._bot_name = "DN"                        # label for the bottom (clock) trace
         self._row_samples = 0.0                      # nominal samples per bus row (zoom-to-row hint)
         self._ui_samples = 0.0                       # samples per UI (max-zoom-in floor)
-        self._lanes = []                             # ordered (device, dp, channel) lane keys
-        self._lane_dots = {}                         # lane -> ScatterPlotItem (per-bit filled circles)
-        self._lane_lines = {}                        # lane -> PlotDataItem (word MSB→LSB join line)
-        self._lane_labels = {}                       # lane -> [TextItem] pool of "CHn" MSB labels
-        self._port_colors = {}                       # lane -> QColor (stable across windows)
+        self._lanes: list[tuple] = []            # ordered (device, dp, channel) lane keys
+        self._lane_dots: dict[tuple, Any] = {}   # lane -> ScatterPlotItem (per-bit filled circles)
+        self._lane_lines: dict[tuple, Any] = {}  # lane -> PlotDataItem (word MSB→LSB join line)
+        self._lane_labels: dict[tuple, list] = {}  # lane -> [TextItem] pool of "CHn" MSB labels
+        self._port_colors: dict[tuple, Any] = {}   # lane -> QColor (stable across windows)
 
         self._plot = pg.PlotWidget(background=VizTheme.PLOT_BG, viewBox=XWheelViewBox(),
                                    axisItems={"bottom": _RawTimeAxis(orientation="bottom")})
