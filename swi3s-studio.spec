@@ -16,7 +16,12 @@ HERE = os.path.abspath(".")
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 
-datas = [(os.path.join(HERE, "data", "registers.json"), "data")]
+datas = [(os.path.join(HERE, "data", "registers.json"), "data"),
+         # The stylesheet's SVGs (checkbox tick, combo chevrons), found beside theme.py
+         # (os.path.dirname(__file__)), so they go where the frozen module lives.
+         (os.path.join(HERE, "swi3s_studio", "ui", "assets"), os.path.join("swi3s_studio", "ui", "assets")),
+         # Help ▸ User Guide renders it (MainWindow.show_user_guide reads _MEIPASS/docs).
+         (os.path.join(HERE, "docs", "USER_GUIDE.md"), "docs")]
 # Ship the compiled swi3score extension (.pyd on Windows, .so/.dylib elsewhere)
 # plus any shared libs it links, alongside the app.
 binaries = collect_dynamic_libs("swi3score")

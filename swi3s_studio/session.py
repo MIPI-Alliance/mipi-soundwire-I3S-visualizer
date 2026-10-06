@@ -134,31 +134,7 @@ class Session:
         # and tell the decoder to skip NRZS and read the CDS at Column 2. FBCSE (PHY1/2)
         # and mid-stream captures keep the forwarded-clock source.
         self._link_control = decode_link_control(capture)
-        # A mid-stream DLV (PHY3) capture has no cold-start to name the PHY. Detect it
-        # from the differential-pair signature (any source: .sal / .bin / CSV / reopen),
-        # so re-importing an exported partial-DLV .sal decodes like the original. Skips
-        # when the PHY is already known (cold start) or DLV was forced by the caller.
-        self._autodetect_partial_dlv(settings)
-        self._source = self._configure_source_for_phy(settings)
-        self.decoder = swi3score.Decoder(self._source, settings)
-        # Let the caller (e.g. the UI's decode worker thread) grab the decoder BEFORE
-        # the blocking run() call, so it can poll decoder.progress / progress_uis /
-        # total_uis from another thread while run() executes on this one. Optional and
-        # backward-compatible: absent for every existing caller.
-        if decoder_ready is not None:
-            decoder_ready(self.decoder)
-        self.decoder.run()
-
-        self.commands: List[dict] = self.decoder.commands()
-        # Audio is kept columnar (struct-of-arrays) — a dense mic-array capture
-        # decodes tens of millions of samples, and materialising that as a Python
-        # list of per-sample dicts is what froze the UI. `audio` (the dict list) is
-        # still available as a lazy property for any caller that wants it.
-        self._refresh_audio()
-        self.column_count: int = self.decoder.column_count
-        self.row_rate_khz: float = self.decoder.row_rate_khz
-        self.ui_rate_hz: float = self.decoder.measured_ui_rate_hz
-        self.segments: List[dict] = self.decoder.segments()
+        self._decode_checking_bringup(settings, decoder_ready)
 
         self.register_map = register_map or RegisterMap.load()
         # Per-device peripheral (vendor) register maps, keyed by device number.
@@ -194,6 +170,104 @@ class Session:
         # so the rows BEFORE the first SSPA decode at the right phase too. No-op unless
         # all of those conditions hold; costs one extra decode when it fires.
         self.lock_ssp_from_sspa()
+
+    def _decode_with(self, settings, decoder_ready=None) -> None:
+        """Pick the source for the PHY the bring-up named, run the decode, and take its
+        results. Run once, or twice when a detected bring-up is rejected after the first
+        decode (`_reject_contradicted_bringup`) and had steered it."""
+        # A mid-stream DLV (PHY3) capture has no cold-start to name the PHY. Detect it
+        # from the differential-pair signature (any source: .sal / .bin / CSV / reopen),
+        # so re-importing an exported partial-DLV .sal decodes like the original. Skips
+        # when the PHY is already known (cold start) or DLV was forced by the caller.
+        self._autodetect_partial_dlv(settings)
+        self._source = self._configure_source_for_phy(settings)
+        self.decoder = swi3score.Decoder(self._source, settings)
+        # Let the caller (e.g. the UI's decode worker thread) grab the decoder BEFORE
+        # the blocking run() call, so it can poll decoder.progress / progress_uis /
+        # total_uis from another thread while run() executes on this one. Optional and
+        # backward-compatible: absent for every existing caller.
+        if decoder_ready is not None:
+            decoder_ready(self.decoder)
+        self.decoder.run()
+
+        self.commands: List[dict] = self.decoder.commands()
+        # Audio is kept columnar (struct-of-arrays) — a dense mic-array capture
+        # decodes tens of millions of samples, and materialising that as a Python
+        # list of per-sample dicts is what froze the UI. `audio` (the dict list) is
+        # still available as a lazy property for any caller that wants it.
+        self._refresh_audio()
+        self.column_count: int = self.decoder.column_count
+        self.row_rate_khz: float = self.decoder.row_rate_khz
+        self.ui_rate_hz: float = self.decoder.measured_ui_rate_hz
+        self.segments: List[dict] = self.decoder.segments()
+
+    def _decode_checking_bringup(self, settings, decoder_ready=None) -> None:
+        """Decode, then drop the detected bring-up if the decode contradicts it.
+
+        The detector reads only the raw edges, and a capture with NO bring-up can satisfy
+        it: on the PHY1, PHY2 and flow-control demos recorded without a cold start, and on
+        a cold-start demo joined after audio began, it found a Cold or Warm Start whose
+        "audio start" had 3 to 36 CRC-valid commands before it. A real bring-up precedes
+        audio mode, so no CRC-valid command (CRC-16: not by chance) decodes inside one, and
+        none did in any genuine bring-up tried. A phantom is not harmless: it swapped the
+        Capture pane's DP/DN labels (each one claimed the bring-up rode the data line) and
+        drew invented bring-up phases on the Timeline.
+
+        A detection that names a PHY or a Safe-Lock width also STEERS the decode (the PHY3
+        path, a column seed). So a rejected one that steered is decoded again without it,
+        and one that steered the decode into no valid command at all, which leaves nothing
+        to contradict it, is checked by decoding without it once: kept if that finds no
+        valid command inside it either. A genuine bring-up decodes valid commands after it,
+        so it never pays the extra decode."""
+        lc = self._link_control
+        before = (settings.forced_column_count, self._forced_column_count, settings.dlv,
+                  settings.cds_horizontal_start, self._dlv_forced, self.capture)
+
+        def restore() -> None:
+            (settings.forced_column_count, self._forced_column_count, settings.dlv,
+             settings.cds_horizontal_start, self._dlv_forced, self.capture) = before
+
+        self._decode_with(settings, decoder_ready)
+        if lc is None or lc.sequence == "none":
+            return
+        steered = bool(lc.phy_name or lc.safe_lock_columns)
+        inside = self._valid_commands_inside(lc)
+        if inside:
+            self._link_control = self._no_bringup(lc, inside)
+            if steered:
+                restore()
+                self._decode_with(settings, decoder_ready)
+            return
+        if steered and not any(c.get("crc_valid") for c in self.commands):
+            restore()
+            self._link_control = LinkControlResult()       # decode as if there were none
+            self._decode_with(settings, decoder_ready)
+            inside = self._valid_commands_inside(lc)
+            if inside:
+                self._link_control = self._no_bringup(lc, inside)
+                return
+            restore()                                      # no evidence either way: keep it
+            self._link_control = lc
+            self._decode_with(settings, decoder_ready)
+
+    def _valid_commands_inside(self, lc) -> int:
+        """CRC-valid commands decoded inside a detected bring-up: from its first non-Idle
+        phase to its audio start. Traffic BEFORE a Bus Reset is a bus that was running and
+        then reset, which is real, so it does not count. A structural test, not a timing
+        one: a genuine bring-up with out-of-spec timing (which the timing checks exist to
+        report) is kept."""
+        end = int(lc.audio_start_sample or 0)
+        phases = [sec for sec in (lc.sections or []) if sec.get("name") != "Idle"]
+        start = int(phases[0]["start"]) if phases else 0
+        return sum(1 for c in self.commands if c.get("crc_valid")
+                   and start <= int(c.get("start_sample", 0)) < end)
+
+    @staticmethod
+    def _no_bringup(lc, inside: int) -> LinkControlResult:
+        return LinkControlResult(
+            note=f"A {lc.sequence} start was detected from the edges but {inside} "
+                 f"CRC-valid command(s) decode inside it, so the capture has no bring-up "
+                 f"(it starts in audio mode).")
 
     # ---- audio (columnar) ----
     _AUDIO_FIELDS = ("device", "dp", "channel", "sample_size", "value",
@@ -754,34 +828,64 @@ class Session:
     @classmethod
     def from_demo(cls, audio_samples_per_channel: int = 32, *,
                   cold_start: bool = False, phy: int = 2, variant: str = "",
-                  **kw) -> "Session":
+                  delay_samples: int = 0, **kw) -> "Session":
         """Synthetic demo session. `phy` = 1 or 2 (FBCSE) or 3 (DLV); with cold_start the
         matching §5.1.2 bring-up selects that PHY on the wire (and, for PHY3, is what
         makes the session pick the recovered-clock DLV decode path). PHY1 is the slow
         4-column variant and synthesizes three ports where 2 and 3 synthesize four.
-        `variant` ="flow_control" selects the four-mode flow-control demo (PHY2 framing)."""
-        return cls(transitions.demo_capture(audio_samples_per_channel,
-                                            cold_start=cold_start, phy=phy,
-                                            variant=variant),
-                   source={"type": "demo",
-                           "audio_samples_per_channel": int(audio_samples_per_channel),
-                           "cold_start": bool(cold_start), "phy": int(phy),
-                           "variant": str(variant)},
-                   **kw)
+        `variant` ="flow_control" selects the four-mode flow-control demo (PHY2 framing).
+        `delay_samples` starts the bus that much later in the capture (the two-Link demo's
+        second Link); it is recorded in `source` only when set, so a plain demo's source
+        is unchanged."""
+        cap = transitions.demo_capture(audio_samples_per_channel, cold_start=cold_start,
+                                       phy=phy, variant=variant)
+        source = {"type": "demo",
+                  "audio_samples_per_channel": int(audio_samples_per_channel),
+                  "cold_start": bool(cold_start), "phy": int(phy), "variant": str(variant)}
+        if delay_samples:
+            cap = transitions.delay_capture(cap, delay_samples)
+            source["delay_samples"] = int(delay_samples)
+        return cls(cap, source=source, **kw)
+
+    @staticmethod
+    def window_samples(window_s, rate_hz: float):
+        """(start_sample, end_sample) for `window_s` = (t0, t1) seconds at `rate_hz`: the
+        nearest samples, the end inclusive (end_sample is one past the sample at t1, as
+        Capture.subcapture's range is half-open)."""
+        t0, t1 = float(window_s[0]), float(window_s[1])
+        return int(round(t0 * rate_hz)), int(round(t1 * rate_hz)) + 1
+
+    @classmethod
+    def _cut(cls, cap, src: dict, window, window_s=None):
+        """Keep only `window` = (start_sample, end_sample) of a capture read whole, rebased
+        to 0, and record it in `src` so a workspace reopens the same slice. The formats
+        without a windowed reader (all but .sal) come through here: the file is read, then
+        cut, so a window saves decode time and memory after the read, not the read.
+        `window_s` gives it in seconds instead, converted at the rate the capture was
+        LOADED at (a complementary CSV pair loads at its true DLV rate, not the rate its
+        edge spacing suggests, so only the loaded capture knows)."""
+        if window is None and window_s is not None:
+            window = cls.window_samples(window_s, cap.sample_rate_hz)
+        if window is None:
+            return cap
+        src["window"] = [int(window[0]), int(window[1])]
+        return cap.subcapture(int(window[0]), int(window[1]))
 
     @classmethod
     def from_saleae_binary(cls, clock_path: str, data_path: str,
-                           sample_rate_hz: int, **kw) -> "Session":
+                           sample_rate_hz: int, window=None, window_s=None,
+                           **kw) -> "Session":
         cap = saleae_binary.load_capture(clock_path, data_path, sample_rate_hz)
-        return cls(cap, source={"type": "saleae_binary", "clock": clock_path,
-                                "data": data_path, "sample_rate_hz": int(sample_rate_hz)},
-                   **kw)
+        src = {"type": "saleae_binary", "clock": clock_path, "data": data_path,
+               "sample_rate_hz": int(sample_rate_hz)}
+        return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
     @classmethod
     def from_sal(cls, path: str, clock_channel: int, data_channel: int,
                  sample_rate_hz: int = 0, auto_clock: bool = False,
-                 window=None, max_bytes=None, **kw) -> "Session":
-        """Open a .sal. `window` is an optional (start_sample, end_sample) range —
+                 window=None, max_bytes=None, window_s=None, **kw) -> "Session":
+        """Open a .sal. `window` is an optional (start_sample, end_sample) range (or
+        `window_s`, in seconds) —
         only that span is decoded (cheaply, by seeking the v3 block chain) and the
         resulting Session is rebased so the window starts at sample 0. `max_bytes`
         caps the predicted memory (0 disables the pre-flight guard, which otherwise
@@ -789,6 +893,9 @@ class Session:
         RAM). The window is recorded in `source` so a workspace reopens the same
         slice."""
         from .ingest import saleae_sal
+        if window is None and window_s is not None:
+            rate = sample_rate_hz or saleae_sal.read_info(path).sample_rate_hz
+            window = cls.window_samples(window_s, rate)
         cap = saleae_sal.load_capture(path, clock_channel, data_channel,
                                       sample_rate_hz or None, auto_clock=auto_clock,
                                       window=window, max_bytes=max_bytes)
@@ -803,7 +910,8 @@ class Session:
 
     @classmethod
     def from_digital_csv(cls, path: str, clock_col: int, data_col: int,
-                         sample_rate_hz: int = 0, auto_dlv: bool = True, **kw) -> "Session":
+                         sample_rate_hz: int = 0, auto_dlv: bool = True, window=None,
+                         window_s=None, **kw) -> "Session":
         """Build a Session from a Logic digital-CSV export.
 
         When `auto_dlv` and no rate is forced, a capture whose two channels form a
@@ -819,29 +927,28 @@ class Session:
             rate = dlv_detect.true_sample_rate_csv(path)
             if rate:
                 cap = digital_csv.load_capture(path, clock_col, data_col, sample_rate_hz=rate)
-                return cls(cap, source={"type": "digital_csv", "path": path,
-                                        "clock_col": int(clock_col), "data_col": int(data_col),
-                                        "sample_rate_hz": int(rate)}, **kw)
+                src = {"type": "digital_csv", "path": path, "clock_col": int(clock_col),
+                       "data_col": int(data_col), "sample_rate_hz": int(rate)}
+                return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
         cap = digital_csv.load_capture(path, clock_col, data_col, sample_rate_hz or None)
-        return cls(cap, source={"type": "digital_csv", "path": path,
-                                "clock_col": int(clock_col), "data_col": int(data_col),
-                                "sample_rate_hz": int(cap.sample_rate_hz)}, **kw)
+        src = {"type": "digital_csv", "path": path, "clock_col": int(clock_col),
+               "data_col": int(data_col), "sample_rate_hz": int(cap.sample_rate_hz)}
+        return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
     @classmethod
     def from_vcd(cls, path: str, clock_ident: str, data_ident: str,
-                 auto_clock: bool = False, **kw) -> "Session":
+                 auto_clock: bool = False, window=None, window_s=None, **kw) -> "Session":
         from .ingest import vcd
         cap = vcd.load_capture(path, clock_ident, data_ident, auto_clock=auto_clock)
-        return cls(cap, source={"type": "vcd", "path": path,
-                                "clock_ident": str(clock_ident),
-                                "data_ident": str(data_ident),
-                                "auto_clock": bool(auto_clock),
-                                "sample_rate_hz": int(cap.sample_rate_hz)}, **kw)
+        src = {"type": "vcd", "path": path, "clock_ident": str(clock_ident),
+               "data_ident": str(data_ident), "auto_clock": bool(auto_clock),
+               "sample_rate_hz": int(cap.sample_rate_hz)}
+        return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
     @classmethod
     def from_wfm(cls, clock_path: str, data_path: str, *,
                  clock_thresh=None, data_thresh=None, auto_clock: bool = True,
-                 sample_rate_hz: int = 0, **kw) -> "Session":
+                 sample_rate_hz: int = 0, window=None, window_s=None, **kw) -> "Session":
         """Build a Session from a pair of Tektronix .wfm scope exports — one analog
         channel per file, both channels of the SAME capture (they share a time base,
         taken from the first file). `clock_thresh`/`data_thresh` are optional (hi, lo)
@@ -880,15 +987,15 @@ class Session:
         cap = analog.capture_from_analog(clk["time"], clk["volts"], dat["volts"],
                                          sample_rate_hz or None, clock_thresh, data_thresh,
                                          auto_clock=auto_clock)
-        return cls(cap, source={"type": "wfm", "clock_path": clock_path,
-                                "data_path": data_path, "auto_clock": auto_clock,
-                                "clock_thresh": clock_thresh, "data_thresh": data_thresh,
-                                "sample_rate_hz": int(cap.sample_rate_hz)}, **kw)
+        src = {"type": "wfm", "clock_path": clock_path, "data_path": data_path,
+               "auto_clock": auto_clock, "clock_thresh": clock_thresh,
+               "data_thresh": data_thresh, "sample_rate_hz": int(cap.sample_rate_hz)}
+        return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
     @classmethod
     def from_analog_csv(cls, path: str, *, clock="CH1", data="CH2",
                         clock_thresh=None, data_thresh=None, auto_clock: bool = False,
-                        **kw) -> "Session":
+                        window=None, window_s=None, **kw) -> "Session":
         """Build a Session from a Tektronix scope analog CSV export (one file, all
         channels). `clock`/`data` select the forwarded-clock and data channels, by
         header name (e.g. "CH1") or by integer index into the file's channel order
@@ -914,11 +1021,10 @@ class Session:
                                          channels[data_name],
                                          parsed["sample_rate_hz"] or None,
                                          clock_thresh, data_thresh, auto_clock=auto_clock)
-        return cls(cap, source={"type": "analog_csv", "path": path,
-                                "clock": clock_name, "data": data_name,
-                                "auto_clock": auto_clock,
-                                "clock_thresh": clock_thresh, "data_thresh": data_thresh},
-                   **kw)
+        src = {"type": "analog_csv", "path": path, "clock": clock_name, "data": data_name,
+               "auto_clock": auto_clock, "clock_thresh": clock_thresh,
+               "data_thresh": data_thresh}
+        return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
     # Reconstruct a Session from a persisted `source` descriptor (workspace reload,
     # in-place re-decode). One dispatch, co-located with the from_* factories above, so
@@ -943,39 +1049,45 @@ class Session:
             return cls.from_demo(int(source.get("audio_samples_per_channel", 32)),
                                  cold_start=bool(source.get("cold_start", False)),
                                  phy=int(source.get("phy", 2)),
-                                 variant=str(source.get("variant", "")), **common)
+                                 variant=str(source.get("variant", "")),
+                                 delay_samples=int(source.get("delay_samples", 0)), **common)
+        # Every capture kind carries its window: a workspace saved from a windowed open
+        # must reopen the same slice, not the whole (possibly unopenable) capture.
+        win = source.get("window")
+        win = tuple(win) if win else None
         if kind == "saleae_binary":
             return cls.from_saleae_binary(source["clock"], source["data"],
-                                          int(source["sample_rate_hz"]), **common)
+                                          int(source["sample_rate_hz"]), window=win, **common)
         if kind == "sal":
-            # Carry the window forward: a workspace saved from a windowed open must
-            # reopen the same slice, not the whole (possibly unopenable) capture.
-            win = source.get("window")
             return cls.from_sal(source["path"], int(source["clock_channel"]),
                                 int(source["data_channel"]),
                                 int(source.get("sample_rate_hz", 0)),
                                 auto_clock=bool(source.get("auto_clock", False)),
-                                window=(tuple(win) if win else None), **common)
+                                window=win, **common)
         if kind == "digital_csv":
             return cls.from_digital_csv(source["path"], int(source["clock_col"]),
                                         int(source["data_col"]),
-                                        int(source.get("sample_rate_hz", 0)), **common)
+                                        int(source.get("sample_rate_hz", 0)), window=win,
+                                        **common)
         if kind == "vcd":
             return cls.from_vcd(source["path"], str(source["clock_ident"]),
                                 str(source["data_ident"]),
-                                auto_clock=bool(source.get("auto_clock", False)), **common)
+                                auto_clock=bool(source.get("auto_clock", False)), window=win,
+                                **common)
         if kind == "wfm":
             return cls.from_wfm(source["clock_path"], source["data_path"],
                                 clock_thresh=source.get("clock_thresh"),
                                 data_thresh=source.get("data_thresh"),
                                 auto_clock=bool(source.get("auto_clock", True)),
-                                sample_rate_hz=int(source.get("sample_rate_hz", 0)), **common)
+                                sample_rate_hz=int(source.get("sample_rate_hz", 0)), window=win,
+                                **common)
         if kind == "analog_csv":
             return cls.from_analog_csv(source["path"], clock=source.get("clock", "CH1"),
                                        data=source.get("data", "CH2"),
                                        clock_thresh=source.get("clock_thresh"),
                                        data_thresh=source.get("data_thresh"),
-                                       auto_clock=bool(source.get("auto_clock", False)), **common)
+                                       auto_clock=bool(source.get("auto_clock", False)),
+                                       window=win, **common)
         raise ValueError(f"unknown workspace source type: {kind!r}")
 
     # ---- sub-capture / export ----
@@ -1032,6 +1144,52 @@ class Session:
         if de.size:
             last = max(last, int(de[-1]))
         return last
+
+    def rate_regions(self) -> List[Tuple[int, int, Optional[float], Optional[float]]]:
+        """(start_sample, end_sample, ui_rate_hz, row_rate_hz) for each stretch of the
+        capture that runs one bus geometry, in capture order and covering [0, last_sample].
+
+        `ui_rate_hz` / `row_rate_khz` are ONE number for the whole capture (the rate in force
+        at its end), but a capture's timing changes with its geometry: on FBCSE the UI rate
+        holds while a column-count change moves the row rate (the PHY2 demo runs 3.072 then
+        1.536 MRows/s across its 8 and 16 columns); on DLV the row rate holds while the UI
+        rate follows the columns. So each decode segment is measured on its own, between the
+        opening edges (Row Sync Points) of its first and last whole rows — exact samples, so
+        two regions at one rate measure the same — and its UI rate is that times its column
+        count. A §5.1.2 bring-up runs its own, slower clock, so the first region starts at
+        its audio start. Before that, and in a region under two whole rows, both are None."""
+        last = max(0, int(self.last_sample()))
+        rate = float(self.sample_rate_hz or 0)
+        segs = sorted(self.segments or [], key=lambda g: int(g["start_sample"]))
+        if not segs or rate <= 0:
+            return [(0, last, None, None)]
+        lc = self.link_control
+        audio = int(getattr(lc, "audio_start_sample", 0) or 0) if lc is not None else 0
+        first = max(int(segs[0]["start_sample"]), audio)
+        out: List[Tuple[int, int, Optional[float], Optional[float]]] = []
+        if first > 0:
+            out.append((0, first, None, None))
+        for k, seg in enumerate(segs):
+            start = max(int(seg["start_sample"]), first)
+            end = int(segs[k + 1]["start_sample"]) if k + 1 < len(segs) else last
+            if end <= start:
+                continue
+            r_a = self.bus_row_for_sample(start) + 1          # whole rows only
+            r_b = self.bus_row_for_sample(end) - 1
+            s_a, s_b = self.sample_at_bus_row(r_a), self.sample_at_bus_row(r_b)
+            if r_b - r_a < 2 or s_b <= s_a:
+                out.append((start, end, None, None))
+                continue
+            row_rate = (r_b - r_a) * rate / (s_b - s_a)
+            out.append((start, end, row_rate * max(1, int(seg["column_count"])), row_rate))
+        return out
+
+    def ui_index(self, sample: int) -> int:
+        """The UI `sample` sits in, counted from the capture's first UI: exact on both PHYs
+        (clock edges on FBCSE, the recovered clock per segment on DLV). The difference of two
+        is a UI COUNT, which a sample gap over one capture-wide UI rate is not wherever the
+        UI rate changes (DLV's Safe-Lock-4 to 16-column switch is a factor of four)."""
+        return int(self._ui_for_sample(int(sample)))
 
     def sample_at_bus_row(self, row: int) -> int:
         """Capture sample opening bus `row` (its Row Sync Point). Clamped; the public

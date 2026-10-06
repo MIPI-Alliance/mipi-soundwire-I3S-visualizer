@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -158,10 +158,22 @@ def transition_counts(path: str, idents=None) -> Dict[str, int]:
     """Count scalar transitions per identifier (a signal's first value is its initial
     level, not a transition). Used to auto-pick the forwarded clock (the busiest
     line). If `idents` is given, only those are counted."""
+    return transition_counts_bounded(path, idents)[0]
+
+
+def transition_counts_bounded(path: str, idents=None, max_changes: Optional[int] = None
+                              ) -> Tuple[Dict[str, int], bool]:
+    """transition_counts, reading at most `max_changes` value changes: (counts, truncated).
+    The channel picker only needs the RANKING (a forwarded clock toggles every UI), which a
+    bounded prefix gives without parsing a whole large dump on the GUI thread."""
     want = set(idents) if idents is not None else None
     counts: Dict[str, int] = {}
     last: Dict[str, int] = {}
+    seen = 0
     for _t, ident, level in _value_changes(path):
+        if max_changes is not None and seen >= max_changes:
+            return counts, True
+        seen += 1
         if want is not None and ident not in want:
             continue
         if ident not in last:
@@ -169,7 +181,7 @@ def transition_counts(path: str, idents=None) -> Dict[str, int]:
         elif level != last[ident]:
             last[ident] = level
             counts[ident] = counts.get(ident, 0) + 1
-    return counts
+    return counts, False
 
 
 def load_capture(path: str, clock_ident: str, data_ident: str,

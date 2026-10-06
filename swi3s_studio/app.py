@@ -1,38 +1,55 @@
 """SWI3S Studio application entry point.
 
-    python3 -m swi3s_studio.app                 # empty window (File > Load Demo)
-    python3 -m swi3s_studio.app --demo          # open the synthetic demo capture
-    python3 -m swi3s_studio.app --demo-bringup  # demo with a §5.1.2 Cold Start
+    python3 -m swi3s_studio.app                          # empty window (File > Load Demo)
+    python3 -m swi3s_studio.app --demo                   # open the synthetic demo capture
+    python3 -m swi3s_studio.app --demo-bringup           # demo with a §5.1.2 Cold Start
+    python3 -m swi3s_studio.app -c cfg.csv               # open a Visualizer config CSV
+    python3 -m swi3s_studio.app -c cfg.csv -o model.json # headless: write the bus model
+
+Argument handling lives in `cli.py`, which is Qt-free, and `-o` is dispatched there BEFORE
+anything Qt is constructed — see `main`. Run with `--help` for the full list.
+
+NOTHING QT IS IMPORTED AT MODULE LEVEL, and that is what makes "-o implies headless" true rather
+than nearly true: a batch model dump neither imports PySide6 nor touches the UI package, so it
+cannot be broken by a display problem, a Qt version, or anything in the window's construction.
+`tests/test_cli.py` pins it by checking sys.modules in a subprocess. The cost is the two
+deferred-import helpers below; the alternative was a module-level QProxyStyle subclass, which
+pulls in QtWidgets just to be defined.
 """
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle
-
-from .ui.main_window import MainWindow
-from .ui.theme import apply_palette, resolve_mode, saved_preference
+from . import cli
 
 _APP_NAME = "SWI3S Studio"
 _MIN_PY = (3, 11)
 
 
-class _CenteredTabStyle(QProxyStyle):
-    """Center tab-bar tabs so tabbed docks match macOS. The Windows/Fusion styles
-    left-align a QTabBar's tabs; SH_TabBar_Alignment is the single style hint that
-    controls this, and it governs QMainWindow's dock tab bars (the bottom pane group +
-    the Registers/Statistics/Bookmarks group) too. macOS already returns AlignCenter,
-    so this proxy is only installed off-darwin (leaving the native Mac style intact).
+def _centered_tab_style():
+    """Build the tab-centering proxy style. A FUNCTION, not a module-level class, because
+    subclassing QProxyStyle requires QtWidgets at import time and the headless path must not
+    import Qt at all — see the module docstring.
 
-    (The dock close/float button chrome is handled by a custom title-bar widget in
-    main_window, not a style hint — the native style paints a button frame the QSS
-    can't suppress.)"""
+    Center tab-bar tabs so tabbed docks match macOS. The Windows/Fusion styles left-align a
+    QTabBar's tabs; SH_TabBar_Alignment is the single style hint that controls this, and it
+    governs QMainWindow's dock tab bars (the bottom pane group + the
+    Registers/Statistics/Bookmarks group) too. macOS already returns AlignCenter, so this proxy
+    is only installed off-darwin (leaving the native Mac style intact).
 
-    def styleHint(self, hint, option=None, widget=None, returnData=None):  # noqa: N802
-        if hint == QStyle.StyleHint.SH_TabBar_Alignment:
-            return int(Qt.AlignmentFlag.AlignCenter)
-        return super().styleHint(hint, option, widget, returnData)
+    (The dock close/float button chrome is handled by a custom title-bar widget in main_window,
+    not a style hint — the native style paints a button frame the QSS can't suppress.)
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QProxyStyle, QStyle
+
+    class _CenteredTabStyle(QProxyStyle):
+        def styleHint(self, hint, option=None, widget=None, returnData=None):  # noqa: N802
+            if hint == QStyle.StyleHint.SH_TabBar_Alignment:
+                return int(Qt.AlignmentFlag.AlignCenter)
+            return super().styleHint(hint, option, widget, returnData)
+
+    return _CenteredTabStyle()
 
 
 
@@ -49,6 +66,20 @@ def _require_python() -> None:
 def main(argv=None) -> int:
     _require_python()
     argv = list(sys.argv if argv is None else argv)
+    args, qt_argv = cli.parse(argv)
+    # -o IMPLIES HEADLESS: return before any QApplication, window or event loop exists, so a
+    # batch run needs no display and cannot be affected by a saved appearance preference or a
+    # restored workspace. cli is Qt-free; this is the only place that decides between the two.
+    if args.output:
+        return cli.run_headless(args.config, args.output)
+    # Qt and the UI package are imported HERE, past the headless return, so a model dump does
+    # not pay for them and cannot fail on them.
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from .ui.main_window import MainWindow
+    from .ui.theme import apply_palette, resolve_mode, saved_preference
+
     # Name the app before QApplication so the macOS application menu reads
     # "SWI3S Studio" instead of "Python".
     QApplication.setApplicationName(_APP_NAME)
@@ -56,20 +87,22 @@ def main(argv=None) -> int:
     QApplication.setOrganizationName("MIPI SWI3S")
     _name_macos_app_menu()
     _set_regular_activation_policy()   # become a normal GUI app BEFORE QApplication
-    app = QApplication(argv)
+    app = QApplication(qt_argv)
     app.setApplicationName(_APP_NAME)
     # Center tabbed-dock tab bars off macOS (Windows/Fusion left-align them; macOS's
     # native style already centers and is left untouched).
     if sys.platform != "darwin":
-        app.setStyle(_CenteredTabStyle())
+        app.setStyle(_centered_tab_style())
     # Apply the saved appearance preference before building the window so every
     # widget is constructed with the right palette ('system' follows the OS).
     apply_palette(resolve_mode(saved_preference()))
     win = MainWindow()
-    if "--demo-bringup" in argv:
+    if args.demo_bringup:
         win.load_demo_bringup()
-    elif "--demo" in argv:
+    elif args.demo:
         win.load_demo()
+    elif args.config:
+        win.open_visualizer_csv_path(args.config)
     win.show()
     # Qt-level focus is safe before the event loop; the macOS Cocoa activation is NOT —
     # calling NSApplication.activate() before app.exec() spins AppKit's activation while

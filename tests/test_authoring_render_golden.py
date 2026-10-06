@@ -17,6 +17,7 @@ Run: PYTHONPATH=. python3 -m pytest tests/test_authoring_render_golden.py
 import glob
 import json
 import os
+import pathlib
 import sys
 
 from swi3s_studio.model import viz_engine
@@ -51,13 +52,14 @@ def _rel(p: str) -> str:
 def _regen() -> None:
     snap = {_rel(p): _signature(p) for p in _all_configs()}
     os.makedirs(os.path.dirname(_GOLDEN), exist_ok=True)
-    json.dump(snap, open(_GOLDEN, "w"), indent=1, sort_keys=True)
+    with open(_GOLDEN, "w") as f:
+        json.dump(snap, f, indent=1, sort_keys=True)
     print(f"regenerated {_GOLDEN}: {len(snap)} configs")
 
 
 def test_authoring_render_matches_golden():
     assert os.path.isfile(_GOLDEN), f"missing golden {_GOLDEN} (run --regen)"
-    golden = json.load(open(_GOLDEN))
+    golden = json.loads(pathlib.Path(_GOLDEN).read_text())
     configs = _all_configs()
     assert configs, f"no example configs under {_EXAMPLES}"
     # Every config still present + its render signature unchanged.
@@ -75,8 +77,8 @@ def test_authoring_render_matches_golden():
 
 
 if __name__ == "__main__":
-    if "--regen" in sys.argv:
-        _regen()
-    else:
-        test_authoring_render_matches_golden()
-        print("ok: authoring render output matches golden for all example configs")
+    # The regeneration entry point only (run the check itself through pytest). Show the
+    # golden diff for review before committing a regenerated file (docs/DEVELOPMENT.md).
+    if "--regen" not in sys.argv:
+        raise SystemExit("usage: python tests/test_authoring_render_golden.py --regen")
+    _regen()

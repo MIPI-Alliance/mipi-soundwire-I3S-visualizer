@@ -20,36 +20,76 @@ def read_header(path: str) -> List[str]:
         return next(csv.reader(f))
 
 
-def channel_transition_counts(path: str, max_rows: int = 2_000_000) -> List[int]:
-    """Count level transitions per channel column (column 0 is Time), reading up
-    to `max_rows` data rows. Used to auto-pick clock vs data: the forwarded clock
-    toggles every UI, so it has far more transitions than the NRZS data line.
-    Returns one count per channel column (index 0 == CSV column 1)."""
+# Rows per batch of `scan`: smaller than the loader's, since a probe keeps nothing per
+# row and its peak is the batch (every cell a Python string).
+_SCAN_CHUNK = 50_000
+
+
+def scan(path: str, max_rows: int = 2_000_000) -> Tuple[List[int], int]:
+    """(transitions per channel column, inferred rate) from ONE pass over up to `max_rows`
+    data rows, read in batches, so a pre-decode look at a large export costs one bounded
+    read and a few MB rather than every row held as Python strings (it was two reads of
+    2M rows, ~670 MB, for an 84 MB file). Counts are per channel column (index 0 == CSV
+    column 1), the forwarded clock toggling every UI; the rate is the finest forward
+    timestamp spacing (~one sample period), snapped to the nearest kHz, or 0."""
+    from itertools import islice
     _TRUE = ("1", "1.0", "True")
     with open(path, newline="", encoding="utf-8") as f:
-        r = csv.reader(f)                          # csv.reader parses at C speed
+        r = csv.reader(f)
         header = next(r, None)
-        if not header:
-            return []
+        if not header or len(header) < 2:
+            return [], 0
         ncols = len(header) - 1                     # channel columns after Time
-        if ncols <= 0:
-            return []
-        rows = []
-        for i, row in enumerate(r):
-            if i >= max_rows:
+        counts = [0] * ncols
+        last: List[Optional[int]] = [None] * ncols  # each column's level ending the last batch
+        t_last = None
+        finest = np.inf
+        left = max_rows
+        while left > 0:
+            raw = list(islice(r, min(_SCAN_CHUNK, left)))
+            if not raw:
                 break
-            if len(row) > ncols:                    # skip short rows (as the old loop did)
-                rows.append(row)
-    if not rows:
-        return [0] * ncols
-    # Per column: strip + membership + count level changes with NumPy, instead of a
-    # per-cell Python string test in a row loop (the old hot spot on 2M-row CSVs).
-    counts = [0] * ncols
-    for c in range(ncols):
-        vals = np.char.strip(np.array([row[c + 1] for row in rows]))
-        lvl = np.isin(vals, _TRUE).astype(np.int8)
-        counts[c] = int(np.count_nonzero(np.diff(lvl)))   # nonzero diff == a transition
-    return counts
+            left -= len(raw)
+            rows = [row for row in raw if len(row) > ncols]     # skip short rows
+            del raw
+            if not rows:
+                continue
+            for c in range(ncols):
+                lvl = np.fromiter((row[c + 1].strip() in _TRUE for row in rows),
+                                  dtype=np.int8, count=len(rows))
+                counts[c] += int(np.count_nonzero(np.diff(lvl)))
+                if last[c] is not None and int(lvl[0]) != last[c]:
+                    counts[c] += 1                   # a transition across the batch seam
+                last[c] = int(lvl[-1])
+            times = [row[0] for row in rows]
+            try:
+                t = np.asarray(times, dtype=np.float64)          # fast path: all numeric
+            except ValueError:                                   # a stray non-numeric cell
+                t = np.full(len(times), np.nan)
+                for n, v in enumerate(times):
+                    try:
+                        t[n] = float(v)
+                    except ValueError:
+                        pass
+                t = t[~np.isnan(t)]
+            if t_last is not None:
+                t = np.concatenate(([t_last], t))
+            if t.size:
+                d = np.diff(t)
+                d = d[d > 0]                         # only forward steps
+                if d.size:
+                    finest = min(finest, float(d.min()))
+                t_last = float(t[-1])
+    rate = int(round(1.0 / finest / 1000.0)) * 1000 if np.isfinite(finest) else 0
+    return counts, rate
+
+
+def channel_transition_counts(path: str, max_rows: int = 2_000_000) -> List[int]:
+    """Level transitions per channel column (column 0 is Time) over up to `max_rows`
+    data rows (`scan`). Used to auto-pick clock vs data: the forwarded clock toggles
+    every UI, so it has far more transitions than the NRZS data line. One count per
+    channel column (index 0 == CSV column 1)."""
+    return scan(path, max_rows)[0]
 
 
 def looks_complementary(path: str, clock_col: int, data_col: int,
@@ -80,36 +120,8 @@ def looks_complementary(path: str, clock_col: int, data_col: int,
 
 def infer_sample_rate(path: str, max_rows: int = 2_000_000) -> int:
     """Infer the capture rate from the finest timestamp spacing (~one sample
-    period), snapped to the nearest kHz. Returns 0 if it can't be inferred."""
-    times: List[str] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.reader(f)
-        next(r, None)
-        for i, row in enumerate(r):
-            if i >= max_rows or not row:
-                break
-            times.append(row[0])
-    if len(times) < 2:
-        return 0
-    # Bulk float-parse + finest positive spacing with NumPy (was a per-row Python loop).
-    try:
-        t = np.asarray(times, dtype=np.float64)     # fast path: all times numeric
-    except ValueError:                              # rare stray non-numeric cell
-        def _f(s):
-            try:
-                return float(s)
-            except ValueError:
-                return np.nan
-        t = np.array([_f(s) for s in times], dtype=np.float64)
-        t = t[~np.isnan(t)]
-    if t.size < 2:
-        return 0
-    d = np.diff(t)
-    d = d[d > 0]                                     # only forward steps (matches t > last)
-    if d.size == 0:
-        return 0
-    rate = 1.0 / float(d.min())
-    return int(round(rate / 1000.0)) * 1000         # snap to nearest kHz
+    period), snapped to the nearest kHz (`scan`). Returns 0 if it can't be inferred."""
+    return scan(path, max_rows)[1]
 
 
 

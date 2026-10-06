@@ -5,19 +5,13 @@ re-themes the views without losing the loaded capture.
 Run: QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_theme.py
 """
 import os
-import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# conftest keeps every QSettings of the run in a throwaway ini, so save_preference() (here
+# and inside MainWindow.apply_theme) cannot touch the user's real appearance preference.
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
-
-# Isolate ALL QSettings in this process to a throwaway ini, so save_preference()
-# (here and inside MainWindow.apply_theme) can't overwrite the user's real
-# appearance preference. setDefaultFormat makes the no-arg QSettings() use it.
-_SETTINGS_DIR = tempfile.mkdtemp(prefix="swi3s_test_settings_")
-QSettings.setDefaultFormat(QSettings.IniFormat)
-QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _SETTINGS_DIR)
 
 from swi3s_studio.ui.theme import (
     _DARK,

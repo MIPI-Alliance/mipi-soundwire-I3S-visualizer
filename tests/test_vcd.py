@@ -198,3 +198,19 @@ def test_truncated_time_token_survives():
             f.write(vcd_text)
         cap = vcd.load_capture(p, "!", "%")   # must not raise
     assert cap.clock_edges.tolist() == [10]
+
+
+def test_bounded_transition_counts_stop_early_and_say_so(tmp_path):
+    from swi3s_studio.ingest import vcd
+    lines = ["$timescale 1ns $end", "$var wire 1 ! clk $end", "$var wire 1 \" dat $end",
+             "$enddefinitions $end", "#0", "0!", "0\""]
+    for t in range(1, 2001):
+        lines.append(f"#{t}")
+        lines.append(f"{t % 2}!")
+    p = tmp_path / "long.vcd"
+    p.write_text("\n".join(lines) + "\n")
+    full, cut = vcd.transition_counts_bounded(str(p), None)
+    assert not cut and full["!"] == 2000
+    part, cut = vcd.transition_counts_bounded(str(p), None, max_changes=500)
+    assert cut and 0 < part["!"] < full["!"]
+    assert vcd.transition_counts(str(p)) == full

@@ -19,6 +19,7 @@ import glob
 import json
 import logging
 import os
+import pathlib
 
 from swi3s_studio.model import viz_engine
 
@@ -50,7 +51,7 @@ def test_bus_model_matches_golden():
     every config — bits, clashes, and warnings included."""
     mismatches = []
     for base, csv, gold in _cases():
-        want = json.load(open(gold))
+        want = json.loads(pathlib.Path(gold).read_text())
         got = viz_engine.model_json(csv)
         if got != want:
             diff = [k for k in set(want) | set(got) if want.get(k) != got.get(k)]

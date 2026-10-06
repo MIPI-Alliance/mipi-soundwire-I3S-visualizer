@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.0.17"
+version = "3.0.19"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
 requires-python = ">=3.11"
 dependencies = [
@@ -52,6 +52,19 @@ data-files = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A bare `pytest` is the functional suite. The perf ceilings are wall clocks and only mean
+# something in their own process (`pytest -m perf`, as the gate and CI run them): pooled
+# behind every other test they flaked. An explicit -m on the command line overrides this.
+addopts = ["-m", "not perf"]
+# Our own warnings are errors: a deprecated Qt call or an unclosed file in this code is
+# fixed when it appears, instead of joining ~2,100 lines of noise that hide the next one.
+# (Scoped by module, so a dependency's warnings stay warnings.) A ResourceWarning is raised
+# from a finalizer, so pytest reports it as an unraisable-exception warning.
+filterwarnings = [
+    "error::DeprecationWarning:(swi3s_studio|test_|conftest)",
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "perf: performance-regression benchmark with a wall-clock ceiling (run: -m perf)",
 ]

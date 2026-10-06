@@ -3,7 +3,7 @@ still decode audio when a Visualizer config CSV is supplied (the decoder applies
 that data-port config from row 0 instead of snooping the missing commands).
 
 Covers the decode-driving config-CSV plumbing (shared by workspace reload and
-File ▸ Apply Config CSV to Open Capture…): the config path flows into the decode,
+Decode ▸ Import Visualizer CSV…): the config path flows into the decode,
 is persisted in the workspace `source`, and reloads; and the GUI exposes the
 capture-open actions and threads the path through `open_capture`.
 
@@ -202,15 +202,16 @@ def test_gui_capture_open_actions():
     assert "config_csv" in inspect.signature(win.open_capture).parameters
     # The old "Open Capture with Config CSV" menu wrapper is gone.
     assert not hasattr(win, "open_capture_with_config")
-    assert hasattr(win, "open_visualizer_csv")        # File ▸ Visualizer ▸ Open Settings
-    assert hasattr(win, "open_visualizer_config")     # File ▸ Analyzer ▸ Import Visualizer CSV
+    assert hasattr(win, "open_visualizer_csv")        # File (Visualizer) ▸ Open Visualizer CSV
+    assert hasattr(win, "open_visualizer_config")     # Decode ▸ Import Visualizer CSV
     # The Analyzer file submenu (held on the window, so its actions survive multi-window
     # GC in the same process — see the shiboken caveat).
-    texts = [a.text() for a in win._file_analyzer_menu.actions()]
-    assert any("Open &Capture" in t for t in texts), texts
-    assert any("Import Visualizer CSV" in t for t in texts), texts
-    assert any("Open &Workspace" in t for t in texts), texts
-    assert any("Save &Workspace" in t for t in texts), texts
+    texts = [a.text().replace("&", "") for a in win._file_analyzer_menu.actions()]
+    assert "Open Capture…" in texts, texts
+    assert "Open Workspace…" in texts and "Save Workspace…" in texts, texts
+    # Importing a Visualizer CSV changes the decode, so it is in Decode, not File.
+    decode = [a.text().replace("&", "") for a in win._decode_menu.actions()]
+    assert "Import Visualizer CSV…" in decode, decode
     # The old flat gating lists are gone (File actions guard at call time instead).
     assert not hasattr(win, "_file_gated") and not hasattr(win, "_file_always")
 
@@ -292,11 +293,11 @@ def test_gui_exposes_open_visualizer_config():
     # method it drives still exists (exercised by the tests above).
     assert hasattr(win, "open_visualizer_config")
     assert hasattr(win._session, "apply_config_csv")
-    labels = [a.text() for a in win._file_analyzer_menu.actions()]
+    labels = [a.text() for a in win._decode_menu.actions()]
     assert any("Import Visualizer CSV" in t for t in labels), labels
 
 
-def test_open_visualizer_config_routes_update_vs_compare():
+def test_open_visualizer_config_routes_update_vs_compare(monkeypatch):
     """Open Visualizer Config routes to the right action per the dialog result:
     file+compare → _run_compare, file+update → _apply_config_csv_path, authoring →
     use_authoring_as_expected (compare only). Spies avoid the modal + async re-decode."""
@@ -321,11 +322,14 @@ def test_open_visualizer_config_routes_update_vs_compare():
 
     with tempfile.TemporaryDirectory() as d:
         csv = _config_csv(d)
-        open_config_dialog.OpenVisualizerConfigDialog = fake_dialog(False, csv, False, True)
+        monkeypatch.setattr(open_config_dialog, "OpenVisualizerConfigDialog",
+                            fake_dialog(False, csv, False, True))
         win.open_visualizer_config()
-        open_config_dialog.OpenVisualizerConfigDialog = fake_dialog(False, csv, True, False)
+        monkeypatch.setattr(open_config_dialog, "OpenVisualizerConfigDialog",
+                            fake_dialog(False, csv, True, False))
         win.open_visualizer_config()
-        open_config_dialog.OpenVisualizerConfigDialog = fake_dialog(True, "", False, True)
+        monkeypatch.setattr(open_config_dialog, "OpenVisualizerConfigDialog",
+                            fake_dialog(True, "", False, True))
         win.open_visualizer_config()
     assert [c[0] for c in calls] == ["compare", "update", "authoring_compare"], calls
 

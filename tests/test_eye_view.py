@@ -58,3 +58,46 @@ def test_all_flavours_hidden_renders_without_error():
     assert len(ev._cat_hidden) == 4
     ev._render()                      # empty plot, no crash
     assert ev._worst == []            # nothing visible -> no worst-UI candidates
+
+
+def test_a_cached_timing_pane_measures_each_region_on_its_own():
+    """The app gives the pane a per-Link cache (so a Link switch does not re-scan the
+    capture). The cache must be per REGION: one entry for the whole capture showed the
+    first region's setup/hold whatever region was picked."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui import eye_view
+    from swi3s_studio.ui.eye_view import EyeView
+
+    s = Session.from_demo(600, cold_start=True, phy=3)
+    regions = s.timing_regions()
+    assert len(regions) >= 2
+    ev = EyeView()
+    ev.set_analysis_context(s.segments, regions, s.timing_column_roles)
+    ev.set_capture(s.capture, recovered_clock=s.recovered_clock(), cache={})
+    seen = []
+    for i in range(len(regions)):
+        ev._region.setCurrentIndex(i)
+        ev._render()
+        seen.append(ev._timing)
+    uncached = EyeView()
+    uncached.set_analysis_context(s.segments, regions, s.timing_column_roles)
+    uncached.set_capture(s.capture, recovered_clock=s.recovered_clock())
+    for i, t in enumerate(seen):
+        uncached._region.setCurrentIndex(i)
+        uncached._render()
+        assert t.n_data_edges == uncached._timing.n_data_edges, regions[i]["label"]
+    assert len({t.n_data_edges for t in seen}) == len(seen)       # really different
+    calls = []
+    real = eye_view.measure_bus_timing
+    eye_view.measure_bus_timing = lambda *a, **k: calls.append(1) or real(*a, **k)
+    try:
+        for i in range(len(regions)):
+            ev._region.setCurrentIndex(i)
+            ev._render()
+    finally:
+        eye_view.measure_bus_timing = real
+    assert not calls                                               # every region cached

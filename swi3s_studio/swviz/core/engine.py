@@ -140,8 +140,8 @@ class BusModelBuilder:
         # observation — see _process_data_port) that a fresh initialize_transport
         # has just run and the next emission is the first of a new transport.
         # Owned by the engine — the DataPort hardware model tracks no
-        # running counter and emits no transport-start strobe (see CLAUDE.md
-        # hardware-model policy).
+        # running counter and emits no transport-start strobe (see docs/DEVELOPMENT.md,
+        # "The swviz reference model is a published spec deliverable").
         self._transport_counts: dict[int, int] = {}
 
     def build(self) -> BusModel:

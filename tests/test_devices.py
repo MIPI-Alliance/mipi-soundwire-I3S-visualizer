@@ -8,6 +8,7 @@
 Run: python3 -m pytest tests/test_devices.py
 """
 import os
+import pathlib
 import tempfile
 
 import swi3score
@@ -53,8 +54,8 @@ def test_session_set_hub_depths_redecodes():
 
 def test_workspace_roundtrip_device_settings():
     pm = PeripheralRegisterMap.from_json(
-        open(os.path.join("data", "regmaps", "example_amp.json"), encoding="utf-8").read())
-    ws = Workspace(
+        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
+    ws = Workspace.single(
         source={"type": "demo"},
         device_names={"0": "Codec", "1": "MicL"},
         device_hub_depths={"2": 1, "3": 4},
@@ -63,9 +64,9 @@ def test_workspace_roundtrip_device_settings():
     p = os.path.join(tempfile.mkdtemp(), "ws.json")
     ws.save(p)
     back = Workspace.load(p)
-    assert back.device_names == {"0": "Codec", "1": "MicL"}
-    assert back.device_hub_depths == {"2": 1, "3": 4}
-    pm2 = PeripheralRegisterMap.from_json_dict(back.device_regmaps["0"])
+    assert back.links[0].device_names == {"0": "Codec", "1": "MicL"}
+    assert back.links[0].device_hub_depths == {"2": 1, "3": 4}
+    pm2 = PeripheralRegisterMap.from_json_dict(back.links[0].device_regmaps["0"])
     assert len(pm2.registers) == len(pm.registers)
 
 
@@ -74,7 +75,7 @@ def test_devices_dialog():
     _app = QApplication.instance() or QApplication([])
     from swi3s_studio.ui.devices_dialog import DevicesDialog
     pm = PeripheralRegisterMap.from_json(
-        open(os.path.join("data", "regmaps", "example_amp.json"), encoding="utf-8").read())
+        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
     dlg = DevicesDialog(None, range(12), {0: "Codec"}, {2: 1}, {0: pm})
     assert dlg._name_edits[0].text() == "Codec"
     assert dlg._depth_spins[2].value() == 1
@@ -90,7 +91,7 @@ def test_devices_dialog():
 
 
 def test_devices_dialog_focused_sections():
-    """The File ▸ Devices menu opens the dialog focused on ONE aspect. A focused dialog
+    """The Devices menu opens the dialog focused on ONE aspect. A focused dialog
     only builds that section's widgets; hidden aspects keep their passed-in values and
     accept() doesn't touch them."""
     from PySide6.QtWidgets import QApplication
@@ -118,7 +119,7 @@ def test_command_table_peripheral_register_name():
     from swi3s_studio.ui.command_table import CommandTableModel
     rmap = RegisterMap.load()
     pm = PeripheralRegisterMap.from_json(
-        open(os.path.join("data", "regmaps", "example_amp.json"), encoding="utf-8").read())
+        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
     cmd = {"command": "WriteA32", "has_address": True, "address": 0x10000007,
            "device_mask": 0b1, "data": [0x2A], "has_manager_packet": True, "crc_valid": True}
     m = CommandTableModel([cmd], rmap, 1)
@@ -136,7 +137,7 @@ def test_register_view_expansion_survives_rebuild():
     from swi3s_studio.ui.register_view import RegisterView
     rmap = RegisterMap.load()
     pm = PeripheralRegisterMap.from_json(
-        open(os.path.join("data", "regmaps", "example_amp.json"), encoding="utf-8").read())
+        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
     rv = RegisterView(rmap)
     df = DeviceRegisterFile(rmap, 0)
     df.apply_write(0x10000007, bytes([0x2A]))

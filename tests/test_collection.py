@@ -6,7 +6,8 @@ used to execute each file as a script, so a file with no `__main__` block ran NO
 exited 0, and was reported "ok". Sixty tests were invisible that way, including a
 regression guard added the same week.
 
-The runner is now a pytest wrapper (coverage is identical to CI by construction), so
+The runner is now the gate's per-suite check (tools/gate.py; run_all.sh wraps it), which
+runs each file through pytest, so coverage is identical to CI by construction and
 that specific hole is closed. This test closes the general one: a file that stops
 contributing tests — renamed helpers, an accidental module-level `return`, a decorator
 that swallows collection, a bad `pytest.ini` marker — fails the build instead of
@@ -95,7 +96,8 @@ def test_perf_only_exemptions_are_still_perf_only():
 
 
 def test_runner_sees_every_test_file():
-    """tests/run_all.sh must walk the same files pytest collects.
+    """The per-suite runner (tools/gate.py, via tests/run_all.sh) must walk the same
+    files pytest collects.
 
     The two diverged for weeks: the runner executed files as scripts and therefore ran
     only what each `__main__` block called. It now globs `tests/test_*.py` and runs each
@@ -107,5 +109,5 @@ def test_runner_sees_every_test_file():
     missed = collected - walked
     assert not missed, (
         f"pytest collects tests from files the runner's glob never visits: "
-        f"{sorted(missed)}. run_all.sh would report green without running them."
+        f"{sorted(missed)}. The per-suite pass would report green without running them."
     )

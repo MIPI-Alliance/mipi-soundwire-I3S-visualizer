@@ -372,6 +372,12 @@ void fillIdleWithPings(std::vector<bool>& bits, long targetLen,
 }
 
 // PCM: a distinct sine per stream, MSb..LSb over (sampleSize+1) bits.
+//
+// Indexed in SAMPLES, not seconds — one cycle per 64 transported samples — so a port running a
+// lower effective rate produces the same sample SEQUENCE at a lower pitch. That is what makes a
+// skipping port need no special handling here: a skipped interval transports nothing, `index`
+// does not advance, and the stream continues where it left off. Which is precisely what payload
+// skipping is: a 44.1 kHz source dropping 48 kHz transport opportunities.
 U64 sineSample(int channel, U64 index, int sampleSize)
 {
     double amp = (double)(1 << sampleSize) * 0.45;
@@ -380,6 +386,31 @@ U64 sineSample(int channel, U64 index, int sampleSize)
     U64 mask = (1ull << (sampleSize + 1)) - 1;
     return (U64)v & mask;
 }
+
+// ---------------------------------------------------------------- payload interval skipping
+//
+// 44.1 kHz carried on 48 kHz transport opportunities (Section 14.1.10). 44100/48000 = 147/160
+// exactly, so skipping 13 of every 160 intervals gives 44.1 kHz with no rounding at all — and
+// 160 is the SMALLEST denominator that can, since 147/160 is already in lowest terms.
+//
+// The demo's PCM ports keep their 48 kHz Interval; only DP0 gains a numerator. Everything else
+// falls out of machinery that already exists, which is why this is two register writes and not a
+// generator rewrite:
+//
+//   * the payload loop drives real CDataPort instances, so `startInterval` runs the accumulator
+//     and a skipped interval simply emits nothing;
+//   * `sineSample` is indexed in samples, so DP0's stream continues across a skipped interval at
+//     a correspondingly lower pitch (see sineSample);
+//   * `intervalAlignment` already multiplies a skipping port's period by the denominator, so the
+//     periodic SSPAs land only where the accumulator is back at 0 — an SSPA anywhere else
+//     restarts the pattern part-way through, which is the unexpected SSP of Section 9.1.6.2.1.
+//
+// ONE CONSEQUENCE WORTH KNOWING: that alignment rises from 64 rows to 64 x 160 = 10240, so a
+// region shorter than ~160 samples/channel can no longer hold an interval-aligned SSPA and gets
+// none. Small demos therefore lose their periodic SSPA; nothing asserts on it at those sizes, and
+// tests/test_sspa_demo.py uses 1500 samples/channel precisely so every region can hold one.
+const int kSkipNumerator   = 13;
+const int kSkipDenominator = 160;      // 48000 * (160-13)/160 == 44100 exactly
 
 // A single register write both emitted onto the CDS bit stream AND applied to the
 // register model (so BuildConfig reflects it after a Commit).
@@ -392,6 +423,22 @@ void emitWrite(std::vector<bool>& bits, CRegisterModel& regs, U16 dev, U32 addr,
     c.phase = swi3s::kPhaseWrite; c.opcode = swi3s::kOpWriteA32;
     c.deviceMask = dev; c.hasAddress = true; c.address = addr; c.data = data;
     regs.OnCommand(c);
+}
+
+// Emit the bus-level denominator plus one port's numerator. Byte orders are OPPOSITE and both
+// are called out as exceptions in the register tables: SLC_SkippingDenominator is MSB-first
+// ([11:8] at the LOWER address), DPn_SkippingNumerator is LSB-first. Written as explicit bytes
+// so neither can be "tidied" into the other's order.
+void emitSkipping(std::vector<bool>& bits, CRegisterModel& regs, U16 dev, int dp,
+                  int numerator = kSkipNumerator, int denominator = kSkipDenominator)
+{
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomHi,
+              {(U8)((denominator >> 8) & 0x0F)});
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomLo, {(U8)(denominator & 0xFF)});
+    emitWrite(bits, regs, dev,
+              swi3s::reg::kDpBase + (U32)swi3s::reg::kDpStride * (U32)dp
+                  + swi3s::reg::kDpSkipNumLo,
+              {(U8)(numerator & 0xFF), (U8)((numerator >> 8) & 0x0F)});
 }
 
 // One port's placement/rate for a geometry. dp = data-port index within the device.
@@ -553,6 +600,11 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
     // ---- commit #1: safe-lock-2 -> 8 columns (audio starts) ----
     emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {0x07});   // 8 columns
     for (const PortGeom& p : geom8) emitPortWrites(bits, regs, dev, p);
+    // DP0 carries 44.1 kHz on its 48 kHz transport opportunities — 13 of every 160 intervals
+    // are skipped (Section 14.1.10; see emitSkipping). Written ONCE, before the first commit:
+    // the register model keeps the value, so it also governs the 16-column geometry, where the
+    // Interval halves to 31 and the skipping pattern's period halves with it.
+    emitSkipping(bits, regs, dev, /*dp=*/0);
     // Show both transports side by side: DP0 (PCM) and DP2 (PDM) run UNSCRAMBLED
     // (PortControl.ScramblerEn=0); DP1/DP3 keep the reset default (scrambling ON). 0x0B is
     // single-rank, so this holds for the whole capture (both geometries).
@@ -1037,6 +1089,11 @@ std::vector<bool> MakeDemoLevelsPhy1(int audioSamplesPerChannel)
     // ---- commit #1: safe-lock-2 -> 4 columns, config_1 placement (audio starts) ----
     emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {0x03});   // 4 columns
     for (const PortGeom& p : cfgA) emitPortWrites(bits, regs, dev, p);
+    // DP0 carries 44.1 kHz on 48 kHz transport opportunities (see emitSkipping). Here DP0 and
+    // DP1 SHARE a column, time-interleaved at Offset 0 and Offset 16, so a skipped DP0 interval
+    // leaves the first 16 rows of that column idle while DP1 keeps transporting in the second
+    // half — the two ports' patterns are independent even though their slots are adjacent.
+    emitSkipping(bits, regs, dev, /*dp=*/0);
     // DP0 (PCM) and DP2 (PDM) run UNSCRAMBLED; DP1 keeps the reset default (scrambling ON).
     for (int dp : {0, 2})
         emitWrite(bits, regs, dev,
@@ -1688,6 +1745,7 @@ DemoLevels MakeDemoLevelsPhy3(int audioSamplesPerChannel)
     // ---- single commit: Safe-Lock-4 -> 16 columns (audio starts) ----
     emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {0x0F});   // 16 columns
     for (const PortGeom& p : geom) emitPortWrites(bits, regs, dev, p);
+    emitSkipping(bits, regs, dev, /*dp=*/0);                // DP0: 44.1 kHz, see emitSkipping
     for (int dp : {0, 2})                                   // DP0/DP2 run UNSCRAMBLED
         emitWrite(bits, regs, dev,
                   swi3s::reg::kDpBase + (U32)swi3s::reg::kDpStride * (U32)dp

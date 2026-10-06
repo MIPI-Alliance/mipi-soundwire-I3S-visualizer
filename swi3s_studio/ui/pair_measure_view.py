@@ -1,6 +1,7 @@
 """Measurements pane: one row per completed bookmark PAIR (A, B, …) showing the delta
 between its two members in time, bus rows, and UIs. Updates live as bookmarks are
-added/dragged; clicking a row seeks the cursor to that pair's left member.
+added/dragged; clicking a row seeks the cursor to that pair's left member. With two or more
+Links a Link column says which bus each bookmark is on (and, for a pair, both).
 
 Distinct from the "Statistics" pane (MeasurementsView), which shows whole-capture facts;
 this pane is purely the user's paired-bookmark measurements."""
@@ -23,12 +24,17 @@ _PAIR_LETTER_RE = re.compile(r"^([A-Za-z])")
 
 
 class PairMeasureView(QTableWidget):
-    #: emitted with the sample to seek to when a pair row is activated
-    sampleSelected = Signal("qlonglong")
+    #: a row was activated: (its seek value, the index of the Link it is on, or -1)
+    sampleSelected = Signal("qlonglong", int)
 
     # One ROW each for A1, A2 and their delta (A1-A2) — the members go down the rows, the
     # metrics across the (few, equal-width) columns. A lone bookmark shows just its A1 row.
-    _COLS = ["", "UI", "Row", "Time"]
+    # The Link column is hidden until there are two Links to tell apart.
+    _COLS = ["", "Link", "UI", "Row", "Time"]
+    _LINK_COL = 1
+    # Where each column's text sits in a row tuple (label, ui, row, time, seek, link, index):
+    # the Link fields were added at the end so a row reads the same as before them.
+    _FIELD = [0, 5, 1, 2, 3]
 
     def __init__(self) -> None:
         super().__init__(0, len(self._COLS))
@@ -46,27 +52,40 @@ class PairMeasureView(QTableWidget):
         enable_copy(self)          # ⌘/Ctrl+C copies the selected row (TSV); row-select is
                                    # kept so activating a row still drives the seek.
         self._seek_samples: List[int] = []          # per-row sample to seek to
+        self._rows: List[Tuple] = []                 # the last rows shown (re-drawn on retheme)
+        self._seek_links: List[int] = []            # per-row Link index (-1 = unknown)
+        self.setColumnHidden(self._LINK_COL, True)
         self.cellClicked.connect(self._on_cell)
+
+    def set_show_link(self, on: bool) -> None:
+        """Show the Link column (two or more Links) or hide it (one)."""
+        self.setColumnHidden(self._LINK_COL, not on)
 
     def retheme(self) -> None:
         self.setStyleSheet(analyzer_stylesheet())
+        self.set_rows(self._rows)                   # pair colours are per theme
 
     def set_rows(self, rows: Sequence[Tuple]) -> None:
-        """Each row is (label, ui, row, time, seek_sample) — an A1, A2 or A1-A2 line."""
+        """Each row is (label, ui, row, time, seek[, link name, link index]) — an A1, A2 or
+        A1-A2 line. The Link fields are optional (blank / -1 without them)."""
+        self._rows = list(rows)
         self._seek_samples = [int(r[4]) for r in rows]
+        self._seek_links = [int(r[6]) if len(r) > 6 else -1 for r in rows]
         self.setRowCount(len(rows))
         for r, row in enumerate(rows):
             label = str(row[0])
             m = _PAIR_LETTER_RE.match(label)
             brush = QBrush(bookmark_pair_color(m.group(1))) if m else None
             for c in range(len(self._COLS)):
-                item = QTableWidgetItem(str(row[c]))
+                f = self._FIELD[c]
+                text = str(row[f]) if f < len(row) else ""
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
-                item.setToolTip(str(row[c]))        # full text on hover if a cell is narrow
+                item.setToolTip(text)               # full text on hover if a cell is narrow
                 if brush is not None:
                     item.setForeground(brush)
                 self.setItem(r, c, item)
 
     def _on_cell(self, row: int, _col: int) -> None:
         if 0 <= row < len(self._seek_samples):
-            self.sampleSelected.emit(self._seek_samples[row])
+            self.sampleSelected.emit(self._seek_samples[row], self._seek_links[row])

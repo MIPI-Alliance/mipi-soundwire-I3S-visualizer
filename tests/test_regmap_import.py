@@ -8,6 +8,7 @@ round-trip, the bundled library example, and per-device resolve routing.
 Run: python3 -m pytest tests/test_regmap_import.py
 """
 import os
+import pathlib
 
 from swi3s_studio.model.registers import Provenance, RegisterMap, apply_commands
 from swi3s_studio.model.regmap_import import (
@@ -116,7 +117,7 @@ def test_json_roundtrip():
 def test_library_example_loads():
     path = os.path.join(library_dir(), "example_amp.json")
     assert os.path.exists(path), path
-    pmap = PeripheralRegisterMap.from_json(open(path, encoding="utf-8").read())
+    pmap = PeripheralRegisterMap.from_json(pathlib.Path(path).read_text(encoding="utf-8"))
     assert pmap.resolve(0x10000007).reset == 0x0A
 
 

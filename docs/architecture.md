@@ -70,7 +70,8 @@ Module map (proposed package `swi3s_studio/`):
 ```
 swi3s_studio/
   core/            # thin python wrapper over the swi3score pybind11 module
-  ingest/          # SalReader, CsvReader, ConfigReader -> ISampleSource
+  ingest/          # SalReader, CsvReader, ConfigReader -> ISampleSource; probe.py says
+                   #   what a file is before decoding (the Open Capture dialog's Source)
   store/           # CommandStore (Arrow), AudioStore (memmap+pyramid), RegisterTimeline, TimeIndex
   model/           # Interface, DataPort, FlowControlPort, Device, BusModel (adapted from visualizer)
                    # RegisterMap (driven by data/registers.json), provenance tracking
@@ -190,7 +191,7 @@ dec.run()                                      # streaming, single pass
 ```
 
 Settings mirror the plugin: column-count (auto/forced), config CSV (mid-stream),
-decode-audio, PHY mode (PHY1/2 now, PHY3 stub).
+decode-audio, PHY mode (PHY1, PHY2, PHY3).
 
 ### Performance & language choice
 
@@ -274,7 +275,7 @@ The design principle: **no view cost scales with capture size.**
    Instead, the core can **seek the sample source and re-decode a window** on
    demand (cheap, edge-based); recently viewed windows are cached.
 
-7. **Port sample points** (the Raw Capture overlay: where each data bit is latched).
+7. **Port sample points** (the Capture pane's overlay: where each data bit is latched).
    Also infeasible to persist whole — but a bit's *sample position* is a pure function
    of the transport **schedule** (config + SSP phase), independent of the descrambler.
    So the streaming decode records a light **transport event log** (each payload
@@ -312,9 +313,9 @@ others — Wireshark-style linked navigation.
   - *Bus Read* (CRC-valid Read's returned data) — the timeline's read colour; a
     read updates the rank it addresses (`_NEXT` alias → `_NEXT`, `_CURR` → `_CURR`)
   - *CSV Import* (expected config overlaid for Compare) — distinct color
-  Field tooltips decode bit ranges. (The earlier in-view "what-if" register editing
-  was dropped; the register map is now read-only — the Visualization mode is where
-  configs are authored.)
+  Field tooltips decode bit ranges. **What-if editing**: right-click (or double-click) a
+  register for *Edit fields…* or *Force value…*, which re-decodes so every pane follows;
+  *Clear all manual edits* reverts (shown as *Manual Edit*).
 - **Audio viewer** (pyqtgraph): multi-track waveforms per `(dp,channel)`, smooth
   zoom/scroll from the pyramid; region-select → **WAV export**; in-app **playback**
   via `QAudioSink`. Sample rate derived from RowRate + DP params (existing
@@ -322,7 +323,7 @@ others — Wireshark-style linked navigation.
   code, not a 1-bit two's-complement sample, so it is decoded to PCM at store-build
   time: `{0,1}→±1`, band-limited polyphase decimation to ~48 kHz (`dsp/resample.py`),
   then DC-blocked (mic density bias) and scaled — see `store.audio_store.decode_pdm`.
-- **Eye Diagram** (pyqtgraph): measured **setup/hold** timing straight off the
+- **Timing** pane (pyqtgraph): measured **setup/hold** timing straight off the
   capture's clock/data edges (`analysis/bus_timing.py`) — per-polarity setup/hold
   histograms + a data-edge "eye", gated on real data transitions, with a margin
   verdict. Aggregate over the capture (no time cursor); rendered lazily on first show.
@@ -330,6 +331,72 @@ others — Wireshark-style linked navigation.
   bandwidth, bus-config segments, link `PM_Action` events).
 - **Timeline overview ribbon**: whole-capture minimap with markers for commits,
   SSPs, PHY/link events, and errors; click to seek.
+
+### Multiple Links
+
+An analysis holds one or more SWI3S **Links** (spec §4.7: one Manager and its Peripherals on
+one bus). Links are independent buses, so nothing is decoded across them. Each is a complete
+`Session`, unchanged.
+
+- **Model.** `links.LinkSet` holds the Links in order, with one **active**. A Link's identity
+  is its index; its name is display only.
+- **Time.** Each Link counts time in its own capture's samples. The Links share a global
+  time in int64 picoseconds, and `LinkEntry.to_ps` / `to_sample` are the only conversion:
+  exact rational arithmetic, with a signed `offset_ps` placing the Link's sample 0.
+  - The offset is a mapping. Changing it re-decodes nothing and forbids nothing, including
+    a negative offset.
+  - `LinkSet.convert` moves a sample between Links, and returns it untouched within one
+    Link. So a single Link never passes through the rounding, and shows exactly what it
+    did before Links existed.
+- **Per-Link window state.** `ui.link_state.LinkPanelState` holds what the window derives
+  from one Link, built once per decode (`_build_link_state`) and kept across switches:
+  - the command model, cursor samples and command kinds
+  - the audio store
+  - the Timing measurement
+  - the Statistics rows
+  - the Commands filter and column widths
+- **Pane groups.** The panes form four groups, each showing a Link of its own:
+  - Commands
+  - Registers and Statistics
+  - the Bus Grid (its own group, since it stays one Link at a time; its handlers run
+    under `_on_grid_link`)
+  - Capture, CDS, Audio, Samples and Timing, which can also show every Link: Capture,
+    Audio, CDS and Samples as stacked lanes (`ui/link_lanes.py`, one single-Link view per
+    Link on global time); Timing stacks the same way
+
+  The Timeline spans every Link, one band each. Bookmarks belong to a Link and are drawn
+  only on it (its band, and the bottom panes when they show it); the Bookmarks pane lists
+  every Link's, and times a pair across two.
+- **How the panes stay Link-unaware.** A group's bind, cursor redraw and refresh run under
+  `_as_link(i)`, which makes Link i active and re-counts the cursor in its samples for the
+  duration. One cursor therefore drives every group at the same instant on each group's
+  Link.
+- **The active Link** is what menus act on, and what the cursor counts in. It is the Link
+  of the group last worked in, set by an application event filter that is installed only
+  while some window has two or more Links. A menu that belongs to a group acts on that
+  group's Link.
+- **Commands, All Links.** `AllLinksCommandModel` merges every Link's command models in
+  global time, behind a Link column, and draws each cell through its own Link's model.
+  The one exception is Time, which is global.
+- **Timeline.** One ribbon per Link, stacked. Each covers the union of every Link's span in
+  its own samples, and they follow each other's zoom and pan through `viewChanged` /
+  `set_view`.
+- **Loading.** Loads are queued, one at a time, by kind:
+  - `open` replaces the analysis.
+  - `add` appends a Link.
+  - `redecode` reloads one session in place.
+
+  A request is superseded only by one that makes it pointless. A re-decode finds its Link
+  by session identity, and rebinds only the groups that show that Link.
+- **Workspace v4.** One `workspace.LinkSpec` per Link holds its source (with the window,
+  in samples, when only part of the capture was decoded), name, offset, decode inputs and
+  any per-stream colours (`stream_colors`, omitted when there are none). With two or more
+  Links, the `view` also records each group's Link, whether Commands and the signal panes
+  show All Links (`bottom_all`), and the Timeline height. A v3 workspace loads as one Link
+  at offset 0.
+- **Bookmarks.** A bookmark stores its own Link's sample and that Link's index, so it moves
+  with its Link's offset. Align on Bookmark Pair sets one Link's offset from a pair that
+  marks the same event on two Links.
 
 ---
 
@@ -341,8 +408,13 @@ others — Wireshark-style linked navigation.
   machine** tracks PHY selection + timings on top.
 - **Mid-stream**: column auto-detect + per-DP config from an imported visualizer
   CSV (already supported by the core).
-- **PHY1/PHY2 selectable now; PHY3 stubbed** (DLV / S0-S1 / recovered clock,
-  multi-lane) — the `ISampleSource` + PHY state machine leave room for it.
+- **The decode can overrule the bring-up detector.** `analysis/link_control` reads only
+  the raw edges, and a capture with no bring-up can satisfy it (a mid-stream recording reads
+  as a Warm Start). A real bring-up precedes audio mode, so the Session drops any detection
+  with CRC-valid commands decoded inside it (`Session._decode_checking_bringup`), and
+  decodes again when the dropped one had steered the decode (a PHY3 path, a Safe-Lock seed).
+- **PHY1, PHY2 and PHY3 (DLV)** all decode: PHY3's bit clock is recovered from the row
+  edges by a virtual PLL, through the same `ISampleSource` + PHY state machine.
 
 ---
 
@@ -388,8 +460,8 @@ visualizer's Python version remains the cross-check oracle in tests.
 
 ## 9. Additional features (from other bus tools)
 
-> Status: all of the below are **implemented** except the dark/light theme toggle
-> (the app is dark-themed). See the README for how each is surfaced in the UI.
+> Status: all of the below are **implemented**, as is a dark / light / follow-system theme
+> (View ▸ Appearance). See the README for how each is surfaced in the UI.
 
 - Wireshark-style **filter expressions** + bookmarks on the command table.
 - **Measurements**: row rate, SSP intervals, derived sample rate, per-DP
@@ -426,15 +498,16 @@ conventions. In brief:
 - **Placement cross-check**: the C++ grid output is compared against the Python
   placement model across the directed-test configs.
 - **Performance**: decode throughput, engine-build time, and digital-CSV import
-  ceilings on synthetic captures (`tests/test_perf.py`). Pan/zoom latency and a
-  memory ceiling are design targets, not yet asserted by a test.
+  ceilings on synthetic captures (`tests/test_perf.py`), including cursor-move, zoom/pan
+  and Link-switch interaction budgets, and a `.sal` load's peak memory against the
+  guard's prediction.
 
 ---
 
 ## 12. Modes
 
-A top **mode switcher** (`ui/mode_controller.py`) swaps the central page and dock set
-per mode; all three share one workspace file.
+The **Mode** menu (`ui/mode_controller.py`), first in the menu bar, swaps the central page
+and dock set per mode; all three share one workspace file.
 
 - **Visualization** — the authoring editor: `model/bus_config.py` (Interface + 12
   DataPort/FCP, the `_REG` config vocabulary, serialised to v2.0 CSV) and
@@ -445,13 +518,14 @@ per mode; all three share one workspace file.
   Visualizer engine under `swi3s_studio/swviz/`, driven by `model/viz_engine.py`: it
   builds a merged `BusModel`, and `GridView.set_bus_model` renders its bits
   (CDS/S0/S1/guards/tails/handovers + data) and clash markers. An authored config can
-  be pushed into Analysis ▸ Compare as the expected config. The engine is covered by a
+  be compared in the Bus Analyzer as the expected config (Decode ▸ Import Visualizer CSV,
+  Compare). The engine is covered by a
   JSON parity testsuite (`tests/test_visualizer_engine.py`).
 - **Timing** — the PHY margin calculator: `swi3s_studio/timing/` (`calculator.py`,
   `delta_tpd.py`, `spec_source.py`), surfaced by `ui/timing_view.py` as a text margin
   readout. **17 inequalities**, numbered in display order: setup and hold for MP, PM and
-  PP, each in both launch forms (`t_DD` and the handover's `t_ZD`); the three handover
-  non-contention legs; and the bus keeper once per releasing device (one keeper, two legs —
+  PP, each in both launch forms (`t_DD` and the handover's `t_ZD`); the three Handover
+  Contention legs (`MP/PM/PP_contention`); and the bus keeper once per releasing device (one keeper, two legs —
   a min over the pair is not affine and defeated the corner search). Every leg is evaluated
   at **its own** worst PVT corner by `find_worst_corner_rows`, which is why each row can
   read a different end of the same input row. `spec_source.py` holds the per-side spec

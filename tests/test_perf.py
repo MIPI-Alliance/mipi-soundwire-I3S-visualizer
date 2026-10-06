@@ -8,7 +8,9 @@ magnitude cliffs, not small drifts. Marked `perf` so they run in their own CI jo
 (`pytest -m perf`) and are excluded from the normal suite (`pytest -m "not perf"`).
 
 Run: PYTHONPATH=. python3 -m pytest -m perf tests/test_perf.py
+(A bare `pytest` skips these: pyproject.toml's addopts default is -m "not perf".)
 """
+import gc
 import os
 import pathlib
 import tempfile
@@ -21,6 +23,21 @@ from swi3s_studio import decode
 from swi3s_studio.ingest import digital_csv
 
 pytestmark = pytest.mark.perf
+
+
+@pytest.fixture(autouse=True)
+def _no_gc_pause():
+    """Collect first, then keep the cyclic GC out of the timed region. A gen-2 pass over
+    whatever an earlier test left behind lands on one timed call at random and doubles
+    it: pooled behind ~1,300 functional tests the cursor-move worst case read 496 ms
+    against a ~39 ms baseline, and 36 ms run alone. That is the host process, not the
+    code under test, and no ceiling here is about it."""
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
 
 _RATE = 98_304_000
 
@@ -434,6 +451,55 @@ def test_cursor_move_budget_with_every_dock_visible():
         "(_TX_PERSIST_SYNC_MAX_UIS) is the shape that did this before.")
 
 
+
+def test_link_switch_budget_with_every_dock_visible():
+    """Switching Links with every dock open, on two Links at the cursor test's scale.
+
+    A switch re-binds every per-Link pane to the other Link's cached state. The caches that
+    make it cheap (the Timing pane's measurement, the command table's column fit, the audio
+    store's gap-split envelope windows) are pinned DETERMINISTICALLY by counts in
+    tests/test_links_gui.py, because a ceiling loose enough for a shared runner cannot see
+    them: measured here, 0.6-1.1 s per switch before them, 195-315 ms after. This is the
+    cliff detector for what those counts do not cover, a new O(capture) step on the bind.
+    Ceilings at ~3x the measured median / ~4x the worst.
+    """
+    import time
+
+    from PySide6.QtWidgets import QApplication, QDockWidget
+
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    w = MainWindow()
+    w.resize(1800, 1000)
+    w.show()
+    w.load_session(Session.from_demo(20000, cold_start=True, register_map=w._rmap))
+    w.load_session(Session.from_demo(20000, cold_start=True, variant="flow_control",
+                                     register_map=w._rmap), add_link=True)
+    docks = w.findChildren(QDockWidget)
+    for d in docks:
+        d.setVisible(True)
+    app.processEvents()
+    for i in (0, 1):                                    # first shows build the caches
+        w.switch_link(i)
+        app.processEvents()
+    times = []
+    for i in (0, 1, 0, 1, 0, 1, 0, 1):
+        t0 = time.perf_counter()
+        w.switch_link(i)
+        app.processEvents()
+        times.append(time.perf_counter() - t0)
+    times.sort()
+    median, worst = times[len(times) // 2], times[-1]
+    assert median < 0.75, (
+        f"median Link switch {median * 1000:.0f} ms (ceiling 750 ms, baseline ~250 ms; "
+        f"worst {worst * 1000:.0f} ms). Something on the bind is doing work proportional "
+        "to the capture — check the counts in tests/test_links_gui.py first.")
+    assert worst < 1.2, (
+        f"worst Link switch {worst * 1000:.0f} ms (ceiling 1200 ms, baseline ~315 ms), "
+        f"median {median * 1000:.0f} ms.")
+
 _SAL_WRITER = r"""
 import json, sys, zipfile
 import numpy as np
@@ -560,3 +626,100 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
         f"est_peak_bytes predicted {predicted / 1e9:.3f} GB for a load that took "
         f"{actual / 1e9:.3f} GB ({predicted / actual:.2f}x). Over-predicting refuses captures "
         "that would have opened fine, and the window prompt is not free to the user.")
+
+
+def test_zoom_and_pan_budget():
+    """Wheel-zoom and pan on a timeline ribbon carrying 100k commands.
+
+    What a zoom costs is the ribbon's per-pixel tick decimation. It used to walk EVERY
+    command once per view change, in Python, so it was linear in the command count: 9 / 76 /
+    299 ms median per step at 10k / 100k / 400k commands. It is now a bisect to the view and
+    a vectorised per-column maximum (tests/test_timeline_decimation.py pins that the answer
+    did not change): ~2.3 ms median at 100k, ~3 ms at 400k, and ~2 ms zoomed in at any
+    count. The ceilings sit at ~10x that, which a slow shared runner clears and a return to
+    a per-command Python loop (76 ms here) does not. tests/test_timeline_interaction.py
+    pins by COUNT that a zoom moves no cursor and rebuilds no pane, which is the rest.
+    """
+    import time
+
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.ui.timeline import TimelineRibbon
+
+    app = QApplication.instance() or QApplication([])
+    n = 100_000
+    r = TimelineRibbon()
+    r.resize(1600, TimelineRibbon.BAND_HEIGHT)
+    r.show()
+    kinds = ("Ping", "WriteA32", "ReadA32", "Commit")
+    r.set_events([{"start_sample": i * 1000 + (i * 37) % 500, "command": kinds[i % 4],
+                   "bus_row": i} for i in range(n)], n * 1000)
+    app.processEvents()
+
+    def wheel(dy=0, dx=0):
+        pos = QPointF(r.width() * 0.4, r.height() / 2)
+        QApplication.sendEvent(r, QWheelEvent(pos, r.mapToGlobal(pos), QPoint(0, 0),
+                                              QPoint(dx, dy), Qt.NoButton, Qt.NoModifier,
+                                              Qt.NoScrollPhase, False))
+        r.repaint()                                   # the paint is the cost being timed
+
+    wheel(dy=120)                                     # warm the first paint
+    times = []
+    for kw in [dict(dy=120)] * 6 + [dict(dx=-120)] * 6 + [dict(dy=-120)] * 6:
+        t0 = time.perf_counter()
+        wheel(**kw)
+        times.append(time.perf_counter() - t0)
+    times.sort()
+    median, worst = times[len(times) // 2], times[-1]
+    assert median < 0.025, (
+        f"median zoom/pan step {median * 1000:.1f} ms over {n:,} commands (ceiling 25 ms, "
+        f"baseline ~2.3 ms; worst {worst * 1000:.1f} ms): the ribbon's tick decimation is "
+        "doing per-command work again — a Python loop over every command was 76 ms here")
+    assert worst < 0.05, (
+        f"worst zoom/pan step {worst * 1000:.1f} ms (ceiling 50 ms, baseline ~3 ms)")
+
+
+def test_the_widest_line_weight_paints_within_budget(monkeypatch):
+    """Preferences ▸ Waveforms lets the Audio and Capture traces be up to 4 px wide, and a
+    pen wider than 1 px is stroked far more slowly. Measured on the full-size demo (a
+    1400 px wide paint, median of 7): Audio's four tracks 6.3 / 15.6 / 16.0 ms at 1 / 2 /
+    4 px; Capture 4.7 / 46.8 / 47.1 ms run alone, ~26 ms at 4 px here. The cost is a step
+    from 1 px to anything wider, not a slope, and Capture has drawn at 2 px all along, so
+    4 px adds nothing 2 px did not. The ceilings sit at ~5x the 4 px figures: a cliff,
+    not drift."""
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.ui import line_style
+    from swi3s_studio.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setenv("SWI3S_DEMO_SAMPLES", "48000")   # the app's demo, not conftest's 300
+    line_style.set_preferences({"weights": {"audio": line_style.MAX_WEIGHT,
+                                            "capture": line_style.MAX_WEIGHT}})
+    win = MainWindow()
+    win.resize(1600, 1000)
+    win.show()
+    win.load_demo()
+    app.processEvents()
+    audio, raw = win._audio_view, win._raw_view
+    assert {curve.opts["pen"].width() for _p, curve, *_r in audio._plots} == {4}
+    assert raw._dp_curve.opts["pen"].width() == 4
+
+    def paint_audio():
+        audio.reset_zoom()
+        audio._tracks_host.resize(1400, 4 * 130)
+        audio._tracks_host.grab()
+
+    def paint_capture():
+        raw._plot.setXRange(0, raw._total / raw._rate * 0.02, padding=0)
+        raw._plot.resize(1400, 400)
+        raw._plot.grab()
+
+    for name, fn, ceiling in (("Audio", paint_audio, 0.08), ("Capture", paint_capture, 0.15)):
+        fn()                                           # warm
+        times = sorted(_elapsed(fn) for _ in range(7))
+        assert times[3] < ceiling, (
+            f"{name} paints in {times[3] * 1000:.1f} ms median at 4 px (ceiling "
+            f"{ceiling * 1000:.0f} ms; measured ~16 / ~26 ms for Audio / Capture)")

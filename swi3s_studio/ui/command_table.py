@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
+import numpy as np
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QAbstractItemView, QMenu, QTableView, QWidget
@@ -450,8 +451,12 @@ class CommandTableView(QTableView):
                     widest = max(widest, fm.horizontalAdvance(str(text)) + 24)   # + cell padding
             self.setColumnWidth(col, widest)
 
-        widen_to_true_max(_COL["Response"])
-        widen_to_true_max(_COL["Row"])
+        # By header, not _COL index: the All Links view leads with a Link column.
+        headers = [model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
+                   for c in range(model.columnCount())]
+        for name in ("Response", "Row"):
+            if name in headers:
+                widen_to_true_max(headers.index(name))
 
     def _column_menu(self, pos) -> None:
         if self.model() is None:
@@ -470,6 +475,10 @@ class CommandTableView(QTableView):
         menu.exec(hdr.mapToGlobal(pos))
 
 
+# begin/endFilterChange() arrived in Qt 6.10, which deprecates invalidateFilter().
+_HAS_FILTER_CHANGE = hasattr(QSortFilterProxyModel, "beginFilterChange")
+
+
 class CommandFilterProxy(QSortFilterProxyModel):
     """Row filter over the command model: boolean free-text, multi-select command
     kind / addressed device / commit group, and an errors-only toggle. Sorts via a
@@ -483,39 +492,55 @@ class CommandFilterProxy(QSortFilterProxyModel):
         super().__init__()
         self._text_ast = None          # parsed boolean query (None = match all)
         self._kinds: set = set()       # empty = all command kinds
+        self._kinds_none = False       # Commands ▸ None: no kind at all (not "empty = all")
         self._errors_only = False
         self._devices: set = set()     # empty = all; else device numbers to match
         self._groups: set = set()      # empty = all; else commit-group numbers
         self.setSortRole(SORT_ROLE)
 
-    def set_text(self, text: str) -> None:
-        self._text_ast = parse_filter(text)
-        self.invalidateFilter()
+    def _refilter(self, apply) -> None:
+        """Run `apply()` (which changes a criterion) as one filter change. Qt 6.10
+        deprecates invalidateFilter() for begin/endFilterChange() bracketing the change;
+        the project supports PySide6 from 6.6, which has only the former."""
+        if _HAS_FILTER_CHANGE:
+            self.beginFilterChange()
+            apply()
+            self.endFilterChange()
+        else:
+            apply()
+            self.invalidateFilter()
 
-    def set_kinds(self, kinds) -> None:
-        """Show only these command kinds (empty set = all)."""
-        self._kinds = set(kinds or ())
-        self.invalidateFilter()
+    def set_text(self, text: str) -> None:
+        ast = parse_filter(text)
+        self._refilter(lambda: setattr(self, "_text_ast", ast))
+
+    def set_kinds(self, kinds, none: bool = False) -> None:
+        """Show only these command kinds (empty set = all), or with `none`, no command."""
+        def apply():
+            self._kinds = set(kinds or ())
+            self._kinds_none = bool(none)
+        self._refilter(apply)
 
     def set_errors_only(self, on: bool) -> None:
-        self._errors_only = bool(on)
-        self.invalidateFilter()
+        self._refilter(lambda: setattr(self, "_errors_only", bool(on)))
 
     def set_devices(self, devices) -> None:
         """Show only commands addressing any of these device numbers (empty = all)."""
-        self._devices = {int(d) for d in (devices or ())}
-        self.invalidateFilter()
+        wanted = {int(d) for d in (devices or ())}
+        self._refilter(lambda: setattr(self, "_devices", wanted))
 
     def set_groups(self, groups) -> None:
         """Show only commits in any of these commit groups (empty = all). Selecting
         groups hides non-commit commands, which have no group."""
-        self._groups = {int(g) for g in (groups or ())}
-        self.invalidateFilter()
+        wanted = {int(g) for g in (groups or ())}
+        self._refilter(lambda: setattr(self, "_groups", wanted))
 
     def describe_active(self) -> list:
         """Short labels for the currently-active filters (for the title indicator)."""
         bits = []
-        if self._kinds:
+        if self._kinds_none:
+            bits.append("Cmd: none")
+        elif self._kinds:
             bits.append("Cmd: " + ", ".join(sorted(self._kinds)))
         if self._devices:
             bits.append("Dev " + ", ".join(str(d) for d in sorted(self._devices)))
@@ -532,7 +557,7 @@ class CommandFilterProxy(QSortFilterProxyModel):
         cmd = model.command_at(row)
         if cmd is None:
             return True
-        if self._kinds and cmd.get("command") not in self._kinds:
+        if self._kinds_none or (self._kinds and cmd.get("command") not in self._kinds):
             return False
         if self._errors_only and not _row_is_error(cmd):
             return False
@@ -550,3 +575,91 @@ class CommandFilterProxy(QSortFilterProxyModel):
             if not eval_filter(self._text_ast, model.search_text(row)):
                 return False
         return True
+
+
+class AllLinksCommandModel(QAbstractTableModel):
+    """Every Link's commands in one table, in GLOBAL time order, led by a Link column.
+
+    Each cell is drawn by its own Link's CommandTableModel, so this view and the per-Link
+    view cannot disagree. The one exception is Time, which shows GLOBAL time (the Link's
+    offset applied): two Links' local times share no origin once an offset is set.
+
+    `parts` is one (name, model, positions_ps, time_offset_ps) per Link. positions_ps are
+    the row-aligned global times of each command's cursor position, which is also what
+    rows are ordered by (ties keep Link order), so a cursor instant bisects to a row.
+    """
+
+    TIME_COLUMN = 1 + _COL["Time (µs)"]        # after the leading Link column
+
+    def __init__(self, parts) -> None:
+        super().__init__()
+        self._names = [p[0] for p in parts]
+        self._models = [p[1] for p in parts]
+        self._offsets = [float(p[3]) for p in parts]
+        pos = [np.asarray(p[2], dtype=np.float64) for p in parts]
+        link = np.concatenate([np.full(len(a), i, dtype=np.int64)
+                               for i, a in enumerate(pos)]) if pos else np.zeros(0, np.int64)
+        row = np.concatenate([np.arange(len(a), dtype=np.int64)
+                              for a in pos]) if pos else np.zeros(0, np.int64)
+        ps = np.concatenate(pos) if pos else np.zeros(0)
+        order = np.lexsort((row, link, ps))            # by time, then Link, then row
+        self._link = link[order]
+        self._row = row[order]
+        self.positions_ps = ps[order]                  # ascending: bisect a cursor instant
+        self._search_cache: dict = {}
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._row)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return 1 + len(_COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            if section == 0:
+                return "Link"
+            name = _COLUMNS[section - 1]
+            return _WRAP_HEADERS.get(name, name)
+        return None
+
+    def link_at(self, row: int) -> int:
+        return int(self._link[row])
+
+    def source_row_at(self, row: int) -> int:
+        """The row in its own Link's command model."""
+        return int(self._row[row])
+
+    def command_at(self, row: int) -> Optional[dict]:
+        if not 0 <= row < len(self._row):
+            return None
+        return self._models[int(self._link[row])].command_at(int(self._row[row]))
+
+    def search_text(self, row: int) -> str:
+        s = self._search_cache.get(row)
+        if s is None:
+            li, r = int(self._link[row]), int(self._row[row])
+            s = f"{self._names[li].lower()} {self._models[li].search_text(r)}"
+            self._search_cache[row] = s
+        return s
+
+    def _global_us(self, li: int, cmd: dict) -> float:
+        model = self._models[li]
+        return (int(cmd.get("start_sample", 0)) / model._rate * 1e6
+                + self._offsets[li] / 1e6)
+
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        li, r = int(self._link[index.row()]), int(self._row[index.row()])
+        if index.column() == 0:
+            if role == Qt.DisplayRole:
+                return self._names[li]
+            if role == SORT_ROLE:
+                return li
+            return None
+        name = _COLUMNS[index.column() - 1]
+        model = self._models[li]
+        if name == "Time (µs)" and role in (Qt.DisplayRole, SORT_ROLE):
+            us = self._global_us(li, model.command_at(r))
+            return f"{us:,.2f}" if role == Qt.DisplayRole else us
+        return model.data(model.index(r, index.column() - 1), role)

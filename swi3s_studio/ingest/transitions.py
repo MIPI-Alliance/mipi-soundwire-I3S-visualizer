@@ -254,3 +254,20 @@ def demo_capture(audio_samples_per_channel: int = 32,
     spu = samples_per_ui if pinned else rate / FBCSE_UI_RATE_HZ   # 24.576 MHz PHY2 UI
     cap = build_capture_from_levels(levels, spu, rate)
     return prepend_cold_start(cap, phy_number=2) if cold_start else cap
+
+
+# The two-Link demo: the PHY2 FBCSE demo as Link 1 and the flow-control demo as Link 2,
+# recorded by one analyzer, Link 2 starting this many samples later (~2.47 ms at 500 MHz).
+# Two DIFFERENT demos, so a mix-up between the Links cannot pass as agreement; the tests'
+# two-Link fixture is built from the same constant.
+DEMO_LINK2_DELAY_SAMPLES = 1_234_567
+
+
+def delay_capture(capture: Capture, samples: int) -> Capture:
+    """A copy of `capture` whose every edge is `samples` later: the same bus, recorded by
+    an analyzer that started earlier. The levels before the first edge are unchanged."""
+    shift = np.uint64(int(samples))
+    return Capture(clock_edges=capture.clock_edges + shift,
+                   data_edges=capture.data_edges + shift,
+                   initial_clock=capture.initial_clock, initial_data=capture.initial_data,
+                   sample_rate_hz=capture.sample_rate_hz)

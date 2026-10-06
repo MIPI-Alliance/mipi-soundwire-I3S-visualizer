@@ -27,3 +27,8 @@ class TimeCursor(QObject):
         if sample != self._sample:
             self._sample = sample
             self.sampleChanged.emit(sample)
+
+    def rebase(self, sample: int) -> None:
+        """Re-count the SAME instant in another Link's samples, without emitting: nothing
+        the panes show has moved, only the Link the cursor's number is counted in."""
+        self._sample = int(sample)

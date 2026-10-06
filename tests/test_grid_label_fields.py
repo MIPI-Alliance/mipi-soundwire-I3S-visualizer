@@ -171,7 +171,7 @@ def test_key_swatches_are_hit_testable(session, qapp):
 
 def test_clicking_a_swatch_emits_its_port(session, qapp):
     from PySide6.QtCore import QEvent, QPointF, Qt
-    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtGui import QMouseEvent, QPointingDevice
 
     gv = _grid(session, qapp)
     got = []
@@ -179,8 +179,9 @@ def test_clicking_a_swatch_emits_its_port(session, qapp):
 
     rect, key = gv._key_hits[2]
     pos = QPointF(gv.mapFromScene(rect.center()))
-    gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos,
-                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+    gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos, gv.mapToGlobal(pos),
+                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+                                   QPointingDevice.primaryPointingDevice()))
     assert got == [key]
 
 
@@ -188,7 +189,7 @@ def test_clicking_the_grid_body_emits_nothing(session, qapp):
     """Only the swatch is a target — a click in the grid must fall through to the
     base class (panning/scrolling must keep working)."""
     from PySide6.QtCore import QEvent, QPointF, Qt
-    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtGui import QMouseEvent, QPointingDevice
 
     gv = _grid(session, qapp)
     got = []
@@ -196,8 +197,9 @@ def test_clicking_the_grid_body_emits_nothing(session, qapp):
 
     rect, _ = gv._key_hits[0]
     below = QPointF(gv.mapFromScene(rect.center().x(), rect.center().y() + 120))
-    gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, below,
-                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+    gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, below, gv.mapToGlobal(below),
+                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+                                   QPointingDevice.primaryPointingDevice()))
     assert got == []
 
 

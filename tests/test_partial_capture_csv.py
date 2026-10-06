@@ -96,7 +96,7 @@ def test_csv_at_open_recovers_every_stream(joined_late, config_csv):
 
 
 def test_csv_applied_later_recovers_every_stream(joined_late, config_csv):
-    """The other route: open the capture bare, then File ▸ Import Visualizer CSV."""
+    """The other route: open the capture bare, then Decode ▸ Import Visualizer CSV."""
     s = Session(joined_late)
     assert s.audio_store().streams() == []
     s.apply_config_csv(config_csv)

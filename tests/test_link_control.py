@@ -51,9 +51,10 @@ def test_warm_start_has_no_phy_number():
 
 def test_audio_only_capture_is_none():
     # A capture that is pure audio-rate clocking — a uniform forwarded clock with no Bus
-    # Reset / PHY-select / Warm-Start pulse — has no observable bring-up. (The demo itself
-    # now starts in safe-lock-2 and reads as a warm start, so build the audio-only case
-    # explicitly, like the synthetic warm/cold cases above.)
+    # Reset / PHY-select / Warm-Start pulse — has no observable bring-up. (The demo
+    # without a cold start still reads as a bring-up to THIS edge-only detector; the
+    # Session overrules it from the decode, see the tests at the end. So build the
+    # audio-only case explicitly, like the synthetic warm/cold cases above.)
     clk = np.arange(1, 4000, 4, dtype=np.uint64)      # uniform UI-rate clock, short pulses
     cap = Capture(clock_edges=clk, data_edges=np.asarray([], np.uint64),
                   initial_clock=False, initial_data=False, sample_rate_hz=RATE)
@@ -143,3 +144,119 @@ def test_cold_start_emits_sections_and_timing():
     assert "Man_tClock1" in params and "Man_tClock0" in params
     assert params["Man_tReset10"]["measured_us"] >= 1569 and params["Man_tReset10"]["ok"]
     assert all(t["ok"] for t in r.timing), [(t["param"], t["measured_us"]) for t in r.timing]
+
+
+# ---- the Session overrules a bring-up the decode contradicts ----
+#
+# The detector above reads only the edges, and a capture with NO bring-up can satisfy it.
+# A real bring-up precedes audio mode, so no CRC-valid command decodes inside one; the
+# Session drops any detection with such commands before its audio start. These pin both
+# directions: every phantom is dropped, every genuine bring-up is kept.
+
+import pytest  # noqa: E402
+
+from swi3s_studio.session import Session  # noqa: E402
+
+
+def _joined_late(cut: int = 1_500_000) -> Session:
+    """The PHY2 cold-start demo as a recording started 3 ms in, after audio began: what a
+    real mid-stream capture looks like."""
+    full = transitions.demo_capture(300, cold_start=True, phy=2)
+    ce = full.clock_edges[full.clock_edges >= cut] - np.uint64(cut)
+    de = full.data_edges[full.data_edges >= cut] - np.uint64(cut)
+    level_c = bool(full.initial_clock) ^ bool(int(np.sum(full.clock_edges < cut)) % 2)
+    level_d = bool(full.initial_data) ^ bool(int(np.sum(full.data_edges < cut)) % 2)
+    return Session(Capture(ce, de, level_c, level_d, full.sample_rate_hz),
+                   source={"type": "fixture"})
+
+
+@pytest.mark.parametrize("phy, variant", [(1, ""), (2, ""), (2, "flow_control")])
+def test_a_capture_without_a_bringup_has_none(phy, variant):
+    s = Session.from_demo(300, phy=phy, variant=variant)
+    assert decode_link_control(s.capture).sequence != "none"     # the edges alone: fooled
+    lc = s.link_control
+    assert not s.has_bringup and lc.sequence == "none"
+    assert not lc.lc_on_data_line and lc.sections == [] and s.audio_start_sample == 0
+    assert "CRC-valid command" in lc.note                       # says why
+
+
+def test_a_capture_joined_after_audio_began_has_no_bringup():
+    s = _joined_late()
+    assert decode_link_control(s.capture).sequence == "warm"     # the phantom
+    assert not s.has_bringup and not s.link_control.lc_on_data_line
+
+
+@pytest.mark.parametrize("phy, variant", [(1, ""), (2, ""), (3, ""), (2, "flow_control")])
+def test_every_genuine_bringup_is_kept(phy, variant):
+    s = Session.from_demo(300, phy=phy, variant=variant, cold_start=True)
+    assert s.has_bringup and s.link_control.phy_name == f"PHY{phy}"
+    assert s.link_control.note == ""
+
+
+def _phantom(cols):
+    from swi3s_studio.analysis.link_control import LinkControlResult
+    return LinkControlResult(sequence="cold", phy_number=1, phy_name="PHY1",
+                             phy_kind="FBCSE-slow", safe_lock_columns=cols,
+                             audio_start_sample=2_000_000,
+                             sections=[{"name": "Bus Reset", "start": 10, "end": 2_000_000}])
+
+
+def _same_decode(a, b):
+    assert [c["start_sample"] for c in a.commands] == [c["start_sample"] for c in b.commands]
+    assert [(g["start_sample"], g["column_count"]) for g in a.segments] == \
+        [(g["start_sample"], g["column_count"]) for g in b.segments]
+
+
+@pytest.mark.parametrize("cols, why", [
+    (8, "steered, with valid commands left inside it: rejected, decoded again"),
+    (4, "steered into NO valid command, which leaves nothing to contradict it"),
+])
+def test_a_phantom_that_named_a_phy_does_not_steer_the_decode(monkeypatch, cols, why):
+    """A phantom naming a PHY seeds the decoder with its Safe-Lock width, on a capture that
+    opens in 2 columns. Seeded at 8 it still decodes 18 valid commands inside the phantom;
+    seeded at 4 it decodes none at all. Either way the result must be the decode of a
+    capture with no bring-up."""
+    from swi3s_studio import session as session_mod
+    clean = Session.from_demo(300, phy=2)
+    monkeypatch.setattr(session_mod, "decode_link_control", lambda cap: _phantom(cols))
+    s = Session.from_demo(300, phy=2)
+    assert not s.has_bringup, why
+    _same_decode(s, clean)
+
+
+def test_a_steered_detection_without_evidence_either_way_is_kept(monkeypatch):
+    """No valid command with it or without it: nothing contradicts the detection, so it
+    stands, and the decode is its steered one (as before this check existed)."""
+    from swi3s_studio import session as session_mod
+    noise = Capture(np.arange(1, 4000, 4, dtype=np.uint64), np.asarray([], np.uint64),
+                    False, False, RATE)
+    monkeypatch.setattr(session_mod, "decode_link_control", lambda cap: _phantom(4))
+    s = Session(noise, source={"type": "fixture"})
+    assert s.has_bringup and s.link_control.safe_lock_columns == 4
+
+
+def test_traffic_before_a_bus_reset_does_not_reject_it():
+    """A bus that was running and then reset: commands BEFORE the Bus Reset are real, and
+    the window starts at the first non-Idle phase."""
+    s = Session.from_demo(300, phy=2, cold_start=True)
+    lc = s.link_control
+    first = next(sec for sec in lc.sections if sec["name"] != "Idle")
+    s.commands = [{"crc_valid": True, "start_sample": max(0, first["start"] - 1)}] + s.commands
+    assert s._valid_commands_inside(lc) == 0
+
+
+def test_the_window_rejects_one_valid_command_inside_it():
+    s = Session.from_demo(300, phy=2, cold_start=True)
+    lc = s.link_control
+    s.commands = [{"crc_valid": True, "start_sample": (lc.audio_start_sample or 0) - 1},
+                  {"crc_valid": False, "start_sample": (lc.audio_start_sample or 0) - 2}]
+    assert s._valid_commands_inside(lc) == 1             # the CRC-valid one only
+
+
+def test_rate_regions_need_no_guard_against_the_phantom():
+    """The no-bring-up PHY2 demo's first measured region starts at its first decode
+    segment (its 2-column opening), not at a phantom's audio start."""
+    s = Session.from_demo(300, phy=2)
+    regions = [r for r in s.rate_regions() if r[2] is not None]
+    assert regions[0][0] == int(s.segments[0]["start_sample"])
+    assert regions[0][3] == pytest.approx(12_288_000, rel=1e-3)   # 2 columns at 24.576 MHz

@@ -10,19 +10,27 @@ from __future__ import annotations
 
 import atexit
 import bisect
+import contextlib
+import functools
 import heapq
 import inspect
+import math
 import os
+import pathlib
+import re
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import swi3score
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
+    QAction,
     QActionGroup,
     QColor,
+    QFont,
+    QFontMetrics,
     QGuiApplication,
     QIntValidator,
     QKeySequence,
@@ -33,7 +41,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -53,6 +63,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 from .. import __version__
 from ..analysis import (
@@ -61,20 +72,29 @@ from ..analysis import (
     register_diff,
     register_diff_report,
 )
-from ..export import write_commands_csv
-from ..ingest import saleae_binary
+from ..export import write_commands_csv, write_links_commands_csv
+from ..ingest import saleae_binary, transitions
+from ..links import LinkSet
 from ..model import RegisterMap, viz_engine
 from ..model.bookmarks import BookmarkSet
 from ..model.bus_config import BusConfig, cds_symbol, demo_config
 from ..session import Session
-from ..workspace import Workspace, session_from_source
+from ..workspace import LinkSpec, Workspace, session_from_source
+from . import line_style, timers
 from .audio_view import AudioView
 from .authoring import AuthoringPanel
-from .command_table import CommandFilterProxy, CommandTableModel, CommandTableView
+from .command_table import (
+    AllLinksCommandModel,
+    CommandFilterProxy,
+    CommandTableModel,
+    CommandTableView,
+)
 from .cursor import TimeCursor
 from .decoded_sample_view import DecodedSampleView
 from .eye_view import EyeView
 from .grid_view import GridView
+from .link_lanes import LinkLanes
+from .link_state import LinkPanelState
 from .measurements_view import MeasurementsView
 from .mode_controller import ANALYSIS, MODES, TIMING, VISUALIZATION, ModeManager
 from .pair_measure_view import PairMeasureView
@@ -86,6 +106,7 @@ from .theme import (
     analyzer_stylesheet,
     apply_palette,
     chrome_stylesheet,
+    combo_qss,
     resolve_mode,
     save_preference,
     saved_preference,
@@ -93,6 +114,18 @@ from .theme import (
 from .timeline import TimelineRibbon
 from .timing_view import TimingView
 
+# The pane groups that each follow their OWN Link: the Commands table, the right-hand group
+# (Registers, Statistics), the Bus Grid, and the bottom group (Capture, CDS, Audio, Samples,
+# Timing). The Bus Grid is a group of its own because it stays one Link at a time (two
+# grids do not fit across) while the bottom group can show every Link. Bookmarks and the
+# Timeline span every Link, so they belong to none.
+_PANE_GROUPS = ("commands", "right", "grid", "bottom")
+_ALL_LINKS = "All Links"
+# Two Links count as running at "the same" UI / row rate (so a cross-Link bookmark pair can
+# be read in UIs and rows) within 0.1%: far above two analyzers' timebase error, far below
+# the gap between distinct bus rates.
+_SAME_RATE_REL_TOL = 1e-3
+_MAX_OFFSET_PS = 10 ** 15   # ±1000 s: the Set Offset dialog's range, in every unit   # the Commands scope that merges every Link, in the switcher
 DEFAULT_GRID_ROWS = 64   # Bus Grid rows to draw (config layout + TX raster); 64 is a
                          # common payload repeat interval. User-settable per capture.
 
@@ -174,8 +207,8 @@ _SAMPLE_CHUNK = 1000           # rows added per scroll-to-edge
 
 def _demo_samples() -> int:
     """Audio samples/channel for the demo capture: 1 s @ 48 kHz (48000) by default.
-    Tests set SWI3S_DEMO_SAMPLES small so building a MainWindow — which preloads the
-    demo — stays fast (a 1 s demo is ~24.6M UIs, ~2.5 s to decode)."""
+    Tests set SWI3S_DEMO_SAMPLES small so a demo load stays fast (a 1 s demo is ~24.6M
+    UIs, ~2.5 s to decode)."""
     try:
         return max(1, int(os.environ.get("SWI3S_DEMO_SAMPLES", "48000")))
     except ValueError:
@@ -383,6 +416,7 @@ class _DockTitleBar(QWidget):
         self._close.setToolTip("Close")
         self._close.clicked.connect(dock.close)
         lay.addWidget(self._close)         # left, matching the native macOS dock button
+        self._lay = lay
         lay.addStretch(1)
         self._label = QLabel(title, self)
         self._label.setAlignment(Qt.AlignCenter)
@@ -402,6 +436,11 @@ class _DockTitleBar(QWidget):
             f" font-size:12px; padding:0; }}"
             f"QToolButton:hover {{ background:{t.BORDER}; color:{t.TEXT};"
             f" border-radius:{t.CORNER_RADIUS}px; }}")
+
+    def add_leading(self, widget: QWidget) -> None:
+        """Put `widget` just right of the close button (the per-group Link picker)."""
+        self._lay.insertSpacing(1, 6)
+        self._lay.insertWidget(2, widget)
 
     def setTitle(self, title: str) -> None:  # noqa: N802 - Qt-style name
         self._label.setText(title)
@@ -433,12 +472,196 @@ def _join_main_window_threads_at_exit() -> None:
         pass
 
 
+def _on_grid_link(method):
+    """Run a Bus Grid handler as if the grid group's Link were the active one: the grid
+    code reads `self._session` and `self.cursor`, which are the active Link's, and the grid
+    shows its own (see _PANE_GROUPS). Nesting is free (`_as_link` of the active Link is a
+    no-op)."""
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        with self._as_link(self._pane_link["grid"]):
+            return method(self, *args, **kwargs)
+    return run
+
+
+class _BusyDialog(QProgressDialog):
+    """A busy dialog that only its owner closes. QProgressDialog closes on Escape or its
+    title-bar button even with no cancel button, and the probe's dialog (_probe_files) is
+    what keeps the window from being used while a nested event loop runs."""
+
+    def __init__(self, text: str, title: str, parent) -> None:
+        super().__init__(text, None, 0, 0, parent)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setCancelButton(None)
+        self.setMinimumDuration(0)
+        self._done = False
+
+    def finish(self) -> None:
+        self._done = True
+        self.close()
+
+    def reject(self) -> None:  # Escape
+        if self._done:
+            super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._done:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
+class _EmptyHint(QLabel):
+    """A note centred over a pane while no capture is open, so the empty Analyzer says
+    what to do rather than showing blank tables and axes. It lets the mouse through and
+    follows its pane's size."""
+
+    def __init__(self, target: QWidget, text: str) -> None:
+        super().__init__(text, target)
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.retheme()
+        target.installEventFilter(self)
+        self.setGeometry(target.rect())
+
+    def retheme(self) -> None:
+        self.setStyleSheet(f"color:{VizTheme.TEXT_DIM}; background:transparent; "
+                           "font-size:13px;")
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt override
+        if event.type() == QEvent.Resize:
+            self.setGeometry(obj.rect())
+        return False
+
+
+class _PaneTouchFilter(QObject):
+    """Makes the Link of the pane group being worked in the ACTIVE Link, before the click
+    or key reaches the pane — so every existing handler (seek, select, edit) and every
+    menu action acts on the Link that pane shows, without each needing to know.
+
+    ONE per application, and only while some window has two or more Links. An
+    application filter sees every event of every object — building one window alone is
+    ~85k of them — so a filter per window made each event cost a Python call per window
+    ever built (a test run builds hundreds, doubling the GUI suites), and even one filter
+    added ~130 ms to building a window. With a single Link nothing needs it."""
+
+    _installed = None
+    _users: set = set()                   # id()s of windows currently with >= 2 Links
+
+    @classmethod
+    def need(cls, window, on: bool) -> None:
+        """Window `window` does (or no longer does) have two or more Links. A window that
+        is destroyed without being closed is forgotten too, through its `destroyed`
+        signal, so it cannot leave the filter installed for good."""
+        key = id(window)
+        if on and key not in cls._users:
+            cls._users.add(key)
+            window.destroyed.connect(lambda *_args, k=key: cls._forget(k))
+        elif not on:
+            cls._users.discard(key)
+        cls._settle()
+
+    @classmethod
+    def _forget(cls, key: int) -> None:
+        cls._users.discard(key)
+        cls._settle()
+
+    @classmethod
+    def _settle(cls) -> None:
+        """Install the filter while anyone needs it, remove it once nobody does."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        if cls._users and cls._installed is None:
+            cls._installed = cls(app)
+            app.installEventFilter(cls._installed)
+        elif not cls._users and cls._installed is not None:
+            app.removeEventFilter(cls._installed)
+            cls._installed.deleteLater()
+            cls._installed = None
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt override
+        if event.type() in (QEvent.MouseButtonPress, QEvent.FocusIn) \
+                and isinstance(obj, QWidget):
+            # The PARENT chain, not window(): a floating dock is its own top-level window,
+            # but it still belongs to its MainWindow and to that dock's pane group.
+            w = obj
+            while w is not None and not isinstance(w, MainWindow):
+                w = w.parentWidget()
+            if w is not None:
+                w._on_pane_touched(obj)
+        return False
+
+
+class _LinkBandLabel(QLabel):
+    """The name beside a Link's timeline band: click to show that Link, double-click to
+    rename it. The Link on screen is drawn bold. Its width is set from the longest Link
+    name (MainWindow._sync_timeline_rows), so short names give the bands the room."""
+    clicked = Signal()
+    doubleClicked = Signal()
+    menuRequested = Signal(object)      # QPoint, global: the Link's own actions
+    MAX_WIDTH = 160                     # a longer name is elided
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedWidth(96)
+        self.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.setContentsMargins(0, 0, 6, 0)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_link(self, name: str, active: bool) -> None:
+        import html
+        shown = html.escape(self.fontMetrics().elidedText(name, Qt.ElideRight, self.width() - 10))
+        self.setText(f"<b>{shown}</b>" if active else shown)
+        self.setToolTip(f"{name}: click to show this Link, double-click to rename")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        if event.button() == Qt.LeftButton:
+            self.doubleClicked.emit()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        self.menuRequested.emit(event.globalPos())
+
+
+class _PerLink:
+    """A MainWindow attribute that belongs to the active Link. Reads and writes go to that
+    Link's LinkPanelState, or to the window's idle state while no Link is loaded, so every
+    existing `self._x` use keeps working unchanged as the Links behind it change."""
+
+    def __set_name__(self, owner, name: str) -> None:
+        self._field = name.lstrip("_")
+
+    def __get__(self, win, owner=None):
+        if win is None:
+            return self
+        return getattr(win._link_state(), self._field)
+
+    def __set__(self, win, value) -> None:
+        setattr(win._link_state(), self._field, value)
+
+
 class MainWindow(QMainWindow):
     # True once the Qt event loop is running (set by app.main via a singleShot). Demo loads
     # go through the async worker+progress path only when it's live; before that (the __init__
     # preload) and in headless tests (which never start exec()) they run synchronously, so a
     # freshly built MainWindow has its session ready without pumping events.
     _event_loop_live = False
+
+    # Per-Link state (see ui/link_state.py); `_session` is the property below.
+    _audio_store = _PerLink()
+    _cmd_model = _PerLink()
+    _starts = _PerLink()
+    _meas_dirty = _PerLink()
+    _sample_range = _PerLink()
+    _sample_total = _PerLink()
+    _sample_filters = _PerLink()
+    _symbol_range = _PerLink()
 
     def __init__(self, register_map: Optional[RegisterMap] = None) -> None:
         super().__init__()
@@ -460,10 +683,19 @@ class MainWindow(QMainWindow):
         # PDM DC-block preference (default OFF): with it off the analyzer shows the
         # true density (all-ones → +1); on, it removes a real mic's density bias.
         self._pdm_dc_block = QSettings().value("audio/pdm_dc_block", False, type=bool)
-        self._session: Optional[Session] = None
-        self._audio_store = None
-        self._meas_dirty = False               # Statistics needs a (re)build (lazy, on show)
-        self._starts: List[int] = []          # command start samples (ascending)
+        # The analysis's Links; the per-Link attributes read the active one's state, and
+        # this idle state while there is none.
+        self._links = LinkSet()
+        self._idle_link = LinkPanelState()
+        self._cursor_instant: Optional[tuple] = None     # (Link, sample, true ps) — see _activate_link
+        self._load_pending: Optional[list] = []   # queued (factory, after, kind, key) requests
+        # Counts the opens asked for (queued or started): a request that queues more Links
+        # once its first has loaded checks it, so a newer open is not added to (_after_open).
+        self._open_gen = 0
+        # Commands scope: one Link's commands (False) or every Link's in time order (True).
+        self._cmd_all = False
+        self._all_model: Optional[AllLinksCommandModel] = None
+        self._all_col_widths: Optional[list] = None   # the All Links table's, kept across rebuilds
         self._syncing = False                  # guards two-way cursor/selection sync
         self._from_symbol = False              # cursor change originated in the CDS symbol pane
         self._from_sample = False              # cursor change originated in the Decoded Samples pane
@@ -515,11 +747,23 @@ class MainWindow(QMainWindow):
             _sig.connect(lambda *a: setattr(self, "_accepted_src_cache", None))
 
         analysis_page = QWidget()
+        self._analysis_page = analysis_page    # the Commands pane group (see _group_of)
         col = QVBoxLayout(analysis_page)
         col.setContentsMargins(0, 0, 0, 0)
         self._cmd_title = QLabel("Commands")  # the central pane has no dock title
         self._cmd_title.setAlignment(Qt.AlignCenter)   # match the dock title bars
-        col.addWidget(self._cmd_title)
+        # The Link switcher sits beside the title and is hidden until there is a second
+        # Link, so a single-Link window is laid out exactly as it always was.
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self._link_combo = QComboBox()
+        self._link_combo.setToolTip("Which Link the per-Link panes show")
+        self._link_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self._link_combo.hide()
+        self._link_combo.activated.connect(self._on_link_combo)
+        header.addWidget(self._link_combo)
+        header.addWidget(self._cmd_title, 1)
+        col.addLayout(header)
         col.addWidget(self._cmd_view)
 
         # Central area is a stack of per-mode pages (Visualization | Timing |
@@ -578,10 +822,20 @@ class MainWindow(QMainWindow):
         self._central_stack.setObjectName("centralStack")
         self._apply_chrome_styles()
 
-        # Timeline ribbon (top dock).
-        self._timeline = TimelineRibbon()
-        self._timeline.seeked.connect(self._on_seek)
-        self._timeline_dock = self._add_dock("Timeline", self._timeline, Qt.TopDockWidgetArea)
+        # Timeline (top dock): one ribbon per Link, stacked on one shared time window (see
+        # _sync_timeline_rows). With one Link it is exactly the single ribbon it always was.
+        self._ribbons: list = []
+        self._ribbon_labels: list = []
+        self._ribbon_rows: list = []
+        self._timeline_rows_shown = 1
+        self._syncing_views = False
+        self._timeline_stack = QWidget()
+        self._timeline_col = QVBoxLayout(self._timeline_stack)
+        self._timeline_col.setContentsMargins(0, 0, 0, 0)
+        self._timeline_col.setSpacing(0)
+        self._add_ribbon()
+        self._timeline_dock = self._add_dock("Timeline", self._timeline_stack,
+                                             Qt.TopDockWidgetArea)
 
         # Register map (right dock).
         self._reg_view = RegisterView(self._rmap)
@@ -595,34 +849,34 @@ class MainWindow(QMainWindow):
         self._grid_view.dpKeyClicked.connect(self._on_dp_key_clicked)
         self._grid_dock = self._add_dock("Bus Grid", self._build_grid_pane(),
                                          Qt.BottomDockWidgetArea)
-        self._audio_view = AudioView()
-        self._audio_view.seeked.connect(self._on_seek)   # click a waveform to seek
-        self._audio_view.playCursorMoved.connect(self._on_seek)  # play head sweeps the cursor
-        self._audio_view.stopped.connect(self._on_playback_stopped)  # full refresh on stop
-        self._audio_view.bookmarkMoved.connect(self._on_bookmark_moved)
-        self._audio_dock = self._add_dock("Audio", self._audio_view, Qt.BottomDockWidgetArea)
-        self._symbol_view = SymbolView()
-        self._symbol_view.sampleSelected.connect(self._on_symbol_selected)
-        self._symbol_view.moreAboveRequested.connect(self._extend_symbols_above)
-        self._symbol_dock = self._add_dock("CDS", self._symbol_view, Qt.BottomDockWidgetArea)
-        self._sample_view = DecodedSampleView()
-        self._sample_view.sampleSelected.connect(self._on_sample_selected)
-        self._sample_view.filtersChanged.connect(self._on_sample_filters_changed)
-        self._sample_view.edgeReached.connect(self._on_sample_edge)   # lazy load on scroll-to-edge
-        self._sample_dock = self._add_dock("Samples", self._sample_view, Qt.BottomDockWidgetArea)
+        # Capture and Audio are LinkLanes: their own view, plus one lane per further Link
+        # while the bottom group shows All Links (set_bottom_scope_all).
+        self._bottom_all = False
+        self._bottom_single_height = 0         # the signal panes' height before All Links
+        self._audio_view = self._wire_audio(AudioView())
+        self._audio_lanes = LinkLanes(self._audio_view, lambda: self._wire_audio(AudioView()))
+        self._audio_dock = self._add_dock("Audio", self._audio_lanes, Qt.BottomDockWidgetArea)
+        # CDS and Samples stack one table per Link in All Links, like Capture and Audio.
+        self._origin_lane = -1                 # the table lane a selection came from
+        self._symbol_view = self._wire_symbols(SymbolView())
+        self._symbol_lanes = LinkLanes(self._symbol_view, lambda: self._wire_symbols(SymbolView()))
+        self._symbol_dock = self._add_dock("CDS", self._symbol_lanes, Qt.BottomDockWidgetArea)
+        self._sample_view = self._wire_samples(DecodedSampleView())
+        self._sample_lanes = LinkLanes(self._sample_view,
+                                       lambda: self._wire_samples(DecodedSampleView()))
+        self._sample_dock = self._add_dock("Samples", self._sample_lanes, Qt.BottomDockWidgetArea)
         # Populate the (windowed) sample table only when its tab is actually shown.
         self._sample_dock.visibilityChanged.connect(self._on_sample_dock_visible)
         # The register tree + bus grid are rebuilt on every cursor tick, so _on_cursor
         # skips them while their tab is hidden; refresh once when the tab is re-shown.
         self._reg_dock.visibilityChanged.connect(self._on_reg_dock_visible)
         self._grid_dock.visibilityChanged.connect(self._on_grid_dock_visible)
-        self._raw_view = RawCaptureView()
-        self._raw_view.sampleSelected.connect(self._on_seek)
-        self._raw_view.bookmarkMoved.connect(self._on_bookmark_moved)
-        self._raw_dock = self._add_dock("Capture", self._raw_view, Qt.BottomDockWidgetArea)
-        self._eye_view = EyeView()
-        self._eye_view.sampleSelected.connect(self._on_timing_jump)
-        self._eye_dock = self._add_dock("Timing", self._eye_view, Qt.BottomDockWidgetArea)
+        self._raw_view = self._wire_capture(RawCaptureView())
+        self._raw_lanes = LinkLanes(self._raw_view, lambda: self._wire_capture(RawCaptureView()))
+        self._raw_dock = self._add_dock("Capture", self._raw_lanes, Qt.BottomDockWidgetArea)
+        self._eye_view = self._wire_timing(EyeView())
+        self._eye_lanes = LinkLanes(self._eye_view, lambda: self._wire_timing(EyeView()))
+        self._eye_dock = self._add_dock("Timing", self._eye_lanes, Qt.BottomDockWidgetArea)
         self._meas_view = MeasurementsView()
         self._meas_dock = self._add_dock("Statistics", self._meas_view, Qt.RightDockWidgetArea)
         # Statistics is tabbed behind Registers (hidden at load), but capture_measurements
@@ -630,7 +884,7 @@ class MainWindow(QMainWindow):
         # not eagerly for a hidden tab. Same deferral as the register/grid docks.
         self._meas_dock.visibilityChanged.connect(self._on_meas_dock_visible)
         self._pair_view = PairMeasureView()
-        self._pair_view.sampleSelected.connect(self._on_seek)     # click a pair -> seek to it
+        self._pair_view.sampleSelected.connect(self._on_pair_seek)   # click a pair -> seek
         self._pair_dock = self._add_dock("Bookmarks", self._pair_view, Qt.RightDockWidgetArea)
         # Bottom docks tabbed left→right: Bus Grid, Capture, CDS, Audio, Samples, Timing.
         self.tabifyDockWidget(self._grid_dock, self._raw_dock)
@@ -658,12 +912,30 @@ class MainWindow(QMainWindow):
         ]
 
         self._bookmarks = BookmarkSet()
-        self._timeline.bookmarkMoved.connect(self._on_bookmark_moved)
 
-        # No status-bar strip — it wasted vertical space and only showed the mode /
-        # a hint. Keep a hidden label so the existing status-message API
-        # (self._status.setText(...)) still works without rendering anything.
-        self._status = QLabel("Bus Visualizer")
+        # Which Link each pane group shows (see _PANE_GROUPS), and a Link picker in the
+        # title bar of every dock of the right and bottom groups, so the Link a pane shows
+        # is visible whichever tab is raised and wherever the dock is moved.
+        self._pane_link = dict.fromkeys(_PANE_GROUPS, 0)
+        self._group_docks = {
+            "right": [self._reg_dock, self._meas_dock],
+            "grid": [self._grid_dock],
+            "bottom": [self._raw_dock, self._symbol_dock, self._audio_dock,
+                       self._sample_dock, self._eye_dock],
+        }
+        # Built with the second Link (see _ensure_pane_pickers): a single-Link window never
+        # shows them, and eight styled combos cost ~130 ms per window built.
+        self._pane_pickers: Dict[str, list] = {"right": [], "grid": [], "bottom": []}
+
+        # A slim status bar: the one place the window says what it just did (opened a
+        # file as a Link, set an offset, found no commit, re-decoded). Without it every
+        # self._status.setText(...) went to a hidden label, and nobody saw any of them.
+        self._status = QLabel("")
+        self._status.setObjectName("statusText")
+        self._status.setTextInteractionFlags(Qt.TextSelectableByMouse)   # copyable
+        bar = self.statusBar()
+        bar.setSizeGripEnabled(False)
+        bar.addWidget(self._status, 1)
         self._build_menu()
 
         # Three-mode shell: a top segmented switcher swaps the central page and the
@@ -692,15 +964,9 @@ class MainWindow(QMainWindow):
             except (AttributeError, RuntimeError):       # older Qt without the signal
                 pass
 
-        # The demo capture is decoded on FIRST ENTRY to Bus Analyzer, not here. It used to
-        # be preloaded at startup so the mode switch was instant, but a 1 s demo is ~25M UIs
-        # of 500 MS/s wire and holding its decode cost ~2.3 GB of the ~2.6 GB the app sat at
-        # on launch — paid by everyone, including the (default) Bus Visualizer sessions that
-        # never open the Analyzer, and by anyone whose next act is File ▸ Open. Synthesis +
-        # decode is a couple of seconds and goes through the same worker + progress path as
-        # a real capture, so deferring it costs the first switch and nothing else.
-        # Cleared by load_session: once ANY capture is loaded there is nothing to preload.
-        self._demo_preload_pending = True
+        # No demo is decoded on entering the Bus Analyzer: it opens empty, with a pointer to
+        # Open Capture and the demos (_analysis_empty). A demo is one menu item away, and
+        # decoding one unasked cost seconds and ~2.3 GB for anyone whose next act was Open.
 
         # The colour-caching views (notably the bus grid, whose palette constants are
         # captured at import — before app startup applies the saved palette) must be
@@ -715,26 +981,36 @@ class MainWindow(QMainWindow):
         # Menus that only make sense while analysing a capture are disabled outside
         # Analysis mode; the View dock toggles only apply to Analysis's docks.
         analysing = (mode == ANALYSIS)
+        # Every menu shows only what applies to the mode: the Analyzer's own menus, the
+        # View menu's pane toggles and the timeline legend are hidden (and disabled, so
+        # their shortcuts do not fire) elsewhere, and File holds the mode's file actions.
         for menu in getattr(self, "_analysis_menus", []):
             menu.setEnabled(analysing)
-        # The View menu's pane toggles only apply to the Analyzer's docks; disable
-        # them outside Analysis (Full Screen stays enabled — it's not in this list).
-        for act in getattr(self, "_view_pane_actions", []):
+            menu.menuAction().setVisible(analysing)
+        # Preferences holds only the waveform colours and weights, so it is the Analyzer's
+        # too (and ⌘, with it), as is the View item that names it.
+        for act in getattr(self, "_view_pane_actions", []) + [
+                a for a in (getattr(self, "_view_pane_sep", None),
+                            getattr(self, "_legend_action", None),
+                            getattr(self, "_colors_action", None),
+                            getattr(self, "_prefs_action", None)) if a is not None]:
             act.setEnabled(analysing)
+            act.setVisible(analysing)
+        if hasattr(self, "_file_mode_menus"):
+            self._fill_file_menu(mode)
+        self._sync_view_links()
         # The bus grid is shared: show the authored grid in Visualization, the
         # decoded grid in Analysis.
         if mode == VISUALIZATION:
             self._refresh_authored_grid()
             self._apply_viz_split_sizes()
         elif analysing:
-            self._preload_demo_if_pending()
-            if self._session is not None:
-                self._apply_grid_for_sample(self.cursor.sample)
+            self._refresh_grid()
         # First time into Analysis, lay out the default arrangement (Bus Grid active,
         # bottom row ~25% tall, Register Map ~33% wide). Deferred so the window has a
         # real geometry; later visits restore the user's own arrangement.
         if analysing and not getattr(self, "_analysis_laid_out", False):
-            QTimer.singleShot(0, self._apply_analysis_layout)
+            timers.after(0, self, self._apply_analysis_layout)
         self._status.setText(f"{mode} mode")
         self._update_title()
         # Switching to Visualization makes the (tall) authoring panel the central widget's
@@ -742,7 +1018,7 @@ class MainWindow(QMainWindow):
         # back on the next switch, so the window can creep past the screen (bottom off-
         # screen in Viz, dock tab bar clipped back in Analysis). Re-fit to the work area
         # after the switch settles so the window never stays larger than the screen.
-        QTimer.singleShot(0, self._fit_to_available_screen)
+        timers.after(0, self, self._fit_to_available_screen)
 
     def _update_title(self) -> None:
         """Window title: the loaded capture's name is shown ONLY in Analyzer mode (the
@@ -752,7 +1028,10 @@ class MainWindow(QMainWindow):
         sess = self._session
         if getattr(self, "_mode_mgr", None) is not None \
                 and self._mode_mgr.current() == ANALYSIS and sess is not None:
-            self.setWindowTitle(f"{base} — {self._elide(sess.source_label())}")
+            label = self._elide(sess.source_label())
+            if len(self._links) > 1:             # name the Link the panes are showing
+                label = f"{self._links[self._links.active_index].name}: {label}"
+            self.setWindowTitle(f"{base} — {label}")
         else:
             self.setWindowTitle(base)
 
@@ -802,13 +1081,13 @@ class MainWindow(QMainWindow):
         # until a full-screen toggle forced a relayout.
         if not getattr(self, "_fit_screen_once", False):
             self._fit_screen_once = True
-            QTimer.singleShot(0, self._fit_to_available_screen)
+            timers.after(0, self, self._fit_to_available_screen)
         # The splitter has no height until the window is shown, so the first-load
         # sizing (run in __init__) was a no-op and left unused space. Re-apply once
         # the geometry exists so first load matches the return-to-mode appearance.
         if not getattr(self, "_sized_viz_once", False):
             self._sized_viz_once = True
-            QTimer.singleShot(0, self._apply_viz_split_sizes)
+            timers.after(0, self, self._apply_viz_split_sizes)
         if not getattr(self, "_stripped_fs_once", False):
             self._stripped_fs_once = True
             # AppKit inserts "Enter Full Screen" into the View menu lazily (after show,
@@ -816,8 +1095,8 @@ class MainWindow(QMainWindow):
             # before the View menu opens so full-screen is left to the OS window
             # title-bar button. Best-effort — no-op off macOS.
             self._strip_macos_fullscreen_menu_item()
-            QTimer.singleShot(0, self._strip_macos_fullscreen_menu_item)
-            QTimer.singleShot(500, self._strip_macos_fullscreen_menu_item)
+            timers.after(0, self, self._strip_macos_fullscreen_menu_item)
+            timers.after(500, self, self._strip_macos_fullscreen_menu_item)
             vm = getattr(self, "_view_menu", None)
             if vm is not None:
                 vm.aboutToShow.connect(self._strip_macos_fullscreen_menu_item)
@@ -942,9 +1221,17 @@ class MainWindow(QMainWindow):
             "Visualizer CSV (*.csv);;All files (*)")
         if not path:
             return
+        self._remember_capture_dir(path, "visualizer")
+        self.open_visualizer_csv_path(path)
+
+    def open_visualizer_csv_path(self, path: str) -> None:
+        """Open a Visualizer config CSV by PATH — the dialog-free half of
+        open_visualizer_csv, so the `-c` command-line option and the menu item take the
+        same route (mode switch, then load). Kept separate rather than defaulting the
+        dialog's argument: a caller passing a path must never be able to raise a file
+        dialog, which is what would happen on an empty string."""
         if self._mode_mgr.current() != VISUALIZATION:
             self._mode_mgr.switch_to(VISUALIZATION)
-        self._remember_capture_dir(path, "visualizer")
         self._load_authoring_csv(path)
 
     def _load_authoring_csv(self, path: str) -> None:
@@ -1070,7 +1357,7 @@ class MainWindow(QMainWindow):
         with tempfile.TemporaryDirectory() as d:
             path = cfg.to_csv_file(os.path.join(d, "expected.csv"))
             self._mode_mgr.switch_to(ANALYSIS)
-            self._run_compare(path)
+            self._for_group("right", lambda: self._run_compare(path))()
 
     def _apply_chrome_styles(self) -> None:
         """(Re)apply the window-chrome stylesheets that bake VizTheme colours: the
@@ -1105,12 +1392,33 @@ class MainWindow(QMainWindow):
         self._appearance_pref = pref
         save_preference(pref)
         apply_palette(resolve_mode(pref))
+        self._restyle()
+
+    def show_preferences(self) -> None:
+        """Preferences ▸ Waveforms: on OK, store the settings and redraw every pane."""
+        from .preferences_dialog import PreferencesDialog
+        dlg = PreferencesDialog(line_style.preferences(), self, mode=VizTheme.MODE)
+        if dlg.exec():
+            line_style.set_preferences(dlg.preferences())
+            self._restyle()
+
+    def _restyle(self) -> None:
+        """Re-theme the chrome and every colour-caching view from the active palette and
+        the waveform preferences, keeping the cursor, filters and bookmarks."""
         self._apply_chrome_styles()
+        for pickers in self._pane_pickers.values():
+            for picker in pickers:
+                picker.setStyleSheet(combo_qss())
         # Views that cache pens / brushes / backgrounds re-read the palette.
-        for view in (self._authoring, self._viz_grid, self._grid_view, self._audio_view,
-                     self._timeline, self._reg_view, self._cmd_view, self._symbol_view,
-                     self._sample_view, self._raw_view, self._eye_view, self._meas_view,
-                     self._pair_view):
+        for view in (self._authoring, self._viz_grid, self._grid_view,
+                     *self._audio_lanes.views, *self._raw_lanes.views,
+                     *self._symbol_lanes.views, *self._sample_lanes.views,
+                     *self._eye_lanes.views,
+                     self._audio_lanes, self._raw_lanes, self._symbol_lanes,
+                     self._sample_lanes, self._eye_lanes,
+                     *self._ribbons, self._reg_view, self._cmd_view,
+                     self._meas_view,
+                     self._pair_view, *getattr(self, "_empty_hints", ())):
             rt = getattr(view, "retheme", None)
             if callable(rt):
                 rt()
@@ -1118,8 +1426,7 @@ class MainWindow(QMainWindow):
         # every cell picks up the new palette (authored grid always; decoded grid
         # when a capture is loaded).
         self._refresh_authored_grid()
-        if self._session is not None:
-            self._apply_grid_for_sample(self.cursor.sample)
+        self._refresh_grid()
 
     def _on_os_color_scheme_changed(self, *_a) -> None:
         """OS light/dark switched — re-apply only when following the system."""
@@ -1235,47 +1542,70 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         f = self.menuBar().addMenu("&File")
-        # File actions are grouped by the mode they act on. Opens work from any mode
-        # (each switches to the mode it needs) and the handlers guard when there's
-        # nothing to act on, so nothing in File is mode-gated.
-        analyzer = f.addMenu("&Analyzer")
-        analyzer.addAction("Open &Capture…", self.open_capture)
-        # A window is reachable on purpose, not only when the size guard forces one --
-        # otherwise a machine with plenty of free memory can never ask for a slice.
-        analyzer.addAction("Open Capture &Time Window…", self.open_capture_window)
+        self._file_menu = f
+        # File holds the CURRENT mode's file actions only (_fill_file_menu, on every mode
+        # change). Each mode's set is built once in a menu of its own, kept off the bar,
+        # and its actions are put into File; Quit is the window's, so File can be
+        # refilled without deleting it.
+        analyzer = QMenu("&Analyzer", self)
+        # Open Capture's dialog asks how much to decode, so a window is on offer at any
+        # size, not only when the memory guard forces one.
+        open_capture = analyzer.addAction("&Open Capture…", lambda: self.open_capture())
         demo_menu = analyzer.addMenu("Open &Demo Capture")
         demo_menu.addAction("PHY1 (FBCSE)", lambda: self.load_demo(phy=1))
         demo_menu.addAction("PHY2 (FBCSE)", lambda: self.load_demo(phy=2))
         demo_menu.addAction("PHY2 (Flow Control)",
                             lambda: self.load_demo(phy=2, variant="flow_control"))
         demo_menu.addAction("PHY3 (DLV)", lambda: self.load_demo(phy=3))
-        self._export_capture_action = analyzer.addAction("Export &Capture…", self.export_capture)
-        self._export_capture_action.setEnabled(False)     # needs a loaded capture
-        analyzer.addAction("&Locate Sub-Capture…", self.locate_subcapture)
-        analyzer.addSeparator()
-        analyzer.addAction("&Import Visualizer CSV…", self.open_visualizer_config)
-        analyzer.addAction("&Export Visualizer CSV…", self.export_grid_csv)
-        analyzer.addAction("&Force Column Count…", self.force_column_count)
-        analyzer.addSeparator()
-        analyzer.addAction("View Bus Grid in Visuali&zer", self.open_grid_in_visualizer)
-        analyzer.addAction("Save Bus Grid &Image…", lambda: self.export_grid(self._grid_view))
+        demo_menu.addSeparator()
+        # Named for the feature it shows (two Links), not for what the Links happen to be.
+        demo_menu.addAction("PHY2 (Two Links)", self.load_demo_links)
         analyzer.addSeparator()
         analyzer.addAction("Open &Workspace…", self.open_workspace)
-        analyzer.addAction("Save &Workspace…", self.save_workspace)
+        save_workspace = analyzer.addAction("&Save Workspace…", self.save_workspace)
+        analyzer.addSeparator()
+        self._export_capture_action = analyzer.addAction("Export &Capture…",
+                                                         self._for_group("bottom", self.export_capture))
+        locate = analyzer.addAction("&Locate Sub-Capture…",
+                                    self._for_group("bottom", self.locate_subcapture))
+        analyzer.addSeparator()
+        export_csv = analyzer.addAction("&Export Visualizer CSV…",
+                                        self._for_group("grid", self.export_grid_csv))
+        grid_image = analyzer.addAction("Export Bus Grid &Image…",
+                                        self._for_group("grid", lambda: self.export_grid(self._grid_view)))
+        to_viz = analyzer.addAction("View Bus Grid in Visuali&zer",
+                                    self._for_group("grid", self.open_grid_in_visualizer))
         self._file_analyzer_menu = analyzer
+        # Everything here that acts on a capture waits for one (see _update_capture_actions).
+        self._needs_capture = [save_workspace, self._export_capture_action, locate,
+                               export_csv, grid_image, to_viz]
 
-        visualizer = f.addMenu("&Visualizer")
-        visualizer.addAction("&Open Settings…", self.open_visualizer_csv)
-        visualizer.addAction("&Save Settings…", self.save_authoring_csv)
-        visualizer.addAction("Save &Image…", lambda: self.export_grid(self._viz_grid))
-        visualizer.addAction("Save Bus &Model…", self.export_frame_json)
+        visualizer = QMenu("&Visualizer", self)
+        open_viz = visualizer.addAction("&Open Visualizer CSV…", self.open_visualizer_csv)
+        save_viz = visualizer.addAction("&Save Visualizer CSV…", self.save_authoring_csv)
+        visualizer.addSeparator()
+        visualizer.addAction("Export Grid &Image…", lambda: self.export_grid(self._viz_grid))
+        visualizer.addAction("Export Bus &Model (JSON)…", self.export_frame_json)
 
-        timing = f.addMenu("&Timing")
-        timing.addAction("&Open Settings…", self.open_timing_settings)
-        timing.addAction("&Save Settings…", self.save_timing_settings)
+        timing = QMenu("&Timing", self)
+        open_timing = timing.addAction("&Open Timing Settings…", self.open_timing_settings)
+        save_timing = timing.addAction("&Save Timing Settings…", self.save_timing_settings)
 
-        f.addSeparator()
-        f.addAction("&Quit", self.close)
+        # ⌘O / ⌘S open and save the CURRENT mode's file; _fill_file_menu moves the keys
+        # to that mode's pair, so one key never names two actions.
+        self._file_keys = {ANALYSIS: (open_capture, save_workspace),
+                           VISUALIZATION: (open_viz, save_viz),
+                           TIMING: (open_timing, save_timing)}
+
+        self._file_mode_menus = {ANALYSIS: analyzer, VISUALIZATION: visualizer, TIMING: timing}
+        self._quit_sep = QAction(self)
+        self._quit_sep.setSeparator(True)
+        self._quit_action = QAction("&Quit", self)
+        self._quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        # macOS gives the Quit role ⌘Q; elsewhere the standard Quit key is often none.
+        self._quit_action.setShortcut(QKeySequence("Ctrl+Q"))
+        self._quit_action.triggered.connect(self.close)
+        self._fill_file_menu(VISUALIZATION)          # the mode the window opens in
 
         # Commands: filter the command table (submenu) + export it as CSV, and jump
         # the cursor between the sync-point commits (SSCR/DSCR — where the config takes
@@ -1283,36 +1613,40 @@ class MainWindow(QMainWindow):
         cmds = self.menuBar().addMenu("&Commands")
         self._build_filter_menu(cmds)
         cmds.addSeparator()
-        nxt = cmds.addAction("Next SSCR/DSCR Commit\tCtrl+>", self.next_sscr)
+        nxt = cmds.addAction("Next SSCR/DSCR Commit\tCtrl+>", self._for_group("commands", self.next_sscr))
         # '>' is Shift+'.', so the OS delivers Ctrl+Shift+. — bind BOTH spellings or the
         # shortcut silently never matches (it read as ⌘> in the menu either way).
         nxt.setShortcuts([QKeySequence("Ctrl+>"), QKeySequence("Ctrl+Shift+.")])
-        prv = cmds.addAction("Previous SSCR/DSCR Commit\tCtrl+<", self.prev_sscr)
+        prv = cmds.addAction("Previous SSCR/DSCR Commit\tCtrl+<",
+                             self._for_group("commands", self.prev_sscr))
         prv.setShortcuts([QKeySequence("Ctrl+<"), QKeySequence("Ctrl+Shift+,")])
         cmds.addSeparator()
-        cmds.addAction("&Export as CSV…", self.export_commands)
+        cmds.addAction("&Export as CSV…", self._for_group("commands", self.export_commands))
 
-        rm = self.menuBar().addMenu("&Devices")
-        rm.addAction("&Names…", self.manage_device_names)
-        rm.addAction("&Register Maps…", self.manage_register_maps)
-        rm.addAction("&Hub Depth…", self.manage_hub_depths)
-
-        a = self.menuBar().addMenu("&Audio")
-        a.addAction("Per-Dataport &Scrambler…", self.scrambler_overrides_dialog)
+        # Decode: every input that changes what the capture decodes to, so each re-decodes.
+        dec = self.menuBar().addMenu("&Decode")
+        self._decode_menu = dec
+        dec.addAction("&Import Visualizer CSV…", self._for_group("grid", self.open_visualizer_config))
+        dec.addAction("&Force Column Count…", self._for_group("grid", self.force_column_count))
+        dec.addAction("&Hub Depths…", self._for_group("right", self.manage_hub_depths))
+        dec.addSeparator()
+        dec.addAction("Per-Dataport &Scrambler…", self._for_group("bottom", self.scrambler_overrides_dialog))
         # Manual Stream Sync Point: for a post-commit capture the SSPA/SSCR was never on
         # the wire, so interval>1 ports decode at an arbitrary phase — pick the row and
         # step it (the phase repeats every interval) until the audio is clean.
-        ssp = a.addMenu("Manual &SSP Move")
-        ssp.addAction("&Set SSP at Cursor Row", self.set_ssp_at_cursor)
+        ssp = dec.addMenu("Manual &SSP Move")
+        ssp.addAction("&Set SSP at Cursor Row", self._for_group("bottom", self.set_ssp_at_cursor))
         # Nudge the SSP by ±1 row with ⌘K / ⌘L (K left of L → −1 / +1). Both display and
         # aren't macOS-reserved — unlike ⌘, (Preferences), which macOS strips the glyph
         # from on any non-Preferences item.
-        ssp.addAction("Move SSP &−1 Row\tCtrl+K", lambda: self.step_ssp_row(-1)).setShortcut("Ctrl+K")
-        ssp.addAction("Move SSP &+1 Row\tCtrl+L", lambda: self.step_ssp_row(+1)).setShortcut("Ctrl+L")
-        ssp.addAction("&Clear Manual SSP", lambda: self.set_ssp_row_async(-1))
+        ssp.addAction("Move SSP &−1 Row\tCtrl+K",
+                      self._for_group("bottom", lambda: self.step_ssp_row(-1))).setShortcut("Ctrl+K")
+        ssp.addAction("Move SSP &+1 Row\tCtrl+L",
+                      self._for_group("bottom", lambda: self.step_ssp_row(+1))).setShortcut("Ctrl+L")
+        ssp.addAction("&Clear Manual SSP", self._for_group("bottom", lambda: self.set_ssp_row_async(-1)))
         # PDM DC-block toggle (default OFF): off shows the true density on the wire
         # (all-ones → +1 DC); on removes a real mic's density bias for listening.
-        self._pdm_dc_action = a.addAction("Block &PDM DC Bias")
+        self._pdm_dc_action = dec.addAction("Block &PDM DC Bias")
         self._pdm_dc_action.setCheckable(True)
         self._pdm_dc_action.setChecked(self._pdm_dc_block)
         self._pdm_dc_action.setToolTip(
@@ -1320,23 +1654,59 @@ class MainWindow(QMainWindow):
             "scale +1). On: subtract the mean so a real mic's density bias doesn't "
             "swamp the audio (a constant/DC pattern then reads ~0).")
         self._pdm_dc_action.toggled.connect(self._on_pdm_dc_toggled)
-        self._export_action = a.addAction("&Export Audio as WAV…", self.export_audio)
-        self._export_action.setEnabled(False)
-        a.addSeparator()
-        self._audio_menu = a
+
+        rm = self.menuBar().addMenu("&Devices")
+        self._devices_menu = rm
+        rm.addAction("Device &Names…", self._for_group("right", self.manage_device_names))
+        rm.addAction("Peripheral &Register Maps…", self._for_group("right", self.manage_register_maps))
+
+        a = self.menuBar().addMenu("&Audio")
         self._play_device_menu = a.addMenu("Playback &Output Device")
         self._play_depth_menu = a.addMenu("Playback &Bit Depth")
         self._play_rate_menu = a.addMenu("Playback &Decimation")
+        # Built as it opens, for the Audio view the menu acts on NOW: in All Links that is
+        # the active Link's lane, which a bind (lane by lane) cannot know.
+        self._play_rate_menu.aboutToShow.connect(self._build_decimation_menu)
+        a.addSeparator()
+        self._export_action = a.addAction("&Export Audio as WAV…", self._for_group("bottom", self.export_audio))
+        self._audio_menu = a
         self._build_audio_playback_menu()
 
         b = self.menuBar().addMenu("&Bookmarks")
+        self._bookmarks_menu = b
         b.addAction("&Toggle Bookmark at Cursor\tCtrl+B", self.toggle_bookmark).setShortcut("Ctrl+B")
         b.addAction("&Next Bookmark\tCtrl+]", self.next_bookmark).setShortcut("Ctrl+]")
         b.addAction("&Previous Bookmark\tCtrl+[", self.prev_bookmark).setShortcut("Ctrl+[")
         b.addAction("&Clear Bookmarks", self.clear_bookmarks)
 
+        # No Links menu: a Link is named, placed and
+        # added in Open Capture's dialog; its own Rename / Set Offset / Remove are on its
+        # timeline label's right-click (_link_label_menu); Align reads two bookmarks, so it
+        # is a Bookmarks item; showing Links is View ▸ Links (built here, placed in View).
+        b.addSeparator()
+        self._align_links_action = b.addAction("&Align Links on Bookmark Pair…",
+                                               self.align_on_bookmark_pair)
+        lk = QMenu("&Links", self)
+        self._all_links_action = lk.addAction("&Commands: All Links")
+        self._all_links_action.setCheckable(True)
+        self._all_links_action.setShortcut(QKeySequence("Ctrl+Alt+0"))
+        self._all_links_action.toggled.connect(self.set_commands_scope_all)
+        self._bottom_all_action = lk.addAction("&Signal Panes: All Links")
+        self._bottom_all_action.setCheckable(True)
+        self._bottom_all_action.setShortcut(QKeySequence("Ctrl+Alt+Shift+0"))
+        self._bottom_all_action.toggled.connect(self.set_bottom_scope_all)
+        lk.addSeparator()
+        self._links_menu = lk
+        self._link_actions: list = []          # one checkable entry per Link, rebuilt
+        self._link_group = QActionGroup(self)
+        self._link_group.setExclusive(True)
+
         # Menus that only apply while analysing a capture — disabled in other modes.
-        self._analysis_menus = [cmds, a, b]
+        self._analysis_menus = [cmds, dec, rm, a, b]
+        # The whole of Commands, Decode, Devices and Bookmarks acts on a capture (Align
+        # needs two Links, which _update_link_switcher decides).
+        self._needs_capture += [act for menu in (cmds, dec, rm, b) for act in menu.actions()
+                                if not act.isSeparator() and act is not self._align_links_action]
 
         # View menu: show/raise any panel (reopens a closed or tab-hidden dock).
         # The pane items only apply to the Analyzer's docks, so they're disabled
@@ -1376,7 +1746,8 @@ class MainWindow(QMainWindow):
         # Appearance (dark / light / follow-system), persisted across launches and
         # applied live — see apply_theme. Not gated to Analysis mode (it themes the
         # whole app, including Visualization).
-        v.addSeparator()
+        self._view_links_action = v.addMenu(lk)   # View ▸ Links: Analyzer, two or more Links
+        self._view_pane_sep = v.addSeparator()   # hidden with the pane toggles
         appearance = v.addMenu("&Appearance")
         self._appearance_group = QActionGroup(self)
         self._appearance_group.setExclusive(True)
@@ -1387,18 +1758,124 @@ class MainWindow(QMainWindow):
             act.setChecked(self._appearance_pref == pref)
             act.triggered.connect(lambda _c=False, p=pref: self.apply_theme(p))
             self._appearance_group.addAction(act)
+        # Preferences is the waveform colours and weights. macOS moves it to the
+        # application menu (Settings…, ⌘,), so View also says what it holds there; elsewhere
+        # it stays in View, where two items opening one dialog would be one too many, so
+        # the named one IS Preferences.
+        import sys
+        self._colors_action = v.addAction("Waveform &Colors and Line Weight…",
+                                          self.show_preferences)
+        if sys.platform == "darwin":
+            self._prefs_action = v.addAction("&Preferences…", self.show_preferences)
+        else:
+            self._prefs_action = self._colors_action
+        self._prefs_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        # The standard Preferences key is Ctrl+, only on macOS (elsewhere just the Settings
+        # key), and Keyboard Shortcuts lists Ctrl+, everywhere: bind both.
+        keys = [QKeySequence("Ctrl+,")]
+        keys += [k for k in QKeySequence.keyBindings(QKeySequence.StandardKey.Preferences)
+                 if k not in keys]
+        self._prefs_action.setShortcuts(keys)
 
         h = self.menuBar().addMenu("&Help")
+        self._help_menu = h            # held, like the others (shiboken: see test_config_csv)
+        h.addAction("SWI3S Studio &User Guide", self.show_user_guide)
         h.addAction("&Keyboard Shortcuts…", self.show_keyboard_shortcuts)
-        h.addAction("&Timeline Marks Legend…", self.show_timeline_legend)
+        self._legend_action = h.addAction("&Timeline Marks Legend…", self.show_timeline_legend)
+        about = h.addAction("&About SWI3S Studio", self.show_about)
+        about.setMenuRole(QAction.MenuRole.AboutRole)      # macOS: the application menu
+        self._update_capture_actions()
+
+    def _update_capture_actions(self) -> None:
+        """Items that act on a capture are enabled once one is loaded (they used to open
+        a "load a capture first" box instead). Export Audio also needs audio, in the Link
+        it would export: the signal panes' (_for_group), or in All Links the active one.
+        Not to be run inside a lane's bind (_as_lane), where the lane's Link stands in as
+        the active one."""
+        loaded = self._session is not None
+        for act in getattr(self, "_needs_capture", []):
+            act.setEnabled(loaded)
+        self._sync_empty_hints(loaded)
+        i = self._links.active_index if self._bottom_all else self._pane_link["bottom"]
+        store = self._links[i].view.audio_store if 0 <= i < len(self._links) else None
+        self._export_action.setEnabled(loaded and store is not None and not store.is_empty())
+
+    def _sync_empty_hints(self, loaded: bool) -> None:
+        """The empty-Analyzer notes: shown while no capture is open, gone once one is.
+        Built the first time, over the panes that would otherwise sit blank."""
+        if not hasattr(self, "_empty_hints"):
+            what = ("No capture open.\n\nFile ▸ Open Capture… (⌘O) opens one; "
+                    "File ▸ Open Demo Capture has a synthetic bus to explore."
+                    if sys.platform == "darwin" else
+                    "No capture open.\n\nFile ▸ Open Capture… (Ctrl+O) opens one; "
+                    "File ▸ Open Demo Capture has a synthetic bus to explore.")
+            short = "No capture open"
+            self._empty_hints = [_EmptyHint(self._cmd_view.viewport(), what)] + [
+                _EmptyHint(target, short) for target in (
+                    self._grid_view, self._raw_view, self._audio_view,
+                    self._symbol_view.viewport(), self._sample_view._table.viewport(),
+                    self._eye_view)]
+        for hint in self._empty_hints:
+            hint.setVisible(not loaded)
+            if not loaded:
+                hint.raise_()
+
+    def show_about(self) -> None:
+        """Help ▸ About SWI3S Studio (macOS: the application menu)."""
+        from .. import __version__
+        QMessageBox.about(self, "About SWI3S Studio",
+                          f"<b>SWI3S Studio</b> {__version__}<br>"
+                          "MIPI SoundWire I3S bus analyzer, visualizer and timing calculator.")
+
+    def show_user_guide(self) -> None:
+        """Help ▸ User Guide: the shipped docs/USER_GUIDE.md, rendered in a window that
+        can stay open beside the app."""
+        import sys
+        here = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(__file__).resolve().parents[2]))
+        path = here / "docs" / "USER_GUIDE.md"
+        if not path.is_file():
+            QMessageBox.information(self, "User Guide", f"The User Guide was not found at {path}.")
+            return
+        if getattr(self, "_guide", None) is None:
+            from PySide6.QtWidgets import QTextBrowser
+            # A window of the main window's, closed with it (closeEvent): a top-level of its
+            # own, left open, kept the app running after File ▸ Quit.
+            self._guide = QTextBrowser(self)
+            self._guide.setWindowFlag(Qt.Window, True)
+            self._guide.setWindowTitle("SWI3S Studio User Guide")
+            self._guide.setSearchPaths([str(path.parent), str(path.parent.parent)])
+            self._guide.setOpenExternalLinks(True)
+            self._guide.resize(820, 900)
+        self._guide.setMarkdown(path.read_text(encoding="utf-8"))
+        self._guide.show()
+        self._guide.raise_()
+
+    def _fill_file_menu(self, mode: str) -> None:
+        """File holds the given mode's actions, then Quit, and ⌘O / ⌘S go to that mode's
+        open / save. Each action is removed by hand, not with clear(): QMenu.clear()
+        deletes the actions it removes even when another menu owns them, which destroyed
+        the previous mode's File items on the first switch."""
+        for m, (op, sv) in self._file_keys.items():
+            op.setShortcut(QKeySequence.StandardKey.Open if m == mode else QKeySequence())
+            sv.setShortcut(QKeySequence.StandardKey.Save if m == mode else QKeySequence())
+        f = self._file_menu
+        for act in f.actions():
+            f.removeAction(act)
+        for act in self._file_mode_menus[mode].actions():
+            f.addAction(act)
+        f.addAction(self._quit_sep)
+        f.addAction(self._quit_action)
 
     # ---- Filter submenu (under Commands; replaces the inline filter bar) ----
     def _build_filter_menu(self, parent):
         fm = parent.addMenu("&Filter")
         fm.addAction("Filter &Expression…", self._filter_expression_dialog)
         fm.addSeparator()
+        # The Commands submenu's quick picks, each a plain ⌘ + digit (4 on: ⌘1–3 are the
+        # modes; ⌘A is Select All in the tables).
         self._kind_menu = self._make_filter_submenu(
-            fm, "&Commands", [], self._cmd_proxy.set_kinds, exclude="Ping")
+            fm, "&Commands", [], self._cmd_proxy.set_kinds, exclude="Ping",
+            quick=True)
         self._dev_menu = self._make_filter_submenu(
             fm, "&Devices", [(d, f"Device {d}") for d in range(12)],
             self._cmd_proxy.set_devices)
@@ -1414,40 +1891,76 @@ class MainWindow(QMainWindow):
         fm.addAction("Clear &All Filters", self._clear_all_filters)
         return fm
 
-    def _make_filter_submenu(self, parent, title, items, setter, exclude=None):
+    # The command kinds Commands ▸ Filter ▸ Commands ▸ Commit shows: the sync-point commits
+    # (the ones Next / Previous SSCR/DSCR Commit steps through, _sscr_samples) and the
+    # table's Commit Point rows, where each confirmed one takes effect.
+    _COMMIT_KINDS = ("SSCR", "DSCR", "Commit Point")
+
+    def _make_filter_submenu(self, parent, title, items, setter, exclude=None,
+                             quick: bool = False):
         """A stay-open checkable submenu (+ an 'All' reset). `setter(set)` applies
         the selection (empty = all). `sub._fill(items)` repopulates it. `exclude` (a
         value) adds an 'All excl. <value>' quick action that checks every entry but
-        that one (used for 'All excl. Ping' on the command-kind filter)."""
+        that one (used for 'All excl. Ping' on the command-kind filter). `quick` (the
+        command-kind filter) adds None and Commit, and gives All, None, All excl. and
+        Commit the keys ⌘4–⌘7; `setter` then also takes `none=`."""
         sub = _CheckableMenu(title, self)
         parent.addMenu(sub)
         sub._actions = []
+        sub._none = False                    # None picked: nothing shown, not "empty = all"
 
         def apply():
+            sub._none = False                # ticking anything leaves None
             setter({a.data() for a in sub._actions if a.isChecked()})
             self._on_command_filter_changed()
 
-        def clear():
+        def check(pred):
             for a in sub._actions:
                 a.blockSignals(True)
-                a.setChecked(False)
+                a.setChecked(pred(a.data()))
                 a.blockSignals(False)
+
+        def clear():
+            check(lambda _v: False)
             apply()
 
         def select_all_except(value):
-            for a in sub._actions:
-                a.blockSignals(True)
-                a.setChecked(a.data() != value)
-                a.blockSignals(False)
+            check(lambda v: v != value)
             apply()
+
+        def select_none():
+            check(lambda _v: False)
+            sub._none = True
+            setter(set(), none=True)
+            self._on_command_filter_changed()
+
+        def select_commits():
+            offered = {a.data() for a in sub._actions}
+            if not offered & set(self._COMMIT_KINDS):
+                select_none()                # no commit in this capture: none to show
+                self._status.setText("No commit in this capture")
+                return
+            check(lambda v: v in self._COMMIT_KINDS)
+            apply()
+
+        def entry(label, slot, key=None):
+            act = sub.addAction(label)
+            act.triggered.connect(slot)
+            if quick and key:
+                act.setShortcut(QKeySequence(key))
+            return act
 
         def fill(its):
             sub.clear()
             sub._actions = []
-            sub.addAction("All").triggered.connect(clear)
+            sub._none = False
+            entry("All", clear, "Ctrl+4")
+            if quick:
+                entry("None", select_none, "Ctrl+5")
             if exclude is not None:
-                sub.addAction(f"All excl. {exclude}").triggered.connect(
-                    lambda: select_all_except(exclude))
+                entry(f"All excl. {exclude}", lambda: select_all_except(exclude), "Ctrl+6")
+            if quick:
+                entry("Commit", select_commits, "Ctrl+7")
             sub.addSeparator()
             for value, label in its:
                 a = sub.addAction(str(label))
@@ -1459,6 +1972,7 @@ class MainWindow(QMainWindow):
 
         sub._fill = fill
         sub._clear = clear
+        sub._select_none = select_none
         fill(items)
         return sub
 
@@ -1536,10 +2050,14 @@ class MainWindow(QMainWindow):
         if title is None:
             return
         base = "Commands"
+        if len(self._links) > 1 and not self._cmd_all \
+                and self._pane_link["commands"] != self._links.active_index:
+            with self._as_link(self._pane_link["commands"]):
+                return self._update_cmd_title()
         if self._session is None or self._cmd_model is None:
             title.setText(base)
             return
-        total = self._cmd_model.rowCount()
+        total = self._table_model().rowCount()
         shown = self._cmd_proxy.rowCount()
         bits = self._cmd_proxy.describe_active()
         if shown != total or bits:
@@ -1557,25 +2075,33 @@ class MainWindow(QMainWindow):
         hidden, or a nearer one revealed)."""
         self._update_cmd_title()
         if self._session is not None:
-            self._select_command_for_sample(int(self.cursor.sample))
+            self._cursor_commands(int(self.cursor.sample))
         self._update_nav_starts()
 
     def _update_nav_starts(self) -> None:
         """Push the command table's currently-VISIBLE commands to the timeline: their RSP
         cursor samples for Left/Right arrow nav, AND their raw start_samples for the drawn-
         tick filter (so hidden commands' ticks disappear). The two differ — nav parks on the
-        RSP, but ticks are drawn at the raw start_sample — so they're sent separately."""
+        RSP, but ticks are drawn at the raw start_sample — so they're sent separately.
+        They go to the band of the Link Commands shows."""
+        if len(self._links) > 1 and not self._cmd_all \
+                and self._pane_link["commands"] != self._links.active_index:
+            with self._as_link(self._pane_link["commands"]):
+                return self._update_nav_starts()
         if self._session is None or self._cmd_model is None:
             self._timeline.set_nav_starts(None)
             self._timeline.set_draw_filter(None)
             return
         proxy = self._cmd_proxy
+        active = self._links.active_index
         nav, draw = [], []
         for pr in range(proxy.rowCount()):
             sr = proxy.mapToSource(proxy.index(pr, 0)).row()
-            if 0 <= sr < len(self._starts):
-                nav.append(int(self._starts[sr]))
-            cmd = self._cmd_model.command_at(sr)
+            link, cmd, pos = self._row_target(sr)
+            if link != active:
+                continue                          # the active Link's ribbon, its own rows
+            if pos is not None:
+                nav.append(int(pos))
             if cmd is not None:
                 draw.append(int(cmd.get("start_sample", 0)))
         self._timeline.set_nav_starts(nav)
@@ -1584,7 +2110,8 @@ class MainWindow(QMainWindow):
     def _refresh_audio_devices(self) -> None:
         """Audio ▸ Refresh Devices: force a re-scan (the cached list otherwise keeps
         the snapshot from when the menu was first built), then rebuild the submenu."""
-        self._audio_view.refresh_devices()
+        for v in self._audio_lanes.views:
+            v.refresh_devices()
         self._build_audio_playback_menu()
 
     def _retire_action_groups(self, *groups) -> None:
@@ -1628,7 +2155,8 @@ class MainWindow(QMainWindow):
             act = m.addAction(name)
             act.setCheckable(True)
             act.setChecked(i == av.device_index)
-            act.triggered.connect(lambda _c=False, idx=i: av.set_device_index(idx))
+            act.triggered.connect(lambda _c=False, idx=i: [
+                v.set_device_index(idx) for v in self._audio_lanes.views])
             self._play_device_group.addAction(act)
         m.addSeparator()
         m.addAction("Refresh Devices", self._refresh_audio_devices)
@@ -1642,7 +2170,8 @@ class MainWindow(QMainWindow):
             act = m.addAction(f"{bits}-bit")
             act.setCheckable(True)
             act.setChecked(av.play_depth == bits)
-            act.triggered.connect(lambda _c=False, b=bits: av.set_play_depth(b))
+            act.triggered.connect(lambda _c=False, b=bits: [
+                v.set_play_depth(b) for v in self._audio_lanes.views])
             self._play_depth_group.addAction(act)
         m.setToolTip("24-bit preserves fidelity for 24-bit sources; most output "
                      "devices play both identically by ear.")
@@ -1651,16 +2180,23 @@ class MainWindow(QMainWindow):
         self._build_decimation_menu()
 
     def _build_decimation_menu(self) -> None:
-        """(Re)build the Audio ▸ Playback Decimation submenu. Decimation is set per
-        (device, dataport): one submenu per stream, each an exclusive rate group.
-        Rebuilt on capture load (streams change); shows a placeholder before then."""
-        av = self._audio_view
+        """(Re)build the Audio ▸ Playback Decimation submenu, for the Audio view a menu
+        acts on (`_audio_lane`). Decimation is set per (device, dataport): one submenu per
+        stream, each an exclusive rate group. Built as the menu opens, and on a capture
+        load; shows a placeholder before one."""
+        av = self._audio_lane()
         m = self._play_rate_menu
+        # clear() drops the entries but leaves each stream's submenu a child of `m`; it is
+        # rebuilt every time it opens, so the old ones are deleted, not piled up.
+        for sub in getattr(self, "_play_rate_subs", ()):
+            if isValid(sub):                # PySide may have freed one already
+                sub.deleteLater()
         m.clear()
         # One group per stream, so this is where the per-load drip came from: the decimation
         # menu is rebuilt on every capture load and every re-decode.
         self._retire_action_groups(*getattr(self, "_play_rate_groups", ()))
         self._play_rate_groups = []          # keep the QActionGroups alive
+        self._play_rate_subs: list = []      # this build's submenus, deleted by the next
         rates = [("Native (no resample)", None), ("8 kHz", 8000),
                  ("16 kHz", 16000), ("32 kHz", 32000), ("44.1 kHz", 44100),
                  ("48 kHz", 48000), ("96 kHz", 96000)]
@@ -1671,6 +2207,7 @@ class MainWindow(QMainWindow):
             return
         for dev, dp in streams:
             sub = m.addMenu(f"Device {dev} · DP{dp}")
+            self._play_rate_subs.append(sub)
             group = QActionGroup(self)
             group.setExclusive(True)
             current = av.play_rate_target_for(dev, dp)
@@ -1689,17 +2226,33 @@ class MainWindow(QMainWindow):
         nav.install_jog_shortcuts). Ctrl is ⌘ on macOS."""
         import sys
         from html import escape
-        mod = "⌘" if sys.platform == "darwin" else "Ctrl"
+        mac = sys.platform == "darwin"
+        mod, alt, shift = ("⌘", "⌥", "⇧") if mac else ("Ctrl+", "Alt+", "Shift+")
         groups = [
             ("Modes", [
                 (f"{mod}1", "Bus Visualizer"),
                 (f"{mod}2", "Timing Calculator"),
                 (f"{mod}3", "Bus Analyzer"),
             ]),
-            ("Cursor navigation (Analyzer)", [
+            ("Files (the current mode's)", [
+                (f"{mod}O", "Open (a capture / a Visualizer CSV / timing settings)"),
+                (f"{mod}S", "Save (the workspace / the Visualizer CSV / timing settings)"),
+            ]),
+            ("Links", [
+                (f"{mod}{alt}1…9", "Show Link 1…9 in every pane"),
+                (f"{mod}{alt}0", "Commands: All Links"),
+                (f"{mod}{alt}{shift}0", "Signal Panes: All Links"),
+            ]),
+            ("Command filter (Commands ▸ Filter ▸ Commands)", [
+                (f"{mod}4", "All commands"),
+                (f"{mod}5", "None"),
+                (f"{mod}6", "All excl. Ping"),
+                (f"{mod}7", "Commit (SSCR / DSCR and their Commit Points)"),
+            ]),
+            ("Cursor navigation", [
                 ("← / →", "Previous / next command (respects the command filter)"),
                 (f"{mod}← / {mod}→", "Previous / next SSCR/DSCR commit"),
-                (f"{mod}> / {mod}<", "Previous / next SSCR/DSCR commit (menu)"),
+                (f"{mod}> / {mod}<", "Next / previous SSCR/DSCR commit (menu)"),
                 (f"{mod}]", "Next bookmark"),
                 (f"{mod}[", "Previous bookmark"),
                 (f"{mod}B", "Toggle bookmark at cursor"),
@@ -1708,14 +2261,25 @@ class MainWindow(QMainWindow):
                 (">", "Page the view one width right"),
                 ("<", "Page the view one width left"),
             ]),
-            ("Manual Stream Sync Point (Audio)", [
+            ("Manual Stream Sync Point (Decode)", [
                 (f"{mod}L", "Move SSP +1 row"),
                 (f"{mod}K", "Move SSP −1 row"),
+            ]),
+            ("Waveform settings", [
+                (f"{mod},", "Preferences (waveform colours and line weights)"),
             ]),
             ("Application", [
                 (f"{mod}Q", "Quit"),
             ]),
         ]
+        # The groups only the Bus Analyzer has keys for: elsewhere they are left out (its
+        # menus are hidden there, so the keys do nothing), with a line saying where they are.
+        analyzer_only = {"Links", "Command filter (Commands ▸ Filter ▸ Commands)",
+                         "Cursor navigation", "Waveform panes (Audio / Capture, when focused)",
+                         "Manual Stream Sync Point (Decode)", "Waveform settings"}
+        analysing = self._mode_mgr_current() == ANALYSIS
+        if not analysing:
+            groups = [g for g in groups if g[0] not in analyzer_only]
         html = []
         for title, rows in groups:
             html.append(f"<p style='margin-bottom:2px;'><b>{title}</b></p>"
@@ -1724,6 +2288,10 @@ class MainWindow(QMainWindow):
                 html.append(f"<tr><td><code>&nbsp;{escape(keys)}&nbsp;</code></td>"
                             f"<td>&nbsp;— {escape(desc)}</td></tr>")
             html.append("</table>")
+        if not analysing:
+            html.append("<p><i>The Bus Analyzer's keys (Links, the command filter, the cursor, "
+                        "the waveform panes and their settings, the SSP) are listed in the Bus "
+                        "Analyzer.</i></p>")
         self._info_box("Keyboard Shortcuts", "".join(html))
 
     def _info_box(self, title: str, html: str) -> None:
@@ -1812,10 +2380,15 @@ class MainWindow(QMainWindow):
         destroy a running QThread. Qt aborts the process on that, so it surfaced as an
         exit-134 with the tests themselves all passing."""
         try:
-            self._audio_view._hard_stop()
+            for v in self._audio_lanes.views:
+                v._hard_stop()
         except Exception:  # noqa: BLE001 - never block window close on teardown
             pass
         self.join_worker_threads()
+        _PaneTouchFilter.need(self, False)     # a closed window touches no panes
+        guide = getattr(self, "_guide", None)
+        if guide is not None:
+            guide.close()                      # left open, it kept the app running
         super().closeEvent(event)
 
     def join_worker_threads(self) -> None:
@@ -1870,34 +2443,29 @@ class MainWindow(QMainWindow):
         else:
             self.load_session(factory())
 
+    def load_demo_links(self) -> None:
+        """Open Demo Capture ▸ PHY2 (Two Links): the PHY2 demo as Link 1 and the flow-control demo
+        as Link 2, as one analyzer recording both buses, Link 2 starting
+        DEMO_LINK2_DELAY_SAMPLES later. Both at offset 0, since they share the file's
+        sample 0. Link 2 is queued only once Link 1 has loaded, as a multi-pair open is."""
+        n = _demo_samples()
+
+        def factory(variant: str, delay: int):
+            return lambda **kw: Session.from_demo(n, cold_start=True, phy=2,  # noqa: E731
+                                                  variant=variant, delay_samples=delay,
+                                                  register_map=self._rmap, **kw)
+        first = factory("", 0)
+        second = factory("flow_control", transitions.DEMO_LINK2_DELAY_SAMPLES)
+        if MainWindow._event_loop_live:
+            self._load_async(first, kind="open", after=self._after_open(
+                lambda _s: self._load_async(second, kind="add"), opening=True))
+        else:
+            self.load_session(first())
+            self.load_session(second(), add_link=True)
+
     def load_demo_bringup(self) -> None:
         """Alias for load_demo (PHY2) — kept for the app's --demo-bringup flag."""
         self.load_demo(phy=2)
-
-    def _preload_demo_if_pending(self) -> None:
-        """Decode the demo capture the first time Bus Analyzer is entered with nothing
-        loaded — the deferred half of what used to happen in __init__ (see the flag there).
-
-        Fires at most once, and never over a real capture: `load_session` clears the flag,
-        so opening a file from any mode and then switching to the Analyzer shows the file,
-        not the demo. The `_session` check is belt-and-braces for the same thing.
-
-        A load already in flight is left to finish and the flag is NOT spent: `_load_async`
-        coalesces with latest-wins, so queueing a demo behind (say) File ▸ Open would
-        discard the capture the user actually asked for. If that load fails, the next
-        switch into the Analyzer preloads as usual.
-
-        A decode hiccup must not leave the mode switch half-done, so it is swallowed here
-        exactly as it was at startup — the Analyzer simply opens empty."""
-        if not getattr(self, "_demo_preload_pending", False):
-            return
-        if self._session is not None or getattr(self, "_load_thread", None) is not None:
-            return
-        self._demo_preload_pending = False      # one attempt, before it can re-enter
-        try:
-            self.load_demo()
-        except Exception:  # noqa: BLE001 - never let a demo-decode hiccup block the switch
-            pass
 
     # Per-mode last-opened-file directory: the Analyzer (captures, .sal export, sub-
     # capture) and the Visualizer (config CSVs) browse independently, so opening one
@@ -1930,7 +2498,7 @@ class MainWindow(QMainWindow):
             QSettings().setValue(f"capture/last_dir_{mode}", d)
 
     def open_visualizer_config(self) -> None:
-        """Analyzer ▸ Import Visualizer CSV: pick a config (a CSV file or the current
+        """Decode ▸ Import Visualizer CSV: pick a config (a CSV file or the current
         Visualizer authoring) and either impose it on the open capture (grid + registers
         from row 0) or compare it against the decode (Register Map overlay). Folds in the
         old Apply Config CSV, Compare ▸ CSV Config and Compare ▸ Visualizer."""
@@ -1951,7 +2519,7 @@ class MainWindow(QMainWindow):
         # A digital capture CSV (Time, ch0, ch1) also ends in .csv but is NOT a Visualizer
         # config — imposing it would silently seed an empty config (grid disappears, no
         # error). A real config CSV carries AppVersion / *_REG / NumColumns rows (the same
-        # markers _open_csv uses to reject a config as a capture). Reject the inverse here.
+        # markers ingest.probe uses to reject a config as a capture). Reject the inverse here.
         try:
             with open(dlg.path, encoding="utf-8", errors="replace") as f:
                 head = [next(f, "") for _ in range(40)]
@@ -2039,22 +2607,24 @@ class MainWindow(QMainWindow):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if resp != QMessageBox.Yes:
                     return
-        self._audio_view.stop()
-        sess, keep_cursor, keep_bms = self._session, self.cursor.sample, self._bookmarks.copy()
+        self._stop_audio()
+        # Bookmarks need no snapshot: a re-decode keeps its Link, and with it the bookmarks.
+        sess, keep_cursor = self._session, self.cursor.sample
 
         def apply(s=sess, p=csv):
             s.apply_config_csv(p)
             return s
 
-        def done(_s, cur=keep_cursor, bms=keep_bms, p=csv):
-            self._bookmarks = bms
-            self._push_bookmarks()
+        def done(_s, cur=keep_cursor, p=csv):
+            if _s is not self._session:
+                return                  # another Link was shown meanwhile; nothing to restore
             self._restore_cursor(cur)
             self._status.setText(f"Imposed {os.path.basename(p)} on the capture "
                                  f"(grid + register map from CSV; re-decoded).")
 
-        self._load_async(apply, after=done)
+        self._load_async(apply, after=done, kind="redecode")
 
+    @_on_grid_link
     def _on_dp_key_clicked(self, device: int, dp: int) -> None:
         """A data-port swatch in the Bus Grid colour key was clicked: choose which
         fields that port's cell labels show (Sample / Channel / Bit).
@@ -2104,7 +2674,7 @@ class MainWindow(QMainWindow):
         self._update_grid_for_cursor(self.cursor.sample)
 
     def force_column_count(self) -> None:
-        """Analyzer ▸ Force Column Count: pin the bus column count for the config
+        """Decode ▸ Force Column Count: pin the bus column count for the config
         region under the cursor, and re-decode.
 
         Region-scoped on purpose. An imported config CSV can know a geometry the wire
@@ -2146,32 +2716,36 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Force Column Count",
                                 f"{val} is not a legal column count (2–32).")
             return
-        self._audio_view.stop()
-        sess, keep_cursor, keep_bms = s, sample, self._bookmarks.copy()
+        self._stop_audio()
+        sess, keep_cursor = s, sample
 
         def apply(_s=sess, smp=sample, v=val):
             _s.force_column_count_at(int(smp), int(v))
             return _s
 
-        def done(_s, cur=keep_cursor, bms=keep_bms, v=val, i=sect):
-            self._bookmarks = bms
-            self._push_bookmarks()
+        def done(_s, cur=keep_cursor, v=val, i=sect):
+            if _s is not self._session:
+                return                  # another Link was shown meanwhile; nothing to restore
             self._restore_cursor(cur)
             self._status.setText(
                 f"Region {i + 1} pinned to {v} columns (re-decoded)." if v
                 else f"Region {i + 1} pin removed (re-decoded).")
 
-        self._load_async(apply, after=done)
+        self._load_async(apply, after=done, kind="redecode")
 
-    def open_capture(self, config_csv: str = "") -> None:
-        """Open a capture: a Logic 2 `.sal` project, one digital `.csv`, a simulation
-        `.vcd`, or BOTH per-channel files together (multi-select) for the two-file
-        formats — `.bin` (Saleae binary) and `.wfm` (Tektronix scope) — to skip the
-        second-file prompt. `config_csv` (optional) supplies the data-port config to
-        decode with from row 0 — normally empty from the menu; use Apply Config CSV to
-        impose a config after opening. Opening switches to Analysis (via load_session)."""
+    def open_capture(self, config_csv: str = "", caption: str = "",
+                     prefer_add: bool = False) -> None:
+        """File ▸ Open Capture (⌘O): pick the file(s) — one capture, or both channel files of
+        a `.bin` / `.wfm` pair — then the Open Capture dialog (ui/open_capture_dialog.py)
+        says what the file is and asks, in one place, for its Links (name, clock, data),
+        how much of it to decode, and whether it replaces or adds to the open Links.
+        `prefer_add` starts on Add. `config_csv` (optional) supplies the
+        data-port config to decode with from row 0; Decode ▸ Import Visualizer CSV imposes
+        one after opening."""
+        if getattr(self, "_probing", False):
+            return                          # a file is being read for the dialog already
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open capture (.sal, .csv, .vcd, or both .bin/.wfm channel files)",
+            self, caption or "Open capture (.sal, .csv, .vcd, or both .bin/.wfm channel files)",
             self._last_capture_dir(),
             filter="Captures (*.sal *.csv *.bin *.vcd *.wfm);;Saleae project (*.sal);;"
                    "Digital CSV (*.csv);;Saleae binary (*.bin);;VCD (*.vcd);;"
@@ -2179,393 +2753,165 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         self._remember_capture_dir(paths[0])
+        from ..ingest import saleae_sal
+        from .open_capture_dialog import OpenCaptureDialog
         try:
-            bins = [p for p in paths if p.lower().endswith(".bin")]
-            if len(bins) >= 2:
-                self._open_bin(bins[0], bins[1], config_csv=config_csv)
-                return
-            wfms = [p for p in paths if p.lower().endswith(".wfm")]
-            if len(wfms) >= 2:
-                self._open_wfm_pair(wfms[0], wfms[1])
-                return
-            path = paths[0]
-            low = path.lower()
-            if low.endswith(".sal"):
-                self._open_sal(path, config_csv=config_csv)
-            elif low.endswith(".csv"):
-                self._open_csv(path, config_csv=config_csv)
-            elif low.endswith(".vcd"):
-                self._open_vcd(path, config_csv=config_csv)
-            elif low.endswith(".wfm"):
-                QMessageBox.warning(self, "Open WFM",
-                                    "A .wfm capture is two files (one channel each) — "
-                                    "select BOTH .wfm files together.")
-            else:
-                self._open_bin(path, config_csv=config_csv)
+            pr = self._probe_files(paths)
         except saleae_binary.UnsupportedSaleaeVersion as exc:
             QMessageBox.warning(self, "Unsupported format", str(exc))
-        except Exception as exc:  # noqa: BLE001 - surface ingest/decode errors
-            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - surface a file that is not a capture
+            QMessageBox.warning(self, "Open Capture", str(exc))
+            return
+        if pr is None:
+            return                          # the window began closing while it was read
+        if len(pr.channels) < 2:
+            QMessageBox.warning(self, "Open Capture",
+                                f"{pr.name}: fewer than two channels to use as clock and data.")
+            return
+        try:
+            budget = saleae_sal.memory_budget()
+        except Exception:  # noqa: BLE001 - no budget: the dialog shows no fit verdict
+            budget = 0
+        dlg = OpenCaptureDialog(pr, [link.name for link in self._links], self,
+                                prefer_add=prefer_add and len(self._links) > 0,
+                                budget_bytes=budget)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._open_request(pr, dlg.result_request(), config_csv=config_csv)
 
-    def _pick_two_channels(self, title, options, labels):
-        """Ask the user which entries are the clock and the data channel.
-        `options` are the values; `labels` the display strings. Labels aren't
-        guaranteed unique (VCD signal names can collide across scopes), so
-        disambiguate the display strings and resolve the choice back by INDEX —
-        never by label lookup, which would pick the first of a duplicate."""
-        if len(options) < 2:
-            raise ValueError("capture needs at least two digital channels")
-        counts: dict = {}
-        for lb in labels:
-            counts[lb] = counts.get(lb, 0) + 1
-        disp, nth = [], {}
-        for lb in labels:
-            if counts[lb] > 1:
-                nth[lb] = nth.get(lb, 0) + 1
-                disp.append(f"{lb}  #{nth[lb]}")
-            else:
-                disp.append(lb)
-        clk, ok = QInputDialog.getItem(self, title, "Clock channel:", disp, 0, False)
-        if not ok:
+    def _probe_files(self, paths):
+        """`ingest.probe.probe(paths)` off the GUI thread, behind a busy dialog, returning
+        its result (or raising its error) here. A probe reads a bounded prefix, but that is
+        still a second or two of a multi-GB CSV or a compressed .sal, which froze the window
+        with no sign of life. Before the event loop runs (and in headless tests) it is a
+        plain call, as a demo load is.
+
+        The wait runs the event loop, so the dialog must hold the window until the read
+        is done (_BusyDialog cannot be dismissed), and None comes back if the window began
+        closing meanwhile: its caller then stops rather than open a dialog on a closed
+        window."""
+        from ..ingest import probe as probe_mod
+        if not MainWindow._event_loop_live:
+            return probe_mod.probe(paths)
+        import threading
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["pr"] = probe_mod.probe(paths)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the GUI thread
+                box["exc"] = exc
+        worker = threading.Thread(target=run, name="swi3s-probe", daemon=True)
+        worker.start()
+        worker.join(0.25)                       # a quick probe shows no dialog at all
+        if worker.is_alive():
+            dlg = _BusyDialog(f"Reading {os.path.basename(paths[0])}…", "Open Capture", self)
+            dlg.show()
+            app = QApplication.instance()
+            self._probing = True
+            try:
+                while worker.is_alive():
+                    app.processEvents(QEventLoop.AllEvents, 50)
+                    worker.join(0.02)
+            finally:
+                self._probing = False
+                dlg.finish()
+        if getattr(self, "_closing", False):
             return None
-        ci = disp.index(clk)
-        di = 1 if ci == 0 else 0
-        dat, ok = QInputDialog.getItem(self, title, "Data channel:", disp, di, False)
-        if not ok:
-            return None
-        return options[ci], options[disp.index(dat)]
+        if "exc" in box:
+            raise box["exc"]
+        return box["pr"]
 
-    def _sal_window_prompt(self, path: str, clk: int, dat: int, force: bool = False):
-        """Pre-flight a .sal open and, when it won't fit in memory, offer a window.
+    def _open_request(self, pr, req, config_csv: str = "") -> None:
+        """Load what the Open Capture dialog asked for: one Link per row, from one file, so
+        on one timeline; the first with the dialog's kind (replace, or add), the rest added
+        once it has LOADED, so a failure does not leave half of this file's Links on top of
+        the analysis that was open. Each Link gets its name, and when adding, the offset."""
+        rate = req.sample_rate_hz or int(pr.sample_rate_hz or 0)
+        # The window goes to the loader in seconds: only the loaded capture knows its rate
+        # (a complementary CSV pair loads at its DLV rate, not the probe's).
+        window = req.window_s
+        kind = "add" if req.add else "open"
+        # The offset places the FILE's time zero; a window is rebased to its own start, so
+        # an added window sits that much later, in line with the same file opened whole.
+        start_s = req.window_s[0] if req.window_s is not None else 0.0
+        offset_ps = int(round((req.offset_s + start_s) * 1e12)) if req.add else 0
+        rmap = self._rmap
 
-        A .sal is a zip of delta-coded transitions: a ~280 MB file can hold 2.2 GB
-        of payload and decode to ~18 GB of uint64 edge arrays, which exhausts RAM
-        and leaves the machine unresponsive with no error. The estimate below reads
-        only the zip directory, so it costs nothing and happens BEFORE any
-        allocation.
+        def factory(link):
+            k = pr.kind
+            if k == "sal":
+                return lambda **kw: Session.from_sal(
+                    pr.paths[0], link.clock, link.data, auto_clock=link.auto_clock,
+                    window_s=window, register_map=rmap, config_csv=config_csv, **kw)
+            if k == "digital_csv":
+                return lambda **kw: Session.from_digital_csv(
+                    pr.paths[0], link.clock, link.data, window_s=window, register_map=rmap,
+                    config_csv=config_csv, **kw)
+            if k == "vcd":
+                return lambda **kw: Session.from_vcd(
+                    pr.paths[0], link.clock, link.data, auto_clock=link.auto_clock,
+                    window_s=window, register_map=rmap, config_csv=config_csv, **kw)
+            if k == "saleae_binary":
+                return lambda **kw: Session.from_saleae_binary(
+                    link.clock, link.data, rate, window_s=window, register_map=rmap,
+                    config_csv=config_csv, **kw)
+            if k == "wfm":
+                return lambda **kw: Session.from_wfm(
+                    link.clock, link.data, clock_thresh=link.clock_thresh,
+                    data_thresh=link.data_thresh, auto_clock=link.auto_clock,
+                    window_s=window, register_map=rmap, **kw)
+            if k == "analog_csv":
+                return lambda **kw: Session.from_analog_csv(
+                    pr.paths[0], clock=link.clock, data=link.data,
+                    clock_thresh=link.clock_thresh, data_thresh=link.data_thresh,
+                    auto_clock=link.auto_clock, window_s=window, register_map=rmap,
+                    config_csv=config_csv, **kw)
+            raise ValueError(f"no loader for {k!r}")
 
-        `force` asks for a window whatever the size predicts — the path behind
-        Open Time Window…. Without it this returns None for anything that fits, which
-        meant a capture the app WOULD load whole could not be windowed at all even by a
-        user who knew they wanted a slice of it. "It fits" is not "it stays interactive",
-        and the prompt was the only route to a window.
-
-        Returns the (start_sample, end_sample) window to load, None for the whole
-        capture, or the string "cancel" if the user backed out.
-        """
-        from ..ingest import saleae_sal
-        try:
-            cost = saleae_sal.estimate_cost(path, channels=[clk, dat])
-            budget = saleae_sal.memory_budget()   # shared with the loader's guard
-        except Exception:
-            if not force:
-                return None                   # can't estimate — let the load proceed
-            cost, budget = None, 0
-        if cost is not None and not force and (budget <= 0 or cost.fits_in(budget)):
-            return None
-        # Restricted to the two channels being loaded: the walk seeks with ZipExtFile.seek(),
-        # which on a DEFLATE member is read-and-discard, so walking every channel in the
-        # archive blocked the GUI for ~2 s here — on exactly the large captures this prompt
-        # exists to serve.
-        span = saleae_sal.capture_span_samples(path, channels=[clk, dat])
-        rate = (cost.sample_rate_hz if cost else 0) or saleae_sal.read_info(path).sample_rate_hz or 1
-        total_s = span / rate if span else 0.0
-        # Suggest the largest window predicted to fit, rounded down to a whole second.
-        edge_bytes = max(1, (cost.est_edge_bytes if cost else 0) * 2)
-        frac = (budget / float(edge_bytes)) if budget > 0 else 1.0
-        suggest_s = max(1.0, min(total_s or 10.0, (total_s or 10.0) * frac))
-        title = "Open time window" if force else "Capture too large"
-        detail = (f"{cost.summary()}\n" if cost else "")
-        avail = (f"Available: {budget / 1e9:.1f} GB\n" if budget > 0 else "")
-        msg = ((f"Open part of this capture.\n\n{detail}{avail}\n" if force else
-                f"This capture is too large to open in full.\n\n{detail}{avail}\n"))
-        if not span:
-            QMessageBox.warning(self, title, msg +
-                                "A time window can't be offered (no block index in "
-                                "this file). Free memory, or export a shorter range "
-                                "from Logic 2.")
-            return "cancel"
-        msg += f"The capture is {total_s:.1f} s long."
-        if not force:
-            msg += (f" Open a time window instead?\n"
-                    f"About {suggest_s:.0f} s is predicted to fit.")
-            if QMessageBox.question(self, title, msg,
-                                    QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
-                return "cancel"
-        start, ok = QInputDialog.getDouble(self, title, "Start (seconds):",
-                                           0.0, 0.0, max(0.0, total_s), 3)
-        if not ok:
-            return "cancel"
-        length, ok = QInputDialog.getDouble(self, title, "Length (seconds):",
-                                            round(suggest_s, 3), 0.001,
-                                            max(0.001, total_s - start), 3)
-        if not ok:
-            return "cancel"
-        return (int(start * rate), int((start + length) * rate))
-
-    def open_capture_window(self) -> None:
-        """Open a time window of a `.sal`, whatever its size predicts.
-
-        The size-triggered prompt in _sal_window_prompt was the ONLY route to a windowed
-        load, so a capture the app was willing to load whole could not be sliced even by a
-        user who knew they wanted a slice — and on a machine with plenty of free memory
-        that was every capture. "It fits" is a statement about capacity, not about staying
-        interactive.
-        """
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open a time window of a Saleae project",
-            self._last_capture_dir(), filter="Saleae project (*.sal);;All files (*)")
-        if not path:
-            return
-        self._remember_capture_dir(path)
-        try:
-            self._open_sal(path, force_window=True)
-        except saleae_binary.UnsupportedSaleaeVersion as exc:
-            QMessageBox.warning(self, "Unsupported format", str(exc))
-        except Exception as exc:  # noqa: BLE001 - surface ingest/decode errors
-            QMessageBox.critical(self, "Open failed", str(exc))
-
-    def _open_sal(self, path: str, config_csv: str = "",
-                  force_window: bool = False) -> None:
-        from ..ingest import saleae_sal
-        info = saleae_sal.read_info(path)
-        if len(info.channels) < 2:
-            raise ValueError(f"{path}: fewer than two digital channels")
-        labels = [f"Channel {c}" for c in info.channels]
-        if len(info.channels) == 2:
-            # Auto-pick the forwarded clock (the busier channel) — same as .bin/.csv.
-            clk, dat, auto = info.channels[0], info.channels[1], True
-        else:
-            picked = self._pick_two_channels("Open .sal", info.channels, labels)
-            if picked is None:
+        def named(link, session) -> None:
+            idx = self._links.index_of(session)
+            if idx < 0:
                 return
-            clk, dat, auto = picked[0], picked[1], False
-        window = self._sal_window_prompt(path, clk, dat, force=force_window)
-        if window == "cancel":
-            return
+            self._links.rename(idx, link.name)
+            if offset_ps:
+                self.set_link_offset(idx, offset_ps)
+            # Everywhere the name shows, as rename_link does.
+            self._update_link_switcher()
+            self._update_title()
+            if self._cmd_all:
+                self._refresh_all_model()
+            self._push_bookmarks()
+            span = (f", {req.window_s[0]:.3f}–{req.window_s[1]:.3f} s"
+                    if req.window_s is not None else "")
+            self._status.setText(f"Opened {pr.name} as {link.name}{span}")
 
-        def after(sess, p=path):
-            src = sess.source
-            win = src.get("window")
-            rate = sess.sample_rate_hz or 1
-            span = (f", window {win[0]/rate:.3f}-{win[1]/rate:.3f} s" if win else "")
-            self._status.setText(
-                f"Opened {p}  (clock=ch{src['clock_channel']}, data=ch{src['data_channel']}"
-                f"{' auto' if src.get('auto_clock') else ''}, "
-                f"{sess.sample_rate_hz/1e6:.3f} MHz{span})")
-        self._load_async(
-            lambda **kw: Session.from_sal(path, clk, dat, auto_clock=auto,
-                                     window=window, register_map=self._rmap,
-                                     config_csv=config_csv, **kw),
-            after=after)
+        first, rest = req.links[0], req.links[1:]
 
-    def _open_vcd(self, path: str, config_csv: str = "") -> None:
-        """Import a simulation VCD: pick the clock + data scalar signals (auto when
-        there are exactly two 1-bit signals), mapping $timescale ticks to samples."""
-        from ..ingest import vcd
-        info = vcd.read_info(path)
-        sigs = info.scalar_signals
-        if len(sigs) < 2:
-            raise ValueError(f"{path}: fewer than two 1-bit signals to use as clock/data")
-        idents = [s.ident for s in sigs]
-        labels = [s.name for s in sigs]
-        name_of = {s.ident: s.name for s in sigs}
-        if len(sigs) == 2:
-            # Auto-pick the forwarded clock (the busier signal) — same as .sal/.csv.
-            clk, dat, auto = idents[0], idents[1], True
-        else:
-            picked = self._pick_two_channels("Open .vcd", idents, labels)
-            if picked is None:
-                return
-            clk, dat, auto = picked[0], picked[1], False
-        def after(sess, p=path, cn=name_of.get(clk, clk), dn=name_of.get(dat, dat), a=auto):
-            self._status.setText(
-                f"Opened {p}  (clock={cn}, data={dn}{' auto' if a else ''}, "
-                f"{sess.sample_rate_hz / 1e6:.3f} MHz)")
-        self._load_async(
-            lambda **kw: Session.from_vcd(path, clk, dat, auto_clock=auto,
-                                     register_map=self._rmap, config_csv=config_csv, **kw),
-            after=after)
+        def more(_session) -> None:
+            for link in rest:
+                self._load_async(factory(link), after=lambda s, ln=link: named(ln, s),
+                                 kind="add")
 
-    def _open_csv(self, path: str, config_csv: str = "") -> None:
-        from ..ingest import analog_csv, digital_csv
-        # A Visualizer *config* CSV (register-style: AppVersion / *_REG / NumColumns
-        # rows) is not a capture — catch it up front so the user gets an actionable
-        # message instead of a cryptic "analog CSV: no TIME header" from deep in the
-        # parser (is_analog_csv can false-positive on it).
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                head = [next(f, "") for _ in range(40)]
-        except OSError as exc:
-            raise ValueError(f"Couldn't read {path}: {exc}") from exc
-        if any(ln.startswith("AppVersion") or "_REG," in ln or ln.startswith("NumColumns")
-               for ln in head):
-            raise ValueError(
-                "This looks like a Visualizer config CSV, not a capture.\n\n"
-                "Open it via File ▸ Visualizer ▸ Open Settings.")
-        # A .csv is either a Logic 2 DIGITAL export (header row of 0/1 channels) or
-        # a Tektronix ANALOG scope export (volts, needs thresholding). Route by the
-        # file's own shape so a single Open Capture handles both.
-        if analog_csv.is_analog_csv(path):
-            self._open_analog_csv(path, config_csv=config_csv)
-            return
-        header = digital_csv.read_header(path)
-        cols = list(range(1, len(header)))      # skip Time column 0
-        if len(cols) < 2:
-            raise ValueError(f"{path}: need >= 2 channel columns")
-        labels = [header[i] for i in cols]
-        # Auto-assign clock vs data by transition count (the forwarded clock
-        # toggles every UI, so it has the most edges) — same heuristic as .bin.
-        # Only fall back to the manual picker when the counts can't decide.
-        counts = digital_csv.channel_transition_counts(path)
-        clk = dat = None
-        if len(counts) == len(cols) and counts:
-            order = sorted(range(len(cols)), key=lambda i: counts[i], reverse=True)
-            # A clear winner (forwarded clock has the most edges), OR exactly two
-            # channels — then assign by count order and let the loader sort out the
-            # rest. A DLV differential pair ties on edge count (both rails toggle
-            # together), so a 2-channel tie must NOT drop to the manual picker; the
-            # complementary pair is detected downstream (Session.from_digital_csv).
-            if counts[order[0]] > counts[order[1]] or len(cols) == 2:
-                clk, dat = cols[order[0]], cols[order[1]]
-        if clk is None:
-            picked = self._pick_two_channels("Open digital CSV", cols, labels)
-            if picked is None:
-                return
-            clk, dat = picked
-        ci, di = cols.index(clk), cols.index(dat)
-        note = (f"clock={labels[ci]} ({counts[ci]:,} edges), "
-                f"data={labels[di]} ({counts[di]:,} edges)"
-                if len(counts) == len(cols) else f"clock={labels[ci]}, data={labels[di]}")
-        def after(sess, p=path, nt=note):
-            self._status.setText(f"Opened {p}  ({nt}, {sess.sample_rate_hz/1e6:.3f} MHz)")
-        self._load_async(
-            lambda **kw: Session.from_digital_csv(path, clk, dat, register_map=self._rmap,
-                                             config_csv=config_csv, **kw),
-            after=after)
+        def first_loaded(session) -> None:
+            named(first, session)
+            more(session)
 
-    def _open_bin(self, path: str, data: str = "", config_csv: str = "") -> None:
-        # Documented per-channel <SALEAE> export needs both channel files + a rate.
-        # `data` may be supplied (both files chosen at once); else prompt for it.
-        from ..ingest import saleae_binary
-        if not data:
-            data, _ = QFileDialog.getOpenFileName(
-                self, "Second channel (Saleae binary)",
-                filter="Saleae binary (*.bin);;All files (*)")
-            if not data:
-                return
-        # The <SALEAE> binary stores transition times in seconds but no sample
-        # rate; infer it from the finest timestamp spacing (~one sample period).
-        # When inference is confident, use it directly (no modal — the rate only
-        # ever needs changing if the decoded row/audio rates come out wrong);
-        # only prompt when inference fails.
-        guess = saleae_binary.infer_sample_rate([path, data])
-        if guess:
-            rate = guess
-        else:
-            rate, ok = QInputDialog.getInt(
-                self, "Sample rate",
-                "Capture sample rate (Hz):\n(couldn't auto-detect from the "
-                "file's timestamps — please enter it)",
-                98_304_000, 1, 2_000_000_000, 1_000_000)
-            if not ok:
-                return
-        # Assign clock vs data by transition count. In FBCSE the forwarded clock
-        # moves to DN for audio mode, so over a multi-second capture the audio clock
-        # (DN) carries the most edges — which is the orientation the CDS/audio
-        # decoder needs. (The §5.1.2 link-control clock is the OTHER line, DP; the
-        # link-control decoder is self-orienting and finds the bring-up there.)
-        na, nb = saleae_binary.transition_count(path), saleae_binary.transition_count(data)
-        clock, dat = path, data
-        if na >= 0 and nb >= 0 and nb > na:
-            clock, dat = data, path
-        def after(_session, c=clock, d=dat):
-            self._status.setText(f"Clock = {os.path.basename(c)}, "
-                                 f"Data = {os.path.basename(d)}")
-        self._load_async(
-            lambda **kw: Session.from_saleae_binary(clock, dat, rate, register_map=self._rmap,
-                                               config_csv=config_csv, **kw),
-            after=after)
+        self._load_async(factory(first), kind=kind,
+                         after=self._after_open(first_loaded, opening=kind == "open"))
 
-    def open_wfm(self) -> None:
-        """Kept for programmatic/scripted use: pick both .wfm channel files and
-        open them as a pair. (No menu entry — .wfm is opened via Open Capture by
-        multi-selecting both files, same as .bin.)"""
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open WFM pair (select BOTH channel files)", self._last_capture_dir(),
-            "Tektronix waveform (*.wfm);;All files (*)")
-        if len(paths) == 2:
-            self._remember_capture_dir(paths[0])
-            self._open_wfm_pair(paths[0], paths[1])
-
-    def _open_wfm_pair(self, clock_path: str, data_path: str) -> None:
-        """Load a WFM pair (order-independent — from_wfm auto-orients the clock)."""
-        def after(sess, c=clock_path, d=data_path):
-            self._status.setText(
-                f"Opened {os.path.basename(c)} / {os.path.basename(d)}  "
-                f"({sess.sample_rate_hz/1e6:.3f} MHz)")
-        try:
-            self._load_async(
-                lambda **kw: Session.from_wfm(clock_path, data_path,
-                                         register_map=self._rmap, **kw),
-                after=after)
-        except Exception as exc:  # noqa: BLE001 - surface ingest/decode errors
-            QMessageBox.critical(self, "Open failed", str(exc))
-
-    def _open_analog_csv(self, path: str, config_csv: str = "") -> None:
-        """Load a Tektronix analog CSV export (all channels in one file), reached
-        via Open Capture when the .csv is detected as analog. Same front-end as the
-        .wfm importer: auto mid-rail + 10% hysteresis thresholding, and the clock
-        auto-assigned by transition count when there are exactly two channels;
-        with more than two the user picks which channel is clock and which is
-        data (no busier-channel guess across unrelated channels)."""
-        try:
-            from ..ingest import analog_csv
-            # Header-only read (preamble + TIME row) to enumerate channel names — the
-            # bulk data is parsed once, asynchronously, inside Session.from_analog_csv
-            # below; a full read_analog_csv here would parse the whole file twice.
-            names = analog_csv.channel_names(path)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Open failed", str(exc))
-            return
-        if len(names) < 2:
-            QMessageBox.warning(self, "Open Analog CSV", f"{path}: fewer than two channels")
-            return
-        if len(names) == 2:
-            clock, data = names[0], names[1]      # order irrelevant — auto_clock decides
-            clock_thresh = data_thresh = None
-            auto_clock = True
-        else:
-            from .open_analog_csv_dialog import OpenAnalogCsvDialog
-            dlg = OpenAnalogCsvDialog(self, channel_names=names)
-            if not dlg.exec():
-                return
-            clock, data = dlg.clock, dlg.data
-            clock_thresh, data_thresh = dlg.clock_thresh, dlg.data_thresh
-            auto_clock = False                     # user chose which is which
-        def after(sess, p=path, c=clock, d=data, auto=auto_clock):
-            if auto:
-                self._status.setText(
-                    f"Opened {p}  (analog, clock auto-detected, "
-                    f"{sess.sample_rate_hz/1e6:.3f} MHz)")
-            else:
-                self._status.setText(
-                    f"Opened {p}  (analog, clock={c}, data={d}, "
-                    f"{sess.sample_rate_hz/1e6:.3f} MHz)")
-        try:
-            self._load_async(
-                lambda **kw: Session.from_analog_csv(path, clock=clock, data=data,
-                                                clock_thresh=clock_thresh,
-                                                data_thresh=data_thresh,
-                                                auto_clock=auto_clock,
-                                                register_map=self._rmap,
-                                                config_csv=config_csv, **kw),
-                after=after)
-        except Exception as exc:  # noqa: BLE001 - surface ingest/decode errors
-            QMessageBox.critical(self, "Open failed", str(exc))
+    def _after_open(self, then, opening: bool):
+        """`then(session)`, for the `after` of a load about to be asked for, unless another
+        open is asked for in between: the decode dialog is not modal, so a second Open can
+        be queued while the first file's first Link decodes, and that file's other Links
+        must not land on the newer one. `opening`: the load it is for is itself an open
+        (which counts, once asked for)."""
+        gen = self._open_gen + (1 if opening else 0)
+        return lambda session: then(session) if self._open_gen == gen else None
 
     def locate_subcapture(self) -> None:
-        """Analyzer ▸ Locate Sub-Capture: open a SECOND capture (any format the Open
+        """File ▸ Locate Sub-Capture (Analyzer): open a SECOND capture (any format the Open
         Capture dialog accepts — select BOTH files together for the two-file .bin /
         .wfm formats) and find every place its signal pattern occurs in the
         currently-open capture (Session.locate_subcapture — sample-rate independent).
@@ -2579,6 +2925,8 @@ class MainWindow(QMainWindow):
         if self._session is None:
             QMessageBox.information(self, "No capture", "Open a capture first.")
             return
+        if getattr(self, "_probing", False):
+            return                          # a file is being read for a dialog already
         # ONE SEARCH AT A TIME, refused BEFORE the file dialog so nobody picks a file only to
         # be told no. _load_async and _start_tx_persist_worker both guard their worker this
         # way; this one did not, and a second invocation during the (multi-second) FFT search
@@ -2610,20 +2958,30 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         self._remember_capture_dir(paths[0], "analyzer")
-        # Pair formats: when both channel files are selected together, use them as the
-        # pair (no second-file prompt); otherwise fall back to a single primary path.
-        path, second = paths[0], None
-        for ext in (".wfm", ".bin"):
-            same = [p for p in paths if p.lower().endswith(ext)]
-            if len(same) >= 2:
-                path, second = same[0], same[1]
-                break
+        # The reference's signals (and how much of it) are picked in Open Capture's dialog,
+        # in its reference form: one row, no name, no Into.
+        from .open_capture_dialog import OpenCaptureDialog
+        try:
+            pr = self._probe_files(paths)
+        except Exception as exc:  # noqa: BLE001 - surface a file that is not a capture
+            QMessageBox.warning(self, "Locate Sub-Capture", str(exc))
+            return
+        if pr is None:
+            return                          # the window began closing while it was read
+        if len(pr.channels) < 2:
+            QMessageBox.warning(self, "Locate Sub-Capture",
+                                f"{pr.name}: fewer than two channels to use as clock and data.")
+            return
+        pick = OpenCaptureDialog(pr, parent=self, reference=True)
+        if pick.exec() != QDialog.Accepted:
+            return    # cancelled — silent, no error
+        path = pr.paths[0]
         try:
             import os as _os
             import sys as _sys
             import time as _t
             _t0 = _t.perf_counter()
-            sub = self._load_bare_capture(path, second)
+            sub = self._reference_capture(pr, pick.result_request())
             if _os.environ.get("SWI3S_LOCATE_DEBUG"):
                 _n = sub.clock_edges.size if sub is not None else 0
                 _mn = self._session.capture.clock_edges.size if self._session else 0
@@ -2633,9 +2991,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - surface ingest errors
             QMessageBox.critical(self, "Locate failed", str(exc))
             return
-        if sub is None:
-            return    # user cancelled a channel-pick / second-file dialog — silent, no error
-
         dlg = QProgressDialog("Searching for sub-capture…", None, 0, 100, self)
         dlg.setWindowTitle("SWI3S Studio")
         dlg.setWindowModality(Qt.ApplicationModal)
@@ -2646,6 +3001,9 @@ class MainWindow(QMainWindow):
         dlg.setValue(0)
         self._locate_dlg = dlg
         self._locate_thread = QThread(self)
+        # The matches are samples of THIS session: they must be bookmarked on its Link,
+        # whichever Link is active when the search finishes.
+        self._locate_link = self._links.active_index
         self._locate_worker = _LocateWorker(self._session, sub)
         self._locate_worker.moveToThread(self._locate_thread)
         self._locate_thread.started.connect(self._locate_worker.run)
@@ -2685,7 +3043,7 @@ class MainWindow(QMainWindow):
             best_start = diag.get("best_start_sample")
             placed = ""
             if best_start is not None:
-                bm = self._bookmarks.add(int(best_start))
+                bm = self._bookmarks.add(int(best_start), link=self._locate_link)
                 bm.label = f"Best (no match)  score={best:.3g}"
                 self._push_bookmarks()
                 placed = ("\n\nA bookmark was placed at the best candidate so you "
@@ -2703,7 +3061,7 @@ class MainWindow(QMainWindow):
                 f"Locate Sub-Capture: no matches (best {best * 100:.1f}%)")
             return
         for i, m in enumerate(matches, start=1):
-            bm = self._bookmarks.add(int(m["start_sample"]))
+            bm = self._bookmarks.add(int(m["start_sample"]), link=self._locate_link)
             bm.label = f"Sub {i}/{len(matches)}  score={m.get('score', 0):.3g}"
         self._locate_dbg("added %d bookmarks" % len(matches))
         self._push_bookmarks()
@@ -2759,127 +3117,49 @@ class MainWindow(QMainWindow):
         self._locate_worker = None
 
 
-    def _load_bare_capture(self, path: str, second: str = None):
-        """Build a bare Capture (no Session/decode) from any of the formats Open
-        Capture accepts, for Locate Sub-Capture's second file. Reuses the same
-        per-format loaders as open_capture, picking clock/data the same way (auto
-        for exactly two channels, else prompt) — but returns the Capture directly
-        instead of wrapping it in a Session. `second` is the already-chosen second
-        channel file for the two-file formats (.bin, .wfm); when omitted those
-        formats prompt for it, so a lone pair file still works.
-
-        Returns None if the user cancels a channel-pick / second-file dialog (the
-        caller treats that as a silent no-op, matching _open_sal/_open_vcd/_open_csv);
-        genuine ingest errors (bad file, wrong shape, …) still raise."""
-        low = path.lower()
-        if low.endswith(".sal"):
-            from ..ingest import saleae_sal
-            info = saleae_sal.read_info(path)
-            if len(info.channels) < 2:
-                raise ValueError(f"{path}: fewer than two digital channels")
-            if len(info.channels) == 2:
-                clk, dat = info.channels[0], info.channels[1]
-            else:
-                labels = [f"Channel {c}" for c in info.channels]
-                picked = self._pick_two_channels("Sub-capture: .sal", info.channels, labels)
-                if picked is None:
-                    return None
-                clk, dat = picked
-            return saleae_sal.load_capture(path, clk, dat, auto_clock=(len(info.channels) == 2))
-        if low.endswith(".vcd"):
-            from ..ingest import vcd
-            info = vcd.read_info(path)
-            sigs = info.scalar_signals
-            if len(sigs) < 2:
-                raise ValueError(f"{path}: fewer than two 1-bit signals")
-            idents = [s.ident for s in sigs]
-            if len(sigs) == 2:
-                clk, dat = idents[0], idents[1]
-            else:
-                labels = [s.name for s in sigs]
-                picked = self._pick_two_channels("Sub-capture: .vcd", idents, labels)
-                if picked is None:
-                    return None
-                clk, dat = picked
-            return vcd.load_capture(path, clk, dat, auto_clock=(len(sigs) == 2))
-        if low.endswith(".csv"):
-            from ..ingest import analog_csv, digital_csv
-            if analog_csv.is_analog_csv(path):
-                # Analog Tek CSV: same front-end as an analog-CSV open — threshold
-                # each channel (auto mid-rail + 10%) and auto-orient the clock.
-                parsed = analog_csv.read_analog_csv(path)
-                names = list(parsed["channels"].keys())
-                if len(names) < 2:
-                    raise ValueError(f"{path}: fewer than two channels")
-                if len(names) == 2:
-                    clk_name, dat_name = names[0], names[1]
-                else:
-                    picked = self._pick_two_channels(
-                        "Sub-capture: analog CSV", names, names)
-                    if picked is None:
-                        return None
-                    clk_name, dat_name = picked
-                from ..ingest import analog
-                return analog.capture_from_analog(
-                    parsed["time"], parsed["channels"][clk_name],
-                    parsed["channels"][dat_name], parsed["sample_rate_hz"] or None,
-                    auto_clock=(len(names) == 2))
-            header = digital_csv.read_header(path)
-            cols = list(range(1, len(header)))
-            if len(cols) < 2:
-                raise ValueError(f"{path}: need >= 2 channel columns")
-            labels = [header[i] for i in cols]
-            counts = digital_csv.channel_transition_counts(path)
-            clk = dat = None
-            if len(counts) == len(cols) and counts:
-                order = sorted(range(len(cols)), key=lambda i: counts[i], reverse=True)
-                if counts[order[0]] > counts[order[1]]:
-                    clk, dat = cols[order[0]], cols[order[1]]
-            if clk is None:
-                picked = self._pick_two_channels("Sub-capture: digital CSV", cols, labels)
-                if picked is None:
-                    return None
-                clk, dat = picked
-            return digital_csv.load_capture(path, clk, dat)
-        if low.endswith(".bin"):
-            data = second
-            if not data:
-                data, _ = QFileDialog.getOpenFileName(
-                    self, "Sub-capture: second channel (Saleae binary)",
-                    filter="Saleae binary (*.bin);;All files (*)")
-            if not data:
-                return None
-            guess = saleae_binary.infer_sample_rate([path, data])
-            if guess:
-                rate = guess
-            else:
-                rate, ok = QInputDialog.getInt(
-                    self, "Sample rate", "Sub-capture sample rate (Hz):",
-                    98_304_000, 1, 2_000_000_000, 1_000_000)
-                if not ok:
-                    return None
-            return saleae_binary.load_capture(path, data, rate)
-        if low.endswith(".wfm"):
-            # A WFM sub-capture is a pair (one analog channel per file), like .bin:
-            # use the already-selected second file, else prompt. Auto-orient the clock.
-            data = second
-            if not data:
-                data, _ = QFileDialog.getOpenFileName(
-                    self, "Sub-capture: second channel (Tektronix .wfm)",
-                    os.path.dirname(path),
-                    filter="Tektronix waveform (*.wfm);;All files (*)")
-            if not data:
-                return None
-            from ..ingest import analog
-            from ..ingest import wfm as wfm_ingest
-            a = wfm_ingest.read_wfm(path)
-            b = wfm_ingest.read_wfm(data)
-            return analog.capture_from_analog(a["time"], a["volts"], b["volts"],
-                                              auto_clock=True)
-        raise ValueError(f"{path}: unsupported sub-capture format")
+    @staticmethod
+    def _reference_capture(pr, req):
+        """A bare Capture (no Session, no decode) of what Locate's dialog picked: the
+        reference is searched for, so only its edges are needed. Same readers as Open
+        Capture, cut to the window when one was asked for."""
+        from ..ingest import analog, analog_csv, digital_csv, saleae_sal, vcd
+        from ..ingest import wfm as wfm_ingest
+        link = req.links[0]
+        rate = req.sample_rate_hz or int(pr.sample_rate_hz or 0)
+        window = None
+        if req.window_s is not None and pr.kind == "sal" and rate:
+            window = Session.window_samples(req.window_s, rate)
+        k = pr.kind
+        if k == "sal":
+            return saleae_sal.load_capture(pr.paths[0], link.clock, link.data,
+                                           auto_clock=link.auto_clock, window=window)
+        if k == "vcd":
+            cap = vcd.load_capture(pr.paths[0], link.clock, link.data,
+                                   auto_clock=link.auto_clock)
+        elif k == "digital_csv":
+            cap = digital_csv.load_capture(pr.paths[0], link.clock, link.data)
+        elif k == "saleae_binary":
+            cap = saleae_binary.load_capture(link.clock, link.data, rate)
+        elif k == "analog_csv":
+            parsed = analog_csv.read_analog_csv(pr.paths[0])
+            cap = analog.capture_from_analog(
+                parsed["time"], parsed["channels"][link.clock], parsed["channels"][link.data],
+                parsed["sample_rate_hz"] or None, link.clock_thresh, link.data_thresh,
+                auto_clock=link.auto_clock)
+        elif k == "wfm":
+            a, b = wfm_ingest.read_wfm(link.clock), wfm_ingest.read_wfm(link.data)
+            cap = analog.capture_from_analog(a["time"], a["volts"], b["volts"], None,
+                                             link.clock_thresh, link.data_thresh,
+                                             auto_clock=link.auto_clock)
+        else:
+            raise ValueError(f"{pr.name}: unsupported sub-capture format")
+        if req.window_s is None:
+            return cap
+        # At the rate the reference loaded at, as Open Capture's windows are.
+        return cap.subcapture(*Session.window_samples(req.window_s, cap.sample_rate_hz))
 
     def export_capture(self) -> None:
-        """File ▸ Analyzer ▸ Export Capture…: one dialog to pick the format (.sal /
+        """File ▸ Export Capture… (Analyzer): one dialog to pick the format (.sal /
         .bin / .csv), which signals + their names, the range (whole capture, or a
         time / bus-row / UI window), and the output file — then dispatch to the
         matching Session.export_* writer."""
@@ -2887,9 +3167,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No capture", "Open a capture first.")
             return
         from .capture_export_dialog import CaptureExportDialog
-        clk_name, dat_name = ("DP", "DN") if self._session.is_dlv else ("SW_CLK", "SW_DATA")
-        dlg = CaptureExportDialog(self._session, default_dir=self._last_capture_dir("analyzer"),
-                                  clock_name=clk_name, data_name=dat_name, parent=self)
+        # The session is fixed BEFORE the dialog: the range is chosen on THIS capture, and
+        # closing the dialog returns focus to a pane, which can make another Link active.
+        sess = self._session
+        clk_name, dat_name = ("DP", "DN") if sess.is_dlv else ("SW_CLK", "SW_DATA")
+        dlg = CaptureExportDialog(sess, default_dir=self._last_capture_dir("analyzer"),
+                                  clock_name=clk_name, data_name=dat_name,
+                                  default_name=f"capture{self._link_stem()}", parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
         path = dlg.output_path()
@@ -2901,18 +3185,18 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)     # deflate/write of a big capture is ~0.5s
         try:
             if fmt == "sal":
-                self._session.export_sal(path, clock_channel=0, data_channel=1,
-                                         clock_name=clk_name, data_name=dat_name, sample_range=rng)
+                sess.export_sal(path, clock_channel=0, data_channel=1,
+                                clock_name=clk_name, data_name=dat_name, sample_range=rng)
                 wrote = path
             elif fmt == "bin":
-                written = self._session.export_bin(path, clock_channel=0, data_channel=1,
-                                                   include_clock=clk_on, include_data=dat_on,
-                                                   sample_range=rng)
+                written = sess.export_bin(path, clock_channel=0, data_channel=1,
+                                          include_clock=clk_on, include_data=dat_on,
+                                          sample_range=rng)
                 wrote = ", ".join(os.path.basename(p) for p in written)
             else:                                          # csv
-                self._session.export_csv(path, clock_channel=0, data_channel=1,
-                                         clock_name=clk_name, data_name=dat_name,
-                                         include_clock=clk_on, include_data=dat_on, sample_range=rng)
+                sess.export_csv(path, clock_channel=0, data_channel=1,
+                                clock_name=clk_name, data_name=dat_name,
+                                include_clock=clk_on, include_data=dat_on, sample_range=rng)
                 wrote = path
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -2935,21 +3219,15 @@ class MainWindow(QMainWindow):
             return
         self._remember_capture_dir(path, "analyzer")
         ws = Workspace(
-            source=self._session.source,
-            overlay=[[int(s), int(d), int(a), int(v)]
-                     for (s, d, a), v in self._session.register_overrides.items()],
+            links=[self._link_spec(link) for link in self._links],
+            active_link=self._links.active_index,
             bookmarks=self._bookmarks.to_json(),
             cursor=self.cursor.sample,
             mode=self._mode_mgr.current() or ANALYSIS,
             authoring=self._authoring.config().to_dict(),
             timing=self._timing_page.to_dict(),
-            device_regmaps={str(d): pm.to_json_dict()
-                            for d, pm in self._session.peripheral_maps.items()},
-            device_names={str(d): n for d, n in self._session.device_names.items()},
-            device_hub_depths={str(d): v for d, v in self._session.hub_depths.items() if v},
-            device_scramblers=[[int(d), int(p), bool(on)]
-                               for (d, p), on in self._session.scrambler_overrides.items()],
-            view={"tx_map": self._tx_map, "tx_persist": self._tx_persist,
+            view={**self._link_view_prefs(),
+                  "tx_map": self._tx_map, "tx_persist": self._tx_persist,
                   "grid_rows": self._grid_rows, "tx_start_row": self._tx_start_row,
                   "show_clock": self._raw_view.show_clock},
         )
@@ -2959,6 +3237,58 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(exc))
             return
         self._status.setText(f"Workspace saved: {path}")
+
+    def _link_view_prefs(self) -> dict:
+        """The multi-Link layout, saved only when there is one: each pane group's Link,
+        whether Commands shows All Links, and the Timeline dock's height."""
+        if len(self._links) < 2:
+            return {}
+        return {"pane_links": dict(self._pane_link), "commands_all": bool(self._cmd_all),
+                "bottom_all": bool(self._bottom_all),
+                "timeline_height": int(self._timeline_dock.height())}
+
+    def _apply_link_view_prefs(self, view: dict, active: int) -> None:
+        if len(self._links) < 2:
+            return
+        panes = dict(view.get("pane_links") or {})
+        # Before 3.0.19's split the Bus Grid was in the bottom group: it shows that Link.
+        panes.setdefault("grid", panes.get("bottom", active))
+        for group in _PANE_GROUPS:
+            try:
+                i = int(panes.get(group, active))
+            except (TypeError, ValueError):     # tolerate a hand-edited/corrupt workspace
+                continue
+            if 0 <= i < len(self._links) and i != self._pane_link[group]:
+                self.set_group_link(group, i)
+        if view.get("commands_all"):
+            self.set_commands_scope_all(True)
+        if view.get("bottom_all"):
+            self.set_bottom_scope_all(True)
+        self._activate_link(active)            # the saved active Link, not the last set
+        self._update_link_switcher()
+        try:
+            h = int(view.get("timeline_height", 0))
+        except (TypeError, ValueError):
+            h = 0
+        if h > 0:
+            self.resizeDocks([self._timeline_dock], [h], Qt.Vertical)
+
+    @staticmethod
+    def _link_spec(link) -> LinkSpec:
+        """What a workspace records to rebuild one Link."""
+        sess = link.session
+        return LinkSpec(
+            source=sess.source, name=link.name, offset_ps=int(link.offset_ps),
+            overlay=[[int(s), int(d), int(a), int(v)]
+                     for (s, d, a), v in sess.register_overrides.items()],
+            device_regmaps={str(d): pm.to_json_dict() for d, pm in sess.peripheral_maps.items()},
+            device_names={str(d): n for d, n in sess.device_names.items()},
+            device_hub_depths={str(d): v for d, v in sess.hub_depths.items() if v},
+            device_scramblers=[[int(d), int(p), bool(on)]
+                               for (d, p), on in sess.scrambler_overrides.items()],
+            stream_colors=line_style.overrides_to_json(
+                getattr(link.view, "stream_colors", None) or {}),
+        )
 
     def open_workspace(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2973,71 +3303,150 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open failed", str(exc))
             return
         # Apply saved hub depths AND what-if register overrides inside the worker-
-        # thread factory (both change the decode), in a single off-GUI-thread decode.
-        # Doing it in apply_workspace (GUI thread) would re-decode again and freeze the UI.
-        def factory(w=ws, **kw):
-            # **kw absorbs decoder_ready (see _factory_takes_decoder_ready /
-            # _LoadWorker.run) so the n/N decode-progress bar appears on workspace
-            # reopen too, not just fresh opens. session_from_source itself doesn't
-            # forward it through to Session.from_x yet (that's workspace.py, owned
-            # elsewhere) — this just carries it as far as this factory can.
-            sess = session_from_source(w.source, register_map=self._rmap)
-            depths = ({int(d): int(v) for d, v in w.device_hub_depths.items()}
-                      if w.device_hub_depths else None)
-            scram = {}
-            for row in (w.device_scramblers or []):
-                try:                                  # [device, dp, on]
-                    d, p, on = int(row[0]), int(row[1]), bool(row[2])
-                except (IndexError, TypeError, ValueError):
-                    continue
-                scram[(d, p)] = on
-            overs = {}
-            for row in (w.overlay or []):
-                try:                                  # [section, device, address, value]
-                    sect, d, a, v = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-                except (IndexError, TypeError, ValueError):
-                    continue
-                overs[(sect, d, a)] = v & 0xFF
-            # Stage every decode input (hub depths + scrambler overrides), then do a
-            # SINGLE re-decode via the last setter, so reopening doesn't fan out into
-            # several decodes. Register overrides re-decode last (they also stage).
-            if depths is not None:
-                sess.hub_depths = depths
-            if scram:
-                sess.scrambler_overrides = scram
-            if overs:
-                sess.set_register_overrides(overs)    # sets overrides + one re-decode
-            elif scram:
-                sess.set_scrambler_overrides(scram)   # one re-decode (picks up staged depths)
-            elif depths is not None:
-                sess.set_hub_depths(depths)
-            return sess
-        self._load_async(factory, after=lambda _session, w=ws: self.apply_workspace(w))
+        # thread factory (both change the decode), in a single off-GUI-thread decode per
+        # Link. Doing it in apply_workspace (GUI thread) would re-decode again and freeze
+        # the UI. The Links decode one after another through the load queue: the first
+        # replaces the analysis, the rest are added (never dropped by the queue), and the
+        # view state is applied once the LAST one has loaded.
+        #
+        # The Links after the first are queued only once the first has LOADED: if it fails,
+        # nothing else runs, where queueing all at once would add the rest onto whatever
+        # analysis was already open. Each Link that loads records which saved Link it is,
+        # so a failure in the middle cannot shift names, offsets and bookmarks onto the
+        # wrong Link, and the view state is applied once every Link has settled, loaded
+        # or failed.
+        state: Dict[str, Any] = {"loaded": [], "waiting": 0}   # saved-Link order; still loading
 
-    def apply_workspace(self, ws: Workspace) -> None:
-        """Apply view state (bookmarks, cursor) onto the loaded session."""
-        self._bookmarks = BookmarkSet.from_json(ws.bookmarks)
+        def finish(w=ws):
+            self.apply_workspace(w, loaded=state["loaded"])
+
+        def settle(i: int, ok: bool) -> None:
+            if ok:
+                state["loaded"].append(i)
+            state["waiting"] -= 1
+            if state["waiting"] == 0:
+                finish()
+
+        def first_loaded(_session, w=ws) -> None:
+            state["loaded"].append(0)
+            rest = list(range(1, len(w.links)))
+            state["waiting"] = len(rest)
+            if not rest:
+                finish()
+            for i in rest:
+                self._load_async(lambda spec=w.links[i], **kw: self._link_factory(spec, **kw),
+                                 after=lambda _s, i=i: settle(i, True), kind="add",
+                                 on_fail=lambda i=i: settle(i, False))
+
+        # Through _after_open, as Open Capture's: a newer open asked for while Link 1 decodes
+        # must not get this workspace's other Links added on top of it.
+        self._load_async(lambda spec=ws.links[0], **kw: self._link_factory(spec, **kw),
+                         after=self._after_open(first_loaded, opening=True), kind="open")
+
+    def _link_factory(self, w: LinkSpec, **kw) -> Session:
+        """Rebuild one saved Link's Session, decode inputs and all, on the load worker."""
+        # **kw absorbs decoder_ready (see _factory_takes_decoder_ready /
+        # _LoadWorker.run) so the n/N decode-progress bar appears on workspace
+        # reopen too, not just fresh opens. session_from_source itself doesn't
+        # forward it through to Session.from_x yet (that's workspace.py, owned
+        # elsewhere) — this just carries it as far as this factory can.
+        sess = session_from_source(w.source, register_map=self._rmap)
+        depths = ({int(d): int(v) for d, v in w.device_hub_depths.items()}
+                  if w.device_hub_depths else None)
+        scram = {}
+        for row in (w.device_scramblers or []):
+            try:                                  # [device, dp, on]
+                d, p, on = int(row[0]), int(row[1]), bool(row[2])
+            except (IndexError, TypeError, ValueError):
+                continue
+            scram[(d, p)] = on
+        overs = {}
+        for row in (w.overlay or []):
+            try:                                  # [section, device, address, value]
+                sect, d, a, v = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            except (IndexError, TypeError, ValueError):
+                continue
+            overs[(sect, d, a)] = v & 0xFF
+        # Stage every decode input (hub depths + scrambler overrides), then do a
+        # SINGLE re-decode via the last setter, so reopening doesn't fan out into
+        # several decodes. Register overrides re-decode last (they also stage).
+        if depths is not None:
+            sess.hub_depths = depths
+        if scram:
+            sess.scrambler_overrides = scram
+        if overs:
+            sess.set_register_overrides(overs)    # sets overrides + one re-decode
+        elif scram:
+            sess.set_scrambler_overrides(scram)   # one re-decode (picks up staged depths)
+        elif depths is not None:
+            sess.set_hub_depths(depths)
+        return sess
+
+    def apply_workspace(self, ws: Workspace, loaded=None) -> None:
+        """Apply view state (bookmarks, cursor, active Link, pane layout) and each Link's
+        name, offset and device metadata onto the loaded Links.
+
+        `loaded` lists, in Link order, which of the workspace's Links each loaded Link is
+        (default: all of them, in order). A saved Link that failed to load is simply
+        absent, and everything that referred to it (its bookmarks, a pane group showing
+        it) is dropped or falls back, instead of landing on its neighbour."""
+        loaded = list(range(len(ws.links))) if loaded is None else list(loaded)
+        where = {spec_i: link_i for link_i, spec_i in enumerate(loaded)
+                 if link_i < len(self._links)}
+        active = where.get(ws.active_link, 0)
+        for spec_i, link_i in where.items():
+            link, spec = self._links[link_i], ws.links[spec_i]
+            link.name = spec.name
+            link.offset_ps = int(spec.offset_ps)
+            if link.view is not None:
+                link.view.stream_colors = line_style.overrides_from_json(spec.stream_colors)
+            # Device names and register maps are UI metadata (cheap). Hub depths were
+            # already applied in the worker-thread factory and reflected by load_session,
+            # so there's no re-decode here.
+            if spec.device_names:
+                link.session.device_names = {int(d): n for d, n in spec.device_names.items()}
+            if spec.device_regmaps:
+                from ..model.regmap_import import PeripheralRegisterMap
+                for dev_str, doc in spec.device_regmaps.items():
+                    link.session.set_peripheral_map(int(dev_str),
+                                                    PeripheralRegisterMap.from_json_dict(doc))
+        # The offsets are assigned directly, and each band's domain was computed as its Link
+        # was added, at offset 0: recompute it once for all of them, or every band but the
+        # first draws unshifted until a zoom re-syncs it.
+        self._update_timeline_domain()
+        if 0 <= active < len(self._links):
+            self.switch_link(active)
+        self._push_stream_colors()              # switch_link is a no-op on the shown Link
+        self._update_link_switcher()
+        self._update_title()
+        bms = BookmarkSet.from_json(ws.bookmarks)
+        # A bookmark on a Link that did not load has nowhere to be shown; keep the rest,
+        # renumbered to the Links as loaded.
+        kept = []
+        for b in bms:
+            if b.link in where:
+                b.link = where[b.link]
+                kept.append(b)
+        self._bookmarks = BookmarkSet(kept)
         self._push_bookmarks()
         self.cursor.set_sample(ws.cursor)
-        if self._session is not None:
-            # Device names are UI metadata (cheap). Hub depths were already applied
-            # in open_workspace's worker-thread factory and reflected by
-            # load_session, so there's no re-decode here.
-            if ws.device_names:
-                self._session.device_names = {int(d): n for d, n in ws.device_names.items()}
+        shown = ws.links[ws.active_link] if ws.active_link in where else None
+        if self._session is not None and shown is not None:
+            if shown.device_names:
                 self._reg_view.set_device_names(self._session.device_names)
-        if ws.device_regmaps and self._session is not None:
-            from ..model.regmap_import import PeripheralRegisterMap
-            for dev_str, doc in ws.device_regmaps.items():
-                self._session.set_peripheral_map(int(dev_str),
-                                                 PeripheralRegisterMap.from_json_dict(doc))
-            self._reg_view.set_peripheral_maps(self._session.peripheral_maps)
-            self._reg_view.set_files(self._session.register_files_at(self.cursor.sample))
+            if shown.device_regmaps:
+                self._reg_view.set_peripheral_maps(self._session.peripheral_maps)
+                self._reg_view.set_files(self._session.register_files_at(self.cursor.sample))
         if ws.authoring:
             self._authoring.set_config(BusConfig.from_dict(ws.authoring))
         if ws.timing:
             self._timing_page.set_from_dict(ws.timing)
         self._apply_view_prefs(ws.view)
+        view = dict(ws.view or {})
+        if isinstance(view.get("pane_links"), dict):
+            view["pane_links"] = {g: where[i] for g, i in view["pane_links"].items()
+                                  if isinstance(i, int) and i in where}
+        self._apply_link_view_prefs(view, active)
         if ws.mode in MODES:
             self._mode_mgr.switch_to(ws.mode)
 
@@ -3059,7 +3468,8 @@ class MainWindow(QMainWindow):
 
         self._grid_rows_edit.setText(str(_int("grid_rows", DEFAULT_GRID_ROWS)))
         self._on_grid_rows_edit()               # clamps 1..10240
-        self._raw_view.set_show_clock(bool(view.get("show_clock", True)))
+        for v in self._raw_lanes.views:
+            v.set_show_clock(bool(view.get("show_clock", True)))
         tx_on = bool(view.get("tx_map", False))
         self._toggles_btn.setChecked(tx_on)
         # Persistence only matters while toggles are shown; force it off otherwise so a
@@ -3067,21 +3477,43 @@ class MainWindow(QMainWindow):
         self._persist_btn.setChecked(tx_on and bool(view.get("tx_persist", False)))
         if tx_on:
             self._tx_scroll.setValue(_int("tx_start_row", 0))
-        if self._session is not None:
-            self._apply_grid_for_sample(self.cursor.sample)
+        self._refresh_grid()
 
-    def _load_async(self, factory, after=None) -> None:
+    def _load_async(self, factory, after=None, kind=None, session=None,
+                    on_fail=None, _queued: bool = False) -> None:
         """Build a Session via `factory()` (the heavy decode + audio store) on a
         worker thread, showing an indeterminate busy dialog so the UI stays
         responsive. On success runs load_session + optional `after(session)` on the
-        GUI thread; on failure shows the error. If a decode is already running, the
-        LATEST request is queued and run when it finishes (so a fast re-decode — an
-        SSP step, a toggle — isn't silently dropped)."""
+        GUI thread; on failure shows the error.
+
+        `kind` says what the load is for: "open" (the default) replaces the analysis,
+        "add" appends a Link (the Open Capture dialog's Add), and "redecode" reloads the active
+        Link's session in place. If a decode is already running the request is queued, and
+        a queued request is superseded only by one that makes it pointless: any open
+        supersedes everything, a re-decode supersedes earlier re-decodes of the SAME
+        session (latest wins, so a fast SSP step or toggle isn't silently dropped), and an
+        added Link is never dropped by anything but an open. A re-decode is of the active
+        Link's session unless `session` names another Link's. `on_fail()` runs if the decode
+        fails, so a caller sequencing several loads can carry on or stop."""
+        kind = kind or "open"
+        if kind == "open" and not _queued:
+            # Counted when an open is ASKED FOR, once: a queued one comes back through here
+            # to start (_run_pending_load), and counting it again made its own follow-on
+            # Links look superseded (_after_open), so they were dropped.
+            self._open_gen += 1
+        key = (session if session is not None else self._session) if kind == "redecode" else None
         if getattr(self, "_load_thread", None) is not None:
-            self._load_pending = (factory, after)   # latest wins; run on completion
+            pending = list(getattr(self, "_load_pending", None) or [])
+            if kind == "open":
+                pending = []
+            elif kind == "redecode":
+                pending = [r for r in pending if not (r[2] == "redecode" and r[3] is key)]
+            self._load_pending = pending + [(factory, after, kind, key, on_fail)]
             return
-        self._load_pending = None
         self._load_after = after
+        self._load_kind = kind
+        self._load_key = key
+        self._load_on_fail = on_fail
         dlg = QProgressDialog("Decoding capture…", None, 0, 0, self)
         dlg.setWindowTitle("SWI3S Studio")
         # NON-modal, deliberately: an ApplicationModal QProgressDialog spins a modal
@@ -3199,13 +3631,15 @@ class MainWindow(QMainWindow):
         if getattr(self, "_closing", False):
             self._load_pending = None     # window is going away; don't spawn a thread
             return
-        pending = getattr(self, "_load_pending", None)
-        if pending is not None:
-            self._load_pending = None
-            self._load_async(*pending)
+        pending = list(getattr(self, "_load_pending", None) or [])
+        if pending:
+            factory, after, kind, key, on_fail = pending.pop(0)
+            self._load_pending = pending
+            self._load_async(factory, after, kind, session=key, on_fail=on_fail, _queued=True)
 
     def _on_load_done(self, session, store, extras) -> None:
         after = self._load_after
+        on_fail = getattr(self, "_load_on_fail", None)
         # Stop the decode-progress poll BEFORE any dialog work, then keep the busy dialog
         # up through load_session — building the views (command table, timeline, grid,
         # statistics) is heavy GUI-thread work that freezes the event loop. If the dialog
@@ -3227,10 +3661,27 @@ class MainWindow(QMainWindow):
         # worker is joined. Guard it: an exception here would otherwise escape the
         # queued slot as an unhandled GUI-thread crash. Surface it like the
         # decode-failure path does.
+        kind = getattr(self, "_load_kind", "open")
         try:
-            self.load_session(session, store, extras=extras)
-            if after is not None:
-                after(session)
+            if kind == "redecode" and self._links.index_of(session) < 0:
+                # Its Link was removed while it decoded. Loading it would make it a NEW
+                # capture and replace every surviving Link with the removed one.
+                self._status.setText("Discarded a re-decode of a Link that was removed.")
+            else:
+                try:
+                    self.load_session(session, store, extras=extras, add_link=kind == "add")
+                except Exception:
+                    # The request must still settle, or a workspace waiting on it never
+                    # applies its saved state to the Links that did load. If the session
+                    # became a Link anyway, it counts as loaded; otherwise as failed.
+                    if self._links.index_of(session) >= 0:
+                        if after is not None:
+                            after(session)
+                    elif on_fail is not None:
+                        on_fail()
+                    raise
+                if after is not None:
+                    after(session)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user
             QMessageBox.critical(self, "Load failed",
                                  f"The capture decoded but the views failed to load: {exc}")
@@ -3239,146 +3690,594 @@ class MainWindow(QMainWindow):
         self._run_pending_load()
 
     def _on_load_failed(self, message: str) -> None:
+        on_fail = getattr(self, "_load_on_fail", None)
         self._finish_load()
         QMessageBox.critical(self, "Open failed", message)
+        if on_fail is not None:
+            on_fail()
         self._run_pending_load()
 
-    def load_session(self, session: Session, audio_store=None, extras=None,
-                     switch_mode: bool = True) -> None:
-        # `extras` (from the load worker) carries values precomputed off the GUI thread
-        # so this method doesn't recompute them here and freeze the UI. None → compute
-        # lazily (the synchronous demo path).
-        extras = extras or {}
-        # Any real load settles the question the startup demo preload existed to answer, so
-        # entering the Analyzer later must not decode a demo over this capture.
-        self._demo_preload_pending = False
-        # A re-decode (SSP step, register/scrambler override, Port-Samples collect) mutates
-        # the SAME session in place and reloads it, so `session is` the previous one — keep
-        # the command filter across it. A genuinely NEW capture clears filters below.
-        re_decode = (session is self._session) and self._session is not None
-        self._session = session
-        # Command table shows the decoded commands PLUS synthetic 'Commit Point' rows at
-        # each confirmed sync-point commit's SSP (where it takes effect) — sorted in with
-        # the commands. PROTOTYPE: these extra rows are table-only (not in session.commands),
-        # so the timeline ticks, error counts and audio are unchanged. _starts/_kinds are
-        # built from this augmented list so cursor-selection + filtering stay aligned.
-        # session.commands is chronological (decoder emits in ascending start_sample) and
-        # commit_point_rows() is a small, sorted set of table-only rows; merge the two sorted
-        # streams (O(N+M)) instead of concatenating + re-sorting the whole list (O(N log N) +
-        # a full copy). heapq.merge breaks ties by iterable order, so commands still precede a
-        # commit row at the same start_sample — identical to the old stable sorted().
-        table_cmds = list(heapq.merge(session.commands, session.commit_point_rows(),
-                                      key=lambda c: int(c.get("start_sample", 0))))
-        self._cmd_model = CommandTableModel(table_cmds, self._rmap,
-                                            session.sample_rate_hz,
-                                            peripheral_maps=session.peripheral_maps,
-                                            row_origin=session.row_origin)
-        self._cmd_proxy.setSourceModel(self._cmd_model)
-        self._cmd_view.fit_columns()
-        # Cursor-selection / arrow-nav anchor samples: each command's Row Sync Point (its
-        # cursor sample), NOT the raw Column-0 closing edge — so a cursor parked on a
-        # command's RSP resolves to THAT command (bisect in RSP space), matching where
-        # command_cursor_sample / symbol / commit navigation place the cursor.
-        self._starts = [session.command_cursor_sample(c) for c in table_cmds]
+    @property
+    def links(self) -> LinkSet:
+        return self._links
 
-        kinds = sorted({c.get("command", "") for c in table_cmds} - {""})
-        if not re_decode:
-            self._kind_menu._fill([(k, k) for k in kinds])   # repopulate for this capture
-            self._clear_all_filters()                        # don't carry a prior capture's filters
-        # else: same capture re-decoded — keep the command filter (menu + proxy) intact.
-        self._update_cmd_title()
+    def _bottom_link_state(self, link: Optional[int] = None) -> Optional[LinkPanelState]:
+        i = self._pane_link.get("bottom", -1) if link is None else link
+        return self._links[i].view if 0 <= i < len(self._links) else None
 
-        # Initialize the register view and bus grid AS-OF the cursor's start (t=0),
-        # not the whole-capture end state — so the far-left cursor shows the bus
-        # before any configuration (defaults / empty grid), and, when a §5.1.2
-        # bring-up is present, "No PHY Selected" until the PHY-select is decoded.
-        # Both views then fill in as the cursor advances past the config commands.
-        self._reg_view.set_files(session.register_files_at(0))
-        self._reg_view.set_peripheral_maps(session.peripheral_maps)
-        self._reg_view.set_device_names(session.device_names)
-        self._reg_view.set_phy(session.link_control.phy_name)
-        # Keep the TX-map scroll position across a re-decode (SSP step, override, CSV):
-        # _update_tx_scrollbar clamps it into the new capture's range rather than
-        # snapping back to row 0 on every re-decode. (A genuinely new/shorter capture
-        # just clamps to a valid row.)
-        self._update_tx_scrollbar()
-        self._apply_grid_for_sample(0)
-        self._audio_store = (audio_store if audio_store is not None
-                             else session.audio_store(pdm_dc_block=self._pdm_dc_block))
-        # Audio waveforms are plotted in CAPTURE-sample space so they sit at their true
-        # offset and line up under the timeline — give the view the capture rate + full
-        # extent (commands + audio) BEFORE set_store (which rebuilds the plots).
-        capture_total = max([c.get("end_sample", 0) for c in session.commands]
-                            + [session.audio_end_sample, 1])
-        self._audio_view.set_capture_context(session.sample_rate_hz, capture_total)
-        self._audio_view.set_row_label(
-            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
-        self._audio_view.set_store(self._audio_store)
-        self._export_action.setEnabled(not self._audio_store.is_empty())
-        self._export_capture_action.setEnabled(True)     # a capture is now loaded
-        self._build_decimation_menu()            # per-dataport decimation for this capture's streams
-        self._symbol_view.set_sample_rate(session.sample_rate_hz)
-        self._symbol_view.set_row_origin(session.row_origin)
-        self._symbol_view.set_symbols(session.symbols())
-        # DLV (PHY3): the Raw view collapses the complementary DP/DN pair to one
-        # differential trace in the audio region and draws the recovered bit clock
-        # beneath it; FBCSE passes no DLV info and keeps the two forwarded-clock traces.
-        _dlv = session.is_dlv
-        _rec = session.recovered_clock() if _dlv else None
-        self._raw_view.set_capture(session.capture,
-                                   dp_is_data_line=session.link_control.lc_on_data_line,
-                                   dlv=_dlv, audio_start=session.audio_start_sample,
-                                   recovered_clock=_rec,
-                                   segments=session.segments if _dlv else None)
-        # Nominal samples per bus row (row rate → samples), for the zoom-to-row button.
-        _row_hz = (session.row_rate_khz or 0.0) * 1000.0
-        self._raw_view.set_row_samples(session.sample_rate_hz / _row_hz if _row_hz else 0.0)
-        # Samples per UI (max-zoom floor: don't let the user zoom in past ~1 UI).
-        self._raw_view.set_ui_samples(
-            session.sample_rate_hz / session.ui_rate_hz if session.ui_rate_hz else 0.0)
-        self._raw_view.set_cds_provider(session.cds_column_samples)
-        self._raw_view.set_commit_provider(session.commit_column_samples)
-        # DLV: flag recovered Row Sync Points with no 0→1 edge on the wire (PLL lock gaps)
-        # and raise the unlock banner when there are more than the session's threshold.
-        self._raw_view.set_missing_provider(session.missing_rsp_samples)
-        self._raw_view.set_pll_unlocked(session.pll_unlocked)
-        self._raw_view.set_row_label(
-            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
-        _store = self._audio_store
-        _lanes = [(d, p, ch) for (d, p) in _store.streams() for ch in _store.channels(d, p)]
-        self._raw_view.set_port_marks(session.port_bit_marks, _lanes)
-        self._sample_view.set_sample_rate(session.sample_rate_hz)
-        self._sample_view.set_row_origin(session.row_origin)
-        self._sample_view.set_lanes(_lanes)
-        self._sample_range = None          # (lo,hi) loaded row positions; None = needs (re)build
-        self._sample_total = 0             # total filtered samples (full scrollable extent)
-        self._sample_filters = None        # filters the loaded window was built with
-        self._symbol_range = None          # (first,last) start_sample of the loaded CDS window
-        self._eye_view.set_analysis_context(session.segments, session.timing_regions(),
-                                            session.timing_column_roles)
-        self._eye_view.set_capture(session.capture, recovered_clock=_rec)
-        self._eye_view.set_sections(extras.get("sections")
-                                    if extras.get("sections") is not None
-                                    else session.section_ui_stats())   # per-section min/max UI
-        self._timeline.set_sample_rate(session.sample_rate_hz)
-        self._timeline.set_row_origin(session.row_origin)
-        self._timeline.set_row_label(
-            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
-        # capture_measurements iterates the whole audio store; Statistics is hidden at
-        # load (Grid/Registers are raised), so defer the build to first show. It re-runs
-        # on the next Statistics show after any re-decode (see _refresh_measurements).
-        self._meas_dirty = True
-        if self._meas_dock.isVisible():
-            self._refresh_measurements()
-        self._bookmarks.clear()
+    def _push_stream_colors(self) -> None:
+        """Each Link's per-stream colours to the panes showing it: Audio and Capture (its
+        bit overlay), lane by lane in All Links, and Samples (its Port column)."""
+        for k, raw, audio in self._bottom_lanes():
+            st = self._bottom_link_state(k)
+            for view in (audio, raw, self._table_lane(self._sample_lanes, k)):
+                view.set_stream_colors(st.stream_colors if st is not None else {})
+
+    def _on_stream_color_chosen(self, device: int, dp: int, color: str,
+                                link: Optional[int] = None) -> None:
+        """A stream's colour was picked (or reset, `color` "") in the Audio pane: keep
+        it as the override of the Link that lane shows, for the current theme, and
+        recolour."""
+        st = self._bottom_link_state(link)
+        if st is None:
+            return
+        key = (int(device), int(dp), VizTheme.MODE)
+        if color:
+            st.stream_colors[key] = color
+        else:
+            st.stream_colors.pop(key, None)
+        self._push_stream_colors()
+
+    # ---- All Links in the bottom group: Capture and Audio, one lane per Link ----
+    def _wire_capture(self, view):
+        """Connect a Capture view (the pane's own, or a lane's) to the Link it shows."""
+        view.sampleSelected.connect(lambda s, v=view: self._on_lane_seek(v, s))
+        view.bookmarkMoved.connect(lambda lb, s, final, v=view: self._on_bookmark_moved(
+            lb, s, final, link=self._lane_link(v)))
+        return view
+
+    def _wire_audio(self, view):
+        """Connect an Audio view (the pane's own, or a lane's) to the Link it shows: its
+        clicks and sweeping playhead seek, its drags move that Link's bookmarks, and its
+        stream colours are that Link's."""
+        view.seeked.connect(lambda s, v=view: self._on_lane_seek(v, s))
+        view.playCursorMoved.connect(lambda s, v=view: self._on_lane_seek(v, s))
+        view.stopped.connect(self._on_playback_stopped)    # full refresh on stop
+        view.playStarted.connect(lambda v=view: self._on_lane_play(v))
+        view.bookmarkMoved.connect(lambda lb, s, final, v=view: self._on_bookmark_moved(
+            lb, s, final, link=self._lane_link(v)))
+        view.streamColorChosen.connect(lambda d, p, c, v=view: self._on_stream_color_chosen(
+            d, p, c, link=self._lane_link(v)))
+        return view
+
+    def _lane_link(self, view) -> int:
+        """The Link a Capture or Audio view shows: its lane's in All Links, else the
+        bottom group's."""
+        if self._bottom_all:
+            for lanes in (self._raw_lanes, self._audio_lanes):
+                if view in lanes.views:
+                    return lanes.views.index(view)
+        return self._pane_link["bottom"]
+
+    def _bottom_lanes(self):
+        """(Link, Capture view, Audio view) for each lane shown: one per Link in All
+        Links, else the bottom group's Link with the panes' own views."""
+        if self._bottom_all:
+            n = len(self._links)
+            return list(zip(range(n), self._raw_lanes.views[:n], self._audio_lanes.views[:n]))
+        return [(self._pane_link["bottom"], self._raw_view, self._audio_view)]
+
+    def _audio_lane(self):
+        """The Audio view a bottom-group menu acts on: in All Links the active Link's lane
+        (the one last worked in), else the pane's own."""
+        a = self._links.active_index
+        if self._bottom_all and 0 <= a < len(self._audio_lanes.views):
+            return self._audio_lanes.views[a]
+        return self._audio_view
+
+    def _capture_lane(self):
+        """The Capture view for the active Link: its lane in All Links, else the pane's."""
+        a = self._links.active_index
+        if self._bottom_all and 0 <= a < len(self._raw_lanes.views):
+            return self._raw_lanes.views[a]
+        return self._raw_view
+
+    def _wire_symbols(self, view):
+        """Connect a CDS table (the pane's own, or a lane's) to the Link it shows."""
+        view.sampleSelected.connect(
+            lambda s, v=view: self._on_table_lane(v, self._on_symbol_selected, s))
+        view.moreAboveRequested.connect(
+            lambda s, v=view: self._on_table_lane(v, self._extend_symbols_above, s))
+        return view
+
+    def _wire_samples(self, view):
+        """Connect a Samples table (the pane's own, or a lane's) to the Link it shows."""
+        view.sampleSelected.connect(
+            lambda s, v=view: self._on_table_lane(v, self._on_sample_selected, s))
+        view.filtersChanged.connect(
+            lambda v=view: self._on_table_lane(v, self._on_sample_filters_changed))
+        view.edgeReached.connect(       # lazy load on scroll-to-edge
+            lambda d, v=view: self._on_table_lane(v, self._on_sample_edge, d))
+        return view
+
+    def _wire_timing(self, view):
+        """Connect a Timing pane (the pane's own, or a lane's): a worst-UI jump visits
+        that lane's Link."""
+        view.sampleSelected.connect(
+            lambda s, v=view: self._on_table_lane(v, self._on_timing_jump, s))
+        return view
+
+    def _table_lane(self, lanes, k: int):
+        """Lane k's pane in All Links, else the pane's own."""
+        return lanes.views[k] if self._bottom_all and k < len(lanes.views) else lanes.views[0]
+
+    @contextlib.contextmanager
+    def _as_lane(self, k: int):
+        """Run CDS / Samples / Timing code for lane k: Link k active (`_as_link`) and
+        `self._symbol_view` / `self._sample_view` / `self._eye_view` pointing at its
+        panes, so the single-Link handlers run as they are, lane by lane."""
+        prev = self._symbol_view, self._sample_view, self._eye_view
+        self._symbol_view = self._table_lane(self._symbol_lanes, k)
+        self._sample_view = self._table_lane(self._sample_lanes, k)
+        self._eye_view = self._table_lane(self._eye_lanes, k)
+        try:
+            with self._as_link(k):
+                yield
+        finally:
+            self._symbol_view, self._sample_view, self._eye_view = prev
+
+    def _on_table_lane(self, view, handler, *args) -> None:
+        """A CDS or Samples table asked for something (a selection, the history above,
+        an edge, a filter). In All Links its lane's Link becomes the active one, as a
+        touch would make it, and the handler runs on that lane's tables."""
+        if not self._bottom_all:
+            handler(*args)
+            return
+        k = max(lanes.lane_of(view) for lanes in (
+            self._symbol_lanes, self._sample_lanes, self._eye_lanes))
+        if k < 0:
+            handler(*args)
+            return
+        self._activate_link(k)
+        self._origin_lane = k
+        try:
+            with self._as_lane(k):
+                handler(*args)
+        finally:
+            self._origin_lane = -1
+
+    def _stop_audio(self) -> None:
+        for v in self._audio_lanes.views:
+            v.stop()
+
+    def _audio_playing(self) -> bool:
+        return any(v.is_playing for v in self._audio_lanes.views)
+
+    def _on_lane_play(self, view) -> None:
+        """One output device: a lane starting playback stops any other."""
+        for v in self._audio_lanes.views:
+            if v is not view and v.is_playing:
+                v.stop()
+
+    def _on_lane_seek(self, view, sample: int) -> None:
+        """A seek from Capture or Audio, counted in the Link that view shows."""
+        if len(self._links) > 1:
+            sample = self._clamp_to_active(self._links.convert(
+                int(sample), self._lane_link(view), self._links.active_index))
+        self._on_seek(sample)
+
+    def _in_link(self, link: int, sample: int) -> int:
+        """An active-Link sample counted in Link `link`."""
+        if len(self._links) < 2:
+            return int(sample)
+        return self._links.convert(int(sample), self._links.active_index, link)
+
+    def _sync_lanes(self) -> None:
+        """The lanes from the LinkSet: one per Link, named and offset into global time, in
+        All Links; else just the panes' own views."""
+        span = None
+        if self._bottom_all:
+            names = [link.name for link in self._links]
+            offs = [int(link.offset_ps) / 1e12 for link in self._links]
+            ends = [o + max(1, int(link.session.last_sample())) / float(
+                link.session.sample_rate_hz or 1) for o, link in zip(offs, self._links)]
+            span = (min(offs), max(ends))           # global seconds every Link covers
+        else:
+            names, offs = [""], [0.0]
+        for lanes in (self._raw_lanes, self._audio_lanes, self._symbol_lanes,
+                      self._sample_lanes, self._eye_lanes):
+            lanes.set_lanes(names, offs, span)
+
+    def _bind_lane_of(self, k: int) -> None:
+        """Bind lane k's Capture and Audio to Link k (All Links)."""
+        self._sync_lanes()
+        if 0 <= k < len(self._links):
+            with self._as_lane(k):
+                self._bind_lane(self._raw_lanes.views[k], self._audio_lanes.views[k])
+                self._bind_tables()
+                self._bind_timing()
+            self._update_capture_actions()      # out of the lane: the Link it would export
+
+    def _align_lanes(self) -> None:
+        """Every lane on the range of the bottom group's Link's lane."""
+        home = self._pane_link["bottom"]
+        for lanes in (self._raw_lanes, self._audio_lanes):
+            lanes.align_to(home if home < lanes.count() else 0)
+
+    def _raised_bottom_dock(self):
+        """The bottom-area dock on screen: the raised tab. Every tab of a tabbed group
+        reports isVisible(), and those behind keep stale heights (and ignore a resize), so
+        it is the one with something actually showing."""
+        docks = [d for d in (self._grid_dock, *self._group_docks["bottom"])
+                 if not d.isHidden() and not d.isFloating()]
+        return next((d for d in docks if not d.visibleRegion().isEmpty()), None)
+
+    def _settle_bottom_height(self, dock, height: int, passes: int = 3) -> None:
+        """Size the bottom docks back to `height` once the layout has settled. A resize
+        made at once is clamped to the lanes' minimum, which lingers until their layouts
+        run, and the rebind that follows leaving All Links queues more layout passes that
+        give the room back; so it is applied on the next pass of the event loop and again
+        while it has not held, up to `passes` times."""
+        def apply(n=passes):
+            if dock.isHidden() or dock.isFloating():
+                return
+            if dock.height() > height + 2:
+                self.resizeDocks([dock], [height], Qt.Vertical)
+                if n > 1:
+                    timers.after(0, self, lambda: apply(n - 1))
+        timers.after(0, self, apply)
+
+    def set_bottom_scope_all(self, on: bool, rebind: bool = True) -> None:
+        """Capture and Audio show every Link, one lane each on one global time axis (All
+        Links), or only the Link the bottom group's picker names. The other groups keep
+        the Links they show. `rebind=False` leaves the panes' binding to the caller: an
+        open that replaces the Links, or a removal down to one, binds them itself, and
+        binding them here as well did it twice."""
+        on = bool(on) and len(self._links) > 1
+        if on == self._bottom_all:
+            self._update_link_switcher()
+            return
+        self._stop_audio()
+        dock = self._raised_bottom_dock()
+        if on:
+            # Two or more lanes need more height, so Qt grows the docks; it never shrinks
+            # them again by itself, so remember the one-Link height to go back to (none,
+            # if no docked pane is on screen to measure: an old one would be wrong).
+            self._bottom_single_height = dock.height() if dock is not None else 0
+        self._bottom_all = on
+        self._sync_lanes()
+        if not on and not rebind:
+            # The caller binds the panes, cursor and pickers next: doing the cursor work here,
+            # on panes not yet bound, was wasted and handed the proxy a stale index.
+            if dock is not None and self._bottom_single_height:
+                self._settle_bottom_height(dock, self._bottom_single_height)
+            return
+        if on:
+            for k in range(len(self._links)):
+                with self._as_lane(k):
+                    self._bind_lane(self._raw_lanes.views[k], self._audio_lanes.views[k])
+                    self._bind_tables()
+                    self._bind_timing()
+            self._update_capture_actions()      # out of the lanes: the Link it would export
+        elif rebind:
+            with self._as_link(self._pane_link["bottom"]):
+                self._bind_lane(self._raw_view, self._audio_view)
+                self._bind_tables()
+                self._bind_timing()
         self._push_bookmarks()
-        # Remind the user which capture is loaded — but only in Analyzer mode (see
-        # _update_title): the capture is irrelevant to the Visualizer/Timing views.
-        self._update_title()
+        self._update_link_switcher()
+        if not on and dock is not None and self._bottom_single_height:
+            self._settle_bottom_height(dock, self._bottom_single_height)
+        if self._session is not None:
+            self._restore_cursor(self.cursor.sample)
+            if on:
+                self._align_lanes()
 
+    def _link_state(self) -> LinkPanelState:
+        active = self._links.active
+        return active.view if active is not None else self._idle_link
+
+    @property
+    def _session(self) -> Optional[Session]:
+        """The active Link's Session, or None when nothing is loaded."""
+        active = self._links.active
+        return active.session if active is not None else None
+
+    @_session.setter
+    def _session(self, session: Optional[Session]) -> None:
+        # Assigning the SAME session (a re-decode reload) keeps its Link and that Link's
+        # state; a different one replaces the analysis, as opening a capture always has.
+        if session is None:
+            self._links.clear()
+        elif self._session is not session:
+            self._links.replace(session, view=LinkPanelState())
+
+    def add_link(self) -> None:
+        """Open Capture with the dialog on Add (with nothing open, there is
+        nothing to add to, so it is a plain open)."""
+        self.open_capture(caption="Add a Link: open its capture",
+                          prefer_add=self._session is not None)
+
+    _OFFSET_UNITS = (("µs", 10 ** 6), ("ns", 10 ** 3), ("ms", 10 ** 9), ("s", 10 ** 12),
+                     ("ps", 1))
+
+    def set_link_offset(self, index: int, offset_ps: int) -> None:
+        """Place Link `index`'s sample 0 at `offset_ps` in global time. Only the mapping
+        moves (no re-decode): the timeline window, the All Links times, every bookmark
+        (each stays on its own Link's samples, so it moves with its Link) and each pane
+        group's instant are brought up to date."""
+        self._links[index].offset_ps = int(offset_ps)
+        # The remembered instant is the old offset's: reused, the next Link activation
+        # would put the cursor back where it was before the move.
+        self._cursor_instant = None
+        self._update_timeline_domain()
+        if self._bottom_all:
+            self._sync_lanes()                  # the lanes' axes and sync read the offsets
+            self._align_lanes()                 # each lane kept its own range: line them up
+        if self._cmd_all:
+            self._refresh_all_model()
+        self._push_bookmarks()
+        if self._session is not None:
+            self._restore_cursor(self.cursor.sample)
+        self._status.setText(f"{self._links[index].name} offset: "
+                             f"{_fmt_duration(int(offset_ps) / 1e12)}")
+
+    def set_link_offset_dialog(self) -> None:
+        """Set Offset… (a Link's timeline label): the active Link's offset, in a unit of
+        the user's choice."""
+        if len(self._links) < 2:
+            return
+        idx = self._links.active_index
+        link = self._links[idx]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Set Link Offset")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Where {link.name}'s capture starts, in the time all Links "
+                             f"share (positive = later):"))
+        row = QHBoxLayout()
+        value = QDoubleSpinBox()
+        value.setDecimals(6)                             # µs, the first unit: 1 ps
+        value.setRange(-_MAX_OFFSET_PS / 1e6, _MAX_OFFSET_PS / 1e6)
+        unit = QComboBox()
+        for name, _factor in self._OFFSET_UNITS:
+            unit.addItem(name)
+        value.setValue(link.offset_ps / self._OFFSET_UNITS[0][1])
+        # Changing the unit re-expresses the SAME offset in it (5 µs -> 5000 ns), so the
+        # unit is a way of reading the number, not a silent 1000x change to it.
+        shown = {"unit": 0}
+
+        def on_unit(i: int) -> None:
+            ps = value.value() * self._OFFSET_UNITS[shown["unit"]][1]
+            shown["unit"] = i
+            # Exactly enough decimals for 1 ps in this unit (10**k ps per unit -> k).
+            value.setDecimals(len(str(self._OFFSET_UNITS[i][1])) - 1)
+            span = _MAX_OFFSET_PS / self._OFFSET_UNITS[i][1]   # the same ±1000 s in any unit
+            value.setRange(-span, span)
+            value.setValue(ps / self._OFFSET_UNITS[i][1])
+        unit.currentIndexChanged.connect(on_unit)
+        row.addWidget(value, 1)
+        row.addWidget(unit)
+        lay.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if not dlg.exec():
+            return
+        factor = self._OFFSET_UNITS[unit.currentIndex()][1]
+        self.set_link_offset(idx, round(value.value() * factor))
+
+    def _cross_link_pairs(self) -> list:
+        """(group, member 1, member 2) for each complete bookmark pair on two Links."""
+        groups: Dict[str, dict] = {}
+        for bm in self._bookmarks:
+            groups.setdefault(bm.group, {})[bm.index] = bm
+        return [(g, m[1], m[2]) for g, m in sorted(groups.items())
+                if 1 in m and 2 in m and m[1].link != m[2].link
+                and max(m[1].link, m[2].link) < len(self._links)]
+
+    def align_on_bookmark_pair(self, group: Optional[str] = None) -> None:
+        """Bookmarks ▸ Align Links on Bookmark Pair…: a pair whose members mark the SAME
+        physical event on two Links. The second member's Link is moved so it lands on the first.
+        Both bookmarks stay where they are in their own Link's samples, so afterwards
+        they coincide, and every other bookmark on the moved Link moves with it."""
+        pairs = self._cross_link_pairs()
+        if not pairs:
+            QMessageBox.information(
+                self, "Align on Bookmark Pair",
+                "Place a bookmark pair across two Links first: one member on each, at the "
+                "same physical event (Ctrl+B on one Link, then on the other).")
+            return
+        if group is None:
+            items = [f"{g}: {a.display()} on {self._links[a.link].name} → "
+                     f"{b.display()} on {self._links[b.link].name}  (moves "
+                     f"{self._links[b.link].name} by "
+                     f"{_fmt_duration((self._bm_ps(a) - self._bm_ps(b)) / 1e12)})"
+                     for g, a, b in pairs]
+            choice, ok = QInputDialog.getItem(self, "Align on Bookmark Pair",
+                                              "Pair to align:", items, 0, False)
+            if not ok:
+                return
+            group = pairs[items.index(choice)][0]
+        g, a, b = next(p for p in pairs if p[0] == group)
+        moved = self._links[b.link]
+        self.set_link_offset(b.link, moved.offset_ps + self._bm_ps(a) - self._bm_ps(b))
+        self._status.setText(f"Aligned {moved.name} on pair {g}: offset "
+                             f"{_fmt_duration(moved.offset_ps / 1e12)}")
+
+    def _link_stem(self) -> str:
+        """A filename suffix naming the active Link ("_Amp_bus"), so exports of two Links
+        into one folder do not overwrite each other. Empty with one Link."""
+        if len(self._links) < 2 or self._links.active is None:
+            return ""
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", self._links.active.name).strip("_")
+        return f"_{slug}" if slug else f"_link{self._links.active_index + 1}"
+
+    def remove_link(self, index: Optional[int] = None, confirm: bool = True) -> None:
+        """Remove Link… (a Link's timeline label): drop a Link (default the active one) and
+        the bookmarks placed on it, after a confirmation that says how many. The last Link is not
+        removed — opening a capture replaces it. Everything that refers to Links by index
+        (bookmarks, each pane group's Link, the timeline bands) is renumbered, and the
+        cursor keeps its instant on whichever Link becomes active."""
+        if len(self._links) < 2:
+            return
+        idx = self._links.active_index if index is None else int(index)
+        if not 0 <= idx < len(self._links):
+            return
+        link = self._links[idx]
+        on_it = sum(1 for b in self._bookmarks if b.link == idx)
+        if confirm:
+            gone = f"\n\nIts {on_it} bookmark(s) are removed with it." if on_it else ""
+            if QMessageBox.question(self, "Remove Link", f"Remove {link.name}?{gone}",
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) != QMessageBox.Yes:
+                return
+        self._stop_audio()
+        if self._cmd_all and len(self._links) == 2:
+            self.set_commands_scope_all(False)  # one Link left: nothing to merge
+        if not self._cmd_all:
+            self._save_commands_view(self._pane_link["commands"])   # survives renumbering
+        t_ps = self._links[self._links.active_index].to_ps(self.cursor.sample)
+        keep = []
+        for b in self._bookmarks:
+            if b.link == idx:
+                continue
+            if b.link > idx:
+                b.link -= 1
+            keep.append(b)
+        self._bookmarks = BookmarkSet(keep)
+        # A queued re-decode of the removed Link must not run: it would land as a new
+        # capture. (One already running is discarded when it lands — see _on_load_done.)
+        self._load_pending = [r for r in (self._load_pending or [])
+                              if not (r[2] == "redecode" and r[3] is link.session)]
+        self._links.remove(idx)
+        new_active = self._links.active_index
+        for group in _PANE_GROUPS:
+            i = self._pane_link[group]
+            self._pane_link[group] = new_active if i == idx else (i - 1 if i > idx else i)
+        if self._bottom_all and len(self._links) < 2:
+            self.set_bottom_scope_all(False, rebind=False)   # bound once, below
+        new = self._links[new_active]
+        self._cursor_instant = None             # its Link index no longer means the same Link
+        self.cursor.rebase(min(max(0, new.to_sample(t_ps)), max(0, int(new.session.last_sample()))))
+        if self._cmd_all:
+            self._refresh_all_model()          # its rows name Links by index: rebuild first
+        # Each band is its Link's position, so every band from the removed one on changed.
+        self._sync_timeline_rows()
+        for i in range(len(self._links)):
+            self._bind_shared(i, feed_timeline=True)
+        for i in sorted(set(self._pane_link.values())):
+            self._bind_link(i, filters=self._links[i].view.filters, feed_timeline=False)
+        if self._bottom_all:                    # every lane after it now shows the next Link
+            for i in range(len(self._links)):
+                self._bind_lane_of(i)
+        self._push_bookmarks()
+        self._update_link_switcher()
+        self._update_title()
+        self._restore_cursor(self.cursor.sample)
+        self._status.setText(f"Removed {link.name}")
+
+    def rename_link(self) -> None:
+        if len(self._links) == 0:
+            return
+        # The Link is fixed BEFORE the dialog: closing it returns focus to a pane, which
+        # can make another Link active before the answer is applied.
+        idx = self._links.active_index
+        link = self._links[idx]
+        name, ok = QInputDialog.getText(self, "Rename Link", "Name:", text=link.name)
+        if not ok:
+            return
+        try:
+            self._links.rename(idx, name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Rename Link", str(exc))
+            return
+        # Everywhere the name is shown: the pickers and bands, the title, the All Links
+        # table (its Link column and text-filter index), and the bookmark labels.
+        self._update_link_switcher()
+        self._update_title()
+        if self._cmd_all:
+            self._refresh_all_model()
+        self._push_bookmarks()
+
+    def _update_link_switcher(self) -> None:
+        """Rebuild the pickers and View ▸ Links' entries from the LinkSet. The pickers
+        show only with two or more Links, as does View ▸ Links."""
+        if self._cmd_all and len(self._links) < 2:
+            self.set_commands_scope_all(False)
+        if self._bottom_all and len(self._links) < 2:
+            self.set_bottom_scope_all(False)
+        elif self._bottom_all:
+            self._sync_lanes()                  # names (a rename), and the lane count
+        combo = self._link_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for link in self._links:
+            combo.addItem(link.name)
+        if len(self._links) > 1:
+            combo.addItem(_ALL_LINKS)
+        combo.setCurrentIndex(len(self._links) if self._cmd_all
+                              else max(0, self._pane_link["commands"]))
+        combo.blockSignals(False)
+        for act, on in ((self._all_links_action, self._cmd_all),
+                        (self._bottom_all_action, self._bottom_all)):
+            act.blockSignals(True)
+            act.setChecked(on)
+            act.setEnabled(len(self._links) > 1)
+            act.blockSignals(False)
+        # Sized from the longest name, not left to AdjustToContents: under the stylesheet's
+        # padding and drop-down, and macOS's checkmark column in the popup, that elided
+        # "Link 1" / "Link 2" to an ambiguous "Link" in both the box and the list.
+        fm = combo.fontMetrics()
+        widest = max([fm.horizontalAdvance(link.name) for link in self._links]
+                     + [fm.horizontalAdvance(_ALL_LINKS)])
+        combo.setMinimumWidth(widest + 48)          # text + padding + drop-down arrow
+        combo.view().setMinimumWidth(widest + 64)   # + the popup's checkmark column
+        combo.setVisible(len(self._links) > 1)
+        _PaneTouchFilter.need(self, len(self._links) > 1)
+        if len(self._links) > 1:
+            self._ensure_pane_pickers()
+        for group, pickers in self._pane_pickers.items():
+            for picker in pickers:
+                picker.blockSignals(True)
+                picker.clear()
+                for link in self._links:
+                    picker.addItem(link.name)
+                if group == "bottom" and len(self._links) > 1:
+                    picker.addItem(_ALL_LINKS)          # one stacked pane per Link
+                picker.setCurrentIndex(len(self._links) if group == "bottom" and self._bottom_all
+                                       else max(0, self._pane_link[group]))
+                picker.setMinimumWidth(widest + 48)
+                picker.view().setMinimumWidth(widest + 64)
+                picker.blockSignals(False)
+                picker.setVisible(len(self._links) > 1)
+        for act in self._link_actions:
+            self._link_group.removeAction(act)
+            self._links_menu.removeAction(act)
+        self._link_actions = []
+        for i, link in enumerate(self._links):
+            act = self._links_menu.addAction(link.name)
+            act.setCheckable(True)
+            act.setChecked(i == self._links.active_index)
+            if i < 9:
+                act.setShortcut(QKeySequence(f"Ctrl+Alt+{i + 1}"))
+            act.triggered.connect(lambda _on=False, i=i: self.switch_link(i))
+            self._link_group.addAction(act)
+            self._link_actions.append(act)
+        self._align_links_action.setEnabled(len(self._links) > 1)
+        self._sync_view_links()
+        self._sync_timeline_rows()
+
+    def _feed_timeline(self, ribbon, session) -> None:
+        """Give one Link's ribbon that Link's events, config bands and bring-up. Everything
+        here is that Link's own; the cursor, view and bookmarks are synced separately."""
+        ribbon.set_sample_rate(session.sample_rate_hz)
+        ribbon.set_row_origin(session.row_origin)
+        ribbon.set_row_label(
+            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
         total = max([c.get("end_sample", 0) for c in session.commands]
                     + [session.audio_end_sample, 1])
-        self._timeline.set_events(session.commands, total)
+        ribbon.set_events(session.commands, total)
         # Anchor each config-band boundary at its row's Row Sync Point (the same edge the
         # commit-point marker uses), so a region transition is COINCIDENT with the commit
         # that caused it instead of ~1 UI later (the segment's raw start_sample is the
@@ -3395,13 +4294,780 @@ class MainWindow(QMainWindow):
             if i in getattr(session, "forced_column_sections", {}):
                 s2["forced"] = True
             band_segs.append(s2)
-        self._timeline.set_segments(band_segs, total)
-        self._timeline.set_bringup(session.link_control)
-        self._timeline.set_cursor(0)
-        self._update_nav_starts()               # arrow-nav starts (all visible at load)
-        self._timeline.set_commit_starts(self._sscr_samples())   # ⌘+arrow commit jump
-        self._timeline.set_commit_points(session.commit_point_samples())   # dotted SSP markers
+        ribbon.set_segments(band_segs, total)
+        ribbon.set_bringup(session.link_control)
+        ribbon.set_commit_points(session.commit_point_samples())   # dotted SSP markers
 
+    @property
+    def _timeline(self) -> TimelineRibbon:
+        """The ACTIVE Link's ribbon: every existing timeline call drives the Link on screen."""
+        i = self._links.active_index
+        return self._ribbons[i] if 0 <= i < len(self._ribbons) else self._ribbons[0]
+
+    def _add_ribbon(self) -> None:
+        ribbon = TimelineRibbon()
+        ribbon.seeked.connect(lambda s, r=ribbon: self._on_ribbon_seek(r, s))
+        ribbon.bookmarkMoved.connect(
+            lambda lbl, s, final, r=ribbon: self._on_ribbon_bookmark_moved(r, lbl, s, final))
+        ribbon.viewChanged.connect(lambda lo, hi, r=ribbon: self._on_ribbon_view(r, lo, hi))
+        label = _LinkBandLabel()
+        label.clicked.connect(lambda r=ribbon: self._on_ribbon_label(r, rename=False))
+        label.doubleClicked.connect(lambda r=ribbon: self._on_ribbon_label(r, rename=True))
+        label.menuRequested.connect(lambda pos, r=ribbon: self._link_label_menu(r, pos))
+        label.hide()                            # shown only in a stack of Links
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(label)
+        lay.addWidget(ribbon, 1)
+        self._timeline_col.addWidget(row, 1)
+        self._ribbons.append(ribbon)
+        self._ribbon_labels.append(label)
+        self._ribbon_rows.append(row)
+
+    def _sync_timeline_rows(self) -> None:
+        """One ribbon row per Link. With two or more, each row is labelled with its Link
+        (the active one marked), heights become flexible so the dock resizes vertically,
+        and the dock grows by a band per Link whenever the COUNT changes."""
+        n = max(1, len(self._links))
+        while len(self._ribbons) < n:
+            self._add_ribbon()
+        while len(self._ribbons) > n:
+            row = self._ribbon_rows.pop()
+            self._ribbons.pop()
+            self._ribbon_labels.pop()
+            self._timeline_col.removeWidget(row)
+            row.deleteLater()
+        multi = n > 1
+        if multi:
+            # As narrow as the longest name allows (bold, the active Link's look), so the
+            # bands start as far left as they can; every label the same width so the
+            # bands stay aligned.
+            bold = QFont(self._ribbon_labels[0].font())
+            bold.setBold(True)
+            fm = QFontMetrics(bold)
+            width = min(_LinkBandLabel.MAX_WIDTH,
+                        max(fm.horizontalAdvance(link.name) for link in self._links) + 16)
+            for label in self._ribbon_labels:
+                label.setFixedWidth(width)
+        for i, (ribbon, label) in enumerate(zip(self._ribbons, self._ribbon_labels)):
+            ribbon.set_flexible_height(multi)
+            label.setVisible(multi)
+            if multi and i < len(self._links):
+                label.set_link(self._links[i].name, i == self._links.active_index)
+        if n != self._timeline_rows_shown:
+            self._timeline_rows_shown = n
+            self.resizeDocks([self._timeline_dock], [n * TimelineRibbon.BAND_HEIGHT + 24],
+                             Qt.Vertical)
+
+    def _update_timeline_domain(self) -> None:
+        """Every ribbon covers the UNION of the Links' spans in global time, each in its
+        own samples, so the stack can share one window. One Link: its own capture."""
+        if len(self._links) < 2 or len(self._ribbons) < len(self._links):
+            for ribbon in self._ribbons:
+                ribbon.set_domain(None)
+            return
+        spans = [(link.to_ps(0), link.to_ps(ribbon._total))
+                 for link, ribbon in zip(self._links, self._ribbons)]
+        lo_ps, hi_ps = min(a for a, _ in spans), max(b for _, b in spans)
+        for link, ribbon in zip(self._links, self._ribbons):
+            ribbon.set_domain(link.to_sample(lo_ps), link.to_sample(hi_ps))
+        self._timeline._reset_view()            # the whole union; the others follow
+
+    def _on_ribbon_view(self, ribbon, lo: float, hi: float) -> None:
+        """A ribbon was zoomed or panned: show the same INSTANTS on every other Link."""
+        if self._syncing_views or len(self._links) < 2:
+            return
+        i = self._ribbons.index(ribbon)
+        if i >= len(self._links):
+            return
+        lo_ps, hi_ps = self._links[i].to_ps(round(lo)), self._links[i].to_ps(round(hi))
+        self._syncing_views = True
+        try:
+            for j, other in enumerate(self._ribbons[:len(self._links)]):
+                if j != i:
+                    other.set_view(self._links[j].to_sample(lo_ps),
+                                   self._links[j].to_sample(hi_ps))
+        finally:
+            self._syncing_views = False
+
+    def _sync_ribbon_cursors(self, sample: int) -> None:
+        """The cursor (active Link's samples) drawn at the same instant on every other
+        Link's ribbon."""
+        a = self._links.active_index
+        for j, ribbon in enumerate(self._ribbons[:len(self._links)]):
+            if j != a:
+                ribbon._cursor = self._links.convert(int(sample), a, j)
+                ribbon.update()
+
+    def _on_ribbon_seek(self, ribbon, sample: int) -> None:
+        """A click on a Link's band makes that Link the active one and moves the cursor to
+        the clicked sample on it, so a bookmark placed next (Ctrl+B) goes on the band that
+        was clicked. Which Link each pane GROUP shows is left alone: they all follow the
+        same instant anyway, and each group's Link is its picker's business."""
+        i = self._ribbons.index(ribbon)
+        if i < len(self._links) and i != self._links.active_index:
+            self._activate_link(i)
+        self._on_seek(self._clamp_to_active(int(sample)))
+
+    def _on_ribbon_bookmark_moved(self, ribbon, label: str, sample: int, final: bool) -> None:
+        """A bookmark dragged on a Link's band. Letting go makes that Link active, as a
+        click on the band does, so the cursor lands on the bookmark on its own bus."""
+        i = self._ribbons.index(ribbon)
+        link = i if i < len(self._links) else None
+        if final and link is not None and link != self._links.active_index:
+            self._activate_link(link)
+        self._on_bookmark_moved(label, sample, final, link=link)
+
+    def _sync_view_links(self) -> None:
+        """View ▸ Links shows in the Analyzer with two or more Links (with one, it would
+        offer only to show that Link, and the All Links toggles are off)."""
+        act = getattr(self, "_view_links_action", None)
+        if act is not None:
+            on = len(self._links) > 1 and self._mode_mgr_current() == ANALYSIS
+            act.setVisible(on)
+            act.setEnabled(on)
+
+    def _mode_mgr_current(self):
+        mgr = getattr(self, "_mode_mgr", None)
+        return mgr.current() if mgr is not None else None
+
+    def _link_label_menu(self, ribbon, pos) -> None:
+        """Right-click a Link's timeline label: that Link's own actions (they were the Links
+        menu's). Each acts on THIS Link: it is made the active one first."""
+        i = self._ribbons.index(ribbon)
+        if i >= len(self._links):
+            return
+        menu = QMenu(self)
+        rename = menu.addAction("&Rename Link…")
+        offset = menu.addAction("Set &Offset…")
+        remove = menu.addAction("Re&move Link…")
+        offset.setEnabled(len(self._links) > 1)
+        remove.setEnabled(len(self._links) > 1)
+        menu.addSeparator()
+        show = menu.addAction("&Show This Link Everywhere")
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+        self._activate_link(i)
+        if chosen is rename:
+            self.rename_link()
+        elif chosen is offset:
+            self.set_link_offset_dialog()
+        elif chosen is remove:
+            self.remove_link(i)
+        elif chosen is show:
+            self.switch_link(i)
+
+    def _on_ribbon_label(self, ribbon, rename: bool) -> None:
+        i = self._ribbons.index(ribbon)
+        if i >= len(self._links):
+            return
+        self.switch_link(i)
+        if rename:
+            self.rename_link()
+
+    def _table_model(self):
+        """The model the Commands table is showing: the active Link's, or All Links'."""
+        return self._all_model if (self._cmd_all and self._all_model is not None) \
+            else self._cmd_model
+
+    def _row_target(self, src_row: int):
+        """(Link index, command, cursor sample in that Link) for a row of the table on
+        screen, in either scope."""
+        if self._cmd_all and self._all_model is not None:
+            if not 0 <= src_row < self._all_model.rowCount():
+                return -1, None, None
+            li = self._all_model.link_at(src_row)
+            r = self._all_model.source_row_at(src_row)
+            st = self._links[li].view
+            return li, st.cmd_model.command_at(r), (st.starts[r] if r < len(st.starts) else None)
+        cmd = self._cmd_model.command_at(src_row) if self._cmd_model is not None else None
+        pos = self._starts[src_row] if 0 <= src_row < len(self._starts) else None
+        return self._links.active_index, cmd, pos
+
+    def _build_all_model(self) -> AllLinksCommandModel:
+        parts = []
+        for link in self._links:
+            st = link.view
+            rate = float(link.session.sample_rate_hz or 1)
+            pos = np.asarray(st.starts, dtype=np.float64) * (1e12 / rate) + link.offset_ps
+            parts.append((link.name, st.cmd_model, pos, link.offset_ps))
+        return AllLinksCommandModel(parts)
+
+    def _refresh_all_model(self) -> None:
+        """Rebuild the All Links table after any Link's commands, name or offset changed.
+        The proxy keeps its filter across the swap, and the table keeps its column widths
+        (including any the user dragged): fitting to content measures every cell, the
+        costliest step of a bind, so it is done once, as the per-Link tables do."""
+        if self._all_model is not None and self._cmd_proxy.sourceModel() is self._all_model:
+            self._all_col_widths = self._command_column_widths()
+        self._all_model = self._build_all_model()
+        self._cmd_proxy.setSourceModel(self._all_model)
+        widths = self._all_col_widths
+        if widths and len(widths) == self._all_model.columnCount():
+            for col, width in enumerate(widths):
+                self._cmd_view.setColumnWidth(col, width)
+        else:
+            self._cmd_view.fit_columns()
+            self._all_col_widths = self._command_column_widths()
+        self._update_cmd_title()
+
+    def _on_link_combo(self, index: int) -> None:
+        """The Commands picker: its own Link, or All Links. Only Commands changes."""
+        if index >= len(self._links):
+            self.set_commands_scope_all(True)
+        else:
+            self.set_group_link("commands", index)
+
+    def set_commands_scope_all(self, on: bool) -> None:
+        """Commands shows every Link's commands in global time order (All Links), or only
+        the Link its picker names. Entering keeps the filter as it stands, offering every
+        Link's command kinds; leaving restores that Link's own filter and column widths.
+        The other pane groups keep the Links they show."""
+        on = bool(on) and len(self._links) > 1
+        if on == self._cmd_all:
+            self._update_link_switcher()
+            return
+        with self._as_link(self._pane_link["commands"]):   # the Link Commands shows
+            st = self._link_state()
+            hdr = self._cmd_view.horizontalHeader()
+            if on:
+                st.filters = self._filter_snapshot()
+                st.col_widths = self._command_column_widths()
+                self._per_link_sort = (hdr.sortIndicatorSection(), hdr.sortIndicatorOrder())
+                self._cmd_all = True
+                self._refresh_all_model()
+                # Sort by the GLOBAL Time column: the per-Link sort column's index now names
+                # the Link column, which would order by Link, not time.
+                self._cmd_view.sortByColumn(AllLinksCommandModel.TIME_COLUMN, Qt.AscendingOrder)
+                kinds = sorted(set().union(*(set(link.view.kinds) for link in self._links)))
+                self._restore_filters(st.filters, kinds=kinds)
+            else:
+                self._all_col_widths = self._command_column_widths()   # for next time
+                self._cmd_all, self._all_model = False, None
+                self._cmd_proxy.setSourceModel(self._cmd_model)
+                section, order = getattr(self, "_per_link_sort", (0, Qt.AscendingOrder))
+                self._cmd_view.sortByColumn(section, order)
+                if st.col_widths is not None:
+                    for col, width in enumerate(st.col_widths):
+                        self._cmd_view.setColumnWidth(col, width)
+                if st.filters is not None:
+                    self._restore_filters(st.filters)
+                else:
+                    self._kind_menu._fill([(k, k) for k in st.kinds])
+                    self._clear_all_filters()
+        self._update_cmd_title()
+        self._update_link_switcher()
+        if self._session is not None:
+            self._cursor_commands(int(self.cursor.sample))
+
+    def _ensure_pane_pickers(self) -> None:
+        if self._pane_pickers["right"]:
+            return
+        for group, docks in self._group_docks.items():
+            for dock in docks:
+                picker = QComboBox()
+                picker.setStyleSheet(combo_qss())    # the arrow, as the Commands picker has
+                picker.setToolTip("Which Link this pane group shows")
+                picker.setFocusPolicy(Qt.NoFocus)
+                picker.hide()
+                picker.activated.connect(lambda i, g=group: self._on_group_picker(g, i))
+                dock.titleBarWidget().add_leading(picker)
+                self._pane_pickers[group].append(picker)
+
+    def _on_group_picker(self, group: str, index: int) -> None:
+        """A pane group's picker: a Link, or (the bottom group's last entry) All Links."""
+        if group == "bottom" and index == len(self._links):
+            self.set_bottom_scope_all(True)
+        else:
+            self.set_group_link(group, index)
+
+    def _for_group(self, group: str, action):
+        """A menu action that belongs to a pane group (Audio to the bottom group, Devices
+        to the right, Commands to Commands) acts on the Link THAT group shows: make it the
+        active Link first, then run the action."""
+        def run(*_args):
+            if len(self._links) > 1 and not (group == "commands" and self._cmd_all) \
+                    and not (group == "bottom" and self._bottom_all):
+                self._activate_link(self._pane_link[group])
+            return action()
+        return run
+
+    def _group_of(self, widget):
+        """The pane group a widget belongs to, or None (menus, dialogs, the timeline)."""
+        w = widget
+        while w is not None:
+            if w is self._analysis_page:
+                return "commands"
+            for group, docks in self._group_docks.items():
+                if w in docks:
+                    return group
+            w = w.parentWidget()
+        return None
+
+    def _on_pane_touched(self, widget) -> None:
+        if len(self._links) < 2:
+            return
+        group = self._group_of(widget)
+        if group is None or (group == "commands" and self._cmd_all):
+            return                  # All Links: a row picks its own Link when selected
+        if group == "bottom" and self._bottom_all:
+            lane = max(lanes.lane_of(widget) for lanes in (
+                self._raw_lanes, self._audio_lanes, self._symbol_lanes, self._sample_lanes,
+                self._eye_lanes))
+            if lane >= 0:           # a lane is its Link's, like a timeline band
+                self._activate_link(lane)
+                return
+        self._activate_link(self._pane_link[group])
+
+    def switch_link(self, index: int) -> None:
+        """Show Link `index` in EVERY pane group and make it the active Link: the Links
+        menu, a timeline band's label, and a newly added Link. (A group's own picker changes
+        only that group — see set_group_link.) The cursor keeps the instant it marks, and
+        the Commands table being left keeps its filter for when it is shown again."""
+        if not 0 <= index < len(self._links):
+            return
+        if index == self._links.active_index and \
+                all(self._pane_link[g] == index for g in _PANE_GROUPS):
+            return
+        if not self._cmd_all:                   # All Links: one shared table + filter
+            self._save_commands_view(self._pane_link["commands"])
+        self._stop_audio()                      # one output device; it played the old Link
+        self._pane_link = dict.fromkeys(_PANE_GROUPS, index)
+        self._activate_link(index)
+        self._bind_link(index, filters=self._links[index].view.filters, feed_timeline=False)
+        self._push_bookmarks()
+        self._update_link_switcher()
+        self._restore_cursor(self.cursor.sample)
+
+    def set_group_link(self, group: str, index: int) -> None:
+        """Show Link `index` in ONE pane group (its picker), leaving the others where they
+        are, and make it the active Link, since that is the one just asked for."""
+        if not 0 <= index < len(self._links):
+            return
+        if group == "commands" and self._cmd_all:
+            self.set_commands_scope_all(False)  # back to its own Link's table first
+        if group == "bottom" and self._bottom_all:
+            self._pane_link["bottom"] = index   # the Link the pane's own views come back on
+            self.set_bottom_scope_all(False)
+        old = self._pane_link[group]
+        if old == index:
+            self._activate_link(index)
+            self._update_link_switcher()
+            return
+        if group == "commands":
+            self._save_commands_view(old)
+        self._pane_link[group] = index
+        self._activate_link(index)
+        if group == "commands":
+            self._bind_commands(self._links[index].view.filters)
+            self._cursor_commands(self.cursor.sample)
+        elif group == "right":
+            self._bind_right()
+            self._cursor_right(self.cursor.sample)
+        elif group == "grid":
+            with self._as_link(index):
+                self._bind_grid()
+                self._cursor_grid(self.cursor.sample)
+        else:
+            self._bind_bottom()
+            self._cursor_bottom(self.cursor.sample)
+            self._audio_view.set_cursor(self.cursor.sample)
+        self._update_nav_starts()
+        self._push_bookmarks()
+        self._update_link_switcher()
+
+    def _save_commands_view(self, index: int) -> None:
+        """Keep Link `index`'s Commands filter and column widths while it is not shown."""
+        if 0 <= index < len(self._links):
+            self._links[index].view.filters = self._filter_snapshot()
+            self._links[index].view.col_widths = self._command_column_widths()
+
+    def _activate_link(self, index: int) -> None:
+        """Make Link `index` the active one (what menus act on, what the cursor counts
+        in, the bold band) WITHOUT redrawing any pane: the cursor is re-counted in its
+        samples at the same instant, clamped into its capture.
+
+        The clamp must not LOSE the instant: activating a Link whose capture does not
+        cover the cursor, then another that does, has to come back to where the cursor
+        was. So the true instant is remembered with the clamped number, and reused while
+        the cursor has not moved since."""
+        a = self._links.active_index
+        if index == a or not 0 <= index < len(self._links):
+            return
+        new = self._links[index]
+        if a >= 0:
+            memo = self._cursor_instant
+            if memo is not None and memo[:2] == (a, self.cursor.sample):
+                t_ps = memo[2]                  # the unclamped instant this number stands for
+            else:
+                t_ps = self._links[a].to_ps(self.cursor.sample)
+            last = max(0, int(new.session.last_sample()))
+            self._links.set_active(index)
+            clamped = min(max(0, new.to_sample(t_ps)), last)
+            self.cursor.rebase(clamped)
+            self._cursor_instant = (index, clamped, t_ps)
+        else:
+            self._links.set_active(index)
+        self._sync_timeline_rows()
+        self._update_title()
+        for i, act in enumerate(self._link_actions):
+            act.setChecked(i == index)
+        if self._bottom_all:
+            self._update_capture_actions()      # Export Audio exports the active Link
+
+    def _command_column_widths(self) -> list:
+        model = self._cmd_view.model()
+        n = model.columnCount() if model is not None else 0
+        return [self._cmd_view.columnWidth(c) for c in range(n)]
+
+    def _filter_snapshot(self) -> dict:
+        """The Commands filter as it stands, to be restored when this Link is shown again."""
+        def checked(menu):
+            return {a.data() for a in menu._actions if a.isChecked()}
+        return {"kinds": checked(self._kind_menu), "kinds_none": self._kind_menu._none,
+                "devices": checked(self._dev_menu),
+                "groups": checked(self._group_menu),
+                "errors_only": self._errors_only_act.isChecked(),
+                "text": self._expr_edit.text() if self._expr_edit is not None else ""}
+
+    def _restore_filters(self, snap: dict, kinds=None) -> None:
+        """Re-impose a `_filter_snapshot` on the menus and the proxy, for the active Link's
+        command kinds (or `kinds`). A kind that is not offered is simply dropped."""
+        self._kind_menu._fill([(k, k) for k in (kinds if kinds is not None
+                                                  else self._link_state().kinds)])
+        for menu, key in ((self._kind_menu, "kinds"), (self._dev_menu, "devices"),
+                          (self._group_menu, "groups")):
+            for a in menu._actions:
+                a.blockSignals(True)
+                a.setChecked(a.data() in snap[key])
+                a.blockSignals(False)
+        self._kind_menu._none = bool(snap.get("kinds_none"))
+        self._cmd_proxy.set_kinds({a.data() for a in self._kind_menu._actions if a.isChecked()},
+                                  none=self._kind_menu._none)
+        self._cmd_proxy.set_devices(set(snap["devices"]))
+        self._cmd_proxy.set_groups(set(snap["groups"]))
+        self._errors_only_act.blockSignals(True)
+        self._errors_only_act.setChecked(bool(snap["errors_only"]))
+        self._errors_only_act.blockSignals(False)
+        self._cmd_proxy.set_errors_only(bool(snap["errors_only"]))
+        if self._expr_edit is not None:
+            self._expr_edit.blockSignals(True)
+            self._expr_edit.setText(snap["text"])
+            self._expr_edit.blockSignals(False)
+        self._cmd_proxy.set_text(snap["text"])
+        self._on_command_filter_changed()
+
+    def load_session(self, session: Session, audio_store=None, extras=None,
+                     switch_mode: bool = True, add_link: bool = False) -> None:
+        # `extras` (from the load worker) carries values precomputed off the GUI thread
+        # so this method doesn't recompute them here and freeze the UI. None → compute
+        # lazily (the synchronous demo path).
+        extras = extras or {}
+        # A re-decode (SSP step, register/scrambler override, Port-Samples collect) mutates
+        # the SAME session in place and reloads it, so it is found among the Links: keep that
+        # Link, its bookmarks and its command filter. `add_link` appends a Link and switches
+        # to it; anything else is a new capture, which replaces the analysis.
+        idx = self._links.index_of(session)
+        re_decode = idx >= 0
+        if re_decode:
+            link = self._links[idx]
+        elif add_link:
+            link = self._links.add(session, view=LinkPanelState())
+        else:
+            link = self._links.replace(session, view=LinkPanelState())
+            self._bookmarks.clear()          # a new analysis; a re-decode or an added Link keeps them
+            self._cmd_all, self._all_model = False, None     # one Link: nothing to merge
+        self._build_link_state(link, audio_store, extras)
+        if add_link and not re_decode:
+            new_idx = self._links.index_of(session)
+            self._bind_shared(new_idx, feed_timeline=True)   # its band, fed before it shows
+            self.switch_link(new_idx)
+            if self._cmd_all:
+                self._refresh_all_model()                    # Commands: All Links gains it
+        else:
+            if not re_decode:
+                self._pane_link = dict.fromkeys(_PANE_GROUPS, 0)   # one Link, everywhere
+                idx = 0
+                if self._bottom_all:          # one Link: its panes are bound once, below
+                    self.set_bottom_scope_all(False, rebind=False)
+            # A re-decode refreshes the groups showing that Link (possibly none, if they
+            # were switched away) and its timeline band; the other groups are untouched.
+            self._bind_link(idx, filters="keep" if re_decode else None)
+        self._update_link_switcher()
+        if link is not self._links.active:
+            return
+        self._push_bookmarks()
+        # A capture is opened to be analysed, so land in Analysis mode where the
+        # decoded, cursor-gated bus grid lives (Visualization shows the authored config,
+        # which is unrelated to the capture). Opening a capture from any mode switches
+        # here; `switch_mode=False` loads without leaving the current mode.
+        if switch_mode and self._mode_mgr.current() != ANALYSIS:
+            self._mode_mgr.switch_to(ANALYSIS)
+
+    def _build_link_state(self, link, audio_store=None, extras=None) -> None:
+        """Everything the panes need from one Link that is derived from its Session: built
+        once per (re)decode, and kept across Link switches so a switch rebuilds nothing.
+        Writes the Link's own state, which need not be the active one."""
+        session, st = link.session, link.view
+        extras = extras or {}
+        # Command table shows the decoded commands PLUS synthetic 'Commit Point' rows at
+        # each confirmed sync-point commit's SSP (where it takes effect) — sorted in with
+        # the commands. PROTOTYPE: these extra rows are table-only (not in session.commands),
+        # so the timeline ticks, error counts and audio are unchanged. _starts/_kinds are
+        # built from this augmented list so cursor-selection + filtering stay aligned.
+        # session.commands is chronological (decoder emits in ascending start_sample) and
+        # commit_point_rows() is a small, sorted set of table-only rows; merge the two sorted
+        # streams (O(N+M)) instead of concatenating + re-sorting the whole list (O(N log N) +
+        # a full copy). heapq.merge breaks ties by iterable order, so commands still precede a
+        # commit row at the same start_sample — identical to the old stable sorted().
+        table_cmds = list(heapq.merge(session.commands, session.commit_point_rows(),
+                                      key=lambda c: int(c.get("start_sample", 0))))
+        st.cmd_model = CommandTableModel(table_cmds, self._rmap,
+                                         session.sample_rate_hz,
+                                         peripheral_maps=session.peripheral_maps,
+                                         row_origin=session.row_origin)
+        # Cursor-selection / arrow-nav anchor samples: each command's Row Sync Point (its
+        # cursor sample), NOT the raw Column-0 closing edge — so a cursor parked on a
+        # command's RSP resolves to THAT command (bisect in RSP space), matching where
+        # command_cursor_sample / symbol / commit navigation place the cursor.
+        st.starts = [session.command_cursor_sample(c) for c in table_cmds]
+        st.kinds = sorted({c.get("command", "") for c in table_cmds} - {""})
+        st.audio_store = (audio_store if audio_store is not None
+                          else session.audio_store(pdm_dc_block=self._pdm_dc_block))
+        st.sections = extras.get("sections")      # None → measured on first bind
+        # capture_measurements iterates the whole audio store; Statistics is hidden at
+        # load (Grid/Registers are raised), so defer the build to first show. It re-runs
+        # on the next Statistics show after any re-decode (see _refresh_measurements).
+        st.meas_dirty = True
+        st.meas_rows = None
+        st.eye_cache = {}                         # a new decode is a new measurement
+        st.col_widths = None                      # refit to the new decode's content
+
+    @contextlib.contextmanager
+    def _as_link(self, index: int):
+        """Run a pane group's work as if Link `index` were the active one, with the cursor
+        re-counted in that Link's samples, so the (Link-unaware) pane code draws that Link
+        at the same instant. If the code inside moves the cursor, the move is carried back
+        into the active Link's samples on the way out."""
+        a = self._links.active_index
+        if index == a or not 0 <= index < len(self._links) or a < 0:
+            yield
+            return
+        outer = self.cursor.sample
+        inner = self._links.convert(outer, a, index)
+        self.cursor.rebase(inner)
+        self._links.set_active(index)
+        try:
+            yield
+        finally:
+            moved = self.cursor.sample
+            self._links.set_active(a)
+            self.cursor.rebase(outer if moved == inner
+                               else self._links.convert(moved, index, a))
+
+    def _bind_link(self, index: int, filters=None, feed_timeline: bool = True) -> None:
+        """Point every pane group that shows Link `index` at it: after it (re)decodes, and
+        when a group is switched to it.
+
+        `filters` is the command filter to show: "keep" leaves the menus and proxy as they
+        are (a re-decode of the Link on screen), None starts clean for this Link's command
+        kinds (a new capture), and a snapshot from `_filter_snapshot` restores one.
+        `feed_timeline` is False on a switch: each Link's ribbon already holds its data (fed
+        when that Link decoded), and refeeding would reset the shared zoom."""
+        for group in _PANE_GROUPS:
+            if self._pane_link[group] != index:
+                continue
+            if group == "commands" and self._cmd_all:
+                continue                        # All Links: refreshed below, not per Link
+            with self._as_link(index):
+                if group == "commands":
+                    self._bind_commands(filters)
+                elif group == "right":
+                    self._bind_right()
+                elif group == "grid":
+                    self._bind_grid()
+                else:
+                    self._bind_bottom()
+        if self._bottom_all and feed_timeline:
+            # Its lane, after it (re)decoded. Not on a switch: the lane already shows it,
+            # and a rebind would reset its channel choice and vertical zoom.
+            self._bind_lane_of(index)
+        if self._cmd_all and feed_timeline:
+            self._refresh_all_model()           # every Link's table: any decode changes it
+        self._bind_shared(index, feed_timeline)
+
+    def _bind_commands(self, filters=None) -> None:
+        """The Commands table for the Link it shows (run under `_as_link`)."""
+        st = self._link_state()
+        self._cmd_proxy.setSourceModel(self._cmd_model)
+        # Column widths: fitted to content once per decode (measuring every cell is the
+        # costliest step of a bind), then kept per Link, including any the user dragged.
+        if st.col_widths is None:
+            self._cmd_view.fit_columns()
+            st.col_widths = self._command_column_widths()
+        else:
+            for col, width in enumerate(st.col_widths):
+                self._cmd_view.setColumnWidth(col, width)
+        if filters is None:
+            self._kind_menu._fill([(k, k) for k in self._link_state().kinds])
+            self._clear_all_filters()                        # don't carry a prior capture's filters
+        elif filters != "keep":
+            self._restore_filters(filters)
+        # else: same capture re-decoded — keep the command filter (menu + proxy) intact.
+        self._update_cmd_title()
+
+
+    def _bind_right(self) -> None:
+        """Registers and Statistics for the Link they show (run under `_as_link`)."""
+        session = self._session
+        assert session is not None
+        st = self._link_state()
+        # Initialize the register view and bus grid AS-OF the cursor's start (t=0),
+        # not the whole-capture end state — so the far-left cursor shows the bus
+        # before any configuration (defaults / empty grid), and, when a §5.1.2
+        # bring-up is present, "No PHY Selected" until the PHY-select is decoded.
+        # Both views then fill in as the cursor advances past the config commands.
+        self._reg_view.set_files(session.register_files_at(0))
+        self._reg_view.set_peripheral_maps(session.peripheral_maps)
+        self._reg_view.set_device_names(session.device_names)
+        self._reg_view.set_phy(session.link_control.phy_name)
+        # Statistics: this Link's rows if they were built, else built now when the pane is
+        # showing, else on its first show (see _refresh_measurements).
+        if st.meas_rows is not None and not st.meas_dirty:
+            self._meas_view.set_rows(st.meas_rows)
+        elif self._meas_dock.isVisible():
+            self._refresh_measurements()
+        else:
+            self._meas_view.set_rows([])
+
+    def _bind_grid(self) -> None:
+        """The Bus Grid for the Link it shows (run under `_as_link`). Keep the TX-map
+        scroll position across a re-decode (SSP step, override, CSV): _update_tx_scrollbar
+        clamps it into the new capture's range rather than snapping back to row 0 on every
+        re-decode. (A genuinely new/shorter capture just clamps to a valid row.)"""
+        self._update_tx_scrollbar()
+        self._apply_grid_for_sample(0)
+
+    def _bind_bottom(self) -> None:
+        """Capture, CDS, Audio, Samples and Timing for the Link they show (run under
+        `_as_link`). In All Links, Capture and Audio are bound lane by lane instead
+        (_bind_lane_of) and this binds the rest."""
+        if not self._bottom_all:               # All Links: lane by lane (_bind_lane_of)
+            self._bind_lane(self._raw_view, self._audio_view)
+            self._bind_tables()
+            self._bind_timing()
+
+    def _bind_lane(self, raw, audio) -> None:
+        """One Link's Capture and Audio views (run under that Link's `_as_link`)."""
+        self._bind_audio(audio)
+        self._bind_capture(raw)
+        if not self._bottom_all:                       # All Links: after the lane (_bind_lane_of)
+            self._update_capture_actions()             # a capture is now loaded
+        self._build_decimation_menu()            # per-dataport decimation for this capture's streams
+
+    def _bind_audio(self, view) -> None:
+        session = self._session
+        assert session is not None
+        view.stop()                                # one output device; it played the old Link
+        view.set_stream_colors(self._link_state().stream_colors, redraw=False)   # set_store draws
+        # Audio waveforms are plotted in CAPTURE-sample space so they sit at their true
+        # offset and line up under the timeline — give the view the capture rate + full
+        # extent (commands + audio) BEFORE set_store (which rebuilds the plots).
+        capture_total = max([c.get("end_sample", 0) for c in session.commands]
+                            + [session.audio_end_sample, 1])
+        view.set_capture_context(session.sample_rate_hz, capture_total)
+        view.set_row_label(
+            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
+        view.set_store(self._audio_store)
+
+    def _bind_capture(self, view) -> None:
+        session = self._session
+        assert session is not None
+        view.set_stream_colors(self._link_state().stream_colors, redraw=False)   # drawn below
+        # DLV (PHY3): the Raw view collapses the complementary DP/DN pair to one
+        # differential trace in the audio region and draws the recovered bit clock
+        # beneath it; FBCSE passes no DLV info and keeps the two forwarded-clock traces.
+        _dlv = session.is_dlv
+        _rec = session.recovered_clock() if _dlv else None
+        view.set_capture(session.capture,
+                         dp_is_data_line=session.link_control.lc_on_data_line,
+                         dlv=_dlv, audio_start=session.audio_start_sample,
+                         recovered_clock=_rec,
+                         segments=session.segments if _dlv else None)
+        # Nominal samples per bus row (row rate → samples), for the zoom-to-row button.
+        _row_hz = (session.row_rate_khz or 0.0) * 1000.0
+        view.set_row_samples(session.sample_rate_hz / _row_hz if _row_hz else 0.0)
+        # Samples per UI (max-zoom floor: don't let the user zoom in past ~1 UI).
+        view.set_ui_samples(
+            session.sample_rate_hz / session.ui_rate_hz if session.ui_rate_hz else 0.0)
+        view.set_cds_provider(session.cds_column_samples)
+        view.set_commit_provider(session.commit_column_samples)
+        # DLV: flag recovered Row Sync Points with no 0→1 edge on the wire (PLL lock gaps)
+        # and raise the unlock banner when there are more than the session's threshold.
+        view.set_missing_provider(session.missing_rsp_samples)
+        view.set_pll_unlocked(session.pll_unlocked)
+        view.set_row_label(
+            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
+        view.set_port_marks(session.port_bit_marks, self._audio_lanes_of_store())
+
+    def _audio_lanes_of_store(self) -> list:
+        """The active Link's (device, dp, channel) lanes, in audio-store order."""
+        _store = self._audio_store
+        return [(d, p, ch) for (d, p) in _store.streams() for ch in _store.channels(d, p)]
+
+    def _bind_tables(self) -> None:
+        """CDS and Samples for the Link they show (run under `_as_link`, or `_as_lane`
+        for a lane's tables)."""
+        session = self._session
+        assert session is not None
+        st = self._link_state()
+        self._sample_view.set_stream_colors(st.stream_colors, redraw=False)   # filled below
+        self._symbol_view.set_sample_rate(session.sample_rate_hz)
+        self._symbol_view.set_row_origin(session.row_origin)
+        self._symbol_view.set_symbols(session.symbols())
+        _lanes = self._audio_lanes_of_store()
+        self._sample_view.set_sample_rate(session.sample_rate_hz)
+        self._sample_view.set_row_origin(session.row_origin)
+        self._sample_view.set_lanes(_lanes)
+        # The Samples and CDS panes hold a window of whichever Link they last showed, so the
+        # active Link's windows are rebuilt on demand (cheap: windowed re-decodes).
+        self._sample_range = None          # (lo,hi) loaded row positions; None = needs (re)build
+        self._sample_total = 0             # total filtered samples (full scrollable extent)
+        self._sample_filters = None        # filters the loaded window was built with
+        self._symbol_range = None          # (first,last) start_sample of the loaded CDS window
+
+    def _bind_timing(self) -> None:
+        """The Timing pane for the Link it shows (run under `_as_link`, or `_as_lane`)."""
+        session = self._session
+        assert session is not None
+        st = self._link_state()
+        _rec = session.recovered_clock() if session.is_dlv else None
+        self._eye_view.set_analysis_context(session.segments, session.timing_regions(),
+                                            session.timing_column_roles)
+        self._eye_view.set_capture(session.capture, recovered_clock=_rec, cache=st.eye_cache)
+        if st.sections is None:
+            st.sections = session.section_ui_stats()          # per-section min/max UI
+        self._eye_view.set_sections(st.sections)
+
+    def _bind_shared(self, index: int, feed_timeline: bool) -> None:
+        """What spans the Links: Link `index`'s timeline band, the title and the status."""
+        # Remind the user which capture is loaded — but only in Analyzer mode (see
+        # _update_title): the capture is irrelevant to the Visualizer/Timing views.
+        self._update_title()
+        self._sync_timeline_rows()
+        if feed_timeline and 0 <= index < len(self._ribbons):
+            with self._as_link(index):
+                self._feed_timeline(self._timeline, self._session)
+                self._timeline.set_cursor(0)
+                self._timeline.set_commit_starts(self._sscr_samples())   # ⌘+arrow jump
+            self._update_timeline_domain()
+        self._update_nav_starts()               # arrow-nav starts (all visible at load)
+        session = self._session
+        if session is None:
+            return
         n_err = count_errors(session.commands)
         lc = session.link_control
         phy = f" · {lc.label()}" if session.has_bringup else ""
@@ -3415,21 +5081,13 @@ class MainWindow(QMainWindow):
             f"{phy}"
         )
 
-        # A capture is opened to be analysed, so land in Analysis mode where the
-        # decoded, cursor-gated bus grid lives (Visualization shows the authored config,
-        # which is unrelated to the capture). Opening a capture from any mode switches
-        # here — but the startup demo preload passes switch_mode=False so the app still
-        # opens in the Bus Visualizer default (the demo is just ready in the background).
-        if switch_mode and self._mode_mgr.current() != ANALYSIS:
-            self._mode_mgr.switch_to(ANALYSIS)
-
     def export_audio(self) -> None:
         if self._session is None or self._audio_store is None or self._audio_store.is_empty():
             return
         from .audio_export_dialog import AudioExportDialog
         dlg = AudioExportDialog(self._audio_store,
-                                visible_index_range=self._audio_view.visible_index_range(),
-                                default_rates=self._audio_view.play_rate_targets,
+                                visible_index_range=self._audio_lane().visible_index_range(),
+                                default_rates=self._audio_lane().play_rate_targets,
                                 parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
@@ -3448,7 +5106,8 @@ class MainWindow(QMainWindow):
             notes = []
             for dev, dp in dps:
                 rate = dlg.target_rate(dev, dp)
-                path = os.path.join(directory, f"swi3s_dev{dev}_dp{dp}.wav")
+                path = os.path.join(directory,
+                                    f"swi3s{self._link_stem()}_dev{dev}_dp{dp}.wav")
                 paths.append(self._audio_store.export_wav(dev, dp, path, index_range=rng,
                                                           target_rate=rate))
                 if rate:
@@ -3462,14 +5121,23 @@ class MainWindow(QMainWindow):
     def export_commands(self) -> None:
         if self._session is None:
             return
+        # With All Links on screen, export what it shows: every Link, in global time.
+        merged = self._cmd_all and len(self._links) > 1
+        stem = "_all_links" if merged else self._link_stem()
         path, _ = QFileDialog.getSaveFileName(
             self, "Export commands CSV",
-            os.path.join(self._last_capture_dir("analyzer"), "commands.csv"), "CSV (*.csv)")
+            os.path.join(self._last_capture_dir("analyzer"), f"commands{stem}.csv"),
+            "CSV (*.csv)")
         if not path:
             return
         self._remember_capture_dir(path, "analyzer")
         try:
-            write_commands_csv(self._session.commands, path, self._rmap)
+            if merged:
+                write_links_commands_csv(
+                    [(link.name, link.session.commands, link.to_ps) for link in self._links],
+                    path, self._rmap)
+            else:
+                write_commands_csv(self._session.commands, path, self._rmap)
         except OSError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
@@ -3538,7 +5206,8 @@ class MainWindow(QMainWindow):
         grid_mode = "visualizer" if grid is self._viz_grid else "analyzer"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export bus grid",
-            os.path.join(self._last_capture_dir(grid_mode), "bus_grid.svg"),
+            os.path.join(self._last_capture_dir(grid_mode),
+                         f"bus_grid{self._link_stem() if grid is self._grid_view else ''}.svg"),
             "SVG (*.svg);;PNG (*.png)")
         if not path:
             return
@@ -3580,7 +5249,7 @@ class MainWindow(QMainWindow):
         cfg.description = f"Exported from analyzer bus grid ({os.path.basename(str(src))})"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export bus grid as Visualizer settings",
-            os.path.join(self._last_capture_dir("visualizer"), "bus_grid_settings.csv"),
+            os.path.join(self._last_capture_dir("visualizer"), f"bus_grid_settings{self._link_stem()}.csv"),
             "CSV (*.csv)")
         if not path:
             return
@@ -3664,20 +5333,19 @@ class MainWindow(QMainWindow):
         running play timer would read cross-thread. Shared by the register-edit/clear,
         scrambler, hub-depth, and PDM re-decodes (the SSP nudge keeps its own variant that
         also holds the audio selection/zoom)."""
-        self._audio_view.stop()
+        self._stop_audio()
         keep_cursor = self.cursor.sample
-        keep_bookmarks = self._bookmarks.copy()
 
-        def done(_s, cur=keep_cursor, bms=keep_bookmarks):
-            self._bookmarks = bms
-            self._push_bookmarks()
+        def done(_s, cur=keep_cursor):
+            if _s is not self._session:
+                return                  # another Link was shown meanwhile; nothing to restore
             self._restore_cursor(cur)
             if after is not None:
                 after()
             if status:
                 self._status.setText(status)
 
-        self._load_async(build_fn, after=done)
+        self._load_async(build_fn, after=done, kind="redecode")
 
     def _restore_cursor(self, sample: int) -> None:
         """Restore the cursor to `sample` after a re-decode and force every pane to
@@ -3695,7 +5363,7 @@ class MainWindow(QMainWindow):
         self._on_seek(int(sample))
         self._raw_dock.show()
         self._raw_dock.raise_()
-        self._raw_view.center_on_sample(int(sample), 2)
+        self._capture_lane().center_on_sample(int(sample), 2)
 
     def _on_register_overrides_cleared(self) -> None:
         if self._session is None or not self._session.register_overrides:
@@ -3714,8 +5382,10 @@ class MainWindow(QMainWindow):
         if not idx.isValid():
             return
         src = self._cmd_proxy.mapToSource(idx)
-        cmd = self._cmd_model.command_at(src.row())
+        link, cmd, _pos = self._row_target(src.row())
         if cmd:
+            if link != self._links.active_index:
+                self.switch_link(link)            # an All Links row shows its own bus
             self._syncing = True
             # A commit jumps the cursor to where it takes effect (its SSP) so the
             # Bus Grid / Register Map show the post-commit state; other commands use
@@ -3733,8 +5403,9 @@ class MainWindow(QMainWindow):
             return
         s = int(self.cursor.sample)
         tol = self._bookmark_tol()
-        if not self._bookmarks.remove_at(s, tol=tol):
-            bm = self._bookmarks.add(s)
+        link = self._links.active_index           # a bookmark belongs to the Link it is on
+        if not self._bookmarks.remove_at(s, tol=tol, link=link):
+            bm = self._bookmarks.add(s, link=link)
             self._status.setText(f"Bookmark {bm.display()} @ {s:,}")
         else:
             self._status.setText(f"{len(self._bookmarks)} bookmark(s)")
@@ -3749,19 +5420,44 @@ class MainWindow(QMainWindow):
         except Exception:                       # noqa: BLE001 — never break the toggle
             return 1
 
+    def _bm_sample(self, bm) -> int:
+        """Where a bookmark sits in the ACTIVE Link's samples, which is what the cursor and
+        every per-Link pane count in. A bookmark on the active Link is its own sample."""
+        if len(self._links) == 0:
+            return int(bm.sample)
+        return self._links.convert(bm.sample, bm.link, self._links.active_index)
+
+    def _bm_marks(self, link: int) -> list:
+        """(sample, label) for the bookmarks ON Link `link`, in its own samples: a view
+        draws only its own Link's bookmarks. Drawing every Link's at its instant made a
+        bookmark look as if it were on every bus, and left no way to see which one it was
+        placed on; a pair across two Links is read in the Bookmarks pane instead."""
+        return [(int(b.sample), b.display()) for b in self._bookmarks if b.link == link]
+
+    def _bm_ps(self, bm) -> int:
+        """A bookmark's global time (ps), for ordering and timing across Links."""
+        return self._links[bm.link].to_ps(bm.sample)
+
+    def _active_bookmark_samples(self) -> list:
+        """The active Link's bookmarks, in its samples: the ones its band shows, and so the
+        only ones next / previous may land on (another Link's would park the cursor on a
+        mark nothing on this Link draws)."""
+        a = self._links.active_index
+        return [int(b.sample) for b in self._bookmarks if b.link == a]
+
     def next_bookmark(self) -> None:
-        bms = sorted(self._bookmarks.samples())
+        bms = sorted(self._active_bookmark_samples())
         if not bms:
             return
         cur = self.cursor.sample
-        self.cursor.set_sample(next((s for s in bms if s > cur), bms[0]))
+        self.cursor.set_sample(self._clamp_to_active(next((s for s in bms if s > cur), bms[0])))
 
     def prev_bookmark(self) -> None:
-        bms = sorted(self._bookmarks.samples(), reverse=True)
+        bms = sorted(self._active_bookmark_samples(), reverse=True)
         if not bms:
             return
         cur = self.cursor.sample
-        self.cursor.set_sample(next((s for s in bms if s < cur), bms[0]))
+        self.cursor.set_sample(self._clamp_to_active(next((s for s in bms if s < cur), bms[0])))
 
     def clear_bookmarks(self) -> None:
         self._bookmarks.clear()
@@ -3770,36 +5466,56 @@ class MainWindow(QMainWindow):
     def _push_bookmarks(self) -> None:
         """Refresh every bookmark consumer from the current set: the timeline, audio and
         raw panes (markers) and the Measurements pane (pair deltas)."""
-        marks = [(b.sample, b.display()) for b in self._bookmarks]
-        self._timeline.set_bookmarks(marks)
-        for view in (self._audio_view, self._raw_view):
-            if hasattr(view, "set_bookmarks"):
-                view.set_bookmarks(marks)
+        for j, ribbon in enumerate(self._ribbons[:max(1, len(self._links))]):
+            ribbon.set_bookmarks(self._bm_marks(j))          # each band: its own Link's
+        for k, raw, audio in self._bottom_lanes():           # each lane: its Link's
+            marks = self._bm_marks(k)
+            raw.set_bookmarks(marks)
+            audio.set_bookmarks(marks)
         self._pair_view.set_rows(self._bookmark_measure_rows())
+        self._pair_view.set_show_link(len(self._links) > 1)
 
     def _bookmark_measure_rows(self) -> list:
         """Bookmark rows for the pane: per group, an A1 row, an A2 row (if it exists), and
         an A1-A2 delta row. A lone bookmark shows just its A1 row (no waiting for a pair).
-        Each row is (label, UI, Row, Time, seek_sample)."""
-        rows = []
-        sess = self._session
-        rate = float(getattr(sess, "sample_rate_hz", 0) or 0) if sess else 0.0
-        ui_rate = float(getattr(sess, "ui_rate_hz", 0) or 0) if sess else 0.0
-        spu = (rate / ui_rate) if (rate and ui_rate) else 0.0   # samples per UI
+        Each row is (label, UI, Row, Time, seek, Link name, Link index); a pair's Link is
+        "Link 1 → Link 2" when it spans two, and its index is its first member's.
 
-        def ui_of(s):
-            return f"{s / spu:,.0f}" if spu else "—"
+        A bookmark's UI, Row and Time are read on ITS OWN Link; Time includes the Link's
+        offset, so it is global time. The seek is GLOBAL time (ps), converted only when the
+        row is clicked (`_on_pair_seek`), which first makes the row's Link active: a view
+        draws only its own Link's bookmarks, so that is where the mark can be seen."""
+        rows: list = []
+        if len(self._links) == 0:
+            return rows
 
-        def row_of(s):
-            if sess is None:
-                return "—"
-            try:
-                return f"{sess.display_row(sess.bus_row_for_sample(int(s))):,}"
+        def rates(link):
+            sess = self._links[link].session
+            rate = float(getattr(sess, "sample_rate_hz", 0) or 0)
+            ui_rate = float(getattr(sess, "ui_rate_hz", 0) or 0)
+            return sess, rate, ui_rate, (rate / ui_rate) if (rate and ui_rate) else 0.0
+
+        def ui_of(bm):
+            try:                                    # a COUNT of UIs, exact on both PHYs
+                return f"{self._links[bm.link].session.ui_index(int(bm.sample)):,}"
             except Exception:                       # noqa: BLE001
                 return "—"
 
-        def time_of(s):
-            return _fmt_duration(s / rate) if rate else f"{int(s):,} smp"
+        def row_of(bm):
+            sess = self._links[bm.link].session
+            try:
+                return f"{sess.display_row(sess.bus_row_for_sample(int(bm.sample))):,}"
+            except Exception:                       # noqa: BLE001
+                return "—"
+
+        def link_name(i):
+            return self._links[i].name if 0 <= i < len(self._links) else "?"
+
+        def time_of(bm):
+            rate = rates(bm.link)[1]
+            if not rate:
+                return f"{int(bm.sample):,} smp"
+            return _fmt_duration(bm.sample / rate + self._links[bm.link].offset_ps / 1e12)
 
         # Group members by their stable group letter (items() is creation-ordered A1,A2,B1…).
         groups: Dict[str, dict] = {}
@@ -3808,45 +5524,111 @@ class MainWindow(QMainWindow):
         for g in sorted(groups):
             a1 = groups[g].get(1)
             a2 = groups[g].get(2)
-            if a1 is not None:
-                rows.append((a1.display(), ui_of(a1.sample), row_of(a1.sample),
-                             time_of(a1.sample), int(a1.sample)))
-            if a2 is not None:
-                rows.append((a2.display(), ui_of(a2.sample), row_of(a2.sample),
-                             time_of(a2.sample), int(a2.sample)))
+            for member in (a1, a2):
+                if member is not None:
+                    rows.append((member.display(), ui_of(member), row_of(member),
+                                 time_of(member), self._bm_ps(member),
+                                 link_name(member.link), member.link))
             if a1 is not None and a2 is not None:
-                dsamp = a2.sample - a1.sample
-                dt = _fmt_duration(dsamp / rate) if rate else f"{dsamp:,} smp"
-                try:
-                    drows = abs(sess.bus_row_for_sample(a2.sample)
-                                - sess.bus_row_for_sample(a1.sample))
-                    drows_s = f"{drows:,}"
-                except Exception:                   # noqa: BLE001
-                    drows_s = "—"
-                dui = f"{dsamp / spu:,.0f}" if spu else "—"
+                if a1.link == a2.link:
+                    dui, drows_s, dt = self._same_link_delta(a1, a2, *rates(a1.link))
+                    names = link_name(a1.link)
+                else:
+                    dui, drows_s, dt = self._cross_link_delta(a1, a2)
+                    names = f"{link_name(a1.link)} → {link_name(a2.link)}"
                 rows.append((f"{a1.display()}-{a2.display()}", dui, drows_s, dt,
-                             int(a1.sample)))
+                             self._bm_ps(a1), names, a1.link))
         return rows
 
-    def _on_bookmark_moved(self, label: str, sample: int, final: bool) -> None:
+    @staticmethod
+    def _same_link_delta(a1, a2, sess, rate, ui_rate, spu):
+        """(ΔUI, ΔRows, ΔTime) for a pair on one Link, counted in that Link's samples.
+        ΔUI and ΔRows are COUNTS of the UIs and rows between the two, so they stay right
+        across a geometry change; a sample gap over the capture-wide UI rate did not
+        (on DLV the UI rate changes fourfold at the Safe-Lock-4 to 16-column commit)."""
+        dsamp = a2.sample - a1.sample
+        dt = _fmt_duration(dsamp / rate) if rate else f"{dsamp:,} smp"
+        try:
+            drows = abs(sess.bus_row_for_sample(a2.sample)
+                        - sess.bus_row_for_sample(a1.sample))
+            drows_s = f"{drows:,}"
+        except Exception:                   # noqa: BLE001
+            drows_s = "—"
+        try:
+            dui = f"{abs(sess.ui_index(a2.sample) - sess.ui_index(a1.sample)):,}"
+        except Exception:                   # noqa: BLE001
+            dui = "—"
+        return dui, drows_s, dt
+
+    def _cross_link_delta(self, a1, a2):
+        """(ΔUI, ΔRows, ΔTime) for a pair on two Links. Time is exact global time. Row
+        NUMBERS of two Links share no origin, so ΔRows and ΔUI are elapsed time at a
+        common rate, and each is shown only when the Links SHARE that timing
+        (`_shared_rates`): one UI (row) rate on both, across the whole interval."""
+        dt_s = (self._bm_ps(a2) - self._bm_ps(a1)) / 1e12
+        ui_hz, row_hz = self._shared_rates(a1, a2)
+        dui = f"{abs(dt_s) * ui_hz:,.1f}" if ui_hz else "—"
+        drows = f"{abs(dt_s) * row_hz:,.1f}" if row_hz else "—"
+        return dui, drows, _fmt_duration(dt_s)
+
+    def _shared_rates(self, a1, a2):
+        """(UI rate, row rate) in Hz that two Links share over the interval between two
+        bookmarks, each None where they do not.
+
+        A Link's timing is not one number: a geometry change moves its row rate (FBCSE) or
+        its UI rate (DLV), so a capture-wide rate — the one in force at the END — let a
+        pair in a 2-column region borrow the 16-column row rate. Instead, each Link's
+        stretch of the interval (in its own samples) must lie inside its capture, every
+        region it crosses (`Session.rate_regions`) must have a measured rate, and all of
+        them, on both Links, must agree. Measured rates of two captures never agree to the
+        last digit (two analyzers' timebases differ by tens of ppm), so "agree" is
+        `_SAME_RATE_REL_TOL`, not equality."""
+        t_lo, t_hi = sorted((self._bm_ps(a1), self._bm_ps(a2)))
+        found: list = []
+        for i in sorted({a1.link, a2.link}):
+            entry = self._links[i]
+            lo, hi = entry.to_sample(t_lo), entry.to_sample(t_hi)
+            if lo < 0 or hi > entry.session.last_sample():
+                return None, None              # this Link was not recording throughout
+            found += [(u, r) for s, e, u, r in entry.session.rate_regions()
+                      if s <= hi and e > lo]
+
+        def common(values):
+            if not values or any(v is None for v in values):
+                return None
+            if all(math.isclose(v, values[0], rel_tol=_SAME_RATE_REL_TOL) for v in values):
+                return sum(values) / len(values)
+            return None
+
+        return common([u for u, _r in found]), common([r for _u, r in found])
+
+    def _on_bookmark_moved(self, label: str, sample: int, final: bool,
+                           link: Optional[int] = None) -> None:
         """A bookmark was dragged in a pane. Move it (snapping to the nearest edge on
-        release) and refresh all consumers so the pair measurement updates live."""
+        release) and refresh all consumers so the pair measurement updates live.
+
+        `sample` counts in Link `link` (default: the active Link), the Link of the view it
+        was dragged in, which since each view draws only its own Link's bookmarks is the
+        bookmark's own. It is converted anyway, so a caller that names another Link is
+        still right. The bookmark snaps to its own Link's clock edges."""
         target = next((b for b in self._bookmarks if b.display() == label), None)
         if target is None:
             return
-        s = int(sample)
-        if final and self._session is not None:
-            s = self._snap_to_edge(s)
+        src = self._links.active_index if link is None else int(link)
+        s = self._links.convert(int(sample), src, target.link)
+        if final:
+            s = self._snap_to_edge(s, self._links[target.link].session)
         self._bookmarks.move(target, s)
         self._push_bookmarks()
         if final:
-            self.cursor.set_sample(s)
+            self.cursor.set_sample(self._clamp_to_active(self._bm_sample(target)))
 
-    def _snap_to_edge(self, sample: int) -> int:
-        """Snap a dragged sample to the nearest clock edge (so a bookmark lands on a real
-        UI boundary). Falls back to the raw sample if there are no edges."""
+    def _snap_to_edge(self, sample: int, session=None) -> int:
+        """Snap a dragged sample to the nearest clock edge of `session` (default: the active
+        Link's), so a bookmark lands on a real UI boundary. Falls back to the raw sample if
+        there are no edges."""
         try:
-            ce = self._session.capture.clock_edges
+            ce = (session if session is not None else self._session).capture.clock_edges
             if len(ce) == 0:
                 return int(sample)
             i = int(np.searchsorted(ce, sample))
@@ -3882,6 +5664,22 @@ class MainWindow(QMainWindow):
         cur = self.cursor.sample
         self.cursor.set_sample(next((s for s in reversed(pts) if s < cur), pts[0]))
 
+    def _on_pair_seek(self, t_ps: int, link: int = -1) -> None:
+        """A Bookmarks-pane row: its bookmark's Link made active (the one whose band draws
+        it), then the cursor to its instant (global ps) there. Without a Link, the
+        instant on the Link active now."""
+        if 0 <= link < len(self._links) and link != self._links.active_index:
+            self._activate_link(link)
+        if self._links.active is not None:
+            self._on_seek(self._clamp_to_active(self._links.active.to_sample(int(t_ps))))
+
+    def _clamp_to_active(self, sample: int) -> int:
+        """A sample converted from another Link can fall outside the active Link's
+        capture; the panes are only defined inside it."""
+        if len(self._links) < 2 or self._session is None:
+            return int(sample)
+        return min(max(0, int(sample)), max(0, int(self._session.last_sample())))
+
     def _on_seek(self, sample: int) -> None:
         self.cursor.set_sample(sample)
 
@@ -3899,14 +5697,17 @@ class MainWindow(QMainWindow):
         # These just reposition existing lines (no re-render), so they're safe to
         # run at the playback tick rate.
         self._timeline.set_cursor(sample)
-        self._audio_view.set_cursor(sample)      # move the cursor line on the waveforms
+        self._sync_ribbon_cursors(sample)
+        # The waveform cursor line, at this instant in the Link each lane shows.
+        for k, _raw, audio in self._bottom_lanes():
+            audio.set_cursor(self._in_link(k, sample))
         # During playback do NO heavy main-thread work. Re-rendering the raw-capture
         # envelope (auto-pan when zoomed), replaying the register files, the windowed
         # symbol re-decode and the grid rebuild are all heavy Python that holds the
         # GIL and starves the (Python) audio pull-source on its thread → glitchy audio
         # (and the raw view scrolling mid-play). Defer them all to one refresh at the
         # resting cursor on stop / clip end (_on_playback_stopped → _on_cursor).
-        if self._audio_view.is_playing:
+        if self._audio_playing():
             return
         # Defer the heavy cascade so clicking around the timeline doesn't stack a full
         # rebuild per click on the main thread. Capture the guard flags NOW: the deferred
@@ -3915,7 +5716,7 @@ class MainWindow(QMainWindow):
         # after set_sample returns). Rapid changes overwrite the pending entry, so only the
         # resting cursor triggers a rebuild.
         self._pending_cursor = (int(sample), self._syncing, self._from_symbol,
-                                self._from_sample)
+                                self._from_sample, self._origin_lane)
         if MainWindow._event_loop_live:
             self._cursor_heavy_timer.start()      # coalesce; fires when clicking settles
         else:
@@ -3930,14 +5731,44 @@ class MainWindow(QMainWindow):
         doesn't re-window that pane out from under the click."""
         if self._session is None or self._pending_cursor is None:
             return
-        sample, syncing, from_symbol, from_sample = self._pending_cursor
-        self._raw_view.set_cursor(sample)
-        # Rebuilding the register tree replays command history (C++) — skip it when the
-        # Registers tab is hidden; _on_reg_dock_visible refreshes it when re-shown.
-        if not self._reg_dock.isHidden():
-            self._reg_view.set_files(self._session.register_files_at(sample))
+        sample, syncing, from_symbol, from_sample, origin = self._pending_cursor
+        # Each pane group redraws at this instant on the Link IT shows (converted from the
+        # captured sample, which may trail the live cursor by the coalescing interval).
+        s_bottom, s_right = self._in_group("bottom", sample), self._in_group("right", sample)
+        with self._as_link(self._pane_link["bottom"]):
+            self._cursor_bottom(s_bottom, from_symbol, from_sample)
+        with self._as_link(self._pane_link["right"]):
+            self._cursor_right(s_right)
+        with self._as_link(self._pane_link["grid"]):
+            self._cursor_grid(self._in_group("grid", sample))
+        if self._bottom_all:
+            for k, raw, _audio in self._bottom_lanes():
+                s_k = self._in_link(k, sample)
+                raw.set_cursor(s_k)
+                with self._as_lane(k):          # a lane's own click does not re-window it
+                    self._cursor_tables(s_k, from_symbol and k == origin,
+                                        from_sample and k == origin)
         if not syncing:
-            self._select_command_for_sample(sample)
+            self._cursor_commands(sample)
+
+    def _in_group(self, group: str, sample: int) -> int:
+        """An active-Link sample counted in the Link pane group `group` shows."""
+        if len(self._links) < 2:
+            return int(sample)
+        return self._links.convert(int(sample), self._links.active_index,
+                                   self._pane_link[group])
+
+    def _cursor_bottom(self, sample: int, from_symbol: bool = False,
+                       from_sample: bool = False) -> None:
+        """Bottom group at the cursor (run with its Link active)."""
+        if self._session is None:
+            return
+        if not self._bottom_all:                # All Links: each lane, in _apply_cursor_heavy
+            self._raw_view.set_cursor(sample)
+            self._cursor_tables(sample, from_symbol, from_sample)
+
+    def _cursor_tables(self, sample: int, from_symbol: bool, from_sample: bool) -> None:
+        """CDS and Samples at the cursor (run with their Link active, or `_as_lane`)."""
         # Symbol viewer follows the cursor via windowed (seeked) re-decode, so it
         # works on big captures without scanning from the start. Skip if hidden, and
         # skip when the cursor change *came from* the symbol pane (a click / arrow
@@ -3947,18 +5778,42 @@ class MainWindow(QMainWindow):
             self._refresh_symbols_around(sample)
         if self._sample_dock.isVisible() and not from_sample:
             self._refresh_samples_around(sample)
-        # If what-if edits are active, keep the projected grid; else show the grid
-        # as-of the cursor — it fills in as registers are written, and for a true
-        # multi-width reconfiguration (cold-start 2col -> 8col) the per-segment
-        # geometry follows the cursor. set_cells reads each cell's own column, so
-        # the decoder's final column_count is the right axis width to pass.
-        # In the scrollable TX map, geometry is scoped to the cursor's config region, so
-        # a cursor move (to a different-width region) must re-anchor the window on the
-        # cursor's row and resize the scrollbar to the new region. The grid rebuild is
-        # heavy (full scene) — skip it when the Bus Grid tab is hidden; _on_grid_dock_visible
-        # re-renders it when re-shown.
-        if not self._grid_dock.isHidden():
+
+    def _cursor_grid(self, sample: int) -> None:
+        """The Bus Grid at the cursor (run with its Link active). If what-if edits are
+        active, keep the projected grid; else show the grid as-of the cursor — it fills in
+        as registers are written, and for a true multi-width reconfiguration (cold-start
+        2col -> 8col) the per-segment geometry follows the cursor. In the scrollable TX
+        map, geometry is scoped to the cursor's config region, so a move to a
+        different-width region re-anchors the window on the cursor's row. The rebuild is
+        heavy (full scene): skipped while the Bus Grid tab is hidden, and
+        _on_grid_dock_visible re-renders it when re-shown."""
+        if self._session is not None and not self._grid_dock.isHidden():
             self._update_grid_for_cursor(sample)
+
+    def _cursor_right(self, sample: int) -> None:
+        """Right group at the cursor (run with its Link active). Rebuilding the register
+        tree replays command history (C++) — skip it when the Registers tab is hidden;
+        _on_reg_dock_visible refreshes it when re-shown."""
+        if self._session is not None and not self._reg_dock.isHidden():
+            self._reg_view.set_files(self._session.register_files_at(sample))
+
+    def _cursor_commands(self, sample: int) -> None:
+        """Select the command at the cursor (active-Link `sample`) in the Commands table.
+        All Links bisects global time, so it runs as-is; a single Link's table runs with
+        that Link active."""
+        if self._cmd_all:
+            self._select_command_for_sample(sample)
+            return
+        s_cmd = self._in_group("commands", sample)
+        with self._as_link(self._pane_link["commands"]):
+            self._select_command_for_sample(s_cmd)
+
+    @_on_grid_link
+    def _refresh_grid(self) -> None:
+        """Re-render the Bus Grid at the cursor, on the Link the grid group shows."""
+        if self._session is not None:
+            self._apply_grid_for_sample(self.cursor.sample)
 
     def _update_grid_for_cursor(self, sample: int) -> None:
         """The grid portion of the cursor cascade — TX-scrollbar re-anchor + grid render.
@@ -4102,6 +5957,7 @@ class MainWindow(QMainWindow):
             self._tx_persist_pending = None
             self._start_tx_persist_worker(*pending)
 
+    @_on_grid_link
     def _toggle_tx_map(self, on: bool) -> None:
         """Switch the Bus Grid between the config layout and the TX-map raster (the
         'Show/Hide Toggles' button), then re-render. Persistence is only meaningful
@@ -4124,6 +5980,7 @@ class MainWindow(QMainWindow):
         if self._session is not None:
             self._apply_grid_for_sample(self.cursor.sample)
 
+    @_on_grid_link
     def _toggle_tx_persist(self, on: bool) -> None:
         """Toggle TX-map persistence (the 'Persistence On/Off' button). Persistence is a
         fixed single-slice summary, so it hides the outer scrollbar (no scrolling)."""
@@ -4150,12 +6007,14 @@ class MainWindow(QMainWindow):
         self._tx_scroll.setValue(self._tx_start_row)
         self._tx_scroll.blockSignals(False)
 
+    @_on_grid_link
     def _on_tx_scroll(self, value: int) -> None:
         """Scroll the TX-map window to top row `value` (0-based) and re-render."""
         self._tx_start_row = max(0, int(value))
         if self._session is not None and self._tx_map:
             self._apply_grid_for_sample(self.cursor.sample)
 
+    @_on_grid_link
     def _on_grid_rows_edit(self) -> None:
         """Apply the Rows-To-Draw box (Bus Grid raster + config-grid height)."""
         try:
@@ -4199,17 +6058,18 @@ class MainWindow(QMainWindow):
             return
         # Captured before the re-decode; set_store would otherwise re-show every
         # dataport and refit to full-scale.
-        keep_sel = self._audio_view.channel_selection()
-        keep_zoom = self._audio_view.visible_index_range()
+        audio = self._audio_lane()
+        keep_sel = audio.channel_selection()
+        keep_zoom = audio.visible_index_range()
         r = int(row)
 
         def apply(s=self._session, r=r):
             s.set_ssp_row(r)
             return s
 
-        def after(sel=keep_sel, zoom=keep_zoom, r=r):
-            self._audio_view.set_channel_selection(sel)   # keep hidden tracks hidden
-            self._audio_view.set_visible_index_range(zoom)  # then hold the zoom
+        def after(sel=keep_sel, zoom=keep_zoom, r=r, audio=audio):
+            audio.set_channel_selection(sel)   # keep hidden tracks hidden
+            audio.set_visible_index_range(zoom)  # then hold the zoom
             # Honest status: the decoder only arms the manual SSP when the payload
             # engine is enabled at decode start (a config CSV supplied the geometry and
             # audio decoded). On a snoop/no-audio capture it's a no-op — say so rather
@@ -4219,7 +6079,7 @@ class MainWindow(QMainWindow):
                 msg = "Manual SSP cleared (auto anchor); re-decoded."
             elif sess is not None and not sess.ssp_effective:
                 msg = (f"SSP set to row {sess.display_row(r)}, but it only re-phases audio "
-                       f"when a config CSV is applied (File ▸ Apply Config CSV) — "
+                       f"when a config CSV is applied (Decode ▸ Import Visualizer CSV) — "
                        f"no change to this capture.")
             else:
                 disp = sess.display_row(r) if sess is not None else r
@@ -4382,19 +6242,23 @@ class MainWindow(QMainWindow):
         show) or the cursor moved outside it, and otherwise just re-selects — so
         re-selecting the tab doesn't repopulate ~8k rows every time."""
         if visible and self._session is not None:
-            self._refresh_samples_around(self.cursor.sample)
+            for k, _raw, _audio in self._bottom_lanes():
+                with self._as_lane(k):
+                    self._refresh_samples_around(self.cursor.sample)
 
     def _on_reg_dock_visible(self, visible: bool) -> None:
         """Refresh the register tree when its tab is shown/raised (its per-tick rebuild is
         skipped in _on_cursor while hidden)."""
         if visible and self._session is not None:
-            self._reg_view.set_files(self._session.register_files_at(self.cursor.sample))
+            with self._as_link(self._pane_link["right"]):
+                self._reg_view.set_files(self._session.register_files_at(self.cursor.sample))
 
     def _on_grid_dock_visible(self, visible: bool) -> None:
         """Render the bus grid when its tab is shown/raised (its per-tick render is skipped
         in _on_cursor while hidden). Not during playback — that path defers heavy work."""
-        if visible and self._session is not None and not self._audio_view.is_playing:
-            self._update_grid_for_cursor(self.cursor.sample)
+        if visible and self._session is not None and not self._audio_playing():
+            with self._as_link(self._pane_link["grid"]):
+                self._update_grid_for_cursor(self.cursor.sample)
 
     def _refresh_measurements(self) -> None:
         """(Re)compute the Statistics rows from the whole capture, once, when marked dirty.
@@ -4404,14 +6268,17 @@ class MainWindow(QMainWindow):
             return
         # capture_measurements emits the Link Control section (timing + PM actions) first,
         # then Regions, Commands, Data Ports — each a collapsible header.
-        self._meas_view.set_rows(capture_measurements(self._session, store=self._audio_store))
+        rows = capture_measurements(self._session, store=self._audio_store)
+        self._meas_view.set_rows(rows)
+        self._link_state().meas_rows = rows          # kept, so a Link switch shows it again
         self._meas_dirty = False
 
     def _on_meas_dock_visible(self, visible: bool) -> None:
         """Build the Statistics table on first show / after a re-decode (deferred from load
         so a hidden Statistics tab doesn't pay for a full-capture measurement pass)."""
         if visible:
-            self._refresh_measurements()
+            with self._as_link(self._pane_link["right"]):
+                self._refresh_measurements()
 
     # ---- per-dataport scrambler override ----
     def scrambler_overrides_dialog(self) -> None:
@@ -4472,7 +6339,7 @@ class MainWindow(QMainWindow):
         """Compare an expected config (CSV path) against the decoded capture as a
         REGISTER-MAP diff: overlay the expected registers in blue in the Register
         Map (alongside the green values snooped from the bus) and report which
-        registers differ. Reached from Analyzer ▸ Import Visualizer CSV (a CSV file or
+        registers differ. Reached from Decode ▸ Import Visualizer CSV (a CSV file or
         the current Visualizer authoring, when its Compare action is chosen).
 
         A register comparison (rather than a grid-cell comparison) is robust to the
@@ -4504,8 +6371,8 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Information)
         box.setText(summary)
         box.setInformativeText(
-            "The expected register config is shown in blue in the Register Map "
-            "(green = snooped from the bus). Compare ▸ Clear to reset.")
+            "The expected register config is shown in blue in the Registers pane "
+            "(green = snooped from the bus). Its Clear Compare button removes it.")
         if detail:
             box.setDetailedText(detail)
         box.exec()
@@ -4514,7 +6381,7 @@ class MainWindow(QMainWindow):
 
     def clear_comparison(self) -> None:
         if self._session is not None:
-            self._apply_grid_for_sample(self.cursor.sample)
+            self._refresh_grid()
             self._reg_view.clear_expected()
             self._status.setText("Comparison cleared")
 
@@ -4560,6 +6427,8 @@ class MainWindow(QMainWindow):
         self._reg_view.set_peripheral_maps(sess.peripheral_maps)
         self._reg_view.set_files(sess.register_files_at(self.cursor.sample))
         self._cmd_model.set_peripheral_maps(sess.peripheral_maps)
+        if self._cmd_all:
+            self._refresh_all_model()        # it draws through that model
         # Hub depths change the decode, so re-decode — but OFF the GUI thread (with
         # the busy dialog), like the scrambler-override path. A synchronous re-decode
         # here froze the UI for seconds on a large capture.
@@ -4580,7 +6449,7 @@ class MainWindow(QMainWindow):
         self._redecode_preserving(rehub, "Hub depths applied; re-decoded.")
 
     def _on_pdm_dc_toggled(self, on: bool) -> None:
-        """Audio ▸ Block PDM DC Bias: persist the choice and rebuild the audio store
+        """Decode ▸ Block PDM DC Bias: persist the choice and rebuild the audio store
         with the new setting. The bit stream is unchanged (no C++ re-decode) — only
         the PDM→PCM decimation differs — but that re-decimation is O(samples), so run
         it off the GUI thread via the load path (identity factory: same session, new
@@ -4594,6 +6463,12 @@ class MainWindow(QMainWindow):
             return s                              # same decode; load_session rebuilds
         #                                           the store with self._pdm_dc_block
 
+        # The preference is window-wide, so EVERY Link's store is rebuilt with it — the
+        # others quietly, as background re-decodes of their own sessions.
+        for link in self._links:
+            if link is not self._links.active:
+                self._load_async(lambda s=link.session, **kw: s, kind="redecode",
+                                 session=link.session)
         self._redecode_preserving(
             rebuild,
             f"PDM DC bias block {'on' if self._pdm_dc_block else 'off'}; audio re-decoded.")
@@ -4610,11 +6485,20 @@ class MainWindow(QMainWindow):
         return self._accepted_src_cache
 
     def _select_command_for_sample(self, sample: int) -> None:
-        if not self._starts:
-            return
-        idx = bisect.bisect_right(self._starts, sample) - 1
-        if idx < 0:
-            idx = 0
+        if self._cmd_all and self._all_model is not None:
+            # All Links rows are ordered by global time: bisect the cursor's instant. The
+            # half-ps slack absorbs float rounding of a cursor parked exactly on a row.
+            pos = self._all_model.positions_ps
+            if not len(pos) or self._links.active is None:
+                return
+            t = self._links.active.to_ps(int(sample)) + 0.5
+            idx = max(0, int(np.searchsorted(pos, t, side="right")) - 1)
+        else:
+            if not self._starts:
+                return
+            idx = bisect.bisect_right(self._starts, sample) - 1
+            if idx < 0:
+                idx = 0
         # The exact nearest command may be filtered out of the table. Fall back to the
         # nearest VISIBLE command: the closest accepted row at/before the cursor (the
         # "in effect" command), else the first accepted row after it. Bisect the cached
@@ -4624,7 +6508,7 @@ class MainWindow(QMainWindow):
             return                                  # nothing visible under the filter
         pos = bisect.bisect_right(accepted, idx) - 1
         src_row = accepted[pos] if pos >= 0 else accepted[0]
-        proxy_idx = self._cmd_proxy.mapFromSource(self._cmd_model.index(src_row, 0))
+        proxy_idx = self._cmd_proxy.mapFromSource(self._table_model().index(src_row, 0))
         if not proxy_idx.isValid():
             return
         self._syncing = True

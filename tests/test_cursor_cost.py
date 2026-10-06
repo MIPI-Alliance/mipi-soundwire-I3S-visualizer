@@ -242,7 +242,7 @@ def test_the_cursor_cascade_skips_hidden_docks(monkeypatch):
     monkeypatch.setattr(s, "register_files_at",
                         lambda *a, **k: touched.append("registers") or [])
 
-    w._pending_cursor = (int(ce[len(ce) // 2]), False, False, False)
+    w._pending_cursor = (int(ce[len(ce) // 2]), False, False, False, -1)   # -1: no lane
     w._apply_cursor_heavy()
 
     assert not touched, (

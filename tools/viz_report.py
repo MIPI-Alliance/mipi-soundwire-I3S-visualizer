@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+import pathlib
 import sys
 import tempfile
 import time
@@ -90,7 +91,7 @@ def _run():
             name = os.path.splitext(rel)[0]
             model = viz_engine.model_json(csv)
             gold_path = os.path.join(_GOLD, os.path.splitext(rel)[0] + ".json")
-            reg_ok = os.path.exists(gold_path) and json.load(open(gold_path)) == model
+            reg_ok = os.path.exists(gold_path) and json.loads(pathlib.Path(gold_path).read_text()) == model
             resaved = os.path.join(d, f"{i}.csv")
             _resave(csv, resaved)
             rt_ok = viz_engine.model_json(resaved) == model
@@ -102,7 +103,7 @@ def _write_summary(results, elapsed):
     prev = {}
     if os.path.exists(_PREV):
         try:
-            prev = json.load(open(_PREV))
+            prev = json.loads(pathlib.Path(_PREV).read_text())
         except (OSError, json.JSONDecodeError):
             prev = {}
     total = len(results)
@@ -168,9 +169,11 @@ def _write_summary(results, elapsed):
                     f.write(f"  - (row {pos // cols}, col {pos % cols})\n")
                 if len(st["clash_positions"]) > 10:
                     f.write(f"  - ... and {len(st['clash_positions']) - 10} more\n")
-    json.dump({"totals": {"configs": total, "reg_pass": reg_pass, "rt_pass": rt_pass, **agg},
-               "slot_types": dict(slot_types), "directions": dict(directions), "elapsed": elapsed},
-              open(_PREV, "w"), indent=2, sort_keys=True)
+    with open(_PREV, "w") as f:
+        json.dump({"totals": {"configs": total, "reg_pass": reg_pass, "rt_pass": rt_pass,
+                              **agg},
+                   "slot_types": dict(slot_types), "directions": dict(directions),
+                   "elapsed": elapsed}, f, indent=2, sort_keys=True)
     return total, reg_pass, rt_pass
 
 

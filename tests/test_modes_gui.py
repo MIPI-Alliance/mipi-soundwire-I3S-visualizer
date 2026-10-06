@@ -127,7 +127,7 @@ def test_return_restores_layout():
 def test_mode_persists_in_workspace():
     win = _win()
     win._mode_mgr.switch_to(VISUALIZATION)
-    ws = Workspace(source=win._session.source, mode=win._mode_mgr.current())
+    ws = Workspace.single(source=win._session.source, mode=win._mode_mgr.current())
     assert Workspace.from_json(ws.to_json()).mode == VISUALIZATION
 
     with tempfile.TemporaryDirectory() as d:
@@ -135,7 +135,7 @@ def test_mode_persists_in_workspace():
         ws.save(path)
         win2 = MainWindow()
         loaded = Workspace.load(path)
-        win2.load_session(session_from_source(loaded.source, register_map=win2._rmap))
+        win2.load_session(session_from_source(loaded.links[0].source, register_map=win2._rmap))
         win2.apply_workspace(loaded)
     assert win2._mode_mgr.current() == VISUALIZATION
     assert win2._central_stack.currentIndex() == MODES.index(VISUALIZATION)
@@ -200,15 +200,15 @@ def test_workspace_carries_authoring():
     # pin min == max to make the round-trip assertion exact).
     win._timing_page._min[("spec", "bus length (cm)")].setValue(42.0)
     win._timing_page._max[("spec", "bus length (cm)")].setValue(42.0)
-    ws = Workspace(source=win._session.source, mode=VISUALIZATION,
-                   authoring=win._authoring.config().to_dict(),
-                   timing=win._timing_page.to_dict())
+    ws = Workspace.single(source=win._session.source, mode=VISUALIZATION,
+                          authoring=win._authoring.config().to_dict(),
+                          timing=win._timing_page.to_dict())
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
         ws.save(path)
         win2 = MainWindow()
         loaded = Workspace.load(path)
-        win2.load_session(session_from_source(loaded.source, register_map=win2._rmap))
+        win2.load_session(session_from_source(loaded.links[0].source, register_map=win2._rmap))
         win2.apply_workspace(loaded)
     assert win2._authoring.config().dataports[5].enable_ch == 0b101
     assert win2._timing_page.inputs("spec").bus_length_cm == 42.0

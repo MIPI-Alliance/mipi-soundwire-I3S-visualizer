@@ -12,7 +12,14 @@
 
         powershell -ExecutionPolicy Bypass -File .\run.ps1
 #>
-param([switch]$Rebuild)
+# $Rebuild is THIS script's flag; everything else is forwarded to the app verbatim
+# (ValueFromRemainingArguments), so `.\run.ps1 -c cfg.csv -o m.json` reaches the CLI.
+# Until 3.0.19 both launchers swallowed every argument.
+param(
+    [switch]$Rebuild,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$AppArgs = @()
+)
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
@@ -172,7 +179,13 @@ swi3score build failed. Not stamping - will retry next run.
 # the last thing on screen is a pip line and the window is the next event - which reads as
 # a stall, especially right after an install: the OS scans the several hundred MB of newly
 # written Qt libraries the first time they load. A warm start is ~1s.
-if ($installedDeps) {
+# -o implies headless, so neither message would be true of it.
+$headless = @($AppArgs | Where-Object { $_ -eq "-o" -or $_ -eq "--output" -or
+                                        $_ -like "-o=*" -or $_ -like "--output=*" -or
+                                        $_ -eq "-h" -or $_ -eq "--help" }).Count -gt 0
+if ($headless) {
+    # nothing to announce: no window opens
+} elseif ($installedDeps) {
     Write-Host "Starting SWI3S Studio - the first launch after an install is slow while the OS"
     Write-Host "verifies the newly installed Qt libraries. Later runs start in about a second."
 } else {
@@ -180,4 +193,8 @@ if ($installedDeps) {
 }
 
 $env:PYTHONPATH = "."
-& $python -m swi3s_studio.app
+# See run.sh: the app names the LAUNCHER in its usage line, not an installed console
+# script that a fresh checkout does not have.
+$env:SWI3S_LAUNCHER = ".\run.ps1"
+& $python -m swi3s_studio.app @AppArgs
+exit $LASTEXITCODE        # -o returns 0/1/2; swallowing it would make it useless

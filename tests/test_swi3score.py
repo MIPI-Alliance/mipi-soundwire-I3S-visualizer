@@ -44,8 +44,8 @@ def test_control_phases_decode():
     # Two commits (8-col then 16-col). Each geometry writes NumColumns + 4 ports x 3
     # register writes (SampleSizeGrouping, BitWidth/HStart/HCount/Spacing/Interval,
     # ChannelGrouping) = 13; plus a one-time PortControl (ScramblerEn=0) for DP0 and DP2
-    # = 2. Total 26 + 2 = 28.
-    assert len(writes) == 28, f"expected 28 writes, got {len(writes)}"
+    # = 2; plus DP0's payload skipping = 3. Total 26 + 2 + 3 = 31.
+    assert len(writes) == 31, f"expected 31 writes, got {len(writes)}"
     assert len(pings) >= 2
     assert len(sscr) == 2, f"expected 2 confirmed commits (8-col, 16-col), got {len(sscr)}"
     # The first write programs the column count (SLC NumColumns_NEXT @ 0x1081).

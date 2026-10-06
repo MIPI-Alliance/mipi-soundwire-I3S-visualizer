@@ -54,11 +54,11 @@ def _square_wave_codes(n: int, period: int, hi: int = 1000, lo: int = -1000):
 
 
 def test_workspace_json_roundtrip():
-    ws = Workspace(source={"type": "demo", "audio_samples_per_channel": 8},
-                   overlay=[[0, 0, 0x2090, 0x02]], bookmarks=[10, 20], cursor=42)
+    ws = Workspace.single(source={"type": "demo", "audio_samples_per_channel": 8},
+                          overlay=[[0, 0, 0x2090, 0x02]], bookmarks=[10, 20], cursor=42)
     ws2 = Workspace.from_json(ws.to_json())
-    assert ws2.source == ws.source
-    assert ws2.overlay == [[0, 0, 0x2090, 0x02]]     # [section, device, address, value]
+    assert ws2.links[0].source == ws.links[0].source
+    assert ws2.links[0].overlay == [[0, 0, 0x2090, 0x02]]     # [section, device, address, value]
     assert ws2.bookmarks == [10, 20]
     assert ws2.cursor == 42
 
@@ -87,9 +87,9 @@ def test_session_from_source_analog_csv_roundtrip():
         assert orig.source["type"] == "analog_csv"
 
         ws_path = os.path.join(d, "ws.json")
-        Workspace(source=orig.source).save(ws_path)
+        Workspace.single(source=orig.source).save(ws_path)
         loaded = Workspace.load(ws_path)
-        reopened = session_from_source(loaded.source)
+        reopened = session_from_source(loaded.links[0].source)
 
     assert reopened.source["type"] == "analog_csv"
     assert reopened.capture.clock_edges.size == orig.capture.clock_edges.size
@@ -113,9 +113,9 @@ def test_session_from_source_wfm_roundtrip_synthetic():
         assert orig.source["type"] == "wfm"
 
         ws_path = os.path.join(d, "ws.json")
-        Workspace(source=orig.source).save(ws_path)
+        Workspace.single(source=orig.source).save(ws_path)
         loaded = Workspace.load(ws_path)
-        reopened = session_from_source(loaded.source)
+        reopened = session_from_source(loaded.links[0].source)
 
     assert reopened.source["type"] == "wfm"
     assert reopened.capture.clock_edges.size == orig.capture.clock_edges.size
@@ -146,16 +146,16 @@ def test_gui_save_open_restores_state():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
         # Save directly via the Workspace model (avoids the file dialog).
-        ws = Workspace(source=win._session.source,
-                       bookmarks=win._bookmarks.to_json(),
-                       cursor=win.cursor.sample)
+        ws = Workspace.single(source=win._session.source,
+                              bookmarks=win._bookmarks.to_json(),
+                              cursor=win.cursor.sample)
         ws.save(path)
 
         # Fresh window, open the workspace.
         win2 = MainWindow()
         loaded = Workspace.load(path)
         from swi3s_studio.workspace import session_from_source as sfs
-        win2.load_session(sfs(loaded.source, register_map=win2._rmap))
+        win2.load_session(sfs(loaded.links[0].source, register_map=win2._rmap))
         win2.apply_workspace(loaded)
 
     assert win2._bookmarks.samples() == win._bookmarks.samples()
@@ -180,7 +180,7 @@ def test_gui_save_open_restores_register_overlay():
         QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
         try:
             win.save_workspace()
-            assert [0, 0, 0x2090, 0x02] in Workspace.load(path).overlay   # saved
+            assert [0, 0, 0x2090, 0x02] in Workspace.load(path).links[0].overlay   # saved
 
             win2 = MainWindow()
             win2.open_workspace()                        # async decode on a worker thread
@@ -217,7 +217,7 @@ def test_gui_save_open_restores_scrambler_overrides():
         QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
         try:
             win.save_workspace()
-            saved = Workspace.load(path).device_scramblers
+            saved = Workspace.load(path).links[0].device_scramblers
             assert [0, 2, False] in saved and [1, 3, True] in saved, saved
 
             win2 = MainWindow()
@@ -297,15 +297,15 @@ def test_view_prefs_no_stale_state_in_reused_window():
     # Apply a v2 workspace whose view is all-default (TX off), and a v1 (empty view).
     from swi3s_studio.workspace import Workspace
     for view in ({"tx_map": False, "tx_persist": False, "show_clock": True}, {}):
-        win.apply_workspace(Workspace(source=win._session.source, view=view))
+        win.apply_workspace(Workspace.single(source=win._session.source, view=view))
         assert not win._tx_map, f"TX map leaked (view={view})"
         assert not win._tx_persist, f"persist leaked (view={view})"
         assert not win._persist_btn.isChecked()
         assert win._raw_view.show_clock is True, f"clock state leaked (view={view})"
 
     # A corrupt grid_rows must not raise (mode switch below must still run).
-    win.apply_workspace(Workspace(source=win._session.source,
-                                  view={"grid_rows": "oops"}, mode="Analysis"))
+    win.apply_workspace(Workspace.single(source=win._session.source,
+                                         view={"grid_rows": "oops"}, mode="Analysis"))
     assert 1 <= win._grid_rows <= 10240
 
 
@@ -320,3 +320,48 @@ def test_toggle_off_clears_persist():
     assert win._tx_persist
     win._toggles_btn.setChecked(False)
     assert not win._tx_persist and not win._persist_btn.isChecked()
+
+
+_V3 = {
+    "version": 3, "source": {"type": "demo"}, "overlay": [[0, 0, 0x2090, 0x02]],
+    "bookmarks": [{"sample": 10, "group": "A", "index": 1, "label": ""}], "cursor": 42,
+    "mode": "Analysis", "device_names": {"0": "Codec"}, "device_hub_depths": {"2": 1},
+    "device_regmaps": {}, "device_scramblers": [[0, 1, True]], "view": {"tx_map": True},
+}
+
+
+def test_a_v3_workspace_loads_as_one_link_at_offset_0():
+    import json
+    ws = Workspace.from_json(json.dumps(_V3))
+    (link,) = ws.links
+    assert link.source == {"type": "demo"} and link.name == "Link 1" and link.offset_ps == 0
+    assert link.overlay == [[0, 0, 0x2090, 0x02]]
+    assert link.device_names == {"0": "Codec"} and link.device_hub_depths == {"2": 1}
+    assert link.device_scramblers == [[0, 1, True]]
+    assert ws.active_link == 0 and ws.cursor == 42 and ws.view == {"tx_map": True}
+    # Re-saving writes the CURRENT layout, not a v3 label on a v4 body.
+    again = json.loads(ws.to_json())
+    assert again["version"] == 4 and "source" not in again
+    assert again["links"][0]["overlay"] == [[0, 0, 0x2090, 0x02]]
+
+
+def test_a_v4_workspace_round_trips_every_link():
+    from swi3s_studio.workspace import LinkSpec
+    ws = Workspace(links=[LinkSpec(source={"type": "demo"}),
+                          LinkSpec(source={"type": "demo", "x": 1}, name="Amp bus",
+                                   offset_ps=-1_250_000, device_names={"3": "Amp"})],
+                   active_link=1, bookmarks=[{"sample": 7, "group": "A", "index": 1,
+                                              "label": "", "link": 1}])
+    back = Workspace.from_json(ws.to_json())
+    assert back == ws
+
+
+def test_from_json_rejects_a_broken_link_list():
+    import json
+    for bad in ({"links": []}, {"links": [{"name": "no source"}]},
+                {"links": [{"source": {"type": "demo"}}], "active_link": 1}):
+        try:
+            Workspace.from_json(json.dumps(bad))
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass

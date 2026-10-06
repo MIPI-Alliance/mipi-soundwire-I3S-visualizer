@@ -35,14 +35,39 @@ regression predicate that can never be true fails three more, including the one 
 import importlib.util
 import json
 import os
+import pathlib
 import re
 import sys
+
+import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CI = os.path.join(_ROOT, ".github", "workflows", "ci.yml")
 _GATE = os.path.join(_ROOT, "tools", "gate.py")          # the implementation
 _GATE_SH = os.path.join(_ROOT, "tests", "gate.sh")       # bash wrapper
 _GATE_PS1 = os.path.join(_ROOT, "tests", "gate.ps1")     # PowerShell wrapper
+# A version reference in a release-notes file, EXCLUDING a spec citation. "Section 14.1.10"
+# parses as 14.1.10 and compares greater than every 3.0.x release, so the forward-reference guard
+# below failed the moment the notes described a spec feature — and these notes cite sections
+# constantly. Narrowed rather than allowlisted, which is the rule tools/leak_scan.py follows for
+# the identical collision — a §10.x spec citation against its private-IP pattern, which is why
+# that pattern carries a § lookbehind of its own. Naming the address here would trip the
+# scanner on this very file, which is the self-matching trap leak_scan.py avoids by building
+# its patterns from parts.
+_VERSION_NOT_A_CITATION = (
+    # not introduced by a citation word or §
+    r"(?<!§)(?<!Section )(?<!section )(?<!Table )(?<!table )(?<!Figure )(?<!figure )"
+    # not starting PART-WAY through a longer dotted number: \b alone let "section 9.1.6.2"
+    # match its tail "1.6.2", which no lookbehind for "section " can see.
+    r"(?<![\w.])"
+    r"v?(\d+)\.(\d+)\.(\d+)"          # `v?` — "v3.1.0" is a version reference too, and \b
+                                       # rejected it outright (v and 3 are both word chars)
+    # reject a FOURTH part, but allow a sentence-final period: only a dot FOLLOWED BY A DIGIT
+    # means "this is a longer citation". The stricter (?![\d.]) killed "ships in 3.0.19." —
+    # the same distinction tools/leak_scan.py's _IPV4_TAIL had to make.
+    r"(?!\.?\d)"
+)
+
 _DOCS = ["README.md", os.path.join("docs", "DEVELOPMENT.md"), os.path.join("docs", "TESTING.md")]
 
 
@@ -147,7 +172,8 @@ def test_gate_is_cross_platform():
 def test_wrappers_delegate_and_hold_no_logic():
     """Two shells, one implementation. A wrapper that grows its own checks is how the gate
     and CI drifted in the first place."""
-    for path, name in ((_GATE_SH, "gate.sh"), (_GATE_PS1, "gate.ps1")):
+    run_all = os.path.join(_ROOT, "tests", "run_all.sh")
+    for path, name in ((_GATE_SH, "gate.sh"), (_GATE_PS1, "gate.ps1"), (run_all, "run_all.sh")):
         text = _read(path)
         assert "tools/gate.py" in text, f"tests/{name} must delegate to tools/gate.py"
         for leaked in ("pytest", "ruff check", "mypy_gate"):
@@ -390,7 +416,7 @@ def test_ci_installs_numpy_for_the_type_check():
 # --------------------------------------------------------------------------------------
 
 _GATE_CHECKS = ("check_native", "check_pytest", "check_per_suite",
-                "check_tool", "check_mypy", "check_leaks")
+                "check_tool", "check_mypy", "check_leaks", "check_native_cpp")
 
 
 def _load_tool(filename: str):
@@ -429,7 +455,7 @@ def test_the_gate_exits_zero_only_when_nothing_failed():
 
 def test_the_gate_exits_nonzero_when_a_check_failed():
     """The mutation that proved this file was untested: main() printing FAIL and returning 0.
-    `exit 0 is the gate` is the sentence in CLAUDE.md this asserts."""
+    "Exit 0 is the gate" (docs/DEVELOPMENT.md, the release checklist) is what this asserts."""
     assert _run_gate(failed=["pytest not-perf"]) == 1, \
         "a failed check must make the gate exit nonzero"
 
@@ -546,3 +572,264 @@ def test_the_ratchet_fails_a_baseline_naming_a_deleted_file(tmp_path):
     3.0.12 review): fewer errors than the stale number read as 'improved' and exited 0."""
     gone = os.path.join("swi3s_studio", "no_such_module_here.py")
     assert _run_ratchet({_F1: 3}, {_F1: 3, gone: 4}, tmp_path) == 1
+
+
+# ---------------------------------------------------------------- release notes are ONE file
+# v3.0.17 was described three separate times by hand — a signed tag annotation, a release
+# body, and the publish branch's commit message — with nothing tying any of them to the tree.
+# They disagreed, and one announced a memory-guard fix that landed AFTER the tag. The fix is
+# structural: one reviewed file per release, in the tree and therefore in the tag, referenced
+# by every consumer instead of restated. These guard the two ways that can rot.
+
+def _notes_path(version: str) -> str:
+    return os.path.join("docs", "releases", f"v{version}.md")
+
+
+def test_the_current_version_has_a_release_notes_file():
+    """Written DURING the cycle, not at push time. Writing it at push time is what let a claim
+    about post-tag work into the notes: by then the work existed, so it read as true."""
+    from swi3s_studio import __version__
+    rel = _notes_path(__version__)
+    full = os.path.join(_ROOT, rel)
+    assert os.path.isfile(full), (
+        f"{rel} is missing. Every description of this release — the release body, the "
+        f"publish branch's commit message, the pull request — reads from it, so it is written "
+        f"as part of the cycle. See docs/DEVELOPMENT.md, 'One release, one description'.")
+    text = pathlib.Path(full).read_text(encoding="utf-8")
+    assert text.splitlines()[0].startswith("#"), f"{rel} must open with a markdown title"
+    assert __version__ in text.splitlines()[0], (
+        f"{rel} title line does not name {__version__}: {text.splitlines()[0]!r}")
+
+
+def test_the_release_notes_claim_no_later_version():
+    """The exact defect, pinned. A description may look back but never forward: naming a LATER
+    version means it is describing work this tag does not contain.
+
+    Scoped PER SECTION, not by splitting at the exempt heading: splitting at '## Not in this
+    release' and checking only what came before leaves every section AFTER it unchecked,
+    including the one v3.0.17's notes end with. An exemption has to be the exempt section
+    itself, not everything downstream of it.
+
+    A SPEC CITATION IS NOT A VERSION — see _VERSION_NOT_A_CITATION for why the pattern is
+    narrowed rather than the string allowlisted, and the test below for the narrowing checked in
+    both directions.
+    """
+    import re as _re
+
+    from swi3s_studio import __version__
+    rel = _notes_path(__version__)
+    text = pathlib.Path(os.path.join(_ROOT, rel)).read_text(encoding="utf-8")
+    mine = tuple(int(p) for p in __version__.split("."))
+
+    # (heading, body) for each '## ' section; the preamble before the first one is its own.
+    sections, head, buf = [], "(preamble)", []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            sections.append((head, "\n".join(buf)))
+            head, buf = line[3:].strip(), []
+        else:
+            buf.append(line)
+    sections.append((head, "\n".join(buf)))
+
+    offenders = []
+    for heading, body in sections:
+        if heading.lower() == "not in this release":
+            continue        # the honest way to record a scope correction — see below
+        for m in _re.finditer(_VERSION_NOT_A_CITATION, body):
+            if tuple(int(g) for g in m.groups()) > mine:
+                offenders.append((heading, m.group(0)))
+    assert not offenders, (
+        f"{rel} names a version later than {__version__}: {offenders} — the notes describe "
+        f"work this tag does not contain. If the point is that something is NOT in this "
+        f"release, say so under a '## Not in this release' heading, which is exempt.")
+
+
+def test_the_citation_narrowing_works_in_both_directions():
+    """The narrowing must not have bought its way out of the false positive by ceasing to catch
+    real forward references. Both directions, on the shapes that actually occur in these notes."""
+    import re as _re
+
+    def hits(text):
+        return [m.group(0) for m in _re.finditer(_VERSION_NOT_A_CITATION, text)]
+
+    # Each of these is a shape that broke a previous draft of the pattern, not a guess.
+    for citation in ("Section 14.1.10", "section 9.1.6.2", "§14.1.10", "see Section 14.1.10.",
+                     "Table 125.4.1", "Figure 174.1.2",
+                     "per Section 9.1.6.2.1 the SSP"):     # matched its tail "1.6.2" once
+        assert not hits(citation), f"citation read as a version: {citation!r} -> {hits(citation)}"
+    for version in ("ship in 3.0.19", "landed in 4.0.0",
+                    "v3.1.0 adds",                         # \b rejected this outright once
+                    "3.0.99 work", "ships in 3.0.19.",     # sentence-final period
+                    "(3.0.20)"):
+        assert hits(version), f"real version reference MISSED: {version!r}"
+
+
+def test_every_released_version_kept_its_notes():
+    """The directory accumulates. A release whose notes vanished cannot be re-described, and
+    the publish tool would refuse to rebuild its tree."""
+    import re as _re
+    notes = os.listdir(os.path.join(_ROOT, "docs", "releases"))
+    have = {m.group(1) for n in notes if (m := _re.fullmatch(r"v(\d+\.\d+\.\d+)\.md", n))}
+    assert "3.0.17" in have, f"docs/releases lost v3.0.17.md; present: {sorted(have)}"
+
+
+def test_the_publish_tool_refuses_a_tree_with_no_notes(tmp_path):
+    """Behavioural, not a substring search — the half of this file that exists because the
+    drift guards could not fail."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
+    pt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pt)
+
+    pkg = tmp_path / "swi3s_studio"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+
+    notes, problems = pt.check_release_notes(str(tmp_path))
+    assert notes is None and problems, "a tree with no notes file was accepted"
+    assert "docs/releases/v9.9.9.md" in problems[0]
+
+    (tmp_path / "docs" / "releases").mkdir(parents=True)
+    target = tmp_path / "docs" / "releases" / "v9.9.9.md"
+    target.write_text("# SWI3S Studio v9.9.9\n\nBody.\n", encoding="utf-8")
+    notes, problems = pt.check_release_notes(str(tmp_path))
+    assert notes and not problems, f"a valid notes file was rejected: {problems}"
+
+    # An unfinalised file is not publishable, same rule as the changelog header.
+    target.write_text("# SWI3S Studio v9.9.9 (in development)\n\nBody.\n", encoding="utf-8")
+    _, problems = pt.check_release_notes(str(tmp_path))
+    assert any("in development" in p for p in problems), problems
+
+    # A title naming the wrong version is caught too.
+    target.write_text("# SWI3S Studio v1.2.3\n\nBody.\n", encoding="utf-8")
+    _, problems = pt.check_release_notes(str(tmp_path))
+    assert any("title line" in p for p in problems), problems
+
+
+def test_preview_mode_allows_unfinished_notes_and_says_so(tmp_path):
+    """A preview publishes an UNFINISHED cycle, so the '(in development)' refusal has to be
+    lift-able — but only by saying plainly that it is a preview. Releases stay strict.
+
+    The failure this prevents is a branch that looks exactly like a release branch: same shape,
+    same tree assembly, same subject line. A reader has no way to tell without being told.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
+    pt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pt)
+
+    pkg = tmp_path / "swi3s_studio"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('__version__ = "9.9.9"\n', encoding="utf-8")
+    (tmp_path / "docs" / "releases").mkdir(parents=True)
+    notes = tmp_path / "docs" / "releases" / "v9.9.9.md"
+    notes.write_text("# SWI3S Studio v9.9.9 (in development)\n\nBody.\n", encoding="utf-8")
+
+    # Default: refused, and the message points at the way out rather than just saying no.
+    _text, problems = pt.check_release_notes(str(tmp_path))
+    assert any("in development" in p for p in problems)
+    assert any("--preview" in p for p in problems), (
+        "the refusal must name --preview; a check that only says no invites deleting the marker")
+
+    # --preview: allowed.
+    text, problems = pt.check_release_notes(str(tmp_path), preview=True)
+    assert text and not problems, problems
+
+    # And the message must SAY it is a preview, in the subject and the body.
+    msg = pt.branch_message(text, "9.9.9", ["a"], ["b"], "public/main", preview=True)
+    assert "PREVIEW" in msg.splitlines()[0], f"subject does not mark it: {msg.splitlines()[0]!r}"
+    assert "NOT A RELEASE" in msg
+    assert "not tagged" in msg
+    # A release message must NOT carry any of that.
+    rel = pt.branch_message(text, "9.9.9", ["a"], ["b"], "public/main")
+    assert "PREVIEW" not in rel and "NOT A RELEASE" not in rel
+    # A preview has no tag, so it must not claim to differ from one. Compared on
+    # whitespace-NORMALISED text: the preamble is wrapped at 95 columns, so "release tag" can
+    # legitimately straddle a line break and a raw substring check reads that as absent.
+    flat = lambda t: " ".join(t.split())        # noqa: E731
+    assert "release tag" not in flat(msg), "the preview message names a tag that does not exist"
+    assert "source commit it was built from" in flat(msg)
+    assert "release tag" in flat(rel), "the release message SHOULD name the tag it differs from"
+
+
+def test_the_branch_message_is_derived_from_the_notes_verbatim():
+    """The preamble is computed; the body is the file. Nothing is retyped, which is the whole
+    point — a retyped body is what drifted."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
+    pt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pt)
+
+    notes = "# SWI3S Studio v4.5.6\n\n## Ingest\n\n- a thing changed.\n"
+    msg = pt.branch_message(notes, "4.5.6", ["a", "b"], ["c"], "public/main")
+    assert msg.startswith("SWI3S Studio v4.5.6\n"), msg.splitlines()[0]
+    assert "- a thing changed." in msg, "the notes body did not reach the message"
+    assert "## Ingest" in msg
+    assert "2 files" in msg and "1 file " in msg, "prune/graft counts are not derived"
+    assert "public/main" in msg
+    assert "docs/releases/v4.5.6.md" in msg, "the message must name the file it quotes"
+
+
+def test_only_runs_the_named_checks_and_never_reads_as_the_gate(capsys):
+    """`--only` (what tests/run_all.sh calls) runs just what it names, in gate order, and its
+    summary says it was partial: a bare PASS from a subset would read as the release gate."""
+    g = _load_tool("gate.py")
+    ran = []
+    for name in _GATE_CHECKS:
+        setattr(g, name, lambda *a, _n=name, **k: ran.append(_n))
+    g._FAILED[:] = []
+    g._NOT_RUN[:] = []
+    saved = sys.argv
+    sys.argv = ["tools/gate.py", "--only", "per-suite,native"]
+    try:
+        rc = g.main()
+    finally:
+        sys.argv = saved
+    out = capsys.readouterr().out
+    assert rc == 0 and ran == ["check_native", "check_per_suite"]
+    assert "a partial run, not the release gate" in out
+
+
+def test_only_refuses_an_unknown_check():
+    g = _load_tool("gate.py")
+    with pytest.raises(SystemExit, match="unknown: typo"):
+        g._selected(["tools/gate.py", "--only", "pytest,typo"])
+
+
+def test_the_full_gate_does_not_run_the_opt_in_native_cpp_suite():
+    g = _load_tool("gate.py")
+    ran = []
+    for name in _GATE_CHECKS:
+        setattr(g, name, lambda *a, _n=name, **k: ran.append(_n))
+    g._FAILED[:] = []
+    g._NOT_RUN[:] = []
+    saved = sys.argv
+    sys.argv = ["tools/gate.py"]
+    try:
+        g.main()
+    finally:
+        sys.argv = saved
+    assert "check_native_cpp" not in ran and "check_per_suite" in ran
+
+
+def test_the_ratchet_reads_plain_output_and_refuses_output_it_cannot_read(monkeypatch):
+    # With FORCE_COLOR set, mypy coloured even a pipe, no error line was parsed, and the
+    # gate passed "0 errors against a baseline of 134". The run asks for plain output with
+    # the colour variables removed, and a failing run with nothing read is refused.
+    import subprocess
+    m = _load_tool("mypy_gate.py")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env") or {}
+        return subprocess.CompletedProcess(
+            cmd, 1, "\x1b[1mswi3s_studio/x.py:1: \x1b[31merror:\x1b[m nope\n", "")
+    monkeypatch.setenv("FORCE_COLOR", "3")
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit) as exc:
+        m._run_mypy()
+    assert exc.value.code == 2
+    assert "--no-color-output" in seen["cmd"] and "FORCE_COLOR" not in seen["env"]

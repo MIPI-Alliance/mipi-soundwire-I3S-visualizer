@@ -3,7 +3,7 @@
     "mypy": "2.3.0",
     "numpy": "2.4.4"
   },
-  "total": 169,
+  "total": 134,
   "per_file": {
     "swi3s_studio/analysis/compare.py": 2,
     "swi3s_studio/analysis/errors.py": 1,
@@ -20,10 +20,10 @@
     "swi3s_studio/ui/audio_view.py": 2,
     "swi3s_studio/ui/devices_dialog.py": 2,
     "swi3s_studio/ui/grid_view.py": 10,
-    "swi3s_studio/ui/main_window.py": 83,
+    "swi3s_studio/ui/main_window.py": 49,
     "swi3s_studio/ui/raw_view.py": 1,
     "swi3s_studio/ui/register_view.py": 8,
-    "swi3s_studio/ui/timeline.py": 7,
+    "swi3s_studio/ui/timeline.py": 6,
     "swi3s_studio/ui/timing_view.py": 14
   }
 }

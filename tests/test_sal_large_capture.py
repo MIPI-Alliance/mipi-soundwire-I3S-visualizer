@@ -344,14 +344,94 @@ def test_guard_fails_closed_when_memory_is_unknown(tmp_path, monkeypatch):
     check, disabling the guard on exactly the machines it was written for. It must
     fall back to a finite budget instead."""
     monkeypatch.setattr(ss, "available_memory_bytes", lambda: 0)
-    assert ss._FALLBACK_BUDGET > 0
+    monkeypatch.setattr(ss, "total_memory_bytes", lambda: 0)
+    assert ss._UNKNOWN_BUDGET > 0
     e = _edges(n=20000, step=200)
     blob = sb.build_channel_v3(False, e, chunk_size=500)
     path = _write_sal(tmp_path, blob, blob)
     # Force the estimate over the fallback budget: the guard must still raise.
-    monkeypatch.setattr(ss, "_FALLBACK_BUDGET", 1)
+    monkeypatch.setattr(ss, "_UNKNOWN_BUDGET", 1)
     with pytest.raises(ss.SalTooLargeError):
         ss.load_capture(path, 0, 1)
+
+
+def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch, caplog):
+    """Free RAM, then a fraction of TOTAL, then a small constant — each rule more cautious
+    than the last, and each saying which one it used.
+
+    It used to fall straight to a flat 8 GiB, which was the same value as _MAX_AUTO_BUDGET
+    and therefore INVISIBLE on any machine with more than ~14 GB free, while being ~3.6x too
+    permissive on a 4 GB one (8.59 GB allowed against the 2.40 GB a psutil reading gives).
+    That is failing OPEN on the machines least able to absorb it, in the branch whose own
+    comment promised to fail closed — and it was silent, which is why an install missing
+    psutil ran on a degraded guard without anyone noticing.
+
+    WHAT IS ASSERTED IS PER-RULE CAUTION, NOT A GLOBAL ORDERING, because a global ordering is
+    not available: total RAM cannot know occupancy, so on a machine that is 75% full the
+    total-derived budget legitimately exceeds the free-derived one, so free > total > unknown
+    across three different figures is false. The claim that IS true is that the same figure
+    through a weaker rule yields a smaller budget.
+    """
+    import logging
+
+    same = 16_000_000_000        # one machine's worth, run through each rule in turn
+
+    monkeypatch.setattr(ss, "available_memory_bytes", lambda: same)
+    from_free = ss.memory_budget()
+    assert ss.budget_source() == "free memory"
+
+    monkeypatch.setattr(ss, "available_memory_bytes", lambda: 0)
+    monkeypatch.setattr(ss, "total_memory_bytes", lambda: same)
+    monkeypatch.setattr(ss, "_WARNED_DEGRADED", False)
+    with caplog.at_level(logging.WARNING, logger="swi3s_studio.ingest.saleae_sal"):
+        from_total = ss.memory_budget()
+    assert "total RAM" in ss.budget_source(), ss.budget_source()
+    assert any("psutil" in r.getMessage() for r in caplog.records), (
+        "a degraded memory guard must say so in the log — silence is the defect this fixes")
+
+    monkeypatch.setattr(ss, "total_memory_bytes", lambda: 0)
+    unknown = ss.memory_budget()
+    assert "conservative" in ss.budget_source(), ss.budget_source()
+
+    assert ss._UNKNOWN_TOTAL_FRACTION < ss._MEM_HEADROOM, (
+        "the total-RAM rule must be more cautious than the free-RAM rule: it cannot see how "
+        "much of that total is already spoken for")
+    assert from_total < from_free, (
+        f"the same {same} bytes gave {from_total} via total and {from_free} via free — a "
+        "weaker reading must not buy a bigger load")
+    assert unknown < from_total, (
+        f"knowing nothing ({unknown}) must not allow more than knowing the total "
+        f"({from_total}) on a machine larger than the assumed one")
+    assert unknown == int(ss._ASSUMED_TOTAL_WHEN_UNKNOWN * ss._UNKNOWN_TOTAL_FRACTION), (
+        "the unknown budget must be the total rule applied to a pessimistic assumed total, "
+        "not an independent constant — an independent constant is what inverted the tiers")
+
+
+def test_the_memory_probes_agree_with_psutil_on_this_platform():
+    """The stdlib route must match psutil where both work — it is the fallback for installs
+    that lack it, and a fallback nobody has compared to the truth is a guess.
+
+    Only the probe for THIS platform is asserted; the others correctly return 0 here. Windows
+    has no sysconf and macOS publishes no SC_AVPHYS_PAGES, so before these existed psutil was
+    the ONLY working path on both — which is how a missing dependency became invisible.
+    """
+    import sys
+
+    psutil = pytest.importorskip("psutil", reason="psutil is the reference for this test")
+    truth = int(psutil.virtual_memory().available)
+    probe = {"darwin": ss._avail_from_vm_stat,
+             "linux": ss._avail_from_proc_meminfo,
+             "win32": ss._avail_from_global_memory_status}.get(sys.platform)
+    if probe is None:
+        pytest.skip(f"no stdlib memory probe declared for {sys.platform}")
+    got = probe()
+    assert got > 0, f"the {sys.platform} stdlib probe read nothing while psutil read {truth}"
+    # Generous: the two sample at different instants and count reclaimable pages slightly
+    # differently. A factor-of-two agreement is enough to prove it reads the right quantity.
+    assert 0.5 <= got / truth <= 2.0, (
+        f"{sys.platform} probe {got/1e9:.2f} GB vs psutil {truth/1e9:.2f} GB — "
+        "the fallback is not measuring the same thing")
+    assert ss.total_memory_bytes() >= truth, "total RAM cannot be below what is available"
 
 
 def test_the_peak_estimate_carries_the_decode_transient():

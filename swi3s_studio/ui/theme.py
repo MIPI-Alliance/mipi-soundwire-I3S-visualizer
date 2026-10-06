@@ -11,7 +11,14 @@ from __future__ import annotations
 
 import os
 
-_CHECK_SVG = os.path.join(os.path.dirname(__file__), "assets", "check.svg").replace("\\", "/")
+_ASSETS = os.path.join(os.path.dirname(__file__), "assets")
+_CHECK_SVG = os.path.join(_ASSETS, "check.svg").replace("\\", "/")
+
+
+def _chevron_svg() -> str:
+    """The combo drop-down arrow for the active theme (TEXT-coloured, a file per theme
+    since a QSS url() cannot recolour an SVG)."""
+    return os.path.join(_ASSETS, f"chevron-down-{VizTheme.MODE}.svg").replace("\\", "/")
 
 
 class VizTheme:
@@ -48,9 +55,11 @@ class VizTheme:
     GRID_INK: str
     GRID_CDS_FILL: str
     PLOT_BG: str
+    PLOT_GRID_ALPHA: float
     CURSOR: str
     AXIS: str
     TRACE_PALETTE: list[str]
+    DP_LINE_PALETTE: list[str]
     RAW_DP: str
     RAW_DN: str
     SEM_ERROR: str
@@ -91,7 +100,15 @@ _DARK = {
     "GRID_LINE": "#8c9196", "GRID_TEXT": "#c8ccd0", "GRID_INK": "#0f0f12",
     "GRID_CDS_FILL": "#34373c",
     "PLOT_BG": "#1e2023", "CURSOR": "#f5f5f5", "AXIS": "#787878",
+    # Plot gridlines are pyqtgraph's axis grey (150,150,150) at this opacity over PLOT_BG.
+    # 0.2 (1.38:1) is too faint behind the Audio waveforms.
+    "PLOT_GRID_ALPHA": 0.35,                                 # 1.82:1 on #1e2023
     "TRACE_PALETTE": ["#3c96c8", "#46be82", "#c85a6e", "#beaa46", "#9670c8", "#5ac8c8"],
+    # Data-port colours drawn as LINES (Audio waveforms, Capture lane overlays, bookmark
+    # pairs), in grid_view._DP_PALETTE's hue order. Dark: the pastels themselves (5:1 or
+    # more on PLOT_BG).
+    "DP_LINE_PALETTE": ["#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
+                        "#BF80FF", "#FFBFFF", "#FFBFBF", "#FFFFBF", "#BFFFBF", "#BFFFFF"],
     "RAW_DP": "#5ac8c8", "RAW_DN": "#ffaa64",
     "SEM_ERROR": "#dc505a", "SEM_ERROR_BG": "#5a2328", "SEM_SSP": "#e1b946",
     "SEM_COMMIT": "#5aaae6", "SEM_READ": "#b48ceb", "SEM_OTHER": "#5ac88c",
@@ -112,7 +129,17 @@ _LIGHT = {
     "GRID_LINE": "#9098a0", "GRID_TEXT": "#2a2e33", "GRID_INK": "#0f0f12",
     "GRID_CDS_FILL": "#e2e5e9",
     "PLOT_BG": "#ffffff", "CURSOR": "#1a1a1a", "AXIS": "#909090",
+    # 0.2 here blends to #eaeaea, 1.2:1 on white, and the grid all but vanished; 0.45
+    # (1.55:1) is still too faint behind the Audio waveforms.
+    "PLOT_GRID_ALPHA": 0.65,                                 # 1.93:1 on white
     "TRACE_PALETTE": ["#2f7db4", "#2fa86e", "#c04a5e", "#9c8520", "#8050c0", "#1f9b9b"],
+    # The pastels on white fall to 1.03:1, so each hue is darkened in HSL (hue and
+    # saturation kept) until it clears 3:1 on PLOT_BG. Three pastels share a hue with a
+    # paler twin (yellow, green, cyan) and would land on the same colour, so the paler
+    # second row (entries 7-11) goes on to 5.5:1: deeper in light mode where it is paler
+    # in dark, and no two entries closer than the fills themselves (tests/test_theme.py).
+    "DP_LINE_PALETTE": ["#ff50a7", "#ff612c", "#999900", "#2bab00", "#00a4a4", "#8080ff",
+                        "#b973ff", "#ba00ba", "#d30000", "#6b6b00", "#007a00", "#007575"],
     "RAW_DP": "#1f9b9b", "RAW_DN": "#cc6a14",
     "SEM_ERROR": "#c62828", "SEM_ERROR_BG": "#f6d2d6", "SEM_SSP": "#b8860b",
     "SEM_COMMIT": "#1f6aa5", "SEM_READ": "#7d3c98", "SEM_OTHER": "#2e8b57",
@@ -324,11 +351,7 @@ def analyzer_stylesheet() -> str:
     QPushButton:checkable:!checked:hover {{ border-color: {t.ACCENT}; }}
     QPushButton:disabled {{ background: {t.ENTRY_BG}; color: {t.TEXT_DIM};
         border: {t.BORDER_WIDTH}px solid {t.BORDER}; }}
-    QComboBox {{
-        background: {t.ENTRY_BG}; color: {t.TEXT};
-        border: {t.BORDER_WIDTH}px solid {t.BORDER};
-        border-radius: {t.CORNER_RADIUS}px; padding: 1px 6px;
-    }}
+    {combo_qss()}
     /* Text/number entries (Samples value+filter, Bus Grid Rows-To-Draw, …) share the
        combo's entry recipe so they read as light entry fields in light mode instead of
        inheriting the panel background from the QWidget catch-all above. */
@@ -343,9 +366,6 @@ def analyzer_stylesheet() -> str:
     QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
         background: {t.ENTRY_BG}; border: none; width: 14px;
     }}
-    /* Merge the drop-down button into the field: no separate border/background box
-       beside the arrow (the "weirdness" at the picker's right edge). */
-    QComboBox::drop-down {{ border: none; background: transparent; width: 18px; }}
     /* Tool button (the multi-select filter) reuses the entry recipe; its pop-up menu is
        themed too so checkable items stay readable (native menus are OS-styled). */
     QToolButton {{
@@ -382,6 +402,24 @@ def analyzer_stylesheet() -> str:
     """
 
 
+def combo_qss() -> str:
+    """Every drop-down's look: the entry recipe and an explicit chevron. Without its own
+    arrow image a combo showed one or not depending on its parent's stylesheet (the
+    Commands picker did, the Link pickers in the dock title bars, under a blanket
+    background rule, did not); an arrow says "click to change", so all have it. The
+    drop-down button is merged into the field: no separate box beside the arrow."""
+    t = VizTheme
+    return f"""
+    QComboBox {{
+        background: {t.ENTRY_BG}; color: {t.TEXT};
+        border: {t.BORDER_WIDTH}px solid {t.BORDER};
+        border-radius: {t.CORNER_RADIUS}px; padding: 1px 6px;
+    }}
+    QComboBox::drop-down {{ border: none; background: transparent; width: 18px; }}
+    QComboBox::down-arrow {{ image: url({_chevron_svg()}); width: 10px; height: 10px; }}
+    """
+
+
 def chrome_stylesheet() -> str:
     """Window-chrome QSS baked with the active palette, applied to the QMainWindow so
     it cascades to the dock tab bars and modal dialogs (which otherwise render with the
@@ -391,6 +429,10 @@ def chrome_stylesheet() -> str:
     t = VizTheme
     return f"""
     QMainWindow {{ background: {t.FRAME_BG}; }}
+    /* The status bar: one slim line, the dim text colour, a hairline above. */
+    QStatusBar {{ background: {t.FRAME_BG}; border-top: 1px solid {t.BORDER}; }}
+    QStatusBar::item {{ border: none; }}
+    QStatusBar QLabel#statusText {{ color: {t.TEXT_DIM}; font-size: 11px; padding: 1px 6px; }}
     QMainWindow::separator {{ background: {t.FRAME_BG}; width: 4px; height: 4px; }}
     /* The in-window menu bar (Windows/Linux) needs explicit colours or dark mode
        renders dark text on a dark bar. macOS uses the native system bar and ignores
