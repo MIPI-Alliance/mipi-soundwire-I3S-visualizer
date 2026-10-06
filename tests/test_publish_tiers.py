@@ -24,16 +24,13 @@ import subprocess
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _INTERNAL = "docs/internal/"
+# Maintainers'-tier files outside docs/internal/ (see tools/publish_tree.py): pruned too.
+_INTERNAL_FILES = ("CLAUDE.md",)
 
 # Top-level paths that are PUBLISHED. A new entry here is a conscious decision to publish.
 _PUBLIC_ROOTS = (
     "README.md", "LICENSE.md", "GOVERNANCE.md", "CODEOWNERS", ".gitignore", ".github/",
     ".mipi/",                                # upstream-owned; present only once published
-    "CLAUDE.md",                             # agent guidance: published deliberately, since
-                                             # an outside contributor using an agent needs
-                                             # the same gate and reference-model rules a
-                                             # maintainer does. Keep it free of anything
-                                             # site-specific — it ships.
     "pyproject.toml", "requirements.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
     "docs/",                                 # docs/internal/ is carved out below
@@ -62,7 +59,11 @@ _UPSTREAM_OWNED = _upstream_owned()
 
 # The enforcing files necessarily CONTAIN the path they forbid, exactly as the leak scanner
 # and the reference-model guard do. Self-exclusion, not an allowlist for real violations.
-_SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py"}
+# Files that must NAME the tier boundary to do their job: this test, the tool that prunes the
+# tier, and the leak scanner (which exempts the internal tier from published-only patterns, so
+# that a third-party capture name can be flagged in what ships while staying legitimate in an
+# internal record). Everything else citing docs/internal/ is a dead link once published.
+_SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py", "tools/leak_scan.py"}
 
 # The three patterns .gitignore uses for the compiled core, so the walk in _files() agrees
 # with the git listing about what is a build product rather than a tracked path.
@@ -120,12 +121,13 @@ def test_nothing_published_references_something_internal():
     was pruned or never existed."""
     offenders = []
     for rel in _files():
-        if rel.startswith(_INTERNAL) or rel in _SELF:
+        if rel.startswith(_INTERNAL) or rel in _SELF or rel in _INTERNAL_FILES:
             continue
         if not rel.endswith((".md", ".py", ".cpp", ".h", ".toml", ".sh", ".ps1", ".yml")):
             continue
         for i, line in enumerate(_read(rel).splitlines(), 1):
-            if _INTERNAL in line or "internal/" + "TECH_DEBT" in line:
+            if _INTERNAL in line or "internal/" + "TECH_DEBT" in line \
+                    or any(f in line for f in _INTERNAL_FILES):
                 offenders.append(f"{rel}:{i}: {line.strip()[:90]}")
     assert not offenders, (
         "published files reference docs/internal/, which will not exist in the published "
@@ -136,8 +138,8 @@ def test_nothing_published_references_something_internal():
 
 def test_every_tracked_path_is_classified():
     """Default-deny: an unclassified path fails rather than silently shipping."""
-    unclassified = [p for p in _files()
-                    if not any(p == r or p.startswith(r) for r in _PUBLIC_ROOTS)]
+    unclassified = [p for p in _files() if p not in _INTERNAL_FILES
+                    and not any(p == r or p.startswith(r) for r in _PUBLIC_ROOTS)]
     assert not unclassified, (
         "tracked path(s) belong to no declared tier:\n  " + "\n  ".join(unclassified)
         + "\n\nAdd to _PUBLIC_ROOTS to publish it, or put it under docs/internal/ to keep it "
@@ -156,6 +158,8 @@ def test_the_split_is_intact():
                    if p.startswith("docs/") and not p.startswith(_INTERNAL)]
     if _is_published_tree():
         assert not internal, f"published tree still carries the internal tier: {internal}"
+        assert not [f for f in _INTERNAL_FILES if f in files], \
+            f"published tree still carries {_INTERNAL_FILES}"
     else:
         assert internal, "docs/internal/ is empty — the tier exists for a reason"
     for needed in ("docs/USER_GUIDE.md", "docs/architecture.md", "docs/DEVELOPMENT.md"):
@@ -255,3 +259,36 @@ def test_no_sync_conflict_duplicates_are_tracked():
         "tracked path(s) look like file-sync conflict copies:\n  " + "\n  ".join(dups)
         + "\n\nDelete them and stage explicitly rather than with `git add -A`. If a name like "
           "this is deliberate, rename it — the pattern is indistinguishable from a conflict.")
+
+
+def test_the_tier_boundary_has_one_definition():
+    """`publish_tree` prunes the internal tier and `leak_scan` exempts it — from the same path.
+
+    Both must name it (they are in _SELF for that reason), which means the string exists twice
+    and can drift. A drift would be silent and asymmetric: the scanner would exempt a directory
+    the pruner still ships, or flag one it already removed, and either way the published tier
+    would not be the scanned tier. leak_scan's comment claims this test keeps them in sync, so
+    the test has to exist for the comment to be true.
+    """
+    import importlib.util
+
+    def load(name, rel):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(_ROOT, rel))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    pruner = load("_pt", "tools/publish_tree.py")
+    scanner = load("_ls", "tools/leak_scan.py")
+    assert scanner._INTERNAL_TIER == pruner._INTERNAL == _INTERNAL, (
+        f"tier boundary disagrees: leak_scan={scanner._INTERNAL_TIER!r} "
+        f"publish_tree={pruner._INTERNAL!r} test={_INTERNAL!r}")
+
+
+def test_the_publish_tool_prunes_the_same_internal_files():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert tuple(mod._INTERNAL_FILES) == _INTERNAL_FILES

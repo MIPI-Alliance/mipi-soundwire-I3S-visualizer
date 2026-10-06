@@ -7,8 +7,14 @@ re-pair them. `add()` fills the earliest incomplete group before opening a new o
 the natural sequence is A1, A2, B1, B2, … and deleting a member reopens its group for
 the next add. Labels default to f"{group}{index}" (e.g. "A1") but can be overridden.
 
+A bookmark belongs to the Link it was placed on: `sample` is in THAT Link's samples and
+`link` is the Link's index, so moving a Link's time offset carries its bookmarks with it. A
+pair may span two Links, which is how an event on one bus is timed against another; this
+module never converts between Links (the window does, through its LinkSet).
+
 Persisted in the workspace; the legacy `[sample, ...]` format loads as ungrouped
-singles paired up in order (see `BookmarkSet.from_json`).
+singles paired up in order (see `BookmarkSet.from_json`). A bookmark saved before Links
+existed has no `link` and loads on Link 0, the only Link there was.
 """
 from __future__ import annotations
 
@@ -32,13 +38,14 @@ class Bookmark:
     group: str            # pair identity: 'A', 'B', ...
     index: int            # 1 or 2 within the group
     label: str = ""       # display override; empty => f"{group}{index}"
+    link: int = 0         # index of the Link `sample` counts in
 
     def display(self) -> str:
         return self.label or f"{self.group}{self.index}"
 
     def to_dict(self) -> dict:
         return {"sample": int(self.sample), "group": self.group,
-                "index": int(self.index), "label": self.label}
+                "index": int(self.index), "label": self.label, "link": int(self.link)}
 
 
 class BookmarkSet:
@@ -83,23 +90,26 @@ class BookmarkSet:
         return _group_name(n)
 
     # ---- mutations ----
-    def add(self, sample: int) -> Bookmark:
-        """Add a bookmark at `sample`, filling the earliest incomplete pair (index 2)
-        or opening a new group (index 1). Returns the new Bookmark."""
+    def add(self, sample: int, link: int = 0) -> Bookmark:
+        """Add a bookmark at `sample` on Link `link`, filling the earliest incomplete pair
+        (index 2) or opening a new group (index 1). Returns the new Bookmark."""
         sample = int(sample)
         g = self._incomplete_group()
         if g is not None:
-            bm = Bookmark(sample=sample, group=g, index=2)
+            bm = Bookmark(sample=sample, group=g, index=2, link=int(link))
         else:
-            bm = Bookmark(sample=sample, group=self._next_new_group(), index=1)
+            bm = Bookmark(sample=sample, group=self._next_new_group(), index=1, link=int(link))
         self._items.append(bm)
         return bm
 
-    def remove_at(self, sample: int, tol: int = 0) -> bool:
-        """Remove the bookmark nearest `sample` within `tol` samples. True if removed."""
-        if not self._items:
+    def remove_at(self, sample: int, tol: int = 0, link: Optional[int] = None) -> bool:
+        """Remove the bookmark nearest `sample` within `tol` samples. True if removed. With
+        `link`, only that Link's bookmarks are candidates (samples of different Links are
+        not comparable)."""
+        cands = [b for b in self._items if link is None or b.link == link]
+        if not cands:
             return False
-        nearest = min(self._items, key=lambda b: abs(b.sample - sample))
+        nearest = min(cands, key=lambda b: abs(b.sample - sample))
         if tol and abs(nearest.sample - sample) > tol:
             return False
         self._items.remove(nearest)
@@ -118,12 +128,15 @@ class BookmarkSet:
     def copy(self) -> "BookmarkSet":
         """Deep-ish copy (new Bookmark objects) so a snapshot survives re-decodes and
         edits to the live set don't leak into it."""
-        return BookmarkSet([Bookmark(b.sample, b.group, b.index, b.label) for b in self._items])
+        return BookmarkSet([Bookmark(b.sample, b.group, b.index, b.label, b.link)
+                            for b in self._items])
 
     # ---- pairs / measurement ----
     def pairs(self) -> List[Tuple[str, Bookmark, Bookmark]]:
         """(group, first, second) for every COMPLETE pair, ordered by group letter.
-        Members are returned in sample order (left, right) for a positive delta."""
+        Members are returned in sample order (left, right) for a positive delta — which is
+        time order only when both are on one Link; the window times cross-Link pairs itself
+        (MainWindow._cross_link_delta)."""
         by_group: Dict[str, List[Bookmark]] = {}
         for b in self._items:
             by_group.setdefault(b.group, []).append(b)
@@ -152,7 +165,8 @@ class BookmarkSet:
             return s
         for d in data:
             s._items.append(Bookmark(sample=int(d["sample"]), group=str(d.get("group", "A")),
-                                     index=int(d.get("index", 1)), label=str(d.get("label", ""))))
+                                     index=int(d.get("index", 1)), label=str(d.get("label", "")),
+                                     link=int(d.get("link", 0))))
         return s
 
 

@@ -90,6 +90,7 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self.verticalHeader().setVisible(False)   # drop the row-index column (always 1,2,3… — the "Row" column carries the meaningful bus row)
         self.horizontalHeader().setStretchLastSection(True)
         self._rate = 0.0          # capture sample rate, for the Time column
+        self._time_offset_us = 0.0  # added to the Time column (set_time_offset)
         self._symbols: List[dict] = []
         self._symbol_rows: List[int] = []   # ascending per-symbol bus rows (select_bus_row bisect)
         self._at_start = False    # reached the earliest symbol — nothing more above
@@ -141,6 +142,15 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self._rate = float(rate_hz or 0.0)
         self._cols_sized = False          # new capture -> re-measure columns on the next fill
 
+    def set_time_offset(self, seconds: float) -> None:
+        """Show the Time column `seconds` later than this capture's own time: in All
+        Links the stacked tables all read global time."""
+        us = float(seconds) * 1e6
+        if us != self._time_offset_us:
+            self._time_offset_us = us
+            if self._symbols:
+                self._populate()
+
     def retheme(self) -> None:
         """Re-apply the palette after a theme switch: refresh the per-kind symbol
         colours and the item-view stylesheet, then repopulate so each row's
@@ -183,7 +193,8 @@ class SymbolView(RowOriginMixin, QTableWidget):
             for r, s in enumerate(symbols):
                 kind = s["kind"]
                 start = int(s["start_sample"])
-                t_us = f"{start / self._rate * 1e6:,.2f}" if self._rate else "—"
+                t_us = (f"{start / self._rate * 1e6 + self._time_offset_us:,.2f}"
+                        if self._rate else "—")
                 # Running disparity, shown as -1 / +1. A legal symbol ends the line
                 # negative (#ones 4), positive (#ones 6) or neutral (#ones 5, RD
                 # unchanged). A ±2 symbol sent when RD already has that sign is a

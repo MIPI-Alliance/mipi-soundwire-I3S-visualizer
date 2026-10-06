@@ -87,6 +87,26 @@ def _version(data: bytes, endian: str) -> int:
         raise ValueError(f".wfm: unrecognised version tag {tag!r} at offset 0x{_VERSION_OFF:03x}") from exc
 
 
+def read_header(path: str) -> Dict[str, float]:
+    """What a .wfm is, from its first kilobyte: ``{"sample_rate_hz", "n_points", "t0",
+    "duration_s"}``. Every field read_wfm takes before the curve sits below 0x340, so the
+    Open Capture dialog learns a pair's length without reading either record."""
+    with open(path, "rb") as f:
+        data = f.read(1024)
+    endian = _endianness(data)
+    version = _version(data, endian)
+    if version != 3:
+        raise NotImplementedError(f"{path}: .wfm version {version} is not supported")
+    bytes_per_point = struct.unpack_from(f"{endian}B", data, _BYTES_PER_POINT_OFF)[0]
+    dt = struct.unpack_from(f"{endian}d", data, _DT_OFF_V3)[0]
+    t0 = struct.unpack_from(f"{endian}d", data, _T0_OFF_V3)[0]
+    data_start = struct.unpack_from(f"{endian}I", data, _DATA_START_OFF_V3)[0]
+    postcharge_start = struct.unpack_from(f"{endian}I", data, _POSTCHARGE_START_OFF_V3)[0]
+    n = max(0, (postcharge_start - data_start) // max(1, bytes_per_point))
+    return {"sample_rate_hz": (1.0 / dt) if dt else 0.0, "n_points": float(n),
+            "t0": float(t0), "duration_s": float(n * dt)}
+
+
 def read_wfm(path: str) -> Dict[str, object]:
     """Parse a Tektronix .wfm file into ``{"time", "volts", "sample_rate_hz",
     "label", "version"}``. `time` is seconds (may start negative, pre-trigger);

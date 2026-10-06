@@ -125,9 +125,11 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         super().__init__()
         self.setStyleSheet(analyzer_stylesheet())
         self._rate = 0.0
+        self._time_offset_us = 0.0                 # added to the Time column (set_time_offset)
         self._samples: List[dict] = []
         self._starts = np.zeros(0, dtype=np.int64)  # cached start_sample of each loaded row
         self._lane_colors: Dict[tuple, Any] = {}   # (device, dp, channel) -> QColor
+        self._stream_overrides: dict = {}          # the shown Link's stream colours (line_style)
         self._suppress_scroll = False          # gate edge-loads during programmatic scroll
         self._suppress_select = False          # gate the selection echo during a programmatic
         #                                        select_sample (see _on_select)
@@ -166,7 +168,9 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setAlternatingRowColors(True)
-        self._table.horizontalHeader().setStretchLastSection(True)
+        # Decimal is sized to its contents like the rest, not stretched: stretched, its width
+        # was whatever the other columns left, so stacked Links' tables differed.
+        self._table.horizontalHeader().setStretchLastSection(False)
         self._table.itemSelectionChanged.connect(self._on_select)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         from .copyable import enable_copy
@@ -187,10 +191,11 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         Channel filter selectors from the same lane list."""
         lanes = [(int(d), int(p), int(ch)) for d, p, ch in (lanes or [])]
         self._cols_sized = False          # new capture -> re-measure columns on the next fill
-        # Same stable per-(device,dp) palette as the bus grid / Audio / Capture views, so
-        # the Port column matches those overlays (channels of a DP share the DP colour).
-        from .grid_view import dp_stream_color
-        self._lane_colors = {key: dp_stream_color(key[0], key[1]) for key in lanes}
+        # Same stable per-(device,dp) line colours as the Audio / Capture views, so the
+        # Port column's text matches those overlays (channels of a DP share the DP colour).
+        from .grid_view import dp_line_color
+        self._lane_colors = {key: dp_line_color(key[0], key[1], self._stream_overrides)
+                             for key in lanes}
         seen = []
         for d, p, _ch in lanes:
             if (d, p) not in seen:
@@ -219,6 +224,14 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self.set_lanes(list(self._lane_colors))
         self.set_samples(self._samples)
 
+    def set_stream_colors(self, overrides, redraw: bool = True) -> None:
+        """The shown Link's per-stream colour overrides; the Port column follows them. A
+        bind passes `redraw=False`: set_lanes and set_samples fill the new Link next."""
+        self._stream_overrides = dict(overrides or {})
+        if redraw and self._lane_colors:
+            self.set_lanes(list(self._lane_colors))
+            self.set_samples(self._samples)
+
     # ---- data ----
     def _fill_row(self, r: int, s: dict) -> None:
         """Populate table row `r` from sample dict `s` (shared by set/append/prepend)."""
@@ -226,7 +239,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         bits = int(s.get("sample_size", 0))
         val = int(s.get("value", 0))
         start = int(s.get("start_sample", 0))
-        t_us = f"{start / self._rate * 1e6:,.2f}" if self._rate else "—"
+        t_us = (f"{start / self._rate * 1e6 + self._time_offset_us:,.2f}"
+                if self._rate else "—")
         dev, dp, ch = int(s.get("device", -1)), int(s.get("dp", -1)), int(s.get("channel", 0))
         cells = [f"{self.display_row(s.get('row', 0)):,}",
                  t_us, f"Dev{dev} DP{dp} CH{ch}",
@@ -245,6 +259,15 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._starts = np.fromiter(
             (int(s.get("start_sample", 0)) for s in self._samples),
             dtype=np.int64, count=len(self._samples))
+
+    def set_time_offset(self, seconds: float) -> None:
+        """Show the Time column `seconds` later than this capture's own time: in All
+        Links the stacked tables all read global time."""
+        us = float(seconds) * 1e6
+        if us != self._time_offset_us:
+            self._time_offset_us = us
+            if self._samples:
+                self.set_samples(self._samples)
 
     def set_samples(self, samples: List[dict]) -> None:
         self._samples = list(samples)

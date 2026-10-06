@@ -1,4 +1,4 @@
-"""Analyzer ▸ Import Visualizer CSV dialog.
+"""Decode ▸ Import Visualizer CSV dialog.
 
 Picks a Visualizer data-port config and what to do with it against the open
 capture. The config comes from either a CSV file or the current Visualizer

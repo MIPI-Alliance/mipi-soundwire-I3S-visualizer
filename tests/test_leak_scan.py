@@ -23,6 +23,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -85,3 +87,54 @@ def test_the_octet_guard_rejects_five_parts_not_a_trailing_period():
     """
     assert _hits("the host is 10.1.4.4.")          # sentence end — still a leak
     assert not _hits("§10.1.4.4.2")                # five parts — a citation
+
+
+# --------------------------------------------------------------- the CLI's own contract
+# Everything above tests the patterns. These test the two ways the tool can report a pass
+# about something it did not actually check — which is worse than a wrong pattern, because
+# a wrong pattern shows up as a finding and this shows up as silence.
+
+def _run(*args, cwd=_ROOT):
+    return subprocess.run([sys.executable, os.path.join(_ROOT, "tools", "leak_scan.py"), *args],
+                          cwd=cwd, capture_output=True, text=True)
+
+
+def test_an_unrecognised_option_is_refused_not_ignored():
+    """`--text=<f>` mistyped is the case that matters: the option parser took the first
+    argument NOT starting with "-" as the revision, so a misspelled flag left both the
+    revision and the text unset and the tool scanned the working tree — printing "no leaks
+    found" about input the caller never named. The release description it was pointed at
+    would have shipped unscanned with a green transcript to show for it."""
+    for bad in ("--tex=/etc/hosts", "--txt=/etc/hosts", "--verbose"):
+        r = _run(bad)
+        assert r.returncode == 2, f"{bad} exited {r.returncode}, not 2:\n{r.stdout}"
+        assert "no leaks found" not in r.stdout, f"{bad} reported a PASS: {r.stdout!r}"
+
+
+def test_a_missing_text_file_is_refused_not_read_as_empty():
+    r = _run("--text=/nonexistent/description.md")
+    assert r.returncode == 2
+    assert "no leaks found" not in r.stdout
+
+
+def test_the_scanner_scans_its_own_prose_for_site_patterns():
+    """The self-exemption is per pattern KIND, not per file.
+
+    tools/leak_scan.py and this file must skip the STRUCTURAL patterns — they contain them
+    as literal source. They must NOT skip the site-specific ones, which cannot self-match
+    because they live outside the repository. A whole-file exemption hid a real leak in this
+    module's own docstring for a release: it was describing what a published description had
+    disclosed, by repeating it, in the one file guaranteed to escape the scan.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert "tools/leak_scan.py" in mod._SELF and "tests/test_leak_scan.py" in mod._SELF
+    # Both are in the scanned file list; exemption happens per pattern, not by omission.
+    files = mod._files(None)
+    for name in mod._SELF:
+        assert name in files, (
+            f"{name} is excluded from the file list, so NO pattern reaches it — the "
+            "exemption must be per pattern kind (see _SELF)")

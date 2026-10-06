@@ -65,3 +65,28 @@ def test_remove_at_tolerance():
     assert not s.remove_at(1200, tol=50)   # too far
     assert s.remove_at(1010, tol=50)       # within tolerance
     assert len(s) == 0
+
+
+def test_a_bookmark_keeps_its_link_through_json_and_copy():
+    s = BookmarkSet()
+    s.add(100, link=0)
+    s.add(200, link=1)
+    back = BookmarkSet.from_json(s.to_json())
+    assert [(b.sample, b.link) for b in back] == [(100, 0), (200, 1)]
+    assert [(b.sample, b.link) for b in back.copy()] == [(100, 0), (200, 1)]
+
+
+def test_a_bookmark_saved_before_links_loads_on_link_0():
+    s = BookmarkSet.from_json([{"sample": 5, "group": "A", "index": 1, "label": ""}])
+    assert s.items[0].link == 0
+
+
+def test_remove_at_one_link_leaves_the_other_links_bookmarks():
+    """Samples of different Links are not comparable, so a toggle on one Link must never
+    remove a bookmark that merely has a nearby sample NUMBER on another."""
+    s = BookmarkSet()
+    s.add(100, link=1)
+    assert not s.remove_at(100, tol=5, link=0)
+    assert len(s) == 1
+    assert s.remove_at(101, tol=5, link=1) and len(s) == 0
+

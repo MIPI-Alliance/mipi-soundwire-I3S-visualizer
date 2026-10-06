@@ -99,7 +99,7 @@ def test_symbols_before_walks_back():
         chunk = sess.symbols_before(anchor)
         if not chunk:
             break
-        assert all(int(b["row"]) < int(anchor) or True for b in chunk)  # earlier chunk
+        assert all(int(b["start_sample"]) < anchor for b in chunk)    # an earlier chunk
         anchor = int(chunk[0]["start_sample"])
         steps += 1
     assert steps < 200, "back-scroll did not terminate"

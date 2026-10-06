@@ -502,42 +502,39 @@ def test_studio_ui_batch(win):
     win.cursor.set_sample(0)
 
 
-def test_the_demo_arrives_on_first_analyzer_entry_not_at_startup():
-    """Constructing the window must decode NOTHING. The demo's decode was ~2.3 GB of the
-    ~2.6 GB the app sat at on launch, and every session paid it — including the default
-    Bus Visualizer ones that never open the Analyzer, and every File ▸ Open that replaced
-    it seconds later. It now arrives on the first switch to Bus Analyzer, exactly once."""
+def test_the_analyzer_opens_empty_and_says_how_to_open_a_capture():
+    """No capture is decoded unasked: not when the window is built, not on entering the
+    Bus Analyzer. A demo is one menu item away (File ▸ Open Demo Capture), and decoding one
+    unasked cost seconds and ~2.3 GB for anyone whose next act was File ▸ Open. The empty
+    panes say so instead of showing blank tables and axes."""
     from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
 
     w = MainWindow()
     assert w._session is None, "MainWindow.__init__ decoded a capture"
-    assert w._demo_preload_pending
+    w.resize(1400, 900)
+    w.show()
     w._mode_mgr.switch_to(ANALYSIS)
-    first = w._session
-    assert first is not None, "entering Bus Analyzer did not preload the demo"
-    assert not w._demo_preload_pending
-    # Leaving and coming back must NOT decode again — a new Session object would mean it did.
+    QApplication.processEvents()
+    assert w._session is None, "entering Bus Analyzer decoded a capture"
+    shown = [h for h in w._empty_hints if h.isVisible()]
+    assert len(shown) == len(w._empty_hints) >= 5
+    assert "Open Capture" in w._empty_hints[0].text() and "Open Demo Capture" in w._empty_hints[0].text()
     w._mode_mgr.switch_to(VISUALIZATION)
     w._mode_mgr.switch_to(ANALYSIS)
-    assert w._session is first, "re-entering Bus Analyzer re-decoded the demo"
+    assert w._session is None
     w.close()
 
 
-def test_a_loaded_capture_is_never_replaced_by_the_deferred_demo():
-    """The deferred preload must not fire over a capture the user opened. Opening from the
-    Visualizer switches into the Analyzer, which is the same code path the preload hangs
-    off — so if the pending flag outlived the load, opening a file would show the demo."""
+def test_opening_a_capture_clears_the_empty_notes():
     from swi3s_studio.session import Session
-    from swi3s_studio.ui.mode_controller import ANALYSIS
 
     w = MainWindow()
-    assert w._demo_preload_pending
-    sess = Session.from_demo(8)                   # stands in for an opened capture
-    w.load_session(sess)                          # switches to Analyzer itself
-    assert w._session is sess
-    assert not w._demo_preload_pending
-    w._mode_mgr.switch_to(ANALYSIS)               # explicit re-entry, for good measure
-    assert w._session is sess, "the deferred demo replaced the loaded capture"
+    w.resize(1400, 900)
+    w.show()
+    w.load_session(Session.from_demo(8))           # stands in for an opened capture
+    QApplication.processEvents()
+    assert w._session is not None
+    assert not any(h.isVisible() for h in w._empty_hints)
     w.close()
 
 
@@ -792,51 +789,29 @@ def test_the_rows_to_draw_field_fits_its_widest_value_at_a_wider_font():
         app.setFont(base)
 
 
-def test_a_capture_that_fits_can_still_be_windowed_on_purpose(win, tmp_path, monkeypatch):
-    """Analyzer ▸ Open Capture Time Window must offer a window even when size would not.
 
-    The size-triggered prompt in _sal_window_prompt was the ONLY route to a windowed load,
-    so a capture the app was willing to open whole could not be sliced at all -- and on a
-    machine with plenty of free memory that is every capture. "It fits" answers a question
-    about capacity, not about staying interactive, and a user who already knows they want
-    20 s out of 176 had no way to say so.
 
-    Drives the prompt against a fixture that comfortably FITS: without force it must stay
-    silent, with force it must ask for a range.
-    """
-    import json
-    import zipfile
+def test_an_owned_one_shot_never_runs_on_a_destroyed_owner(monkeypatch):
+    # timers.after: the context form cancels with its owner; where PySide lacks that
+    # overload, the fallback checks the owner is alive before calling.
+    from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer
 
-    import numpy as np
+    from swi3s_studio.ui import timers
+    for patch_out_context in (False, True):
+        if patch_out_context:
+            real = QTimer.singleShot
 
-    from swi3s_studio.ingest import saleae_binary as sb
-    from swi3s_studio.ingest import saleae_sal as ss
-
-    rate = 500_000_000
-    e = np.cumsum(np.random.default_rng(3).integers(1, 40, size=5000)).astype(np.uint64)
-    path = str(tmp_path / "fits.sal")
-    meta = {"data": {"legacySettings": {"sampleRate": {"digital": rate}}},
-            "binData": [{"type": "Digital", "file": "digital-0.bin", "deviceChannel": 0},
-                        {"type": "Digital", "file": "digital-1.bin", "deviceChannel": 1}]}
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as z:
-        z.writestr("meta.json", json.dumps(meta))
-        z.writestr("digital-0.bin", sb.build_channel_v3(False, e, chunk_size=250))
-        z.writestr("digital-1.bin", sb.build_channel_v3(False, e + 1, chunk_size=250))
-
-    assert ss.estimate_cost(path, channels=[0, 1]).fits_in(ss.memory_budget()), \
-        "the fixture must FIT, or this test proves nothing"
-    assert win._sal_window_prompt(path, 0, 1) is None, \
-        "a capture that fits must not be interrupted by the size prompt"
-
-    calls = []
-
-    def fake_get_double(*args, **kwargs):
-        calls.append(args[2] if len(args) > 2 else "")
-        return 0.0, False                    # user backs out of the range dialog
-
-    monkeypatch.setattr(QInputDialog, "getDouble", fake_get_double)
-    got = win._sal_window_prompt(path, 0, 1, force=True)
-    assert calls, "force=True did not ask for a range"
-    assert got == "cancel", "backing out of the range dialog must cancel, not load whole"
-    assert callable(getattr(win, "open_capture_window", None)), \
-        "no menu entry point for a forced window"
+            def no_context(ms, *args):
+                if len(args) == 2:
+                    raise TypeError("no (msec, context, functor) overload")
+                return real(ms, *args)
+            monkeypatch.setattr(QTimer, "singleShot", staticmethod(no_context))
+        ran = []
+        alive, gone = QObject(), QObject()
+        timers.after(0, alive, lambda: ran.append("alive"))
+        timers.after(0, gone, lambda: ran.append("gone"))
+        gone.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        for _ in range(5):
+            QApplication.processEvents()
+        assert ran == ["alive"], (patch_out_context, ran)

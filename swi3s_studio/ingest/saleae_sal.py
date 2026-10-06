@@ -12,6 +12,8 @@ UnsupportedSaleaeVersion with guidance to export Binary/CSV.
 from __future__ import annotations
 
 import json
+import logging
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
@@ -20,6 +22,8 @@ import numpy as np
 
 from . import saleae_binary
 from .capture import Capture
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -128,19 +132,101 @@ def estimate_cost(path: str, channels: Optional[List[int]] = None) -> SalCost:
                    per_channel=per_channel)
 
 
+def _avail_from_proc_meminfo() -> int:
+    """`MemAvailable` from /proc/meminfo (Linux), or 0. The kernel's own estimate of what a
+    new allocation can have without swapping — which is the question here, and a better
+    answer than free+cached arithmetic."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024        # reported in kB
+    except Exception:
+        pass
+    return 0
+
+
+def _avail_from_global_memory_status() -> int:
+    """`ullAvailPhys` from GlobalMemoryStatusEx (Windows), or 0.
+
+    Windows has no `sysconf`, so without this the POSIX branch below cannot run at all and
+    an install without psutil has NO way to read free memory — see available_memory_bytes.
+    """
+    if sys.platform != "win32":                     # mypy narrows on this, and so must we:
+        return 0                                    # ctypes.windll does not exist elsewhere
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD),
+                        ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullAvailPhys)
+    except Exception:
+        pass
+    return 0
+
+
+def _avail_from_vm_stat() -> int:
+    """Free + inactive + speculative pages from `vm_stat` (macOS), or 0.
+
+    macOS publishes no `SC_AVPHYS_PAGES`, so this is the stdlib route. INACTIVE pages are
+    counted because Darwin will hand them to a new allocation rather than swap; free alone
+    reads as a few hundred MB on a healthy machine and would refuse ordinary captures.
+    Deliberately excludes purgeable/compressed accounting — this is a floor, not a model.
+    """
+    try:
+        import re
+        import subprocess
+        out = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True,
+                             timeout=5).stdout
+        m = re.search(r"page size of (\d+) bytes", out)
+        page = int(m.group(1)) if m else 4096
+        total = 0
+        for key in ("Pages free", "Pages inactive", "Pages speculative"):
+            m = re.search(rf"^{key}:\s+(\d+)\.", out, re.M)
+            if m:
+                total += int(m.group(1))
+        return total * page
+    except Exception:
+        return 0
+
+
 def available_memory_bytes() -> int:
     """Best-effort physical memory available for a load, or 0 if unknown.
 
     Prefers genuinely free memory over total RAM: a 24 GB box with 20 GB in use
     cannot absorb an 18 GB load, and the point of the guard is to refuse before
     the machine starts swapping itself to death.
+
+    EVERY PLATFORM NEEDS A STDLIB ROUTE, not just psutil. psutil is a declared dependency
+    and is the accurate path, but it is also the ONLY path that used to work on the two
+    platforms users actually run: Windows has no `sysconf` at all, and macOS does not publish
+    `SC_AVPHYS_PAGES`, so the POSIX branch below only ever fired on Linux. An install without
+    psutil therefore fell through to "unknown" — silently, since the import is swallowed —
+    and `memory_budget` took its fallback, which above ~14 GB free is indistinguishable from
+    the correct answer and BELOW it is far too permissive (8.59 GB against 2.40 GB on a 4 GB
+    machine, i.e. failing OPEN on exactly the machines that can least afford it). It needs an
+    environment built without requirements.txt: `run.ps1` and `run.sh` install it, so a user
+    following the README would not hit it.
     """
     try:                                        # psutil is the accurate path
         import psutil
         return int(psutil.virtual_memory().available)
     except Exception:
         pass
-    try:                                        # POSIX: free pages * page size
+    try:                                        # POSIX: free pages * page size (Linux only)
         import os
         if hasattr(os, "sysconf"):
             names = os.sysconf_names
@@ -150,22 +236,111 @@ def available_memory_bytes() -> int:
                     return int(avail)
     except Exception:
         pass
+    for probe in (_avail_from_proc_meminfo,          # Linux, if sysconf was unavailable
+                  _avail_from_global_memory_status,  # Windows
+                  _avail_from_vm_stat):              # macOS
+        got = probe()
+        if got > 0:
+            return int(got)
     return 0
 
 
-# Budget used when available memory can't be determined (no psutil, and no
-# SC_AVPHYS_PAGES — which is the case on stock macOS). The guard exists to fail
-# CLOSED: treating "unknown" as "unlimited" silently disables it on exactly the
-# machines it was written for. 8 GiB of predicted peak is generous for any ordinary
-# capture while still refusing the multi-GB ones that wedge a machine; an explicit
-# max_bytes (or max_bytes=0 to opt out) overrides it.
-_FALLBACK_BUDGET = 8 << 30
+def total_memory_bytes() -> int:
+    """Total physical RAM, or 0 if unknown.
+
+    A weaker figure than `available_memory_bytes` and used only when that one fails: it says
+    nothing about what is already in use. But it is readable from the stdlib on every
+    platform, which makes it a far better basis for a fallback than a flat constant — 8 GiB
+    is generous on a workstation and reckless on a 4 GB laptop, and a constant cannot tell
+    them apart. See memory_budget.
+    """
+    try:
+        import os
+        if hasattr(os, "sysconf"):                      # Linux and macOS both publish these
+            names = os.sysconf_names
+            if "SC_PHYS_PAGES" in names and "SC_PAGE_SIZE" in names:
+                total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+                if total > 0:
+                    return int(total)
+    except Exception:
+        pass
+    if sys.platform != "win32":                         # see _avail_from_global_memory_status
+        return 0
+    try:                                                # Windows
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMSTAT(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        stat = _MEMSTAT()
+        stat.dwLength = ctypes.sizeof(_MEMSTAT)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullTotalPhys)
+    except Exception:
+        pass
+    return 0
+
+
+# Fraction of TOTAL RAM allowed when total is known but free is not. Lower than
+# _MEM_HEADROOM because it is a weaker figure: some unknown share of that total is already
+# spoken for, and this has to be safe on a machine that is mostly full.
+_UNKNOWN_TOTAL_FRACTION = 0.25
+# The total this ASSUMES when even total RAM is unreadable — a deliberately small machine.
+# Budget when NOTHING about memory can be read is then the same rule applied to that
+# assumption, which is what keeps the tiers consistent: a weaker reading can never buy a
+# BIGGER load. Stating it as a constant instead (it was a flat 8 GiB) got that backwards
+# twice over — 8 GiB was both larger than the free-memory budget on any machine under ~14 GB
+# AND larger than the total-derived budget on any machine under 32 GB, so the less the guard
+# knew the more it allowed. An explicit max_bytes (or max_bytes=0 to opt out) overrides it.
+_ASSUMED_TOTAL_WHEN_UNKNOWN = 4 << 30
+_UNKNOWN_BUDGET = int(_ASSUMED_TOTAL_WHEN_UNKNOWN * _UNKNOWN_TOTAL_FRACTION)
 # Absolute ceiling on the COMPUTED budget, however much memory is free. Past this a load
 # stops being a question about capacity and becomes one about interactivity, which is a
-# person's call — so the app asks for a time window instead of deciding for them. Set equal
-# to _FALLBACK_BUDGET so "memory unknown" and "memory plentiful" agree on the largest load
-# taken without asking; an explicit max_bytes overrides both. See memory_budget.
+# person's call — so the app asks for a time window instead of deciding for them. An explicit
+# max_bytes overrides it. See memory_budget.
 _MAX_AUTO_BUDGET = 8 << 30
+
+# How the last budget was derived, for callers that want to SAY so — a guard running in a
+# degraded mode is exactly the kind of thing this project refuses to keep quiet about (see
+# "NOT RUN HERE is not a pass" in docs/DEVELOPMENT.md). Set by memory_budget.
+_BUDGET_SOURCE = "not computed yet"
+
+
+def budget_source() -> str:
+    """A short phrase describing how the last `memory_budget()` figure was obtained.
+
+    Exists so the UI can tell the user when the memory guard is working from a weaker
+    reading than free RAM. Silence was the actual defect: an install missing psutil got the
+    flat fallback with no error, no warning and no log line, and above ~14 GB free that was
+    indistinguishable from the correct answer while below it was several times too permissive.
+    """
+    return _BUDGET_SOURCE
+
+
+# Warn ONCE per process, not per open. The guard is consulted on every capture open and on
+# every window prompt, and a line per open would be noise a reader learns to skip — which is
+# how a real warning stops being read.
+_WARNED_DEGRADED = False
+
+
+def _warn_degraded_budget(source: str) -> None:
+    global _WARNED_DEGRADED
+    if _WARNED_DEGRADED:
+        return
+    _WARNED_DEGRADED = True
+    logger.warning(
+        "large-capture memory guard is using %s. Free memory could not be read, so the "
+        "guard is working from a weaker figure and may allow a load this machine cannot "
+        "hold. Installing psutil (a declared dependency: pip install -r requirements.txt) "
+        "restores the accurate reading.", source)
 
 
 def memory_budget(max_bytes: Optional[int] = None) -> int:
@@ -194,15 +369,35 @@ def memory_budget(max_bytes: Optional[int] = None) -> int:
     was that the BETTER machine was slower. `_MAX_AUTO_BUDGET` is what a load may consume
     before the caller has to ask a human; an explicit `max_bytes` still overrides it,
     because a caller naming a number has made the decision itself.
+
+    WHEN FREE MEMORY CANNOT BE READ IT DEGRADES IN STEPS, and says which one it took
+    (`budget_source`). Free RAM, then a quarter of TOTAL RAM, then a small constant, each a
+    weaker reading than the last, and each used only when the one before it cannot be read.
+    They are not ordered by size: a quarter of total RAM can exceed 60% of what is free, and
+    the constant exceeds a quarter of a 2 GB machine. It used to fall straight to a flat
+    8 GiB, which was the same number as the cap and so invisible on a large machine while
+    being ~3.6x too permissive on a 4 GB one: failing OPEN on precisely the machines that can
+    least afford it, in the branch whose own comment promised to fail closed.
     """
+    global _BUDGET_SOURCE
     if max_bytes:
+        _BUDGET_SOURCE = "caller-specified max_bytes"
         return int(max_bytes)
     avail = available_memory_bytes()
-    # Fail CLOSED when memory is unknown (0): a guard that silently disables itself is
-    # worse than none, because the caller believes it is protected.
-    if avail <= 0:
-        return _FALLBACK_BUDGET
-    return min(int(avail * _MEM_HEADROOM), _MAX_AUTO_BUDGET)
+    if avail > 0:
+        _BUDGET_SOURCE = "free memory"
+        return min(int(avail * _MEM_HEADROOM), _MAX_AUTO_BUDGET)
+    total = total_memory_bytes()
+    if total > 0:
+        _BUDGET_SOURCE = (f"{_UNKNOWN_TOTAL_FRACTION:.0%} of total RAM "
+                          "(free memory unreadable — is psutil installed?)")
+        _warn_degraded_budget(_BUDGET_SOURCE)
+        return min(int(total * _UNKNOWN_TOTAL_FRACTION), _MAX_AUTO_BUDGET)
+    # Fail CLOSED when memory is unknown: a guard that silently disables itself is worse
+    # than none, because the caller believes it is protected.
+    _BUDGET_SOURCE = "a conservative fixed budget (no memory reading available at all)"
+    _warn_degraded_budget(_BUDGET_SOURCE)
+    return _UNKNOWN_BUDGET
 
 
 # Never plan to consume ALL free memory: the decode, the audio store and Qt itself
@@ -593,9 +788,9 @@ class SalTooLargeError(MemoryError):
         MemoryError.__init__(
             self,
             f"{path}: {cost.summary()}, but only "
-            f"{available / 1e9:.1f} GB is available for one load. Open a time window "
-            f"instead (Analyzer ▸ Open Capture Time Window…), or free memory / use a "
-            f"machine with more RAM.")
+            f"{available / 1e9:.1f} GB is available for one load. Open it again and choose "
+            f"a window (Decode: From … to …) in the Open Capture dialog, or free memory / use "
+            f"a machine with more RAM.")
 
 
 def load_capture(path: str, clock_channel: int, data_channel: int,

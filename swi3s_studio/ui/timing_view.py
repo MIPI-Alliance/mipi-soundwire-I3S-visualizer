@@ -585,11 +585,12 @@ _INEQ_LABEL = {
     # Named by DIRECTION, like the setup/hold headings above, now that there are
     # three of them: "Manager releases" was legible against one counterpart but
     # not against two, and the reader has to infer the acquirer either way.
-    # "Non-Contention" is dropped — with all three present the section reads as
-    # the handover family, and the equation on each row shows what is bounded.
-    "MP_contention": "Handover — Manager to Peripheral",
-    "PM_contention": "Handover — Peripheral to Manager",
-    "PP_contention": "Handover — Peripheral to Peripheral",
+    # "Handover Contention" (3.0.19): a bare
+    # "Handover" did not say what is bounded, and "Non-Contention" was dropped earlier
+    # as too long. The equation on each row still shows the bound itself.
+    "MP_contention": "Handover Contention — Manager to Peripheral",
+    "PM_contention": "Handover Contention — Peripheral to Manager",
+    "PP_contention": "Handover Contention — Peripheral to Peripheral",
     # NAMED FOR WHO RELEASES, not for whose keeper: there is one keeper and it is in the
     # Manager ({ASW3805}), so "Bus Keeper — Manager Releasing" means that one keeper with
     # the MANAGER as the device letting go. The pair shared a single heading before; two

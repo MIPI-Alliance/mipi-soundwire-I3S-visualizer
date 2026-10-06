@@ -10,7 +10,7 @@ not). X axes are linked across tracks; Y is fit to the data explicitly.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -18,7 +18,9 @@ from PySide6.QtCore import QIODevice, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QCursor, QIcon, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QHBoxLayout,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import line_style
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
 from .theme import VizTheme, analyzer_stylesheet
@@ -39,7 +42,6 @@ try:
 except Exception:                                  # pragma: no cover - env dependent
     _HAVE_AUDIO = False
 
-_PEN_COLORS = VizTheme.TRACE_PALETTE
 _MAX_POINTS = 2000
 # Break the waveform between two envelope bins whose x-positions are further apart
 # than this multiple of the median bin pitch. Decimated bins are near-uniform, so a
@@ -47,13 +49,31 @@ _MAX_POINTS = 2000
 # clear the rounding of a bin boundary and the ragged last bin.
 _GAP_BIN_TOLERANCE = 4.0
 
-# Waveform colours come from the SAME stable per-(device,dp) palette the bus grid uses, so
-# a stream is the same colour in both views; all channels of a DP share the DP colour.
+# Waveform colours share the bus grid's stable per-(device,dp) hues, so a stream is the
+# same colour in both views, as the theme's LINE variant (readable on the plot in light
+# mode); all channels of a DP share the DP colour.
 from swi3s_studio.ui.grid_view import bookmark_pair_color as _bookmark_pair_color  # noqa: E402
-from swi3s_studio.ui.grid_view import dp_stream_color as _dp_color  # noqa: E402
+from swi3s_studio.ui.grid_view import dp_line_color as _dp_color  # noqa: E402
 
 _FADE_MS = 50.0             # playback de-click ramp (fade-in / fade-out)
 _TRACK_H = 120              # min pixels per stacked track so waveforms aren't squashed
+
+
+def _amp_ticks(ymin: float, ymax: float) -> list:
+    """Y ticks for a track: at full scale -1, 0 and +1; zoomed to the data, only its two
+    extremes and 0 (when 0 is in range), as plain values. pyqtgraph's own ticks on a
+    zoomed track were five or more, in an SI-scaled unit ("Amplitude (x0.001)", 200,
+    -200, -400) that a reader had to convert back."""
+    if ymin <= -1.0 and ymax >= 1.0:
+        return [[(-1.0, "-1"), (0.0, "0"), (1.0, "+1")]]
+
+    def fmt(v: float) -> str:
+        return "0" if v == 0 else f"{v:+.2g}".replace("e-0", "e-")
+    ticks = [(ymin, fmt(ymin))]
+    if ymin < 0.0 < ymax:
+        ticks.append((0.0, "0"))
+    ticks.append((ymax, fmt(ymax)))
+    return [ticks]
 
 
 def _transport_icon(kind: str, color: str = "#ffffff", px: int = 13) -> QIcon:
@@ -168,14 +188,26 @@ class _TimeAxis(pg.AxisItem):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self._rate = 0.0
+        self._offset = 0.0                    # seconds added to every label (lanes)
         self.enableAutoSIPrefix(False)        # we format the time ourselves
 
     def set_rate(self, rate_hz: float) -> None:
         self._rate = float(rate_hz or 0.0)
 
+    def tickValues(self, minVal, maxVal, size):
+        """Ticks at round values of the LABELLED time (see set_time_offset): in All Links
+        each lane is offset, and ticks chosen in its own time did not line up with
+        another lane's. The axis is in samples, so the offset is too."""
+        off = self._offset * self._rate
+        if not off:
+            return super().tickValues(minVal, maxVal, size)
+        return [(sp, [v - off for v in vals])
+                for sp, vals in super().tickValues(minVal + off, maxVal + off, size)]
+
     def tickStrings(self, values, scale, spacing):
         if not self._rate:
             return [f"{v:,.0f}" for v in values]
+        values = [v + self._offset * self._rate for v in values]
         step_s = (spacing / self._rate) if spacing else 0.0     # tick spacing in seconds
         if step_s == 0 or step_s >= 1.0:
             unit, mul = "s", 1.0
@@ -186,6 +218,20 @@ class _TimeAxis(pg.AxisItem):
         step_u = step_s * mul
         dec = 0 if step_u >= 1 else int(min(6, np.ceil(-np.log10(step_u)) + 1))
         return [f"{v / self._rate * mul:,.{dec}f} {unit}" for v in values]
+
+
+class _AmpAxis(pg.AxisItem):
+    """The amplitude axis. Its labels sit at the very ends of the range (-1 / +1 at full
+    scale, the data's extremes when zoomed), so half of each overflows the axis. pyqtgraph
+    keeps a label that overflows by up to 15 px, but only while the axis has no grid: with
+    one, boundingRect() is exactly the plot and an end label is culled, which left only
+    "0" on every track. Restore that margin with the grid on."""
+
+    _OVERFLOW = 10
+
+    def boundingRect(self):
+        m = self._OVERFLOW
+        return super().boundingRect().adjusted(0, -m, 0, m)
 
 
 class AudioView(QWidget):
@@ -201,6 +247,13 @@ class AudioView(QWidget):
     stopped = Signal()
     #: a bookmark line was dragged in a track: (label, new_sample, final=True on release)
     bookmarkMoved = Signal(str, 'qlonglong', bool)
+    #: a stream's colour was chosen from its checkbox menu: (device, dp, "#rrggbb"), or
+    #: "" for Reset Color. The window keeps it as the shown Link's override.
+    streamColorChosen = Signal(int, int, str)
+    #: the visible X range changed: (start, end) in seconds of this capture (LinkLanes)
+    viewRangeChanged = Signal(float, float)
+    #: playback started (one output device: the window stops any other lane)
+    playStarted = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -315,6 +368,7 @@ class AudioView(QWidget):
         self._plots: list[tuple] = []            # (plotitem, curve, dev, dp, ch, n)
         self._checks: dict[tuple, Any] = {}      # (dev, dp, ch) -> QCheckBox
         self._lane_colors: dict[tuple, Any] = {}   # (dev, dp, ch) -> QColor (stable; checkbox + curve)
+        self._stream_overrides: line_style.Overrides = {}   # the shown Link's stream colours
         self._link = None
         self._cursor_lines: list[Any] = []       # InfiniteLine per plot, parallel to self._plots
         self._bm_marks: list[tuple] = []         # [(sample, label)] to draw across every track
@@ -325,7 +379,9 @@ class AudioView(QWidget):
         # waveform sits at its true capture-time offset and every track — and the
         # timeline above — lines up. Set from the session before set_store().
         self._capture_rate = 0.0     # capture sample rate (Hz), for the time-axis labels
+        self._time_offset = 0.0      # seconds added to the axis labels (set_time_offset)
         self._capture_extent = 1     # full capture length (samples) = the X extent
+        self._x_bounds: Optional[Tuple[float, float]] = None   # All Links' shared span (s)
         self._sink = None         # QAudioSink while playing
         self._source = None       # _PcmSource feeding the sink (kept alive during play)
         # Playback cursor sweep: a timer maps the sink's processed time back to a
@@ -450,6 +506,9 @@ class AudioView(QWidget):
             item = self._chan_box.takeAt(0)
             w = item.widget()
             if w is not None:
+                # Off screen now: deleteLater runs on a later pass of the event loop, and
+                # until then the old Link's checkboxes drew under the new ones.
+                w.setParent(None)
                 w.deleteLater()
         self._checks = {}
         # Stable per-(dev,dp,ch) colour, assigned in stream order — used for BOTH the
@@ -459,12 +518,15 @@ class AudioView(QWidget):
         self._lane_colors = {}
         for dev, dp in store.streams():
             for ch in store.channels(dev, dp):
-                color = _dp_color(dev, dp)          # bus-grid colour; shared by a DP's channels
+                color = _dp_color(dev, dp, self._stream_overrides)   # shared by a DP's channels
                 self._lane_colors[(dev, dp, ch)] = color
                 cb = QCheckBox(f"Dev{dev} DP{dp} CH{ch}")
                 cb.setChecked(True)
                 cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
                 cb.toggled.connect(lambda _on: self._rebuild_plots())
+                cb.setContextMenuPolicy(Qt.CustomContextMenu)
+                cb.customContextMenuRequested.connect(
+                    lambda pos, w=cb, d=dev, p=dp: self._stream_menu(w, pos, d, p))
                 self._chan_box.addWidget(cb)
                 self._checks[(dev, dp, ch)] = cb
         self._chan_box.addStretch(1)
@@ -475,15 +537,44 @@ class AudioView(QWidget):
         return list(self._store.streams()) if self._store is not None else []
 
     def retheme(self) -> None:
-        """Re-apply the palette after a theme switch. The waveform colours are the stable
-        bus-grid data-port palette (theme-independent), so keep them; just refresh the
-        stylesheet and rebuild so backgrounds / cursors pick up the new theme."""
+        """Re-apply the palette after a theme switch: the waveform and checkbox colours
+        are the theme's data-port line colours, so re-read them, then rebuild so the pens,
+        bookmark lines (new plots, new lines), backgrounds and cursors pick up the new
+        theme."""
         self.setStyleSheet(analyzer_stylesheet())
+        self._recolor_streams()
+
+    def _recolor_streams(self) -> None:
         for key, cb in self._checks.items():
-            color = _dp_color(key[0], key[1])
+            color = _dp_color(key[0], key[1], self._stream_overrides)
             self._lane_colors[key] = color
             cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
         self._rebuild_plots()
+
+    def set_stream_colors(self, overrides: line_style.Overrides, redraw: bool = True) -> None:
+        """The shown Link's per-stream colour overrides (see line_style). Afterwards it
+        recolours the tracks in place; a bind, which sets them just before set_store draws
+        the new Link, passes `redraw=False` (redrawing the OLD Link's tracks in the new
+        Link's colours was a fifth of a Link switch)."""
+        self._stream_overrides = dict(overrides or {})
+        if redraw and self._checks:
+            self._recolor_streams()
+
+    def _stream_menu(self, widget, pos, dev: int, dp: int) -> None:
+        """Right-click a stream's checkbox: Color… picks this Link's colour for the
+        (device, dp) stream in the current theme; Reset Color goes back to the palette."""
+        menu = QMenu(self)
+        pick = menu.addAction("Color…")
+        reset = menu.addAction("Reset Color")
+        reset.setEnabled((dev, dp, VizTheme.MODE) in self._stream_overrides)
+        chosen = menu.exec(widget.mapToGlobal(pos))
+        if chosen is pick:
+            c = QColorDialog.getColor(_dp_color(dev, dp, self._stream_overrides), self,
+                                      f"Dev{dev} DP{dp} colour ({VizTheme.MODE} theme)")
+            if c.isValid():
+                self.streamColorChosen.emit(dev, dp, c.name())
+        elif chosen is reset:
+            self.streamColorChosen.emit(dev, dp, "")
 
     def _selected(self):
         out = []
@@ -540,7 +631,7 @@ class AudioView(QWidget):
             except Exception:
                 prev_range = None
         self._clear_tracks()
-        extent = max(1, int(self._capture_extent))
+        x_lo, x_hi = self._x_extent()
         for dev, dp, ch in self._selected():
             rate = self._store.rate(dev, dp)             # stored/render rate (unused for x now)
             native = self._store.native_rate(dev, dp)    # on-bus rate (label)
@@ -551,34 +642,34 @@ class AudioView(QWidget):
             # X is capture samples, so the axis converts with the CAPTURE rate — the
             # labels are absolute capture time, matching the timeline / other panes.
             taxis.set_rate(self._capture_rate or rate)
+            taxis._offset = self._time_offset
             pw = pg.PlotWidget(title=title, background=VizTheme.PLOT_BG,
                                viewBox=XWheelViewBox(),
-                               axisItems={"bottom": taxis})
+                               axisItems={"bottom": taxis,
+                                          "left": _AmpAxis(orientation="left")})
             pw.setMinimumHeight(_TRACK_H)
             plot = pw.getPlotItem()
             plot.hideButtons()                    # drop the corner auto-range "A" button
             plot.getViewBox().setDefaultPadding(0.0)   # waveform starts flush at t=0
-            plot.showGrid(x=True, y=True, alpha=0.2)
+            plot.showGrid(x=True, y=True, alpha=VizTheme.PLOT_GRID_ALPHA)
             plot.setMouseEnabled(y=False)         # Y fit to data; X is zoomable
             plot.setClipToView(True)
-            plot.setLabel("bottom", "Time")     # unit (s/ms/µs) is shown per tick
-            plot.setLabel("left", "Amplitude")
-            # Full-scale Y with -1/0/+1 majors; ±0.5 are minor ticks pyqtgraph only
-            # labels when the track is tall enough (short track → just -1,0,+1).
-            plot.getAxis("left").setTicks([[(-1.0, "-1"), (0.0, "0"), (1.0, "+1")],
-                                           [(-0.5, "-0.5"), (0.5, "0.5")]])
-            color = self._lane_colors.get((dev, dp, ch)) or QColor(_PEN_COLORS[0])
-            curve = plot.plot(pen=pg.mkPen(color))
+            # No axis titles: the time ticks carry their unit, and a waveform's Y is
+            # plainly amplitude; the vertical room goes to the trace.
+            plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
+            color = self._lane_colors.get((dev, dp, ch)) or _dp_color(dev, dp)
+            curve = plot.plot(pen=pg.mkPen(color, width=line_style.weight("audio")))
             n = self._store.samples(dev, dp, ch).size
             plot.sigXRangeChanged.connect(
                 lambda _vb, rng, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
                     self._render(p, c, a, d, k, rng, b))
-            self._render(plot, curve, dev, dp, ch, (0, extent), bits)
-            plot.setXRange(0, extent, padding=0)
+            self._render(plot, curve, dev, dp, ch, (x_lo, x_hi), bits)
+            plot.setXRange(x_lo, x_hi, padding=0)
             if self._link is not None:
                 plot.setXLink(self._link)
             else:
                 self._link = plot
+                plot.sigXRangeChanged.connect(self._emit_range)
             # Shared-cursor line — X is the capture sample directly (no per-channel map).
             line = pg.InfiniteLine(angle=90, movable=False,
                                    pen=pg.mkPen(VizTheme.CURSOR, width=1, style=Qt.DashLine))
@@ -596,7 +687,7 @@ class AudioView(QWidget):
         # Bound the X view to the full capture so the user can't zoom OUT past it or pan
         # off either end (the tracks are X-linked, so the same extent applies to all).
         for plot, *_rest in self._plots:
-            plot.getViewBox().setLimits(xMin=0, xMax=extent, maxXRange=extent)
+            plot.getViewBox().setLimits(xMin=x_lo, xMax=x_hi, maxXRange=x_hi - x_lo)
         # Restore the pre-rebuild zoom (X-linked, so the link carries every track).
         if prev_range is not None and self._link is not None:
             self._link.setXRange(prev_range[0], prev_range[1], padding=0)
@@ -696,12 +787,11 @@ class AudioView(QWidget):
             ymax = float(max(lo.max(), hi.max()))
             if ymax - ymin < 1e-9:            # flat/silent channel — avoid a zero span
                 ymin, ymax = ymin - 1e-3, ymax + 1e-3
-            plot.getAxis("left").setTicks(None)
+            plot.getAxis("left").setTicks(_amp_ticks(ymin, ymax))
             plot.setYRange(ymin, ymax, padding=0.08)
         else:
             # Fixed full-scale Y range so amplitude is comparable across tracks.
-            plot.getAxis("left").setTicks([[(-1.0, "-1"), (0.0, "0"), (1.0, "+1")],
-                                           [(-0.5, "-0.5"), (0.5, "0.5")]])
+            plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
             plot.setYRange(-1.0, 1.0, padding=0.05)
 
     def _connect_mask(self, dev, dp, ch, xi, x):
@@ -771,9 +861,9 @@ class AudioView(QWidget):
 
     def reset_zoom(self) -> None:
         """Re-fit every track: X to the full capture (Y re-fits via _render)."""
-        extent = max(1, int(self._capture_extent))
+        x_lo, x_hi = self._x_extent()
         for plot, _curve, _dev, _dp, _ch, _n in self._plots:
-            plot.setXRange(0, extent, padding=0)
+            plot.setXRange(x_lo, x_hi, padding=0)
 
     def jog(self, direction: int) -> None:
         """Page the view one whole visible width left (direction < 0) or right
@@ -782,9 +872,53 @@ class AudioView(QWidget):
         if self._link is None or not self._plots:
             return
         x0, x1 = self._link.getViewBox().viewRange()[0]
-        rng = paged_range(x0, x1, 0.0, float(max(1, self._capture_extent)), direction)
+        lo, hi = self._x_extent()
+        rng = paged_range(x0, x1, lo, hi, direction)
         if rng is not None:
             self._link.setXRange(rng[0], rng[1], padding=0)
+
+    # ---- lanes (ui/link_lanes.py): X in seconds of this capture ----
+    def _emit_range(self, _vb, rng) -> None:
+        rate = self._capture_rate or 1.0
+        self.viewRangeChanged.emit(float(rng[0]) / rate, float(rng[1]) / rate)
+
+    def x_range_seconds(self):
+        if self._link is None:
+            return None
+        x0, x1 = self._link.getViewBox().viewRange()[0]
+        rate = self._capture_rate or 1.0
+        return float(x0) / rate, float(x1) / rate
+
+    def set_x_range_seconds(self, t0: float, t1: float) -> None:
+        if self._link is not None:
+            rate = self._capture_rate or 1.0
+            self._link.setXRange(t0 * rate, t1 * rate, padding=0)
+
+    def _x_extent(self):
+        """The X range the tracks may show, in capture samples: the capture, or in All
+        Links the span every Link covers (set_x_bounds), so lanes of different lengths
+        can show one window."""
+        if self._x_bounds is not None and self._capture_rate:
+            return self._x_bounds[0] * self._capture_rate, self._x_bounds[1] * self._capture_rate
+        return 0.0, float(max(1, int(self._capture_extent)))
+
+    def set_x_bounds(self, bounds) -> None:
+        """(t0, t1) seconds of this capture that the tracks may range over (All Links:
+        the whole multi-Link span), or None for the capture itself."""
+        self._x_bounds = (float(bounds[0]), float(bounds[1])) if bounds else None
+        x_lo, x_hi = self._x_extent()
+        for plot, *_rest in self._plots:
+            plot.getViewBox().setLimits(xMin=x_lo, xMax=x_hi, maxXRange=x_hi - x_lo)
+
+    def set_time_offset(self, seconds: float) -> None:
+        """Label the time axes `seconds` later than this capture's own time: in All
+        Links the lanes all read global time."""
+        self._time_offset = float(seconds)
+        for plot, *_r in self._plots:
+            axis = plot.getAxis("bottom")
+            axis._offset = self._time_offset
+            axis.picture = None
+            axis.update()
 
     def set_cursor(self, sample: int) -> None:
         """Move the shared-cursor line on every track to the capture `sample`."""
@@ -954,6 +1088,7 @@ class AudioView(QWidget):
         # glitches, no end-of-data Idle/repeat, and stop() fades in software.
         self._source = _PcmSource(pcm, int(nch), sample_bytes, fade_frames)
         self._sink.start(self._source)
+        self.playStarted.emit()
         # Remember the mapping so the sweep timer can turn elapsed audio frames
         # back into a capture sample for the shared cursor. With decimation the
         # playback frames are in the target-rate domain, so scale them back to the

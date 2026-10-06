@@ -84,8 +84,13 @@ def _run_mypy() -> tuple[dict[str, int], str]:
       regression. Errors outside the target package are separated out and reported as an
       environment failure instead of being counted.
     """
-    proc = subprocess.run([*_mypy_cmd(), "--no-incremental", _TARGET],
-                          cwd=_ROOT, capture_output=True, text=True)
+    # Plain output, whatever the terminal: with FORCE_COLOR set (some environments export
+    # it) mypy colours even a pipe, no error line matched _LINE, and the
+    # gate read 0 errors against a baseline of 134 and called it "no regression".
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("FORCE_COLOR", "MYPY_FORCE_COLOR", "CLICOLOR_FORCE")}
+    proc = subprocess.run([*_mypy_cmd(), "--no-incremental", "--no-color-output", _TARGET],
+                          cwd=_ROOT, capture_output=True, text=True, env=env)
     if "No module named" in proc.stderr or "usage:" in proc.stderr:
         print("mypy is not installed. Install it with one of:\n"
               "  brew install mypy\n"
@@ -108,6 +113,15 @@ def _run_mypy() -> tuple[dict[str, int], str]:
         print("\nA fatal error in an installed stub aborts the whole check, so the counts "
               "below would be meaningless.\nCheck that [tool.mypy] python_version is not "
               "OLDER than the syntax your installed stubs use.", file=sys.stderr)
+        raise SystemExit(2)
+    if proc.returncode != 0 and not counts:
+        # mypy says it found errors (exit 1) or broke (2), and not one line was read: the
+        # output is in a shape this does not parse, so a count of 0 would be a pass about
+        # nothing. Refuse rather than report a clean tree.
+        head = "\n".join((proc.stdout or proc.stderr).splitlines()[:5])
+        print(f"mypy exited {proc.returncode} but no error line could be read from its "
+              f"output, so there is no count to compare. First lines:\n{head}",
+              file=sys.stderr)
         raise SystemExit(2)
     return counts, proc.stdout
 

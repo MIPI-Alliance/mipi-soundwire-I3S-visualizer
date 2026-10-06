@@ -13,6 +13,7 @@ Bus-Visualizer mode is now driven by the vendored Visualizer engine.
 Run: PYTHONPATH=. python3 -m pytest tests/test_authoring.py
 """
 import os
+import pathlib
 import tempfile
 
 import swi3score
@@ -154,7 +155,7 @@ def test_export_decoder_config_as_visualizer_csv():
     # Writes a visualizer CSV the C++ cascade can place.
     p = os.path.join(tempfile.mkdtemp(), "exported.csv")
     cfg.to_csv_file(p)
-    assert "RowRate,781.25" in open(p).read()
+    assert "RowRate,781.25" in pathlib.Path(p).read_text()
     assert len(swi3score.grid_from_csv(p, 32)) > 0
 
 
@@ -504,7 +505,7 @@ def test_cds_guard_polarity_roundtrip():
     cfg.cds_guard[0] = CDS_GUARD_G1
     with tempfile.TemporaryDirectory() as d:
         path = cfg.to_csv_file(os.path.join(d, "c.csv"))
-        text = open(path).read()
+        text = pathlib.Path(path).read_text()
         back = BusConfig.from_csv(path)
     assert sum(1 for l in text.splitlines()
                if l.startswith("CDS_GuardPolarityPerSource")) == 1
@@ -674,7 +675,7 @@ def test_cds_drive_type_reaches_both_engines_and_the_grid_label():
         # than landing in unrecognized_fields.
         scalar = os.path.join(d, "scalar.csv")
         with open(scalar, "w") as f:
-            f.write(open(legacy).read() + "\nCDS_DriveType,0\n")
+            f.write(pathlib.Path(legacy).read_text() + "\nCDS_DriveType,0\n")
         assert BusConfig.from_csv(scalar).cds_drive_type == [CDS_DRIVE_SPECIAL] * 13
         iface3, viz3 = Interface(), VizConfig()
         result3 = CSVHandler.load_csv(scalar, iface3, viz3)
@@ -872,8 +873,8 @@ def test_manager_dataport_beats_device_number_in_either_row_order_in_both_engine
     it writes itself, false of a hand-edited or third-party one — and in that case the later
     DeviceNumber row overwrote the Manager assignment, so a Manager port silently became a
     peripheral. swviz's loader was always order-independent, so THE SAME FILE decoded two
-    different ways depending on which engine read it, which is the divergence CLAUDE.md warns
-    about ("treat a bare device number from a CSV with suspicion").
+    different ways depending on which engine read it: treat a bare device number from a CSV
+    with suspicion.
 
     Asserted in BOTH orders and BOTH engines, because a fix to one engine that leaves the
     other alone recreates the divergence rather than fixing it.
@@ -1007,8 +1008,8 @@ def test_the_cds_csv_round_trips_through_the_cpp_loader_too():
     """A third CSV reader now parses the CDS rows, and must agree with the other two.
 
     `SwI3sConfig::LoadCsv` recognised no CDS field, so its view of a config silently differed
-    from BusConfig's and swviz's. Two engines disagreeing on one file is the defect this
-    repo's CLAUDE.md already warns about; three is worse. Checked through the register
+    from BusConfig's and swviz's. Two engines disagreeing on one file is a defect; three is
+    worse. Checked through the register
     emission, which is the only window onto the C++ struct from Python.
 
     The legacy scalar rows are covered too: a pre-per-source file broadcasts its single

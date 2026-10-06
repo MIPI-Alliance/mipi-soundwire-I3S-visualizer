@@ -5,6 +5,8 @@ Run it on macOS AND Windows at the release commit. Exit 0 is the gate.
 
     python3 tools/gate.py            # full gate
     python3 tools/gate.py --quick    # skip perf + the per-suite pass (dev loop)
+    python3 tools/gate.py --only per-suite --verbose     # one or more named checks
+    python3 tools/gate.py --only native,native-cpp       # (comma-separated; see _CHECKS)
 
 `tests/gate.sh` and `tests/gate.ps1` are thin wrappers around this file so either shell
 has a natural entry point without a second copy of the logic.
@@ -25,6 +27,12 @@ Checks, in order (a failure never stops the rest — you get the whole picture):
      a pooled run can mask; this is what surfaced the 3.0.10 QThread-on-quit bug
   5. ruff
   6. mypy, non-regression vs tools/mypy_baseline.json
+  7. leak scan
+  (native-cpp, the C++ suite of the Saleae plugin sources, runs only when named with --only
+   and needs that checkout beside this one; without it the check is NOT RUN)
+
+`--only` runs a subset and says so: its summary is never a bare PASS, because a partial
+run is not the gate. `tests/run_all.sh` is a wrapper over `--only`.
 
 A MISSING TOOL IS A FAILURE, never a silent skip: a check that quietly does nothing is how
 the lint job went five releases without anyone noticing it had never run.
@@ -33,6 +41,7 @@ from __future__ import annotations
 
 import glob
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -95,15 +104,14 @@ def check_native() -> None:
         _FAILED.append("native build")
         # SAY WHAT THIS FAILURE TOOK WITH IT. Returning here skips the ABI assert, and the
         # suite that follows then runs against whatever core is already installed — the exact
-        # stale-core hazard the assert exists to catch. A first run on a new platform failed
-        # here and reported one problem where there were two: a broken build, and 976 tests
-        # whose subject was unverified. Aggregation is deliberate (one red must not hide the
+        # stale-core hazard the assert exists to catch: a broken build AND a suite whose
+        # subject is unverified are two problems, not one. Aggregation is deliberate (one red must not hide the
         # rest), so do not abort — but never let the skipped assert go unmentioned.
         _NOT_RUN.append("score_abi assert (the build failed; any tests below ran against "
                         "whatever core was already installed)")
         return
 
-    src = open(os.path.join(_ROOT, "swi3s_studio", "session.py"), encoding="utf-8").read()
+    src = pathlib.Path(_ROOT, "swi3s_studio", "session.py").read_text(encoding="utf-8")
     want = int(re.search(r"_REQUIRED_SCORE_ABI\s*=\s*(\d+)", src).group(1))
     probe = _run([sys.executable, "-c",
                   "import swi3score, swi3s_studio as s;"
@@ -128,8 +136,10 @@ def check_pytest(marker: str, label: str) -> None:
 
 
 def check_per_suite() -> None:
-    """Every test file in its own process. Implemented here rather than shelling out to
-    tests/run_all.sh, which is bash — that is why this step had never run on Windows."""
+    """Every test file in its own process. Implemented here rather than in bash (this used
+    to be tests/run_all.sh, which is why the step had never run on Windows); that script is
+    now a wrapper over `--only per-suite`. A failing suite shows its last lines, and
+    `--verbose` lists every suite with its count."""
     _step("per-suite run (one process per file)")
     files = sorted(glob.glob(os.path.join(_ROOT, "tests", "test_*.py")))
     bad, empty = [], []
@@ -139,9 +149,16 @@ def check_per_suite() -> None:
                  capture_output=True, text=True)
         if p.returncode == 5:            # "no tests collected" — legitimate only for perf
             empty.append(rel)
+            if _VERBOSE:
+                print(f"  --   {rel} (no tests for -m 'not perf')")
         elif p.returncode != 0:
             bad.append(rel)
-            print(f"  FAIL {rel}")
+            print(f"  FAIL {rel} (exit {p.returncode})")
+            for line in (p.stdout + p.stderr).strip().splitlines()[-12:]:
+                print(f"         {line}")
+        elif _VERBOSE:
+            n = re.search(r"(\d+) passed", p.stdout)
+            print(f"  ok   {rel:<46} {n.group(0) if n else ''}")
     print(f"  {len(files) - len(bad) - len(empty)} suites ok, {len(bad)} failed, "
           f"{len(empty)} with no tests for this marker")
     if bad:
@@ -196,20 +213,67 @@ def check_leaks() -> None:
                         "($SWI3S_LEAK_PATTERNS unset — structural checks only)")
 
 
-def main() -> int:
-    quick = "--quick" in sys.argv
-    print(f"release gate — {sys.platform}, python {sys.version.split()[0]}"
-          f"{' (--quick)' if quick else ''}")
+def check_native_cpp() -> None:
+    """The native C++ suite, which lives in the sibling protocol-analyzer checkout. Opt-in
+    (`--only native-cpp`): the full gate has never run it, and a missing sibling is NOT RUN,
+    not a silent skip."""
+    _step("native C++ suite (sibling protocol-analyzer checkout)")
+    runner = os.path.join(_ROOT, "..", "protocol-analyzer", "SwI3sAnalyzer", "test",
+                          "run_tests.sh")
+    if _WINDOWS or not os.path.isfile(runner):
+        _NOT_RUN.append(f"native C++ suite ({runner} not available here)")
+        return
+    if _run(["bash", runner]).returncode != 0:
+        _FAILED.append("native C++ suite")
 
-    check_native()
-    check_pytest("not perf", "pytest not-perf")
-    if not quick:
-        check_pytest("perf", "pytest perf")
-        check_per_suite()
-    check_tool("ruff", ["check", "."], "ruff",
-               "brew install ruff  (or python -m pip install ruff)")
-    check_mypy()
-    check_leaks()
+
+_VERBOSE = False
+
+# name -> (check, runs in the full gate, skipped by --quick). Order is run order. Each is
+# looked up when it runs (the lambdas), so a test can stub a check by its module name.
+_CHECKS = {
+    "native": (lambda: check_native(), True, False),
+    "pytest": (lambda: check_pytest("not perf", "pytest not-perf"), True, False),
+    "perf": (lambda: check_pytest("perf", "pytest perf"), True, True),
+    "per-suite": (lambda: check_per_suite(), True, True),
+    "ruff": (lambda: check_tool("ruff", ["check", "."], "ruff",
+                                "brew install ruff  (or python -m pip install ruff)"),
+             True, False),
+    "mypy": (lambda: check_mypy(), True, False),
+    "leaks": (lambda: check_leaks(), True, False),
+    "native-cpp": (lambda: check_native_cpp(), False, False),
+}
+
+
+def _selected(argv: list[str]) -> list[str] | None:
+    """The checks named by --only (None = the full gate). An unknown name is an error, not
+    a silently empty run."""
+    if "--only" not in argv:
+        return None
+    i = argv.index("--only")
+    names = [n for n in (argv[i + 1] if i + 1 < len(argv) else "").split(",") if n]
+    unknown = [n for n in names if n not in _CHECKS]
+    if not names or unknown:
+        raise SystemExit(f"--only needs a comma-separated list of {', '.join(_CHECKS)}"
+                         + (f" (unknown: {', '.join(unknown)})" if unknown else ""))
+    return names
+
+
+def main() -> int:
+    global _VERBOSE
+    quick = "--quick" in sys.argv
+    _VERBOSE = "--verbose" in sys.argv
+    only = _selected(sys.argv)
+    print(f"release gate — {sys.platform}, python {sys.version.split()[0]}"
+          f"{' (--quick)' if quick else ''}"
+          f"{' (--only ' + ','.join(only) + ')' if only else ''}")
+
+    for name, (check, in_gate, quick_skip) in _CHECKS.items():
+        if only is not None:
+            if name in only:
+                check()
+        elif in_gate and not (quick and quick_skip):
+            check()
 
     print("\n=== gate summary ===")
     if _NOT_RUN:
@@ -217,6 +281,9 @@ def main() -> int:
         for n in _NOT_RUN:
             print(f"    - {n}")
     if not _FAILED:
+        if only is not None:
+            print(f"  PASS ({', '.join(only)} only) — a partial run, not the release gate")
+            return 0
         print("  PASS — every applicable check is green")
         if quick:
             print("  (--quick SKIPPED perf and the per-suite pass — not a release gate)")

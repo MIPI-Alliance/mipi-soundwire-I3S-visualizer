@@ -107,8 +107,8 @@ jobs:
       # ratchet is — platform-guarded branches and GUI paths differ. A floor set at the
       # measured 79 would fail on a one-point environment delta, which trains people to
       # ignore it. RAISE IT once this job has reported its own number over a few runs.
-      - name: Coverage (floor 75%)
-        run: python -m pytest -q -m "not perf" --cov=swi3s_studio --cov-report=term-missing:skip-covered --cov-fail-under=75
+      - name: Coverage (floor 80%)
+        run: python -m pytest -q -m "not perf" --cov=swi3s_studio --cov-report=term-missing:skip-covered --cov-fail-under=80
 
   lint:
     name: lint + type

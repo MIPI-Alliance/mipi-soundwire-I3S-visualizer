@@ -20,7 +20,7 @@ import math
 from functools import reduce
 from typing import Dict, List
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QDoubleValidator, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ...analysis.issues import Issue
 from ...model.bus_config import NUM_DATA_PORTS, BusConfig
+from .. import timers
 from ..theme import VizTheme, authoring_stylesheet
 from .dialogs import (
     MANAGER,
@@ -479,13 +480,13 @@ class AuthoringPanel(QWidget):
         super().showEvent(event)
         # Real font/row metrics are only known once shown; defer one tick so the
         # layout has settled, then align the file note with the readouts.
-        QTimer.singleShot(0, self._align_file_status)
+        timers.after(0, self, self._align_file_status)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         super().resizeEvent(event)
         # The panel gets its real size from the splitter after the first show, and
         # again whenever it's dragged; re-align (a no-op once already aligned).
-        QTimer.singleShot(0, self._align_file_status)
+        timers.after(0, self, self._align_file_status)
 
     def _align_file_status(self) -> None:
         """Size the Notifications panel so the file-status note's top lines up with

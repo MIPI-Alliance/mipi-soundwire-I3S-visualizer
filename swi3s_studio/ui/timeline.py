@@ -9,8 +9,9 @@ across a long capture and to get back to a region after drilling into a command.
 from __future__ import annotations
 
 import bisect
-from typing import List
+from typing import List, Optional
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
@@ -27,6 +28,7 @@ def _diamond(cx: float, cy: float, r: float) -> QPolygonF:
 _MARGIN = 8
 _AXIS_H = 18                 # bottom strip reserved for the time ruler
 _H = 92                      # taller so the config-band labels + a time axis both fit
+_H_MIN = 64                  # smallest band in a resizable stack of Links (ticks still read)
 _CFG_BAND_H = 18             # top strip for the config-region bands (holds the "Ncol" label),
                              # kept ABOVE the command ticks so the ticks read clearly
 
@@ -151,11 +153,18 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     #: a bookmark was dragged: (label, new_sample, final). final=False during the drag
     #: (live re-measure), True on mouse release (snap to the nearest edge there).
     bookmarkMoved = Signal(str, 'qlonglong', bool)
+    #: the visible window changed by the USER (zoom, pan, reset) — (lo, hi) in samples. A
+    #: stack of ribbons (one per Link) listens so every Link shows the same instants.
+    viewChanged = Signal(float, float)
+    #: a single ribbon's fixed height, and one Link's default band in a stack of them
+    BAND_HEIGHT = _H
 
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumHeight(_H)
         self.setMaximumHeight(_H)
+        self._flexible = False           # height follows the widget (a stack of Links)
+        self._domain: Optional[tuple] = None   # (lo, hi) the view may cover; None = capture
         self._commands: List[dict] = []
         self._by_start: List[dict] = []      # commands sorted by start sample (nearest-tick)
         self._draw_order: List[dict] = []    # commands sorted by paint rank (computed once)
@@ -168,6 +177,13 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._commit_decim: List[int] = []   # cached in-view commit-point pixel columns
         self._commit_starts: List[int] = []  # SSCR/DSCR starts (⌘+arrow jump)
         self._commit_points: List[int] = []  # SSP samples where confirmed commits TAKE EFFECT
+        self._commit_f = np.empty(0, dtype=np.float64)   # the same, for the decimation
+        # The tick decimation's arrays (see set_events), empty until there are commands.
+        self._tick_start_i = np.empty(0, dtype=np.int64)
+        self._tick_start_f = np.empty(0, dtype=np.float64)
+        self._tick_pos = np.empty(0, dtype=np.int64)
+        self._tick_filter_key: Optional[int] = None
+        self._tick_filter_mask: Optional[np.ndarray] = None
         self._total = 1
         self._cursor = 0
         self._bookmarks: List[tuple] = []    # (sample, label) pairs, e.g. (12345, "A1")
@@ -185,7 +201,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         # the full cursor cascade (register + grid rebuild). Emit at most once per ~30 ms
         # with the latest sample (mirrors raw_view's coalescing); the final position is
         # flushed on mouse-release so it never lags behind the drag.
-        self._pending_seek = None
+        self._pending_seek: Optional[int] = None
+        self._left_dragged = False       # a left press has moved: the release is a seek
         self._seek_timer = QTimer(self)
         self._seek_timer.setSingleShot(True)
         self._seek_timer.setInterval(30)
@@ -246,6 +263,18 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._by_start = sorted(commands, key=lambda c: int(c.get("start_sample", 0)))
         self._starts = [int(c.get("start_sample", 0)) for c in self._by_start]
         self._draw_order = sorted(commands, key=tick_rank)
+        # The decimation's arrays: every command's start (as float64, the type the pixel
+        # arithmetic runs in, and int64 for the filter's exact match) and its POSITION in
+        # _draw_order, all ordered by start so a view is one searchsorted slice.
+        pos = np.arange(len(self._draw_order), dtype=np.int64)
+        starts = np.fromiter((int(c.get("start_sample", 0)) for c in self._draw_order),
+                             dtype=np.int64, count=len(self._draw_order))
+        order = np.argsort(starts, kind="stable")
+        self._tick_start_i = starts[order]
+        self._tick_start_f = self._tick_start_i.astype(np.float64)
+        self._tick_pos = pos[order]
+        self._tick_filter_key = None             # (id(_draw_set)) the mask below is for
+        self._tick_filter_mask = None
         self._total = max(1, int(total_samples))
         self._reset_view()                       # new capture → show the whole thing
 
@@ -291,16 +320,39 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._bookmarks = [(int(s), str(lbl)) for s, lbl in marks]
         self.update()
 
+    def set_flexible_height(self, on: bool) -> None:
+        """Fixed at _H for one Link (as always); in a stack of Links the ribbon takes the
+        height its row is given, so the Timeline dock can be resized vertically."""
+        self._flexible = bool(on)
+        self.setMinimumHeight(_H_MIN if on else _H)
+        self.setMaximumHeight(16777215 if on else _H)     # QWIDGETSIZE_MAX when flexible
+        self.update()
+
+    def set_domain(self, lo=None, hi=None) -> None:
+        """The sample range the view may cover. None (the default) is this capture, [0,
+        total]. A stack of Links passes the union of every Link's span in THIS ribbon's
+        samples, which may start below 0, so all ribbons can show one shared window."""
+        self._domain = None if lo is None else (float(lo), float(max(hi, lo + 1)))
+
+    def _bounds(self):
+        return self._domain if self._domain is not None else (0.0, float(max(1, self._total)))
+
+    def set_view(self, lo: float, hi: float) -> None:
+        """Show [lo, hi] (samples) as told by the stack. Unlike a user zoom this does not
+        emit viewChanged, so ribbons following each other cannot ping-pong."""
+        self._set_view(lo, hi, emit=False)
+
     def _track_rect(self) -> QRectF:
         # Leave the bottom _AXIS_H px for the time ruler; the rest is the track.
+        h = self.height() if self._flexible else _H
         return QRectF(_MARGIN, 10, max(1, self.width() - 2 * _MARGIN),
-                      _H - 28 - _AXIS_H)
+                      max(1, h - 28 - _AXIS_H))
 
     def _reset_view(self) -> None:
         """Show the whole capture (clears any zoom/pan)."""
-        self._view_lo = 0.0
-        self._view_hi = float(max(1, self._total))
+        self._view_lo, self._view_hi = self._bounds()
         self.update()
+        self.viewChanged.emit(self._view_lo, self._view_hi)
 
     def _view_span(self) -> float:
         return max(1.0, self._view_hi - self._view_lo)
@@ -345,19 +397,22 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             self._set_view(lo, hi)
         event.accept()
 
-    def _set_view(self, lo: float, hi: float) -> None:
-        """Clamp a proposed [lo, hi] view to the capture and a sensible min zoom,
-        keeping the span when panning hits an edge."""
-        total = float(max(1, self._total))
+    def _set_view(self, lo: float, hi: float, emit: bool = True) -> None:
+        """Clamp a proposed [lo, hi] view to the capture (or the stack's shared domain)
+        and a sensible min zoom, keeping the span when panning hits an edge."""
+        d_lo, d_hi = self._bounds()
+        total = d_hi - d_lo
         span = max(min(hi - lo, total), 16.0)               # cap zoom-in at 16 samples
-        if lo < 0.0:
-            lo, hi = 0.0, span
-        elif hi > total:
-            lo, hi = total - span, total
+        if lo < d_lo:
+            lo, hi = d_lo, d_lo + span
+        elif hi > d_hi:
+            lo, hi = d_hi - span, d_hi
         else:
             hi = lo + span
-        self._view_lo, self._view_hi = max(0.0, lo), min(total, lo + span)
+        self._view_lo, self._view_hi = max(d_lo, lo), min(d_hi, lo + span)
         self.update()
+        if emit:
+            self.viewChanged.emit(self._view_lo, self._view_hi)
 
     def mouseDoubleClickEvent(self, event) -> None:
         self._reset_view()
@@ -389,6 +444,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         takes effect (Row_Delay rows after the command). Drawn as a dotted commit-colour
         line; distinct from the commit COMMAND tick at its own start sample."""
         self._commit_points = sorted(int(p) for p in points) if points else []
+        self._commit_f = np.asarray(self._commit_points, dtype=np.float64)
         self.update()
 
     def keyPressEvent(self, event) -> None:
@@ -422,60 +478,81 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     def _center_view_on(self, sample: int) -> None:
         """Recenter the visible window on `sample` (keeping the current span) when
         zoomed in — used by arrow navigation. No-op at full zoom."""
-        if self._view_span() >= float(max(1, self._total)):
+        d_lo, d_hi = self._bounds()
+        if self._view_span() >= d_hi - d_lo:
             return
         half = self._view_span() / 2.0
         self._set_view(sample - half, sample + half)
+
+    def _view_slice(self, sorted_f: np.ndarray):
+        """(i0, i1, xs): the entries of an ascending float64 sample array that _in_view
+        accepts (the view plus its 5% margin, both ends inclusive) and the pixel column
+        _x_for would give each, truncated toward zero like int() — vectorised, so a view
+        change costs a bisect plus work on what is IN view, not a walk of everything."""
+        span = self._view_span()
+        lo, hi = self._view_lo - span * 0.05, self._view_hi + span * 0.05
+        i0 = int(np.searchsorted(sorted_f, lo, side="left"))
+        i1 = int(np.searchsorted(sorted_f, hi, side="right"))
+        tr = self._track_rect()
+        xs = (tr.left() + ((sorted_f[i0:i1] - self._view_lo) / span) * tr.width())
+        return i0, i1, xs.astype(np.int64)
 
     def _decimated_ticks(self) -> List[tuple]:
         """[(x, cmd), …] — at most one command per pixel column (the MOST significant,
         by paint rank), for the current view range / width / filter. Recomputed only
         when one of those actually changed (cached otherwise), so paintEvent — driven
-        by a 16 ms play timer — doesn't re-walk every command (tens of thousands at
-        full zoom-out) each frame; it just redraws this ~width-sized list."""
+        by a 16 ms play timer — doesn't redo it each frame; it just redraws this
+        ~width-sized list.
+
+        A column's winner is the in-view (and, with a filter, visible) command LATEST in
+        _draw_order: that list is sorted by ascending paint rank, stable, so the latest
+        is the most significant and, among equals, the one a back-to-front walk of it
+        reaches first — which is how this used to be computed, one Python iteration per
+        command per view change (76 ms per wheel step at 100k commands). Now it is a
+        bisect to the view and a vectorised per-column maximum over what is in it; the
+        result, order included, is the same (tests/test_timeline_decimation.py)."""
         key = (self._view_lo, self._view_hi, self.width(),
                id(self._draw_order), id(self._draw_set))
         if key == self._decim_key:
             return self._decim_ticks
-        drawn_px = set()
-        ticks = []
-        for cmd in reversed(self._draw_order):
-            s = cmd.get("start_sample", 0)
-            # Honor the command-table filter: don't draw ticks for filtered-out commands
-            # (keyed by raw start_sample, matching the tick position — see set_draw_filter).
-            if self._draw_set is not None and int(s) not in self._draw_set:
-                continue
-            if not self._in_view(s):                          # skip off-view (and avoid overflow)
-                continue
-            x = int(self._x_for(s))
-            if x in drawn_px:                                 # a more significant tick owns this column
-                continue
-            drawn_px.add(x)
-            ticks.append((x, cmd))
+        i0, i1, xs = self._view_slice(self._tick_start_f)
+        pos = self._tick_pos[i0:i1]
+        if self._draw_set is not None:
+            # Honor the command-table filter: no ticks for filtered-out commands (keyed by
+            # raw start_sample, matching the tick position — see set_draw_filter). The
+            # mask is built once per filter, not per view.
+            if self._tick_filter_key != id(self._draw_set):
+                self._tick_filter_mask = np.isin(
+                    self._tick_start_i, np.fromiter(self._draw_set, dtype=np.int64,
+                                                    count=len(self._draw_set)))
+                self._tick_filter_key = id(self._draw_set)
+            keep = self._tick_filter_mask[i0:i1]
+            xs, pos = xs[keep], pos[keep]
+        ticks: List[tuple] = []
+        if pos.size:
+            x0 = int(xs.min())
+            best = np.full(int(xs.max()) - x0 + 1, -1, dtype=np.int64)
+            np.maximum.at(best, xs - x0, pos)                 # per column: latest in order
+            cols = np.flatnonzero(best >= 0)
+            won = best[cols]
+            by = np.argsort(-won, kind="stable")              # most significant first
+            ticks = [(int(cols[k]) + x0, self._draw_order[int(won[k])]) for k in by]
         self._decim_key = key
         self._decim_ticks = ticks
         return ticks
 
     def _decimated_commit_points(self) -> List[int]:
-        """In-view commit-point x's, at most one per pixel column, cached by view/width —
-        so paintEvent (16 ms play timer) doesn't re-walk every commit point (tens of
-        thousands at full zoom-out) each frame. Same caching shape as _decimated_ticks."""
+        """In-view commit-point x's, at most one per pixel column, ascending, cached by
+        view/width — so paintEvent (16 ms play timer) doesn't redo it each frame. The
+        points are sorted, so x is non-decreasing along them and the distinct columns in
+        order are the whole answer; same bisect as _decimated_ticks."""
         key = (self._view_lo, self._view_hi, self.width(), id(self._commit_points))
         if key == self._commit_decim_key:
             return self._commit_decim
-        seen_px: set = set()
-        xs: List[int] = []
-        for cp in self._commit_points:                    # sorted; one line per column
-            if not self._in_view(cp):
-                continue
-            x = int(self._x_for(cp))
-            if x in seen_px:
-                continue
-            seen_px.add(x)
-            xs.append(x)
+        _i0, _i1, xs = self._view_slice(self._commit_f)
+        self._commit_decim = [int(x) for x in np.unique(xs)]
         self._commit_decim_key = key
-        self._commit_decim = xs
-        return xs
+        return self._commit_decim
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
@@ -646,8 +723,17 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             p.setPen(QPen(_C_AXIS))
             p.drawLine(int(x), int(y), int(x), int(y) + 4)
             p.setPen(QPen(QColor(180, 180, 185)))
-            p.drawText(QRectF(x - 44, y + 4, 88, _AXIS_H - 4),
-                       Qt.AlignHCenter | Qt.AlignTop, self._fmt_axis(s, step_u))
+            # Centred on its tick, except where that would cut it at the widget's edge
+            # (the "0 ms" at the start, once the Link names left the bands that close to
+            # the left): there it is pinned to the edge instead.
+            rect, align = QRectF(x - 44, y + 4, 88, _AXIS_H - 4), Qt.AlignHCenter
+            text = self._fmt_axis(s, step_u)
+            half = p.fontMetrics().horizontalAdvance(text) / 2 + 1
+            if x - half < 0:
+                rect, align = QRectF(0, y + 4, 88, _AXIS_H - 4), Qt.AlignLeft
+            elif x + half > self.width():
+                rect, align = QRectF(self.width() - 88, y + 4, 88, _AXIS_H - 4), Qt.AlignRight
+            p.drawText(rect, align | Qt.AlignTop, text)
 
     @staticmethod
     def _nice(x: float) -> float:
@@ -696,6 +782,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         return best
 
     def mousePressEvent(self, event) -> None:
+        self._left_dragged = False
         if event.button() == Qt.MiddleButton:
             self._pan_x = event.position().x()       # begin pan
             return
@@ -711,6 +798,11 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             self.bookmarkMoved.emit(self._drag_bm, self._sample_for(event.position().x()), True)
             self._drag_bm = None
         self._pan_x = None
+        if self._left_dragged and event.button() == Qt.LeftButton:
+            # End where the pointer was LET GO, not at the last move event: the two differ
+            # whenever the pointer moved between them, and the cursor would rest short.
+            self._pending_seek = self._sample_for(event.position().x())
+        self._left_dragged = False
         self._flush_pending_seek()                   # apply the final drag position now
 
     def _emit_pending_seek(self) -> None:
@@ -808,7 +900,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         if seg is not None:
             i, s = seg
             forced = bool(s.get("forced"))
-            note = (" · column count pinned by you (Analyzer ▸ Force Column Count) — "
+            note = (" · column count pinned by you (Decode ▸ Force Column Count) — "
                     "the wire's own width is overridden for this region" if forced else "")
             return (f"Bus config: "
                     f"{self._segment_label(i, int(s.get('column_count', 0)), forced)} "
@@ -845,6 +937,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             # Coalesce: stash the latest sample and let the timer emit it (steady ~30 ms
             # cadence — start only when idle so rapid moves collapse into one emit).
             self._pending_seek = self._sample_for(x)
+            self._left_dragged = True
             if not self._seek_timer.isActive():
                 self._seek_timer.start()
             return

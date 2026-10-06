@@ -28,6 +28,25 @@ def test_no_row_index_gutter():
     assert not w._sample_view._table.verticalHeader().isVisible()
 
 
+def test_decimal_is_as_wide_as_its_contents_not_the_space_left():
+    # Stretched, the last column took whatever the others left, so in All Links one
+    # stacked table's Decimal was wide and the next one's narrow.
+    from swi3s_studio.ui.decoded_sample_view import DecodedSampleView
+    v = DecodedSampleView()
+    v.set_sample_rate(1e6)
+    v.set_lanes([(1, 1, 0)])
+    v.set_samples([{"row": r, "start_sample": r, "device": 1, "dp": 1, "channel": 0,
+                    "sample_size": 16, "value": r, "signed": r} for r in range(8)])
+    v.resize(1600, 300)
+    v.show()
+    QApplication.processEvents()
+    t = v._table
+    last = t.columnCount() - 1
+    assert t.viewport().width() > sum(t.columnWidth(c) for c in range(last)) + 300
+    fit = max(t.sizeHintForColumn(last), t.horizontalHeader().sectionSizeHint(last))
+    assert t.columnWidth(last) <= fit + 2
+
+
 def test_window_is_bounded_and_lazily_extends():
     w, _ = _win()
     sv = w._sample_view
@@ -45,8 +64,8 @@ def test_window_is_bounded_and_lazily_extends():
     assert n2 == n1 + _SAMPLE_CHUNK
 
     starts = [int(sv._samples[i]["start_sample"]) for i in range(len(sv._samples))]
+    # Ascending; equal starts are allowed (two channels' samples can start together).
     assert starts == sorted(starts), "loaded window not in ascending order"
-    assert len(set(starts)) == len(starts) or True        # dupes allowed (same-sample lanes), order matters
 
 
 def test_extending_the_window_does_not_re_enter_at_the_far_end():

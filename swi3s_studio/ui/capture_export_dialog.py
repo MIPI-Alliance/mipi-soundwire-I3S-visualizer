@@ -46,11 +46,12 @@ class CaptureExportDialog(QDialog):
 
     def __init__(self, session, *, default_dir: str = "",
                  clock_name: str = "SW_CLK", data_name: str = "SW_DATA",
-                 parent=None) -> None:
+                 default_name: str = "capture", parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export Capture")
         self._session = session
         self._default_dir = default_dir or ""
+        self._default_name = default_name or "capture"   # e.g. "capture_Amp_bus" per Link
 
         lay = QVBoxLayout(self)
 
@@ -120,7 +121,7 @@ class CaptureExportDialog(QDialog):
         _key, ext, _filt = self._format.currentData()
         # Re-point the file field's extension to the chosen format.
         cur = self._path.text().strip()
-        base = cur or os.path.join(self._default_dir, "capture")
+        base = cur or os.path.join(self._default_dir, self._default_name)
         root, _old = os.path.splitext(base)
         self._path.setText(root + ext)
         # A .sal project stores the whole two-wire bus — both signals required; the raw

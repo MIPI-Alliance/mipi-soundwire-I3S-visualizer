@@ -30,8 +30,10 @@ def _assert_decode_good(res, label):
     sscr = [c for c in res.commands if c["is_commit"] and c["commit_confirmed"]]
     assert res.column_count == 16, f"{label}: columns={res.column_count}"   # ends 16-col
     # Two geometry commits (8-col then 16-col), each 13 writes (NumColumns + 4 ports x 3),
-    # plus a one-time PortControl (ScramblerEn=0) for DP0 and DP2 = 2. Total 28.
-    assert len(writes) == 28, f"{label}: writes={len(writes)}"
+    # plus a one-time PortControl (ScramblerEn=0) for DP0 and DP2 = 2, plus DP0's payload
+    # skipping = 3 (SLC_SkippingDenominator is two bytes at two addresses, and
+    # DP0_SkippingNumerator one write of two). Total 31.
+    assert len(writes) == 31, f"{label}: writes={len(writes)}"
     assert len(sscr) == 2, f"{label}: sscr={len(sscr)}"
     assert res.audio, f"{label}: no audio"
     # dp0/dp1 are mono 16-bit PCM (tone == dp*2 on channel 0); verify both against the
@@ -178,17 +180,19 @@ def test_scrambler_override():
     assert stream(on, (0, 1, 0)) == stream(ref, (0, 1, 0))
 
 
-def test_command_store_roundtrip():
+def test_command_store_roundtrip(tmp_path):
+    # tmp_path, not a TemporaryDirectory: on Windows something (a scanner) can hold a
+    # just-written file for a moment, and TemporaryDirectory's cleanup then raised
+    # PermissionError in a test about the round trip, intermittently (1 run in 6).
     res = decode_capture(transitions.demo_capture(32))
     table = command_store.commands_to_table(res.commands)
     assert table.num_rows == len(res.commands)
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "commands.parquet")
-        command_store.save_commands(table, path)
-        back = command_store.load_commands(path)
+    path = str(tmp_path / "commands.parquet")
+    command_store.save_commands(table, path)
+    back = command_store.load_commands(path)
     assert back.column("command").to_pylist() == [c["command"] for c in res.commands]
     writes = list(command_store.register_writes(res.commands))
-    assert len(writes) == 28
+    assert len(writes) == 31       # see _assert_decode_good for the breakdown
     assert writes[0][1] == 0x1081   # first write programs NumColumns_NEXT
 
 

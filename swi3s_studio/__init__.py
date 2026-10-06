@@ -5,6 +5,387 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 (later) a PySide6 UI. See ../docs/architecture.md.
 """
 # App version, shown in the window title. Kept in sync with pyproject.toml.
+# 3.0.19: several SWI3S Links side by side, Open Capture as one page, menus per mode with a
+#        Decode menu, and adjustable waveform colours; with the unreleased 3.0.18.
+#        3.0.18 was never released: its work ships in this release, and is listed below with
+#        the rest.
+#        • MULTIPLE LINKS. Analysis mode shows several SWI3S Links (spec §4.7: one Manager and
+#          its Peripherals on one bus) side by side. A Link comes from another capture file
+#          (Open Capture, Add to them) or from further clock/data pairs of the same file,
+#          which Open Capture offers when a file has spare channels. Links may differ in PHY,
+#          column count and row rate. Each is a complete, unchanged Session held in
+#          `links.LinkSet`; one Link is the active one. A single Link shows exactly what it
+#          did before: nothing single-Link passes through the time conversion.
+#          GLOBAL TIME is int64 picoseconds. Each Link maps its own samples through
+#          `LinkEntry.to_ps` / `to_sample` (exact rationals) and a signed `offset_ps`, set
+#          when adding in Open Capture, by Set Offset… on the Link's timeline label, or by
+#          Bookmarks ▸ Align Links on Bookmark Pair… (one bookmark on each Link at the same
+#          event). The offset is a mapping, so changing it re-decodes nothing.
+#          Links from one file share its timeline and start at offset 0.
+#          FOUR PANE GROUPS each show a Link of their own, chosen by a picker in the group:
+#          Commands (header), Registers/Statistics, the Bus Grid, and Capture/CDS/Audio/
+#          Samples/Timing (dock title bars). The grid has a group of its own because two
+#          grids do not fit across; a workspace that predates it puts the grid on the signal
+#          panes' Link.
+#          ALL LINKS IN THE SIGNAL PANES (their picker, or View ▸ Links ▸ Signal Panes: All
+#          Links, Ctrl+Alt+Shift+0). Capture, Audio, CDS and Samples stack one ordinary
+#          single-Link pane per Link (`ui/link_lanes.py`), each bound under its Link's
+#          `_as_link` (the tables through `_as_lane`, which also points
+#          `_symbol_view`/`_sample_view` at the lane), on one global time: a lane's X range and
+#          axis/Time labels move by its Link's offset. Clicks, drags, picks and touches in lane
+#          k act on Link k; one lane plays. Timing stacks a pane per Link the same way, so each
+#          keeps the four edge-flavour colours the pane is read by (one overlay would need a
+#          colour per Link instead). CDS and Samples stack rather than merge, since their
+#          running disparity, row numbers and scroll-back are per Link. The Capture and Audio
+#          lanes range over the span of every Link (a view capped at its own capture would part
+#          lanes of different lengths) and pick ticks in global time. The Samples table's
+#          Decimal column is sized to its contents, not stretched into the space left, so
+#          stacked tables match.
+#          Every group follows the one cursor, at the same instant on its own Link. The active
+#          Link, which menus act on, is the one of the group last worked in, and a pane's own
+#          menu (Audio, Devices, Commands) acts on that pane's Link. Commands also offers All
+#          Links: every Link's commands in global time, with a Link column. The Timeline stacks
+#          a band per Link on one time scale; clicking a band makes its Link active, so Ctrl+B
+#          places a bookmark on the band clicked. Bookmarks belong to a Link and are drawn only
+#          on it (its band; Audio and Capture when they show it), and the Bookmarks pane names
+#          each one's Link. A pair across two Links is timed in global time, with rows and UIs
+#          shown only when both Links SHARE that timing across the interval, judged per geometry
+#          region (`Session.rate_regions`), not by each capture's end rate: a pair inside the
+#          PHY2 demo's 8-column region (3.072 MRows/s) shows no rows against a 16-column Link at
+#          1.536. One-Link ΔUI is a count, so it is exact across PHY3's Safe-Lock commit, where
+#          the UI rate changes.
+#          WORKSPACE v4 records one LinkSpec per Link (source, name, offset, decode inputs)
+#          and, with two or more Links, the pane layout; a v3 workspace loads as one Link.
+#          `docs/architecture.md` §5 "Multiple Links" is the design; the user guide has a
+#          "Multiple Links" section.
+#          THE mypy RATCHET went from 169 to 134: false positives of attributes created as
+#          `= None` and inferred as type None, and the errors in the openers Open Capture's
+#          dialog replaced.
+#        • OPEN CAPTURE IS ONE PAGE (ui/open_capture_dialog.py). After the file picker,
+#          `ingest.probe` says what the file is without decoding it (channels with edge counts,
+#          "~" where estimated, the rate the loader will use, the length, whether a window reads
+#          alone, a cost against the memory budget), and the dialog asks for its Links (name,
+#          clock, data; analog thresholds), how much to decode, and replace or add (with an
+#          offset). It replaced the clock and data pickers, the "another Link?" loop, the blind
+#          start/length for a large .sal, Open Capture Time Window and the analog CSV dialog.
+#          The pair offered is the first adjacent pair (0/1, 2/3, …) when the pairs read as
+#          Links, every pair's busier line busier than every pair's quieter one, the busier as
+#          clock; else the busiest is the clock and data the busiest with under half its edges.
+#          Counts alone cannot pair: with two Links whose clocks differ 2×, the slower clock is
+#          "under half" the faster. Every Session.from_* takes a window, in samples or in
+#          seconds (`window_s`), converted at the rate the capture LOADED at: a complementary
+#          CSV pair loads at its DLV rate, 20× the probe's in a test, which put a
+#          probe-converted window 20× short. All but .sal are read whole and cut
+#          (`Session._cut`); the window is recorded for the workspace, and an added window is
+#          placed at its start in the file, in line with the same file opened whole. A newer
+#          Open is not added to by an older file's other Links (`_after_open`). The memory
+#          shown is per Link times the Links on the page (VCD priced every channel; each
+#          format now prices one Link). The probe runs on a worker thread behind a busy
+#          dialog, and a digital CSV's is one batched pass for counts and rate
+#          (`digital_csv.scan`): 1.2 s / 73 MB peak for an 87 MB, 3M-row file, from
+#          2.1 s / 697 MB as two reads holding every row. A pick of more than one capture
+#          (a .bin pair plus a .sal) is refused, not quietly the pair; a capture CSV with a
+#          channel named …_REG is a capture (only a config row's FIRST field ends _REG); and
+#          typing a name another row holds by default moves that row to the next free one.
+#          Its numbers read at a glance: edge counts to two or three figures (~9.8M,
+#          ~163k), the window in s, ms or µs by the capture's length with three
+#          decimals (`_TimeSpin`; nine decimals of seconds made the fields too wide),
+#          the rate with its own figures (500 MHz), the offset to the µs.
+#          The Links menu is gone: Add is the dialog's, Rename / Set Offset / Remove a Link's
+#          timeline-label right-click, Align a Bookmarks item, showing Links View ▸ Links.
+#          Locate Sub-Capture picks its reference in the same dialog's reference form.
+#        • THE MENUS. Mode is first (ModeManager inserts it before File) and every menu holds
+#          only what applies to the mode: the Analyzer's menus (Commands, Decode, Devices,
+#          Audio, Bookmarks), View's pane toggles, View ▸ Links and the timeline legend are
+#          hidden AND disabled elsewhere (Devices and Bookmarks had stayed live in the
+#          Visualizer); File is refilled per mode from three off-bar menus (_fill_file_menu),
+#          and ⌘O / ⌘S move to that mode's open / save. QMenu.clear() deletes what it removes
+#          even when another menu owns it, so File is emptied by removeAction. New Decode menu:
+#          everything that re-decodes (Import Visualizer CSV, Force Column Count, Hub Depths,
+#          Scrambler, Manual SSP, PDM DC bias) out of File, Devices and Audio. Capture-bound
+#          items are disabled until a capture is open (_needs_capture). Renames for what each
+#          item holds; Help gains the User Guide (rendered from the shipped docs/USER_GUIDE.md)
+#          and About (AboutRole). Leaving All Links also gives the signal panes back their
+#          one-Link height: Qt grew the docks for the lanes and never shrinks a dock by itself,
+#          and a resize made at once is clamped to the lanes' minimum, so it is re-applied on
+#          the next event-loop passes (_settle_bottom_height) to the raised tab, the only one
+#          whose height is live.
+#        • PANE CHROME: no "Time" / "Amplitude" axis titles in Capture and Audio; Audio's Y axis
+#          reads -1 / 0 / +1 at full scale (the ±1 had been culled: pyqtgraph keeps an
+#          overflowing end label only on an axis WITHOUT a grid) and the shown extremes and 0
+#          when vertically zoomed, not an SI-scaled auto axis; plot grids stronger
+#          (PLOT_GRID_ALPHA 0.35 dark / 0.65 light); every combo draws one themed chevron
+#          (`combo_qss`; the dock-title Link pickers had none); the timeline's Link-name column
+#          is as narrow as the names allow, and an edge tick label is pinned inside the band;
+#          View ▸ Waveform Colors and Line Weight… opens Preferences under a name that says what
+#          it holds; the old Link's channel checkboxes no longer draw under the new ones. The
+#          PyInstaller spec now lists ui/assets: it named only data/registers.json, so the
+#          stylesheet's SVGs (the checkbox tick, now the chevrons) were not declared for a
+#          bundle.
+#        • QUICK COMMAND FILTERS. Commands ▸ Filter ▸ Commands has All (⌘4), None (⌘5, new), All
+#          excl. Ping (⌘6) and Commit (⌘7, new: SSCR / DSCR, the kinds Next / Previous Commit
+#          step through, and the table's Commit Point rows where each takes effect). None is a
+#          state of its own in CommandFilterProxy (`set_kinds(…, none=True)`), since no kind
+#          ticked has always meant all; ticking a kind leaves it, and a Link's saved filter
+#          keeps it. A capture with no commit shows none for Commit.
+#        • KEYS AND WINDOWS. Off macOS, View's Waveform Colors and Line Weight… IS Preferences
+#          (macOS lifts Preferences into the application menu, so there View keeps a named item
+#          too); Keyboard Shortcuts leaves the Analyzer's groups out elsewhere, where its menus
+#          and so its keys are off. Ctrl+Q quits and Ctrl+, opens Preferences on Windows and
+#          Linux too (the standard Quit key is none there, and the standard Preferences key only
+#          the Settings key); Keyboard Shortcuts spells Ctrl+Alt+Shift+0 there, not "Ctrl⌥⇧0" or
+#          "Ctrl1". The User Guide window closes with the main window (a top-level of its own
+#          kept the app running after Quit), and its relative links resolve. In All Links,
+#          Playback Decimation lists and sets the active Link's streams (it was built for
+#          whichever lane was bound last), Export Audio is enabled by the Link it would export,
+#          a lane is not rebound on a switch (which reset its channel choice and vertical zoom),
+#          an offset change re-aligns the lanes, lanes beyond the Link count are deleted (a
+#          hidden one kept a removed Link's session alive), and a Link name is never read as
+#          markup in a label. Leaving All Links for an open that replaces the Links, or a
+#          removal down to one, binds the panes once (it was twice).
+#        • A STATUS BAR AGAIN. The window's status messages (some 75 call sites: an open, a
+#          Link's offset, "No commit in this capture", a re-decode) went to a hidden QLabel
+#          since the status strip was removed for its height; the label now sits in a slim,
+#          themed QStatusBar (11 px, the dim text colour, a hairline above). THE CODING AGENT'S
+#          INSTRUCTIONS FILE is no longer published: `publish_tree.py` prunes it with the
+#          maintainers' tier (`_INTERNAL_FILES`), refuses a tree that still carries it, and
+#          treats a reference to it from a published file as dangling, as `test_publish_tiers`
+#          does in the source tree.
+#        • THE DIRECTED TESTS SAY WHICH ONES REPORT ISSUES ON PURPOSE:
+#          `visualizer_examples/directed_tests/README.md` lists the 18 configurations that
+#          report a bus clash, a placement-rule error or a warning, by kind, and `test_cli`
+#          rebuilds every directed test through the command line's own path and holds the list
+#          equal to what the engine reports.
+#        • THE ANALYZER OPENS EMPTY. Entering Bus Analyzer with nothing open no longer decodes
+#          the demo (it did once per session, deferred from startup in 3.0.13): a demo is one
+#          menu item away, and decoding one unasked cost seconds and ~2.3 GB for anyone whose
+#          next act was File ▸ Open. The empty panes (Commands, Bus Grid, Capture, CDS, Audio,
+#          Samples, Timing) carry a centred note (`_EmptyHint`) pointing to Open Capture and the
+#          demos, cleared once a capture loads; Timing's axes no longer show an auto SI prefix
+#          ("(x0.001)") with no data.
+#        • A TWO-LINK DEMO: Open Demo Capture ▸ PHY2 (Two Links) (`MainWindow.load_demo_links`),
+#          the PHY2 demo and the flow-control demo delayed by `DEMO_LINK2_DELAY_SAMPLES`, as one
+#          analyzer recording both. The delay is a demo source key (`delay_samples`, written
+#          only when set), so a workspace rebuilds it. `conftest.two_link_captures` is now this
+#          demo rather than a copy of it, and a test pins the two edge for edge.
+#        • A TIMELINE DRAG ENDS WHERE IT WAS RELEASED. The release flushed the last MOVE's
+#          position, so a pointer that moved between that event and the release left the
+#          cursor short.
+#        • TESTING. The timeline's wheel and drag handlers, which no test ran, and four dialogs
+#          at 0-9% coverage are driven by real events and through their own widgets. conftest
+#          guards: every modal answers "cancel" and fails the test that opened it (offscreen it
+#          hung); an exception raised inside a Qt slot fails the test (PySide prints it and goes
+#          on); every QSettings of the run is a temporary ini cleared around each test; a test
+#          that leaves a modifier key held fails (QTest keeps Ctrl down after a key sequence,
+#          and a later test's row click read as a Ctrl-click); and each test's MainWindows,
+#          recorded as they are built, are deleted after it. A closed window stays alive through
+#          its own connections, with its Links, so the pooled run had peaked at 17 GB, enough to
+#          exhaust a 4 GB machine; it stays near 1 GB now. The window's QTimer.singleShots take
+#          it as their context, so none fires on a deleted window, and since PySide keeps a
+#          cancelled singleShot's callable, the leftover Python object is emptied. A
+#          TimingView a test built with no parent is deleted the same way: left to the
+#          collector after a click, it segfaulted Python 3.13.
+#          `conftest.pump_loads` fails a load that never finishes. Our own DeprecationWarnings
+#          and every ResourceWarning are errors (the ~35 unclosed-file sites behind them were
+#          all in tests and tools). A bare `pytest` deselects perf (addopts): pooled behind
+#          ~1,300 tests it flaked (a 496 ms GC stall against a 250 ms ceiling), and the perf
+#          tests pause the cyclic GC. Zoom cost was linear in the command count (76 ms per step
+#          at 100k commands), now held by a zoom/pan ceiling and fixed below. `tests/run_all.sh`
+#          wraps `tools/gate.py --only per-suite`; the gate gains `--only`, `--verbose` and an
+#          opt-in `native-cpp` check. TESTING.md names every suite, and `test_testing_doc` keeps
+#          it so. `invalidateFilter` (deprecated in Qt 6.10) gives way to begin/endFilterChange
+#          where PySide6 has them. The mypy ratchet asks for plain output and drops FORCE_COLOR:
+#          with it set, mypy coloured a pipe, no error line parsed, and the ratchet passed 0
+#          errors against a baseline of 134; a failing mypy with nothing read is now refused.
+#        • A CAPTURE WITHOUT A BRING-UP NO LONGER GROWS ONE. The §5.1.2 detector reads only
+#          the edges, and every FBCSE capture with no bring-up satisfied it: the PHY1, PHY2
+#          and flow-control demos without a cold start (Cold or Warm Start, PHY unknown,
+#          failing its own timing checks) and, the real-world case, a cold-start demo joined
+#          after audio began (a Warm Start). Each claimed the bring-up rode the data line, so
+#          the Capture pane SWAPPED its DP/DN labels, and the Timeline drew invented
+#          bring-up phases; the decode itself was untouched. A real bring-up precedes audio
+#          mode, so no CRC-valid command decodes inside one (0 in every genuine bring-up,
+#          3-36 in every phantom): the Session now drops a detection the decode
+#          contradicts, decoding again if it had steered the decode, and checking once
+#          without it if it steered the decode into no valid command at all.
+#        • THE TIMING CALCULATOR'S THREE HANDOVER LEGS are titled "Handover Contention —
+#          Manager to Peripheral" (and Peripheral to Manager, Peripheral to Peripheral),
+#          where they read "Handover — …". Titles only; the legs are unchanged.
+#        • TIMELINE ZOOM NO LONGER SCALES WITH THE COMMAND COUNT. The one-tick-per-pixel
+#          decimation walked every command in Python on every view change: 9 / 76 / 299 ms
+#          per wheel step at 10k / 100k / 400k commands. A column's winner is the in-view
+#          command latest in the rank-sorted draw order, so it is now a searchsorted slice
+#          of start-ordered arrays (built once in set_events) and a np.maximum.at per
+#          column: ~2.3 ms at 100k, ~3 ms at 400k, ~2 ms zoomed in at any count. The
+#          commit-point decimation takes the same slice. test_timeline_decimation holds
+#          the result equal to the old loop, copied in as the oracle, winner and order.
+#        • LINES ARE READABLE IN LIGHT MODE. Audio waveforms, the Capture pane's per-port
+#          bit overlays, the Samples Port column and bookmark pairs were drawn in the Bus
+#          Grid's pastel cell fills, which fall to 1.03:1 on the light plot (11 of 12 below
+#          3:1). Lines now take `VizTheme.DP_LINE_PALETTE` (`grid_view.dp_line_color`):
+#          dark keeps the pastels, light darkens each hue to clear 3:1, and the paler twin of
+#          the three same-hue pairs goes to 5.5:1 so the pair stays two colours. The grid
+#          keeps its fills. And a light-mode LAUNCH drew Capture's DP/DN traces, cursor and
+#          commit marks in the dark palette until the first switch: raw_view copied them at
+#          import, before app.py applies the saved theme. They are read at use now, and the
+#          Bookmarks table and Capture's bookmark lines recolour on a switch.
+#          test_line_palette pins contrast, hue order, distinctness and the live switch.
+#          The plot GRIDLINES were as faint: pyqtgraph's axis grey at 0.2 opacity blends to
+#          #eaeaea on white, 1.2:1. `VizTheme.PLOT_GRID_ALPHA` is 0.35 dark, 0.65 light,
+#          for Audio, Capture and the Timing histograms
+#          (three quarters of it), re-applied on a switch.
+#        • WAVEFORM COLOURS AND WEIGHTS ARE ADJUSTABLE. Preferences (View ▸ Waveform Colors and
+#          Line Weight…; PreferencesRole, so ⌘, in the macOS app menu) sets, per theme, the data-port line palette, bookmark pairs,
+#          Capture DP/DN and the four Timing flavours, and the Audio and Capture line weights
+#          (1-4 px), in QSettings; a colour under 3:1 is flagged and allowed. Right-click an
+#          Audio stream ▸ Color… sets that (device, dp)'s colour for the shown Link and theme;
+#          it reaches Capture's overlay and the Samples Port column and is saved per Link
+#          (`LinkSpec.stream_colors`, absent = none, so v4 is unchanged). One resolver,
+#          `ui/line_style.py` (override → preference → default), answers every pane. A 4 px pen
+#          paints no slower than 2 px (a step from 1 px, not a slope; Capture has always drawn
+#          at 2), which test_perf now holds. And the conftest modal guard's QMenu.exec stub
+#          never caught `menu.exec(pos)`: PySide resolves the instance call past the class
+#          attribute because of the static overload. The guard now routes it; test_modal_guard
+#          pins that. A bind hands a pane the Link's stream colours with `redraw=False`:
+#          redrawing the OLD Link's Audio, Capture and Samples in the new colours just before
+#          the new Link's own draw took a Link switch from 327 to 477 ms (slower platforms
+#          crossed the 750 ms ceiling); it is 325 ms again.
+#        • THE COMMAND LINE IS BACK, and `-o FILE` with it — the v2 batch entry point, absent
+#          for the whole v3 line. There was no argument parsing at all: `app.py` tested
+#          `"--demo" in argv` by string match, and no option could open a file. Now
+#          `swi3s_studio/cli.py` (argparse) with `-c/--config` and `-o/--output`, `--help`
+#          included.
+#          `-o` IMPLIES HEADLESS LITERALLY, not just "no window": it returns before Qt or the UI
+#          package is imported at all, so a model dump runs where there is no display and cannot
+#          be broken by anything in the window's construction. That cost app.py its module-level
+#          Qt imports (the tab-centering QProxyStyle subclass is now built by a function, since
+#          defining it needs QtWidgets) and `tests/test_cli.py` pins it in a subprocess, because
+#          nothing else in the suite would notice it regressing.
+#          THE JSON IS THE BUS MODEL, which is what v2 WROTE while its help text said "frame
+#          model" (the UI's item is Export Bus Model (JSON)… to match). Behaviour follows v2
+#          (that shape is what consumers read, and `load_bus_model` round-trips it) and the help
+#          text is corrected. It routes through `viz_engine.model_json`, the same path the UI's
+#          Export uses, so the two cannot drift: asserted byte-identical on all 96 corpus
+#          configs, because a divergence that depends on a warning only some configs raise would
+#          survive a one-config test.
+#          EACH EXIT CODE MEANS ONE THING: 0 clean, 1 error, 2 written-but-critical. argparse
+#          exits 2 on a usage error by default, which collided with the bus-clash code and made
+#          a misspelled flag indistinguishable from a physical bus collision — the caller most
+#          likely to branch on it is a script. The parser subclass now exits 1. The RowsToDraw
+#          ceiling the UI applies (1024) applies here too, and says so when it bites rather
+#          than returning a quietly smaller model.
+#          AND BOTH LAUNCHERS WERE SWALLOWING EVERY ARGUMENT. `run.sh` ended in a bare
+#          `exec … -m swi3s_studio.app` with no `"$@"`, and `run.ps1` accepted only `-Rebuild`,
+#          so `./run.sh --demo` had silently opened an empty window for the whole v3 line —
+#          invisible because nothing was worth passing until there was a CLI. Both now forward,
+#          each still consuming its own rebuild flag; `run.ps1` also propagates the exit code, which PowerShell drops without an explicit
+#          `exit` and which would have made 0/1/2 useless on Windows. Four text guards, because
+#          a launcher is a wrapper and executing one here means building a venv.
+#          THE LAUNCHER GUARDS ARE NOW BEHAVIOURAL, not just textual, because a text guard could
+#          not have caught the bug one level down: `run.sh` is EXECUTED against a stubbed venv
+#          (a fake activate putting a fake `python` on PATH, plus stamps newer than their sources
+#          so the dependency install and the native build are skipped), so the real argument loop
+#          runs. Mutation-checked three ways — the bare `exec`, unquoted forwarding, and not
+#          stripping `--rebuild`. The unquoted one splits a config path containing a space and is
+#          caught ONLY here; no reading of the source can see it. `run.ps1` has no PowerShell on
+#          macOS or Linux, so there it keeps the text guards, a NOT-RUN-HERE gap rather than a
+#          pass; it is exercised by running the gate on Windows.
+#        • `publish_tree.py --preview` PUBLISHES AN UNFINISHED CYCLE, saying so. The
+#          release-notes check refuses notes still marked "(in development)", which is right for
+#          a release and wrong for a preview, and a preview branch otherwise looks exactly like
+#          a release branch. `--preview` lifts that one refusal and in exchange marks the
+#          subject line and leads the body with what it is: not a release, not tagged, not
+#          through the multi-platform gate. The refusal names `--preview`, since a check that
+#          only says no invites deleting the marker instead. `tools/leak_scan.py` names the tier
+#          boundary as a string, so it is exempt from the dangling-reference check the same way
+#          the scanner's other self-references are, and a test pins that the scanner and the
+#          pruner agree about where the boundary is.
+#        • THE USAGE LINE NAMES THE COMMAND YOU TYPED. `./run.sh -h` printed
+#          `usage: swi3s-studio …` — a command that does not exist on a fresh checkout, while
+#          the launcher is how the README says to run this, so the one line whose job is to be
+#          retypable named something the reader would have to install first. Both launchers now
+#          announce themselves ($SWI3S_LAUNCHER) and the fallbacks cover the rest: an installed
+#          console script keeps its own name, and `python -m swi3s_studio.app` says exactly that
+#          rather than `app.py`, which argparse's own default would have printed and which is
+#          equally unrunnable. `run.ps1` had the same defect and is fixed the same way.
+#        • THE DEMOS CARRY A 44.1 kHz PORT NOW, by PAYLOAD INTERVAL SKIPPING (§14.1.10). DP0 of
+#          the PHY1/PHY2/PHY3 demos skips 13 of every 160 intervals on its 48 kHz transport
+#          opportunities. 44100/48000 IS EXACTLY 147/160, so the rate is exact and 160 is the
+#          smallest denominator that can express it. DP1 stays at 48 kHz, so each demo is now a
+#          mixed-rate bus. The flow-control demo is deliberately untouched: its ports already
+#          gate on DRQ/SourceReady, and skipping would confound two reasons for an interval to
+#          carry nothing.
+#          IT IS TWO REGISTER WRITES, because the generator already drives real `CDataPort`
+#          instances — `startInterval` runs the accumulator, so a skipped interval emits nothing
+#          without the generator knowing anything about skipping — and `sineSample` is indexed in
+#          SAMPLES, so a skipped interval advances nothing and the stream continues at a
+#          correspondingly lower pitch. That is what payload skipping IS, so no audio change was
+#          needed. The SSPA scheduler was already skipping-aware (`intervalAlignment` multiplies
+#          by the denominator).
+#          DP0 IS THE UNSCRAMBLED PORT, on purpose: a mis-phased skip then surfaces as a wrong
+#          sample VALUE against the generator's own sine rather than as descrambler noise. That
+#          is the load-bearing assertion — every transported value must equal the generated
+#          sequence element for element, across every SSP and geometry change, and it holds on
+#          all three demos. A COUNT CANNOT REPLACE IT: skipping interval k instead of k+1 still
+#          transports 147 of 160, and mutation-testing confirms the count and rate checks both
+#          pass while the value check reddens.
+#          THE COUNT IS A BOUND, NOT A CONSTANT. The accumulator restarts at every SSP
+#          (§9.1.6.2.1), so how many samples arrive depends on how many SSPAs the region held:
+#          at 1500 opportunities PHY1 transports 1380 and PHY2/PHY3 1379.
+#          AND SHORT DEMOS LOSE THEIR PERIODIC SSPA: a skipping port's legal SSP rows are
+#          Interval x Denominator apart, so alignment rises from 64 rows to 10240 and a region
+#          under ~160 samples/channel cannot hold an aligned one. Nothing asserts on it at those
+#          sizes, and `test_sspa_demo.py` uses 1500 for exactly this reason.
+#        • THE MEMORY GUARD HAD NO STDLIB ROUTE ON THE TWO PLATFORMS USERS RUN. psutil is a
+#          declared dependency and the accurate path, but it was also the ONLY working path:
+#          Windows has no `sysconf` at all and macOS does not publish `SC_AVPHYS_PAGES`, so the
+#          POSIX branch only ever fired on Linux. An install without psutil fell through to
+#          "unknown" — silently, since the import is swallowed — and took the fallback budget.
+#          Above ~14 GB free that was indistinguishable from the correct answer; below it, far
+#          too permissive (8.59 GB allowed where a real reading gives 2.40 GB on a 4 GB
+#          machine), so it failed OPEN on the machines least able to absorb it, in the branch
+#          whose own comment promised to fail closed. Now `GlobalMemoryStatusEx` via ctypes,
+#          `/proc/meminfo` `MemAvailable`, and `vm_stat` — the macOS probe agrees with psutil to
+#          0.04%.
+#        • AND THE FALLBACK NOW DEGRADES IN STEPS THAT SAY SO. Free RAM, then a quarter of TOTAL
+#          RAM, then the same rule applied to a pessimistically small assumed total. Deriving
+#          the last one instead of writing a constant is what keeps the tiers consistent: the
+#          flat 8 GiB it replaced was both equal to `_MAX_AUTO_BUDGET` (hence invisible on a
+#          large machine) and larger than the total-derived budget on any machine under 32 GB,
+#          so the less the guard knew the more it allowed. `budget_source()` reports which tier
+#          was used and a degraded one warns once in the log. Asserted: the same figure through
+#          a weaker rule yields a smaller budget (total RAM cannot see occupancy, so across
+#          DIFFERENT figures the total-derived budget can legitimately exceed the free-derived).
+#        • PUBLISHED PROSE IS GOVERNED, AND PARTLY CHECKED. A leak scan reads FILES and carries
+#          STRUCTURAL patterns, so prose outside the tree (a branch description, a tag
+#          annotation) and a name in a sentence both pass it. `docs/DEVELOPMENT.md` gains "Write
+#          the RULE, not the story": no discovery narrative, generalise the artifact, generalise
+#          the finding, keep the measurement. `tools/leak_scan.py --text=` scans text that ships
+#          but is not a file. Site patterns can be marked `published-only:`, applying to the
+#          published tree but not to the maintainers' tier. Mechanical sweeps over prose get a
+#          rule of their own under "Mechanical sweeps": read every changed line and its
+#          neighbours, since a replacement's fallout lands beside it and no gate can see whether
+#          a sentence still parses.
+#        • THE SCANNER REFUSES INPUT IT HAS NOT READ. An unrecognised option (`--tex=` for
+#          `--text=`) used to be ignored, so the scan fell through to the working tree and
+#          printed "no leaks found" about a file it never opened; it now exits 2, as does a
+#          named file that does not exist. Its self-exemption is per pattern KIND, not per file:
+#          the scanner and its test hold the structural patterns as literal source and skip only
+#          those, so site-specific patterns (kept outside the repository, which cannot
+#          self-match) now reach them too. Both are mutation-tested.
+#        • A RELEASE IS DESCRIBED ONCE, in `docs/releases/vX.Y.Z.md`. Every description reads
+#          the one file (the release body, the publish branch's message and the pull request),
+#          so they cannot disagree, and because it is in the tree it is in the tag, in the
+#          release diff, and in the leak scan as an ordinary tracked file. `publish_tree.py`
+#          refuses a tree whose version has no notes or whose notes are still "(in
+#          development)", and `--message-out=` writes the branch message as a derived preamble
+#          (the prune and graft counts) plus the file verbatim. Tests pin that the notes exist
+#          and name this version, that they reference no later version except under an explicit
+#          "Not in this release" heading, and the tool's refusal and message derivation,
+#          behaviourally. v3.0.17 gets its notes retroactively. The tag annotation cannot be
+#          generated, so it is a pointer: one paragraph and a reference to the notes. Rewriting
+#          an annotation at a fixed commit is not moving a tag; its cost is that `git fetch`
+#          does not update a tag already held locally (`git fetch --tags --force`).
 # 3.0.17: Saleae .sal version 4 opens, and four separate performance defects are fixed. Logic 2
 #        bumped its internal blob version with no format change; the fix is small, but it was
 #        VERIFIED against a v0 export of the same capture rather than accepted because the parse
@@ -895,7 +1276,7 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 #          writes, false of a hand-edited or third-party one, where the later DeviceNumber row
 #          silently turned a Manager port into a peripheral. swviz's loader was always
 #          order-independent, so THE SAME FILE decoded two ways depending on the engine — the
-#          divergence CLAUDE.md warns about. The flag is now resolved after the loop, and a
+#          two-engine divergence a CSV must never cause. The flag is now resolved after the loop, and a
 #          test pins both orders in both engines plus the flag-false case.
 #        • REGISTER MAP RE-EXTRACTED TO r08 (was r06). The field data moved in six places and
 #          the chapter moved wholesale. Data: `DPn_CommitPointDelay[3:0]` added at DP 0x0F
@@ -2268,7 +2649,7 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 #        ping-period stats, v0 .sal load memory fix; MIPI OSS release scaffolding.
 # 3.0.2: mode-grouped menus; per-mode File submenus; link-control timeline + timing.
 # 3.0.1: workspaces persist the TX-map + Hide-Clock view state.
-__version__ = "3.0.17"
+__version__ = "3.0.19"
 
 from .api import DecodeResult, decode, decode_capture
 from .ingest import saleae_binary

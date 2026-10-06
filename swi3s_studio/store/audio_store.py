@@ -61,7 +61,7 @@ def decode_pdm(bits: np.ndarray, native_rate: float,
     (a density well off 50%) doesn't swamp a quiet tone — what a hardware PDM decoder
     does for listening. It is OFF by default so the analyzer shows the TRUE density
     on the wire: an all-ones stream reads full-scale +1 (DC), all-zeros −1, 50% ~0.
-    Turn it on (Audio ▸ Block PDM DC Bias) to centre a real mic capture. Note a
+    Turn it on (Decode ▸ Block PDM DC Bias) to centre a real mic capture. Note a
     constant/DC pattern decodes to ~0 when blocked (its mean is the whole signal).
 
     Returns (pcm: int64 in int16 range, out_rate_hz, M) where M is the integer
@@ -154,6 +154,8 @@ def _build_pyramid(raw: np.ndarray) -> List[Tuple[int, np.ndarray, np.ndarray]]:
 
 
 
+_SPLIT_CACHE_MAX = 256   # memoised envelope windows per store (see envelope())
+
 @dataclass
 class AudioStore:
     # Keyed by (device, dp, channel). Two devices may each expose a DP0, so the
@@ -173,6 +175,8 @@ class AudioStore:
     _sample_at: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
     # Memoised transport_gaps() per channel — see _gaps_cached().
     _gap_cache: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
+    # Memoised gap-split envelope windows — see envelope(). Bounded, oldest out first.
+    _split_cache: Dict[tuple, tuple] = field(default_factory=dict)
     # TRUE per-index transport positions for flow-controlled channels, captured before
     # the de-jitter ramp overwrites _sample_at. Only populated for flow_mode != 0;
     # transport_gaps() falls back to _sample_at for everything else. See from_audio_columns.
@@ -475,7 +479,21 @@ class AudioStore:
         hi = np.asarray(hi_arr[i0:i1], dtype=np.int64)
         x = (np.arange(len(lo)) + i0) * factor + factor // 2
         if factor > 1:
-            x, lo, hi = self._split_gap_bins(key, x, lo, hi, i0, factor, n)
+            # Splitting walks every bin in Python, which on a gappy flow-controlled stream is
+            # the costliest part of showing a store again (a Link switch rebuilds the plots
+            # over the same windows). A decoded store never changes, so the answer for a
+            # window is fixed: memoise it, returned read-only so no caller can edit the
+            # memo through its result.
+            ck = (key, i0, i1, factor, n)
+            hit = self._split_cache.get(ck)
+            if hit is None:
+                hit = self._split_gap_bins(key, x, lo, hi, i0, factor, n)
+                for arr in hit:
+                    arr.flags.writeable = False
+                if len(self._split_cache) >= _SPLIT_CACHE_MAX:
+                    self._split_cache.pop(next(iter(self._split_cache)))
+                self._split_cache[ck] = hit
+            x, lo, hi = hit
         return x, lo, hi
 
     def _split_gap_bins(self, key, x, lo, hi, i0: int, factor: int, n: int):

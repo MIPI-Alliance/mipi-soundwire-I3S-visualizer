@@ -4,6 +4,7 @@ subset export, and the CaptureExportDialog wiring.
 Run: python3 -m pytest tests/test_capture_export.py -q
 """
 import os
+import pathlib
 import tempfile
 
 import numpy as np
@@ -51,7 +52,8 @@ def test_export_csv_with_time_range():
         part = os.path.join(d, "part.csv")
         s.export_csv(full)
         s.export_csv(part, sample_range=(last // 4, last // 2))     # middle quarter
-        nf = sum(1 for _ in open(full)); npart = sum(1 for _ in open(part))
+        nf = len(pathlib.Path(full).read_text().splitlines())
+        npart = len(pathlib.Path(part).read_text().splitlines())
     assert 1 < npart < nf                                           # a real, smaller slice
 
 
@@ -61,7 +63,7 @@ def test_export_bin_and_csv_signal_subset():
         # CSV, clock only -> header is Time + one column
         p = os.path.join(d, "clk.csv")
         raw_export.export_csv(cap, p, clock_name="CLK", include_data=False)
-        assert open(p).readline().strip() == "Time [s],CLK"
+        assert pathlib.Path(p).read_text().splitlines(True)[0].strip() == "Time [s],CLK"
         # .bin, data only -> exactly one file written
         written = raw_export.export_bin(cap, os.path.join(d, "x.bin"), include_clock=False)
         assert len(written) == 1 and written[0].endswith("-digital-1.bin")

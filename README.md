@@ -1,7 +1,7 @@
 # SWI3S Studio
 
-A **MIPI SoundWire I3S (SWI3S)** suite with three modes, selected from a switcher at
-the top of the window:
+A **MIPI SoundWire I3S (SWI3S)** suite with three modes, selected from the **Mode** menu,
+first in the menu bar:
 
 - **Visualization** — plan a bus: author an Interface + up to 12 data ports, see the
   placed Rows×Columns grid, and catch clashes / spec violations before you build.
@@ -15,8 +15,8 @@ the top of the window:
 
 The three modes share one window, one bus-grid renderer, and one workspace file
 (capture source + authored config + timing inputs + view state). A Visualizer config
-can be pushed into Analysis as the *expected* config (**Compare ▸ Compare with
-Visualizer**).
+can be pushed into Analysis as the *expected* config (**Decode ▸ Import Visualizer
+CSV…**, choosing the current authoring).
 
 See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for a pane-by-pane walkthrough (including
 partial captures and finding the SSP), [`docs/architecture.md`](docs/architecture.md) for
@@ -174,6 +174,29 @@ After pulling changes that touch `native/`, rebuild the core
 (`python3 -m pip install ./native`). The compiled module isn't tracked in git; the app
 reports an "out of date — rebuild" message if it detects a stale build.
 
+### Command line
+
+`--help` lists everything. The options worth knowing:
+
+```bash
+swi3s-studio                                  # empty window
+swi3s-studio --demo                           # synthetic demo capture
+swi3s-studio -c config.csv                    # open a config CSV in Bus-Visualizer mode
+swi3s-studio -c config.csv -o model.json      # headless: write the bus model, no window
+```
+
+**`-o` implies headless.** No window is opened and Qt is never even imported, so it runs on a
+machine with no display. It writes the same bus-model JSON as **File ▸ Export Bus Model (JSON)…** in
+the Bus Visualizer — byte for byte — and prints the same issue list the notifications panel shows.
+
+Exit codes, for scripting:
+
+| code | meaning |
+|---|---|
+| 0 | model written, nothing critical found |
+| 1 | error — bad usage, missing config, unwritable output. No model written. |
+| 2 | model written, **but** it contains a bus clash or a truncated DRQ |
+
 ### Windows
 
 - **Run the launcher.** `.\run.ps1` from a PowerShell prompt in the repo root does the
@@ -201,10 +224,10 @@ reports an "out of date — rebuild" message if it detects a stale build.
   or `winget install --id Python.Python.3.12 --architecture x64`.
 - **Long paths / OneDrive.** Cloning under a deeply nested or cloud-synced folder can
   trip the build or file locks; a short local path like `C:\src\swi3s-studio` is safest.
-- **Running the tests on Windows.** Install `pytest` (one suite uses it) and set
-  `PYTHONUTF8=1` so the suites' Unicode console output (e.g. `▸`, `→`) doesn't trip the
-  legacy cp1252 code page when stdout is redirected:
-  `$env:PYTHONUTF8=1; .venv\Scripts\python -m pytest` (or run individual `tests\test_*.py`).
+- **Running the tests on Windows.** Install `pytest` and set `PYTHONUTF8=1` so the suites'
+  Unicode console output (e.g. `▸`, `→`) doesn't trip the legacy cp1252 code page when
+  stdout is redirected: `$env:PYTHONUTF8=1; .venv\Scripts\python -m pytest` (or name one
+  file, `... -m pytest tests\test_<name>.py`).
 
 ## Tech
 
@@ -228,48 +251,56 @@ tests/          Python suites + run_all.sh
 
 ## Opening captures
 
-**File ▸ Analyzer ▸ Open Capture** reads a Logic 2 `.sal` project (internal blob versions
-3 and 4, plus the documented v0 Binary export), a digital CSV
+**File ▸ Open Capture…** (⌘O, in the Bus Analyzer) reads a Logic 2 `.sal` project
+(internal blob versions 3 and 4, plus the documented v0 Binary export), a digital CSV
 (`Time, Ch…` columns), a simulation `.vcd`, a per-channel `<SALEAE>` binary pair, or a
-Tektronix analog scope export — a `.wfm` channel pair or an analog `.csv` (volts). Analog
-sources are thresholded to logic automatically (mid-rail + 10% hysteresis); digital-vs-
-analog CSV is decided by the data values (strictly 0/1 = digital). Clock vs data is
-auto-assigned by transition count (the forwarded clock toggles every UI, so it has the
-most edges), so file order doesn't matter; select both files of a `.bin`/`.wfm` pair
-together to skip the second-file prompt (an analog CSV with more than two channels prompts
-for which is clock vs data). Sample rate is auto-detected from timestamps. Large captures
-decode on a worker thread behind an n/N progress dialog. A `.sal` too big to hold in
-memory is not attempted: the peak is predicted from the ZIP directory before anything is
-inflated, and past an absolute budget you are offered a **time window** instead — so a
-machine with more RAM does not silently load more. **Open Capture Time Window…** asks for
-one on purpose at any size; see `docs/USER_GUIDE.md` ▸ *Large captures*. **File ▸ Load Demo Capture ▸
-PHY1/PHY2/PHY3** runs a synthetic capture for the chosen PHY, each with a §5.1.2 Cold Start
-spliced in front and the same audio content (so they decode identically): PHY1 a slow
-4-column FBCSE bus whose ports are repositioned mid-capture, PHY2 an FBCSE bus stepping
-2→8→16 columns, PHY3 the differential DLV variant with a recovered bit clock. All sample at
-500 MHz (a real analyzer's fixed rate — a non-integer number of samples per UI).
+Tektronix analog scope export — a `.wfm` channel pair or an analog `.csv` (volts). Select
+both files of a `.bin` / `.wfm` pair together. Before anything is decoded, one page says
+what the file is (format, channels with their edge counts, sample rate, length, and the
+memory a full load needs) and asks for its Links (a name, a clock and a data channel each;
+the busiest channel is offered as the clock), how much to decode (all of it, or a window,
+in s, ms or µs by the capture's length), and whether it replaces the open Links or adds to them. Analog sources are
+thresholded to logic automatically (mid-rail + 10% hysteresis) unless thresholds are
+given; digital-vs-analog CSV is decided by the data values (strictly 0/1 = digital).
+Sample rate is detected from timestamps. Large captures decode on a worker thread behind
+an n/N progress dialog. A `.sal` too big to hold in memory is not attempted: the peak is
+predicted from the ZIP directory before anything is inflated, and past an absolute budget
+the page opens on a **time window** that fits, so a machine with more RAM does not
+silently load more. See `docs/USER_GUIDE.md` ▸ *Opening a capture* and *Large captures*.
 
-**File ▸ Analyzer ▸ Open Visualizer Config…** applies a Visualizer config CSV (or the
-authored config) to the open capture — decoding with that data-port config from row 0
-(for a capture that begins *after* the setup commit, where the port geometry isn't on the
-wire to snoop) and/or comparing it against the decode. See the User Guide's *Partial
-captures & finding the SSP* for the full workflow.
+Several SWI3S Links (one Manager and its Peripherals each) can be open at once, from one
+file or several, on one shared time base; see the User Guide's *Multiple Links*.
 
-**File ▸ Analyzer ▸ Locate Sub-Capture…** finds every recurrence of a smaller reference
-capture and bookmarks each; **Export .sal…** writes the open capture out as a portable
-Logic 2 project.
+**File ▸ Open Demo Capture ▸ PHY1 / PHY2 / PHY3** runs a synthetic capture for the chosen
+PHY, each with a §5.1.2 Cold Start spliced in front and the same audio content (DP0 at
+44.1 kHz by payload interval skipping, DP1 at 48 kHz): PHY1 a slow 4-column FBCSE bus whose ports are repositioned
+mid-capture, PHY2 an FBCSE bus stepping 2→8→16 columns, PHY3 the differential DLV variant
+with a recovered bit clock. All sample at 500 MHz (a real analyzer's fixed rate — a
+non-integer number of samples per UI). *PHY2 (Flow Control)* and *PHY2 (Two Links)* are
+there too.
+
+**Decode ▸ Import Visualizer CSV…** applies a Visualizer config CSV to the open capture —
+decoding with that data-port config from row 0 (for a capture that begins *after* the setup
+commit, where the port geometry isn't on the wire to snoop) — or compares it, or the
+authored config, against the decode. See the User Guide's *Partial captures &
+finding the SSP* for the full workflow.
+
+**File ▸ Locate Sub-Capture…** finds every recurrence of a smaller reference capture and
+bookmarks each; **File ▸ Export Capture…** writes the open capture out as a `.sal`, `.bin`
+or CSV, whole or a window.
 
 ## Workspaces, compare, export
 
-- **Save / Open Workspace** — a JSON sidecar (capture source, config CSV, SSP row,
-  what-if overlay, bookmarks, cursor, authored config, timing inputs, view state);
-  results re-decode on open, so it stays portable.
-- **Compare** — **File ▸ Analyzer ▸ Open Visualizer Config…** can diff an expected config
-  (CSV or the authored config) against the decode: differing grid cells outlined, a
-  per-cell report, expected register values overlaid (*Clear Comparison* removes it).
-- **Audio ▸ Per-Dataport Scrambler** — override the descrambler per (device, data port):
-  Auto / On / Off, then re-decode (fixes a mis-snooped `ScramblerEn`, which otherwise
-  turns the stream into noise).
+- **Save / Open Workspace** — a JSON sidecar (every Link's capture source, name and
+  offset, config CSV, SSP row, what-if overlay, bookmarks, cursor, authored config, timing
+  inputs, view state); results re-decode on open, so it stays portable.
+- **Compare** — **Decode ▸ Import Visualizer CSV…** can diff an expected config (CSV or
+  the authored config) against the decode: differing grid cells outlined, a per-cell
+  report, expected register values overlaid (the Registers pane's *Clear Compare* removes
+  it).
+- **Decode ▸ Per-Dataport Scrambler…** — override the descrambler per (device, data
+  port): Auto / On / Off, then re-decode (fixes a mis-snooped `ScramblerEn`, which
+  otherwise turns the stream into noise).
 - **Export** — Audio as WAV (choose streams + range, optional band-limited resample),
   Commands as CSV, Bus Grid as SVG/PNG. See [`docs/PACKAGING.md`](docs/PACKAGING.md) for a
   standalone bundle.
@@ -279,7 +310,8 @@ Logic 2 project.
 ```bash
 bash tests/gate.sh                    # THE release gate: suite + perf + ruff + mypy + ABI
 bash tests/gate.sh --quick            # dev loop (skips perf + the process-isolated pass)
-bash tests/run_all.sh                 # all Python suites (per-suite summary + counts)
+python3 -m pytest                     # the functional suite (perf is deselected by default)
+bash tests/run_all.sh                 # every suite in its own process (gate.py --only per-suite)
 bash tests/run_all.sh --build         # rebuild the core first
 bash tests/run_all.sh --perf          # the perf benchmarks instead
 bash tests/run_all.sh --native        # also run the native C++ suite
@@ -292,9 +324,9 @@ rather than stopping at the first. It needs `ruff` and `mypy` on `PATH`
 (`brew install ruff mypy`), and treats a missing tool as a failure rather than a silent skip.
 
 The runner is a pytest wrapper, so it covers exactly what `ci.yml` declares. CI runs on this
-repository, and its lint/type job became blocking in 3.0.12 — but it covers neither the perf
-gate nor Windows, so the enforced gate remains `tools/gate.py`, run by hand on macOS and
-Windows at the release commit. See docs/DEVELOPMENT.md.
+repository, and its lint/type job became blocking in 3.0.12 — but it has no process-isolated
+per-suite pass and no stale-core ABI assertion, so the enforced gate remains `tools/gate.py`,
+run by hand on macOS and Windows at the release commit. See docs/DEVELOPMENT.md.
 
 A single suite runs directly (GUI suites need the Qt offscreen platform):
 

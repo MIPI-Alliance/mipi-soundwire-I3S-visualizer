@@ -26,7 +26,7 @@ expected number of UIs late.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -35,20 +35,21 @@ from PySide6.QtGui import QColor, QCursor, QFont
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QToolTip, QVBoxLayout, QWidget
 
 from ..nputil import searchsorted as _ss
+from . import line_style
 from .grid_view import bookmark_pair_color as _bookmark_pair_color
-from .grid_view import dp_stream_color  # shared stable per-(device,dp) colour (grid/audio/capture)
+from .grid_view import dp_line_color  # shared stable per-(device,dp) hue (grid/audio/capture)
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
 from .theme import VizTheme, analyzer_stylesheet
 
-_DP_COLOR = VizTheme.RAW_DP
-_DN_COLOR = VizTheme.RAW_DN
-_CURSOR_COLOR = VizTheme.CURSOR
-_CDS_COLOR = VizTheme.TEXT           # Column-0 (CDS) markers: neutral high-contrast (the repeating grid)
-# A confirmed commit's marker is drawn where the commit TAKES EFFECT (its Commit
-# Synchronization Point). Uses the dedicated sync colour so it matches the timeline's
-# "Commit Sync Point" marker and stands out from the neutral CDS row-syncs it sits among.
-_COMMIT_COLOR = VizTheme.SEM_SYNC
+# Trace and marker colours are read from VizTheme at use, not copied at import: this
+# module is imported before app.py applies the saved theme, so a copy held the default
+# (dark) palette until the first theme switch rebound it. The Column-0 (CDS) markers are
+# TEXT: neutral high-contrast (the repeating grid). A confirmed commit's marker is drawn
+# where the commit TAKES EFFECT (its Commit Synchronization Point), in SEM_SYNC so it
+# matches the timeline's "Commit Sync Point" marker and stands out from the neutral CDS
+# row-syncs it sits among.
+
 # A recovered Row Sync Point with no 0→1 edge on the wire (a PLL lock gap) is flagged
 # in a hard error red so it reads as a fault among the neutral RSP marks.
 _PLL_ERR_COLOR = QColor(0xD3, 0x2F, 0x2F)
@@ -97,8 +98,18 @@ class _RawTimeAxis(pg.AxisItem):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.enableAutoSIPrefix(False)        # we format the time ourselves
+        self._offset = 0.0                    # added to every label (see set_time_offset)
+
+    def tickValues(self, minVal, maxVal, size):
+        """Ticks at round values of the LABELLED time: in All Links each lane is offset,
+        and ticks chosen in its own time fell at 2 / 7 / 12 ms under another lane's
+        5 / 10 / 15."""
+        off = self._offset
+        return [(sp, [v - off for v in vals])
+                for sp, vals in super().tickValues(minVal + off, maxVal + off, size)]
 
     def tickStrings(self, values, scale, spacing):
+        values = [v + self._offset for v in values]
         step_s = float(spacing) if spacing else 0.0     # x is seconds; spacing is too
         if step_s == 0 or step_s >= 1.0:
             unit, mul = "s", 1.0
@@ -128,6 +139,8 @@ class RawCaptureView(QWidget):
     sampleSelected = Signal('qlonglong')             # x clicked → shared cursor
     #: a bookmark line was dragged: (label, new_sample, final)
     bookmarkMoved = Signal(str, 'qlonglong', bool)
+    #: the visible X range changed: (start, end) in seconds of this capture (LinkLanes)
+    viewRangeChanged = Signal(float, float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -138,6 +151,7 @@ class RawCaptureView(QWidget):
         self._dn_init = False
         self._rate = 1
         self._total = 1                              # last sample (full extent)
+        self._x_bounds: Optional[Tuple[float, float]] = None   # All Links' shared span (s)
         self._rendering = False                      # guard re-entrant range updates
         self._cds_provider = None                    # fn(lo, hi) -> sample array (Column-0 edges)
         self._commit_provider = None                 # fn(lo, hi) -> sample array (commit RSP edges)
@@ -160,15 +174,15 @@ class RawCaptureView(QWidget):
         self._lane_lines: dict[tuple, Any] = {}  # lane -> PlotDataItem (word MSB→LSB join line)
         self._lane_labels: dict[tuple, list] = {}  # lane -> [TextItem] pool of "CHn" MSB labels
         self._port_colors: dict[tuple, Any] = {}   # lane -> QColor (stable across windows)
+        self._stream_overrides: line_style.Overrides = {}   # the shown Link's stream colours
 
         self._plot = pg.PlotWidget(background=VizTheme.PLOT_BG, viewBox=XWheelViewBox(),
                                    axisItems={"bottom": _RawTimeAxis(orientation="bottom")})
         self._plot.getPlotItem().hideButtons()   # drop the corner auto-range "A" button
-        self._plot.showGrid(x=True, y=False, alpha=0.2)
+        self._plot.showGrid(x=True, y=False, alpha=VizTheme.PLOT_GRID_ALPHA)
         self._plot.setMouseEnabled(x=True, y=False)
         self._plot.setMenuEnabled(False)
         self._plot.getAxis("left").setTicks([[(2.0, "DP"), (0.5, "DN")]])
-        self._plot.setLabel("bottom", "Time")    # unit (s/ms/µs) shown per tick, comma-separated
         self._plot.setYRange(-0.3, 2.8)
         # Keep the plot area tall enough that the 'CHn' labels (drawn just above the top
         # lane) aren't clipped at a small default dock height — the band top (2.4) leaves
@@ -178,14 +192,15 @@ class RawCaptureView(QWidget):
         # Y range when the clock is hidden so the markers stay visible over the rescaled
         # data instead of being clipped off the top.
         self._cds_y_bot, self._cds_y_top, self._cds_y_arrow = _CDS_Y_BOT, _CDS_Y_TOP, _CDS_Y_ARROW
-        self._dp_curve = self._plot.plot(pen=pg.mkPen(_DP_COLOR, width=2))
-        self._dn_curve = self._plot.plot(pen=pg.mkPen(_DN_COLOR, width=2))
+        self._dp_curve = self._plot.plot()
+        self._dn_curve = self._plot.plot()
+        self._apply_trace_pens()
         # PHY3 (DLV): the recovered bit clock (virtual-PLL output) drawn in the bottom band
         # under the differential signal, over the audio region only. A SOLID trace (a dashed
         # pen on the long per-UI polyline is pathologically slow for Qt to stroke — it was a
         # major cause of the zoom stall — and reads faintly when zoomed out).
         self._rec_clk_curve = self._plot.plot(
-            pen=pg.mkPen(_CDS_COLOR, width=1))
+            pen=pg.mkPen(VizTheme.TEXT, width=1))
         self._dlv = False
         self._audio_start = 0            # sample where DLV audio begins (recovered-clock start)
         self._rec_ui = 0.0               # recovered UI period (samples); 0 = no recovered clock
@@ -198,7 +213,7 @@ class RawCaptureView(QWidget):
         self._cds_lines = pg.PlotDataItem(connect="pairs",
                                           pen=pg.mkPen(self._cds_pen_color(), width=1))
         self._cds_arrows = pg.ScatterPlotItem(symbol="t", size=9, pxMode=True,
-                                              brush=pg.mkBrush(_CDS_COLOR), pen=None)
+                                              brush=pg.mkBrush(VizTheme.TEXT), pen=None)
         self._plot.addItem(self._cds_lines)
         self._plot.addItem(self._cds_arrows)
         # Commit Row-Sync-Point markers: a bolder SOLID full-height gold vertical + a
@@ -206,9 +221,9 @@ class RawCaptureView(QWidget):
         # Point is coincident with a Row Sync Point per spec), so it reads as "this RSP
         # is also where a confirmed commit takes effect".
         self._commit_lines = pg.PlotDataItem(connect="pairs",
-                                             pen=pg.mkPen(_COMMIT_COLOR, width=2))
+                                             pen=pg.mkPen(VizTheme.SEM_SYNC, width=2))
         self._commit_arrows = pg.ScatterPlotItem(symbol="o", size=_COMMIT_RING_MAX, pxMode=True,
-                                                 brush=None, pen=pg.mkPen(_COMMIT_COLOR, width=2))
+                                                 brush=None, pen=pg.mkPen(VizTheme.SEM_SYNC, width=2))
         self._plot.addItem(self._commit_lines)
         self._plot.addItem(self._commit_arrows)
         # Missing-RSP flags (DLV): a recovered Row Sync Point with NO actual 0→1 (S0→S1)
@@ -237,7 +252,7 @@ class RawCaptureView(QWidget):
         # the legend marker small, matching the CDS triangle's scale.
         self._commit_legend_marker = pg.ScatterPlotItem(
             symbol="o", size=9.9, pxMode=True, brush=None,      # 10% smaller (was 11)
-            pen=pg.mkPen(_COMMIT_COLOR, width=2))
+            pen=pg.mkPen(VizTheme.SEM_SYNC, width=2))
         # Per-port sample markers are ScatterPlotItems created on demand in
         # set_port_marks (one per active device/dp/channel, so the legend + colours
         # are stable); a legend maps colour -> port and also keys the CDS marker.
@@ -263,7 +278,7 @@ class RawCaptureView(QWidget):
             pg.LegendItem.mouseClickEvent(self._port_legend, ev)
         self._port_legend.mouseClickEvent = _legend_click
         self._cursor = pg.InfiniteLine(angle=90, movable=False,
-                                       pen=pg.mkPen(_CURSOR_COLOR, width=1))
+                                       pen=pg.mkPen(VizTheme.CURSOR, width=1))
         self._plot.addItem(self._cursor)
         self._plot.scene().sigMouseClicked.connect(self._on_click)
         self._plot.scene().sigMouseMoved.connect(self._on_hover)
@@ -343,14 +358,13 @@ class RawCaptureView(QWidget):
     def _cds_pen_color(self) -> QColor:
         """A translucent CDS colour for the marker verticals so they locate each CDS
         column without masking the underlying DP/DN waveform."""
-        c = QColor(_CDS_COLOR)
+        c = QColor(VizTheme.TEXT)
         c.setAlpha(110)
         return c
     def reset_zoom(self) -> None:
         """Re-fit the X axis to the whole capture (the initial view), leaving blank
         space on the right so the (top-right) legend clears the waveform."""
-        x1 = self._total / self._rate
-        self._plot.setXRange(0, x1 * (1.0 + _RIGHT_PAD), padding=0.0)
+        self._plot.setXRange(*self._x_extent(), padding=0.0)
 
     def jog(self, direction: int) -> None:
         """Page the view one whole visible width left (direction < 0) or right
@@ -359,8 +373,8 @@ class RawCaptureView(QWidget):
         if self._total <= 1:
             return
         x0, x1 = self._plot.getViewBox().viewRange()[0]
-        total_s = (self._total / self._rate) * (1.0 + _RIGHT_PAD) if self._rate else x1
-        rng = paged_range(x0, x1, 0.0, total_s, direction)
+        lo, hi = self._x_extent()
+        rng = paged_range(x0, x1, lo, hi, direction)
         if rng is not None:
             self._plot.setXRange(rng[0], rng[1], padding=0.0)
 
@@ -436,11 +450,26 @@ class RawCaptureView(QWidget):
         right pad that clears the legend) and don't pan off either end; floor the
         max zoom-IN at ~1 UI."""
         vb = self._plot.getViewBox()
-        total_s = (self._total / self._rate) if self._rate else 0.0
-        max_s = total_s * (1.0 + _RIGHT_PAD) if total_s > 0 else None
+        lo, hi = self._x_extent()
         min_x = (self._ui_samples / self._rate) if (self._ui_samples > 0 and self._rate) else None
-        vb.setLimits(xMin=(0.0 if total_s > 0 else None), xMax=max_s,
-                     maxXRange=max_s, minXRange=min_x)
+        vb.setLimits(xMin=(lo if hi > lo else None), xMax=(hi if hi > lo else None),
+                     maxXRange=((hi - lo) if hi > lo else None), minXRange=min_x)
+
+    def _x_extent(self):
+        """The X range the view may show, in seconds of this capture, with the right pad
+        that clears the legend: the capture, or in All Links the span every Link covers
+        (set_x_bounds), so lanes of different lengths can show one window."""
+        if self._x_bounds is not None:
+            lo, hi = self._x_bounds
+        else:
+            lo, hi = 0.0, ((self._total / self._rate) if self._rate else 0.0)
+        return lo, hi + (hi - lo) * _RIGHT_PAD
+
+    def set_x_bounds(self, bounds) -> None:
+        """(t0, t1) seconds of this capture that the view may range over (All Links: the
+        whole multi-Link span), or None for the capture itself."""
+        self._x_bounds = (float(bounds[0]), float(bounds[1])) if bounds else None
+        self._apply_zoom_limit()
 
     def _row_bounds(self, cur: int, n_rows: int = 1):
         """The [start, end] samples spanning `n_rows` bus rows around sample `cur`,
@@ -508,21 +537,15 @@ class RawCaptureView(QWidget):
         """Re-apply the palette after a theme switch: refresh the line colours, the
         plot background and the item-view stylesheet, then re-render the visible
         window with the new pens."""
-        global _DP_COLOR, _DN_COLOR, _CURSOR_COLOR, _CDS_COLOR, _COMMIT_COLOR
-        _DP_COLOR = VizTheme.RAW_DP
-        _DN_COLOR = VizTheme.RAW_DN
-        _CURSOR_COLOR = VizTheme.CURSOR
-        _CDS_COLOR = VizTheme.TEXT          # neutral high-contrast (the repeating CDS grid)
-        _COMMIT_COLOR = VizTheme.SEM_SYNC   # matches the timeline's Commit Sync Point marker
         self.setStyleSheet(analyzer_stylesheet())
         self._plot.setBackground(VizTheme.PLOT_BG)
-        self._dp_curve.setPen(pg.mkPen(_DP_COLOR, width=2))
-        self._dn_curve.setPen(pg.mkPen(_DN_COLOR, width=2))
+        self._plot.showGrid(x=True, y=False, alpha=VizTheme.PLOT_GRID_ALPHA)
+        self._apply_trace_pens()
         self._cds_lines.setPen(pg.mkPen(self._cds_pen_color(), width=1))
-        self._cds_arrows.setBrush(pg.mkBrush(_CDS_COLOR))
-        self._commit_lines.setPen(pg.mkPen(_COMMIT_COLOR, width=2))
-        self._commit_arrows.setPen(pg.mkPen(_COMMIT_COLOR, width=2))   # hollow ring: recolour the outline
-        self._commit_legend_marker.setPen(pg.mkPen(_COMMIT_COLOR, width=2))  # legend swatch ring
+        self._cds_arrows.setBrush(pg.mkBrush(VizTheme.TEXT))
+        self._commit_lines.setPen(pg.mkPen(VizTheme.SEM_SYNC, width=2))
+        self._commit_arrows.setPen(pg.mkPen(VizTheme.SEM_SYNC, width=2))   # hollow ring: recolour the outline
+        self._commit_legend_marker.setPen(pg.mkPen(VizTheme.SEM_SYNC, width=2))  # legend swatch ring
         # The legend background/border/label colours are baked from the palette at build
         # time; re-apply them here or the key box keeps the STARTUP theme's background
         # after a switch (showed as a light box in dark mode / a dark box in light mode).
@@ -537,8 +560,30 @@ class RawCaptureView(QWidget):
             for _sample, label in list(self._port_legend.items):
                 label.setText(label.text, color=VizTheme.TEXT)
         self._recolor_ports()             # port palette + swatches follow the theme
-        self._cursor.setPen(pg.mkPen(_CURSOR_COLOR, width=1))
+        for label, line in self._bm_lines.items():
+            bmc = _bookmark_pair_color(label)
+            line.setPen(pg.mkPen(bmc, width=1))
+            line.label.setColor(bmc)
+        self._cursor.setPen(pg.mkPen(VizTheme.CURSOR, width=1))
         x0, x1 = self._plot.getViewBox().viewRange()[0]
+        self._render_range(int(x0 * self._rate), int(x1 * self._rate))
+
+    def _apply_trace_pens(self) -> None:
+        """The DP / DN trace pens: the user's Capture colours and weight (line_style),
+        defaulting to the theme's RAW_DP / RAW_DN at 2 px."""
+        dp, dn = line_style.palette("capture")
+        w = line_style.weight("capture")
+        self._dp_curve.setPen(pg.mkPen(dp, width=w))
+        self._dn_curve.setPen(pg.mkPen(dn, width=w))
+
+    def set_stream_colors(self, overrides: line_style.Overrides, redraw: bool = True) -> None:
+        """The shown Link's per-stream colour overrides; recolours the port overlay. A bind
+        passes `redraw=False`: set_capture / set_port_marks draw the new Link next."""
+        self._stream_overrides = dict(overrides or {})
+        if not redraw:
+            return
+        self._recolor_ports()
+        x0, x1 = self._plot.getViewBox().viewRange()[0]      # the CHn labels take it on render
         self._render_range(int(x0 * self._rate), int(x1 * self._rate))
 
     def set_cds_provider(self, provider) -> None:
@@ -715,9 +760,9 @@ class RawCaptureView(QWidget):
         self._port_colors.clear()
         self._lanes = [(int(d), int(p), int(ch)) for d, p, ch in (lanes or [])]
         for i, key in enumerate(self._lanes):
-            # Match the bus grid / audio pane: stable per-(device,dp) colour. Channels of
-            # one DP share the DP colour, so they're told apart by the CHn MSB labels below.
-            color = dp_stream_color(key[0], key[1])
+            # Match the bus grid / audio pane: stable per-(device,dp) hue, as a line colour.
+            # Channels of one DP share it, so they're told apart by the CHn MSB labels below.
+            color = dp_line_color(key[0], key[1], self._stream_overrides)
             self._port_colors[key] = color
             # Line first (drawn under the dots): joins a word's bits MSB→LSB.
             line = pg.PlotDataItem(connect="pairs", pen=pg.mkPen(color, width=2))
@@ -732,9 +777,9 @@ class RawCaptureView(QWidget):
         self._refresh_ports()
 
     def _recolor_ports(self) -> None:
-        """Re-apply the stable per-(device,dp) palette to the existing per-lane items."""
+        """Re-apply the stable per-(device,dp) line palette to the existing per-lane items."""
         for key in self._lanes:
-            color = dp_stream_color(key[0], key[1])
+            color = dp_line_color(key[0], key[1], self._stream_overrides)
             self._port_colors[key] = color
             self._lane_dots[key].setBrush(pg.mkBrush(color))
             if key in self._lane_lines:
@@ -981,7 +1026,7 @@ class RawCaptureView(QWidget):
         self._show_ports = False
         # Show the whole capture initially (the user zooms/pans from there), with
         # blank space on the right so the legend clears the trace.
-        self._plot.setXRange(0, (self._total / self._rate) * (1.0 + _RIGHT_PAD), padding=0.0)
+        self._plot.setXRange(*self._x_extent(), padding=0.0)
         self._render_range(0, self._total)
 
     _MAX_EDGES = 60000                               # cap points per render (zoom-out)
@@ -1095,7 +1140,8 @@ class RawCaptureView(QWidget):
         init = bool(initial) ^ bool(i0 & 1)
         return _step_xy_from(win, init, lo, hi, y0, y1)
 
-    def _on_xrange(self, _vb, _rng) -> None:
+    def _on_xrange(self, _vb, rng) -> None:
+        self.viewRangeChanged.emit(float(rng[0]), float(rng[1]))
         # Coalesce a burst of range changes: (re)arm the timer and render the LATEST
         # range when it fires, instead of rebuilding synchronously on every event.
         if self._total <= 1:
@@ -1113,6 +1159,22 @@ class RawCaptureView(QWidget):
             self._render_range(int(x0 * self._rate), int(x1 * self._rate))
         finally:
             self._rendering = False
+
+    # ---- lanes (ui/link_lanes.py): X in seconds of this capture ----
+    def x_range_seconds(self):
+        x0, x1 = self._plot.getViewBox().viewRange()[0]
+        return float(x0), float(x1)
+
+    def set_x_range_seconds(self, t0: float, t1: float) -> None:
+        self._plot.setXRange(t0, t1, padding=0)
+
+    def set_time_offset(self, seconds: float) -> None:
+        """Label the time axis `seconds` later than this capture's own time: in All
+        Links the lanes all read global time."""
+        axis = self._plot.getAxis("bottom")
+        axis._offset = float(seconds)
+        axis.picture = None                    # re-label now, not at the next zoom
+        axis.update()
 
     def set_cursor(self, sample: int) -> None:
         """Move the cursor line to `sample`. If the cursor would fall outside the

@@ -76,10 +76,11 @@ class ModeManager:
             menu.addAction(act)
             act.triggered.connect(lambda _checked=False, mm=m: self.switch_to(mm))
             self._actions[m] = act
-        # Insert just after the File menu so it's prominent without displacing File.
+        # First in the bar (after macOS's own application menu): the mode decides what
+        # every other menu holds, since each shows only what applies to it.
         actions = mb.actions()
-        if len(actions) > 1:
-            mb.insertMenu(actions[1], menu)
+        if actions:
+            mb.insertMenu(actions[0], menu)
         else:
             mb.addMenu(menu)
         self._mode_menu = menu

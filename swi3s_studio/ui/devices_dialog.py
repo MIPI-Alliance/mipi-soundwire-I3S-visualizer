@@ -31,7 +31,7 @@ from .theme import VizTheme
 
 MAX_HUB_DEPTH = 5
 
-# The per-device aspects this dialog can edit. The File ▸ Devices menu opens it
+# The per-device aspects this dialog can edit. The Devices menu (and Decode ▸ Hub Depths) opens it
 # focused on ONE aspect (Names / Register Maps / Hub Depth); the full set is used
 # when everything is edited together.
 ALL_SECTIONS = ("names", "maps", "depths")

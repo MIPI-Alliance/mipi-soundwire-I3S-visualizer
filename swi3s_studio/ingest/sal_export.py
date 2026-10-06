@@ -237,35 +237,36 @@ def export_sal(capture: Capture, path: str, *,
     """
     if clock_channel == data_channel:
         raise ValueError(f"clock_channel and data_channel must differ (both {clock_channel})")
-    rate = int(capture.sample_rate_hz)
+    _write_sal(path, int(capture.sample_rate_hz), [
+        (clock_channel, clock_name, capture.initial_clock, capture.clock_edges),
+        (data_channel, data_name, capture.initial_data, capture.data_edges)])
+
+
+def _write_sal(path: str, rate: int, channels) -> None:
+    """The .sal writer: `channels` is [(channel, name, initial_level, edges), ...]."""
     if rate <= 0:
         raise ValueError(f"export_sal: capture.sample_rate_hz must be > 0 (got {rate})")
-
-    clk = np.ascontiguousarray(capture.clock_edges, dtype=np.uint64)
-    dat = np.ascontiguousarray(capture.data_edges, dtype=np.uint64)
-    # One capture length for the whole project: the last edge on either channel + 1
+    blobs = [(ch, name, bool(init), np.ascontiguousarray(edges, dtype=np.uint64))
+             for ch, name, init, edges in channels]
+    # One capture length for the whole project: the last edge on any channel + 1
     # (a real .sal stores the same final B_end in every channel).
     last_edge = 0
-    if clk.size:
-        last_edge = max(last_edge, int(clk[-1]))
-    if dat.size:
-        last_edge = max(last_edge, int(dat[-1]))
+    for _ch, _name, _init, edges in blobs:
+        if edges.size:
+            last_edge = max(last_edge, int(edges[-1]))
     capture_end = last_edge + 1
 
     # Synthetic capture: no wall-clock time. Use a fixed epoch so exports are
     # reproducible (byte-identical goldens); Logic only uses it for a display label.
     unix_ms, frac_ms = 0, 0.0
 
-    channels = [(clock_channel, clock_name), (data_channel, data_name)]
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as z:
-        z.writestr("meta.json", _meta_json(rate, channels, unix_ms, frac_ms, capture_end))
-        z.writestr(f"digital-{clock_channel}.bin",
-                   saleae_binary.build_logic2_channel_v3(
-                       bool(capture.initial_clock), clk, sample_rate_hz=rate,
-                       unix_ms=unix_ms, frac_ms=frac_ms, capture_end=capture_end))
-        z.writestr(f"digital-{data_channel}.bin",
-                   saleae_binary.build_logic2_channel_v3(
-                       bool(capture.initial_data), dat, sample_rate_hz=rate,
-                       unix_ms=unix_ms, frac_ms=frac_ms, capture_end=capture_end))
+        z.writestr("meta.json", _meta_json(rate, [(ch, name) for ch, name, _i, _e in blobs],
+                                           unix_ms, frac_ms, capture_end))
+        for ch, _name, init, edges in blobs:
+            z.writestr(f"digital-{ch}.bin",
+                       saleae_binary.build_logic2_channel_v3(
+                           init, edges, sample_rate_hz=rate,
+                           unix_ms=unix_ms, frac_ms=frac_ms, capture_end=capture_end))
         z.writestr("trigger-store.bin", _TRIGGER_STORE)   # required by Logic to open
 

@@ -41,6 +41,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView
 
 from ..model.grid_slots import GridSlot
+from . import line_style
 from .theme import VizTheme
 
 # Visualizer cell proportions (src/ui/constants.py COLUMN_SIZE=39, ROW_SIZE=30),
@@ -82,22 +83,38 @@ _DP_PALETTE = [
 ]
 
 
+def _dp_index(device: int, dp: int) -> int:
+    """Palette slot of a (device, dp) stream: dpNumber is 0..31, so device*32+dp is a
+    unique id, mod the palette. Shared by the fill and the line colour."""
+    return (max(0, int(device)) * 32 + max(0, int(dp))) % len(_DP_PALETTE)
+
+
 def dp_stream_color(device: int, dp: int) -> QColor:
-    """Stable data-port colour keyed by the (device, dp) VALUE — never by appearance
+    """Stable data-port FILL colour keyed by the (device, dp) VALUE — never by appearance
     order — so a port keeps the same colour when other ports are enabled/disabled across a
-    capture. dpNumber is 0..31, so device*32+dp is a unique id; mod the palette. Shared by
-    the bus grid and the audio pane so a stream is the same colour in both."""
-    idx = (max(0, int(device)) * 32 + max(0, int(dp))) % len(_DP_PALETTE)
-    return QColor(_DP_PALETTE[idx])
+    capture. A pastel behind dark ink: for the bus grid's cells, not for a line on a plot
+    (see dp_line_color)."""
+    return QColor(_DP_PALETTE[_dp_index(device, dp)])
+
+
+def dp_line_color(device: int, dp: int, overrides=None) -> QColor:
+    """The same stream's colour for a LINE or text on the plot background: by default the
+    hue of dp_stream_color, from the theme's DP_LINE_PALETTE so it stays readable in light
+    mode. Resolved at use by line_style (the Link's `overrides`, then the user's
+    preference, then that default), so a theme switch or a preference change reaches it.
+    Shared by the Audio, Capture and Samples panes, so a stream is one colour across them."""
+    return QColor(line_style.stream_color(_dp_index(device, dp), device, dp, overrides))
 
 
 def bookmark_pair_color(label: str) -> QColor:
-    """Colour for a bookmark PAIR, rotating the data-port palette by pair letter (A, B,
-    C, …) so each pair gets a distinct, consistent colour across every pane (timeline /
-    capture / audio). Falls back to the first palette entry for an unlabelled mark."""
+    """Colour for a bookmark PAIR, rotating the data-port line palette by pair letter (A,
+    B, C, …) so each pair gets a distinct, consistent colour across every pane (timeline /
+    capture / audio / the Bookmarks table). Every use is a line or text, so it is the
+    per-theme line colour (line_style's `bookmark` kind, which defaults to the data-port
+    line palette). Falls back to the first entry for an unlabelled mark."""
     letter = (str(label) or "A")[:1].upper()
     idx = (ord(letter) - 65) if "A" <= letter <= "Z" else 0
-    return QColor(_DP_PALETTE[idx % len(_DP_PALETTE)])
+    return QColor(line_style.color("bookmark", idx))
 
 
 def _dev_tag(device: int) -> str:

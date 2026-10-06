@@ -21,6 +21,7 @@ the authority. Guarding the invariant directly, rather than one config's placeme
 because it is the property the user can state without reading either engine.
 """
 import os
+import pathlib
 import tempfile
 
 import pytest
@@ -41,7 +42,7 @@ def _config(nch: int, cg: int, sg: int, ss: int, *, rows: int = _ROWS) -> str:
     """Template CSV with DP0 rewritten to (channels, grouping, sample-grouping,
     sample-size) and DP1 disabled. Returns a temp path the caller must delete."""
     lines = []
-    for line in open(_CSV, encoding="utf-8").read().splitlines():
+    for line in pathlib.Path(_CSV).read_text(encoding="utf-8").splitlines():
         key = line.split(",", 1)[0]
         if key == "EnableCh_REG":
             line = f"EnableCh_REG,{bin((1 << nch) - 1)},0b0," + ",".join(["0b0"] * 10)

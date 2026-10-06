@@ -3,6 +3,7 @@
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_raw_view.py
 """
 import os
+import pathlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -83,7 +84,7 @@ def test_cds_manager_only_guard_splits_even_without_peripheral_cells():
     def _guard_labels(guard):
         cfg = BusConfig(num_columns=8, row_rate_khz=3072.0); cfg.cds_bit_width = 0
         cfg.cds_guard = list(guard); cfg.enforce_cds_handover = False
-        p = _tf.mktemp(suffix=".csv"); open(p, "w").write(cfg.to_csv())
+        p = _tf.mktemp(suffix=".csv"); pathlib.Path(p).write_text(cfg.to_csv())
         cells, _cl, _i, ncols, nr = viz_engine.render_payload(p); _os.remove(p)
         split = any(c.get("cds_split") for c in cells)
         gv = GridView(); gv.set_bus_model(cells, {}, ncols, 1)

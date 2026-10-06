@@ -5,6 +5,7 @@ SSCR was never on the wire, so interval>1 ports need the phase picked by ear.
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_ssp.py
 """
 import os
+import pathlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,9 +23,9 @@ def test_manual_ssp_survives_negative_interval_csv():
     from swi3s_studio.model.bus_config import demo_config
     with tempfile.TemporaryDirectory() as d:
         csv = demo_config().to_csv_file(os.path.join(d, "c.csv"))
-        txt = open(csv).read().replace("Interval_REG,7,", "Interval_REG,-1,")
+        txt = pathlib.Path(csv).read_text().replace("Interval_REG,7,", "Interval_REG,-1,")
         bad = os.path.join(d, "bad.csv")
-        open(bad, "w").write(txt)
+        pathlib.Path(bad).write_text(txt)
         s = Session.from_demo(64, config_csv=bad, ssp_row=3)   # must not SIGFPE
         assert s.ssp_row == 3
 

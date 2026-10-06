@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..analysis.bus_timing import measure_bus_timing
+from . import line_style
 from .theme import VizTheme, analyzer_stylesheet
 
 # Y is plotted as log10(count) in a LINEAR view (we transform ourselves rather than use
@@ -45,16 +46,23 @@ from .theme import VizTheme, analyzer_stylesheet
 _LOG_FLOOR = -0.35
 
 
+def _grid_alpha() -> float:
+    """The histograms' gridlines: three quarters of the theme's plot-grid opacity, a
+    shade lighter than a trace pane's behind the bars."""
+    return 0.75 * VizTheme.PLOT_GRID_ALPHA
+
+
 def _cat_specs():
     """The four transition categories — (clock rising?, data rising?, label, colour) —
-    read live from the palette so a theme switch recolours them. Clock polarity picks the
-    hue family (rising = cool, falling = warm); data direction picks the shade within it."""
-    p = VizTheme.TRACE_PALETTE
+    read live (line_style's `timing` kind: the user's choice, else the theme's) so a theme
+    switch or a preference change recolours them. By default clock polarity picks the hue
+    family (rising = cool, falling = warm); data direction picks the shade within it."""
+    p = line_style.palette("timing")
     return [
         (True,  True,  "clk↑ dat↑", p[0]),   # blue
-        (True,  False, "clk↑ dat↓", p[5]),   # cyan
-        (False, True,  "clk↓ dat↑", p[3]),   # gold
-        (False, False, "clk↓ dat↓", p[2]),   # red
+        (True,  False, "clk↑ dat↓", p[1]),   # cyan
+        (False, True,  "clk↓ dat↑", p[2]),   # gold
+        (False, False, "clk↓ dat↓", p[3]),   # red
     ]
 
 
@@ -194,7 +202,7 @@ class EyeView(QWidget):
         self._hold_plot.showAxis("right")
         _right = self._hold_plot.getAxis("right")
         _right.setStyle(showValues=False, tickLength=0)
-        _right.setGrid(round(0.15 * 255))                # same alpha as _make_plot's showGrid
+        _right.setGrid(round(_grid_alpha() * 255))       # same alpha as _make_plot's showGrid
         for p in (self._setup_plot, self._hold_plot):    # sample-point line at the join
             p.addItem(pg.InfiniteLine(pos=0.0, angle=90,
                       pen=pg.mkPen(VizTheme.CURSOR, width=1, style=Qt.DashLine)))
@@ -240,7 +248,7 @@ class EyeView(QWidget):
 
     def _make_plot(self, xlabel: str) -> pg.PlotWidget:
         p = pg.PlotWidget(background=VizTheme.PLOT_BG)
-        p.showGrid(x=True, y=True, alpha=0.15)
+        p.showGrid(x=True, y=True, alpha=_grid_alpha())
         p.setMenuEnabled(False)
         p.getPlotItem().hideButtons()      # drop the corner auto-range "A" button
         # A fixed-scale histogram, not an explorable trace — disable mouse pan/zoom so a
@@ -249,6 +257,9 @@ class EyeView(QWidget):
         p.getViewBox().setMouseEnabled(x=False, y=False)
         p.setLabel("bottom", xlabel)
         p.setLabel("left", "transitions")
+        # The labels name their unit; with no data the auto SI prefix read "(x0.001)".
+        p.getAxis("bottom").enableAutoSIPrefix(False)
+        p.getAxis("left").enableAutoSIPrefix(False)
         p.getAxis("left").setTextPen(VizTheme.AXIS)
         p.getAxis("bottom").setTextPen(VizTheme.AXIS)
         return p
@@ -374,16 +385,21 @@ class EyeView(QWidget):
         if self.isVisible():
             self._render()               # re-measure for the new region's rate/geometry
 
-    def set_capture(self, capture, recovered_clock=None) -> None:
+    def set_capture(self, capture, recovered_clock=None, cache=None) -> None:
         """Stash the capture and render lazily — the setup/hold measurement scans
         millions of edges, so we don't want it on the capture-load critical path.
         It runs when the Timing tab is first shown (or immediately if already visible).
 
         `recovered_clock` = (row_sync_samples, ui_samples) selects the PHY3 (DLV) model:
         setup/hold measured against the recovered mid-UI sample point, not a forwarded
-        clock edge (None for FBCSE)."""
+        clock edge (None for FBCSE).
+
+        `cache` is an optional dict owned by the caller for THIS capture's decode: the
+        measurement is stored in it and reused from it, so showing the same capture again
+        (a Link switch) does not re-scan it. The caller clears it when the decode changes."""
         self._capture = capture
         self._recovered_clock = recovered_clock
+        self._cache = cache
         self._dirty = True
         if self.isVisible():
             self._render()
@@ -398,10 +414,20 @@ class EyeView(QWidget):
         _redraw() only (no re-measure)."""
         self._dirty = False
         capture = self._capture
-        t = (measure_bus_timing(capture, segments=self._segments,
-                                start_sample=self._start_sample, end_sample=self._end_sample,
-                                recovered_clock=self._recovered_clock)
-             if capture is not None else None)
+        cache = getattr(self, "_cache", None)
+        # Keyed by the measured range: each region is its own measurement, and a cache that
+        # ignored it showed the first region's setup/hold whatever region was picked.
+        key = ("timing", self._start_sample, self._end_sample)
+        if cache is not None and key in cache:
+            t = cache[key]
+        else:
+            t = (measure_bus_timing(capture, segments=self._segments,
+                                    start_sample=self._start_sample,
+                                    end_sample=self._end_sample,
+                                    recovered_clock=self._recovered_clock)
+                 if capture is not None else None)
+            if cache is not None:
+                cache[key] = t
         self._timing = t
         self._rate = int(t.sample_rate_hz) if t is not None else 1
         self._redraw()
@@ -657,6 +683,7 @@ class EyeView(QWidget):
         self._update_legend()
         for p in (self._setup_plot, self._hold_plot):
             p.setBackground(VizTheme.PLOT_BG)
+            p.showGrid(x=True, y=True, alpha=_grid_alpha())
             p.getAxis("left").setTextPen(VizTheme.AXIS)
             p.getAxis("bottom").setTextPen(VizTheme.AXIS)
         self._dirty = True

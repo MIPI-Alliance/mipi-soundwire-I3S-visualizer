@@ -177,3 +177,20 @@ def test_grid_scroll_resets_so_new_content_is_visible():
     vp = gv.mapToScene(gv.viewport().rect()).boundingRect()
     assert vp.left() <= 0 <= vp.right(), (
         f"message at scene x=0 scrolled out of view: viewport x [{vp.left()}, {vp.right()}]")
+
+
+def test_a_capture_joined_mid_stream_shows_no_bringup_and_keeps_its_line_names():
+    """A recording started after the bus came up has no bring-up, but the edge-only
+    detector reads one into it (a Warm Start, claimed to ride the data line). The Session
+    overrules it from the decode, so the Timeline draws no bring-up band and the Capture
+    pane names the lines as for every genuine FBCSE capture (data DN, clock DP), not
+    swapped."""
+    from test_link_control import _joined_late
+    QApplication.instance() or QApplication([])
+    genuine = MainWindow()
+    genuine.load_demo(phy=2)                              # a real cold start
+    names = (genuine._raw_view._top_name, genuine._raw_view._bot_name)
+    w = MainWindow()
+    w.load_session(_joined_late())
+    assert w._timeline._bringup == {} and w._timeline._link_sections == []
+    assert (w._raw_view._top_name, w._raw_view._bot_name) == names == ("DN", "DP")
