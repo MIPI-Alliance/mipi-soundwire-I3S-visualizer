@@ -246,7 +246,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         row_base). Painted as translucent bands coloured by column count, so each
         distinct bus geometry shows in its own colour. A segment carrying a truthy
         "forced" key had its width pinned by the user (Session.force_column_count_at)
-        and is labelled + outlined as overridden."""
+        and is labelled + outlined as overridden; one carrying "csv" (the file's name) has
+        a config CSV imposed on it alone (Session.apply_config_csv_at)."""
         self._segments = sorted(segments, key=lambda s: s.get("start_sample", 0))
         if total_samples:
             self._total = max(1, int(total_samples))
@@ -597,7 +598,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                 p.setPen(QPen(QColor(VizTheme.TEXT)))     # theme text — visible in light AND dark
                 p.drawText(QRectF(x0 + 6, tr.top(), x1 - x0 - 8, _CFG_BAND_H),
                            Qt.AlignLeft | Qt.AlignVCenter,
-                           self._segment_label(i, cols, bool(seg.get("forced"))))
+                           self._segment_label(i, cols, bool(seg.get("forced")),
+                                               bool(seg.get("csv"))))
         # §5.1.2 link bring-up (Bus Reset → PHY-select → audio). In a multi-second
         # capture this region is well under a pixel wide, so draw an ALWAYS-VISIBLE
         # marker in a distinct cyan (NOT the gold Commit+SSP tick): a min-width band,
@@ -817,7 +819,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._seek_timer.stop()
         self._emit_pending_seek()
 
-    def _segment_label(self, index: int, cols: int, forced: bool = False) -> str:
+    def _segment_label(self, index: int, cols: int, forced: bool = False,
+                       csv: bool = False) -> str:
         """Config-band label. The initial audio segment of a cold/warm start is the
         selected PHY's Safe-Lock geometry, so label it by the PHY (e.g. 'PHY2
         Safe-Lock-2') — the PHY is what makes that 2-column (FBCSE) / 4-column (DLV)
@@ -826,12 +829,13 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         PhyStart), and this audio band begins only after the PHY is selected.
 
         A `forced` region had its width pinned by the user, so say so — otherwise a
-        pinned width is indistinguishable from one the decoder read off the wire."""
+        pinned width is indistinguishable from one the decoder read off the wire. A `csv`
+        region decodes with a config CSV imposed on it, which says so for the same reason."""
         b = self._bringup
         if (index == 0 and b and b.get("phy_name")
-                and b.get("safe_lock_columns") == cols and not forced):
+                and b.get("safe_lock_columns") == cols and not forced and not csv):
             return f"{b['phy_name']} Safe-Lock-{cols}"
-        return f"{cols}col (forced)" if forced else f"{cols}col"
+        return f"{cols}col (forced)" if forced else f"{cols}col (CSV)" if csv else f"{cols}col"
 
     def _nearest(self, x: float, px: float = 5.0):
         """The command whose tick is within `px` of x (closest; higher paint rank wins
@@ -902,8 +906,11 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             forced = bool(s.get("forced"))
             note = (" · column count pinned by you (Decode ▸ Force Column Count) — "
                     "the wire's own width is overridden for this region" if forced else "")
+            if s.get("csv"):
+                note += (f" · config imposed from {s['csv']} (Decode ▸ Import Visualizer "
+                         "CSV) — this region only")
             return (f"Bus config: "
-                    f"{self._segment_label(i, int(s.get('column_count', 0)), forced)} "
+                    f"{self._segment_label(i, int(s.get('column_count', 0)), forced, bool(s.get('csv')))} "
                     f"· from row {int(s.get('row_base', 0)):,}{note}")
         return ""
 

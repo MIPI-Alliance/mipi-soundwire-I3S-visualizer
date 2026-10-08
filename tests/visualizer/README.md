@@ -5,10 +5,14 @@ These fixtures port the standalone **SWI3S Visualizer**'s test suite
 Studio shares with the Visualizer (the verified C++ cascade) is regression-tested
 here, with no dependency on the sibling repo.
 
-- `examples/` — the Visualizer's example configs, copied verbatim:
-  - `directed_tests/` (58) — targeted feature/edge-case configs
+- The configs are the repository's `visualizer_examples/`, the Visualizer's examples copied
+  verbatim except for one move:
+  - `directed_tests/` (65) — targeted feature/edge-case configs. The 18 that report a bus
+    clash, a placement error or a warning on purpose are in `directed_tests/intentional_errors/`
+    here, where the Visualizer keeps them with the rest; its `README.md` lists them.
   - `spec_figures/` (30) — configs reproducing MIPI SoundWire I3S spec figures
   - `use_cases/` (1) — a real-world example
+- `golden/` and `golden_json/` follow the same layout.
 - `golden/` — the Visualizer's **raw per-data-port placement** for each config,
   generated from its `test/model_dump.py` (which drives the Visualizer's own
   `DataPort` model). One `dp row col SLOT` line per owned slot; a `# rows N`
@@ -16,7 +20,7 @@ here, with no dependency on the sibling repo.
 
 `tests/test_visualizer_placement.py` solo-places every enabled data port through
 `swi3score.grid_from_csv` and asserts the `(dp, row, col, slot)` set matches the
-golden for all 89 configs. Column 0 (CDS) is excluded — Studio reserves it for the
+golden for all 90 configs that have one. Column 0 (CDS) is excluded — Studio reserves it for the
 control stream.
 
 To regenerate the goldens after an intentional placement change, re-run

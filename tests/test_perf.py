@@ -573,14 +573,14 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     prediction against that process's own peak RSS. Two bounds, and the directions mean
     different things:
       * predicted >= actual -- the guard must never promise a load will fit and be wrong.
-        This is the assertion that catches the 60 GB defect: reverting to the bare sum
-        predicts 0.072 GB where this fixture measures 0.200 GB, a 2.78x under-prediction on
-        a fixture ~100x smaller than the one that hurt.
+        This is the assertion that catches the 60 GB defect: the bare sum (a transient of
+        1) predicts 0.18 GB where this fixture measures 0.20 GB.
       * predicted <= 3x actual -- the guard must not refuse loads that would have fitted,
-        which is the failure mode of "just multiply everything by a big number". A transient
-        of 16 instead of 4 trips this at 5.00x.
-    Measured pred/actual: 1.27-1.37 across 3M-12M transitions here, and 1.00-1.25 on the
-    three real captures the model was fitted to.
+        which is the failure mode of "just multiply everything by a big number". The old
+        whole-file transient of 4 against today's leaner decode is 3.2x and trips it.
+    Measured pred/actual: 1.67 here (10M transitions per channel; 4M had become too small
+    to measure once the decode stopped holding three copies), and 1.96 on a 54 MB capture
+    with 302M transitions, whose largest block is a quarter of its channel.
     """
     import json
     import subprocess
@@ -591,7 +591,7 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     repo = str(pathlib.Path(swi3s_studio.__file__).resolve().parent.parent)
     env = dict(os.environ, PYTHONPATH=repo)
     sal = str(tmp_path / "measured.sal")
-    n = 4_000_000                          # ~0.2 GB of edges: dominates interpreter baseline
+    n = 10_000_000                         # ~0.16 GB of edges: dominates interpreter baseline
 
     write = subprocess.run([sys.executable, "-c", _SAL_WRITER, str(n), sal],
                            env=env, capture_output=True, text=True)

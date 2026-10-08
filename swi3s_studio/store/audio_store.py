@@ -85,9 +85,10 @@ def decode_pdm(bits: np.ndarray, native_rate: float,
 _RATE_RECOVERY_SUBSAMPLE = 4096   # samples per probe window (bounds memory)
 
 
-def _recover_pdm_bit_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
-    """Recover a PDM port's native bit rate from its own per-bit capture-sample
-    anchors, for use when the core reported no verified rate for the port.
+def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
+    """Recover a port's native rate (a PDM port's bit rate, a PCM port's sample rate)
+    from its own per-sample capture-sample anchors, for use when the core reported no
+    verified rate for the port.
 
     `sample_at` is non-decreasing and, under standard SampleGrouping/Spacing, its
     consecutive diffs are BIMODAL: small gaps between samples grouped onto the same
@@ -156,6 +157,55 @@ def _build_pyramid(raw: np.ndarray) -> List[Tuple[int, np.ndarray, np.ndarray]]:
 
 _SPLIT_CACHE_MAX = 256   # memoised envelope windows per store (see envelope())
 
+@dataclass(frozen=True)
+class StreamProcessing:
+    """A stream's high-pass and gain, applied to every channel of one (device, dp).
+
+    `highpass_hz` is the corner of the 4th-order zero-phase Butterworth high-pass, or None
+    for none; `gain_db` is applied after it. The result is rounded and saturates at the
+    stream's full scale, as a DAC would. `allow_clipping` is the choice the user made in
+    the dialog (whether a gain that clips may be applied); it is kept so a saved workspace
+    reopens the dialog as it was left."""
+    highpass_hz: Optional[float] = None
+    gain_db: float = 0.0
+    allow_clipping: bool = False
+
+    def is_identity(self) -> bool:
+        return self.highpass_hz is None and self.gain_db == 0.0
+
+    def describe(self) -> str:
+        """Short label for the stream's checkbox: "HPF 20 Hz, +12.0 dB"."""
+        parts = []
+        if self.highpass_hz is not None:
+            parts.append(f"HPF {self.highpass_hz:g} Hz")
+        if self.gain_db:
+            parts.append(f"{self.gain_db:+.1f} dB")
+        return ", ".join(parts)
+
+    def to_json(self) -> dict:
+        return {"highpass_hz": self.highpass_hz, "gain_db": self.gain_db,
+                "allow_clipping": self.allow_clipping}
+
+    @classmethod
+    def from_json(cls, d) -> Optional["StreamProcessing"]:
+        """None for anything that is not a usable setting (a hand-edited workspace)."""
+        try:
+            hp = d.get("highpass_hz")
+            out = cls(highpass_hz=None if hp is None else float(hp),
+                      gain_db=float(d.get("gain_db", 0.0)),
+                      allow_clipping=bool(d.get("allow_clipping", False)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if out.highpass_hz is not None and not out.highpass_hz > 0:
+            return None
+        return out
+
+
+def full_scale(bits: int) -> int:
+    """Magnitude of the most negative value of a signed `bits`-bit sample."""
+    return 1 << (max(2, int(bits)) - 1)
+
+
 @dataclass
 class AudioStore:
     # Keyed by (device, dp, channel). Two devices may each expose a DP0, so the
@@ -181,6 +231,11 @@ class AudioStore:
     # the de-jitter ramp overwrites _sample_at. Only populated for flow_mode != 0;
     # transport_gaps() falls back to _sample_at for everything else. See from_audio_columns.
     _transport_at: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
+    # Per-stream high-pass and gain (see set_processing). While a stream is processed its
+    # decoded samples wait here, so Revert returns them exactly, and _channels holds the
+    # processed ones that every view, playback and export reads.
+    _processing: Dict[Tuple[int, int], StreamProcessing] = field(default_factory=dict)
+    _raw: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
 
     @classmethod
     def from_session(cls, session, mmap_dir: Optional[str] = None,
@@ -292,9 +347,9 @@ class AudioStore:
                     # with errors, or no config). Recover the PDM bit rate from the bits'
                     # own capture-sample spacing so it can still be decimated to PCM
                     # instead of collapsing to a ±1 (near-silent) stream — see
-                    # _recover_pdm_bit_rate for why a plain median-of-diffs is wrong
+                    # _recover_rate for why a plain median-of-diffs is wrong
                     # under SampleGrouping/Spacing.
-                    native = _recover_pdm_bit_rate(dense_sat, capture_rate_hz)
+                    native = _recover_rate(dense_sat, capture_rate_hz)
                     if native > 0.0:
                         # Feeds display/bandwidth (native_rate()) with the recovered
                         # on-bus rate instead of the original 0; matches how a
@@ -311,6 +366,17 @@ class AudioStore:
             else:
                 signed = sign_extend(dense_val, bits)
                 sbits = bits
+                if (native_rates.get(devp, 0.0) <= 0.0 and store._rates.get(devp, 0.0) <= 0.0
+                        and capture_rate_hz > 0.0 and n > 1):
+                    # No verified rate from the core, as for the PDM case above: measure it
+                    # from the samples' own spacing. Without it the stream could not be
+                    # high-passed (no Nyquist), played at its pitch (it fell back to
+                    # 48 kHz), or labelled with a rate. The waveform never needed it: it is
+                    # drawn at each sample's capture position.
+                    measured = _recover_rate(dense_sat, capture_rate_hz)
+                    if measured > 0.0:
+                        store._rates[devp] = measured
+                        store._native_rates[devp] = measured
 
             # Flow-controlled ports (TX/RX/ASYNC) transport on a jittered schedule, so
             # dense_sat lands the samples at irregular capture times and a bit-exact sine
@@ -419,11 +485,12 @@ class AudioStore:
         in-memory path stores plain ndarrays. Safe to call repeatedly; the store's
         sample arrays must not be used afterward. Also usable as a context manager."""
         self._pyramids.clear()                # drop derived views before closing the mmaps
-        for arr in self._channels.values():
-            mm = getattr(arr, "_mmap", None)  # np.memmap exposes the mmap; plain ndarray -> None
-            if mm is not None:
+        for arr in [*self._channels.values(), *self._raw.values()]:   # a processed stream's
+            mm = getattr(arr, "_mmap", None)  # decoded samples wait in _raw; np.memmap
+            if mm is not None:                # exposes the mmap, a plain ndarray -> None
                 mm.close()
         self._channels.clear()
+        self._raw.clear()
 
     def __enter__(self) -> "AudioStore":
         return self
@@ -481,9 +548,10 @@ class AudioStore:
         if factor > 1:
             # Splitting walks every bin in Python, which on a gappy flow-controlled stream is
             # the costliest part of showing a store again (a Link switch rebuilds the plots
-            # over the same windows). A decoded store never changes, so the answer for a
-            # window is fixed: memoise it, returned read-only so no caller can edit the
-            # memo through its result.
+            # over the same windows). A channel's samples change only through
+            # set_processing, which drops its entries, so the answer for a window is fixed:
+            # memoise it, returned read-only so no caller can edit the memo through its
+            # result.
             ck = (key, i0, i1, factor, n)
             hit = self._split_cache.get(ck)
             if hit is None:
@@ -625,6 +693,72 @@ class AudioStore:
         if not np.isfinite(nominal) or nominal <= 0.0:
             return np.zeros(0, dtype=np.int64)
         return np.flatnonzero(d > nominal * float(tolerance)).astype(np.int64)
+
+    # ---- per-stream high-pass and gain ----
+    def raw_samples(self, device: int, dp: int, channel: int) -> np.ndarray:
+        """The decoded samples, whatever processing the stream has."""
+        key = (device, dp, channel)
+        raw = self._raw.get(key)
+        return raw if raw is not None else self.samples(device, dp, channel)
+
+    def processing(self, device: int, dp: int) -> Optional[StreamProcessing]:
+        return self._processing.get((device, dp))
+
+    def _processed(self, device: int, dp: int, channel: int,
+                   proc: StreamProcessing) -> np.ndarray:
+        from ..dsp import filters
+        x = np.asarray(self.raw_samples(device, dp, channel), dtype=np.float64)
+        if proc.highpass_hz is not None and x.size:
+            rate = self.rate(device, dp)
+            x = filters.highpass(x, min(proc.highpass_hz, filters.max_cutoff_hz(rate)), rate)
+        if proc.gain_db:
+            x = x * (10.0 ** (proc.gain_db / 20.0))
+        fs = full_scale(self.sample_bits(device, dp, channel))
+        return np.clip(np.rint(x), -fs, fs - 1).astype(np.int32)
+
+    def set_processing(self, device: int, dp: int,
+                       proc: Optional[StreamProcessing]) -> None:
+        """Apply `proc` to every channel of the stream, replacing any earlier processing
+        (it always starts from the decoded samples), or revert to them with None or an
+        identity setting. The render pyramid and envelope memo of each channel are
+        dropped, so the waveform, playback and export all follow."""
+        changed = []
+        if proc is None or proc.is_identity():
+            for ch in self.channels(device, dp):
+                key = (device, dp, ch)
+                if key in self._raw:
+                    self._channels[key] = self._raw.pop(key)
+                    changed.append(key)
+            self._processing.pop((device, dp), None)
+        else:
+            for ch in self.channels(device, dp):
+                key = (device, dp, ch)
+                self._raw.setdefault(key, self._channels[key])
+                self._channels[key] = self._processed(device, dp, ch, proc)
+                changed.append(key)
+            self._processing[(device, dp)] = proc
+        for key in changed:
+            self._pyramids.pop(key, None)
+            for ck in [ck for ck in self._split_cache if ck[0] == key]:
+                del self._split_cache[ck]
+
+    def peak_db(self, device: int, dp: int, highpass_hz: Optional[float] = None
+                ) -> Optional[float]:
+        """The stream's peak over all its channels, in dB relative to full scale, of the
+        decoded samples through the high-pass at `highpass_hz` (None: none). Gain is not
+        included: it is what the caller is choosing. None for a silent stream."""
+        from ..dsp import filters
+        peak = 0.0
+        for ch in self.channels(device, dp):
+            x = np.asarray(self.raw_samples(device, dp, ch), dtype=np.float64)
+            if not x.size:
+                continue
+            if highpass_hz is not None:
+                rate = self.rate(device, dp)
+                x = filters.highpass(x, min(highpass_hz, filters.max_cutoff_hz(rate)), rate)
+            fs = float(full_scale(self.sample_bits(device, dp, ch)))
+            peak = max(peak, float(np.max(np.abs(x))) / fs)
+        return 20.0 * np.log10(peak) if peak > 0 else None
 
     def pcm_play(self, device: int, dp: int, channels: Optional[List[int]] = None,
                  start: int = 0, stop: Optional[int] = None, depth: int = 16,

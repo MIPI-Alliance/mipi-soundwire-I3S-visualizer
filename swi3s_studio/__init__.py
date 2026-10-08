@@ -5,6 +5,123 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 (later) a PySide6 UI. See ../docs/architecture.md.
 """
 # App version, shown in the window title. Kept in sync with pyproject.toml.
+# 3.0.20: (in development).
+#        • A WORKSPACE REOPENS THE WINDOW AS IT WAS. It saved the Links, their decode inputs,
+#          bookmarks, the cursor and a few grid settings; nearly everything a user arranges
+#          was lost. It now also keeps, per Link, the Commands filter and column widths and
+#          the Audio and Capture panes' channels, zoom, Vertical Zoom, decimation and
+#          toggles; and for the window, the dock layout (open, tabbed, raised, sizes) and
+#          geometry, the timeline's zoom, the Commands sort and hidden columns, the Samples
+#          filters, the Registers device and opened blocks, the Statistics folds and the
+#          Timing pane's region, driver filter and hidden edge kinds (ui/view_state.py, one
+#          read/restore pair per pane). The playback device and bit depth stay the
+#          computer's. A text filter set while its editor had never been opened was dropped
+#          at the next Link switch; the proxy now keeps the text.
+#          A workspace is a `.swi3s` file (it was `.swi3s.json`, an extension too many; `.json`
+#          ones still open), and names each capture relative to itself as well as where it
+#          was when saved, so a folder holding both can move. A capture found in neither
+#          place is asked for: Locate it (its partners in that folder are found too), Skip
+#          that Link, or Cancel the open.
+#          The Audio and Capture views were also reset by every Link switch and re-decode,
+#          since each rebinds the shared pane. Each view now leaves its state with the Link
+#          it showed before it is rebound, and the Link's state is put back after, so both
+#          keep it (All Links lanes keep everything but their own zoom: they share one).
+#        • HIGH-PASS AND GAIN, PER STREAM. Right-click a stream in the Audio pane ▸ High-Pass &
+#          Gain… applies a 4th-order zero-phase Butterworth high-pass (1 Hz to 20 kHz, or just
+#          under Nyquist) and a gain to every channel of that stream, to make a glitch stand
+#          out. The dialog follows Audacity's Amplify: Amplification and New Peak Amplitude
+#          are one number in dB, the peak is measured after the filter, and the gain opens
+#          at the value that normalises the stream; without Allow clipping a gain that takes
+#          the peak past 0 dB cannot be applied, and with it the samples saturate. Preview
+#          shows it in the waveform, Cancel restores, Apply keeps; the dialog's Revert
+#          returns the decoded samples exactly. Waveform, playback and export use the processed samples, the
+#          Samples table the decoded ones. The setting is the Link's: it survives a re-decode
+#          and is saved in the workspace.
+#          The filter is SciPy's design and sosfiltfilt in numpy (no SciPy dependency),
+#          checked against outputs SciPy produced, with the recursion in the native core
+#          (`swi3score.sosfilt`, score_abi 11; rebuild the core). It pads by three periods
+#          of the corner rather than SciPy's 15 samples, which at 20 Hz left a transient of
+#          up to half a stream's offset over its first and last 40 ms. Audio ▸ High-Pass &
+#          Gain lists every stream, each opening its dialog.
+#        • A PORT THE CORE GAVE NO RATE HAS ITS RATE MEASURED. A real capture can leave a
+#          PCM port's sample rate unverified (0): its waveform drew, since it is placed at
+#          each sample's capture position, but it could not be high-passed (no Nyquist; the
+#          dialog said the rate was unknown), it played at a 48 kHz guess, and its title
+#          had no rate. The store now measures it from the samples' own spacing, the method
+#          PDM ports already used (averaged over head, middle and tail runs, so samples
+#          grouped onto a row do not fool it).
+#        • THE TYPE CHECK COVERS EVERY PLATFORM. mypy evaluates `sys.platform` checks for one
+#          platform, the host's, so code that runs only on Windows was never type-checked
+#          where the ratchet is comparable. tools/mypy_gate.py runs mypy for darwin, linux and
+#          win32 and compares each file's worst count against the baseline, naming the
+#          platform of a regression. The two findings it exposed, both `os.sysconf_names` in
+#          code Windows never reaches, are now guarded by platform rather than by `hasattr`,
+#          which mypy can follow, so all three platforms agree.
+#        • THE DIRECTED TESTS THAT REPORT ISSUES ON PURPOSE HAVE THEIR OWN FOLDER. The 18
+#          configs that exist to trip a bus clash, a placement rule or a warning are in
+#          `visualizer_examples/directed_tests/intentional_errors/`, so a reviewer opening the
+#          folder sees which results are expected; their goldens moved with them, unchanged.
+#          tests/test_cli.py now checks the folder as well as the README: every config in it
+#          reports an issue, and none outside it does.
+#        • TESTS THAT WOULD HAVE CAUGHT THE 3.0.19 REVIEW'S DEFECTS. Each of those passed a test
+#          that checked the field it set rather than what was derived from it, one operation
+#          at a time, on the happy path, in one argument position. tests/window_checks.py
+#          recomputes the window's derived state (band ranges, the remembered cursor instant,
+#          every Link index) from the Links; test_link_sequences runs seeded random sequences
+#          of Link operations and a save and reopen against it; test_load_queue_settles makes
+#          each stage of a load fail and requires the request to settle exactly once. With the
+#          review's fixes reverted, both sequence and load-queue suites fail at the step that
+#          causes each defect. They also found one more gap: a re-decode discarded because its
+#          Link was removed settled neither way; it now settles as failed. run.sh reads its
+#          arguments in one loop, and docs/DEVELOPMENT.md adds two review steps (trace every
+#          writer of the state a change touches; make each stage fail) and a rule for notes
+#          (a claim about every case names its test).
+#        • A CONFIG CSV IMPORTED INTO A MULTI-REGION CAPTURE APPLIES TO ITS REGION ONLY.
+#          Session.apply_config_csv puts the decoder in its CSV mode: one config from row 0,
+#          no snooped width changes, no re-sync. On a capture that reconfigures mid-stream
+#          that framed every region at the CSV's width; on a user's Safe-Lock-2 -> 8 -> 16
+#          capture an 8-column CSV turned 5,978 valid commands into 1,971 CRC-red ones and
+#          43M audio samples into 6M. The window warned, then did it anyway. With more than
+#          one region it now calls Session.apply_config_csv_at for the region under the
+#          cursor: the CSV's registers become that section's overrides (both ranks, so they
+#          are in effect without a commit) and its width a region pin, and the decoder builds
+#          that section's port config from them alone (DecoderSettings::
+#          importedConfigSections, score_abi 12), so a port the wire enabled and the CSV
+#          leaves out stops there too. Commands are still parsed from the wire. Its grid is
+#          drawn from the CSV, its registers are CSV in the Register Map (a what-if still wins
+#          as UI), the timeline says "8col (CSV)", and the source keeps it as
+#          "config_csv@<section>", which a workspace treats as a file. Section 0's overrides
+#          now also take effect at the decode start: later sections are opened by a
+#          reconfigure, which is where they are folded in, and section 0 had none unless the
+#          wire committed a config inside it. Decode ▸ Remove <file> from This Region (enabled
+#          while the cursor's region has one) takes it out. tests/test_region_csv_import.py.
+#        • A WHOLE-FILE .SAL DECODE TAKES LESS THAN HALF THE MEMORY. parse_channel_v3 kept
+#          every block's int64 deltas, concatenated them and cumsummed the concatenation:
+#          three full-size arrays for one result. It now checks the chain a block at a time
+#          and decodes each block again straight into the one uint64 output, through a uint64
+#          view (cumsum with dtype= casts a full copy first), and the over-long-code scan is
+#          two bool masks rather than three int64 arrays. A 54 MB capture with 302M
+#          transitions peaked at 8.6 GB and now at 3.7 GB, with identical edges. Its estimate
+#          was 14.0 GB, past the 8 GiB budget, so 64 GB and 96 GB machines were asked for a
+#          window; est_peak_bytes now uses _WHOLE_FILE_TRANSIENT = 2 (the output plus one
+#          block, which can be the whole channel) and predicts 7.2 GB. The streaming window
+#          keeps 4. The perf test's fixture grew to 10M transitions per channel, since 4M had
+#          fallen under its noise floor.
+#        • THE 8 GiB CAP IS A LABEL, AND THE DECODE IS WATCHED. memory_budget was min(0.6 x
+#          free, 8 GiB), so past 8 GiB an open was refused however much memory was free:
+#          the dialog chose a window and All raised SalTooLargeError. The cap's own reason
+#          was that past it the call is a person's, and it stood in for an estimate that
+#          under-predicted 3x. The budget is now 0.6 x free alone; 8 GiB is
+#          large_load_bytes(), which the dialog shows ("fits; large, ... may be slow").
+#          The decode after the load is not predicted: its audio runs from 0.014 samples per
+#          UI (flow-control demo) to 0.58 (PHY3), 0.17 on the user's capture, at ~114 B each
+#          at the peak, so a safe bound would have said ~30 GB for that capture's 5 GB.
+#          session.run_watched reads free memory every 0.25 s while Decoder.run() runs and,
+#          below saleae_sal.decode_memory_floor() (10% of RAM, at least 1 GiB), calls the new
+#          Decoder.request_stop() (checked every 64k UIs) and raises DecodeMemoryError; it
+#          also sizes the audio-column copy (Decoder.audio_count) before making it, since
+#          that copy cannot be stopped. A stopped re-decode restores the previous decoder
+#          and its source. tests/test_decode_memory_watchdog.py.
 # 3.0.19: several SWI3S Links side by side, Open Capture as one page, menus per mode with a
 #        Decode menu, and adjustable waveform colours; with the unreleased 3.0.18.
 #        3.0.18 was never released: its work ships in this release, and is listed below with
@@ -2649,7 +2766,7 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 #        ping-period stats, v0 .sal load memory fix; MIPI OSS release scaffolding.
 # 3.0.2: mode-grouped menus; per-mode File submenus; link-control timeline + timing.
 # 3.0.1: workspaces persist the TX-map + Hide-Clock view state.
-__version__ = "3.0.19"
+__version__ = "3.0.20"
 
 from .api import DecodeResult, decode, decode_capture
 from .ingest import saleae_binary

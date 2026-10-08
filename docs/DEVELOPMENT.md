@@ -138,6 +138,17 @@ The review that gates a release runs on the release branch/PR, not post-hoc on `
    mypy errors — because the brief said "verify by running tests" and lint/type was in no
    lens's scope. One of those findings (an f-string with no placeholder) was introduced by
    that very cycle and passed four reviewers.
+6. **Trace every writer of the state a change touches.** For each field the change reads
+   or writes, list everything that writes it, and check each writer keeps what is derived
+   from it current: a range computed from it, a memo keyed on it, a model built from it.
+   Reading the changed lines finds what they do wrong, not what a path that skips them
+   leaves stale. The 3.0.19 PR review found two defects this way that four lenses missed:
+   a workspace reopen assigned Link offsets directly, so the bands kept the range computed
+   at offset 0, and an offset change left the remembered cursor instant at the old offset.
+   `tests/window_checks.py` now recomputes that derived state for any test to compare.
+7. **Make each stage fail.** For a pipeline with callbacks (the load queue), the question
+   is not whether the happy path works but whether every request still ends, once, when
+   any stage raises. `tests/test_load_queue_settles.py` is the pattern.
 
 ## Mechanical sweeps (auto-fixers, formatters, bulk renames)
 
@@ -268,6 +279,13 @@ rather than a discipline:
 `tools/publish_tree.py` refuses to build a tree whose version has no notes file, or whose notes
 are still marked `(in development)`.
 
+**A claim about every case names the test that shows it.** "Each step allows less",
+"never", "always", "every": a sentence of that shape is a property, and a property either
+has a test or is a guess. When writing one, find the test; if there is none, write it or
+narrow the sentence. The 3.0.19 notes said each step of the memory-budget fallback allowed
+less than the one above it, and the test beside the code already said the steps are not
+ordered by size; the review found the sentence, no check could have.
+
 **What does NOT go in it:** anything about the publish mechanism. Which files were pruned, what
 was grafted and from where, and how the tree relates to the tag are all things the tool knows
 for a fact, so it generates that preamble. The notes file is about the software.
@@ -301,6 +319,11 @@ for a fact, so it generates that preamble. The notes file is about the software.
    *identical* tree. Rather than fail on an environment difference or pretend it checked,
    the step reports NOT COMPARABLE and the gate lists it. Run the ratchet where the baseline
    was taken, or re-baseline there (`python3 tools/mypy_gate.py --update`).
+
+   That does not leave the guests' code paths unchecked. The ratchet runs mypy once per
+   supported platform (`--platform darwin`, `linux`, `win32`) wherever it runs, and compares
+   each file's worst count, so a Windows-only branch is type-checked on the Mac with the
+   baseline's stubs. What the guests cannot do is compare against that baseline.
 
    The gate lives in that script, not in this list. It used to be prose here while
    `ci.yml` declared its own set; they drifted, the lint/type half was in CI but not here,

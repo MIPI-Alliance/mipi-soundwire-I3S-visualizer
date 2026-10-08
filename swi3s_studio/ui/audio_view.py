@@ -250,6 +250,9 @@ class AudioView(QWidget):
     #: a stream's colour was chosen from its checkbox menu: (device, dp, "#rrggbb"), or
     #: "" for Reset Color. The window keeps it as the shown Link's override.
     streamColorChosen = Signal(int, int, str)
+    # Right-click ▸ High-Pass & Gain… (dev, dp). The window owns the setting (it is the
+    # Link's), so the view only asks; Revert is in the dialog.
+    streamProcessingRequested = Signal(int, int)
     #: the visible X range changed: (start, end) in seconds of this capture (LinkLanes)
     viewRangeChanged = Signal(float, float)
     #: playback started (one output device: the window stops any other lane)
@@ -520,7 +523,8 @@ class AudioView(QWidget):
             for ch in store.channels(dev, dp):
                 color = _dp_color(dev, dp, self._stream_overrides)   # shared by a DP's channels
                 self._lane_colors[(dev, dp, ch)] = color
-                cb = QCheckBox(f"Dev{dev} DP{dp} CH{ch}")
+                cb = QCheckBox()
+                self._label_check(cb, dev, dp, ch)
                 cb.setChecked(True)
                 cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
                 cb.toggled.connect(lambda _on: self._rebuild_plots())
@@ -531,6 +535,21 @@ class AudioView(QWidget):
                 self._checks[(dev, dp, ch)] = cb
         self._chan_box.addStretch(1)
         self._rebuild_plots(preserve_zoom=False)
+
+    def _label_check(self, cb, dev: int, dp: int, ch: int) -> None:
+        """The channel's checkbox: an asterisk when the stream has a high-pass or gain (what
+        is drawn and played is then not the decoded samples), with the setting in its
+        tooltip. The track's title spells it out; the list is too narrow to."""
+        proc = self._store.processing(dev, dp) if self._store is not None else None
+        cb.setText(f"Dev{dev} DP{dp} CH{ch}" + (" *" if proc else ""))
+        cb.setToolTip(f"{proc.describe()}. Right-click ▸ High-Pass & Gain… to change or "
+                      "revert it." if proc else "")
+
+    def refresh_processing(self) -> None:
+        """The store's processing changed: relabel the channels and redraw the tracks."""
+        for (dev, dp, ch), cb in self._checks.items():
+            self._label_check(cb, dev, dp, ch)
+        self._rebuild_plots()
 
     def streams(self):
         """All (device, dataport) audio streams in the current store ([] if none)."""
@@ -567,8 +586,12 @@ class AudioView(QWidget):
         pick = menu.addAction("Color…")
         reset = menu.addAction("Reset Color")
         reset.setEnabled((dev, dp, VizTheme.MODE) in self._stream_overrides)
+        menu.addSeparator()
+        process = menu.addAction("High-Pass && Gain…")
         chosen = menu.exec(widget.mapToGlobal(pos))
-        if chosen is pick:
+        if chosen is process:
+            self.streamProcessingRequested.emit(dev, dp)
+        elif chosen is pick:
             c = QColorDialog.getColor(_dp_color(dev, dp, self._stream_overrides), self,
                                       f"Dev{dev} DP{dp} colour ({VizTheme.MODE} theme)")
             if c.isValid():
@@ -636,8 +659,10 @@ class AudioView(QWidget):
             rate = self._store.rate(dev, dp)             # stored/render rate (unused for x now)
             native = self._store.native_rate(dev, dp)    # on-bus rate (label)
             bits = self._store.sample_bits(dev, dp, ch)
+            proc = self._store.processing(dev, dp)
             title = (f"Dev{dev} · DP{dp} · CH{ch}"
-                     + (f" · {native/1000:.1f} kHz" if native else ""))
+                     + (f" · {native/1000:.1f} kHz" if native else "")
+                     + (f" · {proc.describe()}" if proc else ""))
             taxis = _TimeAxis(orientation="bottom")
             # X is capture samples, so the axis converts with the CAPTURE rate — the
             # labels are absolute capture time, matching the timeline / other panes.

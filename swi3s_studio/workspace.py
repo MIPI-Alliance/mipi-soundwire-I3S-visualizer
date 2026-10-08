@@ -10,10 +10,11 @@ the decode on load (fast, and keeps workspaces tiny + portable).
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+import os
+from dataclasses import asdict, dataclass, field, replace
+from typing import List, Optional, Tuple
 
-from .session import Session
+from .session import CSV_SECTION_KEY, Session
 
 WORKSPACE_VERSION = 4   # v4: per-Link state moves into `links` (one entry per Link, each with
 #                         its source and time offset); bookmarks carry the Link they are on.
@@ -52,6 +53,13 @@ class LinkSpec:
     # [device, dp, "dark"|"light", "#rrggbb"] (line_style.overrides_to_json). A view
     # preference, not a decode input; absent from workspaces saved before 3.0.19.
     stream_colors: list = field(default_factory=list)
+    # Per-stream high-pass and gain as [device, dp, {"highpass_hz", "gain_db",
+    # "allow_clipping"}] (StreamProcessing.to_json). Changes what the waveform, playback and
+    # export carry but not the decode; absent from workspaces saved before 3.0.20.
+    stream_processing: list = field(default_factory=list)
+    # The Link's own view (ui/view_state.py dicts): its Commands filter and column widths,
+    # and its Audio and Capture panes' channels, zoom and toggles. Absent before 3.0.20.
+    view: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d) -> "LinkSpec":
@@ -64,7 +72,13 @@ class LinkSpec:
                    device_names=d.get("device_names", {}),
                    device_hub_depths=d.get("device_hub_depths", {}),
                    device_scramblers=d.get("device_scramblers", []),
-                   stream_colors=d.get("stream_colors", []))
+                   stream_colors=d.get("stream_colors", []),
+                   stream_processing=d.get("stream_processing", []),
+                   view=_dict_or_empty(d.get("view")))
+
+
+def _dict_or_empty(v) -> dict:
+    return v if isinstance(v, dict) else {}
 
 
 @dataclass
@@ -120,13 +134,95 @@ class Workspace:
                    view=d.get("view", {}))    # migrated: it IS the current version now
 
     def save(self, path: str) -> None:
+        """Write the workspace, each capture file named relative to the workspace's folder
+        (and absolute as a fallback), so a folder holding both can be moved or shared."""
+        base = os.path.dirname(os.path.abspath(path))
+        out = replace(self, links=[replace(link, source=relative_source(link.source, base))
+                                   for link in self.links])
         with open(path, "w", encoding="utf-8") as f:
-            f.write(self.to_json())
+            f.write(out.to_json())
 
     @classmethod
     def load(cls, path: str) -> "Workspace":
+        """Read a workspace and find its capture files: relative to the workspace's folder
+        first, then where they were when it was saved. `missing_files` lists any not found."""
         with open(path, encoding="utf-8") as f:
-            return cls.from_json(f.read())
+            ws = cls.from_json(f.read())
+        base = os.path.dirname(os.path.abspath(path))
+        for link in ws.links:
+            link.source = resolve_source(link.source, base)
+        return ws
+
+    def missing_files(self) -> List[Tuple[int, str, str]]:
+        """(Link index, source key, path as saved) for each capture file not found."""
+        return [(i, key, str(link.source[key])) for i, link in enumerate(self.links)
+                for key in source_files(link.source) if not os.path.isfile(link.source[key])]
+
+    def locate(self, link: int, key: str, path: str) -> None:
+        """The user found a missing file at `path`. Any other missing file with the same
+        name in that folder is taken from there too: a capture folder moves as a whole."""
+        self.links[link].source = {**self.links[link].source, key: os.path.abspath(path)}
+        folder = os.path.dirname(os.path.abspath(path))
+        for i, k, saved in self.missing_files():
+            candidate = os.path.join(folder, os.path.basename(saved))
+            if os.path.isfile(candidate):
+                self.links[i].source = {**self.links[i].source, k: candidate}
+
+
+# A workspace file's extension. Older workspaces were "*.json" (often "*.swi3s.json"); they
+# still open.
+WORKSPACE_SUFFIX = ".swi3s"
+
+# Which keys of a source name files, by source type: an analog CSV's "clock" and "data" are
+# channel names, a .bin pair's are its two files. "config_csv" is a file for every type,
+# and so is each region's "config_csv@<n>" (Session.apply_config_csv_at).
+_FILE_KEYS = {"sal": ("path",), "digital_csv": ("path",), "vcd": ("path",),
+              "analog_csv": ("path",), "saleae_binary": ("clock", "data"),
+              "wfm": ("clock_path", "data_path")}
+_SAVED_AT = "saved_at"         # the absolute paths at save time, under this source key
+
+
+def source_files(source: dict) -> List[str]:
+    """The keys of `source` that hold a file path."""
+    keys = list(_FILE_KEYS.get(str(source.get("type")), ()))
+    if source.get("config_csv"):
+        keys.append("config_csv")
+    keys += sorted(k for k in source if str(k).startswith(CSV_SECTION_KEY))
+    return [k for k in keys if isinstance(source.get(k), str) and source.get(k)]
+
+
+def relative_source(source: dict, base: str) -> dict:
+    """`source` with each file relative to `base`, the absolute paths kept under
+    "saved_at". A file on another drive (Windows) stays absolute."""
+    out = dict(source)
+    saved = {}
+    for key in source_files(source):
+        full = os.path.abspath(source[key])
+        saved[key] = full
+        try:
+            out[key] = os.path.relpath(full, base).replace(os.sep, "/")
+        except ValueError:
+            out[key] = full
+    if saved:
+        out[_SAVED_AT] = saved
+    return out
+
+
+def resolve_source(source: dict, base: str) -> dict:
+    """`source` with each file as an absolute path that exists if one can be found: a
+    relative path against `base`, then the path it had when saved. A file found nowhere
+    keeps the path it was saved with, for `Workspace.missing_files` to report."""
+    out = {k: v for k, v in source.items() if k != _SAVED_AT}
+    saved = _dict_or_empty(source.get(_SAVED_AT))
+    for key in source_files(out):
+        p = out[key]
+        tries = [p] if os.path.isabs(p) else [os.path.join(base, p)]
+        if isinstance(saved.get(key), str):
+            tries.append(saved[key])
+        found = next((os.path.normpath(t) for t in tries if os.path.isfile(t)), None)
+        if found is not None:
+            out[key] = found
+    return out
 
 
 def session_from_source(source: dict, register_map=None) -> Session:

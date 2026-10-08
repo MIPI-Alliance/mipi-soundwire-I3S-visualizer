@@ -36,7 +36,8 @@ _FILE = {
 
 
 def _text(a):
-    return a.text().replace("&", "").split("\t")[0]
+    """An item as shown: mnemonic markers dropped, an escaped "&&" kept as one "&"."""
+    return a.text().replace("&&", "\0").replace("&", "").replace("\0", "&").split("\t")[0]
 
 
 def _bar(win):
@@ -115,11 +116,13 @@ def test_capture_items_wait_for_a_capture(win):
 
 def test_decode_holds_what_re_decodes_and_audio_is_playback(win):
     win._mode_mgr.switch_to(ANALYSIS)
-    assert _items(win._decode_menu) == ["Import Visualizer CSV…", "Force Column Count…",
+    assert _items(win._decode_menu) == ["Import Visualizer CSV…",
+                                        "Remove Region's Visualizer CSV", "Force Column Count…",
                                         "Hub Depths…", "Per-Dataport Scrambler…",
                                         "Manual SSP Move", "Block PDM DC Bias"]
     assert _items(win._audio_menu) == ["Playback Output Device", "Playback Bit Depth",
-                                       "Playback Decimation", "Export Audio as WAV…"]
+                                       "Playback Decimation", "High-Pass & Gain",
+                                       "Export Audio as WAV…"]
     assert _items(win._devices_menu) == ["Device Names…", "Peripheral Register Maps…"]
     assert "Signal Panes: All Links" in _items(win._links_menu)
 

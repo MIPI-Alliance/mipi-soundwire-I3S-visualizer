@@ -1055,6 +1055,7 @@ def test_a_multi_link_workspace_with_a_failing_middle_link_maps_the_rest_correct
     win2 = MainWindow()
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
+    monkeypatch.setattr(win2, "_ask_missing_capture", lambda *a: "skip")   # B's file is gone
     win2.open_workspace()
     pump_loads(win2)
     assert [(e.name, e.offset_ps) for e in win2.links] == [("A", 0), ("C", 9)]
@@ -1076,6 +1077,7 @@ def test_a_workspace_whose_first_link_fails_adds_nothing_to_the_open_analysis(
     Workspace(links=[LinkSpec(source=bad), LinkSpec(source=before.source)]).save(path)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
+    monkeypatch.setattr(win, "_ask_missing_capture", lambda *a: "skip")   # its file is gone
     win.open_workspace()
     pump_loads(win)
     assert len(win.links) == 1 and win._session is before

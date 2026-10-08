@@ -77,7 +77,8 @@ swi3s_studio/
                    # RegisterMap (driven by data/registers.json), provenance tracking
   analysis/        # link_control, cds_meaning, bus_timing (measured setup/hold eye),
                    # compare, responses (incl. per-device ping), errors
-  dsp/             # band-limited polyphase resampler + PDM→PCM decimation (resample.py)
+  dsp/             # band-limited polyphase resampler + PDM→PCM decimation (resample.py);
+                   # zero-phase Butterworth high-pass for per-stream processing (filters.py)
   timing/          # ported SWI3S PHY timing calculator (compute + worst-corner)
   ui/
     main_window.py # dockable layout, menu, session
@@ -191,7 +192,12 @@ dec.run()                                      # streaming, single pass
 ```
 
 Settings mirror the plugin: column-count (auto/forced), config CSV (mid-stream),
-decode-audio, PHY mode (PHY1, PHY2, PHY3).
+decode-audio, PHY mode (PHY1, PHY2, PHY3). Some are scoped to one config section (an index
+into `segments()`): what-if register overrides, a forced column count, and
+`imported_config_sections`, whose port config is built from that section's overrides
+alone rather than over the snoop. A config CSV imported into one region of a multi-region
+capture is those three together (`Session.apply_config_csv_at`); the global config CSV
+would frame every region at its width.
 
 ### Performance & language choice
 
@@ -323,6 +329,16 @@ others — Wireshark-style linked navigation.
   code, not a 1-bit two's-complement sample, so it is decoded to PCM at store-build
   time: `{0,1}→±1`, band-limited polyphase decimation to ~48 kHz (`dsp/resample.py`),
   then DC-blocked (mic density bias) and scaled — see `store.audio_store.decode_pdm`.
+  **Per-stream high-pass and gain** (`StreamProcessing`, the Audio pane's High-Pass & Gain
+  dialog) is applied INSIDE the store: `AudioStore.set_processing` replaces the stream's
+  channel arrays with processed ones and keeps the decoded arrays aside for Revert, so the
+  waveform, playback and WAV export all read the same samples with no change of their own.
+  The filter is `dsp/filters.py`: SciPy's Butterworth design and `sosfiltfilt` algorithm in
+  numpy, padded by three periods of the corner, with the per-sample recursion in the native
+  core (`swi3score.sosfilt`, `score_abi` 11) because numpy cannot vectorise it; a
+  10M-sample channel filters in about 0.13 s on the development Mac. The setting is the Link's
+  (`LinkPanelState.stream_processing`), re-applied to every new store a re-decode builds,
+  and saved per Link in the workspace.
 - **Timing** pane (pyqtgraph): measured **setup/hold** timing straight off the
   capture's clock/data edges (`analysis/bus_timing.py`) — per-polarity setup/hold
   histograms + a data-edge "eye", gated on real data transitions, with a margin
@@ -388,12 +404,19 @@ one bus). Links are independent buses, so nothing is decoded across them. Each i
 
   A request is superseded only by one that makes it pointless. A re-decode finds its Link
   by session identity, and rebinds only the groups that show that Link.
-- **Workspace v4.** One `workspace.LinkSpec` per Link holds its source (with the window,
-  in samples, when only part of the capture was decoded), name, offset, decode inputs and
-  any per-stream colours (`stream_colors`, omitted when there are none). With two or more
-  Links, the `view` also records each group's Link, whether Commands and the signal panes
-  show All Links (`bottom_all`), and the Timeline height. A v3 workspace loads as one Link
-  at offset 0.
+- **Workspace v4** (a `.swi3s` file; older `.json` ones still open). One
+  `workspace.LinkSpec` per Link holds its source (with the window, in samples, when only
+  part of the capture was decoded), name, offset, decode inputs, per-stream colours
+  (`stream_colors`) and High-Pass & Gain (`stream_processing`), and its own `view`: the
+  Commands filter and column widths and the Audio and Capture panes' state
+  (`ui/view_state.py`). The workspace `view` holds the window's: each group's Link, the
+  All Links choices, the Timeline height and zoom, the dock layout and geometry, the
+  Commands sort and hidden columns, and the Samples, Registers, Statistics and Timing
+  panes' settings, applied after the mode switch and again once the deferred layout
+  passes have run. `Workspace.save` writes each capture file relative to the workspace
+  (`source_files` knows which keys of each source type are files) with the absolute path
+  under `saved_at`; `Workspace.load` resolves them, and `missing_files` / `locate` let the
+  window ask for any it cannot find. A v3 workspace loads as one Link at offset 0.
 - **Bookmarks.** A bookmark stores its own Link's sample and that Link's index, so it moves
   with its Link's offset. Align on Bookmark Pair sets one Link's offset from a pair that
   marks the same event on two Links.
@@ -469,7 +492,7 @@ visualizer's Python version remains the cross-check oracle in tests.
 - A dedicated **error lane**: CRC, disparity, unexpected-token, device-mask
   cardinality violations — flagged on the timeline + table.
 - **Config-vs-decoded overlay** and **capture diff**.
-- **Session/workspace save** (loaded capture source + view state) as JSON.
+- **Session/workspace save** (loaded capture source + view state) as a `.swi3s` JSON file.
 - **Exports**: WAV (audio), CSV/Arrow (commands), SVG/PNG (grid).
 - A **synthetic `.sal` generator** (extending the plugin's simulation work) to
   test the whole pipeline, including large files.

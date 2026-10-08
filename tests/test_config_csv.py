@@ -435,7 +435,7 @@ def test_imposing_a_wider_config_warns_instead_of_silently_dropping_ports(monkey
         path = cfg.to_csv_file(os.path.join(d, "wide.csv"))
         win._apply_config_csv_path(path)                     # declined
         assert seen, "no warning shown — the drop is still silent"
-        assert "beyond the capture's decoded width" in seen["text"], seen["text"]
+        assert "decoded width of" in seen["text"], seen["text"]      # region or capture
         assert str(cap_cols) in seen["text"], seen["text"]
         assert "TooWide" in seen["text"], "the offending port is not named: " + seen["text"]
         assert not started, "declining the prompt must abort before the re-decode"
