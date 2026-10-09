@@ -486,20 +486,6 @@ def test_each_link_keeps_the_column_widths_the_user_set():
     assert win._cmd_view.columnWidth(0) == 321
 
 
-def test_the_pdm_preference_rebuilds_every_links_audio(monkeypatch):
-    """Block PDM DC Bias is window-wide, so no Link may keep audio decoded the old way."""
-    win, first, second = _with_added_link()
-    before = [e.view.audio_store for e in win.links]
-    win._pdm_dc_action.setChecked(not win._pdm_dc_action.isChecked())
-    pump_loads(win, 60.0)
-    after = [e.view.audio_store for e in win.links]
-    assert all(a is not b for a, b in zip(after, before)), "a Link kept its old audio store"
-    assert win.links.active_index == 1 and len(win.links) == 2
-    win._pdm_dc_action.setChecked(not win._pdm_dc_action.isChecked())   # restore the setting
-    pump_loads(win, 60.0)
-
-
-
 # ---- phase 4: the stacked timeline and the All Links Commands scope ----
 
 def test_the_timeline_stacks_a_band_per_link_on_one_time_scale():
@@ -1055,6 +1041,7 @@ def test_a_multi_link_workspace_with_a_failing_middle_link_maps_the_rest_correct
     win2 = MainWindow()
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
+    monkeypatch.setattr(win2, "_ask_missing_capture", lambda *a: "skip")   # B's file is gone
     win2.open_workspace()
     pump_loads(win2)
     assert [(e.name, e.offset_ps) for e in win2.links] == [("A", 0), ("C", 9)]
@@ -1076,6 +1063,7 @@ def test_a_workspace_whose_first_link_fails_adds_nothing_to_the_open_analysis(
     Workspace(links=[LinkSpec(source=bad), LinkSpec(source=before.source)]).save(path)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
+    monkeypatch.setattr(win, "_ask_missing_capture", lambda *a: "skip")   # its file is gone
     win.open_workspace()
     pump_loads(win)
     assert len(win.links) == 1 and win._session is before

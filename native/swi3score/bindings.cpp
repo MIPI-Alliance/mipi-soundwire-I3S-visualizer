@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
+#include <algorithm>          // std::copy
 #include <stdexcept>          // requireAudio() throws
 
 #include "ISampleSource.h"
@@ -15,6 +16,7 @@
 #include "CCommandTransportParser.h"
 #include "CCrc16.h"
 #include "CRegisterModel.h"
+#include "SosFilter.h"
 
 namespace py = pybind11;
 using namespace swi3score;
@@ -199,7 +201,14 @@ PYBIND11_MODULE(swi3score, m)
     //    a difference a user would chase as a real defect rather than a stale binary. The
     //    configToDict keys alone would not have justified it (the Python side reads them
     //    with `in`, so they degrade to defaults).
-    m.attr("score_abi") = 10;
+    // 11: sosfilt(sos, x, zi) -> (y, zf), the second-order-section IIR cascade the audio
+    //    high-pass runs on. Additive, but a feature depends on it, so an ABI-10 module asks
+    //    for a rebuild instead of failing with an AttributeError mid-dialog.
+    // 12: DecoderSettings gained imported_config_sections (a config CSV imported into one
+    //    region builds that region's port config from the CSV alone). Setting it on an
+    //    ABI-11 module raises AttributeError, and the region would keep the wire's ports.
+    //    Also Decoder.request_stop() / stopped, the memory watchdog's way to end a decode.
+    m.attr("score_abi") = 12;
 
     py::class_<ISampleSource>(m, "ISampleSource");
 
@@ -292,6 +301,11 @@ PYBIND11_MODULE(swi3score, m)
                        "mis-locked detector. Per-region because forcing one width over a "
                        "capture that genuinely reconfigures misframes the other regions. "
                        "Out-of-range counts (outside 2..32) are ignored.")
+        .def_readwrite("imported_config_sections", &DecoderSettings::importedConfigSections,
+                       "Section indices (keying segments()) whose payload config is "
+                       "built from their register_overrides alone, not from the snooped "
+                       "registers: a config CSV imported into that region. The wire "
+                       "still frames and parses its commands.")
         .def_readwrite("ssp_row", &DecoderSettings::sspRow,
                        "Manual Stream Sync Point: force row_in_interval==0 to this bus "
                        "row (-1 = off). A post-commit capture has no SSPA/SSCR, so ports "
@@ -335,6 +349,9 @@ PYBIND11_MODULE(swi3score, m)
              "AFTER copying them out with audio_columns(): every consumer downstream reads "
              "that copy, and a re-decode builds a new Decoder. Irreversible for this "
              "Decoder — audio()/audio_columns() then raise rather than report no audio.")
+        .def_property_readonly("audio_count", [](const Decoder& d) { return d.audio().size(); },
+             "Decoded audio samples held, without copying them out (the memory watchdog "
+             "sizes the column copy with it before making it).")
         .def("audio_released", [](const Decoder& d) { return d.audioReleased(); },
              "True once release_audio() has dropped the samples.")
         .def("audio_columns", [](const Decoder& d) {
@@ -415,6 +432,11 @@ PYBIND11_MODULE(swi3score, m)
         .def_property_readonly("total_uis", &Decoder::totalUis,
             "Total UI count for this run, fixed once run() starts; 0 if the source "
             "can't report one up front (pure streaming) — treat 0 as unknown, not done.")
+        .def("request_stop", &Decoder::requestStop,
+            "Ask an in-flight run() to stop (call from another thread; run() releases the "
+            "GIL). It returns within ~64k UIs with what it decoded so far.")
+        .def_property_readonly("stopped", &Decoder::stopped,
+            "True if the last run() returned early because of request_stop().")
         .def_property_readonly("progress", &Decoder::progress,
             "progress_uis / total_uis in [0, 1], or 0.0 if total_uis is unknown (0).")
         .def("segments", [](const Decoder& d) {
@@ -717,6 +739,33 @@ PYBIND11_MODULE(swi3score, m)
        "without perturbing the grid/audio config. NEXT display = next if has_next else "
        "cur; CURR = cur. The register map's value + provenance source, so register map "
        "/ grid / audio share one decode authority.");
+
+    m.def("sosfilt", [](py::array_t<double, py::array::c_style | py::array::forcecast> sos,
+                        py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                        py::array_t<double, py::array::c_style | py::array::forcecast> zi) {
+        if (sos.ndim() != 2 || sos.shape(1) != 6)
+            throw std::invalid_argument("sos must have shape (n_sections, 6)");
+        const auto nSec = static_cast<std::size_t>(sos.shape(0));
+        if (zi.ndim() != 2 || static_cast<std::size_t>(zi.shape(0)) != nSec || zi.shape(1) != 2)
+            throw std::invalid_argument("zi must have shape (n_sections, 2)");
+        if (x.ndim() != 1)
+            throw std::invalid_argument("x must be one-dimensional");
+        const double* c = sos.data();
+        for (std::size_t s = 0; s < nSec; ++s)
+            if (c[6 * s + 3] != 1.0)
+                throw std::invalid_argument("each section's a0 must be 1");
+        const auto n = static_cast<std::size_t>(x.shape(0));
+        py::array_t<double> y(n);
+        py::array_t<double> zf({static_cast<py::ssize_t>(nSec), static_cast<py::ssize_t>(2)});
+        std::copy(zi.data(), zi.data() + 2 * nSec, zf.mutable_data());
+        {
+            py::gil_scoped_release rel;
+            SosFilter(c, nSec, x.data(), y.mutable_data(), n, zf.mutable_data());
+        }
+        return py::make_tuple(y, zf);
+    }, py::arg("sos"), py::arg("x"), py::arg("zi"),
+       "Second-order-section IIR cascade (transposed direct form II, as scipy.signal.sosfilt).\n"
+       "Returns (y, zf): the filtered signal and each section's final state.");
 
     m.def("grid_from_csv", [](const std::string& csvPath, int rows) {
         py::list out;

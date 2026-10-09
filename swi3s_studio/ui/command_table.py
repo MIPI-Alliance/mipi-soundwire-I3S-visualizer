@@ -512,7 +512,12 @@ class CommandFilterProxy(QSortFilterProxyModel):
 
     def set_text(self, text: str) -> None:
         ast = parse_filter(text)
+        self._text_src = str(text)
         self._refilter(lambda: setattr(self, "_text_ast", ast))
+
+    def filter_text(self) -> str:
+        """The text filter as typed (the parsed form is what filters)."""
+        return getattr(self, "_text_src", "")
 
     def set_kinds(self, kinds, none: bool = False) -> None:
         """Show only these command kinds (empty set = all), or with `none`, no command."""

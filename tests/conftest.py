@@ -108,7 +108,7 @@ def _no_unexpected_modal(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fresh_settings():
     """Every test starts with no saved settings: the default appearance, waveform colours
-    and weights, folders, the PDM DC-bias choice. They are shared by the whole run, so one
+    and weights, folders. They are shared by the whole run, so one
     test's saved choice (or one left behind by a failed assertion before its restore)
     would otherwise reach every test after it."""
     from swi3s_studio.ui import line_style

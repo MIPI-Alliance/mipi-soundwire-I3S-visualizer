@@ -34,4 +34,13 @@ class LinkPanelState:
     col_widths: Any = None                  # Commands column widths, kept while switched away
     eye_cache: dict = field(default_factory=dict)     # Timing pane's measurement (cached)
     stream_colors: dict = field(default_factory=dict)  # (device, dp, theme) -> "#rrggbb"
+    # Per-stream Filter & Gain (DC blocker, high-pass, gain), (device, dp) -> StreamProcessing. The Link's choice,
+    # re-applied to each new audio store (a re-decode builds one) and saved per Link.
+    stream_processing: dict = field(default_factory=dict)
+    # The Audio and Capture panes' view of this Link (ui/view_state.py dicts): checked
+    # channels, zoom, Vertical Zoom, decimation, toggles. Saved when a pane stops showing
+    # the Link and re-applied when one shows it again, so a Link switch or a re-decode keeps
+    # them, and saved in the workspace. None: not seen yet, so the panes' defaults.
+    audio_view: Any = None
+    capture_view: Any = None
     #                                                    (line_style.Overrides)

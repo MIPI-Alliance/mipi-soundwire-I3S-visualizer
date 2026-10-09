@@ -131,7 +131,8 @@ def test_a_lane_colour_is_its_links(two, monkeypatch):
     win, first, second = two
     _raws, audios = _lanes(win)
     (dev, dp, _ch), cb = next(iter(audios[1]._checks.items()))
-    monkeypatch.setattr(QMenu, "exec", lambda m, *_a: m.actions()[0])
+    monkeypatch.setattr(QMenu, "exec", lambda m, *_a: next(
+        a for a in m.actions() if a.text() == "Color…"))        # by name, not position
     monkeypatch.setattr(QColorDialog, "getColor", lambda *a, **k: QColor("#123456"))
     audios[1]._stream_menu(cb, QPoint(0, 0), dev, dp)
     assert win.links[1].view.stream_colors == {(dev, dp, "dark"): "#123456"}

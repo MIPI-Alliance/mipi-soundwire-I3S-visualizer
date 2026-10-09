@@ -79,8 +79,9 @@ from ..model import RegisterMap, viz_engine
 from ..model.bookmarks import BookmarkSet
 from ..model.bus_config import BusConfig, cds_symbol, demo_config
 from ..session import Session
-from ..workspace import LinkSpec, Workspace, session_from_source
-from . import line_style, timers
+from ..workspace import WORKSPACE_SUFFIX, LinkSpec, Workspace, session_from_source
+from ..workspace import source_files as workspace_source_files
+from . import line_style, timers, view_state
 from .audio_view import AudioView
 from .authoring import AuthoringPanel
 from .command_table import (
@@ -98,6 +99,7 @@ from .link_state import LinkPanelState
 from .measurements_view import MeasurementsView
 from .mode_controller import ANALYSIS, MODES, TIMING, VISUALIZATION, ModeManager
 from .pair_measure_view import PairMeasureView
+from .port_names import port_label, with_name
 from .raw_view import RawCaptureView
 from .register_view import RegisterView
 from .symbol_view import SymbolView
@@ -215,6 +217,22 @@ def _demo_samples() -> int:
         return 48000
 
 
+def _processing_from_json(rows) -> dict:
+    """A workspace's [device, dp, {...}] stream settings as {(device, dp): StreamProcessing},
+    skipping any row that does not read as one (a hand-edited or damaged workspace)."""
+    from ..store.audio_store import StreamProcessing
+    out = {}
+    for row in rows or []:
+        try:
+            dev, dp, d = int(row[0]), int(row[1]), row[2]
+        except (TypeError, ValueError, IndexError):
+            continue
+        proc = StreamProcessing.from_json(d)
+        if proc is not None and not proc.is_identity():
+            out[(dev, dp)] = proc
+    return out
+
+
 def _fmt_duration(seconds: float) -> str:
     """Human 'Δ time' for a bookmark pair: pick s / ms / µs / ns by magnitude."""
     a = abs(seconds)
@@ -268,10 +286,9 @@ class _LoadWorker(QObject):
     failed = Signal(str)
     progress = Signal(str)                  # human phase label for the busy dialog
 
-    def __init__(self, factory, pdm_dc_block: bool = False) -> None:
+    def __init__(self, factory) -> None:
         super().__init__()
         self._factory = factory
-        self._pdm_dc_block = pdm_dc_block
         self.decoder = None   # set via decoder_ready, BEFORE run() blocks on the decode —
                                # the GUI thread polls .progress_uis/.total_uis off this while
                                # the C++ decode runs here (it releases the GIL; see Session)
@@ -296,7 +313,7 @@ class _LoadWorker(QObject):
                 n = 0
             self.progress.emit(f"Reconstructing audio — {n:,} samples…" if n
                                else "Reconstructing audio…")
-            store = session.audio_store(pdm_dc_block=self._pdm_dc_block)
+            store = session.audio_store()
             self.progress.emit("Measuring bus sections…")
             extras = {"sections": session.section_ui_stats()}
         except Exception as exc:  # noqa: BLE001 - surfaced to the user via `failed`
@@ -680,9 +697,6 @@ class MainWindow(QMainWindow):
 
         self._rmap = register_map or RegisterMap.load()
         self._appearance_pref = saved_preference()   # 'dark' | 'light' | 'system'
-        # PDM DC-block preference (default OFF): with it off the analyzer shows the
-        # true density (all-ones → +1); on, it removes a real mic's density bias.
-        self._pdm_dc_block = QSettings().value("audio/pdm_dc_block", False, type=bool)
         # The analysis's Links; the per-Link attributes read the active one's state, and
         # this idle state while there is none.
         self._links = LinkSet()
@@ -1627,6 +1641,10 @@ class MainWindow(QMainWindow):
         dec = self.menuBar().addMenu("&Decode")
         self._decode_menu = dec
         dec.addAction("&Import Visualizer CSV…", self._for_group("grid", self.open_visualizer_config))
+        # Enabled only while the cursor's region has a CSV of its own (set as the menu opens).
+        self._remove_region_csv_action = dec.addAction(
+            "&Remove Region's Visualizer CSV", self._for_group("grid", self.remove_region_csv))
+        dec.aboutToShow.connect(self._update_remove_region_csv)
         dec.addAction("&Force Column Count…", self._for_group("grid", self.force_column_count))
         dec.addAction("&Hub Depths…", self._for_group("right", self.manage_hub_depths))
         dec.addSeparator()
@@ -1644,16 +1662,6 @@ class MainWindow(QMainWindow):
         ssp.addAction("Move SSP &+1 Row\tCtrl+L",
                       self._for_group("bottom", lambda: self.step_ssp_row(+1))).setShortcut("Ctrl+L")
         ssp.addAction("&Clear Manual SSP", self._for_group("bottom", lambda: self.set_ssp_row_async(-1)))
-        # PDM DC-block toggle (default OFF): off shows the true density on the wire
-        # (all-ones → +1 DC); on removes a real mic's density bias for listening.
-        self._pdm_dc_action = dec.addAction("Block &PDM DC Bias")
-        self._pdm_dc_action.setCheckable(True)
-        self._pdm_dc_action.setChecked(self._pdm_dc_block)
-        self._pdm_dc_action.setToolTip(
-            "Off: decode the true PDM density (a constant all-ones stream reads full-"
-            "scale +1). On: subtract the mean so a real mic's density bias doesn't "
-            "swamp the audio (a constant/DC pattern then reads ~0).")
-        self._pdm_dc_action.toggled.connect(self._on_pdm_dc_toggled)
 
         rm = self.menuBar().addMenu("&Devices")
         self._devices_menu = rm
@@ -1667,6 +1675,9 @@ class MainWindow(QMainWindow):
         # Built as it opens, for the Audio view the menu acts on NOW: in All Links that is
         # the active Link's lane, which a bind (lane by lane) cannot know.
         self._play_rate_menu.aboutToShow.connect(self._build_decimation_menu)
+        a.addSeparator()
+        self._process_menu = a.addMenu("&Filter && Gain")
+        self._process_menu.aboutToShow.connect(self._build_processing_menu)
         a.addSeparator()
         self._export_action = a.addAction("&Export Audio as WAV…", self._for_group("bottom", self.export_audio))
         self._audio_menu = a
@@ -2205,8 +2216,9 @@ class MainWindow(QMainWindow):
             act = m.addAction("(load a capture with audio)")
             act.setEnabled(False)
             return
+        names = self._lane_session_names(av)
         for dev, dp in streams:
-            sub = m.addMenu(f"Device {dev} · DP{dp}")
+            sub = m.addMenu(with_name(names, dev, dp, f"Device {dev} · DP{dp}"))
             self._play_rate_subs.append(sub)
             group = QActionGroup(self)
             group.setExclusive(True)
@@ -2219,6 +2231,27 @@ class MainWindow(QMainWindow):
                     lambda _c=False, d=dev, p=dp, r=hz: av.set_play_rate_target(d, p, r))
                 group.addAction(act)
             self._play_rate_groups.append(group)
+
+    def _build_processing_menu(self) -> None:
+        """(Re)build Audio ▸ Filter & Gain for the Audio view the menu acts on: one
+        entry per stream opening its dialog (where Revert is), an asterisk on those that
+        have a setting."""
+        av = self._audio_lane()
+        m = self._process_menu
+        m.clear()
+        streams = av.streams()
+        if not streams:
+            act = m.addAction("(load a capture with audio)")
+            act.setEnabled(False)
+            return
+        link = self._lane_link(av)
+        store = av._store
+        names = self._lane_session_names(av)
+        for dev, dp in streams:
+            on = store is not None and store.processing(dev, dp) is not None
+            m.addAction(with_name(names, dev, dp, f"Device {dev} · DP{dp}") + "…"
+                        + (" *" if on else ""),
+                        lambda d=dev, p=dp: self.edit_stream_processing(d, p, link=link))
 
     def show_keyboard_shortcuts(self) -> None:
         """Help ▸ Keyboard Shortcuts: the full keymap, grouped. Keep this in sync when
@@ -2560,67 +2593,82 @@ class MainWindow(QMainWindow):
         """Impose a Visualizer config CSV on the ALREADY-OPEN capture (no reopen): re-decode
         with it AND seed the bus grid + register map from it (Provenance.CSV — "CSV Import"),
         so a post-commit capture matches the CSV. Runs the re-decode on the worker thread
-        (same path as the Scrambler override); the cursor and bookmarks are kept."""
-        # A config CSV is imposed as ONE config from row 0. Two ways that can quietly not
-        # mean what the user expects — collected into ONE prompt rather than two in a row:
-        #
-        #  * a capture that reconfigures mid-stream (e.g. a DLV cold start: Safe-Lock-4 ->
-        #    16-col) has several configs, so the single imposed one can match only one region
-        #    and will misframe the others (their commands go CRC-red);
-        #  * a port whose columns lie beyond the capture's decoded width is simply NOT
-        #    PLACED. That was silent: the grid just came back narrower with fewer ports, which
-        #    reads as "the config didn't load" rather than "this config is wider than this
-        #    capture". Same family as the warning above, same import path.
-        if self._session is not None:
-            concerns = []
-            widths = sorted({int(s.get("column_count", 0)) for s in self._session.segments})
-            if len(widths) > 1:
+        (same path as the Scrambler override); the cursor and bookmarks are kept.
+
+        A capture with SEVERAL config regions takes the CSV into the region under the
+        cursor only (Session.apply_config_csv_at). A CSV describes one bus config, and the
+        whole-capture import framed every region at its width: on a Safe-Lock-2 -> 8 -> 16
+        capture that turned every command CRC-red and lost the other regions' audio. It
+        used to warn about that and then do it anyway; there was no way to do the right
+        thing. A capture with one region keeps the whole-capture import, which is what a
+        post-commit capture (no config on the wire at all) needs."""
+        s = self._session
+        if s is None:
+            return
+        regions = len(s.segments or [])
+        cursor = self.cursor.sample
+        scoped = regions > 1
+        sect = s.segment_index_for_sample(int(cursor)) if scoped else 0
+        # Two ways the import can quietly not mean what the user expects, collected into
+        # ONE prompt rather than two in a row:
+        #  * the CSV's width is not the region's: the region will be framed at the CSV's;
+        #  * a port whose columns lie beyond the width is simply NOT PLACED. That was
+        #    silent: the grid just came back narrower with fewer ports, which reads as
+        #    "the config didn't load" rather than "this config is wider than this capture".
+        concerns = []
+        cap_cols = int((s.column_count_at(int(cursor)) if scoped
+                        else getattr(s, "column_count", 0)) or 0)
+        try:
+            cfg = self._bus_config_from_csv(csv)
+        except Exception:                     # noqa: BLE001 — unreadable CSV is
+            cfg = None                        # reported by the caller, not here
+        where = f"region {sect + 1} of {regions}" if scoped else "the capture"
+        if cfg is not None and cap_cols > 0:
+            csv_cols = int(cfg.column_count())
+            if scoped and csv_cols != cap_cols:
                 concerns.append(
-                    f"This capture reconfigures mid-stream ({len(self._session.segments)} "
-                    f"regions, column widths {', '.join(map(str, widths))}). A config CSV is "
-                    "imposed from row 0, so it can match only one region and will misframe "
-                    "the others (their commands turn red).")
-            cap_cols = int(getattr(self._session, "column_count", 0) or 0)
-            if cap_cols > 0:
-                try:
-                    cfg = self._bus_config_from_csv(csv)
-                except Exception:                     # noqa: BLE001 — unreadable CSV is
-                    cfg = None                        # reported by the caller, not here
-                if cfg is not None:
-                    # horizontal_count is excess-1, so the last column owned is start+count.
-                    over = [(i, dp) for i, dp in enumerate(cfg.dataports)
-                            if dp.enabled and dp.enable_ch
-                            and dp.horizontal_start + dp.horizontal_count >= cap_cols]
-                    if over:
-                        names = ", ".join(
-                            f"{dp.name or f'DP{i}'} (cols "
-                            f"{dp.horizontal_start}-{dp.horizontal_start + dp.horizontal_count})"
-                            for i, dp in over)
-                        concerns.append(
-                            f"{len(over)} port(s) in this config need columns beyond the "
-                            f"capture's decoded width of {cap_cols}: {names}. They will not "
-                            "be placed, and the grid will come back without them.")
-            if concerns:
-                resp = QMessageBox.warning(
-                    self, "Import Visualizer CSV",
-                    "\n\n".join(concerns) + "\n\nImpose it anyway?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if resp != QMessageBox.Yes:
-                    return
+                    f"This CSV is a {csv_cols}-column config, and {where} is {cap_cols} "
+                    f"columns on the wire. The region will be decoded at {csv_cols} columns.")
+                cap_cols = csv_cols
+            # horizontal_count is excess-1, so the last column owned is start+count.
+            over = [(i, dp) for i, dp in enumerate(cfg.dataports)
+                    if dp.enabled and dp.enable_ch
+                    and dp.horizontal_start + dp.horizontal_count >= cap_cols]
+            if over:
+                names = ", ".join(
+                    f"{dp.name or f'DP{i}'} (cols "
+                    f"{dp.horizontal_start}-{dp.horizontal_start + dp.horizontal_count})"
+                    for i, dp in over)
+                whose = "region" if scoped else "capture"
+                concerns.append(
+                    f"{len(over)} port(s) in this config need columns beyond the "
+                    f"{whose}'s decoded width of {cap_cols}: {names}. They will not "
+                    "be placed, and the grid will come back without them.")
+        if concerns:
+            resp = QMessageBox.warning(
+                self, "Import Visualizer CSV",
+                "\n\n".join(concerns) + f"\n\nImpose it on {where} anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp != QMessageBox.Yes:
+                return
         self._stop_audio()
         # Bookmarks need no snapshot: a re-decode keeps its Link, and with it the bookmarks.
-        sess, keep_cursor = self._session, self.cursor.sample
+        sess, keep_cursor = s, cursor
 
-        def apply(s=sess, p=csv):
-            s.apply_config_csv(p)
+        def apply(s=sess, p=csv, at=cursor):
+            if scoped:
+                s.apply_config_csv_at(int(at), p)
+            else:
+                s.apply_config_csv(p)
             return s
 
-        def done(_s, cur=keep_cursor, p=csv):
+        def done(_s, cur=keep_cursor, p=csv, w=where):
             if _s is not self._session:
                 return                  # another Link was shown meanwhile; nothing to restore
             self._restore_cursor(cur)
-            self._status.setText(f"Imposed {os.path.basename(p)} on the capture "
-                                 f"(grid + register map from CSV; re-decoded).")
+            rest = " The other regions decode as the wire says." if scoped else ""
+            self._status.setText(f"Imposed {os.path.basename(p)} on {w} "
+                                 f"(grid + register map from CSV; re-decoded).{rest}")
 
         self._load_async(apply, after=done, kind="redecode")
 
@@ -2672,6 +2720,42 @@ class MainWindow(QMainWindow):
         else:
             s.set_label_fields(device, dp, dlg.fields)
         self._update_grid_for_cursor(self.cursor.sample)
+
+    def _update_remove_region_csv(self) -> None:
+        s = self._session
+        path = s.csv_section_at(self.cursor.sample) if s is not None else ""
+        act = self._remove_region_csv_action
+        act.setEnabled(bool(path))
+        act.setText(f"&Remove {os.path.basename(path)} from This Region" if path
+                    else "&Remove Region's Visualizer CSV")
+
+    def remove_region_csv(self) -> None:
+        """Decode ▸ Remove … from This Region: drop the config CSV imported into the region
+        under the cursor (Session.apply_config_csv_at with no path) and re-decode, so the
+        region decodes as the wire says again. Other regions' CSVs stay."""
+        s = self._session
+        if s is None:
+            return
+        sample = self.cursor.sample
+        path = s.csv_section_at(sample)
+        if not path:
+            self._status.setText("The region under the cursor has no imported CSV.")
+            return
+        self._stop_audio()
+        sect = s.segment_index_for_sample(int(sample))
+
+        def apply(_s=s, smp=sample):
+            _s.apply_config_csv_at(int(smp), None)
+            return _s
+
+        def done(_s, cur=sample, name=os.path.basename(path), i=sect):
+            if _s is not self._session:
+                return                  # another Link was shown meanwhile; nothing to restore
+            self._restore_cursor(cur)
+            self._status.setText(f"Removed {name} from region {i + 1} (re-decoded as the wire "
+                                 "says).")
+
+        self._load_async(apply, after=done, kind="redecode")
 
     def force_column_count(self) -> None:
         """Decode ▸ Force Column Count: pin the bus column count for the config
@@ -2775,7 +2859,8 @@ class MainWindow(QMainWindow):
             budget = 0
         dlg = OpenCaptureDialog(pr, [link.name for link in self._links], self,
                                 prefer_add=prefer_add and len(self._links) > 0,
-                                budget_bytes=budget)
+                                budget_bytes=budget,
+                                large_bytes=saleae_sal.large_load_bytes())
         if dlg.exec() != QDialog.Accepted:
             return
         self._open_request(pr, dlg.result_request(), config_csv=config_csv)
@@ -3213,11 +3298,14 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save workspace",
-            os.path.join(self._last_capture_dir("analyzer"), "workspace.swi3s.json"),
-            "Workspace (*.json)")
+            os.path.join(self._last_capture_dir("analyzer"), f"workspace{WORKSPACE_SUFFIX}"),
+            f"Workspace (*{WORKSPACE_SUFFIX})")
         if not path:
             return
+        if not os.path.splitext(path)[1]:         # an extension the user typed is kept
+            path += WORKSPACE_SUFFIX
         self._remember_capture_dir(path, "analyzer")
+        self._keep_shown_views()                  # the panes on screen, into their Links
         ws = Workspace(
             links=[self._link_spec(link) for link in self._links],
             active_link=self._links.active_index,
@@ -3229,7 +3317,8 @@ class MainWindow(QMainWindow):
             view={**self._link_view_prefs(),
                   "tx_map": self._tx_map, "tx_persist": self._tx_persist,
                   "grid_rows": self._grid_rows, "tx_start_row": self._tx_start_row,
-                  "show_clock": self._raw_view.show_clock},
+                  "show_clock": self._raw_view.show_clock,
+                  **self._window_view_state()},
         )
         try:
             ws.save(path)
@@ -3288,12 +3377,18 @@ class MainWindow(QMainWindow):
                                for (d, p), on in sess.scrambler_overrides.items()],
             stream_colors=line_style.overrides_to_json(
                 getattr(link.view, "stream_colors", None) or {}),
+            stream_processing=[[int(d), int(p), proc.to_json()] for (d, p), proc in
+                               sorted((getattr(link.view, "stream_processing", None)
+                                       or {}).items())],
+            view={"commands": {"filters": view_state.filters_to_json(link.view.filters),
+                               "col_widths": list(link.view.col_widths or [])},
+                  "audio": link.view.audio_view, "capture": link.view.capture_view},
         )
 
     def open_workspace(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open workspace", self._last_capture_dir("analyzer"),
-            "Workspace (*.json)")
+            f"Workspace (*{WORKSPACE_SUFFIX} *.json)")
         if not path:
             return
         self._remember_capture_dir(path, "analyzer")
@@ -3301,6 +3396,8 @@ class MainWindow(QMainWindow):
             ws = Workspace.load(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        if not self._locate_missing_captures(ws, path):
             return
         # Apply saved hub depths AND what-if register overrides inside the worker-
         # thread factory (both change the decode), in a single off-GUI-thread decode per
@@ -3400,6 +3497,10 @@ class MainWindow(QMainWindow):
             link.offset_ps = int(spec.offset_ps)
             if link.view is not None:
                 link.view.stream_colors = line_style.overrides_from_json(spec.stream_colors)
+                link.view.stream_processing = _processing_from_json(spec.stream_processing)
+                if link.view.stream_processing:   # the panes were drawn before it arrived
+                    self._apply_stream_processing(link.view)
+                    self._refresh_processed_views(link_i)
             # Device names and register maps are UI metadata (cheap). Hub depths were
             # already applied in the worker-thread factory and reflected by load_session,
             # so there's no re-decode here.
@@ -3449,6 +3550,171 @@ class MainWindow(QMainWindow):
         self._apply_link_view_prefs(view, active)
         if ws.mode in MODES:
             self._mode_mgr.switch_to(ws.mode)
+        self._apply_saved_views(ws, where)
+        self._apply_window_view_state(view)
+
+    def _locate_missing_captures(self, ws: Workspace, ws_path: str) -> bool:
+        """Ask about each capture file a workspace names that is neither where the workspace
+        says (relative to it) nor where it was when saved: Locate it, Skip that Link (it
+        fails to load and the rest open, as any Link that fails does), or Cancel the open.
+        False on Cancel: nothing opens."""
+        skipped: set = set()
+        while True:
+            missing = [m for m in ws.missing_files() if m[:2] not in skipped]
+            if not missing:
+                return True
+            i, key, saved = missing[0]
+            answer = self._ask_missing_capture(ws.links[i].name, saved, len(missing) - 1)
+            if answer == "cancel":
+                return False
+            if answer == "skip":
+                skipped.update((i, k) for k in workspace_source_files(ws.links[i].source))
+                continue
+            name = os.path.basename(saved)
+            ext = os.path.splitext(name)[1]
+            found, _ = QFileDialog.getOpenFileName(
+                self, f"Locate {name}", os.path.dirname(os.path.abspath(ws_path)),
+                f"{name} (*{ext});;All files (*)" if ext else "All files (*)")
+            if found:
+                ws.locate(i, key, found)
+
+    def _ask_missing_capture(self, link_name: str, saved: str, others: int) -> str:
+        """"locate", "skip" or "cancel" for one capture file a workspace cannot find."""
+        box = QMessageBox(QMessageBox.Warning, "Capture not found",
+                          f"{link_name}'s capture file was not found:\n{saved}", parent=self)
+        more = f" {others} other file(s) are also missing." if others else ""
+        box.setInformativeText("Locate it, or skip this Link and open the rest." + more)
+        locate = box.addButton("Locate…", QMessageBox.AcceptRole)
+        skip = box.addButton("Skip This Link", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(locate)
+        box.exec()
+        clicked = box.clickedButton()
+        return "locate" if clicked is locate else "skip" if clicked is skip else "cancel"
+
+    # ---- the whole view, for a workspace ----
+    def _keep_shown_views(self) -> None:
+        """Leave what the panes on screen show with the Links they show it for."""
+        for _k, raw, audio in self._bottom_lanes():
+            self._keep_lane_view(raw, audio)
+        if not self._cmd_all:
+            self._save_commands_view(self._pane_link["commands"])
+
+    def _window_view_state(self) -> dict:
+        """What a workspace records of the window, beyond each Link's own view."""
+        from base64 import b64encode
+        a = self._links.active_index
+        timeline = None
+        if 0 <= a < len(self._ribbons) and a < len(self._links):
+            r = self._ribbons[a]
+            timeline = [self._links[a].to_ps(round(r._view_lo)),
+                        self._links[a].to_ps(round(r._view_hi))]
+        out = {
+            "window": {"geometry": b64encode(bytes(self.saveGeometry())).decode("ascii"),
+                       "docks": b64encode(bytes(self.saveState())).decode("ascii")},
+            "timeline_ps": timeline,
+            "commands_header": view_state.commands_header_state(self._cmd_view),
+            "samples": view_state.samples_state(self._sample_view),
+            "registers": view_state.registers_state(self._reg_view),
+            "statistics": view_state.statistics_state(self._meas_view),
+            "timing_pane": view_state.timing_state(self._eye_view),
+        }
+        if self._cmd_all:
+            out["all_links_commands"] = {
+                "filters": view_state.filters_to_json(self._filter_snapshot()),
+                "col_widths": self._command_column_widths()}
+        return out
+
+    def _apply_saved_views(self, ws: Workspace, where: dict) -> None:
+        """Each Link's own view from the workspace: kept with the Link, and shown on the
+        panes that show it now."""
+        for spec_i, link_i in where.items():
+            spec, st = ws.links[spec_i], self._links[link_i].view
+            v = spec.view if isinstance(spec.view, dict) else {}
+            raw_cmd = v.get("commands")
+            cmd: dict = raw_cmd if isinstance(raw_cmd, dict) else {}
+            st.filters = view_state.filters_from_json(cmd.get("filters")) or st.filters
+            widths = cmd.get("col_widths")
+            if isinstance(widths, list) and all(isinstance(w, int) for w in widths) and widths:
+                st.col_widths = widths
+            st.audio_view = v.get("audio") if isinstance(v.get("audio"), dict) else st.audio_view
+            st.capture_view = (v.get("capture") if isinstance(v.get("capture"), dict)
+                               else st.capture_view)
+        for k, raw, audio in self._bottom_lanes():
+            st = self._links[k].view
+            view_state.restore_audio(audio, st.audio_view, zoom=not self._bottom_all)
+            view_state.restore_capture(raw, st.capture_view, zoom=not self._bottom_all)
+            audio._shown_state = raw._shown_state = st
+        if not self._cmd_all:
+            st = self._links[self._pane_link["commands"]].view
+            if st.filters is not None:
+                self._restore_filters(st.filters)
+            self._apply_column_widths(st.col_widths)
+
+    def _all_kinds(self) -> list:
+        """The command kinds the All Links table can show: every Link's."""
+        return sorted(set().union(*(set(link.view.kinds) for link in self._links)))
+
+    def _apply_column_widths(self, widths) -> None:
+        model = self._cmd_view.model()
+        if not widths or model is None or len(widths) != model.columnCount():
+            return
+        for c, w in enumerate(widths):
+            self._cmd_view.setColumnWidth(c, int(w))
+
+    def _apply_window_view_state(self, view: dict) -> None:
+        """The window-wide part of a saved view, after every Link is bound and the mode
+        is set: the panes' own state, the timeline's zoom, and last the window and dock
+        layout, applied again once the deferred layout passes have run."""
+        allc = view.get("all_links_commands")
+        if self._cmd_all and isinstance(allc, dict):
+            snap = view_state.filters_from_json(allc.get("filters"))
+            if snap is not None:
+                self._restore_filters(snap, kinds=self._all_kinds())     # every Link's
+            self._apply_column_widths(allc.get("col_widths"))
+        view_state.restore_commands_header(self._cmd_view, view.get("commands_header"))
+        if "show_clock" in view:                   # lanes made after _apply_view_prefs ran
+            for v in self._raw_lanes.views:
+                v.set_show_clock(bool(view.get("show_clock", True)))
+        view_state.restore_samples(self._sample_view, view.get("samples"))
+        view_state.restore_registers(self._reg_view, view.get("registers"))
+        view_state.restore_statistics(self._meas_view, view.get("statistics"))
+        view_state.restore_timing(self._eye_view, view.get("timing_pane"))
+        self._apply_timeline_zoom(view.get("timeline_ps"))
+        win = view.get("window")
+        if isinstance(win, dict):
+            self._analysis_laid_out = True         # not the one-time default over it
+            self._restore_window(win)
+
+            def again() -> None:
+                self._restore_window(win)
+            timers.after(0, self, again)
+
+    def _apply_timeline_zoom(self, rng) -> None:
+        a = self._links.active_index
+        try:
+            lo_ps, hi_ps = int(rng[0]), int(rng[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if hi_ps <= lo_ps or not 0 <= a < min(len(self._ribbons), len(self._links)):
+            return
+        link = self._links[a]
+        self._ribbons[a]._set_view(link.to_sample(lo_ps), link.to_sample(hi_ps), emit=True)
+
+    def _restore_window(self, win: dict) -> None:
+        from base64 import b64decode
+        from binascii import Error as B64Error
+
+        from PySide6.QtCore import QByteArray
+        try:
+            geometry = b64decode(str(win.get("geometry", "")), validate=True)
+            docks = b64decode(str(win.get("docks", "")), validate=True)
+        except (B64Error, ValueError):
+            return
+        if geometry:
+            self.restoreGeometry(QByteArray(geometry))
+        if docks:
+            self.restoreState(QByteArray(docks))
 
     def _apply_view_prefs(self, view: dict) -> None:
         """Restore the transient Bus-Grid / Raw-Capture pane state from a workspace.
@@ -3531,7 +3797,7 @@ class MainWindow(QMainWindow):
         dlg.setAutoReset(False)
         self._load_dlg = dlg
         self._load_thread = QThread(self)
-        self._load_worker = _LoadWorker(factory, pdm_dc_block=self._pdm_dc_block)
+        self._load_worker = _LoadWorker(factory)
         self._load_worker.moveToThread(self._load_thread)
         self._load_thread.started.connect(self._load_worker.run)
         # Cross-thread → queued delivery onto the GUI thread (self lives there).
@@ -3665,8 +3931,11 @@ class MainWindow(QMainWindow):
         try:
             if kind == "redecode" and self._links.index_of(session) < 0:
                 # Its Link was removed while it decoded. Loading it would make it a NEW
-                # capture and replace every surviving Link with the removed one.
+                # capture and replace every surviving Link with the removed one. Discarded
+                # is not loaded, so it settles as failed.
                 self._status.setText("Discarded a re-decode of a Link that was removed.")
+                if on_fail is not None:
+                    on_fail()
             else:
                 try:
                     self.load_session(session, store, extras=extras, add_link=kind == "add")
@@ -3728,6 +3997,101 @@ class MainWindow(QMainWindow):
             st.stream_colors.pop(key, None)
         self._push_stream_colors()
 
+    # ---- per-stream Filter & Gain (DC blocker, high-pass, gain) ----
+    @staticmethod
+    def _apply_stream_processing(st) -> None:
+        """Put a Link's Filter & Gain settings onto its audio store (a stream the
+        store does not carry keeps its setting for a later decode that has it)."""
+        store = getattr(st, "audio_store", None)
+        if store is None:
+            return
+        have = set(store.streams())
+        for (dev, dp), proc in (st.stream_processing or {}).items():
+            if (dev, dp) in have:
+                store.set_processing(dev, dp, proc)
+
+    def _refresh_processed_views(self, link: int) -> None:
+        for k, _raw, audio in self._bottom_lanes():
+            if k == link:
+                audio.refresh_processing()
+
+    def _preview_stream_processing(self, dev: int, dp: int, proc, link: int) -> None:
+        st = self._bottom_link_state(link)
+        if st is None or st.audio_store is None:
+            return
+        self._stop_audio()                      # the samples a playback reads are changing
+        st.audio_store.set_processing(dev, dp, proc)
+        self._refresh_processed_views(link)
+
+    def set_stream_processing(self, device: int, dp: int, proc,
+                              link: Optional[int] = None) -> None:
+        """Keep `proc` (a StreamProcessing, or None to revert) as the Filter & Gain of
+        the (device, dp) stream on Link `link` (default: the bottom group's), apply it to
+        that Link's audio, and redraw the panes showing it."""
+        i = self._pane_link.get("bottom", -1) if link is None else int(link)
+        st = self._bottom_link_state(i)
+        if st is None:
+            return
+        key = (int(device), int(dp))
+        if proc is None or proc.is_identity():
+            st.stream_processing.pop(key, None)
+            proc = None
+        else:
+            st.stream_processing[key] = proc
+        self._preview_stream_processing(key[0], key[1], proc, i)
+        names = self._links[i].session.dp_names if 0 <= i < len(self._links) else {}
+        name = port_label(names, key[0], key[1])
+        self._status.setText(f"{name}: {proc.describe()}" if proc
+                             else f"{name}: Filter & Gain reverted")
+
+    def edit_stream_processing(self, device: int, dp: int, link: Optional[int] = None) -> None:
+        """Audio ▸ a stream's right-click ▸ Filter & Gain…"""
+        from .audio_process_dialog import StreamProcessingDialog
+        i = self._pane_link.get("bottom", -1) if link is None else int(link)
+        st = self._bottom_link_state(i)
+        if st is None or st.audio_store is None:
+            return
+        names = self._links[i].session.dp_names if 0 <= i < len(self._links) else {}
+        dlg = StreamProcessingDialog(
+            st.audio_store, device, dp, parent=self, names=names,
+            preview=lambda proc: self._preview_stream_processing(device, dp, proc, i))
+        if dlg.exec() == QDialog.Accepted:
+            self.set_stream_processing(device, dp, dlg.chosen(), link=i)
+
+    # ---- data-port names ----
+    def rename_data_port(self, device: int, dp: int, link: Optional[int] = None) -> None:
+        """Audio ▸ right-click a channel ▸ Rename…: name a data port of the Link that lane
+        shows (an empty name goes back to "Dev1 DP2"). The name is the Link's and is saved
+        with it; the Audio, Capture and Samples panes and the Bus Grid's colour key show it."""
+        i = self._links.active_index if link is None else int(link)
+        if not 0 <= i < len(self._links):
+            return
+        sess = self._links[i].session
+        current = sess.dp_names.get((int(device), int(dp)), "")
+        name, ok = QInputDialog.getText(
+            self, "Rename Data Port",
+            f"Name for Device {device} · DP{dp} (empty for none):", text=current)
+        if not ok or name.strip() == current:
+            return
+        sess.set_dp_name(device, dp, name)
+        self._push_stream_names()
+        self._refresh_grid()           # the grid group's Link, which need not be the active one
+
+    def _push_stream_names(self) -> None:
+        """Each Link's data-port names to the panes showing it, lane by lane (as
+        _push_stream_colors), and to the Timing pane's driver filter."""
+        for k, raw, audio in self._bottom_lanes():
+            names = self._links[k].session.dp_names if 0 <= k < len(self._links) else {}
+            for view in (audio, raw, self._table_lane(self._sample_lanes, k)):
+                view.set_stream_names(names)
+            with self._as_lane(k):
+                self._eye_view.set_port_names(names)
+
+    def _lane_session_names(self, view) -> dict:
+        """The data-port names of the Link an Audio view shows."""
+        k = self._lane_link(view)
+        return self._links[k].session.dp_names if 0 <= k < len(self._links) else {}
+
     # ---- All Links in the bottom group: Capture and Audio, one lane per Link ----
     def _wire_capture(self, view):
         """Connect a Capture view (the pane's own, or a lane's) to the Link it shows."""
@@ -3748,6 +4112,10 @@ class MainWindow(QMainWindow):
             lb, s, final, link=self._lane_link(v)))
         view.streamColorChosen.connect(lambda d, p, c, v=view: self._on_stream_color_chosen(
             d, p, c, link=self._lane_link(v)))
+        view.streamProcessingRequested.connect(
+            lambda d, p, v=view: self.edit_stream_processing(d, p, link=self._lane_link(v)))
+        view.streamRenameRequested.connect(
+            lambda d, p, v=view: self.rename_data_port(d, p, link=self._lane_link(v)))
         return view
 
     def _lane_link(self, view) -> int:
@@ -4148,8 +4516,13 @@ class MainWindow(QMainWindow):
         self._bookmarks = BookmarkSet(keep)
         # A queued re-decode of the removed Link must not run: it would land as a new
         # capture. (One already running is discarded when it lands — see _on_load_done.)
-        self._load_pending = [r for r in (self._load_pending or [])
-                              if not (r[2] == "redecode" and r[3] is link.session)]
+        # Dropped is not loaded, so each settles as failed.
+        dropped = [r for r in (self._load_pending or [])
+                   if r[2] == "redecode" and r[3] is link.session]
+        self._load_pending = [r for r in (self._load_pending or []) if r not in dropped]
+        for r in dropped:
+            if r[4] is not None:
+                r[4]()
         self._links.remove(idx)
         new_active = self._links.active_index
         for group in _PANE_GROUPS:
@@ -4268,16 +4641,9 @@ class MainWindow(QMainWindow):
         self._sync_view_links()
         self._sync_timeline_rows()
 
-    def _feed_timeline(self, ribbon, session) -> None:
-        """Give one Link's ribbon that Link's events, config bands and bring-up. Everything
-        here is that Link's own; the cursor, view and bookmarks are synced separately."""
-        ribbon.set_sample_rate(session.sample_rate_hz)
-        ribbon.set_row_origin(session.row_origin)
-        ribbon.set_row_label(
-            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
-        total = max([c.get("end_sample", 0) for c in session.commands]
-                    + [session.audio_end_sample, 1])
-        ribbon.set_events(session.commands, total)
+    def _band_segments(self, session) -> list:
+        """The timeline's config bands for one Link: its segments with what the ribbon
+        labels them by (pinned width, region CSV, the user's name) and their section index."""
         # Anchor each config-band boundary at its row's Row Sync Point (the same edge the
         # commit-point marker uses), so a region transition is COINCIDENT with the commit
         # that caused it instead of ~1 UI later (the segment's raw start_sample is the
@@ -4293,8 +4659,25 @@ class MainWindow(QMainWindow):
             # (forced)" and is outlined rather than looking snooped.
             if i in getattr(session, "forced_column_sections", {}):
                 s2["forced"] = True
+            if i in getattr(session, "csv_sections", {}):
+                s2["csv"] = os.path.basename(session.csv_sections[i])
+            s2["index"] = i
+            if i in getattr(session, "region_names", {}):
+                s2["name"] = session.region_names[i]
             band_segs.append(s2)
-        ribbon.set_segments(band_segs, total)
+        return band_segs
+
+    def _feed_timeline(self, ribbon, session) -> None:
+        """Give one Link's ribbon that Link's events, config bands and bring-up. Everything
+        here is that Link's own; the cursor, view and bookmarks are synced separately."""
+        ribbon.set_sample_rate(session.sample_rate_hz)
+        ribbon.set_row_origin(session.row_origin)
+        ribbon.set_row_label(
+            lambda smp: session.display_row(session.bus_row_for_sample(int(smp))))
+        total = max([c.get("end_sample", 0) for c in session.commands]
+                    + [session.audio_end_sample, 1])
+        ribbon.set_events(session.commands, total)
+        ribbon.set_segments(self._band_segments(session), total)
         ribbon.set_bringup(session.link_control)
         ribbon.set_commit_points(session.commit_point_samples())   # dotted SSP markers
 
@@ -4310,6 +4693,8 @@ class MainWindow(QMainWindow):
         ribbon.bookmarkMoved.connect(
             lambda lbl, s, final, r=ribbon: self._on_ribbon_bookmark_moved(r, lbl, s, final))
         ribbon.viewChanged.connect(lambda lo, hi, r=ribbon: self._on_ribbon_view(r, lo, hi))
+        ribbon.regionMenuRequested.connect(
+            lambda sect, pos, r=ribbon: self._region_band_menu(r, sect, pos))
         label = _LinkBandLabel()
         label.clicked.connect(lambda r=ribbon: self._on_ribbon_label(r, rename=False))
         label.doubleClicked.connect(lambda r=ribbon: self._on_ribbon_label(r, rename=True))
@@ -4460,6 +4845,35 @@ class MainWindow(QMainWindow):
         elif chosen is show:
             self.switch_link(i)
 
+    def _region_band_menu(self, ribbon, section: int, pos) -> None:
+        """Right-click a config-region band on a Link's timeline: Rename… names that region
+        (an empty name clears it). The name is the Link's, saved with it in the workspace."""
+        i = self._ribbons.index(ribbon)
+        if i >= len(self._links):
+            return
+        menu = QMenu(self)
+        rename = menu.addAction("Rename…")
+        if menu.exec(pos) is not rename:
+            return
+        self.rename_region(section, link=i)
+
+    def rename_region(self, section: int, link: Optional[int] = None) -> None:
+        i = self._links.active_index if link is None else int(link)
+        if not 0 <= i < len(self._links):
+            return
+        sess = self._links[i].session
+        current = sess.region_names.get(int(section), "")
+        n = len(sess.segments or [])
+        name, ok = QInputDialog.getText(
+            self, "Rename Region",
+            f"Name for config region {int(section) + 1} of {n} (empty for none):",
+            text=current)
+        if not ok or name.strip() == current:
+            return
+        sess.set_region_name(section, name)
+        if i < len(self._ribbons):
+            self._ribbons[i].set_segments(self._band_segments(sess))   # the bands only
+
     def _on_ribbon_label(self, ribbon, rename: bool) -> None:
         i = self._ribbons.index(ribbon)
         if i >= len(self._links):
@@ -4542,8 +4956,7 @@ class MainWindow(QMainWindow):
                 # Sort by the GLOBAL Time column: the per-Link sort column's index now names
                 # the Link column, which would order by Link, not time.
                 self._cmd_view.sortByColumn(AllLinksCommandModel.TIME_COLUMN, Qt.AscendingOrder)
-                kinds = sorted(set().union(*(set(link.view.kinds) for link in self._links)))
-                self._restore_filters(st.filters, kinds=kinds)
+                self._restore_filters(st.filters, kinds=self._all_kinds())
             else:
                 self._all_col_widths = self._command_column_widths()   # for next time
                 self._cmd_all, self._all_model = False, None
@@ -4731,7 +5144,8 @@ class MainWindow(QMainWindow):
                 "devices": checked(self._dev_menu),
                 "groups": checked(self._group_menu),
                 "errors_only": self._errors_only_act.isChecked(),
-                "text": self._expr_edit.text() if self._expr_edit is not None else ""}
+                "text": (self._expr_edit.text() if self._expr_edit is not None
+                         else self._cmd_proxy.filter_text())}
 
     def _restore_filters(self, snap: dict, kinds=None) -> None:
         """Re-impose a `_filter_snapshot` on the menus and the proxy, for the active Link's
@@ -4836,7 +5250,8 @@ class MainWindow(QMainWindow):
         st.starts = [session.command_cursor_sample(c) for c in table_cmds]
         st.kinds = sorted({c.get("command", "") for c in table_cmds} - {""})
         st.audio_store = (audio_store if audio_store is not None
-                          else session.audio_store(pdm_dc_block=self._pdm_dc_block))
+                          else session.audio_store())
+        self._apply_stream_processing(st)         # a re-decode's new store keeps the setting
         st.sections = extras.get("sections")      # None → measured on first bind
         # capture_measurements iterates the whole audio store; Statistics is hidden at
         # load (Grid/Registers are raised), so defer the build to first show. It re-runs
@@ -4961,18 +5376,38 @@ class MainWindow(QMainWindow):
             self._bind_timing()
 
     def _bind_lane(self, raw, audio) -> None:
-        """One Link's Capture and Audio views (run under that Link's `_as_link`)."""
+        """One Link's Capture and Audio views (run under that Link's `_as_link`).
+
+        Each view first leaves its view of the Link it was showing in that Link's state (a
+        switch, or a re-decode of the same Link), then shows this Link's as it was left."""
+        st = self._link_state()
+        self._keep_lane_view(raw, audio)
         self._bind_audio(audio)
         self._bind_capture(raw)
+        # All Links lanes share one window (the lanes align it), so not their own zooms.
+        view_state.restore_audio(audio, st.audio_view, zoom=not self._bottom_all)
+        view_state.restore_capture(raw, st.capture_view, zoom=not self._bottom_all)
+        audio._shown_state = raw._shown_state = st
         if not self._bottom_all:                       # All Links: after the lane (_bind_lane_of)
             self._update_capture_actions()             # a capture is now loaded
         self._build_decimation_menu()            # per-dataport decimation for this capture's streams
+
+    @staticmethod
+    def _keep_lane_view(raw, audio) -> None:
+        """Leave a Capture and an Audio view's current state with the Link they show."""
+        for view, key, read in ((audio, "audio_view", view_state.audio_state),
+                                (raw, "capture_view", view_state.capture_state)):
+            prev = getattr(view, "_shown_state", None)
+            if prev is not None and getattr(view, "_store" if view is audio else "_plot",
+                                            None) is not None:
+                setattr(prev, key, read(view))
 
     def _bind_audio(self, view) -> None:
         session = self._session
         assert session is not None
         view.stop()                                # one output device; it played the old Link
         view.set_stream_colors(self._link_state().stream_colors, redraw=False)   # set_store draws
+        view.set_stream_names(session.dp_names, redraw=False)
         # Audio waveforms are plotted in CAPTURE-sample space so they sit at their true
         # offset and line up under the timeline — give the view the capture rate + full
         # extent (commands + audio) BEFORE set_store (which rebuilds the plots).
@@ -4987,6 +5422,7 @@ class MainWindow(QMainWindow):
         session = self._session
         assert session is not None
         view.set_stream_colors(self._link_state().stream_colors, redraw=False)   # drawn below
+        view.set_stream_names(session.dp_names, redraw=False)
         # DLV (PHY3): the Raw view collapses the complementary DP/DN pair to one
         # differential trace in the audio region and draws the recovered bit clock
         # beneath it; FBCSE passes no DLV info and keeps the two forwarded-clock traces.
@@ -5025,6 +5461,7 @@ class MainWindow(QMainWindow):
         assert session is not None
         st = self._link_state()
         self._sample_view.set_stream_colors(st.stream_colors, redraw=False)   # filled below
+        self._sample_view.set_stream_names(session.dp_names, redraw=False)
         self._symbol_view.set_sample_rate(session.sample_rate_hz)
         self._symbol_view.set_row_origin(session.row_origin)
         self._symbol_view.set_symbols(session.symbols())
@@ -5045,6 +5482,7 @@ class MainWindow(QMainWindow):
         assert session is not None
         st = self._link_state()
         _rec = session.recovered_clock() if session.is_dlv else None
+        self._eye_view.set_port_names(session.dp_names)      # before the filter is built
         self._eye_view.set_analysis_context(session.segments, session.timing_regions(),
                                             session.timing_column_roles)
         self._eye_view.set_capture(session.capture, recovered_clock=_rec, cache=st.eye_cache)
@@ -5088,7 +5526,7 @@ class MainWindow(QMainWindow):
         dlg = AudioExportDialog(self._audio_store,
                                 visible_index_range=self._audio_lane().visible_index_range(),
                                 default_rates=self._audio_lane().play_rate_targets,
-                                parent=self)
+                                parent=self, names=self._session.dp_names)
         if dlg.exec() != QDialog.Accepted:
             return
         dps = dlg.selected_streams()
@@ -6447,31 +6885,6 @@ class MainWindow(QMainWindow):
             return s
 
         self._redecode_preserving(rehub, "Hub depths applied; re-decoded.")
-
-    def _on_pdm_dc_toggled(self, on: bool) -> None:
-        """Decode ▸ Block PDM DC Bias: persist the choice and rebuild the audio store
-        with the new setting. The bit stream is unchanged (no C++ re-decode) — only
-        the PDM→PCM decimation differs — but that re-decimation is O(samples), so run
-        it off the GUI thread via the load path (identity factory: same session, new
-        store built with the flag). Keeps cursor + bookmarks."""
-        self._pdm_dc_block = bool(on)
-        QSettings().setValue("audio/pdm_dc_block", self._pdm_dc_block)
-        if self._session is None:
-            return
-
-        def rebuild(s=self._session):
-            return s                              # same decode; load_session rebuilds
-        #                                           the store with self._pdm_dc_block
-
-        # The preference is window-wide, so EVERY Link's store is rebuilt with it — the
-        # others quietly, as background re-decodes of their own sessions.
-        for link in self._links:
-            if link is not self._links.active:
-                self._load_async(lambda s=link.session, **kw: s, kind="redecode",
-                                 session=link.session)
-        self._redecode_preserving(
-            rebuild,
-            f"PDM DC bias block {'on' if self._pdm_dc_block else 'off'}; audio re-decoded.")
 
     def _accepted_src_rows(self) -> list:
         """Sorted SOURCE rows currently accepted by the command filter, cached (dropped

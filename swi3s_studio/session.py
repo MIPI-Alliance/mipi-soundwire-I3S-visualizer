@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import bisect
 import os
-from typing import Dict, List, Optional, Tuple
+import threading
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 import swi3score
@@ -19,7 +20,91 @@ from .nputil import searchsorted as _searchsorted
 
 # ABI the Python side expects from the swi3score native module (see bindings.cpp
 # `score_abi`). Bump both together when a binding's return shape changes.
-_REQUIRED_SCORE_ABI = 10
+_REQUIRED_SCORE_ABI = 12
+
+
+# A config CSV imposed on ONE region (Session.apply_config_csv_at) is kept in the source
+# descriptor as "config_csv@<section index>": a flat key, so the workspace treats it like
+# every other file (relative paths, Locate), with the index after the "@".
+CSV_SECTION_KEY = "config_csv@"
+
+
+class DecodeMemoryError(MemoryError):
+    """A decode was stopped because free memory fell below the floor it must leave
+    (saleae_sal.decode_memory_floor). Raised instead of letting the machine compress and
+    swap its way through the rest; the Session keeps its previous decode, if it had one."""
+
+    def __init__(self, available: int, floor: int, progress: float):
+        self.available, self.floor, self.progress = int(available), int(floor), float(progress)
+        at = f" {progress:.0%} of the way through" if 0.0 < progress < 1.0 else ""
+        MemoryError.__init__(
+            self,
+            f"The decode was stopped{at}: free memory fell to {available / 1e9:.1f} GB, "
+            f"below the {floor / 1e9:.1f} GB it must leave. The audio it produces grows with "
+            "the capture and cannot be predicted before decoding. Open a shorter window "
+            "(Open Capture ▸ From … to …), or close other applications and try again.")
+
+
+# How often the watchdog reads free memory while a decode runs. psutil's read is
+# microseconds; the stdlib fallback on macOS runs vm_stat, so not every millisecond.
+_WATCH_PERIOD_S = 0.25
+
+
+def run_watched(decoder) -> None:
+    """decoder.run(), stopped if free memory falls below saleae_sal.decode_memory_floor().
+
+    Raises DecodeMemoryError after a stop, and also before the audio is copied out
+    (Session._refresh_audio) when that copy would cross the floor: it is the largest single
+    allocation after the decode, and one that cannot be stopped once begun."""
+    from .ingest import saleae_sal
+    floor = saleae_sal.decode_memory_floor()
+    if floor <= 0 or not hasattr(decoder, "request_stop"):
+        decoder.run()
+        return
+    done = threading.Event()
+    low: List[int] = []
+
+    def watch() -> None:
+        while not done.wait(_WATCH_PERIOD_S):
+            avail = saleae_sal.available_memory_bytes()
+            if 0 < avail < floor:
+                low.append(avail)
+                decoder.request_stop()
+                return
+
+    t = threading.Thread(target=watch, name="decode-memory-watchdog", daemon=True)
+    t.start()
+    try:
+        decoder.run()
+    finally:
+        done.set()
+        t.join()
+    if decoder.stopped:
+        raise DecodeMemoryError(low[0] if low else 0, floor, float(decoder.progress))
+    need = int(decoder.audio_count) * _AUDIO_ROW_BYTES
+    avail = saleae_sal.available_memory_bytes()
+    if need and 0 < avail and avail - need < floor:
+        raise DecodeMemoryError(avail, floor, 1.0)
+
+
+class RegionCsv(NamedTuple):
+    """One region's imported config CSV, as the decode and the views use it."""
+    overrides: Dict[Tuple[int, int], int]   # (device, address) -> value; _CURR ranks too
+    columns: int                             # its NumColumns + 1, or 0 if it names none
+    written: Set[Tuple[int, int]]            # (device, address) as the CSV writes them
+    replay: List[dict]                       # the CSV as a write + commit replay
+
+
+def csv_sections_in(source: dict) -> Dict[int, str]:
+    """The region config CSVs a source descriptor names, {section index: path}."""
+    out: Dict[int, str] = {}
+    for key, path in (source or {}).items():
+        if str(key).startswith(CSV_SECTION_KEY) and isinstance(path, str) and path:
+            try:
+                out[int(str(key)[len(CSV_SECTION_KEY):])] = path
+            except ValueError:
+                continue
+    return out
 
 
 def zero_based_row(bus_row, origin) -> int:
@@ -51,7 +136,8 @@ class Session:
                  register_map: Optional[RegisterMap] = None,
                  source: Optional[dict] = None, ssp_row: int = -1,
                  dlv: bool = False, decoder_ready=None,
-                 forced_column_sections=None, label_fields=None):
+                 forced_column_sections=None, label_fields=None, csv_sections=None,
+                 dp_names=None, region_names=None):
         _require_score_abi()                          # clear error if the .so is stale
         self.capture = capture
         self.source = source or {"type": "capture"}   # workspace descriptor
@@ -79,6 +165,16 @@ class Session:
             label_fields if label_fields is not None
             else self.source.get("label_fields"))
         self._store_label_fields()               # normalise into the descriptor
+        # Per-(device, dp) names the user gave the data ports, {(device, dp): str}. Display
+        # only, like the label fields, and kept in the source descriptor the same way.
+        self.dp_names: Dict[Tuple[int, int], str] = self._load_dp_names(
+            dp_names if dp_names is not None else self.source.get("dp_names"))
+        self._store_dp_names()
+        # Names the user gave config regions, {section index: str} (Timeline ▸ right-click
+        # a region band ▸ Rename…). Keyed like forced_column_sections, display only.
+        self.region_names: Dict[int, str] = self._load_region_names(
+            region_names if region_names is not None else self.source.get("region_names"))
+        self._store_region_names()
         self._register_map_arg = register_map
         self._source = capture.sample_source()       # keep alive for the decoder
         settings = swi3score.DecoderSettings()
@@ -126,7 +222,24 @@ class Session:
         self.forced_column_sections: Dict[int, int] = {
             int(k): int(v) for k, v in dict(pins).items()}
         self._store_forced_columns()             # normalise into the descriptor
-        settings.forced_column_sections = sorted(self.forced_column_sections.items())
+        # Config CSVs imposed on one region each (apply_config_csv_at), {section: path}:
+        # like the pins, read before the first decode, which they change.
+        self.csv_sections: Dict[int, str] = {
+            int(k): str(v) for k, v in dict(
+                csv_sections if csv_sections is not None
+                else csv_sections_in(self.source)).items()}
+        self._store_csv_sections()
+        self.register_map = register_map or RegisterMap.load()   # resolves the CSVs' ranks
+        self._csv_section_cfg = self._read_csv_sections()
+        # Debug what-if register overrides, keyed by (section_index, device, address)
+        # -> byte. Section-scoped (a capture can change config mid-stream); folded
+        # into the C++ decode for the matching section so the SAME override drives
+        # the audio decode, bus grid, and register map (Provenance.UI). Changing an
+        # override re-decodes. Empty by default; not persisted (a debug tool).
+        self.register_overrides: Dict[Tuple[int, int, int], int] = {}
+        settings.forced_column_sections = self._decode_forced_sections()
+        settings.register_overrides = self._decode_register_overrides()
+        settings.imported_config_sections = sorted(self._csv_section_cfg)
         # PHY3 (DLV) uses a recovered-clock source instead of the forwarded-clock one:
         # decode the §5.1.2 bring-up to learn the selected PHY. When it's PHY3, build a
         # DlvSampleSource over the DP wire STARTING at audio_start (so the virtual PLL
@@ -136,17 +249,10 @@ class Session:
         self._link_control = decode_link_control(capture)
         self._decode_checking_bringup(settings, decoder_ready)
 
-        self.register_map = register_map or RegisterMap.load()
         # Per-device peripheral (vendor) register maps, keyed by device number.
         # Imported via the register-map assistant; addresses in device-defined
         # space resolve against the matching device's map.
         self.peripheral_maps: Dict[int, object] = {}
-        # Debug what-if register overrides, keyed by (section_index, device, address)
-        # -> byte. Section-scoped (a capture can change config mid-stream); folded
-        # into the C++ decode for the matching section so the SAME override drives
-        # the audio decode, bus grid, and register map (Provenance.UI). Changing an
-        # override re-decodes. Empty by default; not persisted (a debug tool).
-        self.register_overrides: Dict[Tuple[int, int, int], int] = {}
         # CSV-import baseline: the register snapshot + grid replay an applied config
         # CSV encodes (Provenance.CSV). Empty unless a config CSV is applied — see
         # apply_config_csv / _reload_csv_seed.
@@ -188,7 +294,7 @@ class Session:
         # backward-compatible: absent for every existing caller.
         if decoder_ready is not None:
             decoder_ready(self.decoder)
-        self.decoder.run()
+        run_watched(self.decoder)
 
         self.commands: List[dict] = self.decoder.commands()
         # Audio is kept columnar (struct-of-arrays) — a dense mic-array capture
@@ -621,14 +727,22 @@ class Session:
         settings.scrambler_overrides = [(int(d), int(p), 1 if on else 0)
                                         for (d, p), on in self.scrambler_overrides.items()]
         settings.hub_depth_overrides = [(d, v) for d, v in self.hub_depths.items() if v]
-        settings.register_overrides = [(int(sect), int(d), int(a), int(v))
-                                       for (sect, d, a), v in self.register_overrides.items()]
-        settings.forced_column_sections = sorted(self.forced_column_sections.items())
+        settings.register_overrides = self._decode_register_overrides()
+        settings.forced_column_sections = self._decode_forced_sections()
+        settings.imported_config_sections = sorted(self._csv_section_cfg)
         # Rebuild the PHY-correct source (DLV needs the recovered-clock source + settings;
         # without this a DLV session silently reverts to FBCSE framing on re-decode).
+        # A decode the watchdog stops leaves the previous one in place: the decoder reads
+        # its source by reference, so the old pair is restored together.
+        old = (self._source, self.decoder, self._cds_horizontal_start, self._forced_column_count)
         self._source = self._configure_source_for_phy(settings)
         self.decoder = swi3score.Decoder(self._source, settings)
-        self.decoder.run()
+        try:
+            run_watched(self.decoder)
+        except DecodeMemoryError:
+            (self._source, self.decoder, self._cds_horizontal_start,
+             self._forced_column_count) = old
+            raise
         self.commands = self.decoder.commands()
         self._rel_cmds = None                    # invalidate config-command cache
         self._eff_sorted = None                  # invalidate effective-sample sort cache
@@ -1044,7 +1158,10 @@ class Session:
                       config_csv=source.get("config_csv", ""),
                       ssp_row=int(source.get("ssp_row", -1)),
                       forced_column_sections=source.get("forced_column_sections") or {},
-                      label_fields=source.get("label_fields") or {})
+                      csv_sections=csv_sections_in(source),
+                      label_fields=source.get("label_fields") or {},
+                      dp_names=source.get("dp_names") or {},
+                      region_names=source.get("region_names") or {})
         if kind == "demo":
             return cls.from_demo(int(source.get("audio_samples_per_channel", 32)),
                                  cold_start=bool(source.get("cold_start", False)),
@@ -1300,8 +1417,11 @@ class Session:
         # audio agree). Section-scoped: only overrides whose section index matches
         # the cursor's section apply here.
         sect = self.segment_index_for_sample(int(sample))
-        overrides = [(int(d), int(a), int(v))
-                     for (s, d, a), v in self.register_overrides.items() if s == sect]
+        overrides = self._section_overrides(sect)
+        if sect in self._csv_section_cfg:
+            # A region's imported CSV is its whole config, as the decode treats it
+            # (imported_config_sections): the wire's writes do not show through.
+            replay = self._csv_section_cfg[sect].replay
         # Force the segment width ONLY for a true multi-width reconfiguration (see
         # below); otherwise defer to the decoder's authoritative column_count — a
         # cold-start capture's lone segment is often LABELLED with the slow-preamble
@@ -1340,8 +1460,11 @@ class Session:
         if self._csv_replay:
             replay = self._csv_replay + replay
         sect = self.segment_index_for_sample(int(sample))
-        overrides = [(int(d), int(a), int(v))
-                     for (s, d, a), v in self.register_overrides.items() if s == sect]
+        overrides = self._section_overrides(sect)
+        if sect in self._csv_section_cfg:
+            # A region's imported CSV is its whole config, as the decode treats it
+            # (imported_config_sections): the wire's writes do not show through.
+            replay = self._csv_section_cfg[sect].replay
         seg_widths = {int(s.get("column_count", 0)) for s in self.segments}
         force = 0
         if len(seg_widths) > 1:
@@ -2676,13 +2799,14 @@ class Session:
         overrides all folded in there (reads reveal live values in the map without
         perturbing the grid/audio config). `section` = the config-section index to
         scope overrides to (None = whole capture: no overrides)."""
-        overrides = [(int(d), int(a), int(v)) for (s, d, a), v in self.register_overrides.items()
-                     if section is not None and s == section]
+        overrides = self._section_overrides(section) if section is not None else []
         # Map each override to the (device, base) it forces and the RANK it edits, so we
         # colour ONLY that rank UI: a _NEXT edit doesn't touch _CURR and vice-versa. The
         # C++ snapshot is keyed by the _NEXT-base address; a _CURR alias maps down to it.
         ov_next, ov_curr = set(), set()
-        for d, a, _ in overrides:
+        for (sect, d, a), _ in self.register_overrides.items():
+            if sect != section:                           # the region CSV's are not UI
+                continue
             res = self.register_map.resolve(a)
             if res is not None and res.register.dual_ranked and res.rank == "CURR":
                 sp = res.register
@@ -2692,6 +2816,10 @@ class Session:
                 ov_next.add((d, a))                       # _NEXT-base rank
             else:
                 ov_curr.add((d, a))                       # single-ranked: its one bank is _CURR
+        # A region's imported config CSV is a baseline like the whole-capture one: CSV
+        # provenance, under any what-if (the same address in ov_* wins as UI).
+        region = self._csv_section_cfg.get(section) if section is not None else None
+        csv_bases = region.written if region is not None else set()
         override_bases = ov_next | ov_curr
         snap = swi3score.registers_from_commands(replay, register_overrides=overrides)
 
@@ -2715,9 +2843,12 @@ class Session:
             file_for(dev).seed(addr, cur, bool(has_cur), Provenance.CSV,
                                nxt, bool(has_next), Provenance.CSV)
         for dev, addr, cur, has_cur, cur_src, nxt, has_next, next_src in snap:
+            in_csv = (dev, addr) in csv_bases
             cur_p = (Provenance.UI if (dev, addr) in ov_curr
+                     else Provenance.CSV if in_csv
                      else src_prov.get(int(cur_src), Provenance.WRITTEN))
             next_p = (Provenance.UI if (dev, addr) in ov_next
+                      else Provenance.CSV if in_csv
                       else src_prov.get(int(next_src), Provenance.WRITTEN))
             file_for(dev).seed(addr, cur, bool(has_cur), cur_p, nxt, bool(has_next), next_p)
         return files
@@ -2764,7 +2895,74 @@ class Session:
         """`dp_display` for GridView.set_cells — {(device, dp): {"display_fields": n}}.
         Only ports that differ from the default are stored, so an untouched session
         passes an empty map and the renderer keeps its own default."""
-        return {k: {"display_fields": v} for k, v in self.label_fields.items()}
+        out: Dict[Tuple[int, int], dict] = {k: {"display_fields": v}
+                                            for k, v in self.label_fields.items()}
+        for k, name in self.dp_names.items():           # the grid's colour key shows it
+            out.setdefault(k, {})["name"] = name
+        return out
+
+    # ---- data-port names (pure display) ----
+    @staticmethod
+    def _load_dp_names(raw) -> Dict[Tuple[int, int], str]:
+        """Parse persisted names ("dev.dp" keys, as for the label fields); a blank or
+        unparseable entry is dropped."""
+        out: Dict[Tuple[int, int], str] = {}
+        for k, v in dict(raw or {}).items():
+            try:
+                dev, dp = str(k).split(".")
+                name = str(v).strip()
+                if name:
+                    out[(int(dev), int(dp))] = name
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def set_dp_name(self, device: int, dp: int, name: str) -> None:
+        """Name a data port, or clear its name with "". Display only: the caller
+        relabels the panes; there is no re-decode."""
+        key = (int(device), int(dp))
+        name = str(name or "").strip()
+        if name:
+            self.dp_names[key] = name
+        else:
+            self.dp_names.pop(key, None)
+        self._store_dp_names()
+
+    # ---- config-region names (pure display) ----
+    @staticmethod
+    def _load_region_names(raw) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        for k, v in dict(raw or {}).items():
+            try:
+                name = str(v).strip()
+                if name:
+                    out[int(k)] = name
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def set_region_name(self, section: int, name: str) -> None:
+        """Name config region `section` (an index into segments), or clear it with "".
+        Display only: no re-decode. Like a region pin it follows the index, so a re-decode
+        that changes which regions exist can move it to another."""
+        name = str(name or "").strip()
+        if name:
+            self.region_names[int(section)] = name
+        else:
+            self.region_names.pop(int(section), None)
+        self._store_region_names()
+
+    def _store_region_names(self) -> None:
+        if self.region_names:
+            self.source["region_names"] = {str(k): v for k, v in sorted(self.region_names.items())}
+        else:
+            self.source.pop("region_names", None)
+
+    def _store_dp_names(self) -> None:
+        if self.dp_names:
+            self.source["dp_names"] = {f"{d}.{p}": n for (d, p), n in sorted(self.dp_names.items())}
+        else:
+            self.source.pop("dp_names", None)
 
     def _store_label_fields(self) -> None:
         """Mirror label fields into the source descriptor (workspace persistence).
@@ -2834,6 +3032,105 @@ class Session:
         else:
             self.source.pop("forced_column_sections", None)
 
+    # ---- a config CSV imposed on one region ----
+    def apply_config_csv_at(self, sample: Optional[int], path: Optional[str]) -> int:
+        """Impose a Visualizer config CSV on the config region containing `sample` only,
+        and re-decode. `path` None/"" removes that region's CSV. Returns the section index.
+
+        apply_config_csv imposes ONE config from row 0 and puts the decoder in its CSV
+        mode, which stops it following the wire: no snooped width changes, no re-sync. On
+        a capture that reconfigures mid-stream (Safe-Lock-2 -> 8 -> 16 columns) that framed
+        every region at the CSV's width, turned every command CRC-red and lost the audio
+        of the regions the CSV was not for. Here the CSV becomes the region's register
+        state instead, through the section-scoped what-if path (both ranks, so it is in
+        effect without a commit) plus its width as a region pin, and every other region
+        decodes as the wire says. An explicit pin or what-if on the region still wins.
+
+        The section index is resolved before the re-decode, as force_column_count_at
+        does, so the CSV cannot walk to another region on a second call."""
+        sect = self.segment_index_for_sample(int(sample)) if sample is not None else 0
+        if path:
+            self.csv_sections[sect] = str(path)
+        elif self.csv_sections.pop(sect, None) is None:
+            return sect
+        self._store_csv_sections()
+        self._csv_section_cfg = self._read_csv_sections()
+        self._redecode()
+        return sect
+
+    def csv_section_at(self, sample: Optional[int]) -> str:
+        """The config CSV imposed on the region containing `sample`, or "" if none."""
+        if sample is None:
+            return ""
+        return self.csv_sections.get(self.segment_index_for_sample(int(sample)), "")
+
+    def _store_csv_sections(self) -> None:
+        for key in [k for k in self.source if str(k).startswith(CSV_SECTION_KEY)]:
+            del self.source[key]
+        for sect, path in sorted(self.csv_sections.items()):
+            self.source[f"{CSV_SECTION_KEY}{sect}"] = path
+
+    def _read_csv_sections(self) -> Dict[int, RegionCsv]:
+        """Each region CSV, read. Its overrides set a dual-ranked register's _CURR rank as
+        well as the _NEXT the CSV writes, so the config is in effect from the region's
+        start without the commit the wire never sent; `written` keeps the addresses as
+        the CSV names them, which is how the register snapshot keys them. A CSV that
+        cannot be read is skipped (the workspace's Locate asks for a missing one before
+        this runs), leaving that region decoding as the wire says."""
+        from .ingest import visualizer_csv
+        out: Dict[int, RegionCsv] = {}
+        for sect, path in self.csv_sections.items():
+            norm = ""
+            try:
+                norm = visualizer_csv.normalized_path(path)
+                seed = swi3score.registers_from_csv(norm)
+            except Exception:                     # noqa: BLE001 - see the docstring
+                continue
+            finally:
+                if norm and norm != path:
+                    try:
+                        os.remove(norm)
+                    except OSError:
+                        pass
+            regs: Dict[Tuple[int, int], int] = {}
+            written: Set[Tuple[int, int]] = set()
+            width = 0
+            for d, a, v in seed:
+                regs[(int(d), int(a))] = int(v) & 0xFF
+                written.add((int(d), int(a)))
+                res = self.register_map.resolve(int(a))
+                if res is None:
+                    continue
+                if res.register.name == "NumColumns":
+                    width = int(v) + 1
+                if res.register.dual_ranked and res.rank == "NEXT":
+                    sp = res.register
+                    delta = (sp.curr_offset - sp.offset) if sp.curr_offset is not None else 0x40
+                    regs[(int(d), int(a) + delta)] = int(v) & 0xFF
+            out[int(sect)] = RegionCsv(regs, width, written, self._csv_writes_replay(seed))
+        return out
+
+    def _section_overrides(self, section: int) -> List[Tuple[int, int, int]]:
+        """(device, address, value) forced on `section`: its region CSV, then what-ifs."""
+        region = self._csv_section_cfg.get(section)
+        merged = dict(region.overrides) if region is not None else {}
+        merged.update({(d, a): v for (s, d, a), v in self.register_overrides.items()
+                       if s == section})
+        return [(int(d), int(a), int(v)) for (d, a), v in merged.items()]
+
+    def _decode_register_overrides(self) -> list:
+        """settings.register_overrides: every section's region CSV, what-ifs on top."""
+        merged = {(s, d, a): v for s, region in self._csv_section_cfg.items()
+                  for (d, a), v in region.overrides.items()}
+        merged.update(self.register_overrides)
+        return [(int(s), int(d), int(a), int(v)) for (s, d, a), v in merged.items()]
+
+    def _decode_forced_sections(self) -> list:
+        """settings.forced_column_sections: region CSV widths, explicit pins on top."""
+        widths = {s: r.columns for s, r in self._csv_section_cfg.items() if r.columns}
+        widths.update(self.forced_column_sections)
+        return sorted(widths.items())
+
     def forced_column_count_at(self, sample: Optional[int]) -> int:
         """The pinned column count for the region containing `sample`, or 0 if that
         region isn't pinned. Drives the timeline's 'forced' region badge."""
@@ -2888,3 +3185,7 @@ class Session:
 
     def sample_to_seconds(self, sample: int) -> float:
         return sample / self.sample_rate_hz if self.sample_rate_hz else 0.0
+
+
+# Bytes per decoded audio sample once copied out as columns (Session._AUDIO_DTYPES).
+_AUDIO_ROW_BYTES = sum(np.dtype(t).itemsize for t in Session._AUDIO_DTYPES.values())

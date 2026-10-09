@@ -69,8 +69,16 @@ class SalCost:
         compression, which is a minute-long stall that no amount of per-move Python tuning
         reaches. Measured against this model: 2.134 vs 2.125 GB actual, 0.948 vs 0.921, and
         0.733 vs 0.598 (over-predicting, which is the safe direction for a guard).
+
+        THE WHOLE-FILE TRANSIENT IS NOW 2, NOT THE STREAMING 4. A whole-channel decode used
+        to hold every block's deltas, their concatenation and the cumsum at once; it now
+        validates the chain a block at a time and decodes each block again straight into
+        the one uint64 output (saleae_binary.parse_channel_v3), so what is live is the
+        output plus ONE block's int64 run. A block can be the whole channel, which is what
+        bounds that at 2. A 54 MB capture with 302M transitions peaked at 8.6 GB before and
+        3.7 GB after; at 4 it was predicted at 14.0 GB and refused on a 64 GB machine.
         """
-        return int(self.uncompressed_bytes + self.est_edge_bytes * _STREAM_TRANSIENT)
+        return int(self.uncompressed_bytes + self.est_edge_bytes * _WHOLE_FILE_TRANSIENT)
 
     def fits_in(self, budget_bytes: int) -> bool:
         return self.est_peak_bytes <= int(budget_bytes)
@@ -228,7 +236,7 @@ def available_memory_bytes() -> int:
         pass
     try:                                        # POSIX: free pages * page size (Linux only)
         import os
-        if hasattr(os, "sysconf"):
+        if sys.platform != "win32":             # Windows has no sysconf
             names = os.sysconf_names
             if "SC_AVPHYS_PAGES" in names and "SC_PAGE_SIZE" in names:
                 avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
@@ -256,7 +264,7 @@ def total_memory_bytes() -> int:
     """
     try:
         import os
-        if hasattr(os, "sysconf"):                      # Linux and macOS both publish these
+        if sys.platform != "win32":                     # Linux and macOS both publish these
             names = os.sysconf_names
             if "SC_PHYS_PAGES" in names and "SC_PAGE_SIZE" in names:
                 total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
@@ -302,11 +310,20 @@ _UNKNOWN_TOTAL_FRACTION = 0.25
 # knew the more it allowed. An explicit max_bytes (or max_bytes=0 to opt out) overrides it.
 _ASSUMED_TOTAL_WHEN_UNKNOWN = 4 << 30
 _UNKNOWN_BUDGET = int(_ASSUMED_TOTAL_WHEN_UNKNOWN * _UNKNOWN_TOTAL_FRACTION)
-# Absolute ceiling on the COMPUTED budget, however much memory is free. Past this a load
-# stops being a question about capacity and becomes one about interactivity, which is a
-# person's call — so the app asks for a time window instead of deciding for them. An explicit
-# max_bytes overrides it. See memory_budget.
-_MAX_AUTO_BUDGET = 8 << 30
+# Predicted peak past which the Open Capture dialog calls a load LARGE (large_load_bytes).
+# It used to cap memory_budget, which made it a refusal: a 64 GB or 96 GB machine could not
+# open a capture predicted at 14 GB, though the cap's own reason was that past it the call
+# is a person's. It was also standing in for an estimate that under-predicted 3x, which is
+# how a 103 GB machine reached ~60 GB resident; that estimate is now measured
+# (test_the_peak_estimate_matches_a_measured_load), and the decode it cannot predict is
+# watched while it runs (decode_memory_floor). So it informs, and the person decides.
+_LARGE_LOAD = 8 << 30
+
+
+def large_load_bytes() -> int:
+    """The predicted peak above which an open is labelled large (and may be slow) rather
+    than refused; memory_budget() is what refuses."""
+    return _LARGE_LOAD
 
 # How the last budget was derived, for callers that want to SAY so — a guard running in a
 # degraded mode is exactly the kind of thing this project refuses to keep quiet about (see
@@ -359,23 +376,16 @@ def memory_budget(max_bytes: Optional[int] = None) -> int:
     before asking), because a budget function has no way to express "unlimited"
     without handing back a number that silently disables the check.
 
-    THE COMPUTED BUDGET IS CAPPED ABSOLUTELY, not just as a fraction of free memory.
-    "Will it fit" and "will it stay interactive" are different questions, and only the
-    first scales with RAM: 0.6 x free means the more capable the machine, the more the app
-    loads without asking, so the failure mode grows with the hardware. That is how a
-    103 GB box loaded a capture to ~60 GB resident — no prompt, continuous macOS memory
-    compression, and a minute-long stall — while 16-32 GB machines were offered a time
-    window for the same file and never reached that state. The complaint that started this
-    was that the BETTER machine was slower. `_MAX_AUTO_BUDGET` is what a load may consume
-    before the caller has to ask a human; an explicit `max_bytes` still overrides it,
-    because a caller naming a number has made the decision itself.
+    IT IS A QUESTION OF CAPACITY ONLY. It was capped at 8 GiB as well, so a machine with
+    lots of free memory still refused anything predicted past it; that cap is now
+    large_load_bytes(), a label the dialog shows, not a refusal (see _LARGE_LOAD).
 
     WHEN FREE MEMORY CANNOT BE READ IT DEGRADES IN STEPS, and says which one it took
     (`budget_source`). Free RAM, then a quarter of TOTAL RAM, then a small constant, each a
     weaker reading than the last, and each used only when the one before it cannot be read.
     They are not ordered by size: a quarter of total RAM can exceed 60% of what is free, and
     the constant exceeds a quarter of a 2 GB machine. It used to fall straight to a flat
-    8 GiB, which was the same number as the cap and so invisible on a large machine while
+    8 GiB, the same number as the cap it then had, and so invisible on a large machine while
     being ~3.6x too permissive on a 4 GB one: failing OPEN on precisely the machines that can
     least afford it, in the branch whose own comment promised to fail closed.
     """
@@ -386,18 +396,36 @@ def memory_budget(max_bytes: Optional[int] = None) -> int:
     avail = available_memory_bytes()
     if avail > 0:
         _BUDGET_SOURCE = "free memory"
-        return min(int(avail * _MEM_HEADROOM), _MAX_AUTO_BUDGET)
+        return int(avail * _MEM_HEADROOM)
     total = total_memory_bytes()
     if total > 0:
         _BUDGET_SOURCE = (f"{_UNKNOWN_TOTAL_FRACTION:.0%} of total RAM "
                           "(free memory unreadable — is psutil installed?)")
         _warn_degraded_budget(_BUDGET_SOURCE)
-        return min(int(total * _UNKNOWN_TOTAL_FRACTION), _MAX_AUTO_BUDGET)
+        return int(total * _UNKNOWN_TOTAL_FRACTION)
     # Fail CLOSED when memory is unknown: a guard that silently disables itself is worse
     # than none, because the caller believes it is protected.
     _BUDGET_SOURCE = "a conservative fixed budget (no memory reading available at all)"
     _warn_degraded_budget(_BUDGET_SOURCE)
     return _UNKNOWN_BUDGET
+
+
+# The free memory a running decode must leave: past this the watchdog stops it (Session).
+# A decode's own growth (the audio it produces) cannot be predicted before it runs, so it is
+# watched instead: 10% of total RAM and at least 1 GiB, the point where macOS starts
+# compressing memory well before it swaps, which is the stall the old 8 GiB cap was for.
+_DECODE_FLOOR_FRACTION = 0.10
+_DECODE_FLOOR_MIN = 1 << 30
+
+
+def decode_memory_floor() -> int:
+    """Free memory, in bytes, a running decode is stopped to keep, or 0 if free memory cannot
+    be read (then there is nothing to watch with)."""
+    if available_memory_bytes() <= 0:
+        return 0
+    total = total_memory_bytes()
+    return max(_DECODE_FLOOR_MIN, int(total * _DECODE_FLOOR_FRACTION)) if total > 0 \
+        else _DECODE_FLOOR_MIN
 
 
 # Never plan to consume ALL free memory: the decode, the audio store and Qt itself
@@ -408,6 +436,9 @@ _MEM_HEADROOM = 0.6
 # Calibrated against the reported capture — a 2 s window whose final edge arrays are
 # 0.31 GB peaked at ~1.29 GB above baseline, i.e. ~4x.
 _STREAM_TRANSIENT = 4.0
+# Peak/final ratio for a whole-file decode: the output plus one block's int64 deltas, and
+# one block can be the whole channel. See SalCost.est_peak_bytes.
+_WHOLE_FILE_TRANSIENT = 2.0
 
 
 def _v3_span_streaming(fh, size: int, want_start: bool = False):

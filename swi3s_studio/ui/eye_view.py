@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from ..analysis.bus_timing import measure_bus_timing
 from . import line_style
+from .port_names import with_name
 from .theme import VizTheme, analyzer_stylesheet
 
 # Y is plotted as log10(count) in a LINEAR view (we transform ourselves rather than use
@@ -114,6 +115,7 @@ class EyeView(QWidget):
         self._start_sample = 0        # current region's sample range (excludes link control)
         self._end_sample = None
         self._filter_items: list[dict] = []      # [{action, cols(frozenset), kind}] checkable filter items
+        self._port_names: dict = {}              # the shown Link's data-port names (port_names)
         self._dirty = False
         self._cat_hidden: set[tuple] = set()     # hidden edge flavours: {(clk_rising, data_rising)} keys
         self._worst: list[tuple] = []            # tightest transitions (sample, setup_ns, hold_ns)
@@ -333,6 +335,17 @@ class EyeView(QWidget):
             ticks.append((float(k), lab))
         return ticks
 
+    def set_port_names(self, names) -> None:
+        """The shown Link's data-port names, for the driver filter's port items. Relabels
+        them in place, so what is checked stays checked. A saved workspace keeps the
+        filter by these labels, which is why the window sets the names before the filter
+        is built (set_analysis_context)."""
+        self._port_names = dict(names or {})
+        for item in self._filter_items:
+            if item.get("port") is not None:
+                d, p = item["port"]
+                item["action"].setText(with_name(self._port_names, d, p, f"Device {d} DP{p}"))
+
     def set_sections(self, sections) -> None:
         """Per config-section UI stats (from Session.section_ui_stats). Kept for callers
         but no longer displayed."""
@@ -457,11 +470,12 @@ class EyeView(QWidget):
             self._filter_menu.addAction("Peripherals", lambda: self._apply_preset("peripherals"))
         self._filter_menu.addSeparator()
 
-        def add_check(label, cols, kind):
+        def add_check(label, cols, kind, port=None):
             act = self._filter_menu.addAction(label)
             act.setCheckable(True)
             act.toggled.connect(lambda _=False: self._on_filter_changed())
-            self._filter_items.append({"action": act, "cols": frozenset(cols), "kind": kind})
+            self._filter_items.append({"action": act, "cols": frozenset(cols), "kind": kind,
+                                       "port": port})
 
         if mgr:
             add_check("Manager", mgr, "manager")
@@ -469,7 +483,8 @@ class EyeView(QWidget):
                             if r.get("kind") == "peripheral"}):
             cs = frozenset(c for c, r in roles.items() if r.get("kind") == "peripheral"
                            and r["device"] == d and r["dp"] == p)
-            add_check(f"Device {d} DP{p}", cs, "peripheral")
+            add_check(with_name(self._port_names, d, p, f"Device {d} DP{p}"), cs,
+                      "peripheral", port=(d, p))
         if cds:
             add_check("CDS (Col 0)", cds, "cds")
         sub = self._filter_menu.addMenu("Columns")

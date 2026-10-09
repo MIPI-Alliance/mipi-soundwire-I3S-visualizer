@@ -193,9 +193,11 @@ class OpenCaptureDialog(QDialog):
 
     def __init__(self, probe: CaptureProbe, open_link_names: Optional[List[str]] = None,
                  parent=None, prefer_add: bool = False, budget_bytes: int = 0,
-                 reference: bool = False) -> None:
+                 reference: bool = False, large_bytes: int = 0) -> None:
         """`reference` is Locate Sub-Capture's form: the file is searched for, not opened as
-        a Link, so it has one row and no name, and no Into."""
+        a Link, so it has one row and no name, and no Into. `budget_bytes` is what refuses
+        a load (memory_budget); a cost past `large_bytes` (large_load_bytes) is labelled
+        large and still allowed, so the person deciding can see it."""
         super().__init__(parent)
         self.probe = probe
         self._reference = bool(reference)
@@ -203,6 +205,7 @@ class OpenCaptureDialog(QDialog):
             open_link_names = []
         self._open_names = list(open_link_names or [])
         self._budget = int(budget_bytes or 0)
+        self._large = int(large_bytes or 0)
         self._rows: List[_LinkRow] = []
         self.setWindowTitle("Locate Sub-Capture: the reference" if self._reference
                             else "Open Capture")
@@ -338,7 +341,7 @@ class OpenCaptureDialog(QDialog):
         """The Source line's load-all cost and the window's, for the Links on the page."""
         n = max(1, len(self._rows))
         cost = self._cost()
-        fits = (" (fits)" if self._fits(cost) else " (does not fit)") \
+        fits = (f" ({self._fit_word(cost)})" if self._fits(cost) else " (does not fit)") \
             if (cost is not None and self._budget) else ""
         how = "" if self.probe.windowed else " · reads the whole file"
         links = f" for {n} Links" if n > 1 else ""
@@ -348,7 +351,8 @@ class OpenCaptureDialog(QDialog):
             t0, t1 = self._t0.seconds(), self._t1.seconds()
             wcost = self._cost(t0, t1)
             note = "" if self.probe.windowed else ", reads the whole file"
-            fits = "" if self._fits(wcost) else " — does not fit"
+            fits = (" — does not fit" if not self._fits(wcost)
+                    else " — large, may be slow" if self._is_large(wcost) else "")
             self._window_line.setText(f"({_dur(max(0.0, t1 - t0))}, ~{_gb(wcost)}{links}"
                                       f"{note}{fits})")
         else:
@@ -356,6 +360,13 @@ class OpenCaptureDialog(QDialog):
 
     def _fits(self, cost: Optional[int]) -> bool:
         return cost is None or not self._budget or cost <= self._budget
+
+    def _is_large(self, cost: Optional[int]) -> bool:
+        return cost is not None and self._large > 0 and cost > self._large
+
+    def _fit_word(self, cost: Optional[int]) -> str:
+        return (f"fits; large, past {_gb(self._large)}, so opening may be slow"
+                if self._is_large(cost) else "fits")
 
     def _choose_default_range(self) -> None:
         """All when it fits; else From/to on the largest window predicted to fit (a

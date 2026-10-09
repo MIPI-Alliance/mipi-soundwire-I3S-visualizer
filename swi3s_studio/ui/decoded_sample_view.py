@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .port_names import port_label
 from .row_origin import RowOriginMixin
 from .theme import analyzer_stylesheet
 
@@ -130,6 +131,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._starts = np.zeros(0, dtype=np.int64)  # cached start_sample of each loaded row
         self._lane_colors: Dict[tuple, Any] = {}   # (device, dp, channel) -> QColor
         self._stream_overrides: dict = {}          # the shown Link's stream colours (line_style)
+        self._stream_names: dict = {}              # the shown Link's data-port names (port_names)
         self._suppress_scroll = False          # gate edge-loads during programmatic scroll
         self._suppress_select = False          # gate the selection echo during a programmatic
         #                                        select_sample (see _on_select)
@@ -200,7 +202,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         for d, p, _ch in lanes:
             if (d, p) not in seen:
                 seen.append((d, p))
-        self._port_cb.set_items([(f"Dev{d} DP{p}", (d, p)) for d, p in seen])
+        self._port_cb.set_items([(port_label(self._stream_names, d, p), (d, p)) for d, p in seen])
         self._chan_cb.set_items([(f"CH{c}", c) for c in sorted({ch for _d, _p, ch in lanes})])
 
     def filters(self):
@@ -232,6 +234,20 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             self.set_lanes(list(self._lane_colors))
             self.set_samples(self._samples)
 
+    def set_stream_names(self, names, redraw: bool = True) -> None:
+        """The shown Link's data-port names, for the Port column and its filter. A bind
+        passes `redraw=False`: set_lanes and set_samples fill the new Link next."""
+        self._stream_names = dict(names or {})
+        if redraw and self._lane_colors:
+            keep = self._port_cb.selected()
+            self.set_lanes(list(self._lane_colors))
+            if keep:
+                for act in self._port_cb._menu.actions():
+                    if isinstance(act.data(), (tuple, list)):
+                        act.setChecked(tuple(act.data()) in set(keep))
+                self._port_cb._update_text()
+            self.set_samples(self._samples)
+
     # ---- data ----
     def _fill_row(self, r: int, s: dict) -> None:
         """Populate table row `r` from sample dict `s` (shared by set/append/prepend)."""
@@ -243,7 +259,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
                 if self._rate else "—")
         dev, dp, ch = int(s.get("device", -1)), int(s.get("dp", -1)), int(s.get("channel", 0))
         cells = [f"{self.display_row(s.get('row', 0)):,}",
-                 t_us, f"Dev{dev} DP{dp} CH{ch}",
+                 t_us, f"{port_label(self._stream_names, dev, dp)} CH{ch}",
                  _binary(val, bits), _hex(val, bits), f"{int(s.get('signed', 0)):,}"]
         for c, text in enumerate(cells):
             item = QTableWidgetItem(text)

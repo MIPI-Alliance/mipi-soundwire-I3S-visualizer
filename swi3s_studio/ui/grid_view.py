@@ -1163,16 +1163,13 @@ class GridView(QGraphicsView):
         items = list(self._stream_colors.items())
         single_dev = (len({d for d, _ in self._slot_port.values()}) == 1 if self._by_slot
                       else len({k[0] for k in self._stream_colors}) == 1)
-        sw_w, sw_h, gap = 46, 18, 8
-        total = len(items) * (sw_w + gap) - gap
-        gx0 = self._cx(0)
-        start = gx0 + max(0, (self._grid_w(cols) - total) / 2)
-        y = (_KEY_H - sw_h) / 2
-        cur = start
-        self._key_hits = []          # [(QRectF, (device, dp))] — see mousePressEvent
+        # Each swatch is as wide as its label needs, and never narrower than a "D1·DP2"
+        # swatch was: a fixed 46 px cut a user-given port name (Session.dp_names) off at
+        # both ends.
+        sw_min, sw_h, gap, pad = 46, 18, 8, 10
+        fm = QFontMetricsF(self._f_key)
+        entries = []                 # (key, colour, label, (device, dp) to click or None, width)
         for key, color in items:
-            rect = QRectF(cur, y, sw_w, sw_h)
-            self._scene.addRect(rect, QPen(_LINE), QBrush(color))
             if self._by_slot:
                 # One swatch per config slot. Label it with the port's own identity, not
                 # its slot number: several slots can share a DataPortNumber, so "DP0" x4
@@ -1181,6 +1178,7 @@ class GridView(QGraphicsView):
                 label = (self._slot_names.get(key) or "").strip()
                 if not label:
                     label = f"DP{dp}" if single_dev else f"{_dev_tag(dev)}·DP{dp}"
+                hit = None
             else:
                 dev, dp = key
                 name = ((self._dp_display.get((dev, dp)) or {}).get("name") or "").strip()
@@ -1188,9 +1186,22 @@ class GridView(QGraphicsView):
                 # Only the decoded (analyzer) grid keys by (device, dp) and can map a
                 # swatch back to a real port; engine mode's label chooser is the
                 # authoring panel, so its swatches stay non-clickable.
-                self._key_hits.append((rect, (int(dev), int(dp))))
-            self._text(label, cur, y, sw_w, sw_h, QColor(0, 0, 0), font=self._f_key)
-            cur += sw_w + gap
+                hit = (int(dev), int(dp))
+            width = max(sw_min, fm.horizontalAdvance(label) + pad)
+            entries.append((key, color, label, hit, width))
+        total = sum(e[4] for e in entries) + gap * (len(entries) - 1)
+        gx0 = self._cx(0)
+        start = gx0 + max(0, (self._grid_w(cols) - total) / 2)
+        y = (_KEY_H - sw_h) / 2
+        cur = start
+        self._key_hits = []          # [(QRectF, (device, dp))] — see mousePressEvent
+        for _key, color, label, hit, width in entries:
+            rect = QRectF(cur, y, width, sw_h)
+            self._scene.addRect(rect, QPen(_LINE), QBrush(color))
+            if hit is not None:
+                self._key_hits.append((rect, hit))
+            self._text(label, cur, y, width, sw_h, QColor(0, 0, 0), font=self._f_key)
+            cur += width + gap
 
     def _draw_frame(self, rows: int, cols: int, key_column: bool = True) -> None:
         gx0, gy0 = self._cx(0), self._cy(0)
