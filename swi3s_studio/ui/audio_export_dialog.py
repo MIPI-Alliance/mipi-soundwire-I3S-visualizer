@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .port_names import with_name
+
 # Standard decimation presets offered per stream (label, Hz). None = native rate.
 _RATE_PRESETS = [("Native", None), ("8 kHz", 8000), ("16 kHz", 16000),
                  ("32 kHz", 32000), ("44.1 kHz", 44100), ("48 kHz", 48000),
@@ -49,7 +51,8 @@ class AudioExportDialog(QDialog):
     """
 
     def __init__(self, store, visible_index_range: Optional[Tuple[int, int]] = None,
-                 parent=None, default_rates: Optional[Dict[Tuple[int, int], int]] = None) -> None:
+                 parent=None, default_rates: Optional[Dict[Tuple[int, int], int]] = None,
+                 names=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export audio as WAV")
         self._store = store
@@ -64,7 +67,8 @@ class AudioExportDialog(QDialog):
         grid.addWidget(QLabel("<b>Resample to</b>"), 0, 1)
         for r, (dev, dp) in enumerate(store.streams(), start=1):
             chs = store.channels(dev, dp)
-            cb = QCheckBox(f"Device {dev} · DP{dp}  ({len(chs)} ch, "
+            cb = QCheckBox(with_name(names or {}, dev, dp, f"Device {dev} · DP{dp}")
+                           + f"  ({len(chs)} ch, "
                            f"{store.rate(dev, dp)/1000:.1f} kHz)")
             cb.setChecked(True)
             self._checks[(dev, dp)] = cb

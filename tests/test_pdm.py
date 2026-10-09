@@ -96,7 +96,7 @@ def test_store_decodes_pdm_channel_as_pcm():
 def test_decode_pdm_blocks_dc_bias():
     # Real PDM mics sit at a density well off 50% (a big DC bias) with the audio
     # riding on top — exactly digital_0/1's mics (~0.31/0.36 density). With DC-block
-    # ENABLED (Audio ▸ Block PDM DC Bias), the bias is removed so the tone survives
+    # ENABLED (the store's pdm_dc_block; the app uses Filter & Gain ▸ DC blocker), the bias is removed so the tone survives
     # instead of the dominant "frequency" being 0.
     fs, f0, bias = 2_048_000.0, 997.0, 0.45        # 0.45 DC -> density ~0.7
     t = np.arange(int(fs * 0.2)) / fs
@@ -145,3 +145,34 @@ def test_store_pdm_dc_block_flag_threads_through():
     assert median_mid(off) == 32767
     on = AudioStore.from_audio_columns(cols, {(0, 1): fs}, pdm_dc_block=True)
     assert abs(median_mid(on)) < 0.02 * 32767
+
+
+def test_a_pdm_stream_at_full_scale_is_kept_unclipped(monkeypatch):
+    """The decode rounds but does not clip: a biased stream whose signal reaches full scale
+    keeps both sides, so Filter & Gain's DC blocker can still centre it. Clipping there cut
+    one side for good, which the old in-decode mean subtraction never did."""
+    import swi3s_studio.dsp as dsp
+    from swi3s_studio.store.audio_store import decode_pdm
+    loud = np.array([0.45 + 0.6, 0.45 - 0.6, 0.45])            # a bias plus a loud tone
+    monkeypatch.setattr(dsp, "pdm_to_pcm", lambda *a, **k: loud.copy())
+    pcm, _rate, _m = decode_pdm(np.zeros(64, dtype=np.int64), 3_072_000.0)
+    assert pcm.max() > 32767 and pcm.tolist() == [int(round(v * 32767.0)) for v in loud]
+
+
+def test_wav_export_clips_rather_than_wraps(tmp_path):
+    """A sample past the container's range clips at full scale: assigned into int16 it
+    would wrap round to the other end."""
+    import wave
+
+    from swi3s_studio.store.audio_store import AudioStore
+    vals = np.array([40000, -40000, 1000, 0], dtype=np.int64)
+    cols = {"device": np.zeros(4, dtype=np.int64), "dp": np.ones(4, dtype=np.int64),
+            "channel": np.zeros(4, dtype=np.int64), "sample_size": np.full(4, 16),
+            "value": vals & 0xFFFF, "index": np.arange(4), "start_sample": np.arange(4) * 10}
+    store = AudioStore.from_audio_columns(cols, {(0, 1): 48000.0})
+    store._channels[(0, 1, 0)] = vals            # past 16 bits, as a full-scale PDM can be
+    path = str(tmp_path / "a.wav")
+    store.export_wav(0, 1, path)
+    with wave.open(path) as w:
+        got = np.frombuffer(w.readframes(4), dtype="<i2")
+    assert got.tolist() == [32767, -32768, 1000, 0]

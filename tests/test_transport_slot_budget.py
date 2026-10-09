@@ -29,7 +29,7 @@ import swi3score
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CSV = os.path.join(os.path.dirname(_HERE), "visualizer_examples", "directed_tests",
-                    "partial_channel_group_sample_grouping.csv")
+                    "intentional_errors", "partial_channel_group_sample_grouping.csv")
 
 # The directed CSV is the template: it already carries every field the loader needs
 # (including the Enabled / DisplayFields rows a hand-built file is easy to omit), so a

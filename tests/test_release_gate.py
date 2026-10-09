@@ -567,6 +567,45 @@ def test_allow_incomparable_does_not_swallow_a_regression(tmp_path):
                         argv=("tools/mypy_gate.py", "--allow-incomparable")) == 1
 
 
+def _run_ratchet_per_platform(by_platform, baseline, tmp_path, capsys):
+    """As _run_ratchet, but with one mypy result per platform, so the combining is real."""
+    m = _load_tool("mypy_gate.py")
+    m._run_mypy_on = lambda plat: (dict(by_platform[plat]), f"<mypy {plat}>")
+    m._env_fingerprint = lambda: dict(_BASE_ENV)
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"env": dict(_BASE_ENV), "total": sum(baseline.values()),
+                                "per_file": dict(baseline)}), encoding="utf-8")
+    m._BASELINE = str(path)
+    saved = sys.argv
+    sys.argv = ["tools/mypy_gate.py"]
+    try:
+        return m.main(), capsys.readouterr().out
+    finally:
+        sys.argv = saved
+
+
+def test_the_ratchet_checks_every_platform_and_names_the_one_that_regressed(tmp_path, capsys):
+    """mypy checks one platform per run, and only the host's unless told otherwise, so an
+    error in a Windows-only branch passed the ratchet on a Mac. Every platform is run, and a
+    regression on any one of them fails and says which."""
+    code, out = _run_ratchet_per_platform(
+        {"darwin": {_F1: 3}, "linux": {_F1: 3}, "win32": {_F1: 5}}, {_F1: 3}, tmp_path, capsys)
+    assert code == 1
+    assert "on win32" in out and "on darwin" not in out and "on linux" not in out
+
+
+def test_the_ratchet_passes_when_every_platform_holds(tmp_path, capsys):
+    code, out = _run_ratchet_per_platform(
+        {"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3}}, {_F1: 3}, tmp_path, capsys)
+    assert code == 0 and "darwin 3, linux 2, win32 3" in out
+
+
+def test_the_ratchet_runs_mypy_for_each_supported_platform():
+    """The list is what makes the check cover Linux and Windows from any one machine."""
+    m = _load_tool("mypy_gate.py")
+    assert set(m._PLATFORMS) == {"darwin", "linux", "win32"}
+
+
 def test_the_ratchet_fails_a_baseline_naming_a_deleted_file(tmp_path):
     """A stale entry lets a recreated file inherit a count nobody reviewed (found in the
     3.0.12 review): fewer errors than the stale number read as 'improved' and exited 0."""

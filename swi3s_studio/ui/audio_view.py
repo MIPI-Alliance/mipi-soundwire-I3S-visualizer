@@ -29,9 +29,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..dsp.spectrogram import FRAME_SIZES, NFFT, spectrogram
 from . import line_style
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
+from .port_names import port_identity, port_label
 from .theme import VizTheme, analyzer_stylesheet
 
 # Audio playback is optional: QtMultimedia (and an output device) may be absent
@@ -57,6 +59,10 @@ from swi3s_studio.ui.grid_view import dp_line_color as _dp_color  # noqa: E402
 
 _FADE_MS = 50.0             # playback de-click ramp (fade-in / fade-out)
 _TRACK_H = 120              # min pixels per stacked track so waveforms aren't squashed
+# A spectrogram lane's colour scale, dB re full scale: the floor is what a quiet 16-bit
+# stream's noise sits at, so silence reads dark and the noise floor is still visible.
+_SPECTRO_DB = (-120.0, 0.0)
+_SPECTRO_COLUMNS = 1400     # frames per redraw: about one per pixel of a wide pane
 
 
 def _amp_ticks(ymin: float, ymax: float) -> list:
@@ -220,6 +226,21 @@ class _TimeAxis(pg.AxisItem):
         return [f"{v / self._rate * mul:,.{dec}f} {unit}" for v in values]
 
 
+def _spectro_nyquist(rate) -> float:
+    """A spectrogram lane's top frequency: the stream's Nyquist, or 0.5 (cycles per sample)
+    when its rate is unknown, the same in the axis range and in the image."""
+    rate = float(rate or 0.0)
+    return rate / 2.0 if rate > 0 else 0.5
+
+
+class _FreqAxis(pg.AxisItem):
+    """A spectrogram lane's frequency axis: Hz below 1 kHz, kHz above, no unit prefix
+    juggling from pyqtgraph's SI scaling."""
+
+    def tickStrings(self, values, scale, spacing):
+        return [f"{v / 1000:g}k" if abs(v) >= 1000 else f"{v:g}" for v in values]
+
+
 class _AmpAxis(pg.AxisItem):
     """The amplitude axis. Its labels sit at the very ends of the range (-1 / +1 at full
     scale, the data's extremes when zoomed), so half of each overflows the axis. pyqtgraph
@@ -250,6 +271,12 @@ class AudioView(QWidget):
     #: a stream's colour was chosen from its checkbox menu: (device, dp, "#rrggbb"), or
     #: "" for Reset Color. The window keeps it as the shown Link's override.
     streamColorChosen = Signal(int, int, str)
+    # Right-click ▸ Filter & Gain… (dev, dp). The window owns the setting (it is the
+    # Link's), so the view only asks; Revert is in the dialog.
+    streamProcessingRequested = Signal(int, int)
+    # Right-click a channel ▸ Rename…: (dev, dp). The window asks for the name, since the
+    # names are the Link's (Session.dp_names), and hands them back via set_stream_names.
+    streamRenameRequested = Signal(int, int)
     #: the visible X range changed: (start, end) in seconds of this capture (LinkLanes)
     viewRangeChanged = Signal(float, float)
     #: playback started (one output device: the window stops any other lane)
@@ -366,9 +393,15 @@ class AudioView(QWidget):
         self._store = None
         self._vzoom = False       # Vertical Zoom: fit Y to visible data vs full-scale ±1
         self._plots: list[tuple] = []            # (plotitem, curve, dev, dp, ch, n)
+        # Channels drawn as a spectrogram instead of a waveform, (dev, dp, ch). Their
+        # `curve` in _plots is the lane's ImageItem.
+        self._spectro: set = set()
+        # A spectrogram channel's frame length, (dev, dp, ch) -> samples; NFFT if absent.
+        self._spectro_nfft: dict = {}
         self._checks: dict[tuple, Any] = {}      # (dev, dp, ch) -> QCheckBox
         self._lane_colors: dict[tuple, Any] = {}   # (dev, dp, ch) -> QColor (stable; checkbox + curve)
         self._stream_overrides: line_style.Overrides = {}   # the shown Link's stream colours
+        self._stream_names: dict = {}            # the shown Link's data-port names (port_names)
         self._link = None
         self._cursor_lines: list[Any] = []       # InfiniteLine per plot, parallel to self._plots
         self._bm_marks: list[tuple] = []         # [(sample, label)] to draw across every track
@@ -498,6 +531,10 @@ class AudioView(QWidget):
         self._vzoom_btn.setChecked(False)
         self._vzoom_btn.setText("Vertical Zoom In")
         self._vzoom_btn.blockSignals(False)
+        # ...and draws every channel as a waveform. A Link's own choice comes back with
+        # the rest of its view (view_state.restore_audio), after this.
+        self._spectro = set()
+        self._spectro_nfft = {}
         # Decimation targets are keyed by (dev, dp); a new capture's streams may
         # differ, so drop any stale entries.
         self._play_rate_targets = {}
@@ -520,17 +557,37 @@ class AudioView(QWidget):
             for ch in store.channels(dev, dp):
                 color = _dp_color(dev, dp, self._stream_overrides)   # shared by a DP's channels
                 self._lane_colors[(dev, dp, ch)] = color
-                cb = QCheckBox(f"Dev{dev} DP{dp} CH{ch}")
+                cb = QCheckBox()
+                self._label_check(cb, dev, dp, ch)
                 cb.setChecked(True)
                 cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
                 cb.toggled.connect(lambda _on: self._rebuild_plots())
                 cb.setContextMenuPolicy(Qt.CustomContextMenu)
                 cb.customContextMenuRequested.connect(
-                    lambda pos, w=cb, d=dev, p=dp: self._stream_menu(w, pos, d, p))
+                    lambda pos, w=cb, d=dev, p=dp, k=ch: self._stream_menu(w, pos, d, p, k))
                 self._chan_box.addWidget(cb)
                 self._checks[(dev, dp, ch)] = cb
         self._chan_box.addStretch(1)
         self._rebuild_plots(preserve_zoom=False)
+
+    def _label_check(self, cb, dev: int, dp: int, ch: int) -> None:
+        """The channel's checkbox: an asterisk when the stream has a high-pass or gain (what
+        is drawn and played is then not the decoded samples), with the setting in its
+        tooltip. The track's title spells it out; the list is too narrow to."""
+        proc = self._store.processing(dev, dp) if self._store is not None else None
+        cb.setText(f"{port_label(self._stream_names, dev, dp)} CH{ch}" + (" *" if proc else ""))
+        tips = [port_identity(self._stream_names, dev, dp)] if (dev, dp) in self._stream_names \
+            else []
+        if proc:
+            tips.append(f"{proc.describe()}. Right-click ▸ Filter & Gain… to change or "
+                        "revert it.")
+        cb.setToolTip("\n".join(tips))
+
+    def refresh_processing(self) -> None:
+        """The store's processing changed: relabel the channels and redraw the tracks."""
+        for (dev, dp, ch), cb in self._checks.items():
+            self._label_check(cb, dev, dp, ch)
+        self._rebuild_plots()
 
     def streams(self):
         """All (device, dataport) audio streams in the current store ([] if none)."""
@@ -560,17 +617,57 @@ class AudioView(QWidget):
         if redraw and self._checks:
             self._recolor_streams()
 
-    def _stream_menu(self, widget, pos, dev: int, dp: int) -> None:
-        """Right-click a stream's checkbox: Color… picks this Link's colour for the
-        (device, dp) stream in the current theme; Reset Color goes back to the palette."""
+    def set_stream_names(self, names, redraw: bool = True) -> None:
+        """The shown Link's data-port names, {(dev, dp): name}. A bind passes
+        `redraw=False` (set_store labels the new Link's channels next)."""
+        self._stream_names = dict(names or {})
+        if redraw and self._checks:
+            for (dev, dp, ch), cb in self._checks.items():
+                self._label_check(cb, dev, dp, ch)
+            self._rebuild_plots()
+
+    def _stream_menu(self, widget, pos, dev: int, dp: int, ch: int = 0) -> None:
+        """Right-click a channel's checkbox: Waveform / Spectrogram choose how THIS channel
+        is drawn, and the frame sizes under Spectrogram its time against frequency
+        resolution (picking one shows the spectrogram at it); Color… picks this Link's
+        colour for the (device, dp) stream in the current theme; Reset Color goes back to
+        the palette."""
         menu = QMenu(self)
+        key = (dev, dp, ch)
+        wave = menu.addAction("Waveform")
+        spec = menu.addAction("Spectrogram")
+        for act, on in ((wave, key not in self._spectro), (spec, key in self._spectro)):
+            act.setCheckable(True)
+            act.setChecked(on)
+        rate = float(self._store.rate(dev, dp) or 0.0) if self._store is not None else 0.0
+        frames = {}
+        for n in FRAME_SIZES:
+            res = (f" · ±{n / 2 / rate * 1000:.1f} ms · {rate / n:.0f} Hz bins" if rate
+                   else "")
+            act = menu.addAction(f"    {n}-point frame{res}")
+            act.setCheckable(True)
+            act.setChecked(key in self._spectro and self.spectrogram_frame(key) == n)
+            frames[act] = n
+        menu.addSeparator()
+        rename = menu.addAction("Rename…")
         pick = menu.addAction("Color…")
         reset = menu.addAction("Reset Color")
         reset.setEnabled((dev, dp, VizTheme.MODE) in self._stream_overrides)
+        menu.addSeparator()
+        process = menu.addAction("Filter && Gain…")
         chosen = menu.exec(widget.mapToGlobal(pos))
-        if chosen is pick:
+        if chosen in (wave, spec):
+            self.set_spectrogram(key, chosen is spec)
+        elif chosen in frames:
+            self.set_spectrogram_frame(key, frames[chosen])
+        elif chosen is rename:
+            self.streamRenameRequested.emit(dev, dp)
+        elif chosen is process:
+            self.streamProcessingRequested.emit(dev, dp)
+        elif chosen is pick:
             c = QColorDialog.getColor(_dp_color(dev, dp, self._stream_overrides), self,
-                                      f"Dev{dev} DP{dp} colour ({VizTheme.MODE} theme)")
+                                      f"{port_identity(self._stream_names, dev, dp)} colour "
+                                      f"({VizTheme.MODE} theme)")
             if c.isValid():
                 self.streamColorChosen.emit(dev, dp, c.name())
         elif chosen is reset:
@@ -584,6 +681,59 @@ class AudioView(QWidget):
                 if cb is None or cb.isChecked():
                     out.append((dev, dp, ch))
         return out
+
+    def spectrogram_channels(self) -> set:
+        """The (dev, dp, ch) channels drawn as a spectrogram."""
+        return set(self._spectro)
+
+    def set_spectrogram(self, key, on: bool) -> None:
+        """Draw channel `key` = (dev, dp, ch) as a spectrogram (on) or a waveform (off)."""
+        key = tuple(int(v) for v in key)
+        if (key in self._spectro) == bool(on):
+            return
+        (self._spectro.add if on else self._spectro.discard)(key)
+        self._rebuild_plots()
+
+    def spectrogram_frame(self, key) -> int:
+        """Channel `key`'s spectrogram frame length in samples."""
+        return int(self._spectro_nfft.get(tuple(key), NFFT))
+
+    def set_spectrogram_frame(self, key, nfft: int) -> None:
+        """Draw channel `key` as a spectrogram with `nfft`-sample frames (one of
+        FRAME_SIZES)."""
+        key = tuple(int(v) for v in key)
+        nfft = int(nfft)
+        if nfft not in FRAME_SIZES:
+            raise ValueError(f"frame size {nfft} is not one of {FRAME_SIZES}")
+        if nfft == self.spectrogram_frame(key) and key in self._spectro:
+            return
+        if nfft == NFFT:
+            self._spectro_nfft.pop(key, None)
+        else:
+            self._spectro_nfft[key] = nfft
+        self._spectro.add(key)
+        self._rebuild_plots()
+
+    def spectrogram_frames(self) -> dict:
+        """{(dev, dp, ch): samples} for the channels whose frame is not the default."""
+        return dict(self._spectro_nfft)
+
+    def set_spectrogram_frames(self, frames) -> None:
+        """Replace the per-channel frame lengths (a restored view); unknown sizes are
+        dropped. Redraws only if the spectrogram channels change with it."""
+        new = {tuple(int(v) for v in k): int(n) for k, n in dict(frames or {}).items()
+               if int(n) in FRAME_SIZES and int(n) != NFFT}
+        if new != self._spectro_nfft:
+            self._spectro_nfft = new
+            if self._spectro:
+                self._rebuild_plots()
+
+    def set_spectrogram_channels(self, keys) -> None:
+        """Replace the set of spectrogram channels (a restored view), one rebuild."""
+        keys = {tuple(int(v) for v in k) for k in keys or ()}
+        if keys != self._spectro:
+            self._spectro = keys
+            self._rebuild_plots()
 
     def channel_selection(self):
         """The set of (dev, dp, ch) lanes currently shown (checked) — captured to hold
@@ -636,8 +786,14 @@ class AudioView(QWidget):
             rate = self._store.rate(dev, dp)             # stored/render rate (unused for x now)
             native = self._store.native_rate(dev, dp)    # on-bus rate (label)
             bits = self._store.sample_bits(dev, dp, ch)
-            title = (f"Dev{dev} · DP{dp} · CH{ch}"
-                     + (f" · {native/1000:.1f} kHz" if native else ""))
+            proc = self._store.processing(dev, dp)
+            spectro = (dev, dp, ch) in self._spectro
+            name = (self._stream_names.get((dev, dp)) or "").strip()
+            title = ((f"{name} · " if name else "") + f"Dev{dev} · DP{dp} · CH{ch}"
+                     + (f" · {native/1000:.1f} kHz" if native else "")
+                     + (f" · {proc.describe()}" if proc else "")
+                     + (f" · spectrogram, {self.spectrogram_frame((dev, dp, ch))}-point"
+                        if spectro else ""))
             taxis = _TimeAxis(orientation="bottom")
             # X is capture samples, so the axis converts with the CAPTURE rate — the
             # labels are absolute capture time, matching the timeline / other panes.
@@ -646,7 +802,8 @@ class AudioView(QWidget):
             pw = pg.PlotWidget(title=title, background=VizTheme.PLOT_BG,
                                viewBox=XWheelViewBox(),
                                axisItems={"bottom": taxis,
-                                          "left": _AmpAxis(orientation="left")})
+                                          "left": (_FreqAxis if spectro else _AmpAxis)(
+                                              orientation="left")})
             pw.setMinimumHeight(_TRACK_H)
             plot = pw.getPlotItem()
             plot.hideButtons()                    # drop the corner auto-range "A" button
@@ -656,9 +813,12 @@ class AudioView(QWidget):
             plot.setClipToView(True)
             # No axis titles: the time ticks carry their unit, and a waveform's Y is
             # plainly amplitude; the vertical room goes to the trace.
-            plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
-            color = self._lane_colors.get((dev, dp, ch)) or _dp_color(dev, dp)
-            curve = plot.plot(pen=pg.mkPen(color, width=line_style.weight("audio")))
+            if spectro:
+                curve = self._spectro_image(plot, rate)
+            else:
+                plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
+                color = self._lane_colors.get((dev, dp, ch)) or _dp_color(dev, dp)
+                curve = plot.plot(pen=pg.mkPen(color, width=line_style.weight("audio")))
             n = self._store.samples(dev, dp, ch).size
             plot.sigXRangeChanged.connect(
                 lambda _vb, rng, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
@@ -746,8 +906,25 @@ class AudioView(QWidget):
             cb.blockSignals(False)
         self._rebuild_plots()
 
+    @staticmethod
+    def _spectro_image(plot, rate: float):
+        """A spectrogram lane's ImageItem: frequency up the Y axis to the stream's Nyquist,
+        dB as colour on a fixed scale (_SPECTRO_DB) so lanes compare."""
+        img = pg.ImageItem(axisOrder="col-major")
+        img.setLookupTable(pg.colormap.get("inferno").getLookupTable(nPts=256))
+        img.setLevels(_SPECTRO_DB)
+        plot.addItem(img)
+        plot.showGrid(x=True, y=False)
+        nyq = _spectro_nyquist(rate)
+        plot.setYRange(0.0, nyq, padding=0)
+        plot.getViewBox().setLimits(yMin=0.0, yMax=nyq)
+        return img
+
     def _render(self, plot, curve, dev, dp, ch, rng, bits=0) -> None:
         if self._store is None:
+            return
+        if isinstance(curve, pg.ImageItem):
+            self._render_spectro(plot, curve, dev, dp, ch, rng, bits)
             return
         # `rng` is the visible X window in CAPTURE samples. Map it to this channel's
         # audio-index slice for the envelope, then map the envelope's index positions
@@ -793,6 +970,40 @@ class AudioView(QWidget):
             # Fixed full-scale Y range so amplitude is comparable across tracks.
             plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
             plot.setYRange(-1.0, 1.0, padding=0.05)
+
+    def _render_spectro(self, plot, img, dev, dp, ch, rng, bits=0) -> None:
+        """Draw the visible stretch of a spectrogram lane: one column per frame across the
+        view (dsp/spectrogram.py), placed in capture samples by the frames' centres. The
+        image is stretched evenly between the first and last centre, so a transport gap
+        inside the view is drawn as continuous rather than as a hole (the waveform breaks
+        its line there)."""
+        store: Any = self._store
+        if store is None:
+            return
+        cs0, cs1 = int(rng[0]), int(rng[1])
+        i0, i1 = store.index_range_for_samples(dev, dp, ch, cs0, cs1)
+        x = store.samples(dev, dp, ch)
+        full = float(1 << (bits - 1)) if bits and bits > 1 else 1.0
+        spec = spectrogram(x, i0, i1, _SPECTRO_COLUMNS, full,
+                           nfft=self.spectrogram_frame((dev, dp, ch)))
+        if spec.db.size == 0:
+            img.clear()
+            return
+        sat = store.sample_positions(dev, dp, ch)
+        if sat is not None and sat.size:
+            xs = np.asarray(sat[np.clip(spec.centres, 0, sat.size - 1)], dtype=np.float64)
+        else:
+            xs = spec.centres.astype(np.float64)
+        nyq = _spectro_nyquist(store.rate(dev, dp))
+        # Each pixel row and column is centred on its bin and its frame: a column covers from
+        # half a pitch before its centre to half after, and bin k (k * nyq / (bins - 1))
+        # likewise, so the image runs half a bin below 0 Hz and above Nyquist.
+        cols, bins = spec.db.shape
+        pitch = (xs[-1] - xs[0]) / (cols - 1) if cols > 1 else max(1.0, cs1 - cs0)
+        bin_hz = nyq / (bins - 1) if bins > 1 else nyq
+        img.setImage(spec.db, autoLevels=False, levels=_SPECTRO_DB)
+        img.setRect(QRectF(xs[0] - pitch / 2, -bin_hz / 2, (xs[-1] - xs[0]) + pitch,
+                           nyq + bin_hz))
 
     def _connect_mask(self, dev, dp, ch, xi, x):
         """Per-point connect mask for the min/max ladder, breaking the line across
@@ -973,7 +1184,11 @@ class AudioView(QWidget):
         except Exception:                               # noqa: BLE001 - never break hover
             QToolTip.hideText()
             return
-        QToolTip.showText(QCursor.pos(), f"Row {row:,}")
+        text = f"Row {row:,}"
+        if any(p is plot and isinstance(c, pg.ImageItem) for p, c, *_r in self._plots):
+            f = plot.vb.mapSceneToView(scene_pos).y()  # a spectrogram's Y is frequency
+            text += f" · {f / 1000:.2f} kHz" if f >= 1000 else f" · {f:.0f} Hz"
+        QToolTip.showText(QCursor.pos(), text)
 
     # ---- playback ----
     def _mix_selected(self, sel, dps):

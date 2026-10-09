@@ -5,6 +5,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# THE ARGUMENTS ARE READ HERE, ONCE. Everything except `--rebuild` is forwarded to the app.
+# This launcher swallowed them all until 3.0.19, so `./run.sh --demo` silently opened an empty
+# window and `./run.sh -c cfg.csv -o m.json` started the UI instead of writing a model.
+# `--rebuild` is this script's own flag (the native build below) and must not reach the app.
+# Read in one place, it means the same wherever it is given: the build step once read only
+# $1 while this loop dropped the flag from any position, so `--demo --rebuild` did neither.
+app_args=()
+headless=0
+rebuild=0
+for a in "$@"; do
+    case "$a" in
+        --rebuild) rebuild=1; continue ;;
+        -o|--output|-o=*|--output=*|-h|--help) headless=1 ;;
+    esac
+    app_args+=("$a")
+done
+
 # Pick a Python the wheels support: PySide6 / pyarrow / numpy publish wheels for
 # 3.11-3.13, not 3.14+ (pip would fall back to building from source and fail). Honour a
 # PYTHON override, else prefer the newest supported interpreter on PATH.
@@ -118,10 +135,6 @@ fi
 # to know a rebuild is needed. (build/ artefacts are excluded from the staleness check.)
 NATIVE_STAMP="$VENV/.native-stamp"
 need_native=0
-rebuild=0
-for a in "$@"; do                       # anywhere among the arguments, not only first
-    [ "$a" = "--rebuild" ] && rebuild=1
-done
 if [ "$rebuild" = 1 ] || ! python -c 'import swi3score' 2>/dev/null; then
     need_native=1
 elif [ ! -f "$NATIVE_STAMP" ] || \
@@ -166,22 +179,6 @@ fi
 # (Emitted below, once the arguments are known — a headless run opens no window, so neither
 # message would be true of it.)
 
-# FORWARD EVERY REMAINING ARGUMENT. This launcher swallowed them all until 3.0.19, so
-# `./run.sh --demo` silently opened an empty window and `./run.sh -c cfg.csv -o m.json` started
-# the UI instead of writing a model. Nothing noticed because there was nothing worth passing
-# until the app grew a real command line.
-#
-# `--rebuild` is THIS script's own flag (see the native build above) and must not reach the app,
-# so it is dropped here, wherever it was given.
-app_args=()
-headless=0
-for a in "$@"; do
-    [ "$a" = "--rebuild" ] && continue
-    case "$a" in
-        -o|--output|-o=*|--output=*|-h|--help) headless=1 ;;
-    esac
-    app_args+=("$a")
-done
 
 # -o implies headless, so say nothing about a window that will not open. The app decides for
 # real; this only picks which message is honest.

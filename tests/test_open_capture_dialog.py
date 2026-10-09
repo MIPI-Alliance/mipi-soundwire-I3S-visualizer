@@ -143,6 +143,22 @@ def test_when_all_does_not_fit_it_opens_on_the_largest_window_that_does():
     assert "does not fit" in dlg._source_line.text()
 
 
+def test_a_large_load_that_fits_is_labelled_and_left_on_all():
+    """Past the large-load mark (8 GiB in the app) the dialog says so and stays on All: the
+    mark used to cap the budget, which chose a window and made All a refusal."""
+    QApplication.instance() or QApplication([])
+    dlg = OpenCaptureDialog(_probe(cost=14 * 10**9), [], budget_bytes=20 * 10**9,
+                            large_bytes=8 * 10**9)
+    text = dlg._source_line.text()
+    assert dlg._all.isChecked() and dlg._open_btn.isEnabled()
+    assert "~14.0 GB to load all (fits; large, past 8.0 GB, so opening may be slow)" in text
+    dlg._t0.set_seconds(0.0)
+    dlg._t1.set_seconds(1.5)                               # 10.5 GB: still large
+    assert "large, may be slow" in dlg._window_line.text()
+    dlg._t1.set_seconds(0.5)                               # 3.5 GB
+    assert "large" not in dlg._window_line.text()
+
+
 def test_a_format_read_whole_says_so():
     dlg = _dlg(_probe(windowed=False))
     assert "reads the whole file" in dlg._source_line.text()
