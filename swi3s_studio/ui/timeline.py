@@ -12,7 +12,7 @@ import bisect
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
 
@@ -156,6 +156,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     #: the visible window changed by the USER (zoom, pan, reset) — (lo, hi) in samples. A
     #: stack of ribbons (one per Link) listens so every Link shows the same instants.
     viewChanged = Signal(float, float)
+    #: right-click on a config-region band: (its section index, global position)
+    regionMenuRequested = Signal(int, QPoint)
     #: a single ribbon's fixed height, and one Link's default band in a stack of them
     BAND_HEIGHT = _H
 
@@ -246,7 +248,9 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         row_base). Painted as translucent bands coloured by column count, so each
         distinct bus geometry shows in its own colour. A segment carrying a truthy
         "forced" key had its width pinned by the user (Session.force_column_count_at)
-        and is labelled + outlined as overridden."""
+        and is labelled + outlined as overridden; one carrying "csv" (the file's name) has
+        a config CSV imposed on it alone (Session.apply_config_csv_at); "name" is the
+        user's name for it (Session.region_names), and "index" its section index."""
         self._segments = sorted(segments, key=lambda s: s.get("start_sample", 0))
         if total_samples:
             self._total = max(1, int(total_samples))
@@ -596,8 +600,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                 p.setFont(label_font)
                 p.setPen(QPen(QColor(VizTheme.TEXT)))     # theme text — visible in light AND dark
                 p.drawText(QRectF(x0 + 6, tr.top(), x1 - x0 - 8, _CFG_BAND_H),
-                           Qt.AlignLeft | Qt.AlignVCenter,
-                           self._segment_label(i, cols, bool(seg.get("forced"))))
+                           Qt.AlignLeft | Qt.AlignVCenter, self._band_label(i, seg))
         # §5.1.2 link bring-up (Bus Reset → PHY-select → audio). In a multi-second
         # capture this region is well under a pixel wide, so draw an ALWAYS-VISIBLE
         # marker in a distinct cyan (NOT the gold Commit+SSP tick): a min-width band,
@@ -783,6 +786,11 @@ class TimelineRibbon(RowOriginMixin, QWidget):
 
     def mousePressEvent(self, event) -> None:
         self._left_dragged = False
+        if event.button() == Qt.RightButton:
+            hit = self._region_at(event.position())
+            if hit is not None:                       # the band's menu, not a seek
+                self.regionMenuRequested.emit(hit[0], event.globalPosition().toPoint())
+                return
         if event.button() == Qt.MiddleButton:
             self._pan_x = event.position().x()       # begin pan
             return
@@ -817,7 +825,31 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._seek_timer.stop()
         self._emit_pending_seek()
 
-    def _segment_label(self, index: int, cols: int, forced: bool = False) -> str:
+    def _band_label(self, index: int, seg: dict) -> str:
+        """A band's label: the user's name for the region, then what it is."""
+        what = self._segment_label(index, int(seg.get("column_count", 0)),
+                                   bool(seg.get("forced")), bool(seg.get("csv")))
+        name = str(seg.get("name") or "").strip()
+        return f"{name} · {what}" if name else what
+
+    def _region_at(self, pos):
+        """(section index, segment) of the config band under widget position `pos`, or
+        None if `pos` is not on the band strip or there is no band there."""
+        tr = self._track_rect()
+        if not (tr.top() <= pos.y() < tr.top() + _CFG_BAND_H):
+            return None
+        # The bring-up's bands sit over the start of region 0, which is drawn only from the
+        # audio start (paintEvent's band_left); a click there is the bring-up's, not region 0's.
+        if self._bringup and self._sample_for(pos.x()) < int(self._bringup.get("audio_start", 0)):
+            return None
+        seg = self._segment_at(self._sample_for(pos.x()))
+        if seg is None:
+            return None
+        i, s = seg
+        return int(s.get("index", i)), s
+
+    def _segment_label(self, index: int, cols: int, forced: bool = False,
+                       csv: bool = False) -> str:
         """Config-band label. The initial audio segment of a cold/warm start is the
         selected PHY's Safe-Lock geometry, so label it by the PHY (e.g. 'PHY2
         Safe-Lock-2') — the PHY is what makes that 2-column (FBCSE) / 4-column (DLV)
@@ -826,12 +858,13 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         PhyStart), and this audio band begins only after the PHY is selected.
 
         A `forced` region had its width pinned by the user, so say so — otherwise a
-        pinned width is indistinguishable from one the decoder read off the wire."""
+        pinned width is indistinguishable from one the decoder read off the wire. A `csv`
+        region decodes with a config CSV imposed on it, which says so for the same reason."""
         b = self._bringup
         if (index == 0 and b and b.get("phy_name")
-                and b.get("safe_lock_columns") == cols and not forced):
+                and b.get("safe_lock_columns") == cols and not forced and not csv):
             return f"{b['phy_name']} Safe-Lock-{cols}"
-        return f"{cols}col (forced)" if forced else f"{cols}col"
+        return f"{cols}col (forced)" if forced else f"{cols}col (CSV)" if csv else f"{cols}col"
 
     def _nearest(self, x: float, px: float = 5.0):
         """The command whose tick is within `px` of x (closest; higher paint rank wins
@@ -902,9 +935,11 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             forced = bool(s.get("forced"))
             note = (" · column count pinned by you (Decode ▸ Force Column Count) — "
                     "the wire's own width is overridden for this region" if forced else "")
-            return (f"Bus config: "
-                    f"{self._segment_label(i, int(s.get('column_count', 0)), forced)} "
-                    f"· from row {int(s.get('row_base', 0)):,}{note}")
+            if s.get("csv"):
+                note += (f" · config imposed from {s['csv']} (Decode ▸ Import Visualizer "
+                         "CSV) — this region only")
+            return (f"Bus config: {self._band_label(i, s)} "
+                    f"· from row {int(s.get('row_base', 0)):,}{note} · right-click to rename")
         return ""
 
     def _nearest_commit_point(self, x: float, px: float = 5.0):

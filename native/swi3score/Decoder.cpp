@@ -12,7 +12,7 @@
 #include "TransitionSampleSource.h"   // concrete source: de-virtualize the hot stream loop
 #include "DlvSampleSource.h"          // concrete DLV source: de-virtualize its stream loop too
 
-#include <algorithm>   // std::upper_bound (windowed checkpoint lookup)
+#include <algorithm>   // std::upper_bound (windowed checkpoint lookup), std::any_of
 #include <cmath>
 #include <numeric>   // std::lcm (manual-SSP interval period)
 
@@ -367,14 +367,17 @@ bool Decoder::maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool pr
 {
     SwI3sConfig snooped;
     bool buildOk;
-    if (mSettings.registerOverrides.empty()) {
+    const auto& imported = mSettings.importedConfigSections;
+    const bool alone = std::find(imported.begin(), imported.end(), sectionIndex) != imported.end();
+    if (mSettings.registerOverrides.empty() && !alone) {
         buildOk = mRegisters.BuildConfig(snooped);
     } else {
         // Fold section-scoped what-if overrides into a COPY of the live register
         // model (never the live one — force-committing it would taint later real
         // commits, Risk R2). CRegisterModel holds only std::maps, so this is cheap
-        // and only happens at (infrequent) reconfigure points.
-        CRegisterModel snoop = mRegisters;
+        // and only happens at (infrequent) reconfigure points. An imported section
+        // starts from an empty model instead (see importedConfigSections).
+        CRegisterModel snoop = alone ? CRegisterModel() : mRegisters;
         applyRegisterOverrides(snoop, sectionIndex);
         buildOk = snoop.BuildConfig(snooped);
     }
@@ -882,6 +885,7 @@ void Decoder::run()
     // (N unknown) readout.
     mProgressUis = 0;
     mTotalUis = mSrc.TotalUiCount();
+    mStopped = false;                // a stop requested before run() still stops it
 
     mConfig = SwI3sConfig();
     mHaveCsv = false;
@@ -1012,6 +1016,17 @@ void Decoder::run()
         mEngine.SetStartColumn(mColumn);
         mEngine.Configure(mConfig);
         recordReconfig(segStartUi, mColumn);   // first config epoch (windowed decode)
+    } else if (mDecodeAudio &&
+               std::any_of(mSettings.registerOverrides.begin(), mSettings.registerOverrides.end(),
+                           [](const auto& ov) { return std::get<0>(ov) == 0; })) {
+        // Overrides for section 0 take effect from the start. Every later section is
+        // opened by a reconfigure, which folds its overrides in (maybeConfigureFromSnoop);
+        // section 0 has none unless the wire commits a config inside it, so a region
+        // config imposed on a capture that starts after its setup commit (a config CSV
+        // imported into the first region) never reached the payload engine.
+        mEngine.SetStartColumn(mColumn);
+        if (maybeConfigureFromSnoop(mColumnCount, 0))
+            recordReconfig(segStartUi, mColumn);
     }
     mRowCounter = 0;
     mPendingSspRow = -1;
@@ -1085,6 +1100,11 @@ void Decoder::streamRemainder(Src& src)
         feed(dataHigh ? BIT_HIGH : BIT_LOW, sn, src.UiIndex() - 1);
         if (mNeedResync)
             resync();
+        if ((mProgressUis & 0xFFFF) == 0 &&
+            mStopRequested.load(std::memory_order_relaxed)) {
+            mStopped = true;
+            return;
+        }
     }
 }
 

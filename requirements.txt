@@ -21,7 +21,10 @@ pyarrow>=14.0
 psutil>=5.9
 
 # Runtime — Qt GUI
-PySide6>=6.6
+# Below 6.12: with PySide6 6.12.0 the process crashes as the interpreter exits, after every
+# test has passed (a segfault on macOS, "pure virtual method called" and an abort on Linux),
+# and 6.11.1 does not. Keep this in step with pyproject.toml.
+PySide6>=6.6,<6.12
 pyqtgraph>=0.13
 
 # Build — native swi3score decode core (pybind11); required by `pip install ./native`

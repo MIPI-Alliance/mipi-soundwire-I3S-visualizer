@@ -206,15 +206,21 @@ def _v3_has_overlong_code(bb: np.ndarray) -> bool:
     from Python any other way. No real capture comes close: the smallest delta that needs ten
     digits is 2**63 samples, which is 585 years at 500 MS/s.
     """
-    if bb.size == 0:
+    run = _V3_MAX_INTERIOR_RUN + 1                 # too long: this many high bytes in a row
+    if bb.size < run:
         return False
     high = bb >= 0x80
     if not high.any():
         return False
-    # Longest run of True: reset a running count at every False.
-    idx = np.arange(bb.size, dtype=np.int64)
-    last_low = np.maximum.accumulate(np.where(~high, idx, np.int64(-1)))
-    return bool(int((idx - last_low).max()) > _V3_MAX_INTERIOR_RUN)
+    # AND the mask with itself shifted 1..run-1 places: what survives starts a run that long.
+    # Two bytes per payload byte. It was a running "distance since the last low byte" in
+    # int64, three of them, 24 bytes per payload byte — three times the decoded output on a
+    # multi-byte-delta block, and the peak of a whole-channel decode.
+    n = bb.size - run + 1
+    hit = high[:n].copy()
+    for k in range(1, run):
+        hit &= high[k:k + n]
+    return bool(hit.any())
 
 
 def _v3_decode_block_np(bb: np.ndarray, require_all: bool):
@@ -359,7 +365,7 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
     # One uint8 view of the whole blob (zero-copy) for the native per-block decode.
     buf8 = np.frombuffer(data, np.uint8) if _native_v3 is not None else None
 
-    def decode_run(body, cnt):
+    def decode_run(body, cnt, checked=False):
         """Decode one block's delta run to an int64 array — native if available.
 
         REJECTS AN OVER-LONG CODE FIRST, for both paths: they share the int64 arithmetic that
@@ -368,20 +374,30 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
         makes walk() treat the block as "not a chain", which is the right outcome either way
         — a spurious zero-qword in the metadata keeps scanning, and a genuinely corrupt
         payload ends with MalformedSaleaeV3 rather than an empty channel that looks decoded.
+        `checked` skips that scan for a block walk() has already passed: it costs about two
+        int64s per payload byte, as much as the output again on a multi-byte-delta block.
         """
         bb = (buf8[body:body + cnt] if buf8 is not None
               else np.frombuffer(data, np.uint8, count=cnt, offset=body))
-        if _v3_has_overlong_code(bb):
+        if not checked and _v3_has_overlong_code(bb):
             return None
         if _native_v3 is not None:
             return _native_v3(buf8, body, cnt)
         return _v3_decode_deltas_np(data, body, cnt)
 
     def walk(o0):
-        """Decode the block chain starting at o0; return (initial_level, deltas) if
-        it tiles the blob exactly, else None. The first block must start at sample
-        0, and carries the channel's initial state in its `level` field."""
-        deltas = []
+        """Validate the block chain starting at o0; return (initial_level, blocks) if it
+        tiles the blob exactly, else None, where `blocks` is one (body, cnt, A_start,
+        delta count) per block. The first block must start at sample 0, and carries the
+        channel's initial state in its `level` field.
+
+        Each run is decoded to check it and then DROPPED, so validating costs one block,
+        and the fill below decodes it again straight into the output. Keeping the runs
+        instead held every delta (8 bytes per transition), then a concatenated copy, then
+        the cumsum: three full-size arrays live at once. On a 264M-transition channel that
+        was 6.3 GB for 2.1 GB of result, and it is what put a 54 MB capture past the
+        memory guard on a 64 GB machine. The second decode costs well under a second."""
+        blocks = []
         o = o0
         prev_b = None
         initial = 0
@@ -411,10 +427,10 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
                 return None
             if int(run.sum()) != (b - a):
                 return None
-            deltas.append(run)
+            blocks.append((body, cnt, a, int(run.size)))
             prev_b = b
             o = body + cnt
-        return (initial, deltas) if o == n else None
+        return (initial, blocks) if o == n else None
 
     # The variable-length metadata header has no documented bound, so scan the whole
     # pre-block region for the first self-consistent chain start. walk() is only
@@ -426,15 +442,28 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
         r = walk(o0)
         if r is None:
             continue
-        initial, deltas = r
-        if not deltas or all(d.size == 0 for d in deltas):
+        initial, blocks = r
+        total = sum(k for _b, _c, _a, k in blocks)
+        if total == 0:
             samples = np.zeros(0, dtype=np.uint64)
         else:
-            # cumsum the concatenated per-block deltas; drop the last (gap to capture
-            # end). cumsum straight into uint64 (deltas are positive) avoids a second
-            # full-size int64→uint64 copy; a[:-1] of a contiguous array stays contiguous.
-            alld = deltas[0] if len(deltas) == 1 else np.concatenate(deltas)
-            samples = np.cumsum(alld, dtype=np.uint64)[:-1]
+            # Each block's cumsum, offset by its A_start, written straight into one uint64
+            # output: the chain check guarantees A_start is the sum of every earlier delta,
+            # so this is the cumsum of the whole run. Drop the last (gap to capture end);
+            # a[:-1] of a contiguous array stays contiguous.
+            out = np.empty(total, dtype=np.uint64)
+            pos = 0
+            for body, cnt, a, k in blocks:
+                if k:
+                    dst = out[pos:pos + k]
+                    # A uint64 VIEW, not dtype=: cumsum casting int64 makes a full copy.
+                    # Every delta is >= 1 (walk() checked the sums), so the bits agree.
+                    run = decode_run(body, cnt, checked=True)
+                    np.cumsum(run.view(np.uint64), out=dst)
+                    del run
+                    dst += np.uint64(a)
+                    pos += k
+            samples = out[:-1]
         return DigitalChannelSamples(bool(initial), np.ascontiguousarray(samples))
     raise MalformedSaleaeV3(label, "no self-consistent transition-block chain found "
                                    "(unrecognised version-3 layout)")

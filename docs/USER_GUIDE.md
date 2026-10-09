@@ -92,6 +92,9 @@ cells are coloured per **(device, data-port)** with channel labels and sample-st
 markers; guard/tail/TxPresent/DRQ slots are labelled; a legend keys the ports and
 slots. Rows are 0-based. **Rows To Draw** sets the grid height.
 
+Each swatch in the colour key is as wide as its label, so a data port you have named
+(Audio ▸ right-click a channel ▸ **Rename…**) reads in full.
+
 **Click a data-port swatch** in the colour key to choose what that port's cell labels
 show — **Sample**, **Channel**, **Bit**, in any combination (the same fields, and the
 same flags, as the Visualizer's port Display Options). The default is Channel|Bit, which
@@ -124,6 +127,51 @@ the extremes of what is shown under **Vertical Zoom In**; a cursor line tracks t
 cursor. **Click a waveform to seek**; **▶ Play** streams the first selected port to the
 system output; **Jog < / >** page one screen. Output device, bit depth, and per-port
 decimation are in the **Audio menu**.
+
+**Right-click a checkbox ▸ Rename…** names that data port, for example `Mic L`. The name
+replaces "Dev1 DP2" in the channel list (the numbers stay in its tooltip and in the track
+titles), the Samples Port column and filter, the Capture legend, the Bus Grid's colour key,
+the Audio menus, the Filter & Gain and Export Audio dialogs and the Timing pane's driver
+filter. An empty name goes back to the numbers. The name is the Link's and is saved in the
+workspace; it changes labels only, so nothing is re-decoded.
+
+**Waveform or spectrogram, per channel.** Right-click a checkbox ▸ **Spectrogram** draws
+that channel as a spectrogram (time across, frequency up to the stream's Nyquist, level as
+colour from −120 to 0 dBFS); **Waveform** goes back. It shares the waveform's zoom, cursor,
+bookmarks and click-to-seek, and the tooltip adds the frequency under the pointer. The
+**frame** sizes under Spectrogram (256, 512, 1024, 2048 points; 1024 by default) trade time
+for frequency: each column is an FFT of one frame centred on it, so a click shows from
+half a frame before it, ±2.7 ms at 256 points and 48 kHz, with 188 Hz bins; ±10.7 ms at
+1024 with 47 Hz bins. Each menu item says what its size gives at that channel's rate. Zoomed
+far out a frame is taken per column, so a click between two frames shows once you zoom in.
+The choice and the frame are part of the Link's Audio view.
+
+**Right-click a checkbox ▸ Filter & Gain…**, or **Audio ▸ Filter & Gain ▸** a stream,
+filters and amplifies one stream, all its channels, to make a glitch stand out: a click or a dropout is often lost under a large
+low-frequency signal or too quiet to see. The dialog follows Audacity's Amplify:
+
+- **DC blocker**: a 2nd-order Butterworth high-pass at a fixed 1 Hz corner, zero phase. It
+  removes a PDM mic's density bias or a PCM stream's offset, including one that drifts. Off,
+  the waveform shows what is on the wire: a constant all-ones PDM stream reads full scale.
+- **High-pass filter**: a 4th-order Butterworth applied forward and backward (zero phase,
+  like SciPy's `filtfilt`), so a click stays where it happened. The corner runs from 1 Hz to
+  20 kHz, or to just under half the stream's sample rate.
+- **Amplification (dB)** and **New Peak Amplitude (dB)** are one number seen two ways. The
+  peak is measured after the DC blocker and the high-pass, and the gain opens at the value
+  that brings it to 0 dBFS; until you edit the gain it keeps doing that as they change.
+- **Allow clipping**: without it, a gain that would take the peak above 0 dB cannot be
+  applied. With it, samples past full scale saturate, as a DAC would.
+- **Preview** shows the result in the waveform; **Cancel** puts back what was there, and
+  **Apply** keeps it. **Revert**, offered when the stream has a setting, removes it and
+  returns the decoded samples exactly.
+
+A processed stream's checkboxes carry an asterisk (the setting is in their tooltip) and its
+tracks' titles name it. Playback and **Export Audio** use the processed samples; the
+**Samples** table keeps the decoded bus values. The setting belongs to the Link, survives a re-decode,
+and is saved in the workspace. A filter cannot know the signal beyond the capture, so a
+stream that starts or ends far from its own level shows the filter's edge response over the
+first and last few periods of the corner frequency; a transport gap, where the stream is
+joined across missing samples, shows the same.
 
 ### CDS
 The Control Data Stream as classified 8b/10b symbols: **Row**, Time, codeword, **RD**
@@ -203,7 +251,11 @@ came. The search runs off the UI thread with a progress dialog.
 A strip across the whole capture: command marks coloured by kind, translucent
 **bus-config bands** by column count (so a `2col → 8col` cold-start reconfiguration is
 visible at a glance), and the cursor. Click to seek; scroll up/down to zoom, left/right
-to pan. **Bookmarks** (⌘B / ⌘] / ⌘[) mark and step through points.
+to pan. **Bookmarks** (⌘B / ⌘] / ⌘[) mark and step through points. **Right-click a
+bus-config band ▸ Rename…** to name that region, for example `Playback`: the band then
+reads `Playback · 8col`. An empty name clears it; the name is the Link's and is saved in the
+workspace. Like a pinned column count it belongs to the region's number, so a re-decode that
+changes which regions exist can leave it on a different one.
 
 ## Opening a capture
 
@@ -272,7 +324,6 @@ the Link of the pane you last clicked in. A menu that belongs to a pane always a
 pane's Link:
 - **Audio**, the capture items of **File** (Export Capture, Locate Sub-Capture), and
   Decode's Scrambler and Manual SSP: the signal panes' Link.
-- **Decode ▸ Block PDM DC Bias**: every Link.
 - The grid items (**File ▸ Export Visualizer CSV / Export Bus Grid Image / View Bus Grid in
   Visualizer**, **Decode ▸ Import Visualizer CSV / Force Column Count**) and the grid's own
   toolbar: the Bus Grid's Link.
@@ -347,7 +398,13 @@ Two things are then missing:
    Visualizer CSV…** — pick a config CSV and choose **Update** to impose its data-port
    config on the open capture, or **Compare** to overlay it in the Register Map (the current
    Visualizer authoring can be compared, not imposed). The config drives the decode from row 0,
-   so audio reconstructs. Use the **TX map** (Bus Grid ▸ Show Toggles) to see which
+   so audio reconstructs. A capture with **several config regions** (a cold start's
+   Safe-Lock-2 → 8 → 16 columns) takes the CSV into the region under the cursor **only**:
+   that region decodes with the CSV's ports and width, and every other region, and every
+   command, decodes as the wire says. The region is labelled `8col (CSV)` in the timeline,
+   its registers show as *CSV* in the Register Map, and the import is saved in the
+   workspace. **Decode ▸ Remove … from This Region** takes it out again (the item names the
+   CSV, and is enabled only while the cursor's region has one). Use the **TX map** (Bus Grid ▸ Show Toggles) to see which
    columns actually carry data and confirm the config matches the wire.
 
    If the grid still shows the wrong number of columns — the wire never carried a
@@ -388,13 +445,19 @@ anything, Studio predicts the peak memory from the ZIP directory alone — no in
 decoding — and the Open Capture dialog shows it against the budget; when all of it would
 not fit, the dialog opens on a **time window** that does.
 
-- **The budget is capped in absolute terms, not just as a share of free RAM.** It is the
-  *lower* of 60% of free memory and an 8 GiB ceiling, so a machine with little free memory
-  is asked sooner while a machine with lots is still asked past ~8 GB of predicted peak —
-  more RAM never means silently loading more. "It will fit" and "it will stay responsive"
-  are different questions, and only the first one scales with RAM: without the ceiling, a
-  machine with a lot of RAM would load a capture to tens of GB resident with no prompt and
-  page through compressed memory on every navigation.
+- **The prediction is for a whole-file decode as it is now**: the inflated payload plus
+  twice the edge arrays (the result, and one block's worth of deltas while it is built). A
+  54 MB capture with 302M transitions peaks at 3.7 GB and is predicted at 7.2 GB, which
+  opens without asking.
+- **The budget is 60% of free memory.** A load predicted past it is not attempted, and the
+  dialog opens on a window that fits. A load that fits but is predicted past 8.6 GB (8 GiB)
+  is labelled *large, so opening may be slow* and is yours to open whole or not.
+- **The decode after the load is watched, not predicted.** How much audio a capture
+  decodes to depends on its bus config (from a few hundredths of a sample per UI to nearly
+  one for 1-bit PDM), so it cannot be known before decoding. While it runs, free memory is
+  read every quarter second; if it falls below a floor (10% of RAM, at least 1 GiB) the
+  decode is stopped and says so, before macOS starts compressing memory, and you can open
+  a window instead. A re-decode stopped this way keeps the decode you had.
 - **You can ask for a window on purpose**, in any format, with the dialog's **From … to
   …**, even for a capture that would fit. For a `.sal` only the overlapping blocks are
   decoded, streamed straight out of the ZIP; other formats are read whole and cut. Either
@@ -425,7 +488,8 @@ panes**: one pane group, with its own Link picker.
   `.vcd`, a Tektronix analog `.csv`, or **both** channel files of a `.bin` or `.wfm` pair,
   multi-selected — see **Opening a capture**); *Open Demo Capture ▸ PHY1 (FBCSE), PHY2
   (FBCSE), PHY2 (Flow Control), PHY3 (DLV), or PHY2 (Two Links)*; *Open / Save Workspace…*
-  (⌘S); *Export Capture…* (one dialog — pick the format `.sal` / `.bin` / CSV, which signals + their names, the range (whole capture or a
+  (⌘S, a `.swi3s` file; older `.json` workspaces still open; see **What a workspace keeps**
+  below); *Export Capture…* (one dialog — pick the format `.sal` / `.bin` / CSV, which signals + their names, the range (whole capture or a
   time / bus-row / UI window), and the output file); *Locate Sub-Capture…*; *Export
   Visualizer CSV…*, *Export Bus Grid Image…* (SVG/PNG) and *View Bus Grid in Visualizer*.
 - **File**, Bus Visualizer — *Open / Save Visualizer CSV…* (⌘O / ⌘S, the authoring CSV);
@@ -436,13 +500,16 @@ panes**: one pane group, with its own Link picker.
   with Commands' quick picks All ⌘4, None ⌘5, All excl. Ping ⌘6, Commit ⌘7; Errors Only);
   *Next / Previous SSCR/DSCR Commit* (⌘> / ⌘<); *Export as CSV…*.
 - **Decode** — everything that changes what the capture decodes to, so each re-decodes:
-  *Import Visualizer CSV…* (impose a config CSV on the capture from row 0, or compare it,
+  *Import Visualizer CSV…* (impose a config CSV on the capture from row 0, or on the
+  region under the cursor when the capture has several, or compare it,
   or the authored config, in the Register Map — clear the comparison with the **Clear
-  Compare** button there); *Force Column Count…* (pin the bus column count for the config
+  Compare** button there); *Remove … from This Region* (drop the cursor region's CSV);
+  *Force Column Count…* (pin the bus column count for the config
   region under the cursor); *Hub Depths…*; *Per-Dataport Scrambler…* (Auto / On / Off);
-  **Manual SSP Move** (see above); *Block PDM DC Bias*.
+  **Manual SSP Move** (see above).
 - **Devices** — *Device Names…*; *Peripheral Register Maps…* (import vendor maps).
-- **Audio** — *Playback Output Device / Bit Depth / Decimation*; *Export Audio as WAV…*.
+- **Audio** — *Playback Output Device / Bit Depth / Decimation*; *Filter & Gain* (a
+  stream's DC blocker, high-pass and gain); *Export Audio as WAV…*.
 - **Bookmarks** — *Toggle / Next / Previous / Clear* (⌘B / ⌘] / ⌘[); *Align
   Links on Bookmark Pair…* (two or more Links).
 - **View** — in the Bus Analyzer, show/raise any pane (Timeline, Registers, Statistics,
@@ -465,6 +532,34 @@ clock is assigned by transition count. Channels are paired into Links in the Ope
 page (see **Opening a capture**). Digital-vs-analog `.csv` is decided by the data values (channels that are strictly 0/1 read as digital). The open
 dialog reopens in the last-used folder, tracked separately per mode (the Visualizer
 defaults to `./visualizer_examples`); a large capture shows an n/N decode-progress bar.
+
+### What a workspace keeps
+
+A saved workspace reopens the window as it was when it was saved:
+
+- **Each Link:** its capture and everything that changes how it decodes (register pins,
+  hub depths, scramblers, device names and register maps), its name and offset, its
+  Commands filter and column widths, its Audio pane's checked channels, zoom, Vertical
+  Zoom, playback decimation and which channels are spectrograms (and their frames), its
+  Capture pane's zoom and RSP marker, Samples and legend toggles, its streams' colours and
+  Filter & Gain, and its data-port and region names.
+- **The window:** bookmarks, the cursor, the mode, which Link each pane group shows and the
+  All Links choices, which panes are open, how they are docked and tabbed and which tab is
+  in front, their sizes, the window's size and position, the timeline's zoom, the Commands
+  sort and hidden columns, the Samples filters, the Registers device and opened blocks,
+  the Statistics sections folded, and the Timing pane's region, driver filter and hidden
+  edge kinds; and the Bus Visualizer and Timing Calculator inputs.
+
+Each capture file is recorded relative to the workspace file, so a folder holding both can
+be moved or shared, and where it was when saved, in case the workspace moves alone. If a
+capture is in neither place, you are asked to **Locate…** it (any other missing file of the
+same name in the folder you pick is found too), to **Skip This Link** and open the rest, or
+to **Cancel**.
+
+The playback output device and bit depth are not in it: they belong to the computer, not
+the capture. A window larger than the screen it reopens on is fitted to that screen. Each
+Link also keeps its own Audio and Capture view while another Link is shown, and through a
+re-decode.
 
 ## Row / Time reference points
 

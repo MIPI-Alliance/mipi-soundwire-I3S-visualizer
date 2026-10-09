@@ -359,7 +359,7 @@ def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch,
     """Free RAM, then a fraction of TOTAL, then a small constant — each rule more cautious
     than the last, and each saying which one it used.
 
-    It used to fall straight to a flat 8 GiB, which was the same value as _MAX_AUTO_BUDGET
+    It used to fall straight to a flat 8 GiB, which was the same value as the cap it had
     and therefore INVISIBLE on any machine with more than ~14 GB free, while being ~3.6x too
     permissive on a 4 GB one (8.59 GB allowed against the 2.40 GB a psutil reading gives).
     That is failing OPEN on the machines least able to absorb it, in the branch whose own
@@ -453,36 +453,61 @@ def test_the_peak_estimate_carries_the_decode_transient():
     cost = ss.SalCost(file_bytes=1_000, uncompressed_bytes=2_000_000_000,
                       est_transitions=1_000_000, est_edge_bytes=8_000_000,
                       sample_rate_hz=_RATE)
-    assert cost.est_peak_bytes == int(2_000_000_000 + 8_000_000 * ss._STREAM_TRANSIENT)
-    assert ss._STREAM_TRANSIENT > 1.0, "a transient of 1 would restore the under-prediction"
+    assert cost.est_peak_bytes == int(2_000_000_000 + 8_000_000 * ss._WHOLE_FILE_TRANSIENT)
+    assert ss._WHOLE_FILE_TRANSIENT > 1.0, "a transient of 1 would restore the under-prediction"
     # The blob term must NOT be multiplied: it is one allocation, not a pipeline.
     assert cost.est_peak_bytes < int(
-        (2_000_000_000 + 8_000_000) * ss._STREAM_TRANSIENT), "transient applied to the blob too"
+        (2_000_000_000 + 8_000_000) * ss._WHOLE_FILE_TRANSIENT), "transient applied to the blob too"
 
 
-def test_the_budget_is_capped_absolutely_not_just_by_free_ram(monkeypatch):
-    """A budget of 0.6 x free memory makes the failure mode scale WITH the hardware.
+@pytest.mark.parametrize("chunk", [0, 50_000])
+def test_a_whole_channel_decode_holds_the_output_and_one_block(chunk):
+    """What _WHOLE_FILE_TRANSIENT promises, measured: a whole-channel v3 decode allocates
+    the uint64 output plus at most one block's int64 deltas — 2x the result when one block
+    is the whole channel, and close to 1x when there are many.
 
-    "Will it fit" and "will it stay interactive" are different questions and only the
-    first grows with RAM, so the better the machine the more the app loaded without ever
-    asking. That is how a 103 GB box loaded a capture whole and sat in continuous memory
-    compression while 16-32 GB machines were offered a time window for the same file and
-    never got into trouble -- the reported complaint being that the FASTER machine was
-    slower. An explicit max_bytes still overrides the cap, because a caller naming a
-    number has already made the decision.
+    It used to keep every block's deltas, concatenate them and cumsum the concatenation,
+    three full-size arrays at once: 8.6 GB for the 2.4 GB of edges in a 54 MB capture,
+    which the estimate (rightly, at the time) put past the memory guard on a 64 GB machine.
+    tracemalloc sees NumPy's allocations, so this is exact, not an RSS sample.
+    """
+    import tracemalloc
+    edges = _edges(n=400_000, step=200)
+    blob = sb.build_channel_v3(True, edges, chunk_size=chunk)
+    tracemalloc.start()
+    try:
+        ch = sb.parse_channel_v3(blob)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert np.array_equal(ch.transition_samples, edges) and ch.initial_state
+    out = edges.nbytes
+    limit = 2.1 * out if chunk == 0 else 1.25 * out
+    assert peak <= limit, (
+        f"decoding {out / 1e6:.1f} MB of edges peaked at {peak / 1e6:.1f} MB "
+        f"({peak / out:.2f}x); the estimate allows {ss._WHOLE_FILE_TRANSIENT}x")
+
+
+def test_the_budget_is_capacity_and_a_large_load_is_only_labelled(monkeypatch, tmp_path):
+    """The budget is 0.6 x free memory and nothing else; 8 GiB only labels a load large.
+
+    It was min(0.6 x free, 8 GiB), so a 64 GB or 96 GB machine REFUSED a capture predicted
+    at 14 GB: the dialog chose a window, and All raised SalTooLargeError. The cap was meant
+    to hand the decision to a person past 8 GiB, but nothing let them make it. It was also
+    covering for an estimate that under-predicted 3x (the 103 GB machine that reached
+    ~60 GB resident); the estimate is now measured against RSS, and the decode is watched
+    while it runs (test_a_decode_is_stopped_when_free_memory_runs_low).
     """
     for free_gb in (4, 16, 64, 103, 1024):
         monkeypatch.setattr(ss, "available_memory_bytes", lambda g=free_gb: int(g * 1e9))
-        budget = ss.memory_budget()
-        assert budget <= ss._MAX_AUTO_BUDGET, (
-            f"{free_gb} GB free produced a {budget/1e9:.1f} GB budget — the cap is not applied")
-        assert budget == min(int(free_gb * 1e9 * ss._MEM_HEADROOM), ss._MAX_AUTO_BUDGET), (
-            f"{free_gb} GB free: the budget is neither the fraction nor the cap")
-    # The fraction still governs below the cap, and the cap still governs above it -- a
-    # constant would pass the equality above while breaking one of these.
-    monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(4e9))
-    assert ss.memory_budget() == int(4e9 * ss._MEM_HEADROOM) < ss._MAX_AUTO_BUDGET
-    monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(103e9))
-    assert ss.memory_budget() == ss._MAX_AUTO_BUDGET
+        assert ss.memory_budget() == int(free_gb * 1e9 * ss._MEM_HEADROOM), f"{free_gb} GB"
+    assert ss.large_load_bytes() == 8 << 30
     monkeypatch.setattr(ss, "available_memory_bytes", lambda: int(1024e9))
     assert ss.memory_budget(max_bytes=64 << 30) == 64 << 30, "explicit max_bytes must win"
+    # A load predicted past the large-load mark but within the budget opens.
+    e = _edges(20_000)
+    blob = sb.build_channel_v3(False, e, chunk_size=500)
+    path = _write_sal(tmp_path, blob, blob)
+    monkeypatch.setattr(ss, "_LARGE_LOAD", 1)
+    assert ss.estimate_cost(path, [0, 1]).est_peak_bytes > ss.large_load_bytes()
+    assert ss.load_capture(path, 0, 1).clock_edges.size == e.size

@@ -40,6 +40,7 @@ from .grid_view import bookmark_pair_color as _bookmark_pair_color
 from .grid_view import dp_line_color  # shared stable per-(device,dp) hue (grid/audio/capture)
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
+from .port_names import port_label
 from .theme import VizTheme, analyzer_stylesheet
 
 # Trace and marker colours are read from VizTheme at use, not copied at import: this
@@ -175,6 +176,7 @@ class RawCaptureView(QWidget):
         self._lane_labels: dict[tuple, list] = {}  # lane -> [TextItem] pool of "CHn" MSB labels
         self._port_colors: dict[tuple, Any] = {}   # lane -> QColor (stable across windows)
         self._stream_overrides: line_style.Overrides = {}   # the shown Link's stream colours
+        self._stream_names: dict = {}            # the shown Link's data-port names (port_names)
 
         self._plot = pg.PlotWidget(background=VizTheme.PLOT_BG, viewBox=XWheelViewBox(),
                                    axisItems={"bottom": _RawTimeAxis(orientation="bottom")})
@@ -586,6 +588,12 @@ class RawCaptureView(QWidget):
         x0, x1 = self._plot.getViewBox().viewRange()[0]      # the CHn labels take it on render
         self._render_range(int(x0 * self._rate), int(x1 * self._rate))
 
+    def set_stream_names(self, names, redraw: bool = True) -> None:
+        """The shown Link's data-port names, for the port legend."""
+        self._stream_names = dict(names or {})
+        if redraw:
+            self._refresh_port_legend()
+
     def set_cds_provider(self, provider) -> None:
         """Bind the callback that yields Column-0 (CDS) edge sample numbers for a
         visible window — `provider(lo_sample, hi_sample) -> np.ndarray`, empty when
@@ -732,7 +740,8 @@ class RawCaptureView(QWidget):
                 if (d, p) in seen:            # one legend entry per DATA PORT, not per channel
                     continue
                 seen.add((d, p))
-                self._port_legend.addItem(self._lane_dots[key], f"Dev{d} DP{p}")
+                self._port_legend.addItem(self._lane_dots[key],
+                                          port_label(self._stream_names, d, p))
 
     def set_port_marks(self, provider, lanes) -> None:
         """Bind the per-bit sample-point provider and the ordered list of active

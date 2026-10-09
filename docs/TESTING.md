@@ -164,6 +164,50 @@ They split into three bands:
 - `test_resample.py` — arbitrary-rate band-limited resampler (`dsp/resample`): identity,
   predicted output length, in-band tone preserved, out-of-band rejected, up/down-sample,
   unity DC gain, PDM→PCM decimation.
+- `test_filters.py` — the audio high-pass (`dsp/filters`) against SciPy: the Butterworth
+  design, the steady-state initial conditions, `sosfiltfilt` with its default padding and with
+  the longer padding `highpass` uses, over corners from 1 Hz to just under Nyquist
+  (references in `tests/fixtures/highpass_reference.json`, regenerated with SciPy by
+  `python3 tests/test_filters.py --regen`); the -6 dB corner and 48 dB/octave stopband; a click
+  left in place; clean stream ends; short streams; and the native `sosfilt` against the
+  textbook recursion.
+- `test_stream_processing.py` — per-stream DC blocker, high-pass and gain in `AudioStore`: the
+  samples are the DC blocker, the filter then the gain, rounded and saturated at full scale;
+  the DC blocker removes a drifting bias, leaves a 1 kHz tone untouched and is −6 dB at its
+  1 Hz corner; every channel of the stream and no other; Revert returns the decoded samples
+  exactly; the waveform, playback and export follow; the peak is measured after the DC
+  blocker and the high-pass; memory-mapped stores; the saved form, an older one included.
+- `test_stream_processing_gui.py` — the Filter & Gain dialog (opens normalised after a
+  20 Hz high-pass, the DC blocker's checkbox and corner, amplification and new peak linked,
+  the logarithmic corner slider, Allow clipping, Preview / Cancel / Apply) and the window:
+  the stream menu and Revert, the marker and title, a re-decode, two Links, and a saved
+  workspace.
+- `test_spectrogram.py` — the spectrogram lane's spectrum (a tone at its frequency and
+  level, within the window's scalloping between bins; a click lit from half a frame before
+  it and no earlier, at every frame size; short, empty and silent streams) and the Audio
+  pane: each channel waveform or spectrogram, its own frame size, the shared zoom, the menu,
+  Vertical Zoom leaving a spectrogram alone.
+- `test_dp_names.py` — a data port's name: kept in the source and reopened, and shown by the
+  Audio, Samples and Capture panes, the Bus Grid key (widened to fit), the Audio menus, the
+  Filter & Gain and Export Audio dialogs and the Timing filter, whose checked items survive a
+  rename; cancel and an empty name; a re-decode.
+- `test_region_names.py` — a config region's name: kept in the source and the workspace,
+  drawn on its timeline band, right-click on a band opening its menu rather than seeking,
+  the zoom kept, a re-decode.
+- `test_workspace_view.py` — the whole Analysis view comes back: each Link's Audio and Capture
+  view survives a Link switch and a re-decode, and a new capture starts from the defaults;
+  a two-Link window with everything changed (Commands filter, widths, hidden column and
+  sort; both Links' Audio and Capture, a spectrogram channel included; Filter & Gain;
+  bookmarks; the timeline's zoom;
+  Samples, Registers, Statistics and Timing; the dock layout) is saved and reopened, and a
+  snapshot of all of it must match (each restore removed in turn fails it); All Links'
+  shared filter and lanes; and the window geometry handed back to Qt unchanged (Qt fits it
+  to the screen, so the offscreen screen cannot hold a size).
+- `test_workspace_paths.py` — captures named relative to the workspace (and where they
+  were saved): a moved folder opens, a workspace moved alone finds them, an older
+  absolute workspace opens, an analog CSV's channel names stay names, a lost `.bin` pair
+  is found from one file; the window's Locate / Skip This Link / Cancel and the `.swi3s`
+  extension.
 - `test_audio_source.py` — the playback `QIODevice` (`_PcmSource`): never short-reads
   (PCM then silence), the software fade-out ramp, and frame/byte math.
 - `test_export.py` — command CSV (headless) + bus-grid SVG/PNG (offscreen Qt).
@@ -192,6 +236,18 @@ They split into three bands:
   removed Link's re-decode, a workspace Link that fails, floating docks, measured rates
   within a tolerance. A switch's caches are pinned by COUNTS (no re-measure, no refit),
   since a CI-safe wall clock cannot see them.
+- `test_link_sequences.py` — seeded random sequences of Link operations (offsets,
+  activations, cursor moves, Align, removals and additions, All Links scopes) on three
+  Links, with `window_checks.check_window` after every step, a cursor round-trip property,
+  and a save and reopen that must bring back what was displayed, band ranges included. A
+  failure names its seed and step. `tests/window_checks.py` is the shared helper: it
+  recomputes the derived state (band ranges, the remembered cursor instant, every index
+  that names a Link) from the Links alone and compares it with what is shown.
+- `test_load_queue_settles.py` — every load settles exactly once (its `after` or its
+  `on_fail`) whichever stage fails: the decode, building the views before or after the
+  session became a Link, or the caller's follow-on, for an open, an added Link and a
+  re-decode; a failure does not stall the requests queued behind it; and a re-decode
+  discarded because its Link was removed, queued or running, settles as failed.
 - `test_two_links.py` — two Links end to end on the `conftest.two_link_captures` fixture:
   one `.sal` carrying both, each Link decoding exactly as it does alone, one file-wide
   timeline, File ▸ Open taking both through the dialog and the real load queue, one row
@@ -355,6 +411,14 @@ They split into three bands:
   Open Capture and Decode ▸ Import Visualizer CSV.
 - `test_partial_capture_csv.py` — join-late captures whose geometry comes from a CSV.
 - `test_forced_columns.py` — region-scoped forced column counts, and the stale Safe-Lock seed.
+- `test_decode_memory_watchdog.py` — a decode stopped when free memory falls below the floor
+  (early, with a message saying what to do), the audio copy sized before it is made, a
+  stopped re-decode keeping the previous decode, and no watchdog when memory is unreadable.
+- `test_region_csv_import.py` — a config CSV imported into one region of the 2 → 8 → 16 column
+  demo changes that region's ports and nothing else (other regions, every command), draws
+  its grid and Register Map from the CSV under any what-if, reopens from the source and the
+  workspace (relative, and Locate-able), reaches a first region with no config on the wire,
+  and is the route the window takes for a multi-region capture.
 - `test_spacing_row_boundary.py`, `test_transport_slot_budget.py` — channel-group spacing
   does not cross a row; every interval carries channels x samples x bits slots.
 - `test_devices.py` — hub-depth response delay and per-device names / register maps / depths.
@@ -369,7 +433,9 @@ They split into three bands:
   1-bit signals are offered, and the bounded edge counts.
 - `test_sal_export.py`, `test_raw_export.py` — `.sal`, per-channel `.bin` and digital-CSV
   exports reconstruct the same Capture.
-- `test_sal_large_capture.py` — cost estimation, refuse-before-OOM and the windowed load.
+- `test_sal_large_capture.py` — cost estimation, refuse-before-OOM and the windowed load, and
+  that a whole-channel v3 decode allocates the output plus one block (tracemalloc), which
+  is what the estimate's whole-file transient of 2 assumes.
 - `test_capture_export.py` — Export Capture: sub-range slicing, signal subsets, the dialog.
 - `test_subcapture.py` — the sub-capture locator, sample-rate independent.
 - `test_regmap_import.py` — vendor register-map import and per-device decode.
@@ -593,8 +659,12 @@ Use this to spot gaps. "Layer" indicates where the assertion bites.
 | Capture ↔ source equivalence | `ingest/capture`, `TransitionSampleSource` | `test_capture_pipeline` | app + binding |
 | Audio store / pyramid / WAV | `store/audio_store`, `export` | `test_audio_pyramid`, `test_audio_export` | app |
 | Arbitrary-rate resampler / PDM | `dsp/resample` | `test_resample`, `test_audio_export` (export-at-rate) | app |
+| Per-stream DC blocker, high-pass and gain | `dsp/filters`, `store/audio_store`, `ui/audio_process_dialog`, native `sosfilt` | `test_filters`, `test_stream_processing`, `test_stream_processing_gui` | core + app + GUI |
+| Spectrogram lanes | `dsp/spectrogram`, `ui/audio_view` | `test_spectrogram` | app + GUI |
+| Data-port and region names | `session`, `ui/port_names`, the panes, `ui/timeline` | `test_dp_names`, `test_region_names` | app + GUI |
 | Multi-Link model + time mapping | `links` | `test_links` | app (headless) |
-| Multi-Link UI (switch, groups, All Links, offsets, workspace v4) | `ui/main_window`, `ui/link_state`, `workspace` | `test_links_gui`, `test_two_links`, `test_workspace` | app (offscreen GUI) |
+| Multi-Link UI (switch, groups, All Links, offsets, workspace v4) | `ui/main_window`, `ui/link_state`, `workspace` | `test_links_gui`, `test_two_links`, `test_workspace`, `test_link_sequences` | app (offscreen GUI) |
+| Load queue: every request settles, whichever stage fails | `ui/main_window._load_async`, `_on_load_done` | `test_load_queue_settles` | app (offscreen GUI) |
 | Two-Link demo (= the test fixture) | `ui/main_window.load_demo_links`, `ingest/transitions` | `test_two_links` | app + GUI |
 | Open Capture (probe, the one-page dialog, windows in every format, Locate's reference form) | `ingest/probe`, `ui/open_capture_dialog`, `session`, `ui/main_window` | `test_probe`, `test_open_capture_dialog`, `test_two_links` | app + GUI |
 | Timeline zoom / pan / seek / drag (real input events), Links in step | `ui/timeline`, `ui/main_window` | `test_timeline_interaction`, `test_perf` (zoom/pan ceiling) | GUI |
@@ -656,7 +726,7 @@ Use this to spot gaps. "Layer" indicates where the assertion bites.
 - **Settings are a throwaway file, empty for every test.** conftest points every
   `QSettings()` of the run (the app's included) at a temporary ini and clears it before
   and after each test, so nothing reaches the developer's own settings and no test's saved
-  choice (a colour, a folder, the PDM DC-bias toggle) reaches the next.
+  choice (a colour, a folder) reaches the next.
 - **The windows a test builds are deleted after it**, workers joined. A closed window is
   kept alive by its own Qt connections to its methods, with every Link it decoded: the
   pooled run peaked at 17 GB, enough to exhaust a 4 GB machine. Deleted, the suite stays

@@ -11,7 +11,8 @@ first in the menu bar:
   **PHY1/PHY2** (FBCSE) or the differential **PHY3 (DLV)**, whose bit clock is recovered
   from the row edges by a virtual PLL — reconstruct the Control Data Stream and audio
   payload, and explore it in linked panes — 2D bus grid, per-device register maps, 8b/10b
-  symbols, command table, and decoded-audio waveforms with WAV export.
+  symbols, command table, and decoded audio as waveforms or spectrograms, per channel, with
+  WAV export.
 
 The three modes share one window, one bus-grid renderer, and one workspace file
 (capture source + authored config + timing inputs + view state). A Visualizer config
@@ -264,9 +265,9 @@ thresholded to logic automatically (mid-rail + 10% hysteresis) unless thresholds
 given; digital-vs-analog CSV is decided by the data values (strictly 0/1 = digital).
 Sample rate is detected from timestamps. Large captures decode on a worker thread behind
 an n/N progress dialog. A `.sal` too big to hold in memory is not attempted: the peak is
-predicted from the ZIP directory before anything is inflated, and past an absolute budget
-the page opens on a **time window** that fits, so a machine with more RAM does not
-silently load more. See `docs/USER_GUIDE.md` ▸ *Opening a capture* and *Large captures*.
+predicted from the ZIP directory before anything is inflated, and past 60% of free memory
+the page opens on a **time window** that fits (a load that fits but is large is labelled
+so); the decode after it is watched, and stopped if free memory runs low. See `docs/USER_GUIDE.md` ▸ *Opening a capture* and *Large captures*.
 
 Several SWI3S Links (one Manager and its Peripherals each) can be open at once, from one
 file or several, on one shared time base; see the User Guide's *Multiple Links*.
@@ -281,7 +282,8 @@ there too.
 
 **Decode ▸ Import Visualizer CSV…** applies a Visualizer config CSV to the open capture —
 decoding with that data-port config from row 0 (for a capture that begins *after* the setup
-commit, where the port geometry isn't on the wire to snoop) — or compares it, or the
+commit, where the port geometry isn't on the wire to snoop), or, on a capture with several
+config regions, in the region under the cursor only — or compares it, or the
 authored config, against the decode. See the User Guide's *Partial captures &
 finding the SSP* for the full workflow.
 
@@ -291,9 +293,13 @@ or CSV, whole or a window.
 
 ## Workspaces, compare, export
 
-- **Save / Open Workspace** — a JSON sidecar (every Link's capture source, name and
-  offset, config CSV, SSP row, what-if overlay, bookmarks, cursor, authored config, timing
-  inputs, view state); results re-decode on open, so it stays portable.
+- **Save / Open Workspace** — a `.swi3s` file (JSON inside): every Link's capture source,
+  name and offset, config CSV, SSP row, what-if overlay, Filter & Gain, data-port and region
+  names, bookmarks,
+  cursor, authored config and timing inputs, and the whole view (each Link's Commands
+  filter and Audio and Capture views, the pane layout, zooms, the side panes' settings).
+  Captures are named relative to the workspace, so a folder holding both can move, and a
+  capture it cannot find is asked for. Results re-decode on open, so it stays portable.
 - **Compare** — **Decode ▸ Import Visualizer CSV…** can diff an expected config (CSV or
   the authored config) against the decode: differing grid cells outlined, a per-cell
   report, expected register values overlaid (the Registers pane's *Clear Compare* removes

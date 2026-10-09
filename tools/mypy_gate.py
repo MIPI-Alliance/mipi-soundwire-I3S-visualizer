@@ -15,6 +15,12 @@ So this gates on NON-REGRESSION against a checked-in per-file baseline:
 Per-file, not a single total, because a total lets a fix in one file mask a regression in
 another. Re-baseline deliberately with `--update` when you improve things.
 
+Every supported platform, not just this one. mypy evaluates `sys.platform` checks for one
+platform, the host's by default, so code that only runs elsewhere was never type-checked: a
+Windows-only error passed the ratchet on a Mac. The tree is checked once per platform in
+`_PLATFORMS`, and each file's WORST count is what the baseline compares, so a regression on
+any one of them fails and names it.
+
     python3 tools/mypy_gate.py            # check (used by tests/gate.sh and ci.yml)
     python3 tools/mypy_gate.py --update   # record the current state as the new baseline
 """
@@ -31,6 +37,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BASELINE = os.path.join(_ROOT, "tools", "mypy_baseline.json")
 _TARGET = "swi3s_studio"
 _LINE = re.compile(r"^(?P<file>[^:]+):\d+:(?:\d+:)? error:")
+_PLATFORMS = ("darwin", "linux", "win32")
+_BY_PLATFORM: dict[str, dict[str, int]] = {}    # the last run's counts, per platform
 
 
 def _mypy_cmd() -> list[str]:
@@ -61,7 +69,21 @@ def _env_fingerprint() -> dict[str, str]:
 
 
 def _run_mypy() -> tuple[dict[str, int], str]:
-    """Per-file error counts, plus mypy's raw output for reporting.
+    """Each file's worst error count over `_PLATFORMS`, plus every run's output, labelled."""
+    _BY_PLATFORM.clear()
+    worst: dict[str, int] = {}
+    raws = []
+    for plat in _PLATFORMS:
+        counts, raw = _run_mypy_on(plat)
+        _BY_PLATFORM[plat] = counts
+        for path, n in counts.items():
+            worst[path] = max(worst.get(path, 0), n)
+        raws.append(f"--- mypy --platform {plat} ---\n{raw}")
+    return worst, "\n".join(raws)
+
+
+def _run_mypy_on(platform: str) -> tuple[dict[str, int], str]:
+    """Per-file error counts for `platform`, plus mypy's raw output for reporting.
 
     Runs with `--no-incremental`. A ratchet's whole value is that its number means the same
     thing twice, and with the cache on it did not: during the 3.0.13 paydown three runs over
@@ -89,7 +111,8 @@ def _run_mypy() -> tuple[dict[str, int], str]:
     # gate read 0 errors against a baseline of 134 and called it "no regression".
     env = {k: v for k, v in os.environ.items()
            if k not in ("FORCE_COLOR", "MYPY_FORCE_COLOR", "CLICOLOR_FORCE")}
-    proc = subprocess.run([*_mypy_cmd(), "--no-incremental", "--no-color-output", _TARGET],
+    proc = subprocess.run([*_mypy_cmd(), "--no-incremental", "--no-color-output",
+                           "--platform", platform, _TARGET],
                           cwd=_ROOT, capture_output=True, text=True, env=env)
     if "No module named" in proc.stderr or "usage:" in proc.stderr:
         print("mypy is not installed. Install it with one of:\n"
@@ -195,7 +218,9 @@ def main() -> int:
     if regressions:
         print("mypy REGRESSED — new type errors:\n")
         for path, now, was in regressions:
-            print(f"  {path}: {was} -> {now}   (+{now - was})")
+            on = [p for p, c in _BY_PLATFORM.items() if c.get(path, 0) > was]
+            where = f"   on {', '.join(on)}" if on else ""
+            print(f"  {path}: {was} -> {now}   (+{now - was}){where}")
         print(f"\ntotal {base['total']} -> {total}")
         print("\nFix them, or if the new errors are unavoidable and reviewed, re-baseline")
         print("deliberately with:  python3 tools/mypy_gate.py --update")
@@ -203,8 +228,10 @@ def main() -> int:
         print(raw)
         return 1
 
+    plats = ", ".join(f"{p} {sum(c.values())}" for p, c in _BY_PLATFORM.items())
     print(f"mypy: {total} errors in {len(counts)} files "
-          f"(baseline {base['total']} in {len(per_file)}) — no regression")
+          f"(baseline {base['total']} in {len(per_file)}) — no regression"
+          + (f"  [{plats}]" if plats else ""))
     if improvements or fixed:
         for path, now, was in improvements:
             print(f"  improved: {path}: {was} -> {now}")

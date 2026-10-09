@@ -8,6 +8,7 @@
 #ifndef SWI3SCORE_DECODER_H
 #define SWI3SCORE_DECODER_H
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -74,6 +75,14 @@ struct DecoderSettings
     // Applied as the section is anchored, so the section RECORDS the forced width and the
     // decode frames at it from there.
     std::vector<std::pair<int, int>> forcedColumnSections;
+    // Sections whose payload config is built from their registerOverrides ALONE, not from
+    // the snooped registers on top: a config CSV imported into that region. The CSV is the
+    // region's whole config, so a port the wire enabled and the CSV does not name must
+    // not decode there — the CSV writes no registers for a port it leaves out, so folding
+    // it over the snoop could not express that. Framing and command parsing still follow
+    // the wire (mRegisters is untouched); only the config handed to the payload engine
+    // changes. Section index keys segments(), like registerOverrides.
+    std::vector<int> importedConfigSections;
     // Manual SSP: force the payload engine's Stream Sync Point (row_in_interval == 0)
     // to bus row `sspRow`. -1 = off (auto: anchor at decode start / snooped commit).
     // A post-commit capture never carries the SSPA/SSCR that sets the SSP, so ports
@@ -292,6 +301,12 @@ public:
     // Convenience: progressUis()/totalUis() in [0,1], or 0.0 if totalUis() is unknown (0).
     double progress() const { return (mTotalUis > 0) ? static_cast<double>(mProgressUis) /
                                                         static_cast<double>(mTotalUis) : 0.0; }
+    // Ask an in-flight run() to stop, from another thread: it returns within ~64k UIs,
+    // with what it decoded so far, and stopped() says so. For a caller watching memory
+    // while the decode grows (the audio it produces cannot be predicted before decoding).
+    // Atomic, unlike the progress counters, because this one changes control flow.
+    void requestStop() { mStopRequested.store(true, std::memory_order_relaxed); }
+    bool stopped() const { return mStopped; }
 
 private:
     void feed(BitState level, std::uint64_t sampleNumber, std::uint64_t srcUi);
@@ -388,6 +403,8 @@ private:
     // comment for why a coarse cross-thread read of a monotonic counter is fine here.
     std::uint64_t mProgressUis = 0;
     std::uint64_t mTotalUis = 0;
+    std::atomic<bool> mStopRequested{false};
+    bool mStopped = false;           // run() returned early because of requestStop()
 
     // Continuous UI-rate tracking: the forwarded-clock rate can change mid-capture
     // (e.g. a cold-start slow preamble that speeds up 4x to operational rate) WITHOUT

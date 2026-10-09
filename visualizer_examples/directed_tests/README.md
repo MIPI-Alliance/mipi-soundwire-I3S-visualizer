@@ -5,12 +5,14 @@ SWI3S Visualizer's own test suite. The test suite builds every one of them and c
 result against a golden (`tests/test_visualizer_engine.py`, `tests/test_visualizer_placement.py`,
 `tests/test_authoring_render_golden.py`).
 
-## Configurations that report errors or warnings
+## `intentional_errors/`: configurations that report errors or warnings
 
-Several exist to exercise the Visualizer's checks, so opening one shows issues in the
-notifications list, and `swi3s-studio -c <file> -o <out>` exits 2 for a bus clash. For these
-files that is the expected result, not a fault in the file or the tool. The lists below are
-checked against what the engine reports (`tests/test_cli.py`).
+Several exist to exercise the Visualizer's checks, so they are kept apart, in
+`intentional_errors/`. Opening one shows issues in the notifications list, and
+`swi3s-studio -c <file> -o <out>` exits 2 for a bus clash. For these files that is the
+expected result, not a fault in the file or the tool. Every file in that folder is listed
+below, and every file in this one builds with no issue; both are checked against what the
+engine reports (`tests/test_cli.py`).
 
 **Bus clash** (an error: two devices drive the same slot; the command line exits 2):
 
@@ -37,5 +39,3 @@ checked against what the engine reports (`tests/test_cli.py`).
 - `test_mode_mismatch.csv`: a port's test mode differs between source and sink
 - `asynchronous_flow_control_mismatched_DRQ_TxP.csv`: DRQ and TxPresent sources without
   sinks, and sinks without sources
-
-Every other file in this folder builds with no issue.

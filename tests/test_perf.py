@@ -462,7 +462,13 @@ def test_link_switch_budget_with_every_dock_visible():
     them: measured here, 0.6-1.1 s per switch before them, 195-315 ms after. This is the
     cliff detector for what those counts do not cover, a new O(capture) step on the bind.
     Ceilings at ~3x the measured median / ~4x the worst.
+
+    WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. The same bind measures 754-799 ms median
+    there, for this release and for 3.0.19 alike, so the macOS ceiling of 750 ms sat on the
+    baseline and failed by chance; the worst has reached 2.18 s. ~2x the Windows median
+    still catches the cliff, which costs 2.5-4x.
     """
+    import sys
     import time
 
     from PySide6.QtWidgets import QApplication, QDockWidget
@@ -492,13 +498,17 @@ def test_link_switch_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
-    assert median < 0.75, (
-        f"median Link switch {median * 1000:.0f} ms (ceiling 750 ms, baseline ~250 ms; "
-        f"worst {worst * 1000:.0f} ms). Something on the bind is doing work proportional "
-        "to the capture — check the counts in tests/test_links_gui.py first.")
-    assert worst < 1.2, (
-        f"worst Link switch {worst * 1000:.0f} ms (ceiling 1200 ms, baseline ~315 ms), "
-        f"median {median * 1000:.0f} ms.")
+    windows = sys.platform == "win32"
+    ceiling, worst_ceiling = (1.5, 2.4) if windows else (0.75, 1.2)
+    base, worst_base = ("~760", "~810") if windows else ("~250", "~315")
+    assert median < ceiling, (
+        f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms, "
+        f"baseline {base} ms; worst {worst * 1000:.0f} ms). Something on the bind is doing "
+        "work proportional to the capture — check the counts in tests/test_links_gui.py "
+        "first.")
+    assert worst < worst_ceiling, (
+        f"worst Link switch {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms, "
+        f"baseline {worst_base} ms), median {median * 1000:.0f} ms.")
 
 _SAL_WRITER = r"""
 import json, sys, zipfile
@@ -573,14 +583,14 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     prediction against that process's own peak RSS. Two bounds, and the directions mean
     different things:
       * predicted >= actual -- the guard must never promise a load will fit and be wrong.
-        This is the assertion that catches the 60 GB defect: reverting to the bare sum
-        predicts 0.072 GB where this fixture measures 0.200 GB, a 2.78x under-prediction on
-        a fixture ~100x smaller than the one that hurt.
+        This is the assertion that catches the 60 GB defect: the bare sum (a transient of
+        1) predicts 0.18 GB where this fixture measures 0.20 GB.
       * predicted <= 3x actual -- the guard must not refuse loads that would have fitted,
-        which is the failure mode of "just multiply everything by a big number". A transient
-        of 16 instead of 4 trips this at 5.00x.
-    Measured pred/actual: 1.27-1.37 across 3M-12M transitions here, and 1.00-1.25 on the
-    three real captures the model was fitted to.
+        which is the failure mode of "just multiply everything by a big number". The old
+        whole-file transient of 4 against today's leaner decode is 3.2x and trips it.
+    Measured pred/actual: 1.67 here (10M transitions per channel; 4M had become too small
+    to measure once the decode stopped holding three copies), and 1.96 on a 54 MB capture
+    with 302M transitions, whose largest block is a quarter of its channel.
     """
     import json
     import subprocess
@@ -591,7 +601,7 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     repo = str(pathlib.Path(swi3s_studio.__file__).resolve().parent.parent)
     env = dict(os.environ, PYTHONPATH=repo)
     sal = str(tmp_path / "measured.sal")
-    n = 4_000_000                          # ~0.2 GB of edges: dominates interpreter baseline
+    n = 10_000_000                         # ~0.16 GB of edges: dominates interpreter baseline
 
     write = subprocess.run([sys.executable, "-c", _SAL_WRITER, str(n), sal],
                            env=env, capture_output=True, text=True)

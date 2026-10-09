@@ -45,7 +45,7 @@ def _example(*parts):
 # assumed: "the first config in the corpus" happens to carry a bus clash, and correctly exits 2.
 _CLEAN = _example("spec_figures",
                   "Figure_150_PDM_Streams_with_PHY_Tail_Bits_No_Sample_Grouping.csv")
-_CLASH = _example("directed_tests", "clash_logic_1.csv")       # 14 bus clashes -> exit 2
+_CLASH = _example("directed_tests", "intentional_errors", "clash_logic_1.csv")       # 14 bus clashes -> exit 2
 
 
 def _run(*args):
@@ -387,6 +387,14 @@ def test_run_sh_rebuilds_wherever_rebuild_is_given(stub_launcher_env, args):
     assert forwarded == ["--demo"]
 
 
+def test_run_sh_reads_its_arguments_in_one_place():
+    """Two readings of one argument list drift: the build step read only $1 for --rebuild
+    while the forwarding loop dropped it from any position. One loop reads them all."""
+    sh = pathlib.Path(_RUN_SH).read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count('"$@"') == 1, "run.sh reads its arguments in more than one place"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="run.sh is the Unix launcher")
 def test_run_sh_does_not_rebuild_unasked(stub_launcher_env):
     """The other half: with the build current and no flag, nothing is rebuilt."""
@@ -483,8 +491,10 @@ def test_both_launchers_announce_themselves():
 
 def test_the_directed_tests_readme_lists_exactly_the_configs_that_report_issues(tmp_path):
     # visualizer_examples/directed_tests/README.md tells a reviewer which configs report
-    # errors or warnings ON PURPOSE. It must name every one of them, and no other, and put
-    # each under the right heading: a stale list would excuse a real regression.
+    # errors or warnings ON PURPOSE, and they live apart in intentional_errors/. The README
+    # must name every one of them, and no other, under the right heading, and the folder
+    # must hold exactly those: a stale list, or a config reporting issues outside the
+    # folder, would excuse a real regression.
     import io
     import re
 
@@ -498,20 +508,25 @@ def test_the_directed_tests_readme_lists_exactly_the_configs_that_report_issues(
             section = line.split("**")[1]
         for name in re.findall(r"`([^`/]+\.csv)`", line):
             listed[name] = section
-    found = {}
-    for name in sorted(os.listdir(folder)):
-        if not name.endswith(".csv"):
-            continue
-        out = io.StringIO()
-        code = cli.run_headless(os.path.join(folder, name), str(tmp_path / "m.json"), out=out)
-        lines = [ln.strip() for ln in out.getvalue().splitlines()]
-        errors = [ln for ln in lines if ln.startswith("ERROR")]
-        warnings = [ln for ln in lines if ln.startswith("WARNING")]
-        if code == 2:
-            found[name] = "Bus clash"
-        elif errors:
-            found[name] = "Placement rule errors"
-        elif warnings:
-            found[name] = "Warnings only:"
+    def issues(sub):
+        found = {}
+        here = os.path.join(folder, *sub)
+        for name in sorted(os.listdir(here)):
+            if not name.endswith(".csv"):
+                continue
+            out = io.StringIO()
+            code = cli.run_headless(os.path.join(here, name), str(tmp_path / "m.json"), out=out)
+            lines = [ln.strip() for ln in out.getvalue().splitlines()]
+            if code == 2:
+                found[name] = "Bus clash"
+            elif any(ln.startswith("ERROR") for ln in lines):
+                found[name] = "Placement rule errors"
+            elif any(ln.startswith("WARNING") for ln in lines):
+                found[name] = "Warnings only:"
+        return found
+    assert issues(()) == {}, "a config outside intentional_errors/ reports issues"
+    inside = issues(("intentional_errors",))
+    held = {n for n in os.listdir(os.path.join(folder, "intentional_errors")) if n.endswith(".csv")}
+    assert held == set(inside), f"in intentional_errors/ with no issue: {sorted(held - set(inside))}"
     assert {n: s.rstrip(":") for n, s in listed.items()} == \
-        {n: s.rstrip(":") for n, s in found.items()}
+        {n: s.rstrip(":") for n, s in inside.items()}

@@ -110,3 +110,19 @@ def test_a_layout_saved_before_the_split_puts_the_grid_on_the_bottom_s_link(two)
     win.set_group_link("grid", 1)
     win._apply_link_view_prefs({"pane_links": {"commands": 1, "right": 1, "bottom": 0}}, 1)
     assert win._pane_link["grid"] == 0 == win._pane_link["bottom"]
+
+
+def test_renaming_a_port_redraws_the_grid_s_link_not_the_active_one(two, monkeypatch):
+    """Rename… in the Audio pane acts on the bottom group's Link (here Link 2), but the grid
+    shows Link 1 and must be redrawn as Link 1, with Link 1's names. It used to call the
+    grid's render directly, as the active Link, and drew Link 2's names on Link 1's grid."""
+    from PySide6.QtWidgets import QInputDialog
+    win, first, second = two
+    first.set_dp_name(0, 0, "First's port")
+    asked = _spy(monkeypatch, win)
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("Second's", True)))
+    win.rename_data_port(0, 1, link=1)
+    assert second.dp_names == {(0, 1): "Second's"}
+    assert asked and set(asked) <= {first}
+    names = {k: v.get("name") for k, v in win._grid_view._dp_display.items() if v.get("name")}
+    assert names == {(0, 0): "First's port"}
