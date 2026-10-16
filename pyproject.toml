@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.0.20"
+version = "3.0.22"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
 requires-python = ">=3.11"
 dependencies = [
     "swi3score>=0.1.0",   # the C++ decode core (build from ./native)
-    "PySide6>=6.6,<6.12",        # 6.12.0 crashes at interpreter exit (requirements.txt)
+    "PySide6>=6.6",
     "pyqtgraph>=0.13",
     "numpy>=1.23",
     "pyarrow>=12",
@@ -45,10 +45,13 @@ packages = [
 # Bundled peripheral register-map examples ship under share/swi3s-studio/regmaps
 # (see model/regmap_import.py library_dir).
 # (init.csv is a user-supplied local file, not packaged.)
-data-files = [
-    ["share/swi3s-studio", ["data/registers.json"]],
-    ["share/swi3s-studio/regmaps", ["data/regmaps/example_amp.json"]],
-]
+[tool.setuptools.data-files]
+"share/swi3s-studio" = ["data/registers.json"]
+"share/swi3s-studio/regmaps" = ["data/regmaps/example_amp.json"]
+
+# The theme's icons are read from beside ui/theme.py, so they ship inside the package.
+[tool.setuptools.package-data]
+"swi3s_studio.ui" = ["assets/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

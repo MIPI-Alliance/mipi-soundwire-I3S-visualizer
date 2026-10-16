@@ -43,7 +43,7 @@ def test_defaults_are_the_theme_palettes():
         assert line_style.palette("capture", mode) == [pal["RAW_DP"], pal["RAW_DN"]]
         t = pal["TRACE_PALETTE"]
         assert line_style.palette("timing", mode) == [t[0], t[5], t[3], t[2]]
-    assert line_style.weight("audio") == 1 and line_style.weight("capture") == 2
+    assert line_style.weight("audio") == 2 and line_style.weight("capture") == 2
 
 
 def test_override_then_preference_then_default_per_theme():
@@ -82,7 +82,7 @@ def test_a_malformed_setting_falls_back_to_the_default(colors, weights):
     QSettings().setValue(line_style.WEIGHT_KEY, weights)
     line_style.reset_cache()
     assert line_style.palette("dp") == _PALETTES["dark"]["DP_LINE_PALETTE"]
-    assert line_style.weight("audio") == 1 and line_style.weight("capture") == 2
+    assert line_style.weight("audio") == 2 and line_style.weight("capture") == 2
 
 
 def test_overrides_round_trip_through_json():

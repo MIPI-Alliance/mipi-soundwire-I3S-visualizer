@@ -35,6 +35,7 @@ from PySide6.QtGui import QColor, QCursor, QFont
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QToolTip, QVBoxLayout, QWidget
 
 from ..nputil import searchsorted as _ss
+from ..nputil import searchsorted_many
 from . import line_style
 from .grid_view import bookmark_pair_color as _bookmark_pair_color
 from .grid_view import dp_line_color  # shared stable per-(device,dp) hue (grid/audio/capture)
@@ -71,6 +72,22 @@ _BIT_DOT, _MSB_DOT = 6, 9                   # bit-sample dot px size; larger for
 _MAX_CH_LABELS = 48                          # per-lane cap: label MSBs with CHn only when few
 #                                              enough are in view to be legible (else too dense)
 _RIGHT_PAD = 0.16                           # blank fraction on the right so the legend clears the trace
+
+
+def _decimate_edges(win: np.ndarray, lo: int, hi: int, slots: int) -> np.ndarray:
+    """At most 3 edges per slot of [lo, hi]: a slot's first and last edges, and one between
+    when their count is odd, so each slot toggles with the same parity as the line and the
+    drawn level is exact at every slot boundary, whatever the zoom and scroll.
+
+    The bounds are searched in the edges' own dtype (nputil.searchsorted_many), so a uint64
+    window is never copied to float64; truncating them keeps them in order."""
+    idx = searchsorted_many(win, np.linspace(lo, hi, slots + 1))
+    idx[-1] = win.size
+    first, end = idx[:-1], idx[1:]
+    count = end - first
+    busy = count > 0
+    keep = [first[busy], (end - 1)[count >= 2], (first + 1)[(count >= 3) & (count % 2 == 1)]]
+    return win[np.unique(np.concatenate(keep))]
 
 
 def _step_xy_from(win: np.ndarray, init_level: bool, lo: int, hi: int, y0: float, y1: float):
@@ -1138,14 +1155,7 @@ class RawCaptureView(QWidget):
         i1 = int(_ss(edges, hi, side="right"))
         win = edges[i0:i1]
         if win.size > self._MAX_EDGES:               # too many to draw — decimate (overview)
-            # Each edge is a level toggle, so a kept edge's level depends on how many
-            # real edges precede it. Dropping every Nth edge stays level-correct only
-            # when N is ODD (an even number of dropped toggles between kept edges nets
-            # to zero); an even stride would invert the trace downstream. (This still
-            # aliases sub-stride activity — a per-pixel high/low/transition envelope
-            # would also show that, but parity correctness comes first.)
-            stride = (int(win.size // self._MAX_EDGES) + 1) | 1
-            win = win[::stride]
+            win = _decimate_edges(win, lo, hi, self._MAX_EDGES // 3)
         init = bool(initial) ^ bool(i0 & 1)
         return _step_xy_from(win, init, lo, hi, y0, y1)
 

@@ -367,6 +367,39 @@ def test_the_three_version_literals_agree():
         "literal that silently sat at 3.0.8 for three releases")
 
 
+def test_the_package_metadata_is_valid_and_ships_its_assets():
+    """pyproject.toml is configuration setuptools accepts, it lists every package, and its
+    package-data names every file the package reads from beside its modules (the theme's
+    icons): a wheel holds only what [tool.setuptools] names. Checked with setuptools' own
+    validator, so no build is needed."""
+    import fnmatch
+    import warnings
+
+    pytest.importorskip("setuptools")
+    from setuptools.config.pyprojecttoml import read_configuration
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")               # "[tool.setuptools] is still beta"
+        conf = read_configuration(os.path.join(_ROOT, "pyproject.toml"))
+    tool = conf["tool"]["setuptools"]
+    pkg_root = pathlib.Path(_ROOT, "swi3s_studio")
+    on_disk = {".".join(d.relative_to(_ROOT).parts) for d in [pkg_root, *pkg_root.rglob("*")]
+               if (d / "__init__.py").is_file()}
+    assert set(tool["packages"]) == on_disk
+    data = tool.get("package-data", {})
+    missing = []
+    for f in pkg_root.rglob("*"):
+        if not f.is_file() or f.suffix in (".py", ".pyc") or "__pycache__" in f.parts:
+            continue
+        owner = f.parent
+        while not (owner / "__init__.py").is_file():
+            owner = owner.parent
+        rel = f.relative_to(owner).as_posix()
+        if not any(fnmatch.fnmatch(rel, g) for g in data.get(".".join(
+                owner.relative_to(_ROOT).parts), [])):
+            missing.append(f.relative_to(_ROOT).as_posix())
+    assert not missing, f"not in [tool.setuptools.package-data], so not in a wheel: {missing}"
+
+
 def test_ci_tolerates_only_the_incomparable_outcome():
     """CI may forgive NOT COMPARABLE, and nothing else.
 

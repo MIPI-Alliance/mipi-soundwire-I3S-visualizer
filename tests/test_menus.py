@@ -110,8 +110,83 @@ def test_the_analyzers_menus_and_keys_are_off_elsewhere(win, mode):
 def test_capture_items_wait_for_a_capture(win):
     assert win._session is None
     assert win._needs_capture and not any(a.isEnabled() for a in win._needs_capture)
+    assert not any(a.isEnabled() for m in win._capture_menus for a in m.actions()
+                   if not a.isSeparator())
     win.load_demo()
     assert all(a.isEnabled() for a in win._needs_capture)
+
+
+def _usable(win):
+    """Every item a user can reach and pick in the bar, as (menu, ..., item) paths: the item
+    and each submenu on the way to it enabled (Audio's per-stream submenus are filled as
+    they open, so their entries are not walked)."""
+    from PySide6.QtWidgets import QMenu
+    out = set()
+    # Submenus by their item: QAction.menu() hands back a dead wrapper on PySide 6.11.
+    menus = {m.menuAction(): m for m in win.findChildren(QMenu)}
+
+    def walk(menu, path):
+        if menu is win._play_rate_menu or menu is win._process_menu:
+            return
+        menu.aboutToShow.emit()
+        for act in menu.actions():
+            if act.isSeparator() or not act.isVisible() or not act.isEnabled():
+                continue
+            here = path + (_text(act),)
+            if act in menus:
+                out.add(here + ("▸",))
+                walk(menus[act], here)
+            else:
+                out.add(here)
+    for act in win.menuBar().actions():
+        if act.isVisible() and act.isEnabled() and act in menus:
+            walk(menus[act], (_text(act),))
+    return out
+
+
+# With no capture open, these are what the Analyzer's menus offer: what opens a file, sets a
+# preference or arranges the window. Everything else acts on a capture and is greyed.
+_WITHOUT_A_CAPTURE = {"Open Capture…", "Open Demo Capture", "Open Workspace…", "Quit",
+                      "Playback Output Device", "Playback Bit Depth", "Appearance", "Help"}
+
+
+@pytest.mark.parametrize("via", ["start", "a mode switch"])
+def test_with_no_capture_only_what_needs_none_is_offered(win, via):
+    """Entering the Analyzer enables its menus, and Qt passes that down to every submenu:
+    the Commands Filter and Manual SSP Move submenus came back on, and with them their
+    items (and keys)."""
+    if via == "a mode switch":
+        win._mode_mgr.switch_to(VISUALIZATION)
+    win._mode_mgr.switch_to(ANALYSIS)
+    usable = _usable(win)
+    for path in usable:
+        menu, top = path[0], path[1]
+        assert menu in ("Mode", "View", "Help") or top in _WITHOUT_A_CAPTURE, path
+    assert not any(p[0] in ("Commands", "Decode", "Devices", "Bookmarks") for p in usable)
+    assert not win._play_rate_menu.menuAction().isEnabled()
+    assert not win._process_menu.menuAction().isEnabled()
+    assert not win._align_links_action.isEnabled()
+
+
+def test_with_a_capture_every_capture_item_is_offered(win):
+    win._mode_mgr.switch_to(ANALYSIS)
+    win.load_demo()
+    win._mode_mgr.switch_to(VISUALIZATION)
+    win._mode_mgr.switch_to(ANALYSIS)
+    usable = _usable(win)
+    for act in win._needs_capture:
+        assert act.isEnabled(), _text(act)
+    # Two wait on more than a capture: Align on two Links, Remove … from This Region on a
+    # CSV imported into the region under the cursor.
+    own_rule = {win._align_links_action, win._remove_region_csv_action}
+    for menu in win._capture_menus:
+        off = [_text(a) for a in menu.actions()
+               if not a.isSeparator() and a not in own_rule and not a.isEnabled()]
+        assert not off, off
+    assert ("Commands", "Filter", "▸") in usable and ("Decode", "Manual SSP Move", "▸") in usable
+    assert win._play_rate_menu.menuAction().isEnabled()
+    assert win._process_menu.menuAction().isEnabled()
+    assert not win._align_links_action.isEnabled(), "one Link: nothing to align"
 
 
 def test_decode_holds_what_re_decodes_and_audio_is_playback(win):

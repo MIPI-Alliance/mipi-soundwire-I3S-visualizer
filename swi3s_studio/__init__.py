@@ -5,6 +5,204 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 (later) a PySide6 UI. See ../docs/architecture.md.
 """
 # App version, shown in the window title. Kept in sync with pyproject.toml.
+# 3.0.22: Python 3.11 on Linux no longer aborts under PySide; CI actions on Node 24.
+#        • NONE AND TRUE CANNOT BE FREED ON PYTHON 3.11. PySide's Linux builds (6.9 to 6.12 at
+#          least) release references they do not hold: one to None each time they hand back
+#          an empty value as None (an item or index read for a role it does not hold, an
+#          invalid index, an unset QAction.data()), and one to True on every emit() of a
+#          Python-defined signal. Python 3.12 made both immortal; on 3.11 the interpreter
+#          aborted once either count reached zero ("deallocating None", "deallocating True or
+#          False"), within one session of the Registers pane's per-row role reads on every
+#          cursor move, and in CI's Linux py3.11 job 17 s in. ui/singleton_pin.pin_singletons()
+#          adds 2**40 to the reference count of None, True and False once, on CPython 3.11
+#          only, from the ui package and conftest; a build whose objects do not start with the
+#          count (Py_TRACE_REFS) is left alone, and a write that did not land is undone.
+#          tests/test_singleton_pin.py runs 100000 of each release in a fresh interpreter.
+#        • CI RUNS ITS ACTIONS ON NODE 24. GitHub runs every JavaScript action on Node 24 and
+#          warns for each that still declares Node 20, as actions/checkout@v4 and
+#          actions/setup-python@v5 did on every job. ci.yml uses checkout@v5 and
+#          setup-python@v6, the first majors that declare node24.
+# 3.0.21: a Link brought up again decodes again, DLV included, and a paused clock decodes on;
+#         maximize a pane (⌘⇧M); the Registers filter by provenance; Audio drawn as its
+#         samples when zoomed in; the app quits with its window and on Ctrl+C; PySide6 6.12.
+#        • NOTHING PYTHON OWNS IS LEFT FOR PYSIDE'S EXIT SWEEP. At interpreter exit PySide
+#          destroys every QObject Python still owns, in wrapper-map order rather than tree
+#          order. PySide 6.12 stopped handing a widget's ownership to C++ when it is added to
+#          a layout that has no parent yet, so the many panes built that way kept
+#          Python-owned children under a C++ parent, and the sweep could destroy a parent and
+#          then reach a child already gone: the crash at exit behind the 3.0.20 cap (macOS's
+#          crash reports show it in PySide::destroyQCoreApplication, on a QComboBox). The
+#          app quitting through app.main left 335 such objects at that point.
+#          ui/teardown.release_python_owned_qobjects() deletes each such tree from its root,
+#          once the workers are joined; app.main calls it after the event loop returns and
+#          conftest at the end of a session. On 6.12, one perf test crashed at exit 12 of
+#          30 runs and 0 of 30 with it; the perf suite 0 of 10. tests/test_exit_teardown.py
+#          checks the count is 0 when the sweep would begin, on any PySide version.
+#          requirements.txt and pyproject.toml no longer cap PySide6 below 6.12.
+#        • A LINK BROUGHT UP AGAIN DECODES AGAIN. The Link-Control decoder found only the
+#          first start sequence, so a Link that went inactive (its clock stopped) and was
+#          brought up again decoded on in the old geometry: every command after the second
+#          bring-up was CRC-invalid and no new region began, since the seeded Safe-Lock
+#          column count also turns the resync watchdog off.
+#          link_control.decode_link_controls finds each later bring-up after a clock stop
+#          over 1 ms, in a capture that starts in audio mode as well. A detection counts
+#          when it reaches audio mode, its start pulse rises within START_PULSE_MAX_EDGES
+#          clock edges of the clock moving again, and the clock then runs as audio mode
+#          does; a stop that is the Bus Reset itself (a short idle) is read from the edge
+#          before it; a Warm Start inherits the PHY before it, a Cold Start does not.
+#          Session.link_controls lists those of the decode's PHY family (PHY3 on DLV, PHY1
+#          and PHY2 on FBCSE, either for one naming none: switching between the forwarded
+#          and the recovered clock would switch the sample source mid-decode), and drops one
+#          after which no CRC-valid command decodes when decoding without it finds some. The
+#          core restarts at each (DecoderSettings.restart_points: sample, Safe-Lock columns,
+#          cold, inactive from; score_abi 15, as an ABI-14 module ignores them for DLV).
+#          From the clock stop to the first clock edge after PhyStart nothing is decoded and
+#          every port stops; there the decode re-aligns, frames at the Safe-Lock count
+#          (2..32, else a Cold Start's cold-start count), reconfigures the payload engine on
+#          the new Column-0 phase and opens a segment flagged restart, and cold_start for a
+#          Cold Start, which resets the register model. A config CSV keeps its ports through
+#          both, and on FBCSE its column count. Window reads and edge hunts stop at the next
+#          restart point; points are sorted and merged at one sample. The register and grid
+#          replays start from the last Cold Start's Bus Reset; the Timeline draws each
+#          bring-up (the stop as Idle) and labels the region it opens, Cold or Warm, by its
+#          PHY; the Bus Grid reads Link Inactive in the stop; the Registers pane's PHY block
+#          follows the cursor; api.decode_capture decodes as Session does. A later
+#          bring-up's Link is inactive from its last audio-mode clock edge, back over the
+#          LC_Ack and LC:00 edges a short idle leaves before the stop. A clock stop with
+#          audio after it and no bring-up is a pause (link_control.clock_resumes;
+#          DecoderSettings.resume_points): a bus that carried on in phase decodes on through
+#          it, one that lost UIs is framed afresh there, column count and phase detected as
+#          in a capture that begins mid-stream, registers kept; DLV takes no resume points,
+#          as after a pause the first rising edge need not open a row. On DLV,
+#          ISampleSource::Reacquire skips the DlvSampleSource over the stopped stretch,
+#          whose link-control pulses its DLL would snap to, and locks the DLL again at the
+#          bring-up's first Row Sync with the seeded Safe-Lock row period over its column
+#          count (a config CSV does not set it, as at the first bring-up). A row the stop
+#          cut short keeps its bus row, as DLV numbers rows by their Row Syncs, and a sample
+#          in the stretch maps to the restart's UI (Session._ui_for_sample). The row log
+#          stays in UI order, and a windowed replay (the bit samples, the CDS pane) follows
+#          it across the restart and across a commit: each logged row from its edge at its
+#          logged column count, the cut row at its own UI, and exactly the live decode from
+#          a re-acquired row on. tests/test_link_restart.py.
+#        • A STOPPED LINE DRAWS ITS TRUE LEVEL AT EVERY ZOOM. Zoomed out, the Capture pane
+#          draws at most three edges per slot: raw_view._decimate_edges keeps a slot's first
+#          and last edges and one between when their count is odd, so each slot toggles with
+#          the line's parity and the level is exact at every slot boundary, whatever the zoom
+#          and scroll (keeping every Nth edge drew a stopped clock high at some zooms and low
+#          at others). The slots are found by nputil.searchsorted_many, in the edges' own
+#          dtype and every key in step: no float64 copy of the window, ~2 ms at 50M edges.
+#          tests/test_raw_view.py, tests/test_nputil.py.
+#        • A TREE SECTION'S ARROW IS THE HEADING'S COLOUR. Every tree on the analyzer
+#          stylesheet draws its open / closed arrow from TEXT-coloured chevrons
+#          (assets/chevron-right-* closed, the combos' chevron-down-* open), not the
+#          platform's black one the dark theme hid; a selected heading's arrow sits on the
+#          selection fill, in the light shade of the row's white text. pyproject.toml ships
+#          ui/assets in a wheel (package-data), and its data-files table is one setuptools
+#          accepts, so `pip install .` builds. tests/test_pane_chrome.py,
+#          tests/test_release_gate.py.
+#        • THE REGISTERS PANE FILTERS BY PROVENANCE. Its colour key is the filter: click Cold
+#          Reset, Bus Write, Bus Read, CSV Import or Manual Edit to hide or show the registers
+#          whose value came from it, so Cold Reset off leaves only what something set. Each
+#          row keeps its provenance (_PROV_ROLE), so NEXT and CURR are filtered on their own,
+#          and a block left with nothing is hidden. Starting or changing the filter opens the
+#          blocks with rows to show (not Peripheral Registers); rebuilds keep the blocks as
+#          the user leaves them, and showing every category again gives back the user's open
+#          blocks, opens and closes made while filtering included (expanded_blocks). Blocks
+#          are kept by id (_BLOCK_ROLE), which a PHY or device change to a title does not
+#          alter, in the workspace too (titles still open). A filter that leaves nothing
+#          says so in words. Each key entry is a click_label.KeyToggle: a checkable button
+#          that Tab reaches, Space, Enter and Return toggle, and that gives assistive
+#          technology its name and state; its tooltip names the state. view_state saves
+#          the filter ("hidden"). ⌘C on rows of two blocks copies a line each, in tree
+#          order (copyable groups rows by their place in the tree).
+#          tests/test_register_filter.py, tests/test_copyable.py.
+#        • CTRL+C QUITS. Ctrl+C in the terminal that launched the app closes the window as
+#          File ▸ Quit does, from the event loop, never inside the Python code it
+#          interrupted, and one pressed while the window is being built is served when the
+#          loop starts (app._QuitOnInterrupt). No Python runs while Qt's loop waits, so the
+#          signal's wake-up byte (signal.set_wakeup_fd) goes down a socket pair a
+#          QSocketNotifier watches: instant, at no idle cost, a socket as Windows requires.
+#          Once the close is under way, and after the loop returns, SIGINT is the default
+#          again, so a second Ctrl+C ends a quit that hangs; a close the window refuses
+#          leaves Ctrl+C asking again. tests/test_exit_teardown.py (the test runs on POSIX;
+#          the startup, re-entry and refused-close cases run everywhere).
+#        • MAXIMIZE A PANE. View ▸ Maximize Pane (⌘⇧M; Ctrl+Shift+M elsewhere, as ⌘M is
+#          the system's Minimize), a ⤢ button at the right of every other pane's title bar and
+#          of the Commands pane's header, or a double-click on either title: the selected
+#          pane alone in the window, and the same again puts every pane back. The Timeline,
+#          which the other panes are navigated by, is never maximized and has no button.
+#          Commands, Registers, Bus Grid, CDS and Samples, read by moving through time, keep
+#          the Timeline at its height, capped until the restore (with the central page
+#          hidden, Qt shares its room between the Timeline and the pane on every resize);
+#          a side-area pane such as Registers moves below it meanwhile, to take the rest.
+#          Audio, Capture, Timing, Statistics and Bookmarks take the window. The selected
+#          pane is the one with the keyboard focus, which a click in any pane gives it; the
+#          Commands table can be it too. Maximizing saves the window's state and hides every
+#          other dock and, for a dock, the central page; restoring shows the page first and
+#          restores the state, so sizes, tab groups and floating panes come back exactly.
+#          The focused widget is saved and focused again (restoreState moves the focus off
+#          the docks it hides), the pane stays the tab in front of its group, and a ⤢
+#          button gives the focus to its pane's view, so the key toggles the same pane. A
+#          pane shown, hidden or closed (View menu, ✕, Timing's jump to Capture, a register
+#          compare), a Link added or removed, leaving the Bus Analyzer (ModeManager's new
+#          before_change, ahead of its layout snapshot) and opening a workspace restore
+#          first; All Links turned off meanwhile resizes the panes put back; a workspace
+#          saved while maximized records the arrangement to return to, and the one-Link
+#          height All Links turned off meanwhile asks for ("bottom_settle"). A double-click on a
+#          title bar never floats a pane, the Timeline's included; dragging it out does.
+#          The key does not auto-repeat. tests/test_maximize_pane.py.
+#        • WITH NO CAPTURE, EVERY ITEM THAT NEEDS ONE IS GREYED. Commands ▸ Filter, Decode ▸
+#          Manual SSP Move and their items were greyed only until the Bus Analyzer was entered:
+#          enabling a menu enables its submenus (Qt passes the change down, and a submenu's
+#          item follows its menu), so the mode switch turned them back on, keys included.
+#          _on_mode_changed re-applies _update_capture_actions, which now sets each item of
+#          the named capture submenus (_capture_menus; not found through QAction.menu(),
+#          which hands back a dead wrapper on PySide 6.11), Align (also two Links) and
+#          Audio's Playback Decimation and Filter & Gain (also streams), which had shown a
+#          greyed "(load a capture with audio)" inside a live submenu. tests/test_menus.py.
+#        • CLOSING THE WINDOW QUITS THE APP, WHATEVER ELSE IS OPEN. Qt quits when the last
+#          visible top-level window closes, and a window with no parent counts: pyqtgraph's
+#          Export dialog (a plot's right-click menu) left open kept the event loop running
+#          with nothing on screen, so the terminal that launched the app never returned (a
+#          sample of the process showed it idle in QApplication.exec, every worker done).
+#          app.main turns that rule off and quits on MainWindow.closed, emitted once the
+#          window's close is accepted. tests/test_exit_teardown.py.
+#        • THE AUDIO LINE IS 2 PX BY DEFAULT, as the Capture lines are
+#          (line_style.DEFAULT_WEIGHTS; a weight set in the preferences is kept).
+#          tests/test_waveform_prefs.py.
+#        • ZOOMED IN, AUDIO IS DRAWN AS ITS SAMPLES. Once each sample has _STEM_MIN_PX (6)
+#          pixels of a track's width, an Audio waveform track draws a stem from zero to each
+#          sample's value with a dot on it, at its capture position (AudioView._render_stems),
+#          so single samples can be seen and counted; closer, it is the line or min/max
+#          envelope through them as before. The view's resize re-renders too, so a pane made
+#          narrower or wider at one zoom switches. tests/test_audio_stems.py.
+#        • A REOPENED WORKSPACE NAMES ITS VENDOR REGISTERS. Each Link's device register maps
+#          were restored into its session and the Registers pane, but the Commands table had
+#          taken its copy of the maps as the Link loaded, before them, so its device-defined
+#          addresses showed no vendor names until the Devices dialog was opened. The workspace
+#          open now hands each Link's table its maps. tests/test_workspace.py.
+#        • REDRAWING THE AUDIO TRACKS KEEPS THE ZOOM. Turning a spectrogram on could move the
+#          view: zoomed away from the cursor, the Audio pane jumped to centre it. Every change
+#          that rebuilds the tracks did it (a spectrogram on or off, a frame size, a channel
+#          shown or hidden, All, colours, names, Filter & Gain): the rebuild restored the zoom
+#          and then applied the cursor, which also FOLLOWED it into view. AudioView now places
+#          the cursor lines on a rebuild (_place_cursor_lines) and follows only a cursor that
+#          moved (_follow_cursor, from set_cursor and playback).
+#          And in a pane narrower than a track's title, the track grew past its widget:
+#          pyqtgraph gives a title a minimum width of its text, so a spectrogram's long title
+#          cut the track's right end off and, the tracks being X-linked by pixel, put it on a
+#          different stretch of the capture from the others. _let_title_shrink releases that
+#          minimum, and a title that does not fit starts at the left, stream name first.
+#          tests/test_audio_zoom_kept.py.
+#        • THE PERF RUN PRINTS ITS MARGINS. After v3.0.20 merged, CI's perf job on public main
+#          failed on two wall-clock ceilings by under 1%: cursor move 121 ms against 120,
+#          Link switch 754 ms against 750, on the same tree and PySide that passed on the
+#          pull request; a re-run of the job passed. The two tests measure 27-29 ms and
+#          304-317 ms on the Mac, so that runner sits about at the ceilings. A ceiling only
+#          reported its number on failure, so a passing log said nothing about margin. Both
+#          now record median and worst through conftest.record_perf, and a `perf margins`
+#          section ends the run with each as a fraction of its ceiling, pass or fail. The
+#          runner ceilings are to be set from those numbers, not from one red run.
 # 3.0.20: a workspace reopens the window as it was and names captures relative to itself;
 #         per-stream Filter & Gain and spectrograms; data-port and region names; a config CSV
 #         into one region; large captures in half the memory, and no fixed 8 GiB limit.
@@ -2802,7 +3000,7 @@ Saleae plugin sources) with capture ingestion, an out-of-core results store, and
 #        ping-period stats, v0 .sal load memory fix; MIPI OSS release scaffolding.
 # 3.0.2: mode-grouped menus; per-mode File submenus; link-control timeline + timing.
 # 3.0.1: workspaces persist the TX-map + Hide-Clock view state.
-__version__ = "3.0.20"
+__version__ = "3.0.22"
 
 from .api import DecodeResult, decode, decode_capture
 from .ingest import saleae_binary
