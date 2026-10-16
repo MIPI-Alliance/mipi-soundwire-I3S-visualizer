@@ -12,7 +12,8 @@
 #include "TransitionSampleSource.h"   // concrete source: de-virtualize the hot stream loop
 #include "DlvSampleSource.h"          // concrete DLV source: de-virtualize its stream loop too
 
-#include <algorithm>   // std::upper_bound (windowed checkpoint lookup), std::any_of
+#include <algorithm>   // std::upper_bound (windowed checkpoint lookup), std::any_of,
+                       // std::stable_sort / std::min (restart points)
 #include <cmath>
 #include <numeric>   // std::lcm (manual-SSP interval period)
 
@@ -34,6 +35,9 @@ static const long kCommandConfidenceRows = 8192;
 // space commands ~30k UIs apart, so 8k UIs would never see two phases. Buffering
 // this many UIs (a few MB) is negligible against multi-100M-edge captures.
 static const int kDetectWindow = 262144;
+// The fewest rows a window after a clock pause needs to say whether the bus carried on in
+// phase (Decoder::resumeAt): fewer, and it decodes on in the current framing.
+static const int kResumeMinRows = 64;
 
 // DLV uses a MUCH smaller leading window: its column count is snoop-driven (forced
 // from the Safe-Lock geometry, then pushed by each commit), so it needs no blind
@@ -363,7 +367,8 @@ static bool sameEnabledConfig(const SwI3sConfig& a, const SwI3sConfig& b)
     return true;
 }
 
-bool Decoder::maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool preservePhase)
+bool Decoder::maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool preservePhase,
+                                      bool force)
 {
     SwI3sConfig snooped;
     bool buildOk;
@@ -392,7 +397,7 @@ bool Decoder::maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool pr
     // Skip if the effective config is unchanged — a single-ranked write that rewrote a
     // register with the same value must NOT record a spurious config epoch (which would
     // desync the windowed re-decode from the full collect).
-    if (mEngine.Enabled() && sameEnabledConfig(mConfig, snooped)) return false;
+    if (!force && mEngine.Enabled() && sameEnabledConfig(mConfig, snooped)) return false;
     mConfig = snooped;
     applyScramblerOverrides();
     if (preservePhase) mEngine.Reconfigure(mConfig);   // DSCR: keep survivors' timing
@@ -919,6 +924,11 @@ void Decoder::run()
     if (!aligned) return;
     std::uint64_t segStartUi = mSrc.UiIndex();   // source UI of this segment's Column 0
 
+    // Later bring-ups, from past this first alignment edge.
+    loadRestarts(sn);
+    mSegmentRestart = false;
+    mSegmentColdStart = false;
+
     // Collect a bounded leading window to measure the UI rate and auto-detect the
     // column count (replaces the plugin's history/rewind; memory stays bounded).
     // DLV streams live after a tiny seed window (see kDlvDetectWindow) so a mid-stream
@@ -926,25 +936,11 @@ void Decoder::run()
     const int kWindow = mSettings.dlv ? kDlvDetectWindow : kDetectWindow;
     std::vector<bool> levels;
     std::vector<std::uint64_t> samples;
-    levels.reserve(kWindow);
-    samples.reserve(kWindow);
-    std::uint64_t firstSample = 0, lastSample = 0;
-    bool haveFirst = false;
-    while (static_cast<int>(levels.size()) < kWindow &&
-           mSrc.NextUi(rising, dataHigh, sn)) {
-        if (!haveFirst) { firstSample = sn; haveFirst = true; }
-        lastSample = sn;
-        levels.push_back(dataHigh);
-        samples.push_back(sn);
-    }
-    if (levels.empty()) return;
-
-    int uiCount = static_cast<int>(levels.size());
-    if (lastSample > firstSample && uiCount > 0) {
-        double avgUiSamples = static_cast<double>(lastSample - firstSample) / uiCount;
-        if (avgUiSamples > 0.0)
-            mMeasuredUiRateHz = static_cast<double>(mSrc.SampleRateHz()) / avgUiSamples;
-    }
+    const Crossing crossing = readWindow(kWindow, levels, samples);
+    // An empty window that stopped at a restart point is a decode that begins at that
+    // bring-up: set up as usual, then take it (below), as resync() does.
+    if (levels.empty() && crossing == Crossing::None) return;
+    measureUiRate(samples);
 
     int phaseOffset = 0;
     // A region-scoped forced width for section 0 outranks every other source (snoop,
@@ -989,8 +985,10 @@ void Decoder::run()
     if (mTotalUis > 0 && mColumnCount > 0)
         mAudio.reserve(mTotalUis / static_cast<std::uint64_t>(mColumnCount));
 
-    mNrzs.Reset(BIT_LOW);
-    mParser.Reset();
+    // Align Column 0 to the detected phase offset: with >2 columns, the
+    // rising-edge alignment can start mid-row, so step mColumn so that window
+    // index `phaseOffset` is treated as Column 0.
+    resetFraming((mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
     // Hub depths are config (survive parser Reset), so apply once here.
     {
         int depths[swi3s::kMaxPeripherals] = {0};
@@ -1001,10 +999,6 @@ void Decoder::run()
         mParser.SetHubDepths(depths);
     }
     mRegisters.Reset();
-    // Align Column 0 to the detected phase offset: with >2 columns, the
-    // rising-edge alignment can start mid-row, so step mColumn so that window
-    // index `phaseOffset` is treated as Column 0.
-    mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
     // Payload ports must share the CDS Column-0 phase: a truncated/mid-stream capture
     // starts partway into a row (phaseOffset != 0), and CDS re-derives Column 0 from
     // its differential code — but the payload is sampled as an absolute level, so
@@ -1029,11 +1023,6 @@ void Decoder::run()
             recordReconfig(segStartUi, mColumn);
     }
     mRowCounter = 0;
-    mPendingSspRow = -1;
-    mPendingSspCommit = false;
-    mPendingSspSyncPoint = false;
-    mPendingImmediateReconfig = false;
-    mPendingSspCmdIndex = -1;
     // Manual SSP: reduce the chosen bus row modulo the LCM of the enabled ports'
     // transport pattern periods, so we re-anchor at the FIRST congruent row near the
     // decode start — making the chosen row (and every period from it) row_in_interval ==
@@ -1059,12 +1048,9 @@ void Decoder::run()
             mSspSyncRow = -1;
         }
     }
-    mRowsSinceCommand = 0;
-    mNeedResync = false;
-    mCdsBitRows.clear();   // rows reset to 0 here, so old (sample->row) trail is stale
     mRowSyncSamples.clear();   // per-run row-start (RSP) samples; reset with the framing
-    mSegments.clear();
-    mSegmentPending = true;   // first Column-0 CDS bit anchors segment 0
+    mSegments.clear();         // resetFraming set mSegmentPending: Column 0 anchors segment 0
+    mRateWinUiCount = 0;
     // Snapshot the initial engine phase (if a CSV config enabled ports) so a window
     // right after the start has a checkpoint to restore from.
     snapshotCheckpoint(segStartUi);
@@ -1076,6 +1062,7 @@ void Decoder::run()
     // absolute source UI of each fed UI) anchors segment row numbering.
     for (std::size_t i = 0; i < levels.size(); ++i)
         feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
+    takeRestarts(crossing);           // the leading window ended at a later bring-up
     // Stream the remainder. Dispatch once to a source-typed drainer: for the concrete
     // TransitionSampleSource (the only source real captures use) this de-virtualizes
     // NextUi() and lets the tight inner loop inline — ~millions of virtual calls
@@ -1090,13 +1077,27 @@ void Decoder::run()
 }
 
 // Templated so the concrete source's NextUi()/UiIndex() inline (no vtable in the
-// per-UI loop). Behaviour is identical to the base-typed walk it replaces.
+// per-UI loop). Behaviour is identical to the base-typed walk it replaces. A pending
+// restart costs one compare per UI (mNextStop); its inactive stretch and the restart
+// itself are taken off the hot path.
 template <class Src>
 void Decoder::streamRemainder(Src& src)
 {
     bool rising = false, dataHigh = false;
     std::uint64_t sn = 0;
     while (src.NextUi(rising, dataHigh, sn)) {
+        if (sn >= mNextStop) {
+            if (sn < mRestarts[mNextRestart].sample) {   // the Link is inactive
+                if (!mInactive) goInactive(src.UiIndex() - 1);
+                ++mProgressUis;
+                continue;
+            }
+            mCrossHigh = dataHigh;
+            mCrossSample = sn;
+            mCrossUi = src.UiIndex() - 1;
+            takeRestarts(rising ? Crossing::Rising : Crossing::Falling);
+            continue;
+        }
         feed(dataHigh ? BIT_HIGH : BIT_LOW, sn, src.UiIndex() - 1);
         if (mNeedResync)
             resync();
@@ -1112,15 +1113,13 @@ void Decoder::streamRemainder(Src& src)
 // kept (config persists across the gap and the snoop will refine it); only the
 // bit-level framing (NRZS phase, comma hunt, column/row counters) is reset.
 // Column 0 begins on a rising clock edge, so re-align there first (as run() does).
+// The edge hunt and the window both stop at the next restart point (readUi): with no
+// Safe-Lock seed the watchdog runs while restart points are pending.
 void Decoder::resync()
 {
-    bool rising = false, dataHigh = false;
-    std::uint64_t sn = 0;
     bool aligned = false;
-    while (mSrc.NextUi(rising, dataHigh, sn)) {
-        if (rising) { aligned = true; break; }
-    }
-    if (!aligned) { mNeedResync = false; return; }
+    Crossing crossing = alignToRising(aligned);
+    if (!aligned) { mNeedResync = false; takeRestarts(crossing); return; }
     std::uint64_t segStartUi = mSrc.UiIndex();   // source UI of the new segment's Column 0
 
     // The rising edge is the alignment UI; Column 0 is the NEXT UI (matching
@@ -1129,24 +1128,13 @@ void Decoder::resync()
     const int kWindow = mSettings.dlv ? kDlvDetectWindow : kDetectWindow;
     std::vector<bool> levels;
     std::vector<std::uint64_t> samples;
-    levels.reserve(kWindow);
-    samples.reserve(kWindow);
-    while (static_cast<int>(levels.size()) < kWindow &&
-           mSrc.NextUi(rising, dataHigh, sn)) {
-        levels.push_back(dataHigh);
-        samples.push_back(sn);
-    }
-    if (levels.empty()) { mNeedResync = false; return; }
+    crossing = readWindow(kWindow, levels, samples);
+    if (levels.empty()) { mNeedResync = false; takeRestarts(crossing); return; }
 
     // Re-measure the UI rate from this window: the clock rate can change across a
     // reconfiguration, so reusing the initial rate would mis-report the row rate
     // and audio sample rates for the new phase.
-    if (samples.size() > 1 && samples.back() > samples.front()) {
-        double avgUiSamples =
-            static_cast<double>(samples.back() - samples.front()) / (samples.size() - 1);
-        if (avgUiSamples > 0.0)
-            mMeasuredUiRateHz = static_cast<double>(mSrc.SampleRateHz()) / avgUiSamples;
-    }
+    measureUiRate(samples);
 
     int phaseOffset = 0;
     int c = CColumnDetector::Detect(levels, &phaseOffset);
@@ -1163,8 +1151,8 @@ void Decoder::resync()
         // re-aligned to a rising edge and re-detected, so it can start mid-row too),
         // matching the mColumn set below.
         mEngine.SetStartColumn((mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
-        // Reconfiguration → a NEW section is about to be anchored (mSegmentPending
-        // is set below); it will take the next segment index.
+        // Reconfiguration → a NEW section is about to be anchored (resetFraming sets
+        // mSegmentPending below); it will take the next segment index.
         maybeConfigureFromSnoop(mColumnCount, static_cast<int>(mSegments.size()));
         // Record the new config epoch + phase so a windowed re-decode can start here.
         recordReconfig(segStartUi, (mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
@@ -1177,13 +1165,22 @@ void Decoder::resync()
     // the engine: that would reset its SSP-anchored interval counter and garble the
     // audio. The engine ticks continuously and stays anchored across the re-hunt.
 
-    mNrzs.Reset(BIT_LOW);
-    mParser.Reset();
-    mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
-    // Bus rows stay CONTINUOUS across the resync (do NOT reset mRowCounter): the
+    // Bus rows stay CONTINUOUS across the resync (resetFraming leaves mRowCounter): the
     // new segment's rows carry on from where the old one left off, so the command
     // table and symbol viewer share one monotonic row scale rather than each
     // segment restarting at 0 (which made row numbers ambiguous).
+    resetFraming((mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
+
+    for (std::size_t i = 0; i < levels.size(); ++i)
+        feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
+    takeRestarts(crossing);
+}
+
+void Decoder::resetFraming(int startColumn)
+{
+    mNrzs.Reset(BIT_LOW);
+    mParser.Reset();
+    mColumn = startColumn;
     mPendingSspRow = -1;
     mPendingSspCommit = false;
     mPendingSspSyncPoint = false;
@@ -1193,9 +1190,317 @@ void Decoder::resync()
     mNeedResync = false;
     mCdsBitRows.clear();      // sample->row trail: framing changed, old entries stale
     mSegmentPending = true;   // next Column-0 CDS bit anchors the new segment
+}
 
+void Decoder::measureUiRate(const std::vector<std::uint64_t>& samples)
+{
+    if (samples.size() < 2 || samples.back() <= samples.front()) return;
+    const double avgUiSamples =
+        static_cast<double>(samples.back() - samples.front()) / (samples.size() - 1);
+    if (avgUiSamples > 0.0)
+        mMeasuredUiRateHz = static_cast<double>(mSrc.SampleRateHz()) / avgUiSamples;
+}
+
+void Decoder::loadRestarts(std::uint64_t after)
+{
+    mRestarts.clear();
+    mNextRestart = 0;
+    mInactive = false;
+    for (const auto& p : mSettings.restartPoints) {
+        Restart r;
+        r.sample = std::get<0>(p);
+        r.columns = std::get<1>(p);
+        r.cold = std::get<2>(p);
+        r.inactiveFrom = std::get<3>(p);
+        if (r.sample > after) mRestarts.push_back(r);
+    }
+    if (!mSettings.dlv) {
+        for (std::uint64_t sample : mSettings.resumePoints) {
+            Restart r;
+            r.sample = sample;
+            r.inactiveFrom = sample;          // the clock was stopped: no UIs to skip
+            r.resume = true;
+            if (r.sample > after) mRestarts.push_back(r);
+        }
+    }
+    std::stable_sort(mRestarts.begin(), mRestarts.end(),
+                     [](const Restart& a, const Restart& b) { return a.sample < b.sample; });
+    // Points at one sample are one bring-up: a Cold Start if either says so, the first
+    // usable column count, the earliest inactive stretch.
+    std::vector<Restart> merged;
+    for (const Restart& r : mRestarts) {
+        if (merged.empty() || merged.back().sample != r.sample) {
+            merged.push_back(r);
+            continue;
+        }
+        Restart& m = merged.back();
+        if (m.resume && !r.resume) {          // a bring-up at a pause's sample is the bring-up
+            m = r;
+            continue;
+        }
+        if (r.resume) continue;
+        m.cold = m.cold || r.cold;
+        if (m.columns < swi3s::kMinColumnCount || m.columns > swi3s::kMaxColumnCount)
+            m.columns = r.columns;
+        if (r.inactiveFrom != 0 && (m.inactiveFrom == 0 || r.inactiveFrom < m.inactiveFrom))
+            m.inactiveFrom = r.inactiveFrom;
+    }
+    // An inactive stretch lies between the previous restart (or the alignment edge) and
+    // its own restart; 0 or out of order means there is none.
+    std::uint64_t prev = after;
+    for (Restart& r : merged) {
+        if (r.inactiveFrom == 0 || r.inactiveFrom > r.sample) r.inactiveFrom = r.sample;
+        if (r.inactiveFrom <= prev) r.inactiveFrom = std::min(prev + 1, r.sample);
+        prev = r.sample;
+    }
+    mRestarts.swap(merged);
+    updateNextStop();
+}
+
+void Decoder::updateNextStop()
+{
+    if (mNextRestart >= mRestarts.size()) { mNextStop = UINT64_MAX; return; }
+    mNextStop = mRestarts[mNextRestart].inactiveFrom;
+}
+
+bool Decoder::readUi(bool& rising, bool& dataHigh, std::uint64_t& sn, Crossing& crossing)
+{
+    crossing = Crossing::None;
+    while (mSrc.NextUi(rising, dataHigh, sn)) {
+        if (sn < mNextStop) return true;
+        if (sn >= mRestarts[mNextRestart].sample) {
+            crossing = rising ? Crossing::Rising : Crossing::Falling;
+            mCrossHigh = dataHigh;
+            mCrossSample = sn;
+            mCrossUi = mSrc.UiIndex() - 1;
+            return false;
+        }
+        if (!mInactive) goInactive(mSrc.UiIndex() - 1);
+        ++mProgressUis;               // consumed, not decoded: the Link is inactive
+    }
+    return false;
+}
+
+void Decoder::goInactive(std::uint64_t ui)
+{
+    mInactive = true;
+    mInactiveUi = ui;
+    // A recovered clock skips the stretch (DlvSampleSource): its next UI is the restart's.
+    if (mSettings.dlv) mSrc.Reacquire(mRestarts[mNextRestart].sample, mColumnCount);
+}
+
+void Decoder::stopPorts()
+{
+    if (!mEngine.Enabled()) return;
+    SwI3sConfig idle = mConfig;
+    for (SwI3sDpConfig& d : idle.dps) d.Enabled = false;
+    mEngine.Configure(idle);
+    mConfigEpochs.push_back(idle);
+    mCurrentEpoch = static_cast<int>(mConfigEpochs.size()) - 1;
+    TransportEvent e;
+    e.ui = mInactiveUi; e.reconfigure = true; e.epoch = mCurrentEpoch; e.startColumn = 0;
+    mTransportEvents.push_back(e);
+}
+
+Decoder::Crossing Decoder::alignToRising(bool& aligned)
+{
+    bool rising = false, dataHigh = false;
+    std::uint64_t sn = 0;
+    Crossing crossing = Crossing::None;
+    aligned = false;
+    while (readUi(rising, dataHigh, sn, crossing))
+        if (rising) { aligned = true; break; }
+    return crossing;
+}
+
+Decoder::Crossing Decoder::readWindow(int n, std::vector<bool>& levels,
+                                      std::vector<std::uint64_t>& samples)
+{
+    levels.clear();
+    samples.clear();
+    levels.reserve(n);
+    samples.reserve(n);
+    bool rising = false, dataHigh = false;
+    std::uint64_t sn = 0;
+    Crossing crossing = Crossing::None;
+    while (static_cast<int>(levels.size()) < n) {
+        if (!readUi(rising, dataHigh, sn, crossing)) return crossing;
+        levels.push_back(dataHigh);
+        samples.push_back(sn);
+    }
+    return Crossing::None;
+}
+
+void Decoder::takeRestarts(Crossing crossing)
+{
+    while (crossing != Crossing::None && mNextRestart < mRestarts.size()) {
+        const Restart r = mRestarts[mNextRestart++];
+        if (mInactive) stopPorts();   // every UI before the stretch has been fed
+        mInactive = false;
+        updateNextStop();
+        crossing = r.resume ? resumeAt(crossing == Crossing::Rising)
+                            : restartAt(r, crossing == Crossing::Rising);
+    }
+}
+
+// A clock pause with no bring-up after it. A bus whose clock only stopped carries on in
+// phase, and is decoded on as if nothing happened, the UIs read to find out included; one
+// that lost UIs in the pause (an analyzer dropout, a joined capture) is re-framed on the
+// wire's Column-0 phase at the current column count, as a resync would, but with the
+// payload engine moved to the new phase too (UIs were lost to it as well).
+Decoder::Crossing Decoder::resumeAt(bool rising)
+{
+    // The pause's UI and those up to the next rising edge, where Column 0 can open.
+    std::vector<bool> lead{mCrossHigh};
+    std::vector<std::uint64_t> leadSamples{mCrossSample};
+    const std::uint64_t leadUi = mCrossUi;
+    Crossing crossing = Crossing::None;
+    bool dataHigh = false;
+    std::uint64_t sn = 0;
+    while (!rising) {
+        if (!readUi(rising, dataHigh, sn, crossing)) break;
+        lead.push_back(dataHigh);
+        leadSamples.push_back(sn);
+    }
+    std::vector<bool> levels;
+    std::vector<std::uint64_t> samples;
+    const std::uint64_t segStartUi = leadUi + lead.size();   // the UI after the rising one
+    if (rising && crossing == Crossing::None)
+        crossing = readWindow(mSettings.dlv ? kDlvDetectWindow : kDetectWindow, levels,
+                              samples);
+    // The column the window's first UI takes if the bus carried on in phase, and the one
+    // the wire says. A short window cannot tell them apart: it decodes on. The column
+    // count is detected afresh, as at the start of a capture that begins mid-stream (a
+    // pin on the section a re-frame would open outranks it); a window it cannot read
+    // keeps the current one.
+    int cols = mColumnCount;
+    const int inPhase =
+        static_cast<int>((static_cast<std::uint64_t>(mColumn) + (segStartUi - leadUi)) % cols);
+    int startColumn = inPhase;
+    if (levels.size() >= static_cast<std::size_t>(kResumeMinRows) * cols) {
+        int phaseOffset = 0;
+        int c = CColumnDetector::Detect(levels, &phaseOffset);
+        if (int pin = forcedColumnsForSection(static_cast<int>(mSegments.size())))
+            c = pin;
+        if (c >= swi3s::kMinColumnCount && c <= swi3s::kMaxColumnCount && !mHaveCsv)
+            cols = c;
+        if (cols == mColumnCount || c != cols)
+            phaseOffset = CColumnDetector::BestOffset(levels, cols);
+        startColumn = (cols - phaseOffset % cols) % cols;
+    }
+    if (cols == mColumnCount && startColumn == inPhase) {
+        for (std::size_t i = 0; i < lead.size(); ++i)
+            feed(lead[i] ? BIT_HIGH : BIT_LOW, leadSamples[i], leadUi + i);
+    } else {
+        measureUiRate(samples);
+        const int section = static_cast<int>(mSegments.size());   // the segment this opens
+        if (cols != mColumnCount) {
+            mColumnCount = cols;
+            updateRowRateFromCapture(mColumnCount);
+        }
+        if (mDecodeAudio) {
+            mEngine.SetStartColumn(startColumn);
+            bool configured = false;
+            if (mHaveCsv) {
+                configured = mConfig.anyAudioEnabled();
+                if (configured) mEngine.Configure(mConfig);
+            } else {
+                configured = maybeConfigureFromSnoop(cols, section, false, /*force=*/true);
+            }
+            if (configured) {
+                recordReconfig(segStartUi, startColumn);
+                snapshotCheckpoint(segStartUi);
+            }
+        }
+        resetFraming(startColumn);
+    }
     for (std::size_t i = 0; i < levels.size(); ++i)
         feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
+    return crossing;
+}
+
+// A later link bring-up: the bus restarts, so the decode does what run() does at the start
+// of the capture. Column 0 opens on a rising clock edge, the geometry is the Safe-Lock count
+// the bring-up selected (its phase found from a fresh window; DLV's recovered clock locks
+// again at the bring-up's first Row Sync, which opens Column 0), and a new segment begins.
+// A Cold Start resets the bus, so the register model goes back to its reset values and the
+// payload engine is reconfigured from them, which stops every port the old configuration
+// ran; a Warm Start keeps the registers, and its ports resume on the new phase. A config
+// CSV keeps its ports across both, and on FBCSE its column count. Bus rows stay
+// continuous, as across a resync.
+Decoder::Crossing Decoder::restartAt(const Restart& r, bool rising)
+{
+    if (r.cold) {
+        mRegisters.Reset();
+        mParser.SetShortProtocolSpacer(mRegisters.ShortProtocolSpacer());
+        mSegmentColdStart = true;
+    }
+    mSegmentRestart = true;
+    mRateWinUiCount = 0;              // the clock rate is measured afresh from here
+    const int section = static_cast<int>(mSegments.size());   // the segment this opens
+    // A recovered clock locks again at the bring-up's first Row Sync, framing its geometry
+    // from there, so the count is settled first; the next UI is that row's alignment edge.
+    if (mSettings.dlv) {
+        mColumnCount = restartColumns(r, section);
+        mSrc.Reacquire(r.sample, mColumnCount);
+        rising = false;
+    }
+    Crossing crossing = Crossing::None;
+    if (!rising) {
+        bool aligned = false;
+        crossing = alignToRising(aligned);
+        if (!aligned) return crossing;
+    }
+    std::uint64_t segStartUi = mSrc.UiIndex();   // source UI of the new segment's Column 0
+
+    const int kWindow = mSettings.dlv ? kDlvDetectWindow : kDetectWindow;
+    std::vector<bool> levels;
+    std::vector<std::uint64_t> samples;
+    crossing = readWindow(kWindow, levels, samples);
+    if (levels.empty()) return crossing;
+    measureUiRate(samples);
+
+    // DLV's Column 0 is the row the source locked on, as in run().
+    if (!mSettings.dlv) mColumnCount = restartColumns(r, section);
+    const int phaseOffset = mSettings.dlv ? 0 : CColumnDetector::BestOffset(levels, mColumnCount);
+    const int startColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
+    updateRowRateFromCapture(mColumnCount);
+    // DLV numbers its rows by their Row Sync Points (one per Column 0 fed), so a row the
+    // stop cut short keeps its number and the restart opens the next.
+    if (mSettings.dlv && mColumn != 0) ++mRowCounter;
+
+    // Every port restarts with the bus, on the new Column-0 phase: always a full
+    // Configure, even of a config that did not change (a Warm Start's).
+    if (mDecodeAudio) {
+        mEngine.SetStartColumn(startColumn);
+        bool configured = false;
+        if (mHaveCsv) {
+            configured = mConfig.anyAudioEnabled();
+            if (configured) mEngine.Configure(mConfig);
+        } else {
+            configured = maybeConfigureFromSnoop(mColumnCount, section, false, /*force=*/true);
+        }
+        if (configured) {
+            recordReconfig(segStartUi, startColumn);
+            snapshotCheckpoint(segStartUi);
+        }
+    }
+
+    resetFraming(startColumn);
+    for (std::size_t i = 0; i < levels.size(); ++i)
+        feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
+    return crossing;
+}
+
+int Decoder::restartColumns(const Restart& r, int section) const
+{
+    if (int pin = forcedColumnsForSection(section))
+        return pin;
+    if (mHaveCsv && !mSettings.dlv)
+        return mConfig.columnCount();
+    if (r.columns >= swi3s::kMinColumnCount && r.columns <= swi3s::kMaxColumnCount)
+        return r.columns;
+    return r.cold ? swi3s::kColdStartColumnCount : mColumnCount;
 }
 
 void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t srcUi)
@@ -1245,8 +1550,11 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
         // Column-0 bit makes that exact regardless of the phase-offset alignment.
         if (mSegmentPending) {
             mSegments.push_back({srcUi, sampleNumber, mColumnCount,
-                                 static_cast<long>(mRowCounter)});
+                                 static_cast<long>(mRowCounter), mSegmentRestart,
+                                 mSegmentColdStart});
             mSegmentPending = false;
+            mSegmentRestart = false;
+            mSegmentColdStart = false;
         }
         // Record this CDS bit's row so a completed command can be back-dated to
         // its starting comma's row (see recordCommand). Bounded: the interior +

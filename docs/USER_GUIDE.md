@@ -56,6 +56,22 @@ pane follows.
 
 ## Analysis panes
 
+**Maximize a pane** to give it the whole window: click in it and press **⌘⇧M** (Ctrl+Shift+M
+on Windows and Linux), or use **View ▸ Maximize Pane**, the **⤢** button at the right of its
+title bar, or a double-click on the title bar (the Commands table's title too). Every other
+pane and the Commands table are hidden; the Commands table can be the maximized pane too.
+The Timeline is not maximized: it has no ⤢, and with it selected the key only says so in the
+status bar. The panes read by moving through time (Commands, Registers, Bus Grid, CDS and
+Samples) keep the **Timeline** above them, at its height, to navigate with; Audio, Capture,
+Timing, Statistics and Bookmarks take the whole window, since the first three have time axes
+of their own. A closed Timeline stays closed. The same key, button or double-click (or
+**View ▸ Restore Panes**) puts every pane back as it was: sizes, tab groups and floating
+panes, with the pane you maximized in front of its tab group and still holding the keyboard
+focus, so the key toggles that same pane. Showing, hiding or closing a pane, adding or
+removing a Link, leaving the Bus Analyzer or opening a workspace puts them back first, and a
+workspace saved meanwhile keeps the arrangement they return to. A double-click on a title bar
+never floats a pane; a pane is floated out of the window by dragging its title bar.
+
 ### Commands
 One row per decoded Command Transport command. Columns: **Row** (the bus row of the
 command's opening SPM comma), **Time**, PhaseID, Devices, Packet Length, Opcode,
@@ -80,7 +96,16 @@ Per-device register state as-of the cursor: SLC, CDS, each active data-port bloc
 active PHY, and any imported peripheral (vendor) registers. Values are coloured by
 **provenance** (inline key): Cold Reset / Bus Write / Bus Read / CSV Import / Manual
 Edit. Dual-ranked registers show a staged **(NEXT)** row and a committed **(CURR)**
-peer. **What-if editing:** right-click (or double-click) a register → *Edit fields…*
+peer. **The key is also a filter:** click an entry (or Tab to it and press Space or
+Enter) to hide or show the registers whose value came from it; hidden entries grey out,
+and the tooltip says which state an entry is in. Turn **Cold Reset** off to see only the
+registers something has set. NEXT and CURR rows are filtered each on its own provenance,
+and a block with nothing left to show is hidden; if nothing at all is left, the pane says
+so. Starting or changing the filter opens the blocks with registers to show (except
+Peripheral Registers, which can be long); after that, blocks stay as you open or close
+them, and showing every category again gives back the blocks you had open, with the
+changes you made while filtering. The filter stays across cursor moves and is saved in the
+workspace. **What-if editing:** right-click (or double-click) a register → *Edit fields…*
 (dropdowns for enums, bounded number boxes otherwise) or *Force value…* (raw byte).
 The edit re-decodes so grid, registers, and audio all reflect it; *Clear all manual
 edits* reverts. A dual-ranked write takes effect at its **commit**, not where it was seen.
@@ -111,11 +136,15 @@ transporting columns fill, an interval/skipping port shows row-periodic gaps. Sc
 the drawn rows into one slice — a column fills if it *ever* toggled within them — so
 active columns read as solid bars. In a cold-start's pre-audio bring-up region (before a
 PHY is selected) the TX map, like the config layout, shows **No PHY Selected** — there is
-no audio-mode column structure on the wire there yet.
+no audio-mode column structure on the wire there yet. Where the Link went inactive before a
+later bring-up (its clock stopped), both read **Link Inactive**.
 
 ### Audio
 One stacked waveform per **(device, data-port, channel)**, from a min/max pyramid so
-pan/zoom stays fast over millions of samples. A **PDM** port (1-bit sample size) is
+pan/zoom stays fast over millions of samples. **Zoomed in until the samples are a few pixels
+apart, a track shows the samples themselves**: a stem from zero to each value with a dot on
+it, at the time the sample arrived on the bus; zoomed out again it is the line through them.
+A **PDM** port (1-bit sample size) is
 decoded from its bipolar density stream to PCM. Each stream has its Bus Grid hue, in a
 deeper shade on the light theme so the line stays readable. Channel checkboxes
 (colour-matched to each waveform) show/hide tracks without resetting zoom; **right-click a
@@ -256,6 +285,23 @@ bus-config band ▸ Rename…** to name that region, for example `Playback`: the
 reads `Playback · 8col`. An empty name clears it; the name is the Link's and is saved in the
 workspace. Like a pinned column count it belongs to the region's number, so a re-decode that
 changes which regions exist can leave it on a different one.
+
+**A Link that goes inactive and is brought up again.** When the clock stops (for over 1 ms)
+and a new start sequence follows, each bring-up is found, in a capture that starts in audio
+mode as well, and the decode starts again where its audio begins, as at the start of the
+capture: framed at the selected PHY's Safe-Lock column count, in a new config region labelled
+by that PHY (e.g. `PHY2 Safe-Lock-2`), whether a Cold or a Warm Start opened it. Nothing is
+decoded while the Link is inactive. A **Cold Start** resets the bus: from its Bus Reset the
+registers read their reset values, so the Registers and Bus Grid panes show only what is
+configured after it. A **Warm Start** keeps the registers, and the data ports carry on. The
+Timeline draws the stopped stretch as an **Idle** band followed by the new bring-up's phases;
+the Bus Grid reads **Link Inactive** in the stopped stretch, then **No PHY Selected** through a
+Cold Start's sequence or **PHY2 Reused** (the PHY named) through a Warm Start's. The Registers
+pane marks the PHY of the bring-up at the cursor. An imported config CSV stays the
+configuration through every bring-up. On a PHY3/DLV capture the recovered clock locks again
+at each bring-up's first Row Sync, so it restarts the same way (e.g. `PHY3 Safe-Lock-4`). A
+bring-up that switches between the forwarded clock (PHY1, PHY2) and DLV is not followed:
+the decode runs on through it, and it is not drawn.
 
 ## Opening a capture
 
@@ -480,7 +526,9 @@ Commands, Decode, Devices, Audio and Bookmarks. There is no Links menu: a Link i
 added in **Open Capture**, its own actions are on its timeline label's right-click, and
 showing Links is **View ▸ Links**. **⌘O / ⌘S** (Ctrl on Windows and
 Linux) open and save the current mode's file. Items that act on a capture are greyed out
-until one is open. The Capture, CDS, Audio, Samples and Timing panes are the **signal
+until one is open, submenus included (Commands ▸ Filter, Decode ▸ Manual SSP Move, Audio's
+per-stream submenus, which also need audio); opening files, preferences, the playback device
+and bit depth, the View menu and Help are always available. The Capture, CDS, Audio, Samples and Timing panes are the **signal
 panes**: one pane group, with its own Link picker.
 
 - **Mode** — *Bus Visualizer* (⌘1), *Timing Calculator* (⌘2), *Bus Analyzer* (⌘3).
@@ -496,6 +544,8 @@ panes**: one pane group, with its own Link picker.
   *Export Grid Image…*; *Export Bus Model (JSON)…* (the placed bus model).
 - **File**, Timing Calculator — *Open / Save Timing Settings…* (⌘O / ⌘S, the calculator's
   inputs as JSON, incl. the selected PHY).
+- **File** ends with *Quit* (⌘Q) in every mode. Ctrl+C in the terminal that launched the
+  app quits it the same way; if that quit hangs, a second Ctrl+C ends the process at once.
 - **Commands** — *Filter* (expression search; multi-select Commands / Devices / Groups,
   with Commands' quick picks All ⌘4, None ⌘5, All excl. Ping ⌘6, Commit ⌘7; Errors Only);
   *Next / Previous SSCR/DSCR Commit* (⌘> / ⌘<); *Export as CSV…*.
@@ -513,7 +563,9 @@ panes**: one pane group, with its own Link picker.
 - **Bookmarks** — *Toggle / Next / Previous / Clear* (⌘B / ⌘] / ⌘[); *Align
   Links on Bookmark Pair…* (two or more Links).
 - **View** — in the Bus Analyzer, show/raise any pane (Timeline, Registers, Statistics,
-  Bookmarks, Bus Grid, Capture, CDS, Audio, Samples, Timing); **Links** (two or more Links:
+  Bookmarks, Bus Grid, Capture, CDS, Audio, Samples, Timing); *Maximize Pane* / *Restore
+  Panes* (⌘⇧M: the selected pane alone in the window, and back; see **Analysis panes**);
+  **Links** (two or more Links:
   *Commands: All Links* ⌘⌥0, *Signal Panes: All Links* ⌘⌥⇧0, and one
   entry per Link, ⌘⌥1…9, to show it in every pane); **Appearance** (Follow System /
   Light / Dark); *Waveform Colors and Line Weight…* (Ctrl+, on Windows and Linux; on macOS also
@@ -546,9 +598,9 @@ A saved workspace reopens the window as it was when it was saved:
 - **The window:** bookmarks, the cursor, the mode, which Link each pane group shows and the
   All Links choices, which panes are open, how they are docked and tabbed and which tab is
   in front, their sizes, the window's size and position, the timeline's zoom, the Commands
-  sort and hidden columns, the Samples filters, the Registers device and opened blocks,
-  the Statistics sections folded, and the Timing pane's region, driver filter and hidden
-  edge kinds; and the Bus Visualizer and Timing Calculator inputs.
+  sort and hidden columns, the Samples filters, the Registers device, opened blocks and
+  provenance filter, the Statistics sections folded, and the Timing pane's region, driver
+  filter and hidden edge kinds; and the Bus Visualizer and Timing Calculator inputs.
 
 Each capture file is recorded relative to the workspace file, so a folder holding both can
 be moved or shared, and where it was when saved, in case the workspace moves alone. If a

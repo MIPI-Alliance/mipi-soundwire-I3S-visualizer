@@ -120,3 +120,52 @@ def test_click_snaps_to_nearby_cds_commit_marker():
     assert rv._snap_click(1020) == 1020          # >1 UI from any marker -> exact (fine pos)
     rv._show_cds = False
     assert rv._snap_click(1002) == 1002          # markers hidden -> no snap
+
+
+def test_a_stopped_line_draws_its_true_level_at_every_zoom():
+    """Zoomed out, the edges are cut to what can be drawn, and a stretch where the line has
+    stopped draws its true level whatever the zoom and scroll."""
+    from swi3s_studio.nputil import searchsorted
+    from swi3s_studio.ui.raw_view import _decimate_edges, _step_xy_from
+    view = RawCaptureView._MAX_EDGES
+    before = np.arange(0, 600_001, 2, dtype=np.uint64)     # an odd count: stops high
+    after = np.arange(1_800_000, 2_400_000, 2, dtype=np.uint64)
+    edges = np.concatenate([before, after])
+    stopped = (int(before[-1]) + int(after[0])) // 2
+    truth = bool(before.size & 1)
+    assert truth, "the stop should be high, so a held low shows"
+    wrong = []
+    for width in (300_000, 700_000, 1_250_000, 1_700_000, 2_000_000, 2_400_000):
+        for shift in (0, 37_001, 120_003, -90_001):
+            lo = max(0, stopped - width // 2 + shift)
+            hi = stopped + width // 2 + shift
+            i0, i1 = int(searchsorted(edges, lo)), int(searchsorted(edges, hi))
+            win = edges[i0:i1]
+            if win.size > view:
+                win = _decimate_edges(win, lo, hi, view // 3)
+                assert win.size <= view and win.dtype == np.uint64
+            xs, ys = _step_xy_from(win, bool(i0 & 1), lo, hi, 0.0, 1.0)
+            k = int(np.searchsorted(np.asarray(xs), stopped, side="right")) - 1
+            if (ys[k] > 0.5) != truth:
+                wrong.append((width, shift))
+    assert not wrong, f"the stopped line drew the wrong level at (width, shift) {wrong}"
+
+
+def test_the_edge_reduction_never_copies_the_window():
+    """The capture's edges are uint64 and a window can hold hundreds of millions of them:
+    searching it with float bounds would make numpy copy the whole window to float64 on
+    every render. What the reduction allocates is bounded by its slots, not the window."""
+    import tracemalloc
+
+    from swi3s_studio.ui.raw_view import _decimate_edges
+    win = np.arange(3, 3 + 2 * 4_000_000, 2, dtype=np.uint64)      # 32 MB
+    lo, hi = 0, int(win[-1]) + 1
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        kept = _decimate_edges(win, lo, hi, 20_000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert kept.dtype == np.uint64 and 0 < kept.size <= 60_000
+    assert peak < win.nbytes // 8, f"{peak} bytes allocated for a {win.nbytes}-byte window"

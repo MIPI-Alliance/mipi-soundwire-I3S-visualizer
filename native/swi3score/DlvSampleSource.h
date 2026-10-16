@@ -15,6 +15,13 @@
 // Safe-Lock-4 count and the decoder pushes each committed NumColumns change via
 // SetColumns(). A future "join an operational bus" mode can instead seed the initial
 // count + CDS position from waveform detection / a Visualizer CSV — the DLL is unchanged.
+//
+// A Link brought up again restarts the clock: the decoder calls Reacquire() where the Link
+// goes inactive and again at the restart, and the DLL locks afresh at the bring-up's first
+// Row Sync with the nominal UI of its Safe-Lock geometry (the seeded row period, which a
+// bring-up does not change, over its column count). The stretch between is skipped, not
+// tracked: it has no rows, and the start sequence's link-control pulses are single-ended
+// edges the loop would snap to.
 
 #ifndef SWI3SCORE_DLVSAMPLESOURCE_H
 #define SWI3SCORE_DLVSAMPLESOURCE_H
@@ -44,7 +51,7 @@ public:
                     double nominalUiSamples = 0.0)
         : mEdges(std::move(dpEdges)), mInitialDp(initialDp), mRate(sampleRateHz),
           mColumns(initialColumns >= swi3s::kMinColumnCount ? initialColumns : swi3s::kColdStartColumnCount),
-          mNominalUi(nominalUiSamples)
+          mNominalUi(nominalUiSamples), mNominalRow(nominalUiSamples * mColumns)
     {
         // Precompute the 0->1 (rising) edge samples the DLL locks to. With DP low before
         // edge 0, even-indexed edges are rising; with DP high, odd-indexed. (A rising
@@ -63,6 +70,7 @@ public:
         // the first rising edge and treats the NEXT UI as Column 0. Report the row's
         // Sync1 as that alignment edge, then start emitting real Column 0..N-1.
         if (!mAlignmentEmitted) {
+            if (mEnded) return false;               // Reacquire found no row edge
             mAlignmentEmitted = true;
             rising = true;
             dataHigh = false;                       // pre-Sync1 (Sync0) level
@@ -93,13 +101,15 @@ public:
     // Instead each row's (start edge, start UI) was recorded as the DLL ran (mRowSyncs /
     // mRowStartUi), so we binary-search the row containing `uiIndex`, restore that row's
     // start edge + per-row UI width, and set the column within it. O(log rows), and NextUi
-    // resumes producing the same (sample, level) the full decode did.
+    // resumes producing the same (sample, level) the full decode did: past the row it takes
+    // each logged row's edge (replayRow), so a window reaches across a re-acquisition too.
     bool CanSeek() const override { return true; }
 
     void Seek(std::uint64_t uiIndex) override
     {
         if (!mLocked && !lock()) return;
         mAlignmentEmitted = true;              // past the one-shot alignment UI
+        mEnded = false;
         mUi = uiIndex;
         if (mRowStartUi.empty()) {             // no per-row log (shouldn't happen post-lock)
             int cols = (mColumns >= swi3s::kMinColumnCount) ? mColumns : swi3s::kColdStartColumnCount;
@@ -112,11 +122,13 @@ public:
         auto it = std::upper_bound(mRowStartUi.begin(), mRowStartUi.end(), uiIndex);
         std::size_t r = (it == mRowStartUi.begin()) ? 0
                                                     : static_cast<std::size_t>((it - mRowStartUi.begin()) - 1);
+        mRow = r;
         mRowStart = static_cast<double>(mRowSyncs[r]);
         mCol = static_cast<int>(uiIndex - mRowStartUi[r]);
         // Per-row UI width and column count from the recorded row spans (row rate constant,
         // so this row's period / its column count = that row's UI). Fall back to the live
-        // values for the final (still-open) row.
+        // values for the final (still-open) row. The span of the row a stop cut short runs
+        // to the re-acquired row, so that row takes the UI it had (see Reacquired).
         if (r + 1 < mRowSyncs.size()) {
             int colsInRow = static_cast<int>(mRowStartUi[r + 1] - mRowStartUi[r]);
             if (colsInRow > 0) {
@@ -124,6 +136,7 @@ public:
                 mUiSamples = static_cast<double>(mRowSyncs[r + 1] - mRowSyncs[r]) / colsInRow;
             }
         }
+        if (const Reacquired* k = reacquiredAt(r + 1)) mUiSamples = k->cutUiSamples;
     }
     std::uint64_t TotalUiCount() const override
     {
@@ -154,12 +167,58 @@ public:
         if (atRowBoundary) mCol = n;   // force advanceRow() on the next NextUi (fresh Column 0)
     }
 
+    // A later bring-up (see the header comment): lock at the first rising edge at or after
+    // `sample`, as lock() does at the first, at `columns` columns and the seeded row period
+    // over them (the tracked one when none was seeded). The row log stays in UI order for
+    // Seek: the UIs consumed since the last row edge belong to the row the stop cut short.
+    // Called twice for one bring-up (where the Link goes inactive, then at the restart
+    // with its geometry), the second replaces the first, which consumed no UI.
+    void Reacquire(std::uint64_t sample, int columns) override
+    {
+        if (!mLocked && !lock()) return;
+        if (columns < swi3s::kMinColumnCount || columns > swi3s::kMaxColumnCount) columns = mColumns;
+        auto it = std::lower_bound(mRising.begin(), mRising.end(), sample);
+        const std::uint64_t edge = (it == mRising.end()) ? UINT64_MAX : *it;
+        double cutUi = mUiSamples;
+        if (!mReacquired.empty() && mRowStartUi[mReacquired.back().row] >= mUi)
+            cutUi = mReacquired.back().cutUiSamples;
+        while (!mRowStartUi.empty() && mRowStartUi.back() >= mUi) {
+            mRowStartUi.pop_back();
+            mRowSyncs.pop_back();
+        }
+        while (!mReacquired.empty() && mReacquired.back().row >= mRowSyncs.size())
+            mReacquired.pop_back();
+        mAlignmentEmitted = false;
+        mEnded = (edge == UINT64_MAX);
+        if (mEnded) return;
+        const double row = (mNominalRow > 0.0) ? mNominalRow : mUiSamples * mColumns;
+        mColumns = columns;
+        mUiSamples = row / columns;
+        mRowStart = static_cast<double>(edge);
+        mCol = 0;
+        mRowSyncs.push_back(edge);
+        mRowStartUi.push_back(mUi);
+        mLoggedThroughUi = mUi;
+        mRow = mRowSyncs.size() - 1;
+        mReacquired.push_back({mRow, mUiSamples, cutUi, columns});
+    }
+
     // The recovered per-row Sync1 sample points (the bit-clock reference), collected as the
     // DLL runs — surfaced to the Raw Capture view to show clock recovery working.
     const std::vector<std::uint64_t>& RecoveredRowSyncs() const { return mRowSyncs; }
     double RecoveredUiSamples() const { return mUiSamples; }
 
 private:
+    // A re-acquisition (Reacquire), for a windowed decode to follow: the row it opened, the
+    // UI and column count it locked with, and the UI of the row before it, which the stop
+    // cut short.
+    struct Reacquired {
+        std::size_t row = 0;
+        double uiSamples = 0.0;
+        double cutUiSamples = 0.0;
+        int columns = 0;
+    };
+
     // DP logical level at `sample`: initial level XOR parity of edges at/before it.
     // NextUi queries strictly-increasing samples, so a forward cursor (count of edges
     // <= sample) is O(1) amortized instead of an O(log m) upper_bound PER UI — this is
@@ -204,6 +263,7 @@ private:
         if (mUiSamples <= 0.0) return false;
         mRowSyncs.push_back(mRowStart);
         mRowStartUi.push_back(0);          // row 0's Column 0 is source UI 0 (Seek row lookup)
+        mRow = 0;
         mLocked = true;
         mCol = 0;
         return true;
@@ -214,6 +274,7 @@ private:
     // half a UI — a missing Row Sync, which the spec tolerates), and refine the UI estimate.
     bool advanceRow()
     {
+        if (mRow + 1 < mRowSyncs.size()) return replayRow(mRow + 1);
         double period = mColumns * mUiSamples;
         double predicted = mRowStart + period;
         if (predicted > static_cast<double>(mLastSample) + mUiSamples) return false;
@@ -234,8 +295,50 @@ private:
             mRowStartUi.push_back(mUi);        // source UI of this row's Column 0 (Seek row lookup)
             mLoggedThroughUi = mUi;
         }
+        mRow = mRowSyncs.size() - 1;
         mCol = 0;
         return true;
+    }
+
+    // Row `n` of the log, reached again by a windowed decode (after Seek). It opens on the
+    // edge the live decode logged, with the column count the log gives it (a commit's
+    // SetColumns, which nothing pushes to a replay) and the UI the loop refines as it did
+    // live. A re-acquired row takes the UI and column count it locked with, so from one on
+    // a replay is the live decode exactly; the row a stop cut short takes the UI it had and
+    // ends where the re-acquired row begins.
+    bool replayRow(std::size_t n)
+    {
+        const double start = static_cast<double>(mRowSyncs[n]);
+        if (const Reacquired* k = reacquiredAt(n)) {
+            mUiSamples = k->uiSamples;
+            mColumns = k->columns;
+        } else {
+            if (n + 1 < mRowStartUi.size() && !reacquiredAt(n + 1)) {
+                const int cols = static_cast<int>(mRowStartUi[n + 1] - mRowStartUi[n]);
+                if (cols >= swi3s::kMinColumnCount && cols != mColumns) {
+                    mUiSamples = mUiSamples * static_cast<double>(mColumns) / static_cast<double>(cols);
+                    mColumns = cols;
+                }
+            }
+            double measured = (start - mRowStart) / mColumns;
+            if (measured > 0.0) mUiSamples = 0.75 * mUiSamples + 0.25 * measured;
+        }
+        if (const Reacquired* k = reacquiredAt(n + 1)) {
+            mUiSamples = k->cutUiSamples;
+            mColumns = static_cast<int>(mRowStartUi[n + 1] - mRowStartUi[n]);
+        }
+        mRowStart = start;
+        mRow = n;
+        mCol = 0;
+        return true;
+    }
+
+    // The re-acquisition that opened row `n` of the log, or null.
+    const Reacquired* reacquiredAt(std::size_t n) const
+    {
+        auto it = std::lower_bound(mReacquired.begin(), mReacquired.end(), n,
+            [](const Reacquired& k, std::size_t v) { return k.row < v; });
+        return (it != mReacquired.end() && it->row == n) ? &*it : nullptr;
     }
 
     std::vector<std::uint64_t> mEdges;      // DP wire transitions
@@ -248,6 +351,10 @@ private:
     std::uint64_t mRate;
     int mColumns;
     double mNominalUi = 0.0;      // seeded free-running UI estimate (0 = auto-acquire)
+    double mNominalRow = 0.0;     // ...its row period, which a later bring-up locks with too
+    std::vector<Reacquired> mReacquired;   // in row order
+    std::size_t mRow = 0;         // the log row being emitted (live: the last one logged)
+    bool mEnded = false;          // Reacquire found no row edge: the source has ended
     std::uint64_t mLastSample = 0;
 
     bool mLocked = false;

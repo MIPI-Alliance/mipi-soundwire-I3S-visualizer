@@ -31,7 +31,7 @@ WEIGHT_KEY = "waveforms/weights"    # QSettings: JSON {kind: px}
 
 KINDS = ("dp", "bookmark", "capture", "timing")
 WEIGHT_KINDS = ("audio", "capture")
-DEFAULT_WEIGHTS = {"audio": 1, "capture": 2}
+DEFAULT_WEIGHTS = {"audio": 2, "capture": 2}
 MIN_WEIGHT, MAX_WEIGHT = 1, 4
 
 # (device, dp, mode) -> "#rrggbb": one Link's per-stream overrides.

@@ -365,3 +365,60 @@ def test_from_json_rejects_a_broken_link_list():
             assert False, f"expected ValueError for {bad!r}"
         except ValueError:
             pass
+
+
+def test_gui_save_open_restores_every_links_device_register_maps():
+    """A device's vendor register map is saved in the workspace with its Link, and reopened
+    every Link has it: in its session (the register files), in its Commands table (the
+    vendor register names, which the table copied when the Link loaded, before the
+    workspace's maps were applied) and in the Registers pane's Peripheral block."""
+    import pathlib
+
+    from swi3s_studio.model.regmap_import import PeripheralRegisterMap
+    app = QApplication.instance() or QApplication([])
+    pm = PeripheralRegisterMap.from_json(
+        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text("utf-8"))
+    win = MainWindow()
+    win.load_demo_links()
+    _wait_for_load(app, win)
+    for link in win._links:
+        link.session.set_peripheral_map(0, pm)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ws.swi3s")
+        save_orig, open_orig = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
+        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
+        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
+        try:
+            win.save_workspace()
+            assert [sorted(spec.device_regmaps) for spec in Workspace.load(path).links] == [
+                ["0"], ["0"]]
+            win2 = MainWindow()
+            win2.open_workspace()
+            _wait_for_load(app, win2)
+        finally:
+            QFileDialog.getSaveFileName = save_orig
+            QFileDialog.getOpenFileName = open_orig
+
+    assert len(win2._links) == 2
+    for i, link in enumerate(win2._links):
+        assert len(link.session.peripheral_maps[0].registers) == len(pm.registers), i
+        assert 0 in link.view.cmd_model._peripheral_maps, (
+            f"Link {i}'s Commands table has no map: vendor register names unresolved")
+        win2.switch_link(i)
+        app.processEvents()
+        root = win2._reg_view._tree.invisibleRootItem()
+        titles = [root.child(k).text(0) for k in range(root.childCount())]
+        assert any(t.startswith("Peripheral Registers") for t in titles), (i, titles)
+
+
+def _wait_for_load(app, win):
+    """Wall-clock wait for the off-thread decode (see the register-overlay test)."""
+    deadline = time.time() + 60.0
+    while getattr(win, "_load_thread", None) is not None:
+        if time.time() > deadline:
+            raise AssertionError("load did not finish")
+        app.processEvents()
+        time.sleep(0.005)
+    for _ in range(5):
+        app.processEvents()
