@@ -39,6 +39,13 @@ public:
     // recovered-clock source (DLV) needs it to subdivide each row into the right UI count.
     virtual void SetColumns(int /*columnCount*/) {}
 
+    // A later link bring-up (DecoderSettings::restartPoints): a recovered-clock source
+    // (DLV) re-acquires its clock at the first row edge at or after `sample`, framing
+    // `columns` UIs a row, and reads nothing before it; the next NextUi() is that row's
+    // alignment UI. A forwarded-clock source ignores it: every UI is a clock edge, which
+    // the decoder reads through itself.
+    virtual void Reacquire(std::uint64_t /*sample*/, int /*columns*/) {}
+
     // Absolute index of the UI that the NEXT NextUi() will return (i.e. the count
     // of UIs already consumed). Lets the decoder stamp segment boundaries with an
     // absolute UI so windowed re-decodes (the symbol viewer) align row numbering.

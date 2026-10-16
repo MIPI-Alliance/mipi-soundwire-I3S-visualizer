@@ -171,12 +171,11 @@ def restore_samples(view, d: Any) -> None:
     view.filtersChanged.emit()
 
 
-# ---- Registers: the device shown and the blocks opened ----
+# ---- Registers: the device shown, the blocks opened (by id) and the filter ----
 def registers_state(view) -> dict:
-    root = view._tree.invisibleRootItem()
     return {"device": view.current_device(),
-            "expanded": sorted(root.child(i).text(0) for i in range(root.childCount())
-                               if root.child(i).isExpanded())}
+            "expanded": sorted(view.expanded_blocks()),
+            "hidden": sorted(p.value for p in view.hidden_provenances())}
 
 
 def restore_registers(view, d: Any) -> None:
@@ -186,12 +185,15 @@ def restore_registers(view, d: Any) -> None:
         i = view._device.findData(d.get("device"))
         if i >= 0 and i != view._device.currentIndex():
             view._device.setCurrentIndex(i)
+    view.set_hidden_provenances(())           # the open blocks are the unfiltered ones
     expanded = d.get("expanded")
     if isinstance(expanded, list):
-        root = view._tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            it = root.child(i)
-            it.setExpanded(it.text(0) in expanded)
+        view.set_expanded_blocks(expanded)    # block ids; titles, as older workspaces saved
+    hidden = d.get("hidden")
+    if isinstance(hidden, list):
+        from ..model import Provenance
+        known = {p.value: p for p in Provenance}
+        view.set_hidden_provenances(known[v] for v in hidden if v in known)
 
 
 # ---- Statistics: folded sections and opened groups, by title ----

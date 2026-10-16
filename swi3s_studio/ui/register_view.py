@@ -8,6 +8,7 @@ CSV-Import colour alongside the values snooped from the bus.
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Dict, List
 
 from PySide6.QtCore import QPoint, Qt, Signal
@@ -40,6 +41,7 @@ from ..model.registers import (
     PHY3_BASE,
     SLC_BASE,
 )
+from .click_label import KeyToggle
 from .theme import VizTheme, analyzer_stylesheet
 
 # The three selectable PHYs (spec Table 9): block name, region base, and the short
@@ -67,6 +69,14 @@ _PROV_LABEL = {
     Provenance.CSV:     "CSV Import",
     Provenance.UI:      "Manual Edit",
 }
+# The legend's order, which is also its filter's.
+_PROV_ORDER = (Provenance.DEFAULT, Provenance.WRITTEN, Provenance.READ, Provenance.CSV,
+               Provenance.UI)
+# Where a register row keeps its value's provenance (UserRole holds its edit key).
+_PROV_ROLE = Qt.UserRole + 1
+# Where a block keeps its id ("SLC", "CDS", "DP3", "PHY2", "PERIPH"): its title changes
+# with the device and the PHY, its id does not, so its open state is kept by id.
+_BLOCK_ROLE = Qt.UserRole + 2
 
 
 def _is_reserved(name) -> bool:
@@ -129,6 +139,12 @@ class RegisterView(QWidget):
         # per-cursor set_files() rebuilds. Reset only on structural changes (device /
         # peripheral map / PHY / CSV-overlay), which re-measure on their next rebuild.
         self._cols_sized = False
+        # The value provenances whose rows are hidden (the legend's toggles), and while any
+        # are, the blocks (by id) the user has open: those open when filtering began, with
+        # the user's own opens and closes since, given back when every one is shown.
+        self._prov_hidden: set = set()
+        self._user_open: "set | None" = None
+        self._arranging = False           # the view, not the user, is opening blocks
 
         self._device = QComboBox()
         self._device.currentIndexChanged.connect(self._on_device_changed)
@@ -161,6 +177,8 @@ class RegisterView(QWidget):
         # discoverable one (double-click alone wasn't obvious). See _RegisterTree for
         # why we use contextMenuEvent, not the CustomContextMenu policy.
         self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self._tree.itemExpanded.connect(lambda it: self._on_block_toggled(it, True))
+        self._tree.itemCollapsed.connect(lambda it: self._on_block_toggled(it, False))
         self._tree.contextRequested.connect(self._on_context_menu)
         # The Fields column holds every decoded field and is often wider than the
         # pane — let it size to its full content and scroll horizontally rather than
@@ -172,16 +190,31 @@ class RegisterView(QWidget):
         # draw a bordered/white square; the plain QWidget inherits FRAME_BG from the sheet.
         self._tree.setCornerWidget(QWidget())
 
-        # Provenance colour key, so a coloured value is self-explanatory.
-        legend = QLabel(self._legend_html())
-        legend.setTextFormat(Qt.RichText)
+        # Provenance colour key, so a coloured value is self-explanatory, and the filter: click
+        # an entry (or Tab to it and press Space) to hide or show the registers whose value
+        # came from it (turning Cold Reset off leaves the registers something has set).
+        # Hidden entries grey out, and a filter that leaves nothing says so in words.
+        legend = QHBoxLayout()
         legend.setContentsMargins(2, 0, 2, 2)
-        self._legend = legend
+        legend.setSpacing(8)
+        self._legend_labels: Dict[Provenance, KeyToggle] = {}
+        for prov in _PROV_ORDER:
+            key = KeyToggle(_PROV_LABEL[prov])
+            key.toggled.connect(lambda on, p=prov: self._show_provenance(p, on))
+            self._legend_labels[prov] = key
+            legend.addWidget(key)
+        legend.addStretch(1)
+        self._empty_note = QLabel()
+        self._empty_note.setAlignment(Qt.AlignCenter)
+        self._empty_note.setWordWrap(True)
+        self._empty_note.hide()
+        self._update_legend()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.addLayout(top)
-        lay.addWidget(legend)
+        lay.addLayout(legend)
+        lay.addWidget(self._empty_note)
         lay.addWidget(self._tree)
 
         # Seed a default device (0) at construction so the pane shows the cold-reset
@@ -190,13 +223,130 @@ class RegisterView(QWidget):
         # decoded file exists, so this renders the spec's reset values.
         self.set_files({})
 
-    def _legend_html(self) -> str:
-        """The provenance colour-key swatches HTML (rebuilt on retheme)."""
-        return "&nbsp;&nbsp;".join(
-            f'<span style="color:{_PROV_COLOR[p].name()}; font-size:14px;">&#9632;</span>'
-            f' {_PROV_LABEL[p]}' for p in
-            (Provenance.DEFAULT, Provenance.WRITTEN, Provenance.READ, Provenance.CSV,
-             Provenance.UI))
+    def _update_legend(self) -> None:
+        """Each colour-key entry checked and in its colour while its registers are shown,
+        unchecked and greyed (swatch and name in the dim text colour) while they are hidden,
+        its tooltip saying which. Rebuilt on retheme."""
+        for prov, key in self._legend_labels.items():
+            hidden = prov in self._prov_hidden
+            key.blockSignals(True)
+            key.setChecked(not hidden)
+            key.blockSignals(False)
+            key.set_colors(VizTheme.TEXT_DIM if hidden else _PROV_COLOR[prov].name(),
+                           VizTheme.TEXT_DIM if hidden else VizTheme.TEXT)
+            name = _PROV_LABEL[prov]
+            key.setToolTip(f"{name}: {'hidden' if hidden else 'shown'}. Click, or press Space, "
+                           f"to {'show' if hidden else 'hide'} the registers whose value is "
+                           f"from {name}.")
+        self._empty_note.setStyleSheet(f"color: {VizTheme.TEXT_DIM}; padding: 8px;")
+
+    # ---- the provenance filter ----
+    def hidden_provenances(self) -> set:
+        """The provenances whose registers are hidden."""
+        return set(self._prov_hidden)
+
+    def set_hidden_provenances(self, provs) -> None:
+        """Hide the registers whose value is from any of `provs` (a restored view)."""
+        self._set_hidden(set(provs or ()))
+
+    def _show_provenance(self, prov: Provenance, shown: bool) -> None:
+        self._set_hidden(self._prov_hidden - {prov} if shown else self._prov_hidden | {prov})
+
+    def _set_hidden(self, hidden: set) -> None:
+        """Filter by `hidden`. Starting or changing the filter opens every block left with
+        rows to show; rebuilds while it is on keep the blocks as the user leaves them."""
+        if hidden == self._prov_hidden:
+            return
+        if hidden and not self._prov_hidden:          # filtering starts: keep the user's
+            self._user_open = self._open_blocks()
+        self._prov_hidden = hidden
+        self._update_legend()
+        if not hidden and self._user_open is not None:
+            mine, self._user_open = self._user_open, None
+            self._open_only(mine)
+        self._apply_filter(open_shown=bool(hidden))
+
+    def expanded_blocks(self) -> set:
+        """The ids of the blocks the user has open; while filtering, those the filter will
+        give back, since it opens every block with a register to show."""
+        if self._user_open is not None:
+            return set(self._user_open)
+        return self._open_blocks()
+
+    def set_expanded_blocks(self, blocks) -> None:
+        """Open exactly the blocks named in `blocks`, by id or by title (as a workspace
+        saved them)."""
+        wanted = set(blocks)
+        root = self._tree.invisibleRootItem()
+        self._open_only({b.data(0, _BLOCK_ROLE) for b in map(root.child, range(root.childCount()))
+                         if b.data(0, _BLOCK_ROLE) in wanted or b.text(0) in wanted})
+        if self._user_open is not None:
+            self._user_open = self._open_blocks()
+
+    def _open_blocks(self) -> set:
+        root = self._tree.invisibleRootItem()
+        return {root.child(i).data(0, _BLOCK_ROLE) for i in range(root.childCount())
+                if root.child(i).isExpanded()}
+
+    def _open_only(self, opened) -> None:
+        """Open the blocks whose ids are in `opened` and close the rest."""
+        root = self._tree.invisibleRootItem()
+        with self._arranged():
+            for i in range(root.childCount()):
+                block = root.child(i)
+                block.setExpanded(block.data(0, _BLOCK_ROLE) in opened)
+
+    @contextlib.contextmanager
+    def _arranged(self):
+        """Opens and closes made inside are the view's, not the user's."""
+        was, self._arranging = self._arranging, True
+        try:
+            yield
+        finally:
+            self._arranging = was
+
+    def _on_block_toggled(self, item: QTreeWidgetItem, opened: bool) -> None:
+        """While filtering, a block the user opens or closes is theirs to keep after it."""
+        if self._arranging or self._user_open is None or item.parent() is not None:
+            return
+        block = item.data(0, _BLOCK_ROLE)
+        if opened:
+            self._user_open.add(block)
+        else:
+            self._user_open.discard(block)
+
+    def _apply_filter(self, open_shown: bool = False) -> None:
+        """Hide each register row whose provenance is hidden, and each block left with
+        none to show. `open_shown` opens each block with rows to show, so what a new filter
+        leaves can be read without opening every block in turn; the Peripheral Registers
+        block, which can hold hundreds, stays as it is."""
+        root = self._tree.invisibleRootItem()
+        hidden = self._prov_hidden
+        total = 0
+        with self._arranged():
+            for i in range(root.childCount()):
+                block = root.child(i)
+                shown = 0
+                for j in range(block.childCount()):
+                    row = block.child(j)
+                    off = row.data(0, _PROV_ROLE) in hidden
+                    row.setHidden(off)
+                    shown += not off
+                block.setHidden(bool(hidden) and shown == 0)
+                if open_shown and shown and block.data(0, _BLOCK_ROLE) != "PERIPH":
+                    block.setExpanded(True)
+                total += shown
+        self._show_empty_note(bool(hidden) and total == 0 and root.childCount() > 0)
+
+    def _show_empty_note(self, empty: bool) -> None:
+        """Say in words why a filtered tree is empty, which the greyed keys alone do not."""
+        if empty:
+            shown = [_PROV_LABEL[p] for p in _PROV_ORDER if p not in self._prov_hidden]
+            self._empty_note.setText(
+                "Every category in the colour key is hidden: click one to show its registers."
+                if not shown else
+                f"No register's value is from {' or '.join(shown)} here.")
+        self._empty_note.setVisible(empty)
 
     def retheme(self) -> None:
         """Re-apply the palette after a theme switch: refresh the provenance value
@@ -211,7 +361,7 @@ class RegisterView(QWidget):
             Provenance.UI:      QColor(VizTheme.PROV_UI),
         }
         self.setStyleSheet(analyzer_stylesheet())
-        self._legend.setText(self._legend_html())
+        self._update_legend()
         self._cols_sized = False          # font/metrics may change with the theme
         self._rebuild()
 
@@ -266,7 +416,10 @@ class RegisterView(QWidget):
     def set_phy(self, phy_name: "str | None") -> None:
         """Mark which PHY (PHY1/2/3) the §5.1.2 link-control decode found active,
         so the register view highlights that block and greys the others. None when
-        no bring-up was captured (then all three PHY blocks render neutrally)."""
+        no bring-up was captured (then all three PHY blocks render neutrally). Unchanged,
+        nothing is rebuilt: the cursor sets it on every move."""
+        if phy_name == self._active_phy:
+            return
         self._active_phy = phy_name
         self._cols_sized = False          # ACTIVE tag / bold can shift the Name column width
         self._rebuild()
@@ -478,9 +631,11 @@ class RegisterView(QWidget):
                                             "", ""])
             for c in range(4):
                 item.setForeground(c, QBrush(_PROV_COLOR[Provenance.DEFAULT]))
+            item.setData(0, _PROV_ROLE, Provenance.DEFAULT)   # reset-coloured: Cold Reset
             item.setToolTip(0, f"{tip}; {span} bytes")
             return item
         item = QTreeWidgetItem(parent, [name, f"0x{addr:04X}", f"0x{value:02X}", fields])
+        item.setData(0, _PROV_ROLE, prov)             # the legend's filter reads it
         brush = QBrush(_PROV_COLOR[prov])
         for c in range(4):
             item.setForeground(c, brush)
@@ -532,16 +687,17 @@ class RegisterView(QWidget):
     def _rebuild(self) -> None:
         # Preserve which top-level blocks the user had expanded, so a cursor move
         # (which re-runs this on the as-of-cursor register files) doesn't collapse
-        # the tree the user just opened. Block labels are stable across rebuilds.
+        # the tree the user just opened. Blocks are matched by id, which a rebuild keeps.
+        # A first build (no tree yet) opens the per-block defaults instead.
         root = self._tree.invisibleRootItem()
-        prev_expanded = {root.child(i).text(0) for i in range(root.childCount())
-                         if root.child(i).isExpanded()}
+        prev_expanded = self._open_blocks() if root.childCount() else None
         # Bulk clear+repopulate a VISIBLE tree without a per-item relayout/repaint — this
         # runs on every settled cursor move while the Registers dock is visible, so the
         # per-item paint storm is the dominant cost (same fix as decoded_sample_view).
         self._tree.setUpdatesEnabled(False)
         try:
-            self._rebuild_body(prev_expanded)
+            with self._arranged():
+                self._rebuild_body(prev_expanded)
         finally:
             self._tree.setUpdatesEnabled(True)
 
@@ -553,6 +709,7 @@ class RegisterView(QWidget):
         dev_file = self._files.get(dev) or DeviceRegisterFile(self._rmap, dev)
 
         slc = QTreeWidgetItem(self._tree, ["System & Link Control (SLC)", "", "", ""])
+        slc.setData(0, _BLOCK_ROLE, "SLC")
         for spec in self._rmap.blocks.get("SLC", []):
             self._add_register(slc, "SLC", spec, SLC_BASE + spec.offset, dev, dev_file)
         slc.setExpanded(True)
@@ -561,6 +718,7 @@ class RegisterView(QWidget):
         cds_specs = self._rmap.blocks.get("CDS", [])
         if cds_specs:
             cds = QTreeWidgetItem(self._tree, ["Control Data Stream Transport (CDS)", "", "", ""])
+            cds.setData(0, _BLOCK_ROLE, "CDS")
             for spec in cds_specs:
                 self._add_register(cds, "CDS", spec, CDS_BASE + spec.offset, dev, dev_file)
 
@@ -568,6 +726,7 @@ class RegisterView(QWidget):
         for dp in active:
             base = DP_BASE + dp * DP_STRIDE
             node = QTreeWidgetItem(self._tree, [f"Data Port Registers — DP{dp}", "", "", ""])
+            node.setData(0, _BLOCK_ROLE, f"DP{dp}")
             for spec in self._rmap.blocks.get("DP", []):
                 self._add_register(node, f"DP{dp}", spec, base + spec.offset, dev, dev_file)
             node.setExpanded(dp == active[0])
@@ -584,6 +743,7 @@ class RegisterView(QWidget):
             unknown = self._active_phy is None
             tag = " — ACTIVE" if active_phy else ("" if unknown else " — inactive")
             node = QTreeWidgetItem(self._tree, [f"{name} ({kind}){tag}", "", "", ""])
+            node.setData(0, _BLOCK_ROLE, name)
             if active_phy:
                 bold = QFont(); bold.setBold(True)
                 node.setFont(0, bold)
@@ -599,17 +759,18 @@ class RegisterView(QWidget):
         if pmap is not None and getattr(pmap, "registers", None):
             label = f"Peripheral Registers — {pmap.name} ({len(pmap.registers)})"
             node = QTreeWidgetItem(self._tree, [label, "", "", ""])
+            node.setData(0, _BLOCK_ROLE, "PERIPH")
             for spec in pmap.registers:
                 self._add_register(node, "PERIPH", spec, spec.abs_address, dev, dev_file)
             node.setExpanded(False)            # large block — user expands
 
         # Re-apply the user's prior expansion (overrides the per-block defaults
-        # above) once anything has been opened, so expansion survives a rebuild.
-        if prev_expanded:
-            root = self._tree.invisibleRootItem()
-            for i in range(root.childCount()):
-                it = root.child(i)
-                it.setExpanded(it.text(0) in prev_expanded)
+        # above), so expansion survives a rebuild, a block closed by the user included.
+        if prev_expanded is not None:
+            self._open_only(prev_expanded)
+
+        if self._prov_hidden:
+            self._apply_filter()
 
         if not self._cols_sized:
             for c in range(4):                       # size every column to its content ONCE

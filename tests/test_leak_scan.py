@@ -138,3 +138,20 @@ def test_the_scanner_scans_its_own_prose_for_site_patterns():
         assert name in files, (
             f"{name} is excluded from the file list, so NO pattern reaches it — the "
             "exemption must be per pattern kind (see _SELF)")
+
+
+def test_a_tree_that_is_not_a_checkout_skips_the_core_its_gate_built(tmp_path, monkeypatch):
+    """A gate guest scans an exported tree with the native core built into its top level;
+    that file is gitignored, never published, and named for its platform, so the walk leaves
+    it out (top level only, as .gitignore has it) and keeps everything else."""
+    spec = importlib.util.spec_from_file_location(
+        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for name in ("swi3score.cpython-312-someplatform.so", "swi3score.cp312-win_amd64.pyd",
+                 "README.md", "native/swi3score_notes.so", "docs/swi3score.so.md"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(mod, "_ROOT", str(tmp_path))
+    assert mod._files(None) == ["README.md", "docs/swi3score.so.md", "native/swi3score_notes.so"]

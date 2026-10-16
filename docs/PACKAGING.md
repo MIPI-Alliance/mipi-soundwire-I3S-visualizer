@@ -22,6 +22,11 @@ loader (`model/registers.py`) finds it via, in order: `$SWI3S_REGISTERS`, the
 repo `data/` dir, the package dir, `sys.prefix/share/swi3s-studio/`, or a
 PyInstaller bundle's `data/`.
 
+A wheel (`pip install .`) carries only what `[tool.setuptools]` names: the packages, the
+theme's icons (`package-data`, `ui/assets/*.svg`) and the register data (`data-files`).
+A new file read from beside a module needs a `package-data` glob;
+`tests/test_release_gate.py` fails until it has one.
+
 ## 3. Standalone desktop bundle (PyInstaller)
 
 ```bash

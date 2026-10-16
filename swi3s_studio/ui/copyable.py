@@ -31,16 +31,27 @@ def enable_copy(view, *, multi: bool = False, cells: bool = False) -> None:
 
 def copy_selection(view) -> None:
     """Copy the view's selected cells to the clipboard as TSV (rows in visual order,
-    columns left-to-right). No-op when nothing is selected."""
+    columns left-to-right). No-op when nothing is selected. A tree's row is told apart by
+    its place in the tree, not its row under its parent, which rows of two blocks share."""
     indexes = view.selectedIndexes() if hasattr(view, "selectedIndexes") else []
     if not indexes:
         return
     rows: dict = defaultdict(dict)
     for ix in indexes:
         val = ix.data(Qt.DisplayRole)
-        rows[ix.row()][ix.column()] = "" if val is None else str(val)
+        rows[_place(ix)][ix.column()] = "" if val is None else str(val)
     lines = []
     for r in sorted(rows):
         cols = rows[r]
         lines.append("\t".join(cols[c] for c in sorted(cols)))
     QGuiApplication.clipboard().setText("\n".join(lines))
+
+
+def _place(ix) -> tuple:
+    """The row numbers from the top level down to `ix`'s row: in a tree's visual order when
+    sorted, and a table row's own number alone."""
+    rows = []
+    while ix.isValid():
+        rows.append(ix.row())
+        ix = ix.parent()
+    return tuple(reversed(rows))

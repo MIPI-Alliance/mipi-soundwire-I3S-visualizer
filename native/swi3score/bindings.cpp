@@ -208,7 +208,18 @@ PYBIND11_MODULE(swi3score, m)
     //    region builds that region's port config from the CSV alone). Setting it on an
     //    ABI-11 module raises AttributeError, and the region would keep the wire's ports.
     //    Also Decoder.request_stop() / stopped, the memory watchdog's way to end a decode.
-    m.attr("score_abi") = 12;
+    // 13: DecoderSettings gained restart_points, and each segments() entry cold_start.
+    //    Setting restart_points on an ABI-12 module raises AttributeError.
+    // 14: restart_points entries became (sample, column_count, cold, inactive_from), and
+    //    each segments() entry gained restart. An ABI-13 module rejects the 4-tuples with a
+    //    TypeError, and its restart neither keeps a config CSV's ports nor puts a Warm
+    //    Start's ports on the new Column-0 phase. DecoderSettings also gained
+    //    resume_points (setting it on an ABI-13 module raises AttributeError).
+    // 15: a DLV decode takes restart_points too: its recovered clock locks again at each
+    //    bring-up. A BUMP EVEN THOUGH NO SIGNATURE CHANGED, as for ABI 8: an ABI-14 module
+    //    ignores them when dlv, so a DLV Link brought up again would decode on in the old
+    //    timing under a Timeline and Bus Grid that present the restart.
+    m.attr("score_abi") = 15;
 
     py::class_<ISampleSource>(m, "ISampleSource");
 
@@ -250,7 +261,9 @@ PYBIND11_MODULE(swi3score, m)
              "DLL locked to the Sync1 row edges, sampling mid-UI. initial_columns = Safe-Lock "
              "count; the decoder pushes NumColumns changes. nominal_ui_samples seeds the loop's "
              "free-running UI estimate for the initial geometry (>0 = robust acquisition; the "
-             "aperture tracks the once-per-row reference instead of the first two edges).")
+             "aperture tracks the once-per-row reference instead of the first two edges). "
+             "Each later bring-up (DecoderSettings.restart_points) locks the loop again at its "
+             "first Row Sync, at the seeded row period over its Safe-Lock count.")
         .def("recovered_row_syncs", [](const DlvSampleSource& s) {
                  const auto& v = s.RecoveredRowSyncs();
                  return py::array_t<std::uint64_t>(
@@ -301,6 +314,35 @@ PYBIND11_MODULE(swi3score, m)
                        "mis-locked detector. Per-region because forcing one width over a "
                        "capture that genuinely reconfigures misframes the other regions. "
                        "Out-of-range counts (outside 2..32) are ignored.")
+        .def_readwrite("restart_points", &DecoderSettings::restartPoints,
+                       "Later link bring-ups: list of (sample, column_count, cold, "
+                       "inactive_from) per start sequence after a stopped clock, the first "
+                       "bring-up excluded; any order, points at one sample merged. From "
+                       "inactive_from (the first sample after the clock stopped; 0 = none) "
+                       "to sample (the bring-up's first audio-mode clock edge) nothing is "
+                       "decoded and every data port stops. At sample the decode restarts "
+                       "as at the start of the capture: it re-aligns to the next rising "
+                       "clock edge, frames at column_count (the Safe-Lock count, 2..32; "
+                       "otherwise a Cold Start frames at the cold-start count and a Warm "
+                       "Start keeps the current one), reconfigures the payload engine on "
+                       "the new Column-0 phase and opens a new segment. cold (a Cold "
+                       "Start) also resets the registers, stopping every data port until "
+                       "configured again. A config CSV keeps its ports, and on FBCSE its "
+                       "column count. With dlv the recovered clock locks again at the first "
+                       "Row Sync at or after sample, at the nominal UI of column_count, and "
+                       "is not run through the inactive stretch. Assign a whole list: like "
+                       "every list field here, reading it returns a copy, so appending to "
+                       "settings.restart_points changes nothing.")
+        .def_readwrite("resume_points", &DecoderSettings::resumePoints,
+                       "Clock pauses with no bring-up after them: list of the first clock "
+                       "edge after each stop. Audio mode never pauses its clock, so samples "
+                       "were lost or the capture was joined there. At each the decode checks "
+                       "a fresh window's Column-0 phase at the current column count: in "
+                       "phase it decodes on as if nothing happened; out of phase it re-frames "
+                       "there, its payload engine on the new phase, in a new segment that is "
+                       "no restart (geometry and registers kept). A restart point at the same "
+                       "sample wins. FBCSE only: ignored when dlv, where a pause leaves no "
+                       "row edge to find the row phase from. Assign a whole list.")
         .def_readwrite("imported_config_sections", &DecoderSettings::importedConfigSections,
                        "Section indices (keying segments()) whose payload config is "
                        "built from their register_overrides alone, not from the snooped "
@@ -447,12 +489,16 @@ PYBIND11_MODULE(swi3score, m)
                 e["start_sample"] = s.startSample;
                 e["column_count"] = s.columnCount;
                 e["row_base"] = s.rowBase;
+                e["restart"] = s.restart;
+                e["cold_start"] = s.coldStart;
                 out.append(e);
             }
             return out;
-        }, "Decode segments (one per column count): each has start_ui, "
-           "start_sample, column_count and row_base (cumulative bus row at the "
-           "segment start). Bus rows are continuous across segments.")
+        }, "Decode segments (one per column count or link restart): each has "
+           "start_ui, start_sample, column_count, row_base (cumulative bus row at "
+           "the segment start), restart (opened by a later link bring-up, see "
+           "restart_points) and cold_start (that bring-up was a Cold Start). Bus "
+           "rows are continuous across segments.")
         .def("bit_samples", [](const Decoder& d) {
             // Per-data-bit sample points (columnar), populated only when
             // settings.collect_bit_samples was set. Keys: sample, device, dp,

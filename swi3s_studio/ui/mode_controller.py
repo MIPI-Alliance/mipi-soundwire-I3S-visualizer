@@ -43,16 +43,21 @@ class ModeManager:
             (0=Visualization, 1=Timing, 2=Analysis).
         mode_docks: mode name → the docks that belong to that mode.
         on_change: optional callback invoked with the new mode name after a switch.
+        before_change: optional callback invoked before leaving the current mode, ahead of
+            the snapshot of its arrangement (a maximized pane is put back first, so the
+            snapshot is the user's layout rather than the maximized one).
     """
 
     def __init__(self, window: QMainWindow,
                  set_central_index: Callable[[int], None],
                  mode_docks: Dict[str, List[QDockWidget]],
-                 on_change: Optional[Callable[[str], None]] = None) -> None:
+                 on_change: Optional[Callable[[str], None]] = None,
+                 before_change: Optional[Callable[[], object]] = None) -> None:
         self._window = window
         self._set_central = set_central_index
         self._mode_docks = mode_docks
         self._on_change = on_change
+        self._before_change = before_change
         self._states: Dict[str, bytes] = {}     # mode → saved QMainWindow state
         self._current: Optional[str] = None
         self._actions: Dict[str, QAction] = {}
@@ -94,6 +99,8 @@ class ModeManager:
         if mode == self._current:
             self._actions[mode].setChecked(True)
             return
+        if self._current is not None and self._before_change is not None:
+            self._before_change()
         # Snapshot the arrangement of the mode we're leaving so we can restore it.
         if self._current is not None:
             self._states[self._current] = bytes(self._window.saveState())

@@ -157,3 +157,23 @@ def test_cds_programmatic_select_highlights_the_whole_row():
     rows = sv.selectionModel().selectedRows()
     assert rows, "programmatic select did not select a full row"
     assert sv.currentRow() == rows[0].row(), "current cell left on a different row"
+
+
+def test_register_rows_of_two_blocks_copy_as_two_lines_in_tree_order():
+    """Rows of different blocks can share their row number under their block; each is its
+    own TSV line, in the order the tree shows them."""
+    from swi3s_studio.model import RegisterMap
+    from swi3s_studio.ui.register_view import RegisterView
+    QApplication.instance() or QApplication([])
+    view = RegisterView(RegisterMap.load())
+    tree = view._tree
+    slc, cds = tree.topLevelItem(0), tree.topLevelItem(1)
+    assert slc.childCount() > 1 and cds.childCount() > 1
+    tree.clearSelection()
+    for item in (cds.child(1), slc.child(1), slc):
+        item.setSelected(True)
+    QGuiApplication.clipboard().clear()
+    copy_selection(tree)
+    lines = QGuiApplication.clipboard().text().split("\n")
+    assert [ln.split("\t")[0] for ln in lines] == [
+        slc.text(0), slc.child(1).text(0), cds.child(1).text(0)], lines

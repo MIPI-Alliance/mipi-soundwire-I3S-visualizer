@@ -41,8 +41,8 @@ jobs:
           - { os: windows-latest, python: "3.14" }
           - { os: macos-latest, python: "3.12" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           # setup-python installs x64 on the windows runner -> pyarrow/PySide6 wheels
@@ -70,8 +70,8 @@ jobs:
     name: perf regression gate
     runs-on: ubuntu-latest       # one consistent runner — perf ceilings are cliff detectors
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Install Qt runtime deps
         run: |
@@ -89,8 +89,8 @@ jobs:
     name: coverage floor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Install Qt runtime deps
         run: |
@@ -119,8 +119,8 @@ jobs:
     # the v3 line reported 445 ruff findings to reviewers. The tree is clean now; keep it
     # that way here.
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Install linters
         # numpy is here for MYPY, not for the lint. mypy follows imports into installed stubs,
