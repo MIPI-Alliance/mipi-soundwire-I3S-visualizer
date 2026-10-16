@@ -18,6 +18,7 @@ import time
 
 import pytest
 import swi3score
+from conftest import record_perf
 
 from swi3s_studio import decode
 from swi3s_studio.ingest import digital_csv
@@ -439,6 +440,7 @@ def test_cursor_move_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
+    record_perf("cursor move", median, 0.12, worst, 0.25)
     assert median < 0.12, (
         f"median cursor move {median * 1000:.0f} ms across {shown} visible docks over "
         f"{len(ce):,} UIs (ceiling 120 ms, baseline ~30 ms; worst {worst * 1000:.0f} ms). "
@@ -501,6 +503,7 @@ def test_link_switch_budget_with_every_dock_visible():
     windows = sys.platform == "win32"
     ceiling, worst_ceiling = (1.5, 2.4) if windows else (0.75, 1.2)
     base, worst_base = ("~760", "~810") if windows else ("~250", "~315")
+    record_perf("Link switch", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
         f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms, "
         f"baseline {base} ms; worst {worst * 1000:.0f} ms). Something on the bind is doing "

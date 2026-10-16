@@ -187,6 +187,30 @@ They split into three bands:
   it and no earlier, at every frame size; short, empty and silent streams) and the Audio
   pane: each channel waveform or spectrogram, its own frame size, the shared zoom, the menu,
   Vertical Zoom leaving a spectrogram alone.
+- `test_maximize_pane.py` — View ▸ Maximize Pane (⌘⇧M), the key itself (no auto-repeat), the
+  title-bar button and a double-click: the focused pane alone in the window (a tab behind
+  another, the Commands table, a floating pane), and the arrangement restored exactly but for
+  that pane staying in front of its tab group; Commands, Registers, Bus Grid, CDS and Samples
+  keep the Timeline at its height through a resize of the window (a side-area pane is moved
+  below it meanwhile), the others take the whole window, a closed Timeline stays closed, and
+  no cap is left behind; the key pressed again and again keeps to the same pane, for every
+  pane, and a title-bar button moves the focus to its pane's view, not a toolbar control; the
+  Commands header's button and a double-click on its title; the Timeline is never maximized
+  nor floated by a double-click; with nothing selected nothing changes; another pane shown,
+  hidden from the View menu or closed by its ✕, a Link added or removed, Timing's jump to
+  Capture, the Bus Analyzer left, All Links turned off or a workspace saved meanwhile all keep
+  the arrangement to return to (a workspace saved after All Links was turned off reopens
+  with the one-Link height); outside the Bus Analyzer the item is hidden; the key is in
+  the shortcuts help.
+- `test_audio_stems.py` — zoomed in to a few pixels a sample, every Audio waveform track is
+  drawn as its samples (a stem from zero at each sample's capture position, a dot on its
+  value), and zoomed out the line through them again; the switch follows the pane's width at
+  one zoom; Vertical Zoom fits Y to the samples shown.
+- `test_audio_zoom_kept.py` — every change that redraws the Audio pane's tracks (a spectrogram
+  on or off, a frame size, a channel shown or hidden, colours, names, Filter & Gain) leaves
+  the zoom where it was with the cursor outside the window, a cursor that moves out of it is
+  still followed, and in a narrow pane a long title neither widens its track nor puts the
+  tracks on different stretches.
 - `test_dp_names.py` — a data port's name: kept in the source and reopened, and shown by the
   Audio, Samples and Capture panes, the Bus Grid key (widened to fit), the Audio menus, the
   Filter & Gain and Export Audio dialogs and the Timing filter, whose checked items survive a
@@ -213,7 +237,9 @@ They split into three bands:
 - `test_export.py` — command CSV (headless) + bus-grid SVG/PNG (offscreen Qt).
 - `test_workspace.py` — workspace JSON round-trip + full GUI save → open restores
   bookmarks and cursor; the v3 → v4 migration (a v3 file loads as one Link at offset 0
-  and re-saves as a true v4); a broken Link list is rejected. A saved what-if register overlay is re-applied on open.
+  and re-saves as a true v4); a broken Link list is rejected. A saved what-if register
+  overlay is re-applied on open, and each Link's device register maps reach its session,
+  its Commands table and the Registers pane's Peripheral block.
 - `test_links.py` — `LinkSet` (headless): ordering, the active Link across add/remove,
   default "Link n" names, rename; the time mapping — sample → ps → sample is the identity
   at every rate (the single-Link invariant), signed offsets, two rates meeting at one
@@ -322,7 +348,10 @@ They split into three bands:
 - `test_perf.py` — wall-clock ceilings on the hot paths (marked `perf`, run on their own with
   `pytest -m perf`): decode, engine build, CSV import, cursor move, zoom/pan and Link-switch
   budgets, and a `.sal` load's peak memory against its prediction. Cliff detectors, not
-  micro-benchmarks: ceilings are several times the observed time.
+  micro-benchmarks: ceilings are several times the observed time. The cursor-move and
+  Link-switch budgets print their median and worst as a fraction of each ceiling at the end
+  of the run (`perf margins`), pass or fail, so a runner creeping up on one shows before it
+  goes red.
 - `test_delta_tpd_swing.py` — the crossing envelope's TX swing is a PARAMETER. `V_OH_frac` /
   `V_OL_frac` were accepted, documented in the module's formula, threaded in from
   `CalcInputs` — and ignored, because the linear helpers divided by a hardcoded `0.60`, which
@@ -447,16 +476,53 @@ They split into three bands:
 - `test_tx_map.py` — the data-line transition raster and its Bus-Grid toggle.
 - `test_grid_dp_colors.py`, `test_grid_label_fields.py` — grid colours key on the config slot;
   per-port cell-label fields and swatch clicks.
-- `test_raw_view.py` — Raw Capture pane regressions.
+- `test_raw_view.py` — Raw Capture pane regressions, including a stopped line drawing its
+  true level at every zoom and scroll (the zoomed-out edge reduction, on uint64 edges) and
+  that reduction allocating by its slots, never a float64 copy of the window (tracemalloc).
 - `test_sample_view_gui.py` — the Decoded-Samples window: bounded, extends at either end,
   drives the cursor.
 - `test_eye_view.py` — the Timing (eye) view's colour-key toggles and its per-Link cache.
+- `test_link_restart.py` — a Link brought up again after its clock stopped (synthetic
+  captures: demos joined with a stop between, the first shorter than the decoder's leading
+  window). Finding them: every bring-up, three in a row, after a short idle (the stop being
+  the Bus Reset itself), with the link control on the data line, in a capture that starts in
+  audio mode, none anywhere; audio after a stop, and a bursty line, read as none; the gap
+  search chunked; a detected Warm Start inheriting the PHY, a later Cold Start with an
+  unrecognised PHY naming none. The decode: restarting at the second Cold Start as the
+  second demo alone decodes, at the first audio edge after PhyStart; nothing (audio,
+  commands, bit samples, the windowed bit-sample replay) decoded while the Link is inactive;
+  a Warm Start putting unchanged ports on the new Column-0 phase; restart points merged,
+  sorted and range-checked; a restart in the first UIs. DLV: the recovered clock locking
+  again so the second part decodes as the demo alone (commands, segments, audio), rows
+  numbered by their Row Syncs across the restart, nothing decoded while inactive, the
+  stretch skipped and its samples mapping to the restart's UI, the windowed bit-sample
+  replay following the restart (exact from the row the stop cut short on, on an analyzer
+  clock 3% off nominal), the CDS symbols after it, a Warm Start keeping the registers, the
+  Safe-Lock count under a config CSV; a bring-up of the other PHY family (FBCSE to DLV and
+  back) followed by no restart. A paused clock's phantom Warm Start dropped by the decode.
+  The registers reset at the Bus Reset (the restart row's section agreeing), a config CSV
+  keeping its ports through a Cold Start, decode_capture decoding as Session does, and the
+  window: Timeline labels and Bus Grid overlays for Cold and Warm restarts and a mid-stream
+  capture's, and the Registers PHY block following the cursor. After a short idle the Link
+  is inactive from its last audio-mode edge. A clock pause with no bring-up: in phase,
+  decoded on as without it (every command, segment and audio sample); out of phase, framed
+  afresh and decoded as the joined demo alone; none found inside a start sequence.
+- `test_register_filter.py` — the Registers pane's colour key as a filter by provenance
+  (Cold Reset, Bus Write, Bus Read, CSV Import, Manual Edit): each category alone, Cold
+  Reset off leaving only what something set, NEXT and CURR on their own provenance, a CSV
+  compare as its own category, empty blocks hidden, the filter outliving a cursor-move
+  rebuild, a block closed while filtering staying closed through one, opens and closes
+  made while filtering given back, blocks kept by id across a title change, Peripheral
+  Registers left closed, a filter that leaves nothing saying so, the entries as keyboard
+  and accessible toggles (Space / Enter / Return, name, checked state, tooltip), and the
+  workspace keeping the filter and the open blocks by id (titles still read).
 - `test_audio_gap_render.py`, `test_audio_playhead.py` — no waveform drawn across undecoded
   gaps; the play-head sweep over streams of different lengths.
 - `test_bookmarks.py`, `test_bookmarks_gui.py` — A1/A2 pairing and deltas; Ctrl+B, the
   Measurements pane, propagation and drag with edge snapping.
 - `test_locate_gui.py` — Locate Sub-Capture progress and teardown.
-- `test_copyable.py` — ⌘/Ctrl+C copies the read-only views as TSV.
+- `test_copyable.py` — ⌘/Ctrl+C copies the read-only views as TSV; rows of two tree blocks
+  sharing a row number are a line each, in tree order.
 - `test_theme.py` — the dark/light palette and a live theme switch.
 - `test_line_palette.py` — every line colour clears 3:1 on its theme's plot background;
   the line palette keeps the grid fills' hues and stays as distinct; panes read the palette
@@ -484,12 +550,16 @@ They split into three bands:
 - `test_menus.py` — Mode first; each mode's menu bar and File items exactly; File survives
   mode switches (QMenu.clear() deleted borrowed actions); ⌘O / ⌘S on the current mode's
   pair and no key on two live actions; the Analyzer's menus hidden and disabled elsewhere;
-  capture items wait for a capture; Decode / Devices / Audio contents; Help's guide and
+  capture items wait for a capture, submenus and their items included, at the start and
+  after a mode switch (enabling a menu re-enables its submenus), and with no capture only
+  what opens files, sets preferences or arranges the window is offered; with one, every
+  capture item is, but those with a rule of their own; Decode / Devices / Audio contents; Help's guide and
   About; no Links menu, with its items where they went (View ▸ Links with its shortcuts,
   Align in Bookmarks, a Link's label menu acting on that Link).
 - `test_pane_chrome.py` — no Capture/Audio axis titles; Audio's -1/0/+1 and zoomed-extreme
   Y labels survive pyqtgraph's culling with the grid on; every Link picker's chevron (and
-  that the spec ships it); the Link-name column's width; View's way to the waveform
+  that the spec ships it); a tree section's arrow in its heading's colour, on the selection
+  fill when selected; the Link-name column's width; View's way to the waveform
   preferences; no stale channel checkboxes after a rebind.
 - `test_grid_group.py` — the Bus Grid's own pane group: every way in to the grid (cursor,
   toolbar, TX map, scroll, raise, theme, compare, its menu actions) draws the grid's Link
@@ -507,13 +577,24 @@ They split into three bands:
 
 *The app, the tree and the gate*
 - `test_app_launch.py` — window activation on startup (the macOS no-menu-bar case).
+- `test_exit_teardown.py` — quitting the app leaves no Python-owned QObject for PySide's
+  sweep at interpreter exit (PySide 6.12 crashed in it), a tree reparented through a
+  layout is deleted from its root, a running QThread is left alone, and Ctrl+C: from the
+  terminal it quits the idle app (POSIX: Popen cannot send SIGINT on Windows); pressed
+  before the event loop it quits once the loop runs; the close runs from the loop, never
+  inside the callback it interrupted; a refused close leaves Ctrl+C asking again; and a
+  second press ends a quit that hangs, as one after the loop does (POSIX: the default
+  action). Closing the window quits the app with a parentless top-level window still
+  open. Each case runs in its own interpreter.
 - `test_cli.py` — CLI dispatch and the headless model dump (no Qt imported, exit codes, the
   batch JSON equal to the UI export); the launcher scripts forward their arguments.
-- `test_nputil.py` — dtype-safe `searchsorted` (the uint64 → float64 promotion stall).
+- `test_nputil.py` — dtype-safe `searchsorted` (the uint64 → float64 promotion stall), and
+  `searchsorted_many` equal to numpy's and exact above float64 precision.
 - `test_native_build_config.py` — the native build finds Python's headers.
 - `test_release_gate.py` — the gate is one definition, CI and the gate stay in step, the
   wrappers (`gate.sh`, `gate.ps1`, `run_all.sh`) hold no logic, `--only` is never read as
-  the gate, and the release docs describe reality.
+  the gate, the release docs describe reality, and pyproject.toml is configuration
+  setuptools accepts, listing every package and every asset a wheel must carry.
 - `test_collection.py` — every test file collects at least one test, and the per-suite
   runner visits every file pytest collects.
 - `test_testing_doc.py` — this document names every suite, and none that is gone.
@@ -661,10 +742,17 @@ Use this to spot gaps. "Layer" indicates where the assertion bites.
 | Arbitrary-rate resampler / PDM | `dsp/resample` | `test_resample`, `test_audio_export` (export-at-rate) | app |
 | Per-stream DC blocker, high-pass and gain | `dsp/filters`, `store/audio_store`, `ui/audio_process_dialog`, native `sosfilt` | `test_filters`, `test_stream_processing`, `test_stream_processing_gui` | core + app + GUI |
 | Spectrogram lanes | `dsp/spectrogram`, `ui/audio_view` | `test_spectrogram` | app + GUI |
+| Audio zoom kept across a track rebuild; titles in a narrow pane | `ui/audio_view` | `test_audio_zoom_kept` | GUI |
+| Audio samples drawn as stems when zoomed in to them | `ui/audio_view` | `test_audio_stems` | GUI |
+| Maximize one pane and restore the arrangement | `ui/main_window`, `ui/mode_controller` | `test_maximize_pane` | GUI |
 | Data-port and region names | `session`, `ui/port_names`, the panes, `ui/timeline` | `test_dp_names`, `test_region_names` | app + GUI |
 | Multi-Link model + time mapping | `links` | `test_links` | app (headless) |
 | Multi-Link UI (switch, groups, All Links, offsets, workspace v4) | `ui/main_window`, `ui/link_state`, `workspace` | `test_links_gui`, `test_two_links`, `test_workspace`, `test_link_sequences` | app (offscreen GUI) |
 | Load queue: every request settles, whichever stage fails | `ui/main_window._load_async`, `_on_load_done` | `test_load_queue_settles` | app (offscreen GUI) |
+| Later link bring-ups: restart the decode (DLV's recovered clock locking again), reset the registers | `analysis/link_control`, `session`, `api`, native `Decoder::restartAt`, `DlvSampleSource::Reacquire`, `ui/timeline`, `ui/main_window` | `test_link_restart` | core + app + GUI |
+| Registers filtered by value provenance (the colour key) | `ui/register_view`, `ui/view_state` | `test_register_filter` | GUI |
+| Exit teardown: nothing Python-owned left for PySide's exit sweep | `ui/teardown`, `app.main`, `conftest.pytest_sessionfinish` | `test_exit_teardown` | app (subprocess, offscreen) |
+| Ctrl+C quits as File ▸ Quit, from the loop; a second one ends a hung quit | `app._QuitOnInterrupt` | `test_exit_teardown` | app (subprocess, offscreen) |
 | Two-Link demo (= the test fixture) | `ui/main_window.load_demo_links`, `ingest/transitions` | `test_two_links` | app + GUI |
 | Open Capture (probe, the one-page dialog, windows in every format, Locate's reference form) | `ingest/probe`, `ui/open_capture_dialog`, `session`, `ui/main_window` | `test_probe`, `test_open_capture_dialog`, `test_two_links` | app + GUI |
 | Timeline zoom / pan / seek / drag (real input events), Links in step | `ui/timeline`, `ui/main_window` | `test_timeline_interaction`, `test_perf` (zoom/pan ceiling) | GUI |

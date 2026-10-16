@@ -224,6 +224,37 @@ def pump_loads(win, seconds: float = 120.0) -> None:
         time.sleep(0.005)
 
 
+# ---------------------------------------------------------------- perf margins, pass or fail
+# A wall-clock ceiling reports its measurement only when it fails, so how close a passing
+# run came was invisible: a GitHub runner measured 121 ms and 754 ms against ceilings of
+# 120 and 750 ms, and a red check was the first sign of how near it ran. The ceilings that
+# record here are printed at the end of the session, each as a fraction of its ceiling,
+# whatever the outcome.
+_PERF_MARGINS: list = []
+
+
+def record_perf(name: str, median: float, ceiling: float,
+                worst: float, worst_ceiling: float) -> None:
+    """Note a perf test's measured median and worst against their ceilings (seconds), for the
+    session summary. Call it BEFORE the asserts, so a failing run reports it too."""
+    _PERF_MARGINS.append((name, median, ceiling, worst, worst_ceiling))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG001
+    if not _PERF_MARGINS:
+        return
+    import platform
+    import sys
+    tr = terminalreporter
+    tr.section("perf margins")
+    tr.write_line(f"{sys.platform} {platform.machine()}, Python {platform.python_version()}, "
+                  f"GITHUB_ACTIONS={os.environ.get('GITHUB_ACTIONS', '-')}")
+    for name, median, ceiling, worst, worst_ceiling in _PERF_MARGINS:
+        tr.write_line(f"{name}: median {median * 1000:.0f} / {ceiling * 1000:.0f} ms "
+                      f"({median / ceiling:.0%}), worst {worst * 1000:.0f} / "
+                      f"{worst_ceiling * 1000:.0f} ms ({worst / worst_ceiling:.0%})")
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """Join every MainWindow's worker threads before the interpreter tears down.
 
@@ -234,8 +265,16 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     tests/run_all.sh, which judges each suite by its exit code.
 
     Fixing it here rather than per-test covers every suite, including ones added later.
+
+    Then every object tree Python still owns is deleted, as the app does on quit: left to
+    PySide's own sweep at exit, PySide 6.12 crashed after a fully passing run (see
+    swi3s_studio/ui/teardown.py).
     """
     _join_all_main_windows()
+    from PySide6.QtWidgets import QApplication
+    if QApplication.instance() is not None:
+        from swi3s_studio.ui.teardown import release_python_owned_qobjects
+        release_python_owned_qobjects()
     shutil.rmtree(_SETTINGS_DIR, ignore_errors=True)
 
 

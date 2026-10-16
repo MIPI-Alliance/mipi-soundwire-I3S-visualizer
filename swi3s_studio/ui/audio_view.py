@@ -50,6 +50,11 @@ _MAX_POINTS = 2000
 # real dropout (orders of magnitude wider) is unambiguous; the margin only has to
 # clear the rounding of a bin boundary and the ragged last bin.
 _GAP_BIN_TOLERANCE = 4.0
+# Zoomed in until each sample has this many pixels of the track's width, a waveform is
+# drawn as its samples: a stem from zero to each value, with a dot on it. Closer than
+# this the dots merge, and the line through the samples (or their min/max) reads better.
+_STEM_MIN_PX = 6.0
+_STEM_DOT_PX = 5
 
 # Waveform colours share the bus grid's stable per-(device,dp) hues, so a stream is the
 # same colour in both views, as the theme's LINE variant (readable on the plot in light
@@ -253,6 +258,32 @@ class _AmpAxis(pg.AxisItem):
     def boundingRect(self):
         m = self._OVERFLOW
         return super().boundingRect().adjusted(0, -m, 0, m)
+
+
+def _let_title_shrink(plot) -> None:
+    """Keep a track's title from setting its width. pyqtgraph gives a title a minimum width of
+    its text, so in a pane narrower than that the track grew past its widget: its right end
+    was cut off, and since tracks are X-linked by pixel it showed a different stretch of the
+    capture from the others. The minimum is released each time pyqtgraph sets it, and a
+    title that does not fit starts at the left edge, so the stream's name is what shows."""
+    label = plot.titleLabel
+    update = label.updateMin
+
+    def update_min():
+        update()
+        label.setMinimumWidth(0)
+        hint = label._sizeHint[Qt.SizeHint.MinimumSize]
+        label._sizeHint[Qt.SizeHint.MinimumSize] = (0, hint[1])
+        label.updateGeometry()
+    label.updateMin = update_min
+    update_min()
+    resize = label.resizeEvent
+
+    def resized(ev):
+        resize(ev)
+        if label.item.boundingRect().width() > label.width():
+            label.item.setPos(0, label.item.pos().y())
+    label.resizeEvent = resized
 
 
 class AudioView(QWidget):
@@ -806,6 +837,7 @@ class AudioView(QWidget):
                                               orientation="left")})
             pw.setMinimumHeight(_TRACK_H)
             plot = pw.getPlotItem()
+            _let_title_shrink(plot)
             plot.hideButtons()                    # drop the corner auto-range "A" button
             plot.getViewBox().setDefaultPadding(0.0)   # waveform starts flush at t=0
             plot.showGrid(x=True, y=True, alpha=VizTheme.PLOT_GRID_ALPHA)
@@ -819,10 +851,19 @@ class AudioView(QWidget):
                 plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
                 color = self._lane_colors.get((dev, dp, ch)) or _dp_color(dev, dp)
                 curve = plot.plot(pen=pg.mkPen(color, width=line_style.weight("audio")))
+                # The samples' dots, drawn only when zoomed in to them (_render_stems).
+                curve.sample_dots = pg.ScatterPlotItem(
+                    size=_STEM_DOT_PX, symbol="s", pen=None, brush=pg.mkBrush(color))
+                plot.addItem(curve.sample_dots)
             n = self._store.samples(dev, dp, ch).size
             plot.sigXRangeChanged.connect(
                 lambda _vb, rng, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
                     self._render(p, c, a, d, k, rng, b))
+            # A wider or narrower track gives each sample more or fewer pixels: whether it
+            # is drawn as stems can change with no change of range.
+            plot.getViewBox().sigResized.connect(
+                lambda vb, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
+                    self._render(p, c, a, d, k, vb.viewRange()[0], b))
             self._render(plot, curve, dev, dp, ch, (x_lo, x_hi), bits)
             plot.setXRange(x_lo, x_hi, padding=0)
             if self._link is not None:
@@ -853,7 +894,7 @@ class AudioView(QWidget):
             self._link.setXRange(prev_range[0], prev_range[1], padding=0)
         # Make the host tall enough that the scroll area actually scrolls.
         self._tracks_host.setMinimumHeight(_TRACK_H * max(1, len(self._plots)) + 8)
-        self._apply_cursor()                  # position the cursor lines
+        self._place_cursor_lines()            # the cursor did not move: no follow
         self._apply_bookmark_lines()          # (re)draw bookmark lines on the fresh plots
 
     def set_bookmarks(self, marks) -> None:
@@ -931,6 +972,13 @@ class AudioView(QWidget):
         # back to capture samples so the curve sits at its true capture-time offset.
         cs0, cs1 = int(rng[0]), int(rng[1])
         i0, i1 = self._store.index_range_for_samples(dev, dp, ch, cs0, cs1)
+        dots = getattr(curve, "sample_dots", None)
+        width = float(plot.getViewBox().width())
+        if dots is not None and 0 < i1 - i0 and (i1 - i0) * _STEM_MIN_PX <= width:
+            self._render_stems(plot, curve, dots, dev, dp, ch, i0, i1, bits)
+            return
+        if dots is not None:
+            dots.setData([], [])
         x_idx, lo, hi = self._store.envelope(dev, dp, ch, i0, i1, max_points=_MAX_POINTS)
         if x_idx.size == 0:
             curve.setData([], [])
@@ -956,6 +1004,36 @@ class AudioView(QWidget):
         curve.setData(xs, ys, connect=self._connect_mask(dev, dp, ch, xi if
                                                          (sat is not None and sat.size) else None,
                                                          x))
+        self._fit_y(plot, lo, hi)
+
+    def _render_stems(self, plot, curve, dots, dev, dp, ch, i0, i1, bits) -> None:
+        """Draw samples [i0, i1) of a channel as themselves: a stem from zero to each value
+        and a dot on it, at its capture position. One sample beyond each end of the view is
+        drawn too, so a stem does not pop in only once its centre is inside. A transport gap
+        needs no break: no stem joins one sample to the next."""
+        store: Any = self._store
+        n = int(store.samples(dev, dp, ch).size)
+        i0, i1 = max(0, i0 - 1), min(n, i1 + 1)
+        scale = float(1 << (bits - 1)) if bits and bits > 1 else 1.0
+        v = np.asarray(store.samples(dev, dp, ch)[i0:i1], dtype=np.float64) / scale
+        sat = store.sample_positions(dev, dp, ch)
+        if sat is not None and sat.size:
+            x = np.asarray(sat[i0:i1], dtype=np.float64)
+        else:
+            x = np.arange(i0, i1, dtype=np.float64)
+        xs = np.repeat(x, 2)
+        ys = np.zeros(xs.size, dtype=np.float64)
+        ys[1::2] = v
+        # Each stem is its own two vertices: connect zero -> value, never value -> the next
+        # stem's zero. An array rather than "pairs", which a clip to the view can misalign.
+        conn = np.zeros(xs.size, dtype=np.uint8)
+        conn[0::2] = 1
+        curve.setData(xs, ys, connect=conn)
+        dots.setData(x, v)
+        self._fit_y(plot, v, v)
+
+    def _fit_y(self, plot, lo, hi) -> None:
+        """The track's Y range: full scale, or fitted to the drawn values (Vertical Zoom)."""
         if self._vzoom and lo.size:
             # Vertical Zoom: fit Y to the visible data so a low-amplitude signal fills
             # the track. Let pyqtgraph auto-tick the zoomed range (the fixed ±1/±0.5
@@ -1137,21 +1215,32 @@ class AudioView(QWidget):
         self._apply_cursor()
 
     def _apply_cursor(self) -> None:
+        """The cursor moved: draw it there, and bring it into view."""
+        self._place_cursor_lines()
+        self._follow_cursor()
+
+    def _place_cursor_lines(self) -> None:
         if self._store is None:
             return
-        s = self._cursor_sample
         # X is capture-sample space, shared by every track, so the cursor line is at the
         # capture sample directly on all of them (no per-channel index mapping).
         for line in self._cursor_lines:
-            line.setPos(s)
-        # Follow the shared cursor: if it falls outside the current zoom window, pan
-        # (keeping the span — zoom is never changed) so it stays visible. The tracks
-        # are X-linked, so panning the link moves them all. Skipped while hidden so a
-        # stale/zero view range can't perturb the zoom. Also skipped *while playing*:
-        # each pan re-renders every track's envelope (sigXRangeChanged -> _render), and
-        # that main-thread burst starves the (Python) pull-source readData on the audio
-        # thread -> stutter. During playback the cursor line still moves; the view just
-        # doesn't auto-scroll (the user can scroll, or it re-follows once stopped).
+            line.setPos(self._cursor_sample)
+
+    def _follow_cursor(self) -> None:
+        """If the cursor falls outside the current zoom window, pan (keeping the span — zoom
+        is never changed) so it stays visible. Only for a cursor that MOVED: a rebuild of the
+        tracks leaves the window where the user put it, cursor in view or not.
+
+        The tracks are X-linked, so panning the link moves them all. Skipped while hidden so
+        a stale/zero view range can't perturb the zoom. Also skipped *while playing*: each
+        pan re-renders every track's envelope (sigXRangeChanged -> _render), and that
+        main-thread burst starves the (Python) pull-source readData on the audio thread ->
+        stutter. During playback the cursor line still moves; the view just doesn't
+        auto-scroll (the user can scroll, or it re-follows once stopped)."""
+        if self._store is None:
+            return
+        s = self._cursor_sample
         if self._link is not None and self.isVisible() and not self.is_playing:
             x0, x1 = self._link.getViewBox().viewRange()[0]
             span = x1 - x0
