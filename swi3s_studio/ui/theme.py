@@ -15,6 +15,14 @@ _ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 _CHECK_SVG = os.path.join(_ASSETS, "check.svg").replace("\\", "/")
 
 
+def _branch_svg(state: str, mode: "str | None" = None) -> str:
+    """A tree section's open / closed arrow, TEXT-coloured like its heading in the active
+    theme (or in `mode`'s): "down" when open, "right" when closed. Left to the platform, it
+    was drawn black, invisible on the dark theme's panel."""
+    mode = mode or VizTheme.MODE
+    return os.path.join(_ASSETS, f"chevron-{state}-{mode}.svg").replace("\\", "/")
+
+
 def _chevron_svg() -> str:
     """The combo drop-down arrow for the active theme (TEXT-coloured, a file per theme
     since a QSS url() cannot recolour an SVG)."""
@@ -313,6 +321,18 @@ def analyzer_stylesheet() -> str:
         outline: none;
     }}
     QTableView::item, QTreeView::item {{ padding: 1px 4px; }}
+    QTreeView::branch:has-children:closed {{ image: url({_branch_svg("right")}); }}
+    QTreeView::branch:has-children:open {{ image: url({_branch_svg("down")}); }}
+    /* A styled branch is painted without the selected row's fill (like ::item above), so
+       the arrow sat on a strip of panel colour: it takes the row's fill, and the arrow the
+       light shade of the row's white text. */
+    QTreeView::branch:selected, QTreeView::branch:selected:!active {{
+        background: {t.ACCENT};
+    }}
+    QTreeView::branch:has-children:closed:selected {{
+        image: url({_branch_svg("right", "dark")});
+    }}
+    QTreeView::branch:has-children:open:selected {{ image: url({_branch_svg("down", "dark")}); }}
     /* Styling ::item above disables Qt's built-in selection fill, so the parent
        selection-background-color no longer paints — the row would select (and copy)
        but show NO highlight. Restore it explicitly, and keep it visible when the view

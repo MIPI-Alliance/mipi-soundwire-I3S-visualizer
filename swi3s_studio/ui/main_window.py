@@ -123,6 +123,17 @@ from .timing_view import TimingView
 # Timeline span every Link, so they belong to none.
 _PANE_GROUPS = ("commands", "right", "grid", "bottom")
 _ALL_LINKS = "All Links"
+# View ▸ Maximize Pane: the selected pane alone in the window, and back. Ctrl is ⌘ on macOS,
+# where ⌘M is the system's Minimize.
+_MAXIMIZE_KEY = "Ctrl+Shift+M"
+_MAXIMIZE_KEY_TEXT = "⌘⇧M" if sys.platform == "darwin" else _MAXIMIZE_KEY
+# The panes read by moving through time keep the Timeline when maximized, to navigate with;
+# the others (Audio, Capture and Timing have their own time axes, Statistics and Bookmarks
+# none to follow) take the whole window. "commands" is the Commands table; the rest name
+# MainWindow's docks.
+_MAXIMIZE_KEEPS_TIMELINE = ("commands", "_reg_dock", "_grid_dock", "_symbol_dock",
+                            "_sample_dock")
+_QWIDGETSIZE_MAX = 16777215    # Qt's "no limit" for a widget's size, which PySide6 does not export
 # Two Links count as running at "the same" UI / row rate (so a cross-Link bookmark pair can
 # be read in UIs and rows) within 0.1%: far above two analyzers' timebase error, far below
 # the gap between distinct bus rates.
@@ -405,6 +416,48 @@ class _CurrentPageStack(QStackedWidget):
 
 
 
+def _title_button_style() -> str:
+    """A title bar's ✕ / ⤢ buttons: no frame at rest, a subtle rounded tint on hover, and
+    on a maximize button while its pane is the maximized one. The docks' title bars and the
+    Commands pane's header share it."""
+    t = VizTheme
+    return (f"QToolButton {{ border:none; background:transparent; color:{t.TEXT_DIM};"
+            f" font-size:12px; padding:0; }}"
+            f"QToolButton:hover, QToolButton:checked {{ background:{t.BORDER};"
+            f" color:{t.TEXT}; border-radius:{t.CORNER_RADIUS}px; }}")
+
+
+def _maximize_button(parent: QWidget, size: int) -> QToolButton:
+    btn = QToolButton(parent)
+    btn.setText("⤢")
+    btn.setCheckable(True)
+    btn.setFixedSize(size, size)
+    btn.setCursor(Qt.ArrowCursor)
+    btn.setFocusPolicy(Qt.NoFocus)
+    _show_maximized(btn, False)
+    return btn
+
+
+def _show_maximized(btn: QToolButton, on: bool) -> None:
+    """Show on a maximize button whether its pane is the maximized one."""
+    btn.setChecked(bool(on))
+    btn.setToolTip(f"Restore Panes ({_MAXIMIZE_KEY_TEXT})" if on
+                   else f"Maximize Pane ({_MAXIMIZE_KEY_TEXT})")
+
+
+class _PaneTitle(QLabel):
+    """The Commands pane's title, which has no dock title bar: a double-click on it
+    maximizes the pane, as one on a dock's title does."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 - Qt override
+        if ev.button() == Qt.LeftButton:
+            ev.accept()
+            self.doubleClicked.emit()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+
 class _DockTitleBar(QWidget):
     """A themed replacement for the native QDockWidget title bar.
 
@@ -413,15 +466,20 @@ class _DockTitleBar(QWidget):
     `::close-button` rule nor the SH_DockWidget_ButtonsHaveFrame hint reliably
     suppresses it (QStyleSheetStyle re-renders the sub-control). Owning the title
     bar sidesteps the platform style entirely: a centered title label plus a
-    close button (a plain QToolButton we style directly). Dragging and
-    double-click-to-float still work — QDockWidget drives them off mouse events on
-    the title-bar widget, which the label/spacers let propagate."""
+    close button (a plain QToolButton we style directly). Dragging still works —
+    QDockWidget drives it off mouse events on the title-bar widget, which the
+    label/spacers let propagate. A double-click maximizes the pane (or puts the panes
+    back), as the button on the right does, and never floats it: a pane is floated by
+    dragging it out. `on_close` replaces the plain close, so the window can put the panes
+    back before one goes."""
 
-    _BTN = 18   # close-button box (px); the left spacer matches it so the title centers
+    _BTN = 18   # button box (px); close on the left, maximize on the right, title centred
 
-    def __init__(self, dock: QDockWidget, title: str) -> None:
+    def __init__(self, dock: QDockWidget, title: str, on_maximize=None,
+                 on_close=None) -> None:
         super().__init__(dock)
         self._dock = dock
+        self._on_maximize = on_maximize
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 3, 6, 3)
         lay.setSpacing(0)
@@ -431,7 +489,8 @@ class _DockTitleBar(QWidget):
         self._close.setCursor(Qt.ArrowCursor)
         self._close.setFocusPolicy(Qt.NoFocus)
         self._close.setToolTip("Close")
-        self._close.clicked.connect(dock.close)
+        on_close = on_close or dock.close
+        self._close.clicked.connect(lambda: on_close())    # not `checked` as an argument
         lay.addWidget(self._close)         # left, matching the native macOS dock button
         self._lay = lay
         lay.addStretch(1)
@@ -439,20 +498,36 @@ class _DockTitleBar(QWidget):
         self._label.setAlignment(Qt.AlignCenter)
         lay.addWidget(self._label)
         lay.addStretch(1)
-        lay.addSpacing(self._BTN)          # balances the left button so the label centers
+        self._max = _maximize_button(self, self._BTN)   # balances the close button
+        if on_maximize is not None:
+            self._max.clicked.connect(lambda: on_maximize())
+        else:                # a pane that is never maximized (Timeline)
+            keep = self._max.sizePolicy()
+            keep.setRetainSizeWhenHidden(True)  # still balances the close button
+            self._max.setSizePolicy(keep)
+            self._max.hide()
+        lay.addWidget(self._max)
         self.retheme()
+
+    def set_maximized(self, on: bool) -> None:
+        """Show whether this pane is the maximized one (the button reads Restore)."""
+        _show_maximized(self._max, on)
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 - Qt override
+        if ev.button() == Qt.LeftButton:
+            ev.accept()                        # QDockWidget would float the pane
+            if self._on_maximize is not None:
+                self._on_maximize()
+            return
+        super().mouseDoubleClickEvent(ev)
 
     def retheme(self) -> None:
         t = VizTheme
         self.setStyleSheet(f"background:{t.FRAME_BG};")
         self._label.setStyleSheet(f"background:transparent; color:{t.TEXT};")
-        # The close button is ours (not the native dock button), so QSS applies cleanly:
-        # no frame at rest, a subtle rounded tint on hover.
-        self._close.setStyleSheet(
-            f"QToolButton {{ border:none; background:transparent; color:{t.TEXT_DIM};"
-            f" font-size:12px; padding:0; }}"
-            f"QToolButton:hover {{ background:{t.BORDER}; color:{t.TEXT};"
-            f" border-radius:{t.CORNER_RADIUS}px; }}")
+        # The buttons are ours (not the native dock buttons), so QSS applies cleanly.
+        self._close.setStyleSheet(_title_button_style())
+        self._max.setStyleSheet(_title_button_style())
 
     def add_leading(self, widget: QWidget) -> None:
         """Put `widget` just right of the close button (the per-group Link picker)."""
@@ -669,6 +744,9 @@ class MainWindow(QMainWindow):
     # preload) and in headless tests (which never start exec()) they run synchronously, so a
     # freshly built MainWindow has its session ready without pumping events.
     _event_loop_live = False
+    # Emitted once the window has closed (its close accepted): app.main quits on it, so a
+    # window still open elsewhere cannot keep the app running.
+    closed = Signal()
 
     # Per-Link state (see ui/link_state.py); `_session` is the property below.
     _audio_store = _PerLink()
@@ -683,6 +761,8 @@ class MainWindow(QMainWindow):
     def __init__(self, register_map: Optional[RegisterMap] = None) -> None:
         super().__init__()
         self.setWindowTitle(f"SWI3S Studio {__version__}")
+        # The maximized pane and the arrangement to put back, or None (toggle_maximized_pane).
+        self._max_pane: Optional[dict] = None
         # Clamp the initial size to the available screen: the default 860 px height can
         # exceed a shorter display (or one with a tall taskbar), pushing the bottom dock
         # tab bar off-screen. Fit within the work area, leaving a small margin.
@@ -764,12 +844,18 @@ class MainWindow(QMainWindow):
         self._analysis_page = analysis_page    # the Commands pane group (see _group_of)
         col = QVBoxLayout(analysis_page)
         col.setContentsMargins(0, 0, 0, 0)
-        self._cmd_title = QLabel("Commands")  # the central pane has no dock title
+        self._cmd_title = _PaneTitle("Commands")   # the central pane has no dock title
         self._cmd_title.setAlignment(Qt.AlignCenter)   # match the dock title bars
+        self._cmd_title.doubleClicked.connect(lambda: self.toggle_maximized_pane("commands"))
         # The Link switcher sits beside the title and is hidden until there is a second
-        # Link, so a single-Link window is laid out exactly as it always was.
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
+        # Link, so a single-Link window is laid out exactly as it always was. The header row
+        # carries the title bar's background, so the maximize button at its right sits on it.
+        self._cmd_header = QWidget()
+        self._cmd_header.setObjectName("cmdHeader")
+        header = QHBoxLayout(self._cmd_header)
+        header.setContentsMargins(0, 0, 6, 0)
+        header.setSpacing(0)
+        header.addSpacing(_DockTitleBar._BTN + 6)      # balances the button, so the title centres
         self._link_combo = QComboBox()
         self._link_combo.setToolTip("Which Link the per-Link panes show")
         self._link_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
@@ -777,7 +863,10 @@ class MainWindow(QMainWindow):
         self._link_combo.activated.connect(self._on_link_combo)
         header.addWidget(self._link_combo)
         header.addWidget(self._cmd_title, 1)
-        col.addLayout(header)
+        self._cmd_max_btn = _maximize_button(self._cmd_header, _DockTitleBar._BTN)
+        self._cmd_max_btn.clicked.connect(lambda: self.toggle_maximized_pane("commands"))
+        header.addWidget(self._cmd_max_btn)
+        col.addWidget(self._cmd_header)
         col.addWidget(self._cmd_view)
 
         # Central area is a stack of per-mode pages (Visualization | Timing |
@@ -849,7 +938,7 @@ class MainWindow(QMainWindow):
         self._timeline_col.setSpacing(0)
         self._add_ribbon()
         self._timeline_dock = self._add_dock("Timeline", self._timeline_stack,
-                                             Qt.TopDockWidgetArea)
+                                             Qt.TopDockWidgetArea, maximizable=False)
 
         # Register map (right dock).
         self._reg_view = RegisterView(self._rmap)
@@ -967,7 +1056,10 @@ class MainWindow(QMainWindow):
                            self._eye_dock],
             },
             on_change=self._on_mode_changed,
+            before_change=self.restore_panes,
         )
+        self._timeline_keepers = {"commands" if name == "commands" else getattr(self, name)
+                                  for name in _MAXIMIZE_KEEPS_TIMELINE}
         self._mode_mgr.switch_to(VISUALIZATION)   # Bus Visualizer is the default mode on open
 
         # Follow the OS light/dark scheme live while the preference is 'system'.
@@ -1001,6 +1093,11 @@ class MainWindow(QMainWindow):
         for menu in getattr(self, "_analysis_menus", []):
             menu.setEnabled(analysing)
             menu.menuAction().setVisible(analysing)
+        if analysing and hasattr(self, "_needs_capture"):
+            # Enabling a menu enables every submenu in it (Qt passes the change down to
+            # the child menus, and a submenu's item follows its menu), so what waits for a
+            # capture is greyed again here.
+            self._update_capture_actions()
         # Preferences holds only the waveform colours and weights, so it is the Analyzer's
         # too (and ⌘, with it), as is the View item that names it.
         for act in getattr(self, "_view_pane_actions", []) + [
@@ -1382,7 +1479,9 @@ class MainWindow(QMainWindow):
         self._analysis_page.setStyleSheet(analyzer_stylesheet())
         if hasattr(self, "_grid_pane"):
             self._grid_pane.setStyleSheet(analyzer_stylesheet())   # Bus Grid toolbar buttons
+        self._cmd_header.setStyleSheet(f"QWidget#cmdHeader {{ background:{t.FRAME_BG}; }}")
         self._cmd_title.setStyleSheet(f"padding:3px 6px; background:{t.FRAME_BG};")
+        self._cmd_max_btn.setStyleSheet(_title_button_style())
         self._viz_restore_btn.setStyleSheet(
             f"QPushButton {{ background:{t.ACCENT}; color:white; border:none; "
             f"border-radius:{t.CORNER_RADIUS}px; padding:6px 10px; }} "
@@ -1523,12 +1622,14 @@ class MainWindow(QMainWindow):
         self._grid_pane = host          # re-styled on theme switch (_apply_chrome_styles)
         return host
 
-    def _add_dock(self, title: str, widget: QWidget, area) -> QDockWidget:
+    def _add_dock(self, title: str, widget: QWidget, area,
+                  maximizable: bool = True) -> QDockWidget:
         dock = QDockWidget(title, self)
         dock.setObjectName(title.replace(" ", ""))
         dock.setWidget(widget)
         # Own the title bar so the close X matches the theme (see _DockTitleBar).
-        bar = _DockTitleBar(dock, title)
+        bar = _DockTitleBar(dock, title, (lambda d=dock: self.toggle_maximized_pane(d))
+                            if maximizable else None, lambda d=dock: self._hide_dock(d))
         dock.setTitleBarWidget(bar)
         if not hasattr(self, "_dock_titlebars"):
             self._dock_titlebars = []
@@ -1625,7 +1726,7 @@ class MainWindow(QMainWindow):
         # the cursor between the sync-point commits (SSCR/DSCR — where the config takes
         # effect), with ⌘> / ⌘< (Ctrl on non-mac).
         cmds = self.menuBar().addMenu("&Commands")
-        self._build_filter_menu(cmds)
+        self._filter_menu = self._build_filter_menu(cmds)
         cmds.addSeparator()
         nxt = cmds.addAction("Next SSCR/DSCR Commit\tCtrl+>", self._for_group("commands", self.next_sscr))
         # '>' is Shift+'.', so the OS delivers Ctrl+Shift+. — bind BOTH spellings or the
@@ -1714,10 +1815,13 @@ class MainWindow(QMainWindow):
 
         # Menus that only apply while analysing a capture — disabled in other modes.
         self._analysis_menus = [cmds, dec, rm, a, b]
-        # The whole of Commands, Decode, Devices and Bookmarks acts on a capture (Align
-        # needs two Links, which _update_link_switcher decides).
-        self._needs_capture += [act for menu in (cmds, dec, rm, b) for act in menu.actions()
-                                if not act.isSeparator() and act is not self._align_links_action]
+        # The whole of Commands, Decode, Devices and Bookmarks acts on a capture, down to
+        # the items in their submenus, whose shortcuts would otherwise still fire. The
+        # submenus are named here, not found through QAction.menu(), which on PySide 6.11
+        # hands back a dead wrapper; their items are read each time, as some are rebuilt
+        # per capture (_update_capture_actions). Align also needs two Links.
+        self._capture_menus = (cmds, dec, rm, b, self._filter_menu, self._kind_menu,
+                               self._dev_menu, self._group_menu, ssp)
 
         # View menu: show/raise any panel (reopens a closed or tab-hidden dock).
         # The pane items only apply to the Analyzer's docks, so they're disabled
@@ -1745,11 +1849,19 @@ class MainWindow(QMainWindow):
             act = v.addAction(label)
             act.setCheckable(True)
             act.setChecked(not dock.isHidden())
-            act.toggled.connect(lambda on, d=dock: self._show_dock(d) if on else d.hide())
+            act.toggled.connect(lambda on, d=dock: self._show_dock(d) if on
+                                else self._hide_dock(d))
             self._dock_actions[dock] = act
             self._view_pane_actions.append(act)
             # Keep the menu check in sync with the dock's own close button.
             dock.visibilityChanged.connect(lambda _vis, d=dock: self._sync_dock_action(d))
+        # The selected pane alone in the window, and back (toggle_maximized_pane).
+        v.addSeparator()
+        self._maximize_action = v.addAction("Maximize Pane",
+                                            lambda: self.toggle_maximized_pane())
+        self._maximize_action.setShortcut(QKeySequence(_MAXIMIZE_KEY))
+        self._maximize_action.setAutoRepeat(False)    # a held key is one toggle, not many
+        self._view_pane_actions.append(self._maximize_action)
 
         # TX map moved to buttons in the Bus Grid pane itself (Show Toggles /
         # Persistence — see _build_grid_pane), keeping the View menu to show/hide panes.
@@ -1798,14 +1910,25 @@ class MainWindow(QMainWindow):
         self._update_capture_actions()
 
     def _update_capture_actions(self) -> None:
-        """Items that act on a capture are enabled once one is loaded (they used to open
-        a "load a capture first" box instead). Export Audio also needs audio, in the Link
-        it would export: the signal panes' (_for_group), or in All Links the active one.
-        Not to be run inside a lane's bind (_as_lane), where the lane's Link stands in as
-        the active one."""
+        """Items that act on a capture are enabled once one is loaded, submenus included,
+        and greyed until then; what opens a file, sets a preference or arranges the window
+        is always available. Export Audio and Audio's per-stream submenus also need audio,
+        in the Link they act on: the signal panes' (_for_group), or in All Links the active
+        one. Not to be run inside a lane's bind (_as_lane), where the lane's Link stands in
+        as the active one."""
         loaded = self._session is not None
         for act in getattr(self, "_needs_capture", []):
             act.setEnabled(loaded)
+
+        for menu in getattr(self, "_capture_menus", ()):
+            for act in menu.actions():
+                if not act.isSeparator():
+                    act.setEnabled(loaded)
+        self._align_links_action.setEnabled(loaded and len(self._links) > 1)
+        # Audio's per-stream submenus wait for streams, as the items above for a capture.
+        streams = loaded and bool(self._audio_lane().streams())
+        for menu in (self._play_rate_menu, self._process_menu):
+            menu.menuAction().setEnabled(streams)
         self._sync_empty_hints(loaded)
         i = self._links.active_index if self._bottom_all else self._pane_link["bottom"]
         store = self._links[i].view.audio_store if 0 <= i < len(self._links) else None
@@ -2290,6 +2413,10 @@ class MainWindow(QMainWindow):
                 (f"{mod}[", "Previous bookmark"),
                 (f"{mod}B", "Toggle bookmark at cursor"),
             ]),
+            ("Panes", [
+                (f"{mod}{shift}M", "Maximize the selected pane / put the panes back "
+                                   "(or double-click its title bar)"),
+            ]),
             ("Waveform panes (Audio / Capture, when focused)", [
                 (">", "Page the view one width right"),
                 ("<", "Page the view one width left"),
@@ -2308,7 +2435,8 @@ class MainWindow(QMainWindow):
         # The groups only the Bus Analyzer has keys for: elsewhere they are left out (its
         # menus are hidden there, so the keys do nothing), with a line saying where they are.
         analyzer_only = {"Links", "Command filter (Commands ▸ Filter ▸ Commands)",
-                         "Cursor navigation", "Waveform panes (Audio / Capture, when focused)",
+                         "Cursor navigation", "Panes",
+                         "Waveform panes (Audio / Capture, when focused)",
                          "Manual Stream Sync Point (Decode)", "Waveform settings"}
         analysing = self._mode_mgr_current() == ANALYSIS
         if not analysing:
@@ -2323,8 +2451,8 @@ class MainWindow(QMainWindow):
             html.append("</table>")
         if not analysing:
             html.append("<p><i>The Bus Analyzer's keys (Links, the command filter, the cursor, "
-                        "the waveform panes and their settings, the SSP) are listed in the Bus "
-                        "Analyzer.</i></p>")
+                        "the panes, the waveform panes and their settings, the SSP) are listed "
+                        "in the Bus Analyzer.</i></p>")
         self._info_box("Keyboard Shortcuts", "".join(html))
 
     def _info_box(self, title: str, html: str) -> None:
@@ -2346,7 +2474,8 @@ class MainWindow(QMainWindow):
             for name, c, meaning in MARK_LEGEND)
         # Link-control sub-phase colours (drawn as bands within the §5.1.2 bring-up).
         lc_meaning = {
-            "Idle": "bus idle (DP low) before the sequence",
+            "Idle": "bus idle (DP low) before the sequence; before a later bring-up, "
+                    "the stretch the clock stopped for (the Link inactive)",
             "Bus Reset": "Cold-Start bus reset (LC:00 then LC:10)",
             "Cold Start": "reset recovery + PHY-number clocking",
             "Warm Start": "warm-start pulse (PHY reused)",
@@ -2366,8 +2495,9 @@ class MainWindow(QMainWindow):
             "coloured by column count — so a reconfiguration (e.g. cold-start "
             "2col → 8col) is visible at a glance.</p>"
             "<p>The <b>§5.1.2 link bring-up</b> is drawn as distinct colour bands, "
-            "one per sub-phase (the Cold-Start safe-lock band is labelled by the "
-            "selected PHY, e.g. <i>Cold Start PHY2</i>):</p>"
+            "one per sub-phase, and so is each later one after the Link went inactive "
+            "(the safe-lock band a bring-up opens is labelled by the selected PHY, "
+            "e.g. <i>PHY2 Safe-Lock-2</i>):</p>"
             f"<table cellpadding='2'>{lc_rows}</table>")
 
     def _sync_dock_action(self, dock) -> None:
@@ -2381,7 +2511,147 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
+    # ---- one pane maximized ----
+    def _pane_of(self, widget):
+        """The Bus Analyzer pane `widget` is in: its dock, or "commands" for the Commands
+        table; None outside them (a menu, another mode's page, nothing)."""
+        w = widget
+        while w is not None:
+            if isinstance(w, QDockWidget) and w in self._dock_area:
+                return w
+            if w is self._analysis_page:
+                return "commands"
+            w = w.parentWidget()
+        return None
+
+    def maximized_pane(self):
+        """The pane shown alone (a dock, or "commands"), or None."""
+        return self._max_pane["pane"] if self._max_pane is not None else None
+
+    def toggle_maximized_pane(self, pane=None) -> None:
+        """View ▸ Maximize Pane, its key, a pane's title-bar button or a double-click on the
+        title: show one pane alone in the window, or put every pane back as it was.
+
+        Without `pane`, the selected one is the pane holding the keyboard focus, which a
+        click in any pane gives it. The arrangement is saved whole (sizes, tab groups, the
+        tab in front, floating panes) and restored whole, so nothing about the layout is
+        rebuilt by hand. Showing, hiding or closing a pane, adding or removing a Link,
+        leaving the Bus Analyzer, or opening a workspace puts the panes back first, and a
+        workspace saved meanwhile records them as they will be put back. All Links turned
+        off meanwhile resizes the panes put back, not the maximized one. The panes read by
+        moving through time keep the Timeline at its height (_MAXIMIZE_KEEPS_TIMELINE).
+
+        The focus stays with the pane throughout. restoreState hides and re-shows docks,
+        and Qt moves the focus off a hidden dock to the next widget in the chain, so the
+        widget that had it is focused again after a restore; and the pane stays the tab in
+        front of its group, since it is the one being worked in."""
+        if self._max_pane is not None:
+            self.restore_panes()
+            return
+        if self._mode_mgr_current() != ANALYSIS:
+            return
+        if pane is None:
+            pane = self._pane_of(QApplication.focusWidget())
+        if pane is None:
+            self._status.setText("Click in a pane to choose the one to maximize")
+            return
+        if pane is self._timeline_dock:       # navigation for the others, not a view of its own
+            self._status.setText("The Timeline is not maximized: click in another pane")
+            return
+        focus = QApplication.focusWidget()
+        if self._pane_of(focus) is not pane:      # a title-bar button: focus is elsewhere
+            focus = self._pane_focus_widget(pane)
+        bottom = self._raised_bottom_dock()
+        self._max_pane = {"pane": pane, "state": self.saveState(), "focus": focus,
+                          "shown": [d for d in self._dock_area if not d.isHidden()],
+                          "bottom": (bottom, bottom.height() if bottom is not None else 0),
+                          "timeline_held": False, "settle": None}
+        if isinstance(pane, QDockWidget) and pane.isFloating():
+            pane.setFloating(False)               # maximized means in the window
+        keep = {pane}
+        timeline = self._timeline_dock
+        timeline_h = timeline.height()
+        if pane in self._timeline_keepers:
+            keep.add(timeline)                    # left as it is, open or closed
+        for dock in self._dock_area:
+            if dock not in keep and not dock.isHidden():
+                dock.hide()
+        if timeline in keep and isinstance(pane, QDockWidget) \
+                and self.dockWidgetArea(pane) != Qt.BottomDockWidgetArea:
+            # Beside the Timeline, a pane in a side area gets only what is left under the
+            # top area's share of the window, which no resize moves. Below it, the pane
+            # takes the rest. The restore puts it back.
+            self.addDockWidget(Qt.BottomDockWidgetArea, pane)
+        if isinstance(pane, QDockWidget):
+            pane.show()
+            pane.raise_()                         # a tab behind another comes to the front
+            self._central_stack.hide()            # the docks then take the central space
+        if timeline in keep and timeline.isVisible() and not timeline.isFloating():
+            # With the central page hidden Qt shares its room between the Timeline's area
+            # and the pane's, on every resize of the window, and resizeDocks cannot pin it
+            # (it moves both areas). Its height is capped until the restore.
+            self._max_pane["timeline_held"] = True
+            timeline.setMaximumHeight(timeline_h)
+        if focus is not None:
+            focus.setFocus(Qt.OtherFocusReason)
+        self._sync_maximize_ui()
+
+    def restore_panes(self) -> bool:
+        """Put back the arrangement a maximize saved; nothing to do if no pane is. Whether
+        it did: a resizeDocks in the same pass of the event loop is overridden by the
+        restored sizes, so a caller resizing after has to wait a pass."""
+        saved, self._max_pane = self._max_pane, None
+        if saved is None:
+            return False
+        timeline = self._timeline_dock
+        if saved["timeline_held"]:                # first: the cap would clamp the state
+            timeline.setMaximumHeight(_QWIDGETSIZE_MAX)
+        self._central_stack.show()                # and this: the state's sizes include it
+        if not self.restoreState(saved["state"]):
+            for dock in saved["shown"]:           # the state is the window's own; still
+                dock.show()
+        if saved["settle"] is not None:
+            self._settle_bottom_height(*saved["settle"])
+        pane, focus = saved["pane"], saved["focus"]
+        if isinstance(pane, QDockWidget):
+            pane.raise_()
+        if focus is None or not isValid(focus) or not focus.isVisible():
+            focus = self._pane_focus_widget(pane)
+        if focus is not None:
+            focus.setFocus(Qt.OtherFocusReason)
+        self._sync_maximize_ui()
+        return True
+
+    def _pane_focus_widget(self, pane):
+        """Where the keyboard focus goes in `pane`: its widget if that takes focus, else its
+        largest visible focusable child, the pane's view (a dock's own widget is often a plain
+        container, and its first focusable child a toolbar control)."""
+        host = self._cmd_view if pane == "commands" else pane.widget()
+        if host is None:
+            return None
+        if host.focusPolicy() != Qt.NoFocus:
+            return host
+        return max((c for c in host.findChildren(QWidget)
+                    if c.focusPolicy() != Qt.NoFocus and c.isVisibleTo(host)),
+                   key=lambda c: c.width() * c.height(), default=host)
+
+    def _hide_dock(self, dock: QDockWidget) -> None:
+        """Hide a pane (its ✕, or its View-menu item unchecked). The panes are put back
+        first, so the restore does not show it again or leave the window empty."""
+        self.restore_panes()
+        dock.hide()
+
+    def _sync_maximize_ui(self) -> None:
+        pane = self.maximized_pane()
+        act = getattr(self, "_maximize_action", None)
+        if act is not None:
+            act.setText("Restore Panes" if pane is not None else "Maximize Pane")
+        for bar in getattr(self, "_dock_titlebars", []):
+            bar.set_maximized(bar._dock is pane)
+        _show_maximized(self._cmd_max_btn, pane == "commands")
+
     def _show_dock(self, dock: QDockWidget) -> None:
+        self.restore_panes()                      # showing a pane ends a maximize
         # Re-show a closed/tab-hidden dock and force it back to docked. A dock closed
         # via its X button (especially on macOS) can come back floating or detached,
         # so we ALWAYS drop floating and re-add it to its home dock area, then re-join
@@ -2423,6 +2693,8 @@ class MainWindow(QMainWindow):
         if guide is not None:
             guide.close()                      # left open, it kept the app running
         super().closeEvent(event)
+        if event.isAccepted():
+            self.closed.emit()
 
     def join_worker_threads(self) -> None:
         """Quit + wait on every worker QThread, clearing each slot.
@@ -3511,6 +3783,12 @@ class MainWindow(QMainWindow):
                 for dev_str, doc in spec.device_regmaps.items():
                     link.session.set_peripheral_map(int(dev_str),
                                                     PeripheralRegisterMap.from_json_dict(doc))
+                # The Commands table took a copy of the maps when the Link loaded, before
+                # these: give it them, or its vendor register names stay unresolved.
+                if link.view is not None and link.view.cmd_model is not None:
+                    link.view.cmd_model.set_peripheral_maps(link.session.peripheral_maps)
+        if self._cmd_all:                       # it draws through the per-Link models
+            self._refresh_all_model()
         # The offsets are assigned directly, and each band's domain was computed as its Link
         # was added, at offset 0: recompute it once for all of them, or every band but the
         # first draws unshifted until a zoom re-syncs it.
@@ -3609,9 +3887,16 @@ class MainWindow(QMainWindow):
             r = self._ribbons[a]
             timeline = [self._links[a].to_ps(round(r._view_lo)),
                         self._links[a].to_ps(round(r._view_hi))]
+        window: Dict[str, Any] = {"geometry": b64encode(bytes(self.saveGeometry())).decode("ascii"),
+                  "docks": b64encode(bytes(self._max_pane["state"] if self._max_pane
+                                           else self.saveState())).decode("ascii")}
+        settle = self._max_pane["settle"] if self._max_pane else None
+        if settle is not None:
+            # All Links turned off while a pane is maximized: the arrangement put back is
+            # resized after it is restored, so the workspace carries that resize too.
+            window["bottom_settle"] = [settle[0].objectName(), int(settle[1])]
         out = {
-            "window": {"geometry": b64encode(bytes(self.saveGeometry())).decode("ascii"),
-                       "docks": b64encode(bytes(self.saveState())).decode("ascii")},
+            "window": window,
             "timeline_ps": timeline,
             "commands_header": view_state.commands_header_state(self._cmd_view),
             "samples": view_state.samples_state(self._sample_view),
@@ -3714,7 +3999,14 @@ class MainWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(QByteArray(geometry))
         if docks:
+            self.restore_panes()
             self.restoreState(QByteArray(docks))
+            settle = win.get("bottom_settle")
+            if isinstance(settle, list) and len(settle) == 2 \
+                    and isinstance(settle[1], int) and settle[1] > 0:
+                dock = next((d for d in self._dock_area if d.objectName() == settle[0]), None)
+                if dock is not None:
+                    self._settle_bottom_height(dock, settle[1])
 
     def _apply_view_prefs(self, view: dict) -> None:
         """Restore the transient Bus-Grid / Raw-Capture pane state from a workspace.
@@ -4287,6 +4579,9 @@ class MainWindow(QMainWindow):
         give the room back; so it is applied on the next pass of the event loop and again
         while it has not held, up to `passes` times."""
         def apply(n=passes):
+            if self._max_pane is not None:        # made to the arrangement put back
+                self._max_pane["settle"] = (dock, height, n)
+                return
             if dock.isHidden() or dock.isFloating():
                 return
             if dock.height() > height + 2:
@@ -4307,11 +4602,14 @@ class MainWindow(QMainWindow):
             return
         self._stop_audio()
         dock = self._raised_bottom_dock()
+        height = dock.height() if dock is not None else 0
+        if self._max_pane is not None:            # measured in the arrangement put back
+            dock, height = self._max_pane["bottom"]
         if on:
             # Two or more lanes need more height, so Qt grows the docks; it never shrinks
             # them again by itself, so remember the one-Link height to go back to (none,
             # if no docked pane is on screen to measure: an old one would be wrong).
-            self._bottom_single_height = dock.height() if dock is not None else 0
+            self._bottom_single_height = height
         self._bottom_all = on
         self._sync_lanes()
         if not on and not rebind:
@@ -4678,7 +4976,7 @@ class MainWindow(QMainWindow):
                     + [session.audio_end_sample, 1])
         ribbon.set_events(session.commands, total)
         ribbon.set_segments(self._band_segments(session), total)
-        ribbon.set_bringup(session.link_control)
+        ribbon.set_bringups(session.link_controls)
         ribbon.set_commit_points(session.commit_point_samples())   # dotted SSP markers
 
     @property
@@ -4716,6 +5014,9 @@ class MainWindow(QMainWindow):
         (the active one marked), heights become flexible so the dock resizes vertically,
         and the dock grows by a band per Link whenever the COUNT changes."""
         n = max(1, len(self._links))
+        # A Link added or removed ends a maximize first: the arrangement it saved has the
+        # old number of bands, and a workspace saved after would record it.
+        restored = n != self._timeline_rows_shown and self.restore_panes()
         while len(self._ribbons) < n:
             self._add_ribbon()
         while len(self._ribbons) > n:
@@ -4743,8 +5044,13 @@ class MainWindow(QMainWindow):
                 label.set_link(self._links[i].name, i == self._links.active_index)
         if n != self._timeline_rows_shown:
             self._timeline_rows_shown = n
-            self.resizeDocks([self._timeline_dock], [n * TimelineRibbon.BAND_HEIGHT + 24],
-                             Qt.Vertical)
+            def resize() -> None:
+                self.resizeDocks([self._timeline_dock],
+                                 [n * TimelineRibbon.BAND_HEIGHT + 24], Qt.Vertical)
+            if restored:             # a resize in the pass that restored the state is lost
+                timers.after(0, self, resize)
+            else:
+                resize()
 
     def _update_timeline_domain(self) -> None:
         """Every ribbon covers the UNION of the Links' spans in global time, each in its
@@ -5348,7 +5654,7 @@ class MainWindow(QMainWindow):
         self._reg_view.set_files(session.register_files_at(0))
         self._reg_view.set_peripheral_maps(session.peripheral_maps)
         self._reg_view.set_device_names(session.device_names)
-        self._reg_view.set_phy(session.link_control.phy_name)
+        self._reg_view.set_phy(session.phy_at(0))          # as of the files above
         # Statistics: this Link's rows if they were built, else built now when the pane is
         # showing, else on its first show (see _refresh_measurements).
         if st.meas_rows is not None and not st.meas_dirty:
@@ -5799,8 +6105,7 @@ class MainWindow(QMainWindow):
         there and surface it in the Raw Capture pane, zoomed to a couple of bus rows and
         centered on the event so its clock edge sits in the middle of the pane."""
         self._on_seek(int(sample))
-        self._raw_dock.show()
-        self._raw_dock.raise_()
+        self._show_dock(self._raw_dock)
         self._capture_lane().center_on_sample(int(sample), 2)
 
     def _on_register_overrides_cleared(self) -> None:
@@ -6234,6 +6539,8 @@ class MainWindow(QMainWindow):
         tree replays command history (C++) — skip it when the Registers tab is hidden;
         _on_reg_dock_visible refreshes it when re-shown."""
         if self._session is not None and not self._reg_dock.isHidden():
+            # The PHY block follows the bring-up in force: a later one can select another.
+            self._reg_view.set_phy(self._session.phy_at(sample))
             self._reg_view.set_files(self._session.register_files_at(sample))
 
     def _cursor_commands(self, sample: int) -> None:
@@ -6277,20 +6584,43 @@ class MainWindow(QMainWindow):
         # transitions into a column grid just shows a bogus 2/4-col bus. Gate both modes on
         # it, ABOVE the TX-map branch. (A warm start / mid-stream capture is configured from
         # row 0, so it falls through and shows the grid / TX map as normal.)
-        lc = s.link_control
-        if lc.sequence == "cold" and sample < s.audio_start_sample:
+        # The bring-up the cursor is in, the first or a later one (the Link went inactive,
+        # its clock stopped, and a new start sequence followed). A later one of either kind
+        # gets the overlay: the bus stopped, so the old grid is not on the wire, and the
+        # stretch the clock stopped for (its Idle) reads Link Inactive.
+        lc = s.bringup_at(sample)
+        later = lc is not None and lc is not s.link_control
+        if lc is not None and later and lc.sequence == "warm":
+            phase = next((sec["name"] for sec in lc.sections
+                          if int(sec.get("start", 0)) <= sample < int(sec.get("end", 0))), "")
+            if phase == "Idle":
+                self._grid_view.show_message(
+                    "Link Inactive", "The clock stopped; a new start sequence follows (§5.1.2)")
+            else:
+                sl = f" — Safe-Lock-{lc.safe_lock_columns}" if lc.safe_lock_columns else ""
+                self._grid_view.show_message(
+                    f"{lc.phy_name or 'PHY'} Reused",
+                    f"Warm Start, audio not started yet{sl} (§5.1.2)")
+            return
+        if lc is not None and lc.sequence == "cold":
+            audio_start = int(lc.audio_start_sample or 0)
             # The selected PHY is only KNOWN once its number has been fully clocked — at
             # PhyStart (the final DP falling edge → audio-mode PHY). Before that point
             # nothing on the wire names a PHY, so don't claim one (the decoded result knows
             # the answer, but at THIS cursor it can't be known yet). After it — but before
             # audio starts — the PHY is fixed, just with no geometry yet.
-            phy_known_at = lc.phystart_sample or lc.phy_select_sample or s.audio_start_sample
+            phy_known_at = lc.phystart_sample or lc.phy_select_sample or audio_start
             if sample < int(phy_known_at):
                 # Name the current bring-up sub-phase (Bus Reset / Cold Start / PhyStart)
                 # for context — never the PHY, which isn't decoded yet at this cursor.
                 phase = next((sec["name"] for sec in lc.sections
                               if int(sec.get("start", 0)) <= sample < int(sec.get("end", 0))),
                              "")
+                if phase == "Idle" and later:
+                    self._grid_view.show_message(
+                        "Link Inactive",
+                        "The clock stopped; a new start sequence follows (§5.1.2)")
+                    return
                 self._grid_view.show_message(
                     "No PHY Selected",
                     f"Link bring-up in progress — {phase} (§5.1.2)" if phase
@@ -6793,8 +7123,7 @@ class MainWindow(QMainWindow):
         # Expected (CSV) config in the register view (blue), beside the green values
         # snooped from the bus — the visual side of the register-map comparison.
         self._reg_view.set_expected(expected)
-        self._reg_dock.show()
-        self._reg_dock.raise_()
+        self._show_dock(self._reg_dock)
 
         # Baseline = the decoder's effective register config (snooped from the bus);
         # absent addresses fall back to their spec reset value inside register_diff.

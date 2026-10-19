@@ -46,6 +46,9 @@ fresh build of the native core — which is what you want after pulling changes 
 `native/`. The compiled module isn't tracked in git, and the app reports an "out of date —
 rebuild" message if it spots a stale one.
 
+Ctrl+C in the terminal that launched the app quits it as File ▸ Quit does; if that quit
+hangs, a second Ctrl+C ends the process at once.
+
 Both launchers pick the newest **3.11–3.13** they can find, because PySide6 / pyarrow / numpy
 have no 3.14+ wheels yet and pip would otherwise try to build Arrow from source. On 3.14 use
 the manual setup below, once wheels exist for your platform.

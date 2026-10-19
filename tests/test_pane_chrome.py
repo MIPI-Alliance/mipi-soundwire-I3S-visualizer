@@ -7,6 +7,8 @@
   overflowing label only on an axis WITHOUT a grid), which left just "0".
 - Every Link picker draws the same chevron, the Commands one and those in the dock title
   bars; it is in the shipped assets.
+- A tree section's open / closed arrow is drawn in its heading's colour in each theme, not
+  the platform's black, and on a selected heading it sits on the row's fill.
 - The timeline's Link-name column is as narrow as the names allow.
 - The waveform colours and line weight are reachable from the View menu.
 - In All Links, lanes of different lengths share one window and put their ticks at the
@@ -128,3 +130,38 @@ def test_the_view_menu_opens_the_waveform_preferences(win, monkeypatch):
                if a.text().replace("&", "").startswith("Waveform Colors"))
     act.trigger()
     assert len(opened) == 1
+
+
+def test_a_tree_sections_arrow_is_drawn_in_its_heading_colour():
+    """Left to the platform, the Registers tree's open / closed arrow was drawn black, which
+    the dark theme's panel hid. Each theme draws it with its own text colour (the heading's),
+    from the shipped assets, and a selected heading's arrow sits on the row's fill in the
+    light shade of its white text."""
+    import re
+
+    from swi3s_studio.ui import theme
+    from swi3s_studio.ui.theme import VizTheme
+    QApplication.instance() or QApplication([])
+    original = VizTheme.MODE
+    try:
+        for mode in ("dark", "light"):
+            theme.apply_palette(mode)
+            sheet = theme.analyzer_stylesheet()
+
+            def arrow(selector, sheet=sheet):
+                m = re.search(re.escape(selector) + r"\s*\{\s*image:\s*url\(([^)]*)\)", sheet)
+                assert m, f"{selector} has no arrow in the {mode} theme"
+                return pathlib.Path(m.group(1))
+            for state, glyph in (("closed", "right"), ("open", "down")):
+                path = arrow(f"QTreeView::branch:has-children:{state}")
+                assert path.name == f"chevron-{glyph}-{mode}.svg" and path.is_file()
+                assert f'stroke="{VizTheme.TEXT}"' in path.read_text(), (
+                    f"the {mode} {glyph} arrow is not the heading's colour {VizTheme.TEXT}")
+                selected = arrow(f"QTreeView::branch:has-children:{state}:selected")
+                assert selected.name == f"chevron-{glyph}-dark.svg"   # light, on the fill
+            fill = re.search(r"QTreeView::branch:selected[^{]*\{\s*background:\s*([^;]+);",
+                             sheet)
+            assert fill and fill.group(1).strip() == VizTheme.ACCENT, (
+                f"a selected heading's arrow is not on the selection fill in the {mode} theme")
+    finally:
+        theme.apply_palette(original)

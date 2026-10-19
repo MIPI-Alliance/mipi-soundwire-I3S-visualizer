@@ -12,7 +12,12 @@ from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 import numpy as np
 import swi3score
 
-from .analysis.link_control import LinkControlResult, decode_link_control
+from .analysis.link_control import (
+    LinkControlResult,
+    clock_resumes,
+    decode_link_control,
+    decode_link_controls,
+)
 from .ingest import saleae_binary, transitions
 from .ingest.capture import Capture
 from .model import DeviceRegisterFile, Provenance, RegisterMap
@@ -20,7 +25,7 @@ from .nputil import searchsorted as _searchsorted
 
 # ABI the Python side expects from the swi3score native module (see bindings.cpp
 # `score_abi`). Bump both together when a binding's return shape changes.
-_REQUIRED_SCORE_ABI = 12
+_REQUIRED_SCORE_ABI = 15
 
 
 # A config CSV imposed on ONE region (Session.apply_config_csv_at) is kept in the source
@@ -247,6 +252,7 @@ class Session:
         # and tell the decoder to skip NRZS and read the CDS at Column 2. FBCSE (PHY1/2)
         # and mid-stream captures keep the forwarded-clock source.
         self._link_control = decode_link_control(capture)
+        self._later_link_controls: Optional[List[LinkControlResult]] = None   # link_controls
         self._decode_checking_bringup(settings, decoder_ready)
 
         # Per-device peripheral (vendor) register maps, keyed by device number.
@@ -260,7 +266,7 @@ class Session:
         # Whole-capture register state, sourced from the C++ decode authority (same
         # as register_files_at, whole-capture / no overrides).
         self.register_files: Dict[int, DeviceRegisterFile] = self._build_register_files(
-            self._config_commands(), None)
+            self._config_commands_since_reset(), None)
         # _link_control was decoded up front (source selection); keep it (property caches).
         # For DLV, capture the virtual PLL's recovered Row Sync Points NOW, from the real
         # DlvSampleSource — a later in-place re-decode (scrambler / register what-if)
@@ -308,7 +314,13 @@ class Session:
         self.segments: List[dict] = self.decoder.segments()
 
     def _decode_checking_bringup(self, settings, decoder_ready=None) -> None:
-        """Decode, then drop the detected bring-up if the decode contradicts it.
+        """Decode, then drop any detected bring-up the decode contradicts: the first
+        (`_check_first_bringup`), then each later one (`_check_later_bringups`)."""
+        self._check_first_bringup(settings, decoder_ready)
+        self._check_later_bringups(settings, decoder_ready)
+
+    def _check_first_bringup(self, settings, decoder_ready=None) -> None:
+        """Decode, then drop the detected first bring-up if the decode contradicts it.
 
         The detector reads only the raw edges, and a capture with NO bring-up can satisfy
         it: on the PHY1, PHY2 and flow-control demos recorded without a cold start, and on
@@ -355,6 +367,50 @@ class Session:
             restore()                                      # no evidence either way: keep it
             self._link_control = lc
             self._decode_with(settings, decoder_ready)
+
+    def _check_later_bringups(self, settings, decoder_ready=None) -> None:
+        """Drop a later bring-up the decode contradicts.
+
+        The decode does not run inside a later one (from its clock stop to its restart the
+        Link is inactive and nothing is decoded), so the evidence is what follows it: a
+        genuine bring-up decodes CRC-valid commands after its restart, framed at the
+        Safe-Lock count it selected. One after which none decodes, up to the next bring-up
+        or the end, is checked by decoding once without it, and dropped if that decode finds
+        CRC-valid commands from its clock stop to there (the Link never went down: its
+        clock only paused). A genuine bring-up never pays the extra decode."""
+        later = self.link_controls[1:]
+        if not later:
+            return
+        spans = self._later_spans(later)
+        suspects = [r for r, (restart, _stop, end) in zip(later, spans)
+                    if not self._valid_commands_between(restart, end)]
+        if not suspects:
+            return
+        everything = self._later_link_controls or []
+        self._later_link_controls = [r for r in everything
+                                     if not any(r is x for x in suspects)]
+        self._decode_with(settings, decoder_ready)
+        dropped = [r for r, (_restart, stop, end) in zip(later, spans)
+                   if any(r is x for x in suspects) and self._valid_commands_between(stop, end)]
+        self._later_link_controls = [r for r in everything
+                                     if not any(r is x for x in dropped)]
+        if len(dropped) < len(suspects):
+            self._decode_with(settings, decoder_ready)      # the kept ones restart again
+
+    def _later_spans(self, later) -> List[Tuple[int, int, int]]:
+        """(restart, clock stop, end) per later bring-up: where the decode restarts, where
+        the Link stopped before it, and where the next one's stop (or the capture) ends
+        what it opens."""
+        stops = [int(r.clock_stop_sample if r.clock_stop_sample is not None
+                     else self._restart_sample(r)) for r in later]
+        ends = stops[1:] + [1 << 62]
+        return [(self._restart_sample(r), stop, end)
+                for r, stop, end in zip(later, stops, ends)]
+
+    def _valid_commands_between(self, lo: int, hi: int) -> bool:
+        """Whether a CRC-valid command decodes with its start in [lo, hi)."""
+        return any(c.get("crc_valid") and lo <= int(c.get("start_sample", 0)) < hi
+                   for c in self.commands)
 
     def _valid_commands_inside(self, lc) -> int:
         """CRC-valid commands decoded inside a detected bring-up: from its first non-Idle
@@ -446,6 +502,88 @@ class Session:
         if self._link_control is None:
             self._link_control = decode_link_control(self.capture)
         return self._link_control
+
+    @property
+    def link_controls(self) -> List[LinkControlResult]:
+        """Every link bring-up the decode follows: `link_control` first (sequence 'none'
+        when the capture starts in audio mode), then each later start sequence after the
+        Link went inactive (decode_link_controls), at each of which the decode restarts
+        (`_restart_points`). Lazy + cached, and computed with the decode in __init__, so the
+        gap search runs in the load worker rather than on the GUI thread.
+
+        Only bring-ups of the decode's PHY family, or naming no PHY, are listed: PHY3 ones
+        on a DLV decode, PHY1 and PHY2 ones on an FBCSE one. A bring-up of the other family
+        would switch the decode between the forwarded clock and the recovered one, while the
+        sample source, the UI index every sample maps through and the Capture pane's drawing
+        are each fixed per capture; so the decode runs on through it in the old geometry,
+        and nothing presents it as a restart: not the Timeline, the Bus Grid or the register
+        replay."""
+        found = getattr(self, "_later_link_controls", None)
+        if found is None:
+            found = self._later_link_controls = decode_link_controls(self.capture)[1:]
+        # The first is read live: a rejected bring-up replaces it after the first decode.
+        dlv = self.is_dlv
+        later = [r for r in found if r.phy_name is None or (r.phy_name == "PHY3") == dlv]
+        return [self.link_control] + later
+
+    @staticmethod
+    def _strip_start(r: LinkControlResult) -> int:
+        """Where a later bring-up's strip begins: its first section (its Idle, the stretch
+        the clock stopped for)."""
+        return int(r.sections[0]["start"]) if r.sections else int(r.audio_start_sample or 0)
+
+    def bringup_at(self, sample: int) -> Optional[LinkControlResult]:
+        """The link bring-up whose strip contains `sample` — from its first section (a later
+        one's Idle, the stretch the clock stopped for) to its audio start — or None in audio
+        mode. The first bring-up's strip runs from the start of the capture; a capture that
+        starts in audio mode has none, and its later bring-ups still have theirs."""
+        lcs = self.link_controls
+        first = lcs[0]
+        if first.sequence != "none" and sample < int(first.audio_start_sample or 0):
+            return first
+        for r in lcs[1:]:
+            if r.audio_start_sample is not None and (
+                    self._strip_start(r) <= sample < int(r.audio_start_sample)):
+                return r
+        return None
+
+    def phy_at(self, sample: int) -> Optional[str]:
+        """The PHY named by the bring-up in force at `sample`: the last one whose strip
+        begins at or before it, the first's from the start of the capture. None where that
+        bring-up names none (no bring-up, or an unrecognised PHY number)."""
+        phy = self.link_control.phy_name
+        for r in self.link_controls[1:]:
+            if self._strip_start(r) <= sample:
+                phy = r.phy_name
+        return phy
+
+    @staticmethod
+    def _bus_reset_start(r: LinkControlResult) -> int:
+        """Where a Cold Start's Bus Reset begins (its LC:00, else the LC:10 rise)."""
+        sec = next((x for x in r.sections if x.get("name") == "Bus Reset"), None)
+        if sec is not None:
+            return int(sec["start"])
+        return int(r.bus_reset_sample if r.bus_reset_sample is not None
+                   else r.audio_start_sample or 0)
+
+    def _replay_start(self, sample: Optional[int]) -> int:
+        """The sample the config replay starts from for state as-of `sample` (None = the
+        end of the capture): the Bus Reset of the last later Cold Start the decode restarted
+        at, at or before it, else 0. Keyed on the Bus Reset, not on the segment the restart
+        opens: the bus is reset from there, while the decode has nothing to decode until
+        the restart (the Link is inactive), so from the reset on the registers read their
+        reset values. The resets are fixed per decode (`_configure_source_for_phy`)."""
+        resets = getattr(self, "_replay_resets", [])
+        i = len(resets) if sample is None else bisect.bisect_right(resets, int(sample))
+        return resets[i - 1] if i else 0
+
+    def _config_commands_since_reset(self) -> List[dict]:
+        """_config_commands() from the last Cold Start: the configuration the capture ends
+        in, which nothing before a bus reset contributes to."""
+        start = self._replay_start(None)
+        if not start:
+            return self._config_commands()
+        return [c for c in self._config_commands() if int(c.get("start_sample", 0)) >= start]
 
     @property
     def audio_start_sample(self) -> int:
@@ -689,6 +827,12 @@ class Session:
         scrambler / hub-depth / register what-if / config-CSV change re-runs the decode."""
         self._cds_horizontal_start = 0             # DLV CDS column (0 = FBCSE, CDS at Col 0)
         cap = self.capture
+        settings.restart_points = self._restart_points()
+        settings.resume_points = [] if self.is_dlv else clock_resumes(self.capture,
+                                                                      self.link_controls)
+        self._replay_resets: List[int] = sorted(
+            self._bus_reset_start(r) for r in self.link_controls[1:]
+            if r.sequence == "cold" and r.audio_start_sample is not None)
         if self.is_dlv:
             cols = int(self._forced_column_count or self.link_control.safe_lock_columns or 4)
             settings.dlv = True
@@ -716,6 +860,28 @@ class Session:
             settings.forced_column_count = int(self.link_control.safe_lock_columns)
             self._forced_column_count = int(self.link_control.safe_lock_columns)
         return cap.sample_source()
+
+    def _restart_points(self) -> List[tuple]:
+        """The decoder's restart_points: one (restart, Safe-Lock columns, cold, inactive
+        from) per later bring-up in `link_controls`, whether or not the capture had a first
+        one. `restart` is the first clock edge after the bring-up's PhyStart, where audio
+        mode actually begins (Man_tPhyStart is 64–96 µs, so the nominal audio start can be
+        16 µs out either way); `inactive from` is the first sample after the clock stopped.
+        On DLV the clock is the DP wire, whose first edge after PhyStart is the first Row
+        Sync, where the recovered clock locks again."""
+        return [(self._restart_sample(r), int(r.safe_lock_columns or 0), r.sequence == "cold",
+                 int(r.clock_stop_sample) + 1 if r.clock_stop_sample is not None else 0)
+                for r in self.link_controls[1:] if r.audio_start_sample is not None]
+
+    def _restart_sample(self, r: LinkControlResult) -> int:
+        """The first clock edge after `r`'s PhyStart (its nominal audio start when there is
+        none): the UI the decoder restarts at."""
+        if r.phystart_sample is not None:
+            ce = self.capture.clock_edges
+            i = int(_searchsorted(ce, int(r.phystart_sample), side="right"))
+            if i < len(ce):
+                return int(ce[i])
+        return int(r.audio_start_sample or 0)
 
     def _redecode(self) -> None:
         """Rebuild the decoder from the current settings + overrides and re-run."""
@@ -761,7 +927,7 @@ class Session:
         self.ui_rate_hz = self.decoder.measured_ui_rate_hz
         self.segments = self.decoder.segments()
         self._reload_csv_seed()                  # config CSV may have changed (apply_config_csv)
-        self.register_files = self._build_register_files(self._config_commands(), None)
+        self.register_files = self._build_register_files(self._config_commands_since_reset(), None)
 
     def apply_config_csv(self, path: Optional[str]) -> None:
         """Impose a Visualizer config CSV on the ALREADY-OPEN capture (no reopen): a
@@ -1349,7 +1515,7 @@ class Session:
             # A config CSV is imposed (apply_config_csv): draw the grid from the CSV
             # baseline + any wire config so it matches the CSV, rather than the
             # decoder's snoop-only grid (empty for a post-commit capture).
-            replay = self._csv_replay + self._grid_replay(self._config_commands())
+            replay = self._csv_replay + self._grid_replay(self._config_commands_since_reset())
             return swi3score.grid_from_commands(replay, rows, force_columns=self.column_count,
                                                 dlv=self.is_dlv,
                                                 cds_horizontal_start=self._cds_horizontal_start)
@@ -1409,7 +1575,8 @@ class Session:
         replay = self._grid_replay_in_effect(sample)
         # A config CSV imposed on the capture is the baseline from row 0 (its write+
         # commit replay prepended), so a post-commit capture matches the CSV and any
-        # real bus writes still layer on top (later replay entries win).
+        # real bus writes still layer on top (later replay entries win). It stays the
+        # baseline after a later Cold Start, as the decode keeps the CSV's ports there.
         if self._csv_replay:
             replay = self._csv_replay + replay
         # What-if overrides for the section under the cursor, folded in by the C++
@@ -1770,7 +1937,8 @@ class Session:
         replay dicts are precomputed once per decode (in effective order), so a cursor
         move is a bisect + list slice — no per-move dict rebuild of every command."""
         _eff, _cmds, replay, replay_eff = self._effective_sorted()
-        return replay[:bisect.bisect_right(replay_eff, int(sample))]
+        lo = bisect.bisect_left(replay_eff, self._replay_start(sample))   # a bus reset since?
+        return replay[lo:bisect.bisect_right(replay_eff, int(sample))]
 
     def _effective_sorted(self):
         """(eff_samples, commands, replay, replay_eff) — the config commands sorted by
@@ -2094,7 +2262,12 @@ class Session:
                 # across the commit. row_period = operational UI * operational columns.
                 seg_ui = ui * self.column_count / max(1, int(seg["column_count"]))
                 off = int(round((sample - int(seg["start_sample"])) / seg_ui))
-                return int(seg["start_ui"]) + max(0, off)
+                # A segment's UIs end where the next one's begin: the recovered clock skips
+                # a stopped Link's stretch, so a sample in it maps to the restart's UI.
+                nxt = next((int(b["start_ui"]) for a, b in zip(self.segments, self.segments[1:])
+                            if a is seg), None)
+                at = int(seg["start_ui"]) + max(0, off)
+                return at if nxt is None else min(at, nxt)
         return int(_searchsorted(self.capture.clock_edges, sample, side="right"))
 
     def _recovered_row_syncs(self) -> np.ndarray:
@@ -2743,9 +2916,15 @@ class Session:
         # bisect per cursor move — mirroring the grid path (_grid_replay_in_effect) —
         # instead of rebuilding the whole replay from the in-effect commands every move.
         reg_replay, reg_eff = self._reg_replay_sorted()
-        replay = reg_replay[:bisect.bisect_right(reg_eff, int(sample))]
-        sect = self.segment_index_for_sample(int(sample))
-        return self._build_register_files_from_replay(replay, sect)
+        reset = self._replay_start(sample)                              # a bus reset since?
+        lo = bisect.bisect_left(reg_eff, reset)
+        replay = reg_replay[lo:bisect.bisect_right(reg_eff, int(sample))]
+        index = self.segment_index_for_sample(int(sample))
+        # Between a later Cold Start's Bus Reset and its restart the decode is still in the
+        # old section, but the bus was reset: that section's what-ifs do not apply.
+        stale = bool(reset and self.segments
+                     and int(self.segments[index]["start_sample"]) < reset)
+        return self._build_register_files_from_replay(replay, None if stale else index)
 
     @staticmethod
     def _reg_replay_entry(c):
@@ -2836,7 +3015,9 @@ class Session:
         src_prov = {1: Provenance.WRITTEN, 2: Provenance.READ}
         # CSV-import baseline (Provenance.CSV): seed UNDERNEATH the snooped writes/reads
         # so a post-commit capture (nothing on the wire) shows the CSV config, while any
-        # real bus write/read re-seeds the same address below and wins.
+        # real bus write/read re-seeds the same address below and wins. The CSV is the
+        # capture's configuration through every bring-up (the decode keeps its ports
+        # across a later Cold Start too), so it seeds the state after a bus reset as well.
         for dev, addr, cur, has_cur, _cs, nxt, has_next, _ns in self._csv_snap:
             if (dev, addr) in override_bases:
                 continue
@@ -3162,7 +3343,7 @@ class Session:
         else:
             self.peripheral_maps[device] = pmap
         if rebuild:
-            self.register_files = self._build_register_files(self._config_commands(), None)
+            self.register_files = self._build_register_files(self._config_commands_since_reset(), None)
 
     def _config_commands(self):
         """The config-relevant commands only — CRC-valid WriteA32, every Commit, and

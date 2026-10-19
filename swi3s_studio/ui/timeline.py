@@ -193,7 +193,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._segments: List[dict] = []      # bus-config segments (start_sample, column_count, …)
         self._seg_band: dict = {}            # column_count -> band QColor
         self._bringup: dict = {}             # §5.1.2 link bring-up region (or empty)
-        self._link_sections: List[dict] = [] # named LC sub-phases within the bring-up
+        self._link_sections: List[dict] = [] # named LC sub-phases within the bring-ups
+        self._later_bringups: List[dict] = [] # later bring-ups (after the Link went inactive)
         self._rate = 0.0                 # sample rate, for the hover tooltip's time
         self._row_label = None           # fn(sample) -> 0-based display row, for the hover
         self._view_lo = 0.0              # visible sample window (zoom/pan); full = [0,_total]
@@ -282,32 +283,49 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._total = max(1, int(total_samples))
         self._reset_view()                       # new capture → show the whole thing
 
-    def set_bringup(self, result) -> None:
-        """Mark the §5.1.2 link bring-up region (Bus Reset → PHY-select → audio).
-        `result` is a LinkControlResult; cleared when there's no bring-up so the
-        ribbon shows nothing extra for mid-stream/plain captures."""
-        if result is None or getattr(result, "sequence", "none") == "none":
-            self._bringup = {}
-            self._link_sections = []
-        else:
-            self._bringup = {
-                "start": int(result.bus_reset_sample or 0),
-                "phy_select": (int(result.phy_select_sample)
-                               if result.phy_select_sample is not None else None),
-                "phystart": (int(result.phystart_sample)
-                             if result.phystart_sample is not None else None),
-                "audio_start": int(result.audio_start_sample or 0),
-                "label": result.label(),
-                # For the safe-lock band label: the selected PHY + its Safe-Lock column
-                # count, so the initial audio segment reads e.g. "Cold Start PHY2".
-                "sequence": getattr(result, "sequence", "none"),
-                "phy_name": getattr(result, "phy_name", None),
-                "safe_lock_columns": getattr(result, "safe_lock_columns", None),
-            }
-            # Named LC sub-phases (Idle / Bus Reset / Cold|Warm Start / PhyStart /
-            # LC_Request) — drawn as distinct colour bands within the bring-up region.
-            self._link_sections = list(getattr(result, "sections", []) or [])
+    def set_bringups(self, results) -> None:
+        """Mark every link bring-up (Session.link_controls): the first — absent ('none')
+        when the capture starts in audio mode — and each later one after the Link went
+        inactive, whose Idle section is the stretch the clock stopped for. The config bands
+        stop where a later one begins, and the region a later one opens (Cold or Warm) is
+        labelled by its PHY, as the first's is."""
+        results = [r for r in (results or []) if r is not None]
+        first = results[0] if results else None
+        present = [r for r in results if getattr(r, "sequence", "none") != "none"]
+        self._bringup = ({} if first is None or getattr(first, "sequence", "none") == "none"
+                         else self._bringup_marks(first))
+        self._later_bringups = [self._bringup_marks(r) for r in present if r is not first]
+        # Named LC sub-phases (Idle / Bus Reset / Cold|Warm Start / PhyStart / LC_Request)
+        # — drawn as distinct colour bands within each bring-up region.
+        self._link_sections = [sec for r in present for sec in (getattr(r, "sections", []) or [])]
         self.update()
+
+    @staticmethod
+    def _bringup_marks(result) -> dict:
+        sections = list(getattr(result, "sections", []) or [])
+        return {
+            "start": int(result.bus_reset_sample or 0),
+            # Where the bring-up's strip begins: its first section (a later one's Idle).
+            "span_start": int(sections[0]["start"]) if sections else int(
+                result.bus_reset_sample or result.phy_select_sample or 0),
+            "phy_select": (int(result.phy_select_sample)
+                           if result.phy_select_sample is not None else None),
+            "phystart": (int(result.phystart_sample)
+                         if result.phystart_sample is not None else None),
+            "audio_start": int(result.audio_start_sample or 0),
+            "label": result.label(),
+            # For the safe-lock band label: the selected PHY + its Safe-Lock column
+            # count, so the region it opens reads e.g. "PHY2 Safe-Lock-2".
+            "sequence": getattr(result, "sequence", "none"),
+            "phy_name": getattr(result, "phy_name", None),
+            "safe_lock_columns": getattr(result, "safe_lock_columns", None),
+        }
+
+    def _in_bringup(self, sample: int) -> bool:
+        """Whether `sample` is in a bring-up's strip rather than an audio region."""
+        if self._bringup and sample < int(self._bringup.get("audio_start", 0)):
+            return True
+        return any(b["span_start"] <= sample < b["audio_start"] for b in self._later_bringups)
 
     def set_cursor(self, sample: int) -> None:
         self._cursor = int(sample)
@@ -582,6 +600,10 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                               if i + 1 < len(self._segments) else tr.right())
             if band_left is not None and x0 < band_left:
                 x0 = band_left
+            for b in self._later_bringups:            # the band ends where the Link stopped
+                bx = self._clampx(self._x_for(b["span_start"]))
+                if x0 < bx < x1:
+                    x1 = bx
             if x1 <= x0:
                 continue
             cols = int(seg.get("column_count", 0))
@@ -605,7 +627,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         # capture this region is well under a pixel wide, so draw an ALWAYS-VISIBLE
         # marker in a distinct cyan (NOT the gold Commit+SSP tick): a min-width band,
         # a solid vertical line at the PHY-select edge, and a downward flag on top.
-        if self._bringup:
+        if self._bringup or self._later_bringups:
             # Named sub-phase bands (Idle / Bus Reset / Cold|Warm Start / PhyStart /
             # LC_Request), each its own data-port-palette colour, drawn in the SAME top
             # strip as the config "Ncol" bands (so LC regions read like the audio-mode
@@ -624,21 +646,22 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                     p.setPen(QPen(QColor(VizTheme.TEXT)))
                     p.drawText(QRectF(sx0 + 3, tr.top(), w - 5, _CFG_BAND_H),
                                Qt.AlignLeft | Qt.AlignVCenter, sec.get("name", ""))
-            if not self._link_sections:                       # fallback: single cyan band
+            if self._bringup and not self._link_sections:     # fallback: single cyan band
                 bx0 = self._clampx(self._x_for(self._bringup["start"]))
                 bx1 = self._clampx(self._x_for(self._bringup["audio_start"]))
                 band = QRectF(bx0, tr.top(), max(4.0, bx1 - bx0), _CFG_BAND_H)
                 p.fillRect(band, QColor(_C_BRINGUP.red(), _C_BRINGUP.green(), _C_BRINGUP.blue(), 120))
                 p.setPen(QPen(_C_BRINGUP, 1))
                 p.drawRect(band)
-            ps = self._bringup.get("phy_select")
-            mx = self._clampx(self._x_for(ps if ps is not None else self._bringup["start"]))
-            p.setPen(QPen(_C_BRINGUP, 2))
-            p.drawLine(int(mx), int(tr.top()), int(mx), int(tr.bottom()))
-            flag = QPolygonF([QPointF(mx - 4, tr.top() - 7), QPointF(mx + 4, tr.top() - 7),
-                              QPointF(mx, tr.top())])           # downward triangle above track
-            p.setBrush(_C_BRINGUP); p.setPen(QPen(_C_BRINGUP, 1))
-            p.drawPolygon(flag)
+            for b in ([self._bringup] if self._bringup else []) + self._later_bringups:
+                ps = b.get("phy_select")
+                mx = self._clampx(self._x_for(ps if ps is not None else b["start"]))
+                p.setPen(QPen(_C_BRINGUP, 2))
+                p.drawLine(int(mx), int(tr.top()), int(mx), int(tr.bottom()))
+                flag = QPolygonF([QPointF(mx - 4, tr.top() - 7), QPointF(mx + 4, tr.top() - 7),
+                                  QPointF(mx, tr.top())])       # downward triangle above track
+                p.setBrush(_C_BRINGUP); p.setPen(QPen(_C_BRINGUP, 1))
+                p.drawPolygon(flag)
         # baseline
         p.setPen(QPen(_C_AXIS))
         p.drawLine(int(tr.left()), int(tr.bottom()), int(tr.right()), int(tr.bottom()))
@@ -828,7 +851,9 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     def _band_label(self, index: int, seg: dict) -> str:
         """A band's label: the user's name for the region, then what it is."""
         what = self._segment_label(index, int(seg.get("column_count", 0)),
-                                   bool(seg.get("forced")), bool(seg.get("csv")))
+                                   bool(seg.get("forced")), bool(seg.get("csv")),
+                                   int(seg.get("start_sample", 0)) if seg.get("restart")
+                                   else None)
         name = str(seg.get("name") or "").strip()
         return f"{name} · {what}" if name else what
 
@@ -840,7 +865,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             return None
         # The bring-up's bands sit over the start of region 0, which is drawn only from the
         # audio start (paintEvent's band_left); a click there is the bring-up's, not region 0's.
-        if self._bringup and self._sample_for(pos.x()) < int(self._bringup.get("audio_start", 0)):
+        if self._in_bringup(self._sample_for(pos.x())):
             return None
         seg = self._segment_at(self._sample_for(pos.x()))
         if seg is None:
@@ -849,7 +874,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         return int(s.get("index", i)), s
 
     def _segment_label(self, index: int, cols: int, forced: bool = False,
-                       csv: bool = False) -> str:
+                       csv: bool = False, restart: Optional[int] = None) -> str:
         """Config-band label. The initial audio segment of a cold/warm start is the
         selected PHY's Safe-Lock geometry, so label it by the PHY (e.g. 'PHY2
         Safe-Lock-2') — the PHY is what makes that 2-column (FBCSE) / 4-column (DLV)
@@ -859,9 +884,15 @@ class TimelineRibbon(RowOriginMixin, QWidget):
 
         A `forced` region had its width pinned by the user, so say so — otherwise a
         pinned width is indistinguishable from one the decoder read off the wire. A `csv`
-        region decodes with a config CSV imposed on it, which says so for the same reason."""
+        region decodes with a config CSV imposed on it, which says so for the same reason.
+
+        `restart`, the start sample of a region a later bring-up (Cold or Warm) opened,
+        labels it by that bring-up's PHY the same way."""
         b = self._bringup
-        if (index == 0 and b and b.get("phy_name")
+        if restart is not None:
+            b = next((x for x in reversed(self._later_bringups)
+                      if x["span_start"] <= restart), {})
+        if ((index == 0 or restart is not None) and b and b.get("phy_name")
                 and b.get("safe_lock_columns") == cols and not forced and not csv):
             return f"{b['phy_name']} Safe-Lock-{cols}"
         return f"{cols}col (forced)" if forced else f"{cols}col (CSV)" if csv else f"{cols}col"

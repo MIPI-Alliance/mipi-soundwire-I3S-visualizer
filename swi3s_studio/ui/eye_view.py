@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from ..analysis.bus_timing import measure_bus_timing
 from . import line_style
+from .click_label import ClickLabel
 from .port_names import with_name
 from .theme import VizTheme, analyzer_stylesheet
 
@@ -76,22 +77,6 @@ class _MultiMenu(QMenu):
         if act is not None and act.isCheckable() and act.isEnabled():
             act.trigger()                 # toggle in place, keep the menu up
             return
-        super().mouseReleaseEvent(event)
-
-
-class _ClickLabel(QLabel):
-    """A QLabel that emits `clicked` on a left-button release — used for the timing
-    view's clickable colour-key entries (click to hide/show that edge flavour)."""
-
-    clicked = Signal()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setCursor(Qt.PointingHandCursor)
-
-    def mouseReleaseEvent(self, event):  # noqa: N802 (Qt signature)
-        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
-            self.clicked.emit()
         super().mouseReleaseEvent(event)
 
 
@@ -152,9 +137,9 @@ class EyeView(QWidget):
         row.addWidget(self._filter)
         row.addSpacing(16)
         # Clickable colour key: click a flavour to hide/show it; hidden ones grey out.
-        self._legend_labels = {}      # (ck, dk) -> _ClickLabel
+        self._legend_labels = {}      # (ck, dk) -> ClickLabel
         for ck, dk, label, _color in _cat_specs():
-            lab = _ClickLabel()
+            lab = ClickLabel()
             lab.setTextFormat(Qt.RichText)
             lab.setToolTip("Click to hide/show this clock/data edge flavour")
             lab.clicked.connect(lambda c=ck, d=dk: self._toggle_category(c, d))

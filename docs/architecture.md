@@ -176,7 +176,8 @@ and the decoder falls back to the cold-start column count (so a *truly silent* C
 also falls back). Column 0 then recurs every `column_count` UIs from that anchor;
 the Raw-Capture view marks each Row-Sync-Point rising edge from the same segment
 geometry (`session.cds_column_samples`). A mid-stream geometry change re-runs the
-same detection (resync watchdog), producing one segment per width.
+same detection (resync watchdog), producing one segment per width; a later link bring-up
+opens one too (§6), so there is one segment per column count or link restart.
 
 ### pybind11 surface
 
@@ -321,9 +322,18 @@ others — Wireshark-style linked navigation.
   - *Bus Read* (CRC-valid Read's returned data) — the timeline's read colour; a
     read updates the rank it addresses (`_NEXT` alias → `_NEXT`, `_CURR` → `_CURR`)
   - *CSV Import* (expected config overlaid for Compare) — distinct color
+  - *Manual Edit* (a what-if override, below) — its own color
   Field tooltips decode bit ranges. **What-if editing**: right-click (or double-click) a
   register for *Edit fields…* or *Force value…*, which re-decodes so every pane follows;
-  *Clear all manual edits* reverts (shown as *Manual Edit*).
+  *Clear all manual edits* reverts (shown as *Manual Edit*). **The colour key is a filter
+  by provenance**: each entry (`click_label.KeyToggle`, a checkable button the keyboard
+  reaches) hides or shows the rows whose value came from it, each row filtered on its own
+  provenance (`_PROV_ROLE`, so `_NEXT` and `_CURR` apart) and a block left empty hidden.
+  Starting or changing the filter opens the blocks with rows to show (not Peripheral
+  Registers); rebuilds keep the user's open blocks, which are tracked by block id
+  (`_BLOCK_ROLE`, stable when a PHY or device changes a title) and given back when every
+  category shows again. A filter that leaves nothing says so; the workspace keeps the
+  filter and the open blocks (`ui/view_state.py`).
 - **Audio viewer** (pyqtgraph): multi-track waveforms per `(dp,channel)`, smooth
   zoom/scroll from the pyramid; region-select → **WAV export**; in-app **playback**
   via `QAudioSink`. Sample rate derived from RowRate + DP params (existing
@@ -438,6 +448,66 @@ one bus). Links are independent buses, so nothing is decoded across them. Each i
   as a Warm Start). A real bring-up precedes audio mode, so the Session drops any detection
   with CRC-valid commands decoded inside it (`Session._decode_checking_bringup`), and
   decodes again when the dropped one had steered the decode (a PHY3 path, a Safe-Lock seed).
+- **A Link can be brought up more than once.** After a clock stop longer than 1 ms past the
+  previous bring-up's audio start (or anywhere, in a capture that starts in audio mode),
+  `link_control.decode_link_controls` decodes the next start sequence from the stop on. A
+  detection counts only if it reaches audio mode, its start pulse rises within a few clock
+  edges of the clock moving again, and the clock then runs as audio mode does. The Session
+  hands each later one of the decode's PHY family to the core as a restart point
+  (`DecoderSettings.restart_points`: restart sample, Safe-Lock columns, cold, inactive
+  from). The restart sample is the first clock edge after PhyStart (on DLV, the DP wire's:
+  the first Row Sync), not the nominal audio start. From the clock stop to it nothing is
+  decoded and every port stops. There the decode re-aligns, frames at the Safe-Lock count,
+  reconfigures the payload engine on the new Column-0 phase and opens a segment flagged
+  `restart`; only a Cold Start also flags it `cold_start` and resets the register model. A
+  config CSV keeps its ports through both, and on FBCSE its column count. Every window read
+  and edge hunt stops at the next restart point (the leading window is 262144 UIs, which a
+  short first session fits inside), and the register and grid replays start from the Bus
+  Reset of the last Cold Start before the cursor.
+- **The phantom check applies to every bring-up.** The decode does not run inside a later
+  one, so the evidence is what follows it: one after which no CRC-valid command decodes is
+  checked by decoding once without it, and dropped when that decode finds CRC-valid
+  commands from its clock stop on (`Session._check_later_bringups`).
+- **A clock pause is not a bring-up.** Audio mode never pauses its clock, so a stop longer
+  than 1 ms with audio mode's clock after it and no bring-up there means samples were lost
+  or the capture was joined (`link_control.clock_resumes`, handed to the core as
+  `DecoderSettings.resume_points` on FBCSE). There the decode reads a fresh window: a bus
+  that carried on in phase is decoded on through as if nothing happened; one that did not is
+  framed afresh, its column count and Column-0 phase detected as at the start of a capture
+  that begins mid-stream, in a new segment that is no restart (registers kept). A later
+  bring-up's Link is inactive from its last audio-mode clock edge, found back over any
+  link-control edges before the stop (after a short idle the stop is the Bus Reset's LC:10
+  itself, with the LC_Ack and LC:00 edges before it).
+- **A DLV restart locks the recovered clock again.** Where the Link goes inactive the
+  decoder calls `ISampleSource::Reacquire`, and `DlvSampleSource` skips to the bring-up's
+  first Row Sync, the first rising DP edge at or after the restart sample: the stretch has
+  no rows, and its link-control pulses are single-ended edges the DLL would snap to. At the
+  restart it is called again with the restart's column count, and the DLL locks there as at
+  the first bring-up, at the seeded Safe-Lock row period over that count (a bring-up does
+  not change the row rate). Column 0 is the row it locked on (no phase search), the CDS is
+  at Column 2, and a config CSV does not set the count, as at the first bring-up. A row the
+  stop cut short keeps its bus row, so the restart opens the next: DLV rows are numbered by
+  their Row Sync Points (`Session.bus_row_for_sample`). The stretch has no UIs, so a sample
+  in it maps to the restart's (`Session._ui_for_sample`). The row log stays in UI order: the
+  UIs consumed after the last row edge belong to the row the stop cut short, and each
+  re-acquisition records its row, its UI and column count, and that cut row's UI. A seek
+  into the log (`bit_samples_window`, the CDS pane) replays each logged row from its edge,
+  with the column count the log gives it (a commit's `SetColumns` reaches no replay); from a
+  re-acquired row on the replay is the live decode exactly, while before it a seek restores
+  a row's UI from its logged span rather than the DLL's running estimate, which can place a
+  bit a sample away.
+- **Later bring-ups keep the decode's PHY family.** `Session.link_controls` lists PHY3 ones
+  on a DLV decode and PHY1 and PHY2 ones on an FBCSE one (and one naming no PHY on either).
+  Switching between the forwarded clock and the recovered one mid-decode would need the
+  sample source switched, and the UI index every sample maps through, the CDS pane's source
+  and the Capture pane's drawing are each fixed per capture, so the decode runs on through
+  such a bring-up: the Timeline, the Bus Grid and the register replay present one bring-up
+  per decode restart. The bring-up in force at the cursor names the Registers pane's PHY
+  block (`Session.phy_at`).
+- **DLV takes no resume points.** Its clock is the data line, so a pause is a stretch with
+  no row edges, and after it the first rising edge need not open a row: framing it afresh
+  needs the row phase found from the edges, with no bring-up to anchor it. The DLL coasts
+  through a pause and the decode runs on.
 - **PHY1, PHY2 and PHY3 (DLV)** all decode: PHY3's bit clock is recovered from the row
   edges by a virtual PLL, through the same `ISampleSource` + PHY state machine.
 

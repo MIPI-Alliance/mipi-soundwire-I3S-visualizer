@@ -18,11 +18,20 @@ import time
 
 import pytest
 import swi3score
+from conftest import record_perf
 
 from swi3s_studio import decode
 from swi3s_studio.ingest import digital_csv
 
 pytestmark = pytest.mark.perf
+
+
+# GitHub's shared runners run the two whole-window cascades below at about 2.2x a Mac's time,
+# so they get their own ceilings, set from the medians the `perf margins` section printed
+# there (GITHUB_ACTIONS=true, linux x86_64): Link switch 754-784 ms (worst 822), cursor move
+# 116-121 ms (worst 143). At ~2x those medians they still catch the cliffs the tests exist
+# for, which cost 2.5-4x; at the Mac's ceilings they failed on the runner's speed alone.
+_SHARED_RUNNER = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 @pytest.fixture(autouse=True)
@@ -439,13 +448,18 @@ def test_cursor_move_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
-    assert median < 0.12, (
+    ceiling, worst_ceiling = (0.24, 0.5) if _SHARED_RUNNER else (0.12, 0.25)
+    base, worst_base = ("~118", "~143") if _SHARED_RUNNER else ("~30", "~39")
+    record_perf("cursor move", median, ceiling, worst, worst_ceiling)
+    assert median < ceiling, (
         f"median cursor move {median * 1000:.0f} ms across {shown} visible docks over "
-        f"{len(ce):,} UIs (ceiling 120 ms, baseline ~30 ms; worst {worst * 1000:.0f} ms). "
+        f"{len(ce):,} UIs (ceiling {ceiling * 1000:.0f} ms, baseline {base} ms; worst "
+        f"{worst * 1000:.0f} ms). "
         "Something on the cascade is doing work proportional to the capture on the GUI "
         "thread — see tests/test_cursor_cost.py for which counts to check first.")
-    assert worst < 0.25, (
-        f"worst cursor move {worst * 1000:.0f} ms (ceiling 250 ms, baseline ~39 ms), median "
+    assert worst < worst_ceiling, (
+        f"worst cursor move {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms, "
+        f"baseline {worst_base} ms), median "
         f"{median * 1000:.0f} ms. A single move stalling while the rest are fast is a COLD "
         "path — a first-visit scan running inline instead of on a worker "
         "(_TX_PERSIST_SYNC_MAX_UIS) is the shape that did this before.")
@@ -466,7 +480,8 @@ def test_link_switch_budget_with_every_dock_visible():
     WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. The same bind measures 754-799 ms median
     there, for this release and for 3.0.19 alike, so the macOS ceiling of 750 ms sat on the
     baseline and failed by chance; the worst has reached 2.18 s. ~2x the Windows median
-    still catches the cliff, which costs 2.5-4x.
+    still catches the cliff, which costs 2.5-4x. A shared GitHub runner (_SHARED_RUNNER) gets
+    the same ceilings, from the 754-784 ms medians it measures.
     """
     import sys
     import time
@@ -498,9 +513,10 @@ def test_link_switch_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
-    windows = sys.platform == "win32"
-    ceiling, worst_ceiling = (1.5, 2.4) if windows else (0.75, 1.2)
-    base, worst_base = ("~760", "~810") if windows else ("~250", "~315")
+    slow = sys.platform == "win32" or _SHARED_RUNNER
+    ceiling, worst_ceiling = (1.5, 2.4) if slow else (0.75, 1.2)
+    base, worst_base = ("~770", "~820") if slow else ("~345", "~365")
+    record_perf("Link switch", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
         f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms, "
         f"baseline {base} ms; worst {worst * 1000:.0f} ms). Something on the bind is doing "

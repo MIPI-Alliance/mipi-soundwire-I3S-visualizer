@@ -108,6 +108,10 @@ def _files(rev: str | None) -> list[str]:
     skip = {".git", "__pycache__", ".venv", "venv", "env", "build", "dist", ".mypy_cache",
             ".ruff_cache", ".pytest_cache", "scratch", "node_modules", "dev_docs", ".eggs"}
     found: list[str] = []
+    # The native core a gate builds beside the tree (gitignored as /swi3score*.so etc.) is a
+    # build artefact, never part of a published tree, and its name carries the platform,
+    # which a published-tier pattern can rightly forbid in the files that are published.
+    core = re.compile(r"swi3score[^/]*\.(so|pyd|dylib)$")
     for base, dirs, names in os.walk(_ROOT):
         dirs[:] = [d for d in dirs if d not in skip]
         # macOS AppleDouble sidecars are filesystem metadata git never tracks;
@@ -118,7 +122,8 @@ def _files(rev: str | None) -> list[str]:
             # Windows a backslash path silently matches nothing — which made this file scan
             # ITSELF there and report its own pattern descriptions ("10.0.0.0/8") as leaks.
             rel = os.path.relpath(os.path.join(base, n), _ROOT).replace(os.sep, "/")
-            found.append(rel)
+            if not core.fullmatch(rel):                 # top level only, as .gitignore has it
+                found.append(rel)
     return sorted(found)
 
 
