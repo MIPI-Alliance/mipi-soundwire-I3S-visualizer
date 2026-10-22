@@ -6,38 +6,53 @@ design see [architecture.md](architecture.md).
 
 ## Branch model
 
-- **`main`** is always the latest *released* state (it carries the most recent `vX.Y.Z`
-  tag). It is protected — changes reach it only by merging a release branch.
-- **`release/X.Y.Z`** — every release cuts the branch for the **next** version. All work
-  toward that version (features, fixes, review follow-ups) lands on this branch via PRs,
-  runs through CI, and is reviewed there. At release time it merges to `main` and is
-  tagged.
+- **`main`** is the integration branch. Every change reaches it through a reviewed pull
+  request, it is kept releasable (the gate green), and new major and minor releases are
+  tagged on it.
+- **Work happens on short-lived branches off `main`**: a feature branch
+  (`feature/<topic>`) or a fix branch (`fix/<topic>`) for one change, or a sprint branch
+  (`sprint/<name>`) for a group of changes that only make sense together. Each merges to
+  `main` through its own pull request once it is reviewed and CI is green, and is deleted
+  on merge. Prefer several small pull requests to one large one: a reviewer can keep up
+  with them, a finding on one does not hold up the rest, and an outside contributor's
+  pull request against `main` does not collide with a long-running branch.
+- **Work prepared elsewhere arrives the same way**: as a branch based on the current
+  `main` and a pull request, so that whatever was merged meanwhile, outside
+  contributions included, is kept.
+- **Release branches `vX.Y`** are created when a minor release `vX.Y.0` is tagged on
+  `main` ([GOVERNANCE.md](../GOVERNANCE.md), Branching and Tags). Sub-minor releases of
+  that line are made on that branch: a fix lands on `main` first and is cherry-picked to
+  `vX.Y`, which is then tagged `vX.Y.1`, `vX.Y.2`, and so on.
 
-**On every release, create the next version's branch.** Immediately after tagging
-`vX.Y.Z`, branch `release/X.Y.(Z+1)` off `main` and bump the version
-(`swi3s_studio/__init__.py::__version__`, `pyproject.toml::version`,
-`swi3s_studio/swviz/version.py::APP_VERSION`) so dev builds identify as the next version.
-Branch names use `release/…`, never `vX.Y.Z`, so they don't collide with the release tag.
+**Version numbers are applied only to releases.** No branch is named after the version it
+is expected to become, and nothing during development changes the version: the three
+version sites (`swi3s_studio/__init__.py::__version__`, `pyproject.toml::version`,
+`swi3s_studio/swviz/version.py::APP_VERSION`) keep the last release's number until the
+release commit sets the new one. The number follows from what the release contains
+([GOVERNANCE.md](../GOVERNANCE.md), Version Numbering): any new user-visible
+functionality makes it a minor release, and a sub-minor release carries fixes only.
 
-### A corp push is a checkpoint, not a release
+### A pushed branch is a checkpoint, not a release
 
-A release branch may be **long-lived**. Work evolves on it locally, reaches the corp remote
-whenever it is convenient, and is published ONCE at the end — so three different things happen
-at three different cadences, and only the last of them is a release:
+Pushing a branch, opening a pull request for it, and merging it to `main` are all
+checkpoints. A release happens once, at the end, and is the only one of these that sets a
+version or creates a tag:
 
 | | when | what runs | what moves |
 |---|---|---|---|
 | **local commit** | continuously | the gate (`bash tests/gate.sh`) | nothing outside this machine |
-| **corp checkpoint** | whenever convenient | the gate | `release/X.Y.Z` on the corp remote. **No tag. `main` untouched.** |
-| **release** | once, at the end | the gate **and both test guests** | `main`, one tag, one published PR |
+| **branch push / pull request** | whenever convenient | CI, and the gate before review | the work branch. **No version change, no tag.** |
+| **merge** | when reviewed and green | CI | `main` |
+| **release** | once, at the end | the gate **and both test guests** | the version, the notes file, one signed tag |
 
 Two rules follow, and both exist because 3.0.16 was tagged the moment its branch merged rather
 than when the cycle was actually finished:
 
-- **The version does not change during a cycle, and the changelog header keeps
-  `(in development)` until the release commit.** Finalising that header is part of releasing,
-  not part of working. All three version sites are pinned to each other by
-  `tests/test_release_gate.py`, so the marker is the only thing left to discipline.
+- **The version changes only in the release commit.** Release notes for the next release
+  collect in `docs/releases/next.md`, marked `(in development)`, and the changelog block's
+  newest entry is headed `next (in development)`. The release commit sets the version,
+  renames the notes file to `vX.Y.Z.md` and finalises both headers. All three version
+  sites are pinned to each other by `tests/test_release_gate.py`.
 - **Tag once, at the end, and never re-point it.** The tag is the last step after the guests are
   green, not a by-product of merging. If a checkpoint needs a name — a build handed to someone,
   a bisect anchor — use a pre-release tag (`vX.Y.Z-rc1`), which is expected to be superseded and
@@ -172,7 +187,7 @@ than they appear to. Rules, learned from the 3.0.12 ruff sweep (226 auto-fixes, 
   object alive — rename to `_app`, don't delete. An `F401` in a package `__init__` may be a
   deliberate re-export. Decide per case; verify with a repo-wide search before removing.
 - **The published reference model** (`swviz/models/dataport.py`, `flow_control_port.py`)
-  needs the AST proof *and* a zero-comment check — see the reference-model section above.
+  needs the AST proof *and* a zero-comment check — see the reference-model section below.
 - **Prefer ignoring a style rule to churning the tree for it.** 194 layout findings were
   silenced in `[tool.ruff.lint] ignore` with a written rationale rather than hand-splitting
   ~190 statements across 30+ files. A clean tree is what makes the gate blockable; uniform
@@ -213,7 +228,7 @@ docstring, not a rename, not a hoist. There is no local change to them that is o
 next drop either reverts it silently or has to be reconciled by hand, and a divergence here is
 a divergence from a published specification, which is not a thing this repository is entitled
 to introduce on its own. If a defect really is in the model, the fix belongs upstream in the
-incoming drop; raise it, and record it in the tech-debt register meanwhile. If something needs
+incoming drop; raise it, and open a `tech-debt` issue for it meanwhile. If something needs
 to change on this side of the boundary, change the code path around them instead.
 
 Two further rules are enforced by `tests/test_reference_model_clean.py`:
@@ -292,8 +307,9 @@ for a fact, so it generates that preamble. The notes file is about the software.
 
 ## Release checklist
 
-1. Land all planned work + review follow-ups on `release/X.Y.Z`, and write
-   `docs/releases/vX.Y.Z.md` as you go (see "One release, one description" above).
+1. Land all planned work and review follow-ups on `main` through their pull requests,
+   and keep `docs/releases/next.md` current as you go (see "One release, one description"
+   above). For a sub-minor release, cherry-pick the fixes from `main` to `vX.Y`.
 2. **The gate — one command:**
 
    ```bash
@@ -331,8 +347,9 @@ for a fact, so it generates that preamble. The notes file is about the software.
    first public PR reported them. `tests/test_release_gate.py` now fails the build if
    `ci.yml` declares a check `tools/gate.py` does not run.
 
-   **A green CI is not a green gate.** CI runs on the public repo only, and covers neither
-   the perf gate nor Windows; the gate covers neither Linux nor Python 3.12/3.13. Run both.
+   **A green CI is not a green gate.** CI has no process-isolated per-suite pass and no
+   stale-ABI assertion (the table under CI); the gate covers only the platform and Python
+   it runs on. Run both.
 3. **Run the gate on the test VMs, BEFORE tagging.** Not after, and not "if there is
    time": this step is the one the checklist keeps losing and it has cost two consecutive
    releases. 3.0.13 and 3.0.14 were both tagged, published and opened as pull requests on a
@@ -379,12 +396,15 @@ for a fact, so it generates that preamble. The notes file is about the software.
    **A simulated font is not this step.** Scaling the application font locally is worth doing
    — it is how both defects were finally reproduced — but a point size is not a width, and a
    fix verified that way shipped broken once already.
-4. Merge `release/X.Y.Z` → `main`. **Only when the cycle is finished** — a release branch may be
-   long-lived, and pushing it to the corp remote along the way is a checkpoint, not a release
-   (see "A corp push is a checkpoint, not a release" under Branch model). Steps 4-6 are one
-   event at the end, not a habit.
-5. Tag **once**, at the end: annotated `vX.Y.Z` on the merge commit (public MIPI releases
-   use a GPG-signed tag + the governed PR flow — see [GOVERNANCE.md](../GOVERNANCE.md)).
+4. Make the release commit, through a pull request to `main` (or to `vX.Y` for a
+   sub-minor release): choose the number (see Branch model), set it in the three version
+   sites, rename `docs/releases/next.md` to `vX.Y.Z.md`, and finalise its title and the
+   changelog entry's header. **Only when the cycle is finished** — every push and merge
+   before it is a checkpoint, not a release (see "A pushed branch is a checkpoint, not a
+   release" under Branch model). Steps 4-6 are one event at the end, not a habit.
+5. Tag **once**, at the end: annotated `vX.Y.Z` on the release commit (GPG-signed, as
+   [GOVERNANCE.md](../GOVERNANCE.md) requires).
+   For a new minor release, create the `vX.Y` branch from the tag at the same time.
    If signing fails with `gpg: signing failed: No agent running`, start the agent with
    `gpgconf --launch gpg-agent` and retry — do NOT quietly fall back to an unsigned tag, which
    is how v3.0.15's tag ended up unsigned.
@@ -403,8 +423,10 @@ for a fact, so it generates that preamble. The notes file is about the software.
    annotation is worth having in the first place.
 6. Publish the release: `gh release create vX.Y.Z --latest --notes-file docs/releases/vX.Y.Z.md`.
    Never a hand-written body — see "One release, one description".
-7. **Cut `release/X.Y.(Z+1)` and bump the version** (see Branch model), and open
-   `docs/releases/vX.Y.(Z+1).md` with the `(in development)` marker.
+7. **Open a fresh `docs/releases/next.md`** with the `(in development)` marker. Nothing
+   else changes: the version stays at the release just made until the next release commit.
+   If the release is a new minor version, update the README's Releases section, which
+   names the minor version that receives fixes.
 
 Cut the tag *once, after the cycle settles* — re-pointing a published tag (as happened
 repeatedly during 3.0.6) is a smell that the release was tagged too early.
@@ -508,5 +530,7 @@ untrustworthy.
 
 ## Deferred work
 
-Findings consciously deferred from a review cycle live in the maintainers' tech-debt register so
-they aren't lost between releases. Pick one strategic item per cycle.
+Findings consciously deferred from a review are tracked as issues with the `tech-debt`
+label, so they aren't lost between releases and anyone can see what is known and left for
+later. A finding from a pull request review that is not fixed in that pull request gets an
+issue before the pull request is merged or closed. Pick one strategic item per cycle.

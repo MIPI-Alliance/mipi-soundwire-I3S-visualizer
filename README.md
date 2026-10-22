@@ -246,7 +246,7 @@ swi3s_studio/   Python app: ingest, store, model, analysis, dsp, timing, ui
   timing/              SWI3S PHY timing calculator
 native/         swi3score C++ decode core + pybind11 bindings (scikit-build-core)
 data/registers.json    SWI3S register map (source of truth)
-docs/           USER_GUIDE, DEVELOPMENT, TESTING, architecture, PACKAGING, TECH_DEBT, …
+docs/           USER_GUIDE, DEVELOPMENT, TESTING, architecture, PACKAGING, releases/, …
 tests/          Python suites + run_all.sh
 ```
 
@@ -343,13 +343,30 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_gui_smoke.py
 
 See [`docs/TESTING.md`](docs/TESTING.md) for the approach and coverage matrix.
 
+## Releases
+
+Releases are the signed `vX.Y.Z` tags. Each has its notes in
+[`docs/releases/`](docs/releases/) and on the
+[Releases](https://github.com/MIPI-Alliance/mipi-soundwire-I3S-visualizer/releases) page.
+Version numbers, branches and tags follow [`GOVERNANCE.md`](GOVERNANCE.md): a minor
+release adds functionality, and a sub-minor release carries fixes only.
+
+**Supported:** 3.x, the current major version. Fixes are made on its latest minor
+version, currently 3.0; within a major version releases stay compatible, so moving up to
+the latest minor version is how an older 3.x install gets a fix. The SWI3S Traffic
+Visualizer's `v1.*` and `v2.*` releases are no longer maintained.
+
 ## Contributing
 
-This is a MIPI Alliance Open Source Software project. Contributions go through pull
-requests reviewed per [`GOVERNANCE.md`](GOVERNANCE.md); non-members must sign the
-[CLA](.github/CLA.md) (the CLA Assistant bot prompts on your first PR). The MIPI
-Alliance organisation-level contributing guide is shown by GitHub when you open a pull
-request, and vulnerabilities go through the repository's **Security** tab, which serves
+**The most useful help is to use SWI3S Studio and
+[open an issue](https://github.com/MIPI-Alliance/mipi-soundwire-I3S-visualizer/issues/new/choose)
+for any problem you find** — a decode that looks wrong, a crash, a capture it cannot open,
+a step in the User Guide that does not match the app. [`CONTRIBUTING.md`](CONTRIBUTING.md)
+says what makes a report useful and how to submit a pull request.
+
+Pull requests are reviewed per [`GOVERNANCE.md`](GOVERNANCE.md); contributors from outside
+MIPI member companies must sign the [CLA](.github/CLA.md) (the CLA Assistant bot prompts on
+your first PR). Vulnerabilities go through the repository's **Security** tab, which serves
 the organisation-level security policy — please do not file them as public issues. See
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the branch / CI / review / release
 workflow.

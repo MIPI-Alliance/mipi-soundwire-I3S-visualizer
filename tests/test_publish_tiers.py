@@ -29,7 +29,8 @@ _INTERNAL_FILES = ("CLAUDE.md",)
 
 # Top-level paths that are PUBLISHED. A new entry here is a conscious decision to publish.
 _PUBLIC_ROOTS = (
-    "README.md", "LICENSE.md", "GOVERNANCE.md", "CODEOWNERS", ".gitignore", ".github/",
+    "README.md", "LICENSE.md", "GOVERNANCE.md", "CONTRIBUTING.md", "CODEOWNERS", ".gitignore",
+    ".github/",
     ".mipi/",                                # upstream-owned; present only once published
     "pyproject.toml", "requirements.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
@@ -189,9 +190,9 @@ def test_the_governance_files_upstream_owns_are_actually_declared():
     corrected it to "@nielwarren582", and the v3.0.13 preview would have reverted
     that — a one-token diff, in the file deciding who must approve a PR.
 
-    Deliberately NOT the whole governance layer: GOVERNANCE.md, LICENSE.md and
-    the CLA files are identical in both trees and shared by agreement, so
-    carrying them is not a divergence risk.
+    Deliberately NOT the whole governance layer: GOVERNANCE.md, CONTRIBUTING.md,
+    LICENSE.md and the CLA files are identical in both trees and shared by
+    agreement, so carrying them is not a divergence risk.
     """
     for path in ("CODEOWNERS", ".mipi/project.yml",
                  ".github/workflows/config-check.yml"):
