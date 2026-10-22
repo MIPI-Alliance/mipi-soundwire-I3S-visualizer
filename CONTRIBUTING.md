@@ -85,9 +85,12 @@ checks this on every pull request; to sign, comment on your PR exactly:
 
 - **Setup and tests.** The [README](README.md) covers setup (`run.sh` / `run.ps1`, or the
   manual steps) and the test commands. Before opening a PR, run
-  `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows), which runs the
-  suite, `ruff` and the `mypy` check; CI runs the full set on Linux, macOS and Windows.
-  After changing anything under `native/`, rebuild the decode core first. See
+  `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows). It rebuilds the
+  native decode core and checks its ABI, then runs the test suite, `ruff`, the `mypy`
+  check and the leak scan; it skips only the perf gate and the one-process-per-file pass.
+  On a pull request, CI runs the test suite on Linux, macOS and Windows, and the perf,
+  coverage and lint jobs on Linux. If you run `pytest` directly after changing anything
+  under `native/`, rebuild the decode core first. See
   [docs/TESTING.md](docs/TESTING.md) for how the suites are organised.
 - **Docs change with the code.** If a change makes a sentence in the README, the User
   Guide or another doc wrong, correct it in the same PR.
