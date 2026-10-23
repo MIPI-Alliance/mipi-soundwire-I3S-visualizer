@@ -1,9 +1,9 @@
-// Streaming SWI3S PHY2 decoder over an ISampleSource. This is a faithful port of
-// SwI3sAnalyzer::WorkerThread (the Saleae plugin), decoupled from the Saleae SDK:
-// align to Column 0, measure the UI rate + auto-detect the column count over a
-// bounded leading window, then run the same NRZS -> 8b/10b -> command transport
-// -> register-snoop -> SSP/commit -> payload pipeline, collecting lightweight
-// result records instead of emitting Saleae FrameV2 rows.
+// Streaming SWI3S PHY2 decoder over an ISampleSource, with the pipeline of the
+// analyzer plugin's SwI3sAnalyzer::WorkerThread and no SDK dependency: align to
+// Column 0, measure the UI rate + auto-detect the column count over a bounded
+// leading window, then run the NRZS -> 8b/10b -> command transport ->
+// register-snoop -> SSP/commit -> payload pipeline, collecting lightweight result
+// records.
 
 #ifndef SWI3SCORE_DECODER_H
 #define SWI3SCORE_DECODER_H
@@ -27,7 +27,8 @@ namespace swi3score {
 
 struct DecoderSettings
 {
-    int  forcedColumnCount = 0;   // 0 = auto-detect from the bitstream
+    int  forcedColumnCount = 0;   // 0 = auto-detect from the bitstream; a value outside
+                                  // [kMinColumnCount, kMaxColumnCount] also auto-detects
     bool decodeAudio = true;
     // PHY3 (DLV) mode: the source recovers the clock (mid-UI sampling) and the CDS is a
     // plain-NRZ bit at `cdsHorizontalStart` (no NRZS decode). Column 0 = Sync1 and the
@@ -64,16 +65,10 @@ struct DecoderSettings
     // Region-scoped forced column count: (section_index, column_count) pairs. Pins ONE
     // config section's bus geometry, overriding both the snooped NumColumns and the blind
     // column detector for that section only. Section index keys segments(), exactly like
-    // registerOverrides.
-    //
-    // Why per-section and not the global forcedColumnCount: a capture that reconfigures
-    // mid-stream (a cold start's Safe-Lock-2 -> 8 -> 16) has several genuine geometries,
-    // so forcing ONE width over the whole capture misframes every other region (their
-    // commands go CRC-red). The real need is narrower — an imported config CSV knows a
-    // width the wire never carried (a post-commit capture has no NumColumns commit), or
-    // the blind detector mis-locked — and that applies to the region being looked at.
-    // Applied as the section is anchored, so the section RECORDS the forced width and the
-    // decode frames at it from there.
+    // registerOverrides. Unlike the global forcedColumnCount it leaves the other
+    // geometries of a capture that reconfigures mid-stream (a cold start's
+    // Safe-Lock-2 -> 8 -> 16) alone. Applied as the section is anchored, so the section
+    // RECORDS the forced width and the decode frames at it from there.
     std::vector<std::pair<int, int>> forcedColumnSections;
     // Sections whose payload config is built from their registerOverrides ALONE, not from
     // the snooped registers on top: a config CSV imported into that region. The CSV is the
@@ -83,6 +78,40 @@ struct DecoderSettings
     // the wire (mRegisters is untouched); only the config handed to the payload engine
     // changes. Section index keys segments(), like registerOverrides.
     std::vector<int> importedConfigSections;
+    // Later link bring-ups (the first is where the decode starts): (sample, column count,
+    // cold, inactive from) per start sequence the Link-Control decoder found after a
+    // stopped clock, in any order (sorted on load; points at one sample merge, cold if
+    // either is). `sample` is the bring-up's first audio-mode clock edge. From `inactive
+    // from` (the first sample after the clock stopped; 0 = none) up to `sample` the Link
+    // is not in audio mode: those UIs are not decoded, so the old geometry emits no audio
+    // and no commands from the start sequence, and every data port stops there.
+    // At `sample` the decode restarts as at the start of the capture: it re-aligns to the
+    // next rising clock edge, frames at `column count` (the Safe-Lock count, 2..32; out of
+    // range, a Cold Start frames at the cold-start count and a Warm Start keeps the
+    // current one) and opens a new segment, its payload engine reconfigured on the new
+    // Column-0 phase. A Cold Start (`cold`) resets the bus: the register model returns to
+    // its reset values and every port stays stopped until configured again. A Warm Start
+    // keeps the registers, so its ports resume on the new phase.
+    // A config CSV is the capture's configuration through every bring-up: a restart keeps
+    // the CSV's column count and ports (a Cold Start still resets the snooped registers,
+    // which command parsing reads). A forcedColumnSections pin on the section a restart
+    // opens outranks both. With `dlv` the recovered clock locks again at the first Row Sync
+    // at or after `sample`, with the nominal UI of `column count`, and is not run through
+    // the inactive stretch (ISampleSource::Reacquire); the column count is chosen as for
+    // FBCSE except that a config CSV's is not taken, as run() does not take it at the first
+    // bring-up.
+    std::vector<std::tuple<std::uint64_t, int, bool, std::uint64_t>> restartPoints;
+    // Clock pauses with no bring-up after them: the first clock edge after each stop. Audio
+    // mode never pauses its clock, so the analyzer lost samples or the capture was joined
+    // there, and the bus may or may not carry on in phase. At each the decode checks the
+    // Column-0 phase of a fresh window at the current column count: in phase, it decodes on
+    // through as if nothing happened; out of phase (UIs were lost), it re-frames there, its
+    // payload engine reconfigured on the new phase, in a new segment that is no restart
+    // (geometry and registers kept). Any order; a restart point at the same sample wins.
+    // FBCSE only: ignored when `dlv`. A DLV pause is a stretch with no row edges, and after
+    // it the first rising edge need not open a row, so its row phase would have to be found
+    // from the edges with no bring-up to anchor it.
+    std::vector<std::uint64_t> resumePoints;
     // Manual SSP: force the payload engine's Stream Sync Point (row_in_interval == 0)
     // to bus row `sspRow`. -1 = off (auto: anchor at decode start / snooped commit).
     // A post-commit capture never carries the SSPA/SSCR that sets the SSP, so ports
@@ -93,7 +122,7 @@ struct DecoderSettings
     long sspRow = -1;
 };
 
-// Decoded command phase (decoupled from Saleae FrameV2).
+// Decoded command phase.
 struct CommandRec
 {
     std::string command;          // CommandName() e.g. "WriteA32", "Ping", "SSCR"
@@ -114,7 +143,7 @@ struct CommandRec
     std::uint8_t rowDelay = 0;        // SSP Row_Delay (anchors the payload interval)
     std::uint16_t groupMask = 0;
     bool hasPingStatus = false;
-    int pingStatus[12] = {};          // default-initialised (was the one uninit member)
+    int pingStatus[12] = {};          // default-initialised
     bool hasReadData = false;
     std::vector<std::uint8_t> readData;
     bool readDataCrcValid = false;
@@ -186,7 +215,8 @@ struct SymbolRec
 
 // One decode "segment": a stretch of the capture decoded at a single column
 // count. A reconfiguration (e.g. cold-start 2 columns -> commit -> 8 columns)
-// triggers a resync that starts a new segment. Bus rows are continuous across
+// triggers a resync that starts a new segment, and so does a later link bring-up
+// (DecoderSettings::restartPoints). Bus rows are continuous across
 // segments (rowBase is the cumulative row at the segment's first Column-0 UI),
 // so the symbol viewer can window into any segment with matching row numbers.
 struct SegmentRec
@@ -195,6 +225,8 @@ struct SegmentRec
     std::uint64_t startSample = 0;   // sample at that boundary
     int           columnCount = 2;
     long          rowBase = 0;        // cumulative bus row at the segment start
+    bool          restart = false;    // opened by a later link bring-up (restartPoints)
+    bool          coldStart = false;  // ...and that bring-up was a Cold Start
 };
 
 class Decoder
@@ -212,23 +244,19 @@ public:
     // rather than inferring "no audio" from an empty audio().)
     bool audioReleased() const { return mAudioReleased; }
 
-    // Drop the decoded audio samples and hand their memory back.
+    // Drop the decoded audio samples and hand their memory back (72 bytes per sample).
     //
-    // The Python layer copies this whole vector into NumPy columns ONCE per decode, and
-    // every consumer past that point — audio store, playback, the plots, PDM decode, WAV
-    // export — reads the columns; a re-decode builds a whole new Decoder rather than
-    // re-reading this one. So after that copy the vector is a second reader's worth of
-    // memory for a reader that never arrives: 72 bytes per sample, 449 MB on a 6.24M-sample
-    // capture, beside the 349 MB of columns holding the same numbers.
+    // Call once the Python layer has copied this vector into NumPy columns (once per
+    // decode): every consumer past that point — audio store, playback, the plots, PDM
+    // decode, WAV export — reads the columns, and a re-decode builds a new Decoder.
     //
-    // Irreversible for this Decoder, and deliberately so: audio() / audio_columns()
-    // afterwards is a bug in the caller, and the bindings report it rather than answer with
-    // an empty set — silently-empty audio is indistinguishable from a capture that carried
-    // none, which is exactly the class of failure this codebase keeps getting bitten by.
+    // Irreversible for this Decoder: audio() / audio_columns() afterwards is a bug in the
+    // caller, and the bindings report it rather than answer with an empty set, which would
+    // be indistinguishable from a capture that carried no audio.
     void releaseAudio()
     {
         mAudio.clear();
-        mAudio.shrink_to_fit();     // clear() alone keeps the capacity — the whole point
+        mAudio.shrink_to_fit();     // clear() alone keeps the capacity
         mAudioReleased = true;
     }
     int columnCount() const { return mColumnCount; }
@@ -290,17 +318,25 @@ public:
     // are safe for this coarse a readout WITHOUT a lock — each is written with a single
     // aligned store (so a concurrent read never sees a torn value), progressUis() is
     // monotonically non-decreasing for the life of one run(), and a stale/one-UI-behind
-    // read only makes the reported percentage briefly lag, never wrong-direction or
-    // out-of-range. Do not add finer synchronization here; that would defeat the point
+    // read only makes the reported percentage briefly lag. Do not add finer
+    // synchronization here; that would defeat the point
     // (a per-UI atomic/lock would cost more than the decode step itself).
     std::uint64_t progressUis() const { return mProgressUis; }
-    // Total UI count for this run, or 0 if the source can't report one up front (pure
-    // streaming) — callers should treat 0 as "unknown", not "100% done". Fixed once
-    // run() knows it (before the main feed loop starts) and constant thereafter.
+    // Total UI count for this run, or 0 if the source can't report one (pure streaming)
+    // — callers should treat 0 as "unknown", not "100% done". Set from the source's
+    // TotalUiCount() before the main feed loop starts, then re-read every 64k UIs and at
+    // the end of run(), never below progressUis(). A source with an exact count (a
+    // forwarded-clock capture) reports the same value each time; a recovered-clock (DLV)
+    // source reports an estimate that follows its current UI period.
     std::uint64_t totalUis() const { return mTotalUis; }
-    // Convenience: progressUis()/totalUis() in [0,1], or 0.0 if totalUis() is unknown (0).
-    double progress() const { return (mTotalUis > 0) ? static_cast<double>(mProgressUis) /
-                                                        static_cast<double>(mTotalUis) : 0.0; }
+    // Convenience: progressUis()/totalUis() clamped to [0,1], or 0.0 if totalUis() is
+    // unknown (0).
+    double progress() const
+    {
+        if (mTotalUis == 0) return 0.0;
+        const double f = static_cast<double>(mProgressUis) / static_cast<double>(mTotalUis);
+        return (f < 1.0) ? f : 1.0;
+    }
     // Ask an in-flight run() to stop, from another thread: it returns within ~64k UIs,
     // with what it decoded so far, and stopped() says so. For a caller watching memory
     // while the decode grows (the audio it produces cannot be predicted before decoding).
@@ -314,7 +350,76 @@ private:
     // type so the concrete TransitionSampleSource de-virtualizes NextUi()/UiIndex()
     // in the per-UI hot loop; defined in Decoder.cpp (both instantiations used there).
     template <class Src> void streamRemainder(Src& src);
+    template <class Src> void refreshTotalUis(const Src& src);
     void resync();   // re-detect column count + re-hunt comma after framing loss
+    // Where a window read or an edge hunt stopped short: at the UI that reached the next
+    // restart point (DecoderSettings::restartPoints), a falling or a rising edge, or not
+    // at all (the window filled, the edge was found, or the source ended).
+    enum class Crossing { None, Falling, Rising };
+    // One restart point, normalized on load (see loadRestarts).
+    struct Restart {
+        std::uint64_t sample = 0;         // the bring-up's first audio-mode clock edge
+        int           columns = 0;        // its Safe-Lock count (validated in restartAt)
+        bool          cold = false;
+        std::uint64_t inactiveFrom = 0;   // <= sample; == sample when there is no stretch
+        bool          resume = false;     // a clock pause (resumePoints), not a bring-up
+    };
+    // The pending restarts from `restartPoints` (and, for FBCSE, `resumePoints`), later
+    // than `after` (the first alignment edge): sorted stably by sample, points at one
+    // sample merged (cold if either is), each inactive stretch clamped to begin after the
+    // previous restart.
+    void loadRestarts(std::uint64_t after);
+    // The next sample the per-UI loops leave the fast path at: the next restart's
+    // inactiveFrom (every UI from there to its sample takes the slow path, a few dozen in
+    // a start sequence), or UINT64_MAX when none is pending.
+    void updateNextStop();
+    // Read the next UI to decode. Returns false at the end of the source (`crossing`
+    // None) or at a UI at or past the next restart point (`crossing` says whether it was
+    // a rising edge); that UI is the restart's. UIs in the inactive stretch before it are
+    // consumed without being decoded (goInactive).
+    bool readUi(bool& rising, bool& dataHigh, std::uint64_t& sn, Crossing& crossing);
+    // The Link stopped at source UI `ui` (the first UI past the next restart's
+    // inactiveFrom): from here to the restart nothing is decoded. A recovered clock (DLV)
+    // is re-acquired at the restart at once, so the stretch is not read at all.
+    void goInactive(std::uint64_t ui);
+    // Stop every data port where the Link went inactive: an empty payload config, recorded
+    // as a transport event at that UI so a windowed bit-sample replay stops there too.
+    // Called as the restart is taken, once every UI before the stretch has been fed (a
+    // window read can run past the stretch before its UIs are fed).
+    void stopPorts();
+    // Read UIs to the next rising clock edge (Column 0 opens on one). `aligned` says
+    // whether it was found; if not, the return value says whether a restart point was.
+    Crossing alignToRising(bool& aligned);
+    // A later link bring-up (DecoderSettings::restartPoints): reset the registers on a
+    // Cold Start and mark the segment it opens, then re-align, re-frame, reconfigure the
+    // payload engine on the new Column-0 phase and feed a fresh window. `rising` is
+    // whether the UI that crossed the restart sample is a rising edge. The Cold Start's
+    // reset and the segment marks apply even when the window is empty, because the NEXT
+    // restart point follows within it; the return value is that one's crossing, if any.
+    Crossing restartAt(const Restart& r, bool rising);
+    // The column count restart `r` frames at, opening segment `section`: a pin on that
+    // section, else (FBCSE) a config CSV's, else the bring-up's Safe-Lock count (2..32),
+    // else a Cold Start's cold-start count; a Warm Start with none keeps the current one.
+    int restartColumns(const Restart& r, int section) const;
+    // A clock pause (DecoderSettings::resumePoints): read to the next rising edge and a
+    // fresh window, then either feed it all on in the current framing (in phase) or
+    // re-frame on the window's Column-0 phase. `rising` is whether the UI that crossed the
+    // pause (mCross*) is a rising edge. Returns the next restart point's crossing, if any.
+    Crossing resumeAt(bool rising);
+    // Take the restart points from `crossing` on, each in turn (one's window can reach the
+    // next).
+    void takeRestarts(Crossing crossing);
+    // Read up to `n` UIs into levels/samples through readUi, stopping at a UI at or past
+    // the next restart point, which is the restart's and not the window's. Every window
+    // read goes through here: the leading one is 262144 UIs, which a short first session
+    // fits inside whole.
+    Crossing readWindow(int n, std::vector<bool>& levels, std::vector<std::uint64_t>& samples);
+    // The bit-level framing reset shared by run(), resync() and restartAt(): NRZS phase,
+    // comma hunt, Column-0 phase `startColumn`, pending commits, the watchdog count, and a
+    // new segment anchored at the next Column-0 CDS bit. Bus rows carry on.
+    void resetFraming(int startColumn);
+    // Measure the UI rate from a window's UI samples (span / intervals), if it has two.
+    void measureUiRate(const std::vector<std::uint64_t>& samples);
     void recordCommand(const SwI3sCommand& cmd);
     // Rebuild the payload config from the current register snoop. preservePhase uses the
     // engine's phase-preserving Reconfigure (for a DSCR — keep survivors' timing) instead
@@ -322,7 +427,10 @@ private:
     // Returns true if the effective (enabled-port) config actually CHANGED and the engine
     // was (re)configured; false if it was unchanged (so the caller skips a spurious config
     // epoch — e.g. a single-ranked write that rewrote a register with the same value).
-    bool maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool preservePhase = false);
+    // `force` reconfigures an unchanged config too: a restart puts every port on the new
+    // Column-0 phase.
+    bool maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool preservePhase = false,
+                                 bool force = false);
     void applyScramblerOverrides();   // force per-(device,dp) ScramblerEn from settings
     // Fold what-if register overrides for config section `sectionIndex` into `regs`
     // (ForceWrite + Commit-all), so the snooped config the audio engine uses matches
@@ -331,6 +439,8 @@ private:
     // Region-scoped forced column count for `sectionIndex`, or 0 if none/out of range
     // (see DecoderSettings::forcedColumnSections).
     int forcedColumnsForSection(int sectionIndex) const;
+    // DecoderSettings::forcedColumnCount, or 0 (auto-detect) if out of range.
+    int forcedColumnCount() const;
     void updateRowRateFromCapture(int columnCount);
     static int firstSelectedDevice(std::uint16_t mask);
 
@@ -385,6 +495,7 @@ private:
     // the SSP — so it commits + reconfigures at its row without a SyncToSSP.
     bool   mPendingSspSyncPoint = false;
     std::uint8_t mPendingSspGroup = 0;
+    std::uint16_t mPendingSspDevices = 0;   // the pending commit's Device Mask
     // An immediate (single-ranked) config write changed the committed register state with
     // no commit; reconfigure the payload engine at the next row boundary so the audio /
     // samples decode reflects the register state however it was set (not only at commits).
@@ -398,9 +509,9 @@ private:
 
     // Decode progress (see progressUis()/totalUis()/progress()): a plain counter bumped
     // once per UI in feed() (a single increment — negligible next to the decode work it
-    // sits beside) and a total fixed once at the start of run() from the source's
-    // TotalUiCount() (0 if the source can't report one). No lock: see progressUis()'s
-    // comment for why a coarse cross-thread read of a monotonic counter is fine here.
+    // sits beside) and a total read from the source's TotalUiCount() (0 if the source
+    // can't report one) at the start of run() and refreshed as totalUis() describes. No
+    // lock: see progressUis()'s comment for why a coarse cross-thread read is fine here.
     std::uint64_t mProgressUis = 0;
     std::uint64_t mTotalUis = 0;
     std::atomic<bool> mStopRequested{false};
@@ -436,9 +547,22 @@ private:
     // framing — see rowSyncSamples().
     std::vector<std::uint64_t> mRowSyncSamples;
 
-    // Decode segments (one per column count); bus rows are continuous across them.
+    // Decode segments (one per column count or link restart); bus rows are continuous
+    // across them.
     std::vector<SegmentRec> mSegments;
     bool mSegmentPending = false;   // anchor the next segment on the next Column-0 CDS bit
+    bool mSegmentRestart = false;   // ...and mark it as opened by a later bring-up
+    bool mSegmentColdStart = false; // ...a Cold Start
+    std::vector<Restart> mRestarts;   // pending, sorted (loadRestarts)
+    std::size_t mNextRestart = 0;
+    std::uint64_t mNextStop = UINT64_MAX;   // see updateNextStop
+    bool mInactive = false;         // between a restart's inactiveFrom and its sample
+    std::uint64_t mInactiveUi = 0;  // source UI where that stretch began (stopPorts)
+    // The UI that crossed the next restart point, read but not fed (readUi and the hot
+    // loop set them): resumeAt feeds it when the bus carried on in phase.
+    bool          mCrossHigh = false;
+    std::uint64_t mCrossSample = 0;
+    std::uint64_t mCrossUi = 0;
 
     // Windowed-decode reconstruction state, recorded during run() (see the structs
     // above / bitSamplesInWindow). mConfigEpochs holds each distinct payload config the

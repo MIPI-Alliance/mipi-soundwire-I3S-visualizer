@@ -13,8 +13,8 @@ pair may span two Links, which is how an event on one bus is timed against anoth
 module never converts between Links (the window does, through its LinkSet).
 
 Persisted in the workspace; the legacy `[sample, ...]` format loads as ungrouped
-singles paired up in order (see `BookmarkSet.from_json`). A bookmark saved before Links
-existed has no `link` and loads on Link 0, the only Link there was.
+singles paired up in order (see `BookmarkSet.from_json`). A bookmark with no `link`
+(saved before Links) loads on Link 0.
 """
 from __future__ import annotations
 

@@ -2,8 +2,8 @@
 
 A capture is represented by the *edges* of the forwarded clock and the data
 line, not per-sample data — the compact form a .sal / digital CSV decodes to,
-and exactly what the decode core walks. This keeps even multi-GB captures light:
-edge counts scale with bus activity, not capture duration × sample rate.
+and exactly what the decode core walks. Edge counts scale with bus activity,
+not capture duration × sample rate.
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@
 glitch-free playback and the 50 ms stop-fade. No audio device is required: we
 drive readData() directly and check the byte stream it would hand the sink.
 
-Verifies the three properties the fade redesign depends on:
+Verifies three properties:
   1. It reproduces the PCM exactly, then emits silence forever (never a short
      read -> the sink can't underrun or hit end-of-data).
   2. A partial block at the clip end is filled with silence (still full-length).

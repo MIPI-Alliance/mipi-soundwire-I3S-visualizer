@@ -1,9 +1,7 @@
 """The dialogs, driven as a user would: each is opened by its real menu handler (or built
 as its handler builds it), filled in through its own widgets, and accepted or cancelled.
 
-Before this, four dialogs had 0-9% coverage and every handler that opens one was
-unexercised past the `exec()`: a test that reached a modal simply hung offscreen. The
-conftest guard now fails such a test instead, and `_drive` below is the sanctioned way
+The conftest guard fails a test that reaches a modal; `_drive` below is the sanctioned way
 through: it replaces `exec` on one dialog class with a function that plays the user.
 """
 import os
@@ -122,8 +120,8 @@ def test_cancelling_export_audio_asks_for_no_directory(monkeypatch):
 
 # ---- Open Analog CSV ----
 
-# The analog CSV dialog's job (channels, Schmitt thresholds) is the Open Capture dialog's
-# now: tests/test_open_capture_dialog.py.
+# Analog CSV channels and Schmitt thresholds are set in the Open Capture dialog:
+# tests/test_open_capture_dialog.py.
 
 
 # ---- Import Visualizer CSV ----
@@ -196,8 +194,8 @@ def test_the_regmap_dialog_previews_an_import_and_binds_the_device(tmp_path, mon
     assert f"{len(dlg.pmap.registers)} registers" in dlg._summary.text()
     assert dlg._preview.topLevelItemCount() == len(dlg.pmap.registers)
     def amp_fields():
-        return [f.name for r in dlg.pmap.registers if r.name == "AMP_LEVEL" for f in r.fields]
-    assert amp_fields() == ["amp_lvl"]                   # amp_lvl[5:0], one ranged field
+        return [f.name for r in dlg.pmap.registers if r.name == "GAIN" for f in r.fields]
+    assert amp_fields() == ["gain"]                   # gain[5:0], one ranged field
     dlg._coalesce.setChecked(False)                      # re-imports, bit by bit
     assert len(amp_fields()) == 6
     dlg.accept()
@@ -232,7 +230,7 @@ def test_a_broken_regmap_says_why_and_cannot_be_accepted(tmp_path, monkeypatch):
     assert not dlg._buttons.button(dlg._buttons.StandardButton.Ok).isEnabled()
 
 
-# ---- Set Offset… (a Link's timeline label) ----
+# ---- Set Time Offset… (a Link's timeline label) ----
 
 def _two_links():
     win = _win()
@@ -269,3 +267,28 @@ def test_cancelling_set_offset_changes_nothing(monkeypatch):
 def test_set_offset_with_one_link_opens_nothing():
     win = _win()
     win.set_link_offset_dialog()                          # the guard fails on a dialog
+
+
+def test_export_audio_visible_range_covers_the_same_time_on_every_stream(tmp_path, monkeypatch):
+    """Two streams at different rates (the demo's 44.1 kHz DP0 and 48 kHz DP1) exported over
+    the visible window last the same time, each at its own rate."""
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    win = _win()
+    keep = {(0, 0), (0, 1)}
+
+    def user(dlg):
+        for key, cb in dlg._checks.items():
+            cb.setChecked(key in keep)
+        i = next(i for i in range(dlg._range.count()) if dlg._range.itemData(i) is not None)
+        dlg._range.setCurrentIndex(i)
+        return QDialog.Accepted
+    _drive(monkeypatch, AudioExportDialog, user)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    win.export_audio()
+    secs = {}
+    for dev, dp in keep:
+        with wave.open(str(tmp_path / f"swi3s_dev{dev}_dp{dp}.wav")) as w:
+            secs[(dev, dp)] = w.getnframes() / w.getframerate()
+    a, b = secs[(0, 0)], secs[(0, 1)]
+    assert a > 0 and abs(a - b) <= 2.0 / 44100, secs

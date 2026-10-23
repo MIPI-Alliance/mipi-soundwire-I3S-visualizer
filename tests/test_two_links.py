@@ -143,10 +143,9 @@ def test_add_link_from_another_file_keeps_the_first(two_link_sal, tmp_path, monk
     assert win.links[0].session is first and win.links.active_index == 1
 
 
-# The channel picker and its edge-count helpers went with the Open Capture dialog: the
-# counts and the busiest-as-clock default are tests/test_probe.py's and
-# tests/test_open_capture_dialog.py's now, and test_one_row_opens_one_link above pins the
-# clock-with-a-data-line default on this four-channel file.
+# The channel edge counts and the busiest-as-clock default are tested in
+# tests/test_probe.py and tests/test_open_capture_dialog.py; test_one_row_opens_one_link
+# above pins the clock-with-a-data-line default on this four-channel file.
 
 
 def test_align_recovers_a_known_offset_between_two_files(tmp_path, monkeypatch):
@@ -182,7 +181,7 @@ def test_align_recovers_a_known_offset_between_two_files(tmp_path, monkeypatch):
     assert abs(win.links[1].offset_ps - TWO_LINK_SHIFT_SAMPLES * period_ps) <= period_ps
 
 
-# ---- the in-app two-Link demo (Open Demo Capture ▸ PHY2 (Two Links)) ----
+# ---- the in-app two-Link demo (Open Demo Capture ▸ PHY2) ----
 
 def _demo_menu_actions(win):
     from PySide6.QtWidgets import QMenu
@@ -192,10 +191,17 @@ def _demo_menu_actions(win):
     raise AssertionError("no Open Demo Capture menu")
 
 
-def test_the_demo_menu_offers_two_links():
+def test_the_demo_menu_offers_two_links(monkeypatch):
     from swi3s_studio.ui.main_window import MainWindow
     QApplication.instance() or QApplication([])
-    assert "PHY2 (Two Links)" in _demo_menu_actions(MainWindow())
+    win = MainWindow()
+    assert "PHY2" in _demo_menu_actions(win)
+    opened = []
+    monkeypatch.setattr(win, "load_session", lambda s, **kw: opened.append(s.source))
+    monkeypatch.setattr(win, "apply_workspace", lambda *a, **kw: None)
+    win.open_demo("phy2")
+    assert [(s["variant"], s.get("delay_samples", 0)) for s in opened] == [
+        ("", 0), ("flow_control", TWO_LINK_SHIFT_SAMPLES)]
 
 
 def test_the_two_link_demo_is_the_test_fixture():

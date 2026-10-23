@@ -4,9 +4,11 @@
 // and hands them here; the per-UI walk runs in C++ at native speed, so the hot
 // loop never crosses the Python boundary.
 //
-// Storage is a NON-OWNING view (pointer + size): the binding constructs it
-// straight from NumPy buffers and keeps them alive via pybind11 keep_alive, so
-// even multi-GB edge arrays are referenced zero-copy. An owning constructor is
+// Storage is a NON-OWNING view (pointer + size) plus an opaque `owner` handle that
+// holds the buffers alive for this object's lifetime: the binding constructs it from
+// the NumPy arrays its argument casters produced (the caller's own arrays when already
+// C-contiguous uint64, a converted copy otherwise) and passes those arrays as the owner,
+// so even multi-GB edge arrays are referenced zero-copy. An owning constructor is
 // provided for C++ use/tests.
 //
 // Semantics mirror the plugin's CBitstreamDecoder: each clock edge bounds one UI;
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -29,12 +32,15 @@ namespace swi3score {
 class TransitionSampleSource final : public ISampleSource
 {
 public:
-    // Non-owning (zero-copy): caller guarantees the arrays outlive this object.
+    // Non-owning (zero-copy): the arrays must outlive this object, either because the
+    // caller guarantees it or because `owner` (released when this object is destroyed)
+    // keeps them alive.
     TransitionSampleSource(const std::uint64_t* clockEdges, std::size_t clockCount,
                            const std::uint64_t* dataEdges, std::size_t dataCount,
                            bool initialClock, bool initialData,
-                           std::uint64_t sampleRateHz)
-        : mClock(clockEdges), mClockN(clockCount),
+                           std::uint64_t sampleRateHz,
+                           std::shared_ptr<const void> owner = nullptr)
+        : mOwner(std::move(owner)), mClock(clockEdges), mClockN(clockCount),
           mData(dataEdges), mDataN(dataCount),
           mInitialClock(initialClock), mInitialData(initialData),
           mClockState(initialClock), mDataState(initialData), mRate(sampleRateHz) {}
@@ -93,6 +99,7 @@ public:
     }
 
 private:
+    std::shared_ptr<const void> mOwner;       // holds the viewed buffers (zero-copy path)
     std::vector<std::uint64_t> mClockOwned;   // empty in the zero-copy path
     std::vector<std::uint64_t> mDataOwned;
     const std::uint64_t* mClock;

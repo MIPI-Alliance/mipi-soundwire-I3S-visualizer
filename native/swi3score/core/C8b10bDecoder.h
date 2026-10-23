@@ -5,9 +5,9 @@
 // order is a b c d e i f g h j with 'a' first, so as we shift bits in MSB-first
 // the assembled 10-bit value has a@bit9 .. j@bit0; abcdei = sym>>4, fghj = sym&0xF.
 //
-// Robust Tokens (Section 7.1.4, Table 38) are 16 fixed, zero-disparity D-code
-// symbols used for Phase Header / response fields; they are matched directly
-// against the raw 10-bit symbol (RobustToken()).
+// Robust Tokens (Section 7.1.4, the "Robust Token Symbols" table) are 16 fixed,
+// zero-disparity D-code symbols used for Phase Header / response fields; they are
+// matched directly against the raw 10-bit symbol (RobustToken()).
 
 #ifndef SWI3S_C8B10BDECODER_H
 #define SWI3S_C8B10BDECODER_H
@@ -48,14 +48,15 @@ public:
     // this while it is consuming a phase's known-length DATA region (Manager Packet
     // payload+CRC, or ReadData payload+CRC), where uncontrolled byte values — the
     // CRC especially — can accidentally form the 10-bit SPM pattern at a sub-symbol
-    // offset. Per Figures 88-90 / {ASW2206} an SPM mid-phase is only the ARMING
-    // event for header detection and must not, by itself, re-frame or abandon the
+    // offset. Per the Peripheral SPM Detector, Header Detector and Common Phase
+    // Flow flowcharts / {ASW2206} an SPM mid-phase is only the ARMING event for
+    // header detection and must not, by itself, re-frame or abandon the
     // in-progress phase. Cleared at each phase boundary so a genuine next-phase SPM
     // still (re)aligns normally.
     void SetFramingLocked(bool locked) { mFramingLocked = locked; }
     bool FramingLocked() const { return mFramingLocked; }
 
-    // Match a raw 10-bit symbol against the 16 Robust Tokens (Table 38).
+    // Match a raw 10-bit symbol against the 16 Robust Tokens ("Robust Token Symbols" table).
     // Returns the token number 0..15, or -1 if it is not a (near) token.
     static int RobustToken(U16 rawSymbol);
 

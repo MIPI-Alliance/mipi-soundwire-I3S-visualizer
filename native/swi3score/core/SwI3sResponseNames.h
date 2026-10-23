@@ -1,10 +1,11 @@
 // Human-readable names for SWI3S Command Transport response tokens.
 //
-// Peripheral Response tokens (Table 67) and the Manager Response HD10 tokens
-// (Table 66 / 91-93) are Robust Token numbers (0..15) whose MEANING depends on
-// the PhaseID. Token 0 in particular resolves to WRITE_OK / READ_DATA_NOW /
-// COMMIT_READY / CALIBRATE_NOW by phase; tokens 4 and 5 likewise. -1 = no
-// (recognised) token / no response.
+// Peripheral Response tokens (the "Assignment of Robust Token Numbers (Peripheral)"
+// table) and the Manager Response HD10 tokens (the "Assignment of Robust Token Numbers
+// (Manager)" table and the "Manager Response in ..." tables) are Robust Token numbers
+// (0..15) whose MEANING depends on the PhaseID. Token 0 in particular resolves to
+// WRITE_OK / READ_DATA_NOW / COMMIT_READY / CALIBRATE_NOW by phase; tokens 4 and 5
+// likewise. -1 = no (recognised) token / no response.
 
 #ifndef SWI3S_RESPONSENAMES_H
 #define SWI3S_RESPONSENAMES_H
@@ -13,8 +14,9 @@
 
 namespace swi3s {
 
-// Peripheral Response token -> name, resolved within the phase (Table 67 + the
-// per-phase tables 84/85/86/87/90).
+// Peripheral Response token -> name, resolved within the phase (the "Assignment of Robust
+// Token Numbers (Peripheral)" table and the per-phase "Peripheral Responses Specific to
+// ..." and "Peripheral Responses to GetStatus Phase" tables).
 inline const char* PeripheralResponseName(PhaseId phase, int token)
 {
     switch (token) {

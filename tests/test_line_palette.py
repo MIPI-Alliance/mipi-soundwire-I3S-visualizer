@@ -1,10 +1,8 @@
 """Line colours are readable in both themes, and follow a theme switch.
 
-The Audio waveforms, the Capture pane's lane overlays and the bookmark pairs used to be drawn
-in the Bus Grid's data-port PASTELS, which are cell fills made for dark ink: on the light
-theme's white plot they fell to 1.03:1, eleven of twelve below 3:1. Lines now take the
-theme's DP_LINE_PALETTE, the same hues darkened for light mode, and the grid keeps its
-fills. These pin:
+The Audio waveforms, the Capture pane's lane overlays and the bookmark pairs take the
+theme's DP_LINE_PALETTE: the Bus Grid's data-port PASTELS (cell fills made for dark ink)
+with the same hues darkened for light mode. The grid keeps its fills. These pin:
 
 - every line colour clears 3:1 (WCAG 1.4.11, graphical objects) on its theme's PLOT_BG;
 - the line palette keeps the fill palette's hues, in order, so a stream is recognisably one
@@ -12,7 +10,7 @@ fills. These pin:
 - the panes read the palette at use: a pane built in light mode draws light, and a live
   switch recolours pens and the cached bookmark lines;
 - the plot gridlines are at least as visible in light mode as in dark. They are the axis
-  grey at a fixed opacity, and the dark theme's 0.2 left them at 1.2:1 on white.
+  grey at the theme's PLOT_GRID_ALPHA opacity.
 """
 import colorsys
 import itertools
@@ -114,7 +112,7 @@ def test_the_line_palette_keeps_the_fill_hues_in_order(mode):
 @pytest.mark.parametrize("mode", ["dark", "light"])
 def test_no_two_line_colours_are_closer_than_the_fills(mode):
     """Darkening keeps hue, and three pastels share a hue with a paler twin, so a uniform
-    darkening collapsed each twin pair onto one colour. The line palette must tell its
+    darkening would collapse each twin pair onto one colour. The line palette must tell its
     entries apart at least as well as the grid's fills do."""
     line = t._PALETTES[mode]["DP_LINE_PALETTE"]
     assert _min_delta_e(line) >= _min_delta_e(_DP_PALETTE) - 0.5
@@ -135,8 +133,7 @@ def _grid_contrast(mode, scale=1.0):
 
 
 def test_the_light_grid_is_at_least_as_visible_as_the_dark_one():
-    """The dark theme's gridlines read well; light used the same opacity, which on white
-    blends to #eaeaea. Hold light to dark's contrast, for the trace panes and the Timing
+    """Light-mode gridlines are held to dark's contrast, for the trace panes and the Timing
     histograms (drawn at three quarters of the opacity)."""
     from swi3s_studio.ui.eye_view import _grid_alpha
     for scale in (1.0, _grid_alpha() / t.VizTheme.PLOT_GRID_ALPHA):
@@ -170,9 +167,9 @@ def test_the_grid_keeps_the_fill_and_lines_take_the_theme():
 
 
 def test_a_capture_pane_built_in_light_mode_draws_light():
-    """app.py imports the UI before it applies the saved theme, so colours copied at import
-    were the dark palette's: a light-mode launch drew the DP/DN traces, cursor and commit
-    marks in dark-theme colours until the first switch."""
+    """app.py imports the UI before it applies the saved theme, so the pane must read its
+    colours at construction, not at import: a pane built in light mode draws the DP/DN
+    traces and cursor in light-theme colours."""
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.raw_view import RawCaptureView
     apply_palette("light")

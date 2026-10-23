@@ -1,5 +1,5 @@
 // Flow Control Port (DRQ) slot placement — a C++ port of the visualizer's
-// FlowControlPort (src/models/flow_control_port.py). It is an independent peer
+// FlowControlPort (swi3s_studio/swviz/models/flow_control_port.py). It is an independent peer
 // of CDataPort on the bus: ticked once per UI, it emits the DRQ slot (plus
 // guard/tail for a source DRQ) in RxControlled / Async flow modes.
 //
@@ -27,7 +27,11 @@ public:
     CFlowControlPort() = default;
 
     void Configure(const SwI3sDpConfig& dpCfg, int numColumns);
-    void Initialize();
+    // Initialize the DRQ placement state. 'startColumn' is the bus column the FIRST tick
+    // lands on, wrapped modulo the column count as CDataPort::Initialize wraps it;
+    // 'rowInInterval' is the row of the interval that tick is in. FCP_HorizontalStart and
+    // FCP_Offset are absolute positions, so both must match the parent data port's phase.
+    void Initialize(int startColumn = 0, int rowInInterval = 0);
 
     // Advance one UI. 'dpIntervalSkipped' is the parent data port's
     // interval-skipped status for this interval (the FCP gates DRQ on it).

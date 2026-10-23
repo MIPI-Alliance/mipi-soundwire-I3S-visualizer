@@ -2,17 +2,14 @@
 
 `butter_highpass_sos(cutoff_hz, rate_hz)` designs the filter as second-order sections and
 `sosfiltfilt(sos, x)` runs it forward and then backward, so the result has the squared
-magnitude response and no phase shift: an edge or a click stays where it happened instead
-of being smeared later in time, which is the point when looking for glitches.
+magnitude response and no phase shift: an edge or a click stays where it happened.
 
 Both follow scipy.signal step for step (`butter(order, fc, "highpass", fs=fs,
 output="sos")`, `sosfilt_zi`, and `sosfiltfilt` with its odd padding), and the tests compare
 them with outputs SciPy produced. `highpass` pads by at least three periods of the corner
-(`padlen`): SciPy's default extension is 15 samples, far shorter than a low corner rings,
-and it left a transient of up to half the signal's offset over the first and last 40 ms of
-a stream at 20 Hz, a false glitch at both ends of every capture. SciPy is not a dependency: the design is a few
-lines of numpy, and the one part numpy cannot vectorise, the recursion itself, runs in the
-native core (`swi3score.sosfilt`).
+(`padlen`) rather than SciPy's default 15 samples, which is shorter than a low corner rings.
+SciPy is not a dependency: the design is numpy, and the recursion runs in the native core
+(`swi3score.sosfilt`).
 """
 from __future__ import annotations
 
@@ -22,10 +19,8 @@ import numpy as np
 
 ORDER = 4                   # the high-pass offered in the UI: 4th-order Butterworth
 MIN_CUTOFF_HZ = 1.0
-# The DC blocker (Filter & Gain ▸ DC blocker): a fixed, gentler high-pass ahead of the
-# adjustable one. A filter rather than subtracting the mean, so a bias that drifts (a PDM
-# mic settling after power-up) goes too, and zero phase like the high-pass, so a glitch
-# stays where it happened.
+# The DC blocker (Filter & Gain ▸ DC blocker): a fixed, gentler zero-phase high-pass ahead
+# of the adjustable one. It removes a drifting bias as well as a constant one.
 DC_BLOCK_HZ = 1.0
 DC_BLOCK_ORDER = 2
 MAX_CUTOFF_HZ = 20_000.0
@@ -117,8 +112,7 @@ def sosfiltfilt(sos: np.ndarray, x: np.ndarray, padlen: Optional[int] = None) ->
 
 def highpass_padlen(sos: np.ndarray, cutoff_hz: float, rate_hz: float) -> int:
     """The edge extension `highpass` uses: three periods of the corner, or SciPy's default
-    if that is longer. Measured on an offset tone with a drift, it takes the edge error
-    at a 20 Hz corner from 394 to 0, and at 1 Hz from 783 to 7."""
+    if that is longer."""
     return max(_padlen(sos), int(np.ceil(3.0 * float(rate_hz) / float(cutoff_hz))))
 
 

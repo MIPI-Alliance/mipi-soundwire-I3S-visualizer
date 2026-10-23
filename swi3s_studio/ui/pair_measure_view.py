@@ -32,8 +32,7 @@ class PairMeasureView(QTableWidget):
     # The Link column is hidden until there are two Links to tell apart.
     _COLS = ["", "Link", "UI", "Row", "Time"]
     _LINK_COL = 1
-    # Where each column's text sits in a row tuple (label, ui, row, time, seek, link, index):
-    # the Link fields were added at the end so a row reads the same as before them.
+    # Where each column's text sits in a row tuple (label, ui, row, time, seek, link, index).
     _FIELD = [0, 5, 1, 2, 3]
 
     def __init__(self) -> None:

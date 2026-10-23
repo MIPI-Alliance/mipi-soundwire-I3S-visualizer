@@ -185,14 +185,12 @@ def test_command_row_is_zero_based():
 def test_command_filter_survives_a_redecode():
     """A re-decode of the SAME capture (SSP step, register/scrambler override, or a
     Port-Samples collect) reloads the same session in place and must KEEP the command
-    filter — only a genuinely new capture clears it. Regression for a re-decode (which
-    every override/collect triggers via load_session) resetting the filter to all
-    commands as the user navigated between commit points."""
+    filter — only a genuinely new capture clears it."""
     QApplication.instance() or QApplication([])
     from swi3s_studio.session import Session
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
-    win.load_demo()                                # the demo is no longer preloaded in __init__
+    win.load_demo()                                # the demo is not preloaded in __init__
     win._cmd_proxy.set_kinds({"WriteA32"})
     assert win._cmd_proxy._kinds == {"WriteA32"}
     win.load_session(win._session)                 # re-decode: same session object
@@ -203,8 +201,8 @@ def test_command_filter_survives_a_redecode():
 
 
 def test_row_sync_cursor_paths_land_on_rsp():
-    """Cousins of the commit-point one-UI-late fix: selecting a CDS symbol, jumping to an
-    SSCR, and the cursor<->command `_starts` index all anchor on the Row Sync Point (the
+    """Selecting a CDS symbol, jumping to an SSCR, and the cursor<->command `_starts`
+    index all anchor on the Row Sync Point (the
     RSP rising edge / CDS marker), not the Column-0 closing edge one UI later."""
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
@@ -240,11 +238,8 @@ def test_search_text_matches_what_the_cells_display():
     """The free-text filter must match what the user can SEE.
 
     search_text() builds a row's searchable string from _display_text(cmd, column) rather than
-    self.data(self.index(row, col)) — twelve QModelIndex constructions and twelve role
-    dispatches per row was what made the first keystroke a multi-second GUI-thread freeze on a
-    large capture. Both now go through the one formatter, and this asserts they agree for
-    every row and every column of a real decode, so the speedup cannot have changed what is
-    searchable.
+    self.data(self.index(row, col)); both go through the one formatter, and this asserts they
+    agree for every row and every column of a real decode.
     """
     _app = QApplication.instance() or QApplication([])
     from swi3s_studio.session import Session
@@ -263,8 +258,7 @@ def test_the_expression_filter_is_debounced_and_applies_on_demand():
     Each set_text invalidates the proxy filter, which re-tests every source row; the first
     sweep after a model reset also fills the row-text cache. textChanged therefore only
     RESTARTS a short timer, and the apply happens once when typing pauses — while Enter and
-    Clear All Filters apply immediately, because waiting out an invisible timer would read as
-    the box being broken.
+    Clear All Filters apply immediately.
     """
     _app = QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow

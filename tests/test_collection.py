@@ -1,17 +1,9 @@
 """Meta-test: every test file must actually contribute tests.
 
-A file that collects nothing is indistinguishable from a passing one in most runners —
-it just doesn't fail. That is exactly how six suites went unnoticed: `tests/run_all.sh`
-used to execute each file as a script, so a file with no `__main__` block ran NOTHING,
-exited 0, and was reported "ok". Sixty tests were invisible that way, including a
-regression guard added the same week.
-
-The runner is now the gate's per-suite check (tools/gate.py; run_all.sh wraps it), which
-runs each file through pytest, so coverage is identical to CI by construction and
-that specific hole is closed. This test closes the general one: a file that stops
-contributing tests — renamed helpers, an accidental module-level `return`, a decorator
-that swallows collection, a bad `pytest.ini` marker — fails the build instead of
-quietly shrinking the suite.
+A file that collects nothing does not fail in most runners. The per-suite runner is the
+gate's per-suite check (tools/gate.py; run_all.sh wraps it), which runs each file through
+pytest. A file that stops contributing tests — renamed helpers, an accidental module-level
+`return`, a decorator that swallows collection, a bad `pytest.ini` marker — fails this test.
 """
 import collections
 import functools
@@ -35,14 +27,11 @@ _PERF_ONLY = {"test_perf.py"}
 def _collected_per_file(marker: str):
     """{filename: number of tests} for the whole tests/ directory under `-m marker`.
 
-    ONE `--collect-only` over the directory, parsed per file — not a subprocess per
-    suite. The per-suite form cost ~60 s (70 interpreter starts, each importing Qt);
-    this is ~1 s and answers the same question. Cached so the three checks below share
-    a single collection pass.
+    ONE `--collect-only` over the directory, parsed per file, not a subprocess per
+    suite. Cached so the three checks below share a single collection pass.
 
-    Uses a real pytest subprocess rather than importing the modules: import-time
-    success is not collection success (a module can import cleanly and still yield zero
-    tests), and that gap is the whole point of this check.
+    Uses a real pytest subprocess rather than importing the modules: a module can import
+    cleanly and still yield zero tests.
     """
     out = subprocess.run(
         [sys.executable, "-m", "pytest", _HERE, "--collect-only", "-q",
@@ -99,10 +88,8 @@ def test_runner_sees_every_test_file():
     """The per-suite runner (tools/gate.py, via tests/run_all.sh) must walk the same
     files pytest collects.
 
-    The two diverged for weeks: the runner executed files as scripts and therefore ran
-    only what each `__main__` block called. It now globs `tests/test_*.py` and runs each
-    through pytest, so the invariant to pin is that no collected file is missed by that
-    glob — i.e. every file contributing tests is one the runner will visit.
+    The runner globs `tests/test_*.py` and runs each through pytest; every file
+    contributing tests must be one that glob visits.
     """
     collected = set(_collected_per_file("not perf"))
     walked = {os.path.basename(p) for p in glob.glob(os.path.join(_HERE, "test_*.py"))}

@@ -9,7 +9,8 @@ in `../registers.json`.
 
 In SWI3S Studio: **Registers ▸ Import Peripheral Register Map…**, then either
 
-- browse to a vendor file (e.g. Cirrus-style `.xml`) — the import assistant
+- browse to a vendor `.xml` file — rootless `<register>`/`<bit>` lists, or a `<Registers>` list of
+  wide registers with a separate `<Fields>` list (split into byte registers) — the import assistant
   normalizes it (coalescing indexed bits, slicing per-field resets, reporting
   anything that looked off), or
 - browse to a normalized `.json` in this folder.
@@ -26,12 +27,12 @@ shared workspace carries its register maps with it.
   "_meta": { "schema": "swi3s-studio-regmap/1", "name": "<map name>" },
   "registers": [
     {
-      "name": "AMP_LEVEL",
-      "address": "0x10000007",      // absolute 32-bit address (byte register)
-      "reset": "0x0A",
+      "name": "GAIN",
+      "address": "0x10000104",      // absolute 32-bit address (byte register)
+      "reset": "0x15",
       "access": "RW",
       "fields": [
-        { "name": "amp_lvl", "bits": "[5:0]", "reset": 10, "access": "RW" }
+        { "name": "gain", "bits": "[5:0]", "reset": 21, "access": "RW" }
       ]
     }
   ]

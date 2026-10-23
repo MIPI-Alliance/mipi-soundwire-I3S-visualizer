@@ -78,10 +78,9 @@ def test_prepend_cold_start_then_decode_and_still_decodes_audio():
 
 
 def test_real_world_cold_start_quirks():
-    """Regression for a real cold-start capture: the waveform has TWO long
-    Bus-Reset highs (not one), a >48 µs recovery low, and a sub-sample glitch edge
-    in the PHY-number burst. Earlier these made the decoder mis-detect PhyStart and
-    drop/duplicate a bit. DN here has a single ~10 µs high over the 3rd of 4 bit
+    """A cold start with TWO long Bus-Reset highs (not one), a >48 µs recovery low,
+    and a sub-sample glitch edge in the PHY-number burst still yields the right
+    PhyStart and PHY number. DN here has a single ~10 µs high over the 3rd of 4 bit
     falling edges → 0b0010 = PHY2. Sample rate 250 MHz (250 samples/µs)."""
     import numpy as np
     spp = 250.0
@@ -93,7 +92,7 @@ def test_real_world_cold_start_quirks():
     clk += [t]; t += us(1600)       # Bus Reset high #2
     clk += [t]; t += us(75)         # recovery low (> PhyStart gap — must not trip)
     # 4 clock cycles (bits 3..0). Insert a sub-sample glitch (a +1-sample pip) at
-    # the start of the 3rd low, like the real capture.
+    # the start of the 3rd low.
     bit_edges = []
     for k in range(4):
         clk += [t]; t += us(30)     # rising
@@ -226,7 +225,7 @@ def test_a_phantom_that_named_a_phy_does_not_steer_the_decode(monkeypatch, cols,
 
 def test_a_steered_detection_without_evidence_either_way_is_kept(monkeypatch):
     """No valid command with it or without it: nothing contradicts the detection, so it
-    stands, and the decode is its steered one (as before this check existed)."""
+    stands, and the decode is its steered one."""
     from swi3s_studio import session as session_mod
     noise = Capture(np.arange(1, 4000, 4, dtype=np.uint64), np.asarray([], np.uint64),
                     False, False, RATE)

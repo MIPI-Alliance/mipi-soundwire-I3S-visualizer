@@ -1,14 +1,10 @@
 """A decode is stopped when free memory runs low, and a stopped re-decode keeps the last.
 
 The Open Capture dialog predicts the LOAD (est_peak_bytes, measured against RSS by
-test_perf), but not the decode after it: its audio depends on the bus config, from 0.014
-samples per UI (the flow-control demo) to 0.58 (PHY3), 0.17 on a user's capture, and near 1
-for a 1-bit PDM port, at ~114 bytes each at the peak. A bound loose enough to be safe would
-have predicted ~30 GB for that capture's 5 GB. So it is watched instead
-(session.run_watched): free memory is read while the decoder runs, and below the floor
-(saleae_sal.decode_memory_floor) the decode is stopped with Decoder.request_stop and
-DecodeMemoryError says what happened. That is the protection the old 8 GiB budget cap was
-for; it refused opens that would have fitted, where this stops only one that does not.
+test_perf), not the decode after it, whose audio volume depends on the bus config. The
+decode is watched instead (session.run_watched): free memory is read while the decoder
+runs, and below the floor (saleae_sal.decode_memory_floor) the decode is stopped with
+Decoder.request_stop and DecodeMemoryError says what happened.
 """
 import pytest
 

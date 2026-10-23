@@ -1,10 +1,9 @@
 """App launch helper: focusing/activating the window on startup.
 
-`app._activate` fixes the macOS unbundled "no menu bar" case — an unbundled
-`python -m swi3s_studio.app` process isn't a foreground GUI app by default, so the
-native (top-of-screen) menu bar stays owned by the launching terminal until the app
-is activated. This checks the helper is import-safe and doesn't raise, on a real
-window and on a minimal stub (PyObjC / macOS may be absent).
+`app._activate` raises and focuses the window and, on macOS, activates an unbundled
+`python -m swi3s_studio.app` process so it owns the native menu bar. This checks the
+helper is import-safe and does not raise, on a real window and on a minimal stub
+(PyObjC / macOS may be absent).
 
 Run: QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_app_launch.py
 """

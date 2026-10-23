@@ -5,12 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# THE ARGUMENTS ARE READ HERE, ONCE. Everything except `--rebuild` is forwarded to the app.
-# This launcher swallowed them all until 3.0.19, so `./run.sh --demo` silently opened an empty
-# window and `./run.sh -c cfg.csv -o m.json` started the UI instead of writing a model.
-# `--rebuild` is this script's own flag (the native build below) and must not reach the app.
-# Read in one place, it means the same wherever it is given: the build step once read only
-# $1 while this loop dropped the flag from any position, so `--demo --rebuild` did neither.
+# The arguments are read here, once. Everything except `--rebuild` is forwarded to the app.
+# `--rebuild` is this script's own flag (the native build below), accepted in any position,
+# and never reaches the app.
 app_args=()
 headless=0
 rebuild=0
@@ -22,9 +19,9 @@ for a in "$@"; do
     app_args+=("$a")
 done
 
-# Pick a Python the wheels support: PySide6 / pyarrow / numpy publish wheels for
-# 3.11-3.13, not 3.14+ (pip would fall back to building from source and fail). Honour a
-# PYTHON override, else prefer the newest supported interpreter on PATH.
+# Pick a Python the launcher supports: 3.11-3.13, where every platform has PySide6 /
+# pyarrow / numpy wheels. Honour a PYTHON override, else prefer the newest supported
+# interpreter on PATH.
 supported() { "$1" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)' 2>/dev/null; }
 
 # Does this interpreter have the C API headers (Python.h)? The decode core is C++, so a
@@ -35,8 +32,8 @@ has_headers() {
     "$1" -c 'import os,sysconfig,sys; sys.exit(0 if os.path.isfile(os.path.join(sysconfig.get_paths()["include"],"Python.h")) else 1)' 2>/dev/null
 }
 
-# Printed whenever we need to build but have no headers. Managed build hosts often have
-# several Pythons and no sudo, so lead with the options that need neither.
+# Printed whenever a build is needed but the headers are missing. Lists the options that
+# need no root and no other interpreter first.
 header_help() {
     cat >&2 <<EOF
 
@@ -75,10 +72,8 @@ if [ -n "$PY" ]; then
         exit 1
     fi
 else
-    # Two passes: prefer an interpreter that ALSO has the headers, so a host with a
-    # headerless system python3 but a usable toolchain python is picked automatically
-    # rather than failing the build minutes later. Falls back to version-only if none
-    # has them (the module may already be built, in which case no build is needed).
+    # Two passes: prefer a supported interpreter that also has the headers, else fall back
+    # to version-only (the module may already be built, in which case no build is needed).
     for c in python3.13 python3.12 python3.11 python3; do
         if command -v "$c" >/dev/null 2>&1 && supported "$c" && has_headers "$c"; then PY="$c"; break; fi
     done
@@ -89,7 +84,7 @@ else
     fi
 fi
 if [ -z "$PY" ]; then
-    echo "Need Python 3.11-3.13 (PySide6/pyarrow/numpy have no 3.14+ wheels yet). Install one and re-run, or set PYTHON=/path/to/python3.12" >&2
+    echo "Need Python 3.11-3.13 (the versions this launcher supports). Install one and re-run, or set PYTHON=/path/to/python3.12" >&2
     exit 1
 fi
 
@@ -103,10 +98,9 @@ VENV="${SWI3S_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/swi3s-studio/venv-$KEY}"
 mkdir -p "$(dirname "$VENV")"
 
 if [ ! -d "$VENV" ]; then
-    # No venv yet => the native core will certainly have to be built. Check the headers
-    # NOW rather than after creating the venv and downloading ~200 MB of wheels: on a
-    # headerless host that work is wasted and the real error arrives minutes later.
-    # Skipped when SKBUILD_CMAKE_DEFINE already points the build at private headers.
+    # No venv yet => the native core will have to be built. Check the headers before
+    # creating the venv and downloading the wheels. Skipped when SKBUILD_CMAKE_DEFINE
+    # already points the build at private headers.
     if ! has_headers "$PY" && [ -z "${SKBUILD_CMAKE_DEFINE:-}" ]; then
         echo "Cannot build the decode core with $PY: Python.h is missing." >&2
         header_help "$PY"
@@ -151,15 +145,10 @@ if [ "$need_native" = 1 ]; then
         exit 1
     fi
     echo "Building the swi3score decode core..."
-    # --force-reinstall because the native version is a fixed 0.1.0: a plain install
-    # no-ops ("Requirement already satisfied") and silently keeps a stale .so after a
-    # source change, which then trips the ABI check at import. --no-deps keeps it from
-    # re-resolving the app deps on every rebuild.
+    # --force-reinstall because the native version is a fixed 0.1.0, so a plain install
+    # no-ops and keeps a stale .so. --no-deps skips re-resolving the app deps.
     if ! python -m pip install --force-reinstall --no-deps ./native; then
-        # Don't guess at the cause. This used to say "a C++ compiler is required",
-        # which was wrong for the most common real failure — a working g++ but no
-        # Python development headers — and sent people looking for a compiler that
-        # was already installed and had just compiled two of the thirteen objects.
+        # List the usual causes; do not assert one.
         echo "swi3score build failed; not stamping - will retry next run." >&2
         echo "  The build output above names the cause. The usual ones are:" >&2
         echo "    * 'Python.h: No such file or directory' or 'Python development" >&2
@@ -172,16 +161,9 @@ if [ "$need_native" = 1 ]; then
     touch "$NATIVE_STAMP"
 fi
 
-# Say that the launch has started. Everything above prints as it works, so without this
-# the last thing on screen is a pip line and the window is the next event - which reads as
-# a stall, especially right after an install: the OS verifies the ~450 MB of Qt libraries
-# the first time they are loaded, so the window can take a while. A warm start is ~1s.
-# (Emitted below, once the arguments are known — a headless run opens no window, so neither
-# message would be true of it.)
-
-
-# -o implies headless, so say nothing about a window that will not open. The app decides for
-# real; this only picks which message is honest.
+# Announce the launch; the first launch after an install is slow while the OS verifies the
+# Qt libraries. -o implies headless, so say nothing about a window that will not open. The
+# app decides for real; this only picks the message.
 if [ "$headless" = 1 ]; then
     :
 elif [ "$installed_deps" = 1 ]; then
@@ -191,7 +173,13 @@ else
     echo "Starting SWI3S Studio..."
 fi
 
-# Tell the app what to call itself in `usage:` — see cli.program_name(). Without this,
-# `./run.sh -h` printed `usage: swi3s-studio …`, naming a command that does not exist on a
-# fresh checkout, when the launcher is how this project is documented to be run.
+# Under PYTHONPATH=. a decode core built at the checkout root (native/build_local.sh, which
+# the gate runs) is imported instead of the venv's. Name it so a stale one is noticed.
+root_core=$(python -c 'import sysconfig; print("swi3score" + sysconfig.get_config_var("EXT_SUFFIX"))')
+if [ -e "$root_core" ]; then
+    echo "Note: using ./$root_core from the checkout root, not the venv's build." >&2
+    echo "  After a native/ change, rebuild it with: bash native/build_local.sh (or delete it)." >&2
+fi
+
+# Tell the app what to call itself in `usage:` — see cli.program_name().
 exec env PYTHONPATH=. SWI3S_LAUNCHER=./run.sh python -m swi3s_studio.app "${app_args[@]+"${app_args[@]}"}"

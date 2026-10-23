@@ -1,0 +1,299 @@
+{
+  "links": [
+    {
+      "source": {
+        "type": "demo",
+        "audio_samples_per_channel": 48000,
+        "cold_start": true,
+        "phy": 2,
+        "variant": "",
+        "dp_names": {
+          "0.0": "AMP1",
+          "0.1": "AMP2",
+          "0.2": "MIC1",
+          "0.3": "MIC2"
+        },
+        "region_names": {
+          "1": "1x44.1k, 1x48k, 2x3.072M",
+          "2": "1x44.1k, 2x48k, 2x3.072M"
+        }
+      },
+      "name": "Link 1",
+      "offset_ps": 0,
+      "overlay": [],
+      "device_regmaps": {},
+      "device_names": {},
+      "device_hub_depths": {},
+      "device_scramblers": [],
+      "stream_colors": [],
+      "stream_processing": [],
+      "even_timing": [],
+      "view": {
+        "commands": {
+          "filters": {
+            "kinds": [
+              "Commit Point",
+              "ReadA32",
+              "ReadData",
+              "SSCR",
+              "SSPA",
+              "WriteA32"
+            ],
+            "kinds_none": false,
+            "devices": [],
+            "groups": [],
+            "errors_only": false,
+            "text": ""
+          },
+          "col_widths": {
+            "Time (µs)": 100,
+            "PhaseID": 86,
+            "Opcode": 84,
+            "Address": 96,
+            "Register": 229,
+            "Data": 209,
+            "Response": 313
+          }
+        },
+        "audio": {
+          "channels": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1,
+              0
+            ],
+            [
+              0,
+              3,
+              0
+            ]
+          ],
+          "x_range_s": [
+            0.0009918902630487085,
+            0.004127413736951292
+          ],
+          "vertical_zoom": false,
+          "decimation": [],
+          "spectrogram": [],
+          "spectrogram_frames": []
+        },
+        "capture": {
+          "x_range_s": [
+            0.0,
+            1.16296919632
+          ],
+          "rsp_markers": false,
+          "samples": false,
+          "hide_legend": true
+        }
+      }
+    },
+    {
+      "source": {
+        "type": "demo",
+        "audio_samples_per_channel": 48000,
+        "cold_start": true,
+        "phy": 2,
+        "variant": "flow_control",
+        "delay_samples": 1234567,
+        "dp_names": {
+          "0.0": "No Flow Control",
+          "1.0": "TX Synchronous",
+          "2.0": "RX Synchronous",
+          "3.0": "Asynchronous"
+        },
+        "region_names": {
+          "1": "All Flow Control Modes"
+        }
+      },
+      "name": "Link 2",
+      "offset_ps": 0,
+      "overlay": [],
+      "device_regmaps": {},
+      "device_names": {},
+      "device_hub_depths": {},
+      "device_scramblers": [],
+      "stream_colors": [],
+      "stream_processing": [],
+      "even_timing": [],
+      "view": {
+        "commands": {
+          "filters": {
+            "kinds": [
+              "Commit Point",
+              "SSCR",
+              "SSPA",
+              "WriteA32"
+            ],
+            "devices": [],
+            "groups": [],
+            "kinds_none": false,
+            "errors_only": false,
+            "text": ""
+          },
+          "col_widths": {
+            "Time (µs)": 80,
+            "PhaseID": 68,
+            "Opcode": 74,
+            "Address": 96,
+            "Register": 257,
+            "Data": 173,
+            "Response": 313
+          }
+        },
+        "audio": {
+          "channels": [
+            [
+              1,
+              0,
+              5
+            ],
+            [
+              1,
+              0,
+              6
+            ],
+            [
+              2,
+              0,
+              7
+            ],
+            [
+              2,
+              0,
+              8
+            ],
+            [
+              3,
+              0,
+              7
+            ],
+            [
+              3,
+              0,
+              8
+            ]
+          ],
+          "x_range_s": [
+            0.0,
+            0.3052433990484851
+          ],
+          "vertical_zoom": false,
+          "decimation": [],
+          "spectrogram": [],
+          "spectrogram_frames": []
+        },
+        "capture": {
+          "x_range_s": [
+            0.0,
+            2.32338588224
+          ],
+          "rsp_markers": false,
+          "samples": false,
+          "hide_legend": true
+        }
+      }
+    }
+  ],
+  "active_link": 0,
+  "bookmarks": [],
+  "cursor": 1279826,
+  "mode": "Analysis",
+  "view": {
+    "pane_links": {
+      "commands": 0,
+      "right": 0,
+      "grid": 0,
+      "bottom": 0
+    },
+    "commands_all": false,
+    "bottom_all": false,
+    "timeline_height": 180,
+    "tx_map": false,
+    "tx_persist": false,
+    "grid_rows": 64,
+    "tx_start_row": 0,
+    "show_clock": true,
+    "window": {
+      "docks": "AAAA/wAAAAD9AAAAAwAAAAEAAAHyAAAB1PwCAAAAAfwAAAC4AAAB1AAAAM8BAAAg+gAAAAACAAAAA/sAAAASAFIAZQBnAGkAcwB0AGUAcgBzAQAAAAD/////AAAArgD////7AAAAFABTAHQAYQB0AGkAcwB0AGkAYwBzAQAAAAD/////AAAAZAD////7AAAAEgBCAG8AbwBrAG0AYQByAGsAcwEAAAAA/////wAAAGAA////AAAAAgAABXYAAAC0/AEAAAAB+wAAABAAVABpAG0AZQBsAGkAbgBlAQAAAAAAAAV2AAAAYwD///8AAAADAAAFdgAAAXf8AQAAAAH8AAAAAAAABXYAAAODAP////oAAAADAQAAAAb7AAAADgBCAHUAcwBHAHIAaQBkAQAAAAD/////AAABcgD////7AAAADgBDAGEAcAB0AHUAcgBlAQAAAAD/////AAADEQD////7AAAABgBDAEQAUwEAAAAA/////wAAALIA////+wAAAAoAQQB1AGQAaQBvAQAAAAD/////AAACqwD////7AAAADgBTAGEAbQBwAGwAZQBzAQAAAAD/////AAABxAD////7AAAADABUAGkAbQBpAG4AZwEAAAAA/////wAAA4MA////AAADgAAAAdQAAAAEAAAABAAAAAgAAAAI/AAAAAA="
+    },
+    "timeline_ps": [
+      0,
+      1002559328000
+    ],
+    "commands_header": {
+      "hidden": [
+        "Row",
+        "ΔRows",
+        "ΔTime (µs)",
+        "Devices",
+        "Packet\nLength",
+        "Group\nMask",
+        "CRC"
+      ],
+      "columns": [
+        "Row",
+        "ΔRows",
+        "Time (µs)",
+        "ΔTime (µs)",
+        "PhaseID",
+        "Devices",
+        "Packet\nLength",
+        "Opcode",
+        "Address",
+        "Register",
+        "Data",
+        "Group\nMask",
+        "CRC",
+        "Response"
+      ],
+      "sort": null
+    },
+    "samples": {
+      "ports": [],
+      "channels": [],
+      "op": "—",
+      "value": ""
+    },
+    "registers": {
+      "device": 0,
+      "expanded": [
+        "DP0",
+        "SLC"
+      ],
+      "hidden": [
+        "csv",
+        "default",
+        "ui"
+      ],
+      "col_widths": {
+        "Register": 258,
+        "Addr": 63,
+        "Value": 52,
+        "Fields": 407
+      }
+    },
+    "statistics": {
+      "collapsed": [],
+      "expanded": []
+    },
+    "timing_pane": {
+      "region": "16 col  (0.34–1.00 s)",
+      "filter": [
+        "Manager",
+        "AMP1 · Device 0 DP0",
+        "AMP2 · Device 0 DP1",
+        "MIC1 · Device 0 DP2",
+        "MIC2 · Device 0 DP3",
+        "CDS (Col 0)"
+      ],
+      "hidden": []
+    }
+  },
+  "version": 4
+}

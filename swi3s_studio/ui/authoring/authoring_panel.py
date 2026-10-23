@@ -61,6 +61,15 @@ _BTN_CSS = (f"QPushButton {{ background:{VizTheme.ACCENT}; color:white; border:n
             f"QPushButton:hover {{ background:{VizTheme.ACCENT_HOVER}; }}")
 
 
+def _dialog_button_css() -> str:
+    """A button in the value column that opens a settings dialog: the entry look, in the
+    current theme."""
+    return (f"QPushButton {{ background:{VizTheme.ENTRY_BG}; color:{VizTheme.TEXT};"
+            f" border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER};"
+            f" border-radius:{VizTheme.CORNER_RADIUS}px; padding:1px 4px; }}"
+            f"QPushButton:hover {{ border-color:{VizTheme.ACCENT}; }}")
+
+
 class _ClickLineEdit(QLineEdit):
     """A read-only entry that emits `clicked` on press — used for the Device and
     Num Channels cells, which open a picker dialog like the Visualizer."""
@@ -77,7 +86,7 @@ class _ClickLineEdit(QLineEdit):
         super().mousePressEvent(e)
 
 
-# Eddie's 12 data-port colours (Colors.DP_COLORS) — the DP name headers.
+# The Visualizer's 12 data-port colours (Colors.DP_COLORS) — the DP name headers.
 _DP_COLORS = ["#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
               "#BF80FF", "#FFBFFF", "#FFBFBF", "#FFFFBF", "#BFFFBF", "#BFFFFF"]
 
@@ -119,13 +128,11 @@ _CLICK_NUMERIC = {"device_number", "num_channels"}
 
 # Interface ("Other Parameters") rows: (label, attr, kind, min, max, phy3_only).
 #
-# THE FOUR CDS ROWS ARE ONE ROW NOW. Bit width, guard, tail and handover were four
-# consecutive rows in three different control shapes, and CDS_DriveType would have been
-# a fifth — a third of the interface column spent on one register block. They collapse
-# to a single "CDS Settings" button opening CdsSettingsDialog, which owns all five and
-# reaches the per-source guard/tail dialogs from inside. `kind == "dialog"` is a row
-# whose widget is a button, carrying no attr of its own (hence the `cds_settings`
-# pseudo-attr, which nothing on BusConfig answers to — see _on_iface_edit's skip list).
+# The CDS settings (bit width, guard, tail, handover, CDS_DriveType) are one row: a
+# "CDS Settings" button opening CdsSettingsDialog, which owns all five and reaches the
+# per-source guard/tail dialogs from inside. `kind == "dialog"` is a row whose widget is a
+# button, carrying no attr of its own (hence the `cds_settings` pseudo-attr, which nothing
+# on BusConfig answers to — see _on_iface_edit's skip list).
 _IFACE_ROWS = [
     ("Num Columns (1-31)", "num_columns", "int", 1, 31, False),
     ("Skipping Denominator (1-4096)", "skipping_denominator", "int", 1, 4096, False),
@@ -168,7 +175,7 @@ class AuthoringPanel(QWidget):
         super().__init__()
         self._cfg = BusConfig()   # start in the reset (empty) state — no ports enabled
         self._loading = False
-        self.setStyleSheet(authoring_stylesheet())   # match the old Visualizer look
+        self.setStyleSheet(authoring_stylesheet())   # match the Visualizer look
 
         # widget stores
         self._dp_name: List[QLineEdit] = []
@@ -177,6 +184,7 @@ class AuthoringPanel(QWidget):
         self._dp_rate: List[QLabel] = []
         self._iface: Dict[str, QWidget] = {}
         self._action_btns: List[QPushButton] = []   # re-styled on theme switch
+        self._dialog_btns: List[QPushButton] = []   # re-styled on theme switch
         # arrow-key navigation grid: widget -> (row, col) + the reverse list
         self._nav_pos: Dict[QLineEdit, tuple] = {}
         self._nav_list: List[tuple] = []
@@ -345,8 +353,7 @@ class AuthoringPanel(QWidget):
         # Horizontal scroll for the 12 DP entry columns; the frozen label column
         # stays put. No visible scrollbars — a trackpad/mouse horizontal swipe still
         # scrolls the columns, and the panel is sized to its content height so every
-        # row is always visible (the vertical scroll that only existed to expose the
-        # horizontal bar is gone).
+        # row is always visible.
         n_rows = 1 + len(_NUMERIC_ROWS) + len(_CHECK_ROWS) + 1
         content_h = n_rows * (_ROW_H + 2)
         inner = QScrollArea()
@@ -400,25 +407,19 @@ class AuthoringPanel(QWidget):
                 form.addWidget(cell, i, 1, alignment=Qt.AlignRight)
             elif kind == "dialog":
                 # A row whose "value" is a button: clicking opens the dialog that owns that
-                # group of settings (today, CDS). Sized to the same 64px value column so the
+                # group of settings (CDS). Sized to the same 64px value column so the
                 # column stays aligned with the entry boxes above it.
                 #
-                # STYLED, because `authoring_stylesheet()` covers QLineEdit and QCheckBox but
-                # NOT QPushButton — so this fell through to the platform frame and drew a
-                # light bevel on three sides with a dark one on the fourth, which reads as a
-                # rendering fault next to the flat themed entries beside it. It takes the
-                # ENTRY look rather than the panel's accent-blue action style: it sits in a
-                # column of values, and an accent fill here would shout louder than the
-                # buttons that actually load and save files. Hover + a hand cursor carry the
-                # affordance that the border no longer does.
+                # Styled here, since `authoring_stylesheet()` covers QLineEdit and QCheckBox
+                # but NOT QPushButton, and restyled by retheme(). It takes the ENTRY look, not
+                # the accent-blue action style, as it sits in a column of values; hover and a
+                # hand cursor mark it as clickable.
                 w = QPushButton("Open…")
-                w.setFixedWidth(64)
                 w.setCursor(Qt.PointingHandCursor)
-                w.setStyleSheet(
-                    f"QPushButton {{ background:{VizTheme.ENTRY_BG}; color:{VizTheme.TEXT};"
-                    f" border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER};"
-                    f" border-radius:{VizTheme.CORNER_RADIUS}px; padding:1px 4px; }}"
-                    f"QPushButton:hover {{ border-color:{VizTheme.ACCENT}; }}")
+                w.setStyleSheet(_dialog_button_css())
+                self._dialog_btns.append(w)
+                # The value column's width, or wider where the platform font needs it.
+                w.setFixedWidth(max(64, w.sizeHint().width()))
                 w.clicked.connect(self._open_cds_settings_dialog)
                 form.addWidget(w, i, 1, alignment=Qt.AlignRight)
             else:
@@ -465,10 +466,14 @@ class AuthoringPanel(QWidget):
                            ("Maximize Frame", self.maximizeRequested)):
             b = QPushButton(label)
             b.clicked.connect(sig.emit)
-            b.setFixedWidth(180)
             b.setStyleSheet(_BTN_CSS)
             self._action_btns.append(b)
             btns.addWidget(b, alignment=Qt.AlignHCenter)
+        # One width for the column: 180 px, or the widest label where the platform font
+        # needs more.
+        width = max(180, *(b.sizeHint().width() for b in self._action_btns))
+        for b in self._action_btns:
+            b.setFixedWidth(width)
         col.addLayout(btns)
         col.addStretch(1)
         return host
@@ -549,8 +554,8 @@ class AuthoringPanel(QWidget):
         # aren't known until shown), and re-tuned on resize.
         self._notifications.setFixedHeight(_NOTIF_H)
         col.addWidget(self._notifications)
-        # Last loaded / saved file, shown like the Visualizer's file status — under
-        # Notifications (not under the buttons, which cost the grid vertical space).
+        # Last loaded / saved file, shown like the Visualizer's file status, under
+        # Notifications.
         self._file_status = QLabel("")
         self._file_status.setAlignment(Qt.AlignCenter)
         self._file_status.setWordWrap(True)
@@ -579,7 +584,7 @@ class AuthoringPanel(QWidget):
         """Re-apply the palette after a theme switch. Re-applying the panel
         stylesheet re-themes every cascaded child (labels, entries, checkboxes); the
         few widgets with their own inline style (the DP-name colour chips, the action
-        buttons, the description's pinned viewport/palette, the file-status note) and
+        buttons, the dialog buttons, the description's pinned viewport/palette, the file-status note) and
         the Notifications sub-panel are refreshed explicitly."""
         global _BTN_CSS
         _BTN_CSS = (f"QPushButton {{ background:{VizTheme.ACCENT}; color:white; border:none; "
@@ -593,6 +598,8 @@ class AuthoringPanel(QWidget):
                 f"border-radius:{VizTheme.CORNER_RADIUS}px;")
         for b in self._action_btns:
             b.setStyleSheet(_BTN_CSS)
+        for b in self._dialog_btns:
+            b.setStyleSheet(_dialog_button_css())
         self._desc.viewport().setStyleSheet(f"background:{VizTheme.ENTRY_BG};")
         dpal = self._desc.palette()
         dpal.setColor(QPalette.Text, QColor(VizTheme.TEXT))
@@ -755,11 +762,10 @@ class AuthoringPanel(QWidget):
 
         Bit width, drive type and handover are edited in the dialog itself; the
         per-source guard/tail dialogs open from inside it. Nothing is written back
-        unless the dialog is accepted — including a guard change made two dialogs deep,
-        which is why the guard/tail lists come back through the dialog rather than being
-        applied by the inner one.
+        unless the dialog is accepted — including a guard change made two dialogs deep:
+        the guard/tail lists come back through this dialog, not applied by the inner one.
 
-        `cds_guard_enabled` / `cds_tail_enabled` remain READ-ONLY properties derived from
+        `cds_guard_enabled` / `cds_tail_enabled` are READ-ONLY properties derived from
         the per-source lists; assigning either raises, so the lists are what is set.
         """
         dlg = CdsSettingsDialog(self, bit_width=self._cfg.cds_bit_width,
@@ -779,8 +785,7 @@ class AuthoringPanel(QWidget):
         self._update_cds_settings_row()
 
     def _update_cds_settings_row(self) -> None:
-        """Summarise the CDS on the row's tooltip, so the collapse into one row doesn't
-        cost the at-a-glance read the four separate rows gave."""
+        """Summarise every CDS setting on the CDS Settings row's tooltip."""
         _lab, w = self._iface["cds_settings"]
         w.setToolTip(
             f"Bit width {self._cfg.cds_bit_width}"

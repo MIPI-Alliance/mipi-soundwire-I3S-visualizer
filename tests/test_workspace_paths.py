@@ -164,3 +164,48 @@ def test_cancel_opens_nothing_and_skip_opens_the_rest(opened, tmp_path, monkeypa
     monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", lambda *a, **k: None)
     again, _asked = _reopen(monkeypatch, ws_path, "skip")
     assert len(again.links) == 0                      # its only Link was skipped
+
+
+def _two_link_workspace(tmp_path):
+    """A workspace of two .sal Links, "Bus A" (active) and "Bus B", each its own file."""
+    a = _sal(tmp_path / "proj", "a.sal")
+    b = _sal(tmp_path / "proj", "b.sal")
+    ws_path = str(tmp_path / "proj" / "two.swi3s")
+    Workspace(links=[LinkSpec(source=_sal_source(a), name="Bus A"),
+                     LinkSpec(source=_sal_source(b), name="Bus B", offset_ps=7)],
+              bookmarks=[{"sample": 11, "group": "A", "index": 1, "label": "", "link": 0},
+                         {"sample": 22, "group": "A", "index": 2, "label": "", "link": 1}],
+              ).save(ws_path)
+    return ws_path, a, b
+
+
+def _no_errors(monkeypatch):
+    shown = []
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical",
+                        lambda *a, **k: shown.append(a[1:3]))
+    return shown
+
+
+def test_skipping_the_first_link_opens_the_others(tmp_path, monkeypatch):
+    QApplication.instance() or QApplication([])
+    ws_path, a, b = _two_link_workspace(tmp_path)
+    os.remove(a)
+    errors = _no_errors(monkeypatch)
+    again, asked = _reopen(monkeypatch, ws_path, "skip")
+    assert asked == ["a.sal"]
+    assert [(e.name, e.offset_ps) for e in again.links] == [("Bus B", 7)]
+    assert again._session.source["path"] == b
+    assert sorted((m.sample, m.link) for m in again._bookmarks) == [(22, 0)]
+    assert errors == []                               # a skipped file is not an error
+
+
+def test_skipping_every_link_opens_nothing_and_reports_no_error(tmp_path, monkeypatch):
+    QApplication.instance() or QApplication([])
+    ws_path, a, b = _two_link_workspace(tmp_path)
+    os.remove(a)
+    os.remove(b)
+    errors = _no_errors(monkeypatch)
+    again, asked = _reopen(monkeypatch, ws_path, "skip")
+    assert asked == ["a.sal", "b.sal"]
+    assert len(again.links) == 0 and getattr(again, "_load_thread", None) is None
+    assert errors == []

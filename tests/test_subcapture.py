@@ -18,8 +18,8 @@ from swi3s_studio.ingest.capture import Capture
 def test_low_entropy_sub_is_bounded_not_a_hang():
     """A low-entropy sub (constant/idle data) matches at a huge number of overlapping
     offsets in a large capture. The exact-match hit collection must be CAPPED so this
-    stays fast instead of the O(N * hits) hang (which stalled the UI for minutes).
-    Both the exact path (some matches) and the no-match seed path must be bounded."""
+    stays fast instead of O(N * hits). Both the exact path (some matches) and the
+    no-match seed path must be bounded."""
     n = 8_000_000
     clk = (np.arange(1, n + 1, dtype=np.int64) * 2).astype(np.uint64)
     # data never toggles -> every clock edge samples data level 0 (a constant pattern)
@@ -34,13 +34,10 @@ def test_low_entropy_sub_is_bounded_not_a_hang():
     sub2 = Capture(clock_edges=sub.clock_edges, data_edges=sub.clock_edges,  # data toggles every edge
                    initial_clock=False, initial_data=True, sample_rate_hz=1_000_000)
     _ = locate_subcapture(main, sub2)
-    # A LOOSE BOUND HERE, THE TIGHT ONE IN THE PERF LANE. This file runs in the default suite
-    # on every CI config, and docs/TESTING.md's convention is that wall-clock CEILINGS belong
-    # behind the `perf` marker with generous margins, so runner jitter cannot redden an
-    # ordinary run. But the defect this pins was a HANG (minutes, O(N * hits)), and a hang is
-    # worth catching everywhere — so the bound that stays here is one no amount of jitter can
-    # reach while still failing a regression to that behaviour. The real ceiling
-    # (test_perf.py::test_low_entropy_locate_ceiling) is 15 s.
+    # A LOOSE BOUND HERE, THE TIGHT ONE IN THE PERF LANE. Wall-clock CEILINGS belong behind
+    # the `perf` marker (docs/TESTING.md); this bound only catches an O(N * hits) hang, which
+    # no runner jitter reaches. The real ceiling (test_perf.py::test_low_entropy_locate_ceiling)
+    # is 15 s.
     assert time.time() - t0 < 120.0, "low-entropy locate must be bounded, not a hang"
     assert isinstance(matches, list)
     # STRUCTURALLY bounded too, not just fast: the cap on collected hits is what makes it
@@ -249,8 +246,7 @@ def test_locates_slice_in_a_multi_rate_main():
     median must still score ~1.0. capture_to_symbols normalizes gaps by the
     WHOLE-capture median, so a single-rate sub sliced from a non-median region
     carries a constant log-gap offset vs main's window; _shape_similarity must
-    mean-center that away (else the true match scored ~0 and unrelated windows
-    won). Regression for the global-vs-local median normalization bug."""
+    mean-center that away."""
     main, clk = _make_multirate([(10000, 4), (4000, 6)])
     k0, k1 = 11000, 11500                              # slice from the gap=6 region
     s0, s1 = int(clk[k0]), int(clk[k1])

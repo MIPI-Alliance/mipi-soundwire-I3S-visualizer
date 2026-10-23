@@ -51,7 +51,7 @@ class JSONHandler:
 
     @staticmethod
     def save_bus_model(filename: str, model: BusModel, batch_mode: bool = False) -> None:
-        """Save bus model to JSON file (new sequential format).
+        """Save bus model to JSON file (sequential format).
 
         Args:
             filename: Path to JSON file to create
@@ -114,7 +114,7 @@ class JSONHandler:
                 row_rate=data.get('row_rate', 3072.0)  # Default if not present
             )
 
-            # Load bits - new hierarchical format: bits is dict keyed by bit_index
+            # Load bits - bits is a dict keyed by bit_index
             # Each entry has row, column, and slots array
             bits_data = data['bits']
             for bit_index_str, bit_entry in bits_data.items():
@@ -141,7 +141,7 @@ class JSONHandler:
             bus_model.device_clashes = data.get('device_clashes', [])
             bus_model.read_overlaps = data.get('read_overlaps', [])
 
-            # Load warnings (new format)
+            # Load warnings
             # Warnings are stored as {"truncation": [0, 1], "validation": [2]}
             # We reconstruct the internal warning lists from these
             warnings_data = data.get('warnings', {})

@@ -1,7 +1,6 @@
-// Synthetic SWI3S PHY2 demo stream. See Demo.h. The plan-building logic mirrors
-// SwI3sSimulationDataGenerator (and test/test_simulation_roundtrip.cpp), reusing
-// the core's 8b/10b encoder, CRC, register model, placement cascade and
-// scrambler so the produced stream decodes back to the generated audio.
+// Synthetic SWI3S PHY2 demo stream. See Demo.h. The plan building reuses the
+// core's 8b/10b encoder, CRC, register model, placement cascade and scrambler so
+// the produced stream decodes back to the generated audio.
 //
 // The demo starts in safe-lock-2 (2 columns, control only), commits to 8 columns
 // (audio starts), then commits to 16 columns (audio continues, uninterrupted). It
@@ -10,7 +9,7 @@
 // rate-determining registers alongside NumColumns: PCM Interval 63->31; and the PDM
 // ports switch to SampleGrouping=2 (two adjacent samples/row) so 3.072 MHz survives the
 // halved row rate. DP0 (PCM) and DP2 (PDM) run unscrambled, DP1/DP3 scrambled, to show
-// both transports. See the maintainers' demo-rework notes.
+// both transports.
 
 #include "Demo.h"
 
@@ -61,13 +60,10 @@ void appendWriteA32(std::vector<bool>& bits, U16 devMask, U32 addr,
 // The Mgr-owned spacer + read payload + its own CRC + the tail that CLOSES the phase, shared
 // by an immediate ReadSetup and a ReadData delivery.
 //
-// The tail is not optional and is easy to leave off. After the data + 2 CRC bytes the parser
-// goes eReadPmSpacer -> eReadMgrResp and only emits the command record on the MANAGER's
-// response symbol (READ_DATA_OK). A first version of this helper stopped at the CRC, so the
-// immediate read decoded into NOTHING AT ALL — no record, no error — because the next
-// command's comma arrived mid-spacer and abandoned the phase in progress. The deferred pair
-// happened to survive only because idle fill followed it. Silent, and invisible to any
-// assertion that counts errors rather than records.
+// The tail is not optional. After the data + 2 CRC bytes the parser goes eReadPmSpacer ->
+// eReadMgrResp and only emits the command record on the MANAGER's response symbol
+// (READ_DATA_OK); without it the next command's comma arrives mid-spacer and abandons the
+// phase, so the read produces no record and no error.
 void appendReadPayload(std::vector<bool>& bits, const U8* data, int n)
 {
     appendSymbol(bits, 0x155);                                    // Mgr-owned data spacer
@@ -125,10 +121,7 @@ void appendReadData(std::vector<bool>& bits, U16 devMask, const U8* data, int n)
 // `presentMask` is the demo's device mask; `alertMask` picks which of those report
 // PING_ALERT instead of PING_ATTACHED. Every ABSENT device leaves the field undriven,
 // which on the wire is the all-ones symbol — RobustToken can't resolve it to a token,
-// returns -1, and the UI reports NO_RESPONSE (see analysis/responses.py). Driving
-// PING_ATTACHED for all 12 (as this used to) claimed twelve attached peripherals on a
-// bus that only ever configures one, which the per-peripheral Ping statistics made
-// obvious.
+// returns -1, and the UI reports NO_RESPONSE (see analysis/responses.py).
 const U16 kUndrivenSymbol = 0x3FF;      // undriven bus = all ones; decodes to token -1
 
 void appendPing(std::vector<bool>& bits, U16 presentMask = 0x001, U16 alertMask = 0x000)
@@ -301,10 +294,11 @@ SspaSchedule makeSspaSchedule(const SwI3sConfig& cfg, long anchorSsp, long regio
 // The idle pattern is the alternating D10.2 sequence 0101010101 ({ASW2201}: when the
 // Manager has no Command to send it drives a continuous stream of idle 0-1 bit pairs, one
 // CDS bit per Row) — this is the idle pattern at the CDS-bit layer, independent of PHY.
-// On FBCSE (PHY1/PHY2) the CDS is additionally NRZS-encoded (Table 133: a CDS 0 inverts
-// the bus value, a 1 repeats it), so those 0101 idle bits render on the wire as the
-// ..1100.. "zebra" — the same rendered form as the Cold-Start idle preamble. On DLV (PHY3)
-// the CDS is not NRZS-encoded, so the identical 0101 idle bits render as 0101 directly.
+// On FBCSE (PHY1/PHY2) the CDS is additionally NRZS-encoded (the "PHY1 & PHY2: NRZS
+// Encoding for CDS" table: a CDS 0 inverts the bus value, a 1 repeats it), so those 0101
+// idle bits render on the wire as the ..1100.. "zebra" — the same rendered form as the
+// Cold-Start idle preamble. On DLV (PHY3) the CDS is not NRZS-encoded, so the identical
+// 0101 idle bits render as 0101 directly.
 // Emitting all-ones instead would NRZS-hold the FBCSE level flat (no zebra), which a real
 // bus never does when idle.
 const long kPingRowPeriod = 2048;   // half the {ASW2601} 4096-Row limit (error margin)
@@ -393,9 +387,8 @@ U64 sineSample(int channel, U64 index, int sampleSize)
 // exactly, so skipping 13 of every 160 intervals gives 44.1 kHz with no rounding at all — and
 // 160 is the SMALLEST denominator that can, since 147/160 is already in lowest terms.
 //
-// The demo's PCM ports keep their 48 kHz Interval; only DP0 gains a numerator. Everything else
-// falls out of machinery that already exists, which is why this is two register writes and not a
-// generator rewrite:
+// The demo's PCM ports keep their 48 kHz Interval; only DP0 gains a numerator (two register
+// writes). The rest follows from the existing machinery:
 //
 //   * the payload loop drives real CDataPort instances, so `startInterval` runs the accumulator
 //     and a skipped interval simply emits nothing;
@@ -405,10 +398,9 @@ U64 sineSample(int channel, U64 index, int sampleSize)
 //     periodic SSPAs land only where the accumulator is back at 0 — an SSPA anywhere else
 //     restarts the pattern part-way through, which is the unexpected SSP of Section 9.1.6.2.1.
 //
-// ONE CONSEQUENCE WORTH KNOWING: that alignment rises from 64 rows to 64 x 160 = 10240, so a
-// region shorter than ~160 samples/channel can no longer hold an interval-aligned SSPA and gets
-// none. Small demos therefore lose their periodic SSPA; nothing asserts on it at those sizes, and
-// tests/test_sspa_demo.py uses 1500 samples/channel precisely so every region can hold one.
+// That alignment is 64 x 160 = 10240 rows, so a region shorter than ~160 samples/channel cannot
+// hold an interval-aligned SSPA and gets none. tests/test_sspa_demo.py uses 1500
+// samples/channel so every region holds one.
 const int kSkipNumerator   = 13;
 const int kSkipDenominator = 160;      // 48000 * (160-13)/160 == 44100 exactly
 
@@ -614,7 +606,7 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
                       + swi3s::reg::kDpScramDirMode, {0x00});
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg8; regs.BuildConfig(cfg8);
     cfg8.NumColumns = 7;
     if (cfg8.SkippingDenominator < 1) cfg8.SkippingDenominator = 1;
@@ -645,7 +637,7 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
     SspaSchedule sspa8 = makeSspaSchedule(cfg8, ssp1, blkStart, 8, dev, group, rowDelay);
     fillIdleWithPings(bits, blkStart, &sspa8);
     bits.insert(bits.end(), blk.begin(), blk.end());
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg16; regs.BuildConfig(cfg16);
     cfg16.NumColumns = 15;
     if (cfg16.SkippingDenominator < 1) cfg16.SkippingDenominator = 1;
@@ -659,16 +651,14 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
     // Pinging here too (else confidence lapses after 8192 Rows -> a spurious re-hunt),
     // plus this region's own periodic SSPAs (its geometry -> its own alignment/cadence).
     SspaSchedule sspa16 = makeSspaSchedule(cfg16, ssp2, totalRows, 16, dev, group, rowDelay);
-    // A DEFERRED Read, emitted here because no demo carried one and nothing tested the
-    // path: ReadSetup answered REMOTE_READ_DEFERRED (no data), then the ReadData delivery
-    // inheriting its byte count + address. An IMMEDIATE read goes first for contrast — the
-    // two shapes produce a DIFFERENT NUMBER OF COMMAND RECORDS from the same logical read,
-    // which is what per-command statistics group by.
+    // A DEFERRED Read: ReadSetup answered REMOTE_READ_DEFERRED (no data), then the ReadData
+    // delivery inheriting its byte count + address. An IMMEDIATE read goes first for
+    // contrast — the two shapes produce a DIFFERENT NUMBER OF COMMAND RECORDS from the same
+    // logical read, which is what per-command statistics group by.
     //
-    // Appended BEFORE the idle fill on purpose: fillIdleWithPings pads to `totalRows`, so
-    // whatever these consume it emits less idle to reach the same total. The demo's row
-    // count, audio timing and SSP rows are therefore unchanged — only the command list
-    // grows. Adding them after the fill would have shifted every downstream row.
+    // Appended BEFORE the idle fill: fillIdleWithPings pads to `totalRows`, so whatever
+    // these consume it emits less idle to reach the same total. The demo's row count, audio
+    // timing and SSP rows are therefore unchanged — only the command list grows.
     const U8 immData[2] = { 0x5A, 0xA5 };
     const U8 defData[2] = { 0xC3, 0x3C };
     appendReadSetup(bits, dev, 0x0000'2040u, 2, 0, immData);      // immediate: one record
@@ -814,8 +804,8 @@ double flowDemoFreq(int deviceNum, int channel)
 // hand-shaking. The receiver de-jitters for free: the decoder emits a sample only
 // when its TX_PRESENT read 1, in order, so audio() == the uniform 48 kHz stream and
 // the round-trip is bit-exact. The DRQ bus bits (RX/ASYNC handshake, and ASYNC's
-// jittered-DRQ + 0/1-interval TX response delay) are added together with their decode
-// so the drive and the decode stay in lockstep — see the FCP re-drive work.
+// jittered-DRQ + 0/1-interval TX response delay) are driven at the FCP cells, mirroring
+// the decode's FCP re-drive.
 std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel)
 {
     const U8 group = 0x01, rowDelay = 14;
@@ -850,7 +840,7 @@ std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel)
     for (const FcPort& fp : fps) emitFcPortWrites(bits, regs, fp.mask, fp.geom);
     appendPing(bits, allDev, alertDev);
     long sspBit = (long)appendSscr(bits, allDev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, allDev);
     SwI3sConfig cfg; regs.BuildConfig(cfg);
     cfg.NumColumns = 15;
     if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
@@ -904,10 +894,12 @@ std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel)
     //                  "0/1 interval of transport jitter" with no DRQ.
     //   RX_CONTROLLED  bijective: TxPresent[n] == Earlier_FCP_DRQ[n], where the DRQ
     //                  is the sink's request d = FlowControlDelay+1 intervals earlier
-    //                  (Table 156). The manager drives the DRQ bit on the bus at the
-    //                  FCP cell; the demo drives a deterministic DRQ coin and the
-    //                  transport MUST mirror it d intervals later.
-    //   ASYNC          TxPresent[n] = Earlier_FCP_DRQ[n] AND SourceReady[n] (Table 155):
+    //                  (the "Selection of FCP_DRQ Bit in Source DP" table). The manager
+    //                  drives the DRQ bit on the bus at the FCP cell; the demo drives a
+    //                  deterministic DRQ coin and the transport MUST mirror it d intervals
+    //                  later.
+    //   ASYNC          TxPresent[n] = Earlier_FCP_DRQ[n] AND SourceReady[n] (the "Effect
+    //                  of DPn_FlowMode when DPn_PortMode is Normal" table):
     //                  the sink holds DRQ HIGH (standing permission), and the source's
     //                  own SourceReady gate (a producer + small FIFO) decides when to
     //                  emit, with a random 0/1-interval delay. Data appears only in a
@@ -985,7 +977,8 @@ std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel)
                                     curTxp[p] = earlier;               // bijective (mode 2)
                                 } else {
                                     // ASYNC (mode 3): TxPresent = SourceReady AND
-                                    // Earlier_FCP_DRQ (Table 155). Model a source whose
+                                    // Earlier_FCP_DRQ (the "Effect of DPn_FlowMode when
+                                    // DPn_PortMode is Normal" table). Model a source whose
                                     // audio arrives at ~half the opportunity rate (a
                                     // producer feeding a small FIFO) and which may DELAY
                                     // its response by 0/1 interval. Emit only in a DRQ-
@@ -1101,7 +1094,7 @@ std::vector<bool> MakeDemoLevelsPhy1(int audioSamplesPerChannel)
                       + swi3s::reg::kDpScramDirMode, {0x00});
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg1; regs.BuildConfig(cfg1);
     cfg1.NumColumns = 3;
     if (cfg1.SkippingDenominator < 1) cfg1.SkippingDenominator = 1;
@@ -1127,7 +1120,7 @@ std::vector<bool> MakeDemoLevelsPhy1(int audioSamplesPerChannel)
     SspaSchedule sspaA = makeSspaSchedule(cfg1, ssp1, blkStart, 4, dev, group, rowDelay);
     fillIdleWithPings(bits, blkStart, &sspaA);
     bits.insert(bits.end(), blk.begin(), blk.end());
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg2; regs.BuildConfig(cfg2);
     cfg2.NumColumns = 3;
     if (cfg2.SkippingDenominator < 1) cfg2.SkippingDenominator = 1;
@@ -1262,7 +1255,7 @@ std::vector<bool> MakeDscrDisableLevels(int samplesPerChannel, bool disableAll)
     for (const PortGeom& p : g) emitPortWrites(bits, regs, dev, p);
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);        // SSCR: enable both
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg1; regs.BuildConfig(cfg1); cfg1.NumColumns = cols - 1;
     if (cfg1.SkippingDenominator < 1) cfg1.SkippingDenominator = 1;
     long ssp1 = ssp1Bit + 1 + (int)rowDelay;
@@ -1288,7 +1281,7 @@ std::vector<bool> MakeDscrDisableLevels(int samplesPerChannel, bool disableAll)
     for (long s = (long)bits.size(); (long)bits.size() < blkStart; )
         bits.push_back((((long)bits.size() - s) & 1) != 0);   // D10.2 0101 idle (§8.1.2.9), 0 first
     bits.insert(bits.end(), blk.begin(), blk.end());
-    regs.Commit(group);                                        // disable dp1 in the model
+    regs.Commit(group, dev);                                        // disable dp1 in the model
     long totalRows = ssp2 + (long)samplesPerChannel * (kInt + 1);
 
     std::vector<const SwI3sDpConfig*> dps;                     // BOTH ports drive the wire
@@ -1380,7 +1373,7 @@ std::vector<bool> MakeImmediateScramblerLevels(int samplesPerChannel, bool midIn
     emitPortWrites(bits, regs, dev, g);           // no PortControl write -> ScramblerEn=1 (reset)
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
     if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
     long ssp1 = ssp1Bit + 1 + (int)rowDelay;
@@ -1466,6 +1459,107 @@ std::vector<bool> MakeImmediateScramblerLevels(int samplesPerChannel, bool midIn
     return levels;
 }
 
+// Test fixture for a SampleSize change through the IMMEDIATE (single-ranked) write path:
+// one PCM port (dp0, col1, one bit per row, 64-row Interval) carries `fromSize`+1-bit
+// samples; a WriteA32 to SampleSizeGrouping (0x09) sets SampleSize to `toSize`. The write's
+// last CDS bit lands `rowsIntoSample` rows into a sample, and the decoder reconfigures at
+// the next row boundary, so that sample is in flight across the reconfigure. The wire
+// follows the same rule as the decode: the in-flight sample finishes at its old width and
+// the next sample starts at the new one. Each sample is sineSample(0, index, width - 1),
+// scrambled. Returns bus levels for MemorySampleSource.
+std::vector<bool> MakeImmediateSampleSizeLevels(int samplesPerChannel, int fromSize, int toSize,
+                                                int rowsIntoSample)
+{
+    const U16 dev = 0x001;
+    const U8  group = 0x01, rowDelay = 14;
+    const int kInt = 63, cols = 8;
+    if (samplesPerChannel < 8) samplesPerChannel = 8;
+    fromSize &= 0x1F;
+    toSize &= 0x1F;
+    if (rowsIntoSample < 0) rowsIntoSample = 0;
+    if (rowsIntoSample > kInt) rowsIntoSample = kInt;
+    const PortGeom g = {0, fromSize, 1, 0, kInt, 0, 0};
+
+    CRegisterModel regs;
+    std::vector<bool> bits;
+    for (int i = 0; i < 8; ++i) appendSymbol(bits, 0x155);
+    appendPing(bits);
+    emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {0x07});
+    emitPortWrites(bits, regs, dev, g);
+    appendPing(bits);
+    long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
+    regs.Commit(group, dev);
+    SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
+    if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
+    long ssp1 = ssp1Bit + 1 + (int)rowDelay;
+
+    std::vector<bool> blk;
+    emitWrite(blk, regs, dev, swi3s::reg::kDpBase + swi3s::reg::kDpSampleSizeGrouping,
+              {(U8)(toSize & 0x1F)});
+    // The row the decode reconfigures at: the first row after the write's last CDS bit.
+    const long applyRow = ssp1 + (long)samplesPerChannel * (kInt + 1) + rowsIntoSample;
+    const long writeRow = applyRow - (long)blk.size();
+    for (long s = (long)bits.size(); (long)bits.size() < writeRow; )
+        bits.push_back((((long)bits.size() - s) & 1) != 0);   // D10.2 0101 idle (§8.1.2.9), 0 first
+    bits.insert(bits.end(), blk.begin(), blk.end());
+    const long totalRows = applyRow + (long)samplesPerChannel * (kInt + 1);
+
+    SwI3sDpConfig dp;
+    for (const SwI3sDpConfig& d : cfg.dps)
+        if (d.Enabled && d.numChannels() > 0) { dp = d; break; }
+    SwI3sDpConfig dpNew = dp;
+    dpNew.SampleSize = toSize;
+
+    CDescrambler scram;
+    U64 curSample = 0, sampleIndex = 0;
+    CDataPort port;
+    int columnCount = 2;
+    bool portReady = false;
+    std::vector<bool> levels;
+    bool cur = false;
+
+    for (long r = 0; r < totalRows; ++r) {
+        if (r == ssp1) {
+            columnCount = cols;
+            port.Configure(dp, cols, cfg.SkippingDenominator);
+            port.Initialize();
+            port.SyncToSSP();
+            portReady = true;
+        }
+        if (r == applyRow && portReady) {
+            // The decode's in-place reconfigure: new config, transport phase restored.
+            CDataPort::State st = port.SaveState();
+            port.Configure(dpNew, cols, cfg.SkippingDenominator);
+            port.Initialize();
+            port.RestoreState(st);
+        }
+        for (int c = 0; c < columnCount; ++c) {
+            DpEmit e;
+            if (portReady) e = port.clock_tick();
+            bool level;
+            if (c == swi3s::kCdsColumn) {
+                bool bit = (r < (long)bits.size()) ? (bool)bits[r] : true;
+                level = bit ? cur : !cur;
+            } else {
+                level = cur;
+                if (portReady && e.sampleHere &&
+                    (e.slot == SwI3sSlot::Data || e.slot == SwI3sSlot::TxPresent)) {
+                    bool clear = false;
+                    if (e.slot == SwI3sSlot::Data) {
+                        if (e.bitInChannel == e.sampleSize)
+                            curSample = sineSample(0, sampleIndex++, e.sampleSize);
+                        clear = ((curSample >> e.bitInChannel) & 1) != 0;
+                    }
+                    level = scram.Scramble(clear);
+                }
+            }
+            levels.push_back(level);
+            cur = level;
+        }
+    }
+    return levels;
+}
+
 // Test fixture for the EnableCh_CURR protocol-error rule (see Demo.h / Decoder.h
 // CommandRec::enablechCurrError). One PCM port (dp0) is configured with Interval =
 // `interval` and committed via SSCR; after `samplesPerChannel` rows a single WriteA32
@@ -1492,7 +1586,7 @@ std::vector<bool> MakeEnableChCurrWriteLevels(int samplesPerChannel, int interva
     emitPortWrites(bits, regs, dev, g);
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
     if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
     long ssp1 = ssp1Bit + 1 + (int)rowDelay;
@@ -1583,9 +1677,9 @@ std::vector<bool> MakeEnableChCurrWriteLevels(int samplesPerChannel, int interva
 // audio. `numerator`/`denominator` are the skipping ratio; the port transports
 // (D - N) of every D intervals and leaves the rest idle.
 //
-// The generator's ports are Initialize()d and deliberately NOT SyncToSSP()d: Initialize is
-// the path the placement cross-check pins against the normative Python model, so the
-// decode's SSP re-anchor has to AGREE with it rather than share a mistake with it. Periodic
+// The generator's ports are Initialize()d and NOT SyncToSSP()d: Initialize is the path the
+// placement cross-check pins against the normative Python model, independent of the
+// decode's SSP re-anchor. Periodic
 // SSPAs land only on rows Interval x SkippingDenominator apart (the pattern period, where
 // the accumulated skipping is back at 0), so re-anchoring must be a no-op. With
 // `misalignedSspa` they land one Interval off that — still on a row where
@@ -1621,7 +1715,7 @@ std::vector<bool> MakeSkippingLevels(int samplesPerChannel, int numerator, int d
               {(U8)(numerator & 0xFF), (U8)((numerator >> 8) & 0x0F)});
     appendPing(bits);
     long sspBit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
     if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;
     const long ssp = sspBit + 1 + (long)rowDelay;
@@ -1698,11 +1792,10 @@ std::vector<bool> MakeSkippingLevels(int samplesPerChannel, int numerator, int d
 
 // ===========================================================================
 // PHY3 (DLV) demo. Mirrors MakeDemoLevels' audio content (2x 16-bit PCM @48 kHz,
-
 // 2x 1-bit PDM @3.072 MHz; DP0/DP2 unscrambled, DP1/DP3 scrambled) but over DLV
 // framing instead of FBCSE. Returned as per-UI LOGICAL differential levels (1 =
 // DP high/DN low, 0 = DP low/DN high); the Python side turns these into the
-// complementary DP/DN edge arrays. See docs / §12.1.10, §12.2.5.
+// complementary DP/DN edge arrays. See §12.1.10, §12.2.5.
 //
 // DLV row framing (unlike FBCSE where Column 0 is the NRZS CDS and cols 1.. are
 // payload): Column 0 = Sync1 (logical 1; the 0->1 into it is the Row Sync Point the
@@ -1752,7 +1845,7 @@ DemoLevels MakeDemoLevelsPhy3(int audioSamplesPerChannel)
                       + swi3s::reg::kDpScramDirMode, {0x00});
     appendPing(bits);
     long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
-    regs.Commit(group);
+    regs.Commit(group, dev);
     SwI3sConfig cfg; regs.BuildConfig(cfg);
     cfg.NumColumns = kOpCols - 1;
     if (cfg.SkippingDenominator < 1) cfg.SkippingDenominator = 1;

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from ..analysis.bus_timing import measure_bus_timing
 from . import line_style
+from .click_label import ClickLabel
 from .port_names import with_name
 from .theme import VizTheme, analyzer_stylesheet
 
@@ -76,22 +77,6 @@ class _MultiMenu(QMenu):
         if act is not None and act.isCheckable() and act.isEnabled():
             act.trigger()                 # toggle in place, keep the menu up
             return
-        super().mouseReleaseEvent(event)
-
-
-class _ClickLabel(QLabel):
-    """A QLabel that emits `clicked` on a left-button release — used for the timing
-    view's clickable colour-key entries (click to hide/show that edge flavour)."""
-
-    clicked = Signal()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setCursor(Qt.PointingHandCursor)
-
-    def mouseReleaseEvent(self, event):  # noqa: N802 (Qt signature)
-        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
-            self.clicked.emit()
         super().mouseReleaseEvent(event)
 
 
@@ -152,9 +137,9 @@ class EyeView(QWidget):
         row.addWidget(self._filter)
         row.addSpacing(16)
         # Clickable colour key: click a flavour to hide/show it; hidden ones grey out.
-        self._legend_labels = {}      # (ck, dk) -> _ClickLabel
+        self._legend_labels = {}      # (ck, dk) -> ClickLabel
         for ck, dk, label, _color in _cat_specs():
-            lab = _ClickLabel()
+            lab = ClickLabel()
             lab.setTextFormat(Qt.RichText)
             lab.setToolTip("Click to hide/show this clock/data edge flavour")
             lab.clicked.connect(lambda c=ck, d=dk: self._toggle_category(c, d))
@@ -164,10 +149,9 @@ class EyeView(QWidget):
         row.addStretch(1)
 
         # Worst-UI navigator: a single 'View Worst UI' button that becomes prev/next
-        # once pressed. (No running readout — it clutters the bar and users rarely
-        # step through all of the offered UIs.)
+        # once pressed, with no running readout.
         self._worst_view = QPushButton("View Worst UI")
-        self._worst_view.setToolTip("Jump the cursor to the worst-margin UI and show it "
+        self._worst_view.setToolTip("Jump the playhead to the worst-margin UI and show it "
                                     "centered in the Raw Capture pane")
         self._worst_view.clicked.connect(self._view_worst)
         self._worst_prev = QPushButton("◀ View Previous UI")
@@ -193,14 +177,14 @@ class EyeView(QWidget):
         self._hold_plot = self._make_plot("hold (ns) →")
         self._hold_plot.setYLink(self._setup_plot)       # shared Y range
         # Drop the hold plot's Y axis entirely (label lives on the left plot). hideAxis
-        # RECLAIMS the axis's layout width — setVisible(False) leaves it reserved, which
-        # opened a blank strip on the hold plot's inner edge and split the two 0-ns points.
+        # RECLAIMS the axis's layout width; setVisible(False) would leave a blank strip on
+        # the hold plot's inner edge, splitting the two 0-ns points.
         self._hold_plot.hideAxis("left")
-        # The horizontal (Y) grid lines are painted by the left axis, so hiding it left
-        # the hold plot with only the vertical (bottom-axis) grid. Route the Y grid
-        # through the OUTER right axis instead — hide its ticks + numbers, but leave the
-        # pen at the axis default (pyqtgraph paints grid lines in the axis's OWN pen
-        # colour, so a background pen would make them invisible) so it matches setup's.
+        # The horizontal (Y) grid lines are painted by the left axis, so the hold plot
+        # routes its Y grid through the OUTER right axis instead — hide its ticks +
+        # numbers, but leave the pen at the axis default (pyqtgraph paints grid lines in
+        # the axis's OWN pen colour, so a background pen would make them invisible) so it
+        # matches setup's.
         self._hold_plot.showAxis("right")
         _right = self._hold_plot.getAxis("right")
         _right.setStyle(showValues=False, tickLength=0)
@@ -259,7 +243,7 @@ class EyeView(QWidget):
         p.getViewBox().setMouseEnabled(x=False, y=False)
         p.setLabel("bottom", xlabel)
         p.setLabel("left", "transitions")
-        # The labels name their unit; with no data the auto SI prefix read "(x0.001)".
+        # The labels name their unit, so no auto SI prefix.
         p.getAxis("bottom").enableAutoSIPrefix(False)
         p.getAxis("left").enableAutoSIPrefix(False)
         p.getAxis("left").setTextPen(VizTheme.AXIS)
@@ -306,8 +290,8 @@ class EyeView(QWidget):
     def _x_ticks(hi: float):
         """Major x ticks from 0 up to `hi` (ns) at a 1/2/5·10ⁿ step (~4 divisions), so a
         '0' label always lands at the inner edge. pyqtgraph's auto-ticker drops the
-        boundary value, so with 0 pinned flush at the join (padding=0) the sample-point
-        '0' vanished; forcing the tick set restores it. Both plots pin 0 at the join, so
+        boundary value, so with 0 pinned flush at the join (padding=0) the tick set is
+        forced to keep the sample-point '0'. Both plots pin 0 at the join, so
         their two '0' labels meet to read as one centred at the sample point."""
         if not (hi > 0):
             return [(0.0, "0")]
@@ -347,8 +331,8 @@ class EyeView(QWidget):
                 item["action"].setText(with_name(self._port_names, d, p, f"Device {d} DP{p}"))
 
     def set_sections(self, sections) -> None:
-        """Per config-section UI stats (from Session.section_ui_stats). Kept for callers
-        but no longer displayed."""
+        """Per config-section UI stats (from Session.section_ui_stats). Kept for callers;
+        not displayed."""
         self._sections = list(sections or [])
 
     def set_analysis_context(self, segments, regions, roles_fn=None) -> None:
@@ -428,8 +412,7 @@ class EyeView(QWidget):
         self._dirty = False
         capture = self._capture
         cache = getattr(self, "_cache", None)
-        # Keyed by the measured range: each region is its own measurement, and a cache that
-        # ignored it showed the first region's setup/hold whatever region was picked.
+        # Keyed by the measured range: each region is its own measurement.
         key = ("timing", self._start_sample, self._end_sample)
         if cache is not None and key in cache:
             t = cache[key]
@@ -612,7 +595,7 @@ class EyeView(QWidget):
         # 0 (the sample point) must sit flush at the inner edge of EACH plot so the two
         # 0-ns points meet at the join with no gap; put the small headroom on the OUTER
         # edge only (range [0, hi*1.03] with padding=0), not symmetric padding (which
-        # pushed 0 inward on both plots and opened a gap between them).
+        # would push 0 inward on both plots).
         self._setup_plot.setXRange(0, su_hi * 1.03, padding=0)
         self._hold_plot.setXRange(0, ho_hi * 1.03, padding=0)
         # Pin explicit x ticks (incl. 0) on each side — auto-ticking drops the boundary

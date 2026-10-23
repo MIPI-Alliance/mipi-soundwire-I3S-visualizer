@@ -1,9 +1,9 @@
 // NRZS line decoder for the PHY2 Control Data Stream.
 //
 // PHY2 line-codes the CDS as NRZS relative to the immediately preceding UI
-// (Section 11.1.1.7, Table 134): a physical TOGGLE between consecutive UIs
-// decodes to 0, no toggle decodes to 1. An undriven CDS bit is held at its
-// previous level by the bus keeper and therefore decodes to 1.
+// (Section 11.1.1.7, the "PHY1 & PHY2: NRZS Decoding for CDS" table): a physical
+// TOGGLE between consecutive UIs decodes to 0, no toggle decodes to 1. An undriven
+// CDS bit is held at its previous level by the bus keeper and therefore decodes to 1.
 //
 // The reference UI is the one immediately before the CDS bit, which is the
 // last column of the previous row -- not the previous CDS bit. So the caller

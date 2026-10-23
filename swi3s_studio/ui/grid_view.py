@@ -5,7 +5,7 @@ bus, or `grid_from_csv` for an authored config) — the same renderer serves bot
 The grid is MULTI-EMIT: each (row, col) may carry a *source* transport (drawn in
 the top half of the row) and a *sink* transport (bottom half), exactly like the
 Visualizer's source/sink split. Data cells are coloured per (device, data-port)
-using the Visualizer's pastel palette ("Eddie's colours"); each sample is labelled
+using the Visualizer's pastel palette; each sample is labelled
 ``S<sample>C<channel>`` (merged across its bit columns), TxPresent as ``TxP<ch>``,
 DRQ as ``DRQ``. Guards show ``G0``/``G1``; tails draw a decaying ringing squiggle;
 Column 0 is the full-height Control Data Stream. A right-hand key labels each
@@ -76,7 +76,7 @@ _CDS_FILL = QColor(VizTheme.GRID_CDS_FILL)  # CDS / system full-height fill
 _TX_FILL = QColor(0x35, 0xC2, 0x8A)         # TX map: a UI with a data-line transition
 
 # Visualizer data-port palette (src/config/constants.py Colors.DP_COLORS — light
-# pastels, "thanks to Eddie").
+# pastels).
 _DP_PALETTE = [
     "#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
     "#BF80FF", "#FFBFFF", "#FFBFBF", "#FFFFBF", "#BFFFBF", "#BFFFFF",
@@ -152,9 +152,8 @@ def _cells_key(cells):
     scalars with a FIXED key order (gridCellToDict / render_payload build them the same
     way every time), so a tuple of each cell's values is an equivalent cache key to the
     recursive sorted-items _freeze — but without sorting ~13 keys per cell on every
-    settled cursor move (the guard used to cost more than the redraw it gates). A
-    differing key order across calls would only cause a false cache MISS (a harmless
-    rebuild), never a false hit, so this is safe."""
+    settled cursor move. A differing key order across calls would only cause a false cache
+    MISS (a harmless rebuild), never a false hit, so this is safe."""
     return tuple(tuple(c.values()) for c in cells)
 
 
@@ -205,11 +204,10 @@ class GridView(QGraphicsView):
         # What a CDS cell is labelled. "CDS" normally; "CDS_SP" when the config sets
         # CDS_DriveType to Special, where a CDS bit of 1 is left high-Z for the Manager's
         # bus keeper to hold rather than actively driven — a decode-visible difference
-        # (NRZS) worth seeing on the cell. Held as ONE attribute rather than passed down
-        # the drawing calls because three separate paths draw a CDS cell (the merged
-        # run in _draw_row, _sys_full's synthesized block, and the TX raster's column 0)
-        # and a literal in each is how they would drift apart. Only the Visualizer path
-        # sets it; the analyzer and TX map leave it at the default. See bus_config.cds_symbol.
+        # (NRZS) worth seeing on the cell. Held as ONE attribute read by the three paths
+        # that draw a CDS cell (the merged run in _draw_row, _sys_full's synthesized block,
+        # and the TX raster's column 0). Only the Visualizer path sets it; the analyzer and
+        # TX map leave it at the default. See bus_config.cds_symbol.
         self._cds_symbol = "CDS"
         # column -> extra width, for the CDS run only (see _size_cds_columns). Empty means a
         # uniform _CW grid, which is every path that draws no CDS flags.
@@ -237,11 +235,10 @@ class GridView(QGraphicsView):
     def mousePressEvent(self, event) -> None:
         """Clicking a data-port swatch in the top key emits dpKeyClicked.
 
-        The swatch is already the per-port affordance (it names the port and carries
-        its colour), which is why the chooser hangs off it rather than a toolbar
-        button — it mirrors the Visualizer, where clicking a port's row opens the same
-        dialog. Left button only, and only over a swatch; everything else falls
-        through so panning/scrolling is untouched.
+        The swatch names the port and carries its colour, so it opens that port's
+        chooser (in the Visualizer, clicking a port's row opens the same dialog). Left
+        button only, and only over a swatch; everything else falls through so
+        panning/scrolling is untouched.
         """
         if event.button() == Qt.LeftButton:
             key = self._dp_key_at(event.position().toPoint())
@@ -396,9 +393,7 @@ class GridView(QGraphicsView):
         which is why it arrives here rather than through the engine's bit model."""
         # Content cache (see set_cells): skip the full rebuild when the model + clashes
         # are unchanged, as on a cursor move within one config region. THE CDS SYMBOL IS
-        # IN THE KEY: nothing else in the key moves when only CDS_DriveType is toggled, so
-        # without it the redraw would be skipped as unchanged and the label would not
-        # appear until some other edit happened to invalidate the cache.
+        # IN THE KEY: nothing else in the key moves when only CDS_DriveType is toggled.
         try:
             key = ("model", int(column_count), int(num_rows), self._show_key,
                    _cells_key(cells), _freeze(clashes or {}), _freeze(slot_names or {}),
@@ -452,11 +447,10 @@ class GridView(QGraphicsView):
         row-periodic 'TX' gaps you can read vertically.
 
         Cheap content-cache guard: manual cursor navigation calls this repeatedly with
-        an unchanged window (same rows/cols/tx bits), and each lit cell now costs 2
-        QGraphicsPathItem (see _toggle_glyph) on top of the per-cell QGraphicsRectItem
-        — a full scene rebuild on every call is hundreds of ms to seconds with a large
-        Rows-To-Draw. Skip the rebuild entirely when the raster's content key matches
-        the last-rendered one."""
+        an unchanged window (same rows/cols/tx bits), and each lit cell costs 2
+        QGraphicsPathItem (see _toggle_glyph) on top of the per-cell QGraphicsRectItem,
+        so a full rebuild is costly with a large Rows-To-Draw. Skip the rebuild entirely
+        when the raster's content key matches the last-rendered one."""
         tx = raster.get("tx")
         cols = int(raster.get("column_count", 0))
         labels = list(raster.get("row_labels") or [])
@@ -514,8 +508,8 @@ class GridView(QGraphicsView):
 
     def _toggle_glyph(self, x: float, y: float, color: QColor) -> None:
         """A crossover ('toggle') glyph — two leads that swap top/bottom through a central
-        X — drawn in a TX-map cell in place of the old 'TX' text: it reads as a line that
-        toggled state during that UI."""
+        X — drawn in a lit TX-map cell: it reads as a line that toggled state during that
+        UI."""
         m = _s(6)
         x0, x1 = x + m, x + _CW - m
         xa, xb = x + _CW * 0.40, x + _CW * 0.60      # where the leads meet the crossing
@@ -534,7 +528,7 @@ class GridView(QGraphicsView):
         """Draw a clash X contained to the cell's relevant region: full height over a
         full-height system slot (CDS/S0/S1), the sink half for a read overlap, else
         the source half (matching the Visualizer's clash geometry). A CDS system
-        guard/tail cell (dp<0) is now SPLIT Manager-top/Peripheral-bottom (see
+        guard/tail cell (dp<0) is SPLIT Manager-top/Peripheral-bottom (see
         _draw_cds_split), so its clash X is confined to whichever band(s) actually
         have an occupant there — full height only if both do."""
         x, y0 = self._cx(c), self._cy(r)
@@ -584,13 +578,12 @@ class GridView(QGraphicsView):
 
     # ---- column geometry: every column is _CW WIDE EXCEPT the CDS run ----
     #
-    # `CDS_SPx` needs 58 px in a 44 px cell and overflowed, and the fix is to widen the ONE
-    # column that carries a long label rather than every column — widening the grid uniformly
-    # costs horizontal room on a view whose whole job is fitting 32 columns on screen.
+    # Only the columns that carry a long CDS label widen (`CDS_SPx` needs 58 px in a 44 px
+    # cell); the rest stay _CW, so the grid still fits 32 columns on screen.
     #
     # `_col_extra` maps a column index to the pixels it gains, and `_col_off` is its running
     # prefix sum so `_cx` stays O(1). Both are rebuilt per render (see `_size_cds_columns`) and
-    # empty by default, so every path that never widens anything behaves exactly as before.
+    # empty by default, so a path that widens nothing draws a uniform grid.
     def _cx(self, c: int) -> float:
         return _ROWHDR_W + c * _CW + self._col_off(c)
 
@@ -638,10 +631,9 @@ class GridView(QGraphicsView):
     # ---- colour assignment ----
     def _assign_stream_colors(self, cells: List[dict], by_slot: bool = False) -> None:
         """by_slot=True (engine/Bus-Visualizer): colour by the port's CONFIG SLOT
-        (`palette[slot%12]`), which is what the Visualizer's frame_renderer does — there
-        `dp` *was* the slot index. Studio's cells carry the logical DataPortNumber instead,
-        and several slots may share one number (each device may use its own DP0), so
-        keying on the number collapsed distinct ports onto one colour and one swatch.
+        (`palette[slot%12]`), as the Visualizer does. The cells carry the logical
+        DataPortNumber, which several slots may share (each device may use its own DP0),
+        so the slot, not the number, keys the colour and the swatch.
         by_slot=False (Analysis): colour each (device, dp) stream distinctly."""
         self._by_slot = by_slot
         if by_slot:
@@ -676,7 +668,7 @@ class GridView(QGraphicsView):
     def _slot_of(cell: dict) -> int:
         """A cell's config-slot index. Engine cells carry ``dp_index``; hand-built and
         decoded cells don't, and there the logical number IS the slot (identity mapping),
-        so falling back to ``dp`` reproduces the previous behaviour rather than raising."""
+        so it falls back to ``dp``."""
         v = cell.get("dp_index")
         return int(cell["dp"]) if v is None else int(v)
 
@@ -787,17 +779,14 @@ class GridView(QGraphicsView):
         `_cds_symbol` is "CDS" or two lines — "CDS" over its flags ("SP", "SPx EDEx", …). A
         merged run's " x{n}" belongs on the FIRST line beside the name, not appended to the
         flags, so the two are composed here rather than by string concatenation at the call
-        site (which is what produced "CDS\nSPx x2")."""
+        site."""
         head, _, flags = self._cds_symbol.partition("\n")
         if n > 1:
             head = f"{head} x{n}"
         return f"{head}\n{flags}" if flags else head
 
     def _sys_full(self, r: int, col: int, label: str, *, is_cds: bool = False) -> None:
-        # `is_cds` is PASSED, not inferred from the label. It used to read
-        # `label == "CDS"`, which silently became False the moment the label could also
-        # be "CDS_SP" — turning the CDS column into an ordinary system cell for exactly
-        # the configs the new label exists to mark.
+        # `is_cds` is PASSED, not inferred from the label, which may be "CDS" or "CDS_SP".
         cell = {"row": r, "col": col, "is_cds": is_cds, "slot": 0,
                 "dp": -1, "channel": -1, "is_source": True}
         self._full_cell(r, col, 0, _BG, label, _LABEL, cell)
@@ -1118,14 +1107,17 @@ class GridView(QGraphicsView):
     # ---- headers, key, frame ----
     def _text(self, text: str, x: float, y: float, w: float, h: float,
               color: QColor, align_right: bool = False, font: QFont = None) -> None:
-        # QGraphicsSimpleTextItem (plain text) instead of addText's QGraphicsTextItem
-        # (full rich-text/QTextDocument engine): ~2x cheaper per label and these are all
-        # plain strings. It has no document margin, matching the setDocumentMargin(0) the
-        # rich-text path used, so placement/boundingRect are identical.
-        # MULTI-LINE IS DRAWN LINE BY LINE. A QGraphicsSimpleTextItem holding a "\n" renders
-        # the block correctly but LEFT-ALIGNS each line inside it, so the CDS cell's "CDS" sat
-        # flush against its wider "SPx EDEx" instead of centred over it. One item per line
-        # costs a second item on the one column that has two lines, and centres both.
+        # QGraphicsSimpleTextItem (plain text), not addText's QGraphicsTextItem (full
+        # rich-text/QTextDocument engine): these are all plain strings. It has no document
+        # margin.
+        # MULTI-LINE IS DRAWN LINE BY LINE, one item per line, each centred: a
+        # QGraphicsSimpleTextItem holding a "\n" LEFT-ALIGNS each line inside it.
+        # Centred VERTICALLY on the capitals, from the cap height of the first line to the
+        # baseline of the last; the item's box also holds the descent, so centring the box
+        # puts capitals and digits above the middle. An item's baseline is `ascent` below
+        # its top.
+        fm = QFontMetricsF(font or self._f_label)
+        ascent, cap = fm.ascent(), fm.capHeight()
         if "\n" in text:
             lines = text.split("\n")
             items = []
@@ -1134,7 +1126,7 @@ class GridView(QGraphicsView):
                 it.setBrush(color)
                 items.append(it)
             lh = max(i.boundingRect().height() for i in items)
-            top = y + (h - lh * len(items)) / 2
+            top = y + h / 2 - ((len(items) - 1) * lh + 2 * ascent - cap) / 2
             for k, it in enumerate(items):
                 bw = it.boundingRect().width()
                 ix = x + w - bw - 3 if align_right else x + (w - bw) / 2
@@ -1144,7 +1136,7 @@ class GridView(QGraphicsView):
         t.setBrush(color)
         br = t.boundingRect()
         tx = x + w - br.width() - 3 if align_right else x + (w - br.width()) / 2
-        t.setPos(tx, y + (h - br.height()) / 2)
+        t.setPos(tx, y + h / 2 + cap / 2 - ascent)
 
     def _draw_headers(self, rows: int, cols: int) -> None:
         gy0 = self._cy(0)
@@ -1163,17 +1155,15 @@ class GridView(QGraphicsView):
         items = list(self._stream_colors.items())
         single_dev = (len({d for d, _ in self._slot_port.values()}) == 1 if self._by_slot
                       else len({k[0] for k in self._stream_colors}) == 1)
-        # Each swatch is as wide as its label needs, and never narrower than a "D1·DP2"
-        # swatch was: a fixed 46 px cut a user-given port name (Session.dp_names) off at
-        # both ends.
+        # Each swatch is as wide as its label needs (a user-given port name,
+        # Session.dp_names, included), and at least sw_min, the width of a "D1·DP2" label.
         sw_min, sw_h, gap, pad = 46, 18, 8, 10
         fm = QFontMetricsF(self._f_key)
         entries = []                 # (key, colour, label, (device, dp) to click or None, width)
         for key, color in items:
             if self._by_slot:
-                # One swatch per config slot. Label it with the port's own identity, not
-                # its slot number: several slots can share a DataPortNumber, so "DP0" x4
-                # would name the colours no better than merging them did.
+                # One swatch per config slot, labelled with the port's own identity (name,
+                # else device and number), since several slots can share a DataPortNumber.
                 dev, dp = self._slot_port.get(key, (-1, key))
                 label = (self._slot_names.get(key) or "").strip()
                 if not label:

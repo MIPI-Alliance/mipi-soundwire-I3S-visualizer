@@ -271,8 +271,7 @@ def test_leaving_all_links_gives_back_the_tables(tables):
 
 # ---- Timing: one pane per Link, each keeping its edge-flavour colours ---------------------
 #
-# Not one overlay with a colour per Link: that would take away the four edge-flavour colours
-# the pane is read by.
+# Not one overlay with a colour per Link: each pane keeps its four edge-flavour colours.
 
 @pytest.fixture
 def timing(two):
@@ -364,9 +363,8 @@ def test_view_links_toggles_all_links_and_only_with_two(monkeypatch):
 
 
 def test_lanes_of_different_lengths_share_one_window_and_its_ticks(two):
-    """Each view used to cap its zoom at its own capture, so a shorter Link's lane could
-    not show the other's span and the lanes parted; and ticks chosen in each lane's own
-    time fell at different instants under one another."""
+    """A shorter Link's lane shows the other's span, so the lanes share one global window,
+    and the ticks fall at the same global instants in every lane."""
     win, first, second = two
     raws, audios = _lanes(win)
     for lanes in (raws, audios):
@@ -386,8 +384,8 @@ def test_lanes_of_different_lengths_share_one_window_and_its_ticks(two):
 
 
 def test_leaving_all_links_gives_the_bottom_panes_their_one_link_height():
-    """Two lanes need more room, so Qt grows the bottom docks on the way in; it never
-    shrinks a dock by itself, so they stayed tall after going back to one Link."""
+    """Qt grows the bottom docks for two lanes and never shrinks a dock by itself; going
+    back to one Link restores the one-Link height."""
     win, first, second = _with_added_link()
     win.resize(1500, 1000)
     win.show()

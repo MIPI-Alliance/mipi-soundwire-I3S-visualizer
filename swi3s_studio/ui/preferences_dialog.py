@@ -1,8 +1,8 @@
 """Preferences ▸ Waveforms: line colours per theme, and line weights.
 
 Edits a working copy of line_style's settings; nothing changes until OK. A colour below
-3:1 on that theme's plot background is allowed and flagged, since it is the user's
-call, but it is the threshold the default palettes are held to.
+3:1 on that theme's plot background (the threshold the default palettes are held to) is
+allowed and flagged.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ _SWATCH = 28
 # on device 0 slot n is DPn; other devices start the rotation elsewhere.
 _GROUPS = (
     ("dp", "Data-port lines (slot n is DPn on device 0)", [str(i) for i in range(12)]),
-    ("bookmark", "Bookmark pairs", [chr(65 + i) for i in range(12)]),
+    ("bookmark", "Cursor pairs", [chr(65 + i) for i in range(12)]),
     ("capture", "Capture traces", ["DP", "DN"]),
     ("timing", "Timing edge flavours", ["clk↑ dat↑", "clk↑ dat↓", "clk↓ dat↑", "clk↓ dat↓"]),
 )

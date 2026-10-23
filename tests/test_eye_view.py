@@ -62,8 +62,7 @@ def test_all_flavours_hidden_renders_without_error():
 
 def test_a_cached_timing_pane_measures_each_region_on_its_own():
     """The app gives the pane a per-Link cache (so a Link switch does not re-scan the
-    capture). The cache must be per REGION: one entry for the whole capture showed the
-    first region's setup/hold whatever region was picked."""
+    capture). The cache is per REGION: each region shows its own setup/hold."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication

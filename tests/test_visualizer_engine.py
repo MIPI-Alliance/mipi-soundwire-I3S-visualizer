@@ -1,15 +1,15 @@
-"""SWI3S Visualizer parity — the Visualizer's REAL testsuite, run against Studio.
+"""SWI3S Visualizer parity — the Visualizer's testsuite, run against Studio.
 
 Bus-Visualizer mode is driven by the vendored Visualizer engine
 (`swi3s_studio.model.viz_engine`), so Studio's bus model must reproduce the
 Visualizer's golden output exactly — not just placement, but **bits + bus_clashes +
-device_clashes + read_overlaps + warnings**. This is the verification the
-Visualizer's own `test/testsuite.py` does (build the model from each config, dump
-JSON, compare to `test_json_outputs/`), ported here over the vendored goldens.
+device_clashes + read_overlaps + warnings**. The test builds the model from each
+config, dumps JSON and compares it to the vendored golden, as the Visualizer's own
+`test/testsuite.py` does.
 
 Fixtures:
-- `visualizer_examples/<category>/<name>.csv` (repo root) — the 89 example configs
-  copied verbatim from the original visualizer; the single source of test inputs.
+- `visualizer_examples/<category>/<name>.csv` (repo root) — the Visualizer's 89 example
+  configs, copied verbatim; the single source of test inputs.
 - `tests/visualizer/golden_json/<category>/<name>.json` — the Visualizer's golden
   serialized BusModel for each (vendored from its `test/test_json_outputs/`).
 
@@ -28,8 +28,8 @@ logging.disable(logging.CRITICAL)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GOLD = os.path.join(_HERE, "visualizer", "golden_json")
-# Example configs are the repo-root visualizer_examples/ folder (copied verbatim
-# from the original visualizer); the goldens stay vendored under tests/visualizer.
+# Example configs are the repo-root visualizer_examples/ folder; the goldens stay
+# vendored under tests/visualizer.
 _EXAMPLES = os.path.join(os.path.dirname(_HERE), "visualizer_examples")
 
 

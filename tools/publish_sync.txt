@@ -1,0 +1,7 @@
+# The public/main commits this release tree has taken in, oldest first. The first is a
+# publish commit; `python3 tools/publish_tree.py --record-sync` appends public/main's
+# current commit once every contributed commit since the last line is in the release
+# tree. tools/publish_tree.py (check 3b) refuses to build while public/main has commits
+# after the last line, or when the tree undoes a contributed commit between two lines.
+ff0aaac4b72eb2b22c531bc7e5de9a7f7fdf377d  2026-10-12 SWI3S Studio v3.0.20
+87d23419a2c23fc0e5f9cb68e9260ce67f7c8a9b  2026-10-22 Merge pull request #24 from MIPI-Alliance/docs/cleanup

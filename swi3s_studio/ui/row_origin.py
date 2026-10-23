@@ -3,9 +3,8 @@
 A mid-row-start capture anchors its first complete bus row at an internal
 ``row_base`` > 0 (the leading partial row bumps the decoder's counter). Every
 row shown to the user is 0-based: the first row reads as 0. This mixin holds the
-per-view offset (``Session.row_origin``) and formats a display row through the
-single source of truth, :func:`swi3s_studio.session.zero_based_row`, so a new
-row-showing view can't silently drift back to internal rows.
+per-view offset (``Session.row_origin``) and formats a display row through
+:func:`swi3s_studio.session.zero_based_row`. Every row-showing view uses it.
 """
 from __future__ import annotations
 

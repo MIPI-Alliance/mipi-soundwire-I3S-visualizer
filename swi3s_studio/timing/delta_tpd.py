@@ -20,24 +20,23 @@ Notation:
   binding metric is the DIFFERENCE between the two threshold-crossing times
   at the Peripheral RX: a LATE crossing minus an EARLY one.
 
-  Which lane carries which is NOT fixed, and this is the part that misleads.
-  A data edge's direction follows the bit pattern, so either lane may rise or
-  fall on any given UI; the coefficients are therefore named for EDGE
-  POLARITY (``mp_late_rise``, ``mp_early_fall``), not for a lane.  The
-  rising-late/falling-early pairing dominates the other three enumerated
-  pairings for ANY positive t_RF pair, so the polarity choice needs no
-  runtime search — but the LANE the late edge sits on flips with direction:
+  Which lane carries which is not fixed.  A data edge's direction follows the
+  bit pattern, so either lane may rise or fall on any given UI; the
+  coefficients are therefore named for EDGE POLARITY (``mp_late_rise``,
+  ``mp_early_fall``), not for a lane.  The rising-late/falling-early pairing
+  dominates the other three enumerated pairings for ANY positive t_RF pair, so
+  the polarity choice needs no runtime search — but the LANE the late edge
+  sits on flips with direction:
 
     setup — the DATA must arrive late and the CLOCK sample early, so the
             late crossing scales with t_RF_Man_DATA.
     hold  — the CLOCK must sample late and the DATA transition early, so the
             late crossing scales with t_RF_Man_CLK.
 
-  At equal per-lane t_RF the two are identical, which is why one coefficient
-  served both for so long.  Unequal — legal, since Table 127's RFT constrains
-  only the Peripheral and the Manager has no normative per-output slew
-  control — they diverge by up to ~9.5 ns, so ``delta_cross_MP_ns`` takes the
-  direction explicitly rather than assuming a lane.
+  At equal per-lane t_RF the two are identical.  Unequal per-lane t_RF is
+  legal (the RFT in the "PHY1 & PHY2 Output Ramp Time" table constrains only the
+  Peripheral) and the two then diverge by up to ~9.5 ns, so ``delta_cross_MP_ns`` takes
+  the direction explicitly.
 
 - ``Σ_cross,PM,setup`` = PM setup SUM.  The clock travels Mgr→Per (forward
   leg, slew rate t_RF_Man) and the data travels Per→Mgr (backward leg,
@@ -47,8 +46,8 @@ Notation:
   The ground shift is ONE physical quantity δ = V_Per_gnd − V_Man_gnd with
   |δ| ≤ α and either sign.  TX and RX roles swap on the return leg, so the
   forward leg sees V_IH,eff + δ and the backward leg sees V_IH,eff − δ.
-  That antisymmetry is forced by the topology, not chosen — which is why δ
-  cancels here while α accumulates in the MP differential below.
+  The antisymmetry follows from the topology: δ cancels here while α
+  accumulates in the MP differential.
 
   The cancellation is EXACT only when the ramp is linear *and* the two legs
   carry equal t_RF.  A linear ramp makes t_cross affine in the threshold, so
@@ -58,8 +57,7 @@ Notation:
   the δ=0 value even at equal t_RF.  Σ_setup is a penalty, so the binding δ
   maximises the sum; convexity puts that maximum at an endpoint δ = ±α, so
   ``sigma_pm_setup_ns`` takes the max over the two polarities and no interior
-  search is needed.  Assuming cancellation instead understates the penalty by
-  up to ~0.6 ns (exp ramp, α = 0.10, t_RF = 5 ns).
+  search is needed.
 
   ``sigma_pm_setup`` remains the δ=0 per-leg coefficient for reporting; it is
   NOT sufficient to form the total — call ``sigma_pm_setup_ns``.
@@ -95,10 +93,10 @@ RampShape = Literal["linear", "exp"]
 MPDirection = Literal["setup", "hold"]
 
 # Exponential-ramp normalization. t_RF is defined as the 20%-80% V_DD slew
-# time (matches the SWI3S V_OL/V_OH endpoints, Table 123). Under
-# V(t)=V_DD(1-e^(-t/τ)) rising, t_80 - t_20 = τ·ln(0.8/0.2) = τ·ln(4),
-# so τ = t_RF/ln(4) and any threshold-crossing time in units of t_RF
-# carries a factor 1/ln(4).
+# time (matches the SWI3S V_OL/V_OH endpoints, "PHY1 & PHY2 Input and Output Voltage
+# Parameters" table). Under V(t)=V_DD(1-e^(-t/τ)) rising, t_80 - t_20 = τ·ln(0.8/0.2) =
+# τ·ln(4), so τ = t_RF/ln(4) and any threshold-crossing time in units of t_RF carries a
+# factor 1/ln(4).
 _LN4 = math.log(4.0)
 
 
@@ -113,11 +111,8 @@ def _t_cross_frac_rising(V_th: float, V_DD: float, shape: RampShape,
     ramp is defined by its time constant, not by a straight-line slope
     between the two output levels.
 
-    REQUIRED AND KEYWORD-ONLY, DELIBERATELY. This was the literal 0.60, which is
-    (0.80 − 0.20) — the default V_OH/V_OL pair and nothing more. Callers of the
-    envelope could pass V_OH_frac/V_OL_frac and see no effect at all: the swing
-    legs in calculator.py moved while every crossing term here silently did not.
-    A default here would let the next call site reintroduce exactly that.
+    ``swing_frac`` is required and keyword-only: every call site passes the swing
+    in force.
     """
     if shape == "linear":
         return V_th / (swing_frac * V_DD)
@@ -132,8 +127,8 @@ def _t_cross_frac_falling(V_th: float, V_DD: float, shape: RampShape,
                           *, swing_frac: float) -> float:
     """Time from V=V_DD to V=V_th on a falling edge, in units of t_RF.
 
-    ``swing_frac`` is the TX swing as a fraction of V_DD; see
-    :func:`_t_cross_frac_rising` for why it is required rather than defaulted.
+    ``swing_frac`` is the TX swing as a fraction of V_DD, required and
+    keyword-only as in :func:`_t_cross_frac_rising`.
     """
     if shape == "linear":
         return (V_DD - V_th) / (swing_frac * V_DD)
@@ -147,22 +142,18 @@ def _t_cross_frac_falling(V_th: float, V_DD: float, shape: RampShape,
 def per_tdd_offset_frac(shape: RampShape, *,
                         V_OH_frac: float = 0.80, V_OL_frac: float = 0.20) -> float:
     """V=0 → V_OL slew portion baked into the spec Per_t_DD measurement
-    (Fig 174), as a fraction of t_RF. Linear: V_OL/swing = 0.20/0.60 = 1/3.
+    (Peripheral Output Timing figure), as a fraction of t_RF. Linear: V_OL/swing = 0.20/0.60 = 1/3.
     Exp: time from V=0 to V_OL=0.20·V_DD = -ln(0.8)/ln(4) ≈ 0.1610.
 
-    FIGURE 174 is the authority here, not Table 129's wording, which describes a 0 % anchor
-    and would make this fraction zero. See `output_anchor_frac` and docs/anchors.md.
+    THE PERIPHERAL OUTPUT TIMING FIGURE is the authority here, not the wording of the "PHY1 &
+    PHY2 Output Timing" table, which describes a 0 % anchor and would make this fraction
+    zero. See `output_anchor_frac` and docs/anchors.md.
 
-    DERIVED FROM THE SAME V_OH/V_OL PAIR AS THE CROSSING ENVELOPE, not from the literals it
-    used to carry (`1/3` and `-ln(0.80)`). Those are what 0.80/0.20 works out to, so today's
-    numbers are unchanged to within a ULP — but they were a second place the output levels were
-    hardcoded, and the crossing envelope's copy having gone stale is precisely the defect fixed
-    one layer up in this module. Whoever wires those fields to a UI row should not have to
-    discover this one separately.
+    Derived from the same V_OH/V_OL pair as the crossing envelope; the 0.80/0.20 defaults
+    give `1/3` (linear) and `-ln(0.80)/ln(4)` (exp).
 
-    No caller varies the pair yet, deliberately: nothing sweeps `V_OH_min_frac` /
-    `V_OL_max_frac` (neither has a CalcRow), so threading them through spec_source would be
-    parameters for their own sake. When a caller does vary them, pass them here too.
+    No caller varies the pair yet (neither `V_OH_min_frac` nor `V_OL_max_frac` has a
+    CalcRow). A caller that varies them must pass them here too.
     """
     if shape == "linear":
         return V_OL_frac / (V_OH_frac - V_OL_frac)          # V_OL / swing
@@ -191,6 +182,12 @@ class DeltaTpdEnvelope:
     # edge flips between setup and hold (see delta_cross_MP_ns).
     mp_late_rise: float       # MP +α corner: rising crossing, slow, at V_IH,eff,+α
     mp_early_fall: float      # MP +α corner: falling crossing, fast, at V_IL,eff,+α
+    # The same two crossings on a lane a PERIPHERAL drives, so they take the Peripheral's
+    # ramp shape. The P->P legs read them for peripheral A's data reaching peripheral B; the
+    # clock lane on those legs is driven by the Manager and keeps mp_late_rise /
+    # mp_early_fall. Equal to those two when both devices share one shape.
+    mp_late_rise_per: float
+    mp_early_fall_per: float
 
     # MP differential at the worst correlated corner (= Δ_cross,MP).
     # Total ns penalty = correlated_diff · t_RF_Man (Mgr drives both lanes in MP).
@@ -240,13 +237,11 @@ class DeltaTpdEnvelope:
         """Δ_cross,MP as ((lane, coefficient), (lane, coefficient)), dimensionless.
 
         The pair the caller must multiply by that lane's t_RF and SUM to reproduce
-        `delta_cross_MP_ns` exactly, the LATE leg subtracted and the EARLY leg added
-        -- both coefficients are returned POSITIVE so the caller carries the sign in the
-        operator, which is what the differential actually says: a late crossing costs and
-        an early one credits. Exists so a displayed inequality can show
-        `coefficient x t_RF` per lane instead of one pre-multiplied nanosecond value
-        -- the ns form hides both the per-lane t_RF and, here, the fact that WHICH
-        lane carries the late crossing swaps with the direction.
+        `delta_cross_MP_ns` exactly, the LATE leg subtracted and the EARLY leg added.
+        Both coefficients are returned POSITIVE; the caller carries the sign in the
+        operator (a late crossing costs, an early one credits). A displayed inequality
+        uses this to show `coefficient x t_RF` per lane; which lane carries the late
+        crossing swaps with the direction.
         """
         if direction == "setup":
             return (("Man DATA", self.mp_late_rise),
@@ -254,15 +249,42 @@ class DeltaTpdEnvelope:
         return (("Man CLK", self.mp_late_rise),
                 ("Man DATA", self.mp_early_fall))
 
+    def delta_cross_PP_lanes(
+        self, *, direction: MPDirection,
+    ) -> tuple[tuple[str, float], tuple[str, float]]:
+        """Δ_cross,MP's construction at a P->P sampler, as ((lane, coefficient), ...).
+
+        Peripheral B's detection of the clock and of A's data, differenced like
+        `delta_cross_MP_lanes`, with the data lane on `Per DATA`. Each lane takes the
+        shape of the device driving it: the clock lane the Manager's (`mp_late_rise`,
+        `mp_early_fall`), the data lane the Peripheral's (`mp_late_rise_per`,
+        `mp_early_fall_per`). Late leg first, both coefficients positive.
+        """
+        if direction == "setup":
+            return (("Per DATA", self.mp_late_rise_per),
+                    ("Man CLK", self.mp_early_fall))
+        return (("Man CLK", self.mp_late_rise),
+                ("Per DATA", self.mp_early_fall_per))
+
+    def delta_cross_PP_ns(
+        self, tRF_Man_CLK_ns: float, tRF_Per_DATA_ns: float,
+        *, direction: MPDirection,
+    ) -> float:
+        """`delta_cross_PP_lanes` in ns: the late leg times its lane's t_RF minus the
+        early leg times its lane's."""
+        trf = {"Man CLK": tRF_Man_CLK_ns, "Per DATA": tRF_Per_DATA_ns}
+        (late_lane, late), (early_lane, early) = self.delta_cross_PP_lanes(
+            direction=direction)
+        return late * trf[late_lane] - early * trf[early_lane]
+
     def sigma_pm_setup_lanes(
         self, tRF_Man_ns: float, tRF_Per_ns: float,
     ) -> tuple[float, float]:
         """(clock, data) coefficients of the delta-GND polarity Σ_setup SELECTS.
 
         Σ_setup is a max over two polarities, so the coefficients are not fixed --
-        which pair is in force depends on the two t_RF values. Returning the winning
-        pair keeps a displayed `coefficient x t_RF` identical to the ns value rather
-        than merely close to it.
+        which pair is in force depends on the two t_RF values. The returned pair makes
+        a displayed `coefficient x t_RF` equal the ns value exactly.
         """
         pos = (self.sigma_pm_setup_clk_dgnd_pos, self.sigma_pm_setup_data_dgnd_neg)
         neg = (self.sigma_pm_setup_clk_dgnd_neg, self.sigma_pm_setup_data_dgnd_pos)
@@ -285,9 +307,9 @@ class DeltaTpdEnvelope:
     ) -> float:
         """Δ_cross,MP in ns with per-lane t_RF on the Mgr side.
 
-        Both lanes are Mgr-driven in MP but may have independent t_RF (Table 127
-        RFT constrains only the Peripheral; the Manager has no normative
-        per-output slew control, so per-driver mismatch is allowed). The
+        Both lanes are Mgr-driven in MP but may have independent t_RF (the RFT in the
+        "PHY1 & PHY2 Output Ramp Time" table constrains only the Peripheral; the Manager
+        has no normative per-output slew control, so per-driver mismatch is allowed). The
         differential is a LATE crossing minus an EARLY one, and WHICH LANE holds
         the late crossing depends on the direction:
 
@@ -296,10 +318,8 @@ class DeltaTpdEnvelope:
           hold  — the clock must sample late and the data transition early, so
                   the late (rising) crossing scales with t_RF_Man_CLK.
 
-        Identical at equal per-lane t_RF. Unequal, they differ by up to ~9.5 ns,
-        and using the hold assignment for setup understates a setup PENALTY.
-        Taking a max over both instead would be wrong in the other direction --
-        it would make hold pessimistic -- so the caller states which it wants.
+        Identical at equal per-lane t_RF; unequal, they differ by up to ~9.5 ns,
+        so the caller states the direction.
         """
         if direction == "setup":
             return (self.mp_late_rise * tRF_Man_DATA_ns
@@ -369,11 +389,9 @@ def compute_delta_tpd_envelope(
     budget (V_GND shift + V_noise systematic + bilateral V_noise),
     treated as a single correlated coherent shift acting on V_IH and
     V_IL together at the worst-case sample event.  This is the spec's
-    10 % V_SEOS cap (120 mV at V_nom = 1.2 V).  Treating all of this
-    as one correlated shift gives the worst-case bound — any
-    decomposition into LF/HF/bilateral can only at most match this
-    bound, never exceed it (because the deterministic worst-case
-    enumeration always picks the same polarity at all events).
+    10 % V_SEOS cap (120 mV at V_nom = 1.2 V).  As one correlated
+    shift it is the worst-case bound: no decomposition into
+    LF/HF/bilateral exceeds it.
 
     ``tRF_tolerance`` (default 5%) bounds the per-edge slew tolerance
     relative to nominal t_RF.  In an opposite-polarity edge pair
@@ -393,11 +411,7 @@ def compute_delta_tpd_envelope(
 
     s = ramp_shape
     # THE TX SWING IS A PARAMETER, NOT A CONSTANT: swing_TX/V_DD = V_OH_frac - V_OL_frac.
-    # Every linear crossing below divides by it. It used to be a hardcoded 0.60 — which is
-    # exactly the 0.80/0.20 default and nothing more — so V_OH_frac / V_OL_frac were
-    # accepted, documented in this module's own formula, threaded in from CalcInputs, and
-    # then ignored: calculator.py's swing legs moved with the pair while every crossing
-    # term here did not. Two halves of one model disagreeing about one knob.
+    # Every linear crossing below divides by it.
     swing = V_OH_frac - V_OL_frac
     if swing <= 0.0:
         raise ValueError(
@@ -493,6 +507,8 @@ def compute_delta_tpd_envelope(
         falling_min=falling_min,
         mp_late_rise=mp_late_rise,
         mp_early_fall=mp_early_fall,
+        mp_late_rise_per=mp_late_rise,
+        mp_early_fall_per=mp_early_fall,
         correlated_diff=correlated_diff,
         uncorrelated_diff=uncorrelated_diff,
         sigma_pm_setup=sigma_pm_setup,
@@ -530,6 +546,8 @@ def compute_delta_tpd_envelope_per_device(
     MP coefficients (mp_late_rise, mp_early_fall, correlated_diff,
     uncorrelated_diff) take Man_shape: in MP both lanes are Mgr-driven,
     so the Mgr ramp shape sets both per-leg t_cross values.
+    mp_late_rise_per / mp_early_fall_per are the same crossings on a
+    Peripheral-driven lane and take Per_shape (the P->P data lane).
 
     PM coefficients split per leg: clock (forward, Mgr TX → Per RX) uses
     Man_shape; data (backward, Per TX → Mgr RX) uses Per_shape.  The
@@ -555,6 +573,8 @@ def compute_delta_tpd_envelope_per_device(
         falling_min=env_man.falling_min,
         mp_late_rise=env_man.mp_late_rise,
         mp_early_fall=env_man.mp_early_fall,
+        mp_late_rise_per=env_per.mp_late_rise,
+        mp_early_fall_per=env_per.mp_early_fall,
         correlated_diff=env_man.correlated_diff,
         uncorrelated_diff=env_man.uncorrelated_diff,
         sigma_pm_setup=env_man.sigma_pm_setup,

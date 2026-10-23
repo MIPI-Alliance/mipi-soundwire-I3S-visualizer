@@ -1,8 +1,8 @@
 """BusModel JSON round-trip (swviz.io.json_handler).
 
-Regression: non-payload slots (guard/tail/CDS/…) carry sample/bit = None, and the
-save->load round trip must preserve that — coercing None to 0 corrupts the
-scrambler/test-mode mismatch checks (0 is a valid payload sample).
+Non-payload slots (guard/tail/CDS/…) carry sample/bit = None, and the save->load
+round trip must preserve that — coercing None to 0 corrupts the scrambler/test-mode
+mismatch checks (0 is a valid payload sample).
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_json_handler.py
 """

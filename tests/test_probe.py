@@ -56,11 +56,12 @@ def test_saleae_binary_pair(demo, tmp_path):
     by = {c.value: c.edges for c in pr.channels}
     assert by[clk] == cap.clock_edges.size and by[dat] == cap.data_edges.size
     assert pr.channels[pr.busiest_pair()[0]].value == clk     # the clock is the busier
-    # A .bin stores times, not a rate: the probe infers it exactly as the loader will (the
-    # finest edge spacing, so 1/10 of the demo's 500 MHz), and both must agree.
+    # A .bin stores times, not a rate: the probe infers it from the grid the times sit on,
+    # which is the capture's own rate, and the pair reloads edge for edge at it.
     loaded = Session.from_saleae_binary(clk, dat, int(pr.sample_rate_hz)).capture
-    assert pr.sample_rate_hz == saleae_binary.infer_sample_rate([clk, dat])
-    assert loaded.clock_edges.size == cap.clock_edges.size
+    assert pr.sample_rate_hz == saleae_binary.infer_sample_rate([clk, dat]) \
+        == cap.sample_rate_hz
+    assert _same_capture(loaded, cap)
     assert pr.duration_s == pytest.approx(cap.duration_s, rel=1e-2)
     assert pr.cost_bytes(0, 0.001) == pr.cost_all_bytes       # read whole, whatever the window
 
@@ -73,8 +74,10 @@ def test_digital_csv(demo, tmp_path):
     assert pr.kind == "digital_csv" and not pr.windowed and len(pr.channels) == 2
     assert pr.channels[0].edges == cap.clock_edges.size and not pr.channels[0].approx
     assert pr.duration_s == pytest.approx(cap.duration_s, rel=1e-3)
-    # As for .bin: the rate the loader will infer, not the demo's own.
-    assert pr.sample_rate_hz == Session.from_digital_csv(path, 1, 2).capture.sample_rate_hz
+    # As for .bin: the capture's own rate, which the loader infers too.
+    loaded = Session.from_digital_csv(path, 1, 2).capture
+    assert pr.sample_rate_hz == loaded.sample_rate_hz == cap.sample_rate_hz
+    assert _same_capture(loaded, cap)
 
 
 def test_vcd(demo, tmp_path):
@@ -193,7 +196,7 @@ def test_clocks_wired_side_by_side_fall_back_to_the_counts():
 
 
 def test_a_window_in_seconds_takes_the_nearest_samples_and_keeps_its_last():
-    # A .wfm's rate is 1/dt, here 999999999.9999999 Hz: truncating 1 µs gave sample 999.
+    # A .wfm's rate is 1/dt, here 999999999.9999999 Hz: truncating 1 µs would give 999.
     rate = 1 / 1e-9
     assert Session.window_samples((0.0, 1e-6), rate) == (0, 1001)
     assert Session.window_samples((2.5e-7, 5e-7), 1e9) == (250, 501)
@@ -260,6 +263,61 @@ def test_a_csv_scan_finds_the_finest_spacing_across_a_batch_seam(tmp_path, monke
     monkeypatch.setattr(digital_csv, "_SCAN_CHUNK", 3)   # the 1 ns step spans two batches
     assert digital_csv.scan(str(path)) == ([3, 1], 1_000_000_000)
 
+
+
+def test_a_csv_header_ending_in_a_comma_counts_what_the_loader_reads(tmp_path):
+    from swi3s_studio.ingest import digital_csv
+    path = tmp_path / "trail.csv"
+    lines = ["Time [s],Channel 0,Channel 1,"]
+    lines += [f"{i * 2e-9:.9f},{i % 2},{(i // 3) % 2}" for i in range(2_000)]
+    path.write_text("\n".join(lines) + "\n")
+    cap = digital_csv.load_capture(str(path), 1, 2)
+    assert digital_csv.scan(str(path)) == ([cap.clock_edges.size, cap.data_edges.size],
+                                           cap.sample_rate_hz)
+    pr = probe_mod.probe([str(path)])
+    assert [c.label for c in pr.channels] == ["Channel 0", "Channel 1"]
+    assert [c.edges for c in pr.channels] == [cap.clock_edges.size, cap.data_edges.size]
+    assert pr.sample_rate_hz == cap.sample_rate_hz and pr.busiest_pair() == (0, 1)
+
+
+def _volts_csv(path, rows, header="Time [s],Channel 0,Channel 1", preamble=()):
+    with open(path, "w") as f:
+        f.writelines(ln + "\n" for ln in preamble)
+        f.write(header + "\n")
+        f.writelines(f"{i * 1e-9:.9e},{0.5 + (i % 4) * 0.3:.4f},{0.1 * (i % 7):.4f}\n"
+                     for i in range(rows))
+
+
+def test_an_analog_csv_without_a_time_header_is_refused_from_its_preamble(tmp_path):
+    import tracemalloc
+
+    from swi3s_studio.ingest import analog_csv
+    path = str(tmp_path / "volts.csv")
+    _volts_csv(path, 300_000)                         # about 11 MB
+    assert analog_csv.is_analog_csv(path)
+    calls = [lambda: probe_mod.probe([path]), lambda: analog_csv.channel_names(path),
+             lambda: analog_csv.read_analog_csv(path),
+             lambda: analog_csv.read_analog_csv(path, max_bytes=0)]
+    for call in calls:
+        tracemalloc.start()
+        try:
+            with pytest.raises(ValueError, match="no TIME header"):
+                call()
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < 4 << 20, f"{peak / 1e6:.1f} MB read to refuse it"
+    assert analog_csv.sample_interval(path) is None
+    # A preamble longer than any scope's, with no header row, is refused too.
+    _volts_csv(path, 10, header="Note,x",
+               preamble=[f"Key {i},v" for i in range(analog_csv._PREAMBLE_MAX_ROWS + 5)])
+    with pytest.raises(ValueError, match="no TIME header"):
+        analog_csv.channel_names(path)
+    _volts_csv(path, 10, header="TIME,CH1,CH2", preamble=["Sample Interval,1e-09", ""])
+    assert analog_csv.channel_names(path) == ["CH1", "CH2"]
+    assert analog_csv.sample_interval(path) == 1e-9
+    pr = probe_mod.probe([path])
+    assert pr.kind == "analog_csv" and pr.sample_rate_hz == pytest.approx(1e9)
 
 
 def test_a_capture_with_a_channel_named_like_a_register_is_a_capture(tmp_path):

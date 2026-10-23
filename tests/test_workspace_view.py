@@ -119,7 +119,7 @@ def full_snapshot(win) -> dict:
     for link in win.links:
         st = link.view
         links.append({"filters": view_state.filters_to_json(st.filters),
-                      "col_widths": list(st.col_widths or []),
+                      "col_widths": dict(st.col_widths or {}),
                       "audio": st.audio_view, "capture": st.capture_view,
                       "processing": dict(st.stream_processing),
                       "colors": dict(st.stream_colors)})
@@ -152,9 +152,10 @@ def _change_everything(win):
     kinds = [a.data() for a in win._kind_menu._actions]
     snap.update(kinds={kinds[0]}, errors_only=False, text="device == 1")
     win._restore_filters(snap)
-    win._cmd_view.setColumnWidth(2, 211)
-    win._cmd_view.setColumnHidden(3, True)
-    win._cmd_view.sortByColumn(1, __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.DescendingOrder)
+    from PySide6.QtCore import Qt
+    win._cmd_view.setColumnWidth(_cmd_col(win, "Opcode"), 211)
+    win._cmd_view.set_column_shown("Address", False)
+    win._cmd_view.sortByColumn(_cmd_col(win, "Time (µs)"), Qt.DescendingOrder)
     # Link 2 gets its own Audio view.
     win.switch_link(1)
     win._audio_view._vzoom_btn.setChecked(True)
@@ -184,6 +185,7 @@ def _change_everything(win):
     assert root.childCount() > 1, "the demo's Registers pane should list blocks"
     for i in range(root.childCount()):
         root.child(i).setExpanded(i == root.childCount() - 1)
+    reg._tree.setColumnWidth(0, 233)                            # a Registers column width
     # Docks: Capture raised in the bottom group, CDS closed, Bookmarks closed.
     win._raw_dock.raise_()
     win._symbol_dock.hide()
@@ -199,6 +201,9 @@ def test_a_saved_workspace_reopens_exactly_as_it_was(two, tmp_path, monkeypatch)
     from swi3s_studio.ui.main_window import MainWindow
     _change_everything(two)
     before = full_snapshot(two)
+    assert before["commands_header"]["sort"] == ["Time (µs)", 1]     # descending
+    assert "Address" in before["commands_header"]["hidden"]
+    assert before["links"][0]["col_widths"].get("Opcode") == 211
     path = str(tmp_path / "ws.json")
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
@@ -284,3 +289,82 @@ def test_the_all_links_commands_filter_and_lanes_come_back(two, tmp_path, monkey
     assert again._filter_snapshot() == want_filter
     assert [(v._vzoom_btn.isChecked(), sorted(v.channel_selection()))
             for v in again._audio_lanes.views[:2]] == want_lanes
+
+
+# ------------------------------------------------- Commands column widths, by column name
+def _cmd_col(win, name):
+    from PySide6.QtCore import Qt
+    m = win._cmd_view.model()
+    return next(c for c in range(m.columnCount())
+                if str(m.headerData(c, Qt.Horizontal)).replace("\n", " ") == name)
+
+
+def _save_and_reopen(win, tmp_path, monkeypatch, edit=None):
+    import json
+
+    from conftest import pump_loads
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.ui.main_window import MainWindow
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win.save_workspace()
+    if edit is not None:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        edit(doc)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+    again = MainWindow()
+    again.resize(1400, 900)
+    again.show()
+    again.open_workspace()
+    pump_loads(again)
+    QApplication.processEvents()
+    return again, path
+
+
+def test_a_hidden_column_shown_after_reopening_a_workspace_has_a_width(two, tmp_path,
+                                                                       monkeypatch):
+    import json
+    again, path = _save_and_reopen(two, tmp_path, monkeypatch)
+    with open(path, encoding="utf-8") as f:
+        saved = json.load(f)["links"][0]["view"]["commands"]["col_widths"]
+    assert isinstance(saved, dict) and "Time (µs)" in saved and "ΔRows" not in saved
+    for name in ("ΔRows", "ΔTime (µs)"):
+        again._cmd_view.set_column_shown(name, True)
+        assert again._cmd_view.columnWidth(_cmd_col(again, name)) > 0, name
+
+
+def _links_widths(doc):
+    return [link["view"]["commands"] for link in doc["links"]]
+
+
+def test_positional_widths_apply_only_when_they_fit_the_columns(two, tmp_path, monkeypatch):
+    """A list with one width per column is read by position; one saved for another column
+    layout (12 columns, before the delta columns) is dropped and the columns are fitted."""
+    from swi3s_studio.ui.command_table import COLUMN_NAMES
+    n = len(COLUMN_NAMES)
+    fitted = dict(two.links[1].view.col_widths)
+
+    def edit(doc):
+        first, second = _links_widths(doc)
+        first["col_widths"] = [300 + i for i in range(n)]        # one per column
+        second["col_widths"] = [400 + i for i in range(12)]      # another layout
+    again, _ = _save_and_reopen(two, tmp_path, monkeypatch, edit)
+    for _ in range(2):                                  # bind each Link's Commands, twice
+        for k in (1, 0):
+            again.set_group_link("commands", k)
+            QApplication.processEvents()
+            widths = {name: again._cmd_view.columnWidth(_cmd_col(again, name))
+                      for name in COLUMN_NAMES if not again._cmd_view.isColumnHidden(
+                          _cmd_col(again, name))}
+            if k == 0:
+                assert widths == {name: 300 + i for i, name in enumerate(COLUMN_NAMES)
+                                  if name in widths}
+            else:
+                assert not set(widths.values()) & {400 + i for i in range(12)}
+                assert widths == {name: w for name, w in fitted.items() if name in widths}
+    again._cmd_view.set_column_shown("ΔRows", True)
+    assert again._cmd_view.columnWidth(_cmd_col(again, "ΔRows")) == 301

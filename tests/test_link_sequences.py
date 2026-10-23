@@ -1,12 +1,11 @@
 """Random sequences of Link operations, with the window re-derived after every step.
 
-Each operation is tested on its own elsewhere. What those tests cannot see is an operation
-leaving state that a LATER one trusts: an offset change left the remembered cursor instant
-at the old offset, and only the next Link activation, putting the cursor back by the shift,
-showed it. A seeded sequence of offsets, activations, cursor moves, bookmark alignments,
-removals, additions and pane-scope toggles reaches orders like that without anyone having
-to think of them, and `check_window` after each step says which step broke what. A failure
-names its seed and step, so it replays exactly.
+Each operation is tested on its own elsewhere. These cover an operation leaving state that
+a LATER one trusts (e.g. an offset change and the cursor instant remembered for the next Link
+activation). A seeded sequence of offsets, activations, cursor moves, bookmark alignments,
+removals, additions and pane-scope toggles reaches such orders, and `check_window` after
+each step says which step broke what. A failure names its seed and step, so it replays
+exactly.
 """
 import os
 import random

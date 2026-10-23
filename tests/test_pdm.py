@@ -3,8 +3,8 @@
 A 1-bit PDM stream is a bipolar density code, NOT a 1-bit two's-complement sample:
 {0,1} must map to {-1,+1}, and the audio is recovered by band-limited decimation.
 These tests encode a known tone with a 1st-order sigma-delta modulator, then check
-the decode recovers the right pitch with ~0 DC (the bug was {0,1}->{0,-1}, which
-both halves the swing and adds a -0.5 DC offset, decoding tones as garble).
+the decode recovers the right pitch with ~0 DC (mapping {0,1}->{0,-1} instead would
+halve the swing and add a -0.5 DC offset).
 """
 import os
 import sys
@@ -95,8 +95,8 @@ def test_store_decodes_pdm_channel_as_pcm():
 
 def test_decode_pdm_blocks_dc_bias():
     # Real PDM mics sit at a density well off 50% (a big DC bias) with the audio
-    # riding on top — exactly digital_0/1's mics (~0.31/0.36 density). With DC-block
-    # ENABLED (the store's pdm_dc_block; the app uses Filter & Gain ▸ DC blocker), the bias is removed so the tone survives
+    # riding on top. With DC-block ENABLED (the store's pdm_dc_block; the app uses
+    # Filter & Gain ▸ DC blocker), the bias is removed so the tone survives
     # instead of the dominant "frequency" being 0.
     fs, f0, bias = 2_048_000.0, 997.0, 0.45        # 0.45 DC -> density ~0.7
     t = np.arange(int(fs * 0.2)) / fs
@@ -118,7 +118,7 @@ def test_decode_pdm_preserves_dc_by_default():
         s, _out, _M = decode_pdm(np.asarray(bits, dtype=np.int64), fs)
         return int(np.median(s[s.size // 4: 3 * s.size // 4]))
 
-    assert settled(np.ones(300_000)) == 32767            # all-ones -> +1 DC (the reported bug)
+    assert settled(np.ones(300_000)) == 32767            # all-ones -> +1 DC
     assert settled(np.zeros(300_000)) == -32767          # all-zeros -> -1 DC
     assert abs(settled(np.tile([1, 0], 150_000))) < 0.02 * 32767   # 50% -> ~0
     # DC-block ON instead drives the constant all-ones to ~0.
@@ -149,8 +149,7 @@ def test_store_pdm_dc_block_flag_threads_through():
 
 def test_a_pdm_stream_at_full_scale_is_kept_unclipped(monkeypatch):
     """The decode rounds but does not clip: a biased stream whose signal reaches full scale
-    keeps both sides, so Filter & Gain's DC blocker can still centre it. Clipping there cut
-    one side for good, which the old in-decode mean subtraction never did."""
+    keeps both sides, so Filter & Gain's DC blocker can still centre it."""
     import swi3s_studio.dsp as dsp
     from swi3s_studio.store.audio_store import decode_pdm
     loud = np.array([0.45 + 0.6, 0.45 - 0.6, 0.45])            # a bias plus a loud tone

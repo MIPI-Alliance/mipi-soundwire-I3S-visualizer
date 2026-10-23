@@ -24,7 +24,7 @@ from ..viz import VizConfig
 
 
 class _HandoverTracker:
-    """Per-DP handover bookkeeping extracted from _process_data_port.
+    """Per-DP handover bookkeeping for _process_data_port.
 
     Each tick, the engine calls update() with the effective slot (DP or FCP,
     whichever is non-EMPTY) plus whether any tail was actually drawn this
@@ -104,8 +104,8 @@ class _HandoverTracker:
 class BusModelBuilder:
     """Builds BusModel from Interface configuration without UI dependencies.
 
-    This class extracts the bit iteration logic from the GUI's draw_data_port
-    method and builds a sequential BusModel representation of the bus.
+    Iterates every data port bit by bit and builds a sequential BusModel
+    representation of the bus.
     """
 
     def __init__(self, interface: Interface, num_rows: int,
@@ -187,7 +187,7 @@ class BusModelBuilder:
         self._finalize_clashes()
 
         # 6-9. Bit-position mismatch detectors — group the model's bits by index ONCE
-        # here and share it (each detector previously rebuilt the same O(N) map).
+        # here and share it.
         bits_by_index = self._group_bits_by_index()
 
         # 6. Detect scrambler mismatches
@@ -429,8 +429,8 @@ class BusModelBuilder:
         """True when every source (Manager + all 12 devices) shares the SAME CDS
         guard AND the same CDS tail. Every device can use the CDS regardless of its
         data ports, so a legacy/global config expands to all 13 sources being equal;
-        that uniform case collapses to a single universal (Manager-attributed) symbol
-        — byte-identical to the pre-per-source output, keeping the goldens stable.
+        that uniform case collapses to a single universal (Manager-attributed) symbol,
+        which the goldens pin.
         Only a per-source DIVERGENCE (a device set differently from the rest) drops to
         per-source emission + the peripheral CDS-bit handover."""
         return (len(set(self.interface.CDS_Guard_PerSource)) <= 1
@@ -499,7 +499,7 @@ class BusModelBuilder:
 
         If no source drives a guard or tail (legacy / no-guard configs), a single
         handover at `region_end_col` represents the turnaround after the plain
-        CDS column itself, attributed to SpecialDevices.UNIVERSAL as before.
+        CDS column itself, attributed to SpecialDevices.UNIVERSAL.
         """
         guard_sources = set(self._cds_guard_sources())
         tail_sources = set(self._cds_tail_sources())
@@ -713,12 +713,8 @@ class BusModelBuilder:
         # BRANCH ON THE BIT'S OWN DIRECTION, NOT THE PARENT DP'S REGISTER. For a DRQ the
         # two disagree by definition: `direction` above takes bit_slot.direction, which
         # device._drq_direction() defines as the OPPOSITE of the parent DP's data
-        # direction (a Sink DP's FCP DRIVES its DRQ; a Source DP samples it). Reading
-        # PortDirection_REG here therefore inverted the check for every DRQ bit — a real
-        # two-driver DRQ collision was recorded as a read overlap (and never added as a
-        # write), while several devices legally sampling one DRQ column was reported as a
-        # physical bus clash. Every other slot type is unaffected: for them `direction` is
-        # derived from PortDirection_REG, so the two forms agree.
+        # direction (a Sink DP's FCP DRIVES its DRQ; a Source DP samples it). For every
+        # other slot type `direction` is derived from PortDirection_REG, so the two agree.
         clash_type = ClashType.NONE
         if direction == DirectionType.SOURCE:
             has_clash, _, suppress_slots = self.clash_detector.check_write_clash(row, column, device)
@@ -1044,9 +1040,6 @@ class BusModelBuilder:
         A mismatch occurs when:
         - One data port is in test mode (test ones or test zeros) while another is in normal mode
         - Two data ports are in different test modes (test ones vs test zeros)
-
-        The user specified: "test mode bits in the same bit slot as not test mode bits"
-        and "The test mode need to match also i.e 1 vs 1, 0 vs 0"
         """
 
         # Check each position for test mode mismatches
@@ -1109,8 +1102,7 @@ class BusModelBuilder:
         2. Display truncation: Data would fit if more rows were displayed
 
         Compares expected bits per interval against actual bits placed in the
-        bus model. This is simpler and more reliable than trying to predict
-        overflow from configuration parameters.
+        bus model.
         """
         from ..models.enums import FlowMode, SlotType
 
@@ -1258,9 +1250,7 @@ class BusModelBuilder:
     def _detect_enabled_no_channels_warnings(self) -> None:
         """Detect data ports with EnableDataPort=True but NumChannels=0.
 
-        This is a common configuration mistake where the user enables drawing
-        but hasn't configured any channels. The data port will appear to do
-        nothing, which can confuse new users.
+        Such a data port is enabled for drawing but emits nothing.
         """
         for dp_index, dp in enumerate(self.interface.data_ports):
             if not self.viz_config.data_ports[dp_index].enabled:

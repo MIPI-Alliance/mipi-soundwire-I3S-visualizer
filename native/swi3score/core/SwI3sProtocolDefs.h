@@ -1,8 +1,7 @@
 // SWI3S PHY2 protocol constants.
 //
-// Values verified against the MIPI SoundWire I3S (SWI3S) Specification
-// v1.1r06 via the project spec service. Items still to be transcribed from
-// the spec during later build phases are marked "TODO(spec)".
+// Values follow the MIPI SoundWire I3S (SWI3S) Specification v1.1r06. Items not
+// yet transcribed from the spec are marked "TODO(spec)".
 
 #ifndef SWI3S_PROTOCOL_DEFS_H
 #define SWI3S_PROTOCOL_DEFS_H
@@ -37,7 +36,7 @@ static const int kCdsColumn            = 0;  // CDS_HorizontalStart is RO 0 on P
 static const int kDlvCdsColumn         = 2;  // PHY3 (DLV) frames S1 at col 0, CDS at col 2
 
 // ---------------------------------------------------------------------------
-// CDS line coding (Section 11.1.1.7, Table 134, {ASW4108})
+// CDS line coding (Section 11.1.1.7, "PHY1 & PHY2: NRZS Decoding for CDS" table, {ASW4108})
 // ---------------------------------------------------------------------------
 // PHY1 & PHY2 line-code the CDS as NRZS relative to the immediately preceding
 // UI: a physical TOGGLE decodes to 0, no toggle decodes to 1. (This is the
@@ -48,7 +47,7 @@ inline bool NrzsDecode(BitState previousUi, BitState thisUi)
 }
 
 // ---------------------------------------------------------------------------
-// 8b/10b comma (Section 7.1.1.2, Table 37)
+// 8b/10b comma (Section 7.1.1.2, "K.28.y Comma Symbols" table)
 // ---------------------------------------------------------------------------
 // K.28.7 is the Start-of-Phase Marker, the only symbol with two like bits
 // followed by five opposite bits, so it is findable at any bit alignment.
@@ -71,7 +70,9 @@ static const unsigned kScramblerTap1 = 9;   // Y^-9
 static const unsigned kNoToggleLimit = 16;
 
 // ---------------------------------------------------------------------------
-// System & Link Control register offsets (Section 15.2 / Table 170-171)
+// System & Link Control register offsets (Section 15.2; the "Peripheral Register Map for
+// System and Link Control Dual-Ranked Registers (SLC_*_NEXT)" and "System and Link Control
+// Register Fields (SLC_*)" tables)
 // ---------------------------------------------------------------------------
 // Dual-ranked: _CURR = _NEXT + 0x40. A WriteA32 to a _NEXT register followed
 // by a Commit (SSCR/DSCR) at an SSP applies the new value.
@@ -81,7 +82,9 @@ static const U32 kRegRowRateRange_Next  = 0x82;
 static const U32 kRegCurrRankOffset     = 0x40;
 
 // ---------------------------------------------------------------------------
-// Command Transport Protocol (Section 8.1, Tables 66/67/97)
+// Command Transport Protocol (Section 8.1; the "Assignment of Robust Token Numbers
+// (Manager)", "Assignment of Robust Token Numbers (Peripheral)" and "Opcodes for Commands"
+// tables)
 // ---------------------------------------------------------------------------
 
 // A phase is: K.28.7 SPM, then a 6-token Phase Header, then (if Packet_Length
@@ -89,7 +92,7 @@ static const U32 kRegCurrRankOffset     = 0x40;
 // Protocol Spacer.
 static const int kPhaseHeaderTokens = 6;  // PhaseID, DevMask H/M/L, PktLen H/L
 
-// PhaseID token values (Table 66).
+// PhaseID token values ("Assignment of Robust Token Numbers (Manager)" table).
 enum PhaseId {
     kPhaseGetStatus    = 0,
     kPhaseWrite        = 1,
@@ -100,8 +103,8 @@ enum PhaseId {
     kPhaseCalibratePhy = 6,
 };
 
-// Command opcodes, interpreted per PhaseID (Table 97). The opcode is the first
-// Manager Packet byte.
+// Command opcodes, interpreted per PhaseID ("Opcodes for Commands" table). The opcode is
+// the first Manager Packet byte.
 enum Opcode {
     kOpPing        = 0x00,  // GetStatus
     kOpReadA32     = 0x00,  // ReadSetup
@@ -115,7 +118,7 @@ enum Opcode {
     kOpTrimCal     = 0x01,  // CalibratePhy
 };
 
-// Protocol Spacer sizes in bits (Table 68). PM default assumes
+// Protocol Spacer sizes in bits ("Size of Protocol Spacer" table). PM default assumes
 // ShortProtocolSpacer = 0 (reset default).
 static const int kSpacerBitsMP = 10;  // Manager -> Peripheral
 static const int kSpacerBitsPP = 10;  // Peripheral -> Peripheral
@@ -126,7 +129,11 @@ static const int kMaxPeripherals = 12;  // 12-bit Device Mask
 // CRC-16 over the Manager Packet (see CCrc16.h): poly 0xA2EB, init 0.
 
 // ---------------------------------------------------------------------------
-// Register address map (Section 15.2, Tables 163/164/166/167/169/170)
+// Register address map (Section 15.2; the "Peripheral Top-Level Address Map", "Peripheral
+// Address Map Regions for Local SWI3S Registers" and "Peripheral Address Map Blocks for
+// SWI3S Interface Registers" tables, and the "Peripheral Register Map for Data Port" and
+// "Peripheral Register Map for System and Link Control" tables with their Dual-Ranked
+// counterparts)
 // The target device is selected by the Phase Header Device Mask; the 32-bit
 // WriteA32/ReadA32 address is an offset WITHIN that peripheral's own space.
 // Every peripheral has the identical layout. Dual-ranked registers: _CURR =
@@ -150,13 +157,16 @@ static const U32 kShortSpacer_Next   = 0x1083;  // bit0
 // time-multiplexed, so every source that drives it has its OWN copy of these
 // registers in its own block — there is no bus-wide CDS register.
 //
-// THE MANAGER HAS NO BLOCK HERE. A config's per-source CDS list carries 13 entries
-// (Manager + Device 0..11), but only the twelve peripherals are addressable; the
-// Manager's own CDS behaviour is not expressible as a peripheral register write and
-// so has no representation in this map. registersFromConfig therefore emits entries
-// for devices only, and BuildConfig can never recover the Manager's value from the
-// wire. See the manager-slot notes in Decoder.cpp / bus_config.py.
+// The Manager has no block here. A config's per-source CDS list carries 13 entries
+// (Manager + Device 0..11), but only the twelve peripherals are addressable, so
+// registersFromConfig emits entries for devices only and BuildConfig cannot recover
+// the Manager's value from the wire.
 static const U32 kCdsBase              = 0x1100;
+// PHY Control blocks, one per PHY. Like SLC and CDS, offsets 0x80..0xBF hold dual-ranked
+// _NEXT registers and 0xC0..0xFF their _CURR aliases.
+static const U32 kPhy1Base             = 0x0100;
+static const U32 kPhy2Base             = 0x0200;
+static const U32 kPhy3Base             = 0x0300;
 static const U32 kCdsHorizontalStart_N = 0x1184;  // [4:0]
 static const U32 kCdsDriveType_N       = 0x1186;  // bit7: 0=Special(passive 1), 1=Normal
 static const U32 kCdsBitWidthGuardTail_N = 0x1187;  // [7:5]=BitWidth(ex-1), bit4=EndDriveEarly,

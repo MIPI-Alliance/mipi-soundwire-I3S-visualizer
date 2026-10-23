@@ -9,8 +9,8 @@ it is decoded to PCM at build time (map {0,1}->±1 and band-limit + decimate, se
 decode_pdm). The per-dataport sample rate comes from the C++ core's verified
 SampleRateHz (and is replaced by the decimated rate for PDM streams).
 
-(The min/max render pyramid for very large captures plugs in here; for now the
-viewer relies on pyqtgraph downsampling.)
+Each channel has a lazily built min/max render pyramid that serves the waveform
+envelope (see `AudioStore.envelope`).
 """
 from __future__ import annotations
 
@@ -57,19 +57,17 @@ def decode_pdm(bits: np.ndarray, native_rate: float,
     and the audio is the local average, recovered by band-limited decimation
     (low-pass below the output Nyquist, then downsample — see dsp.pdm_to_pcm).
 
-    `dc_block` (default False) subtracts the mean so a real mic's large density bias
-    (a density well off 50%) doesn't swamp a quiet tone — what a hardware PDM decoder
-    does for listening. It is OFF by default so the analyzer shows the TRUE density
-    on the wire: an all-ones stream reads full-scale +1 (DC), all-zeros −1, 50% ~0.
-    The app no longer turns it on: Filter & Gain ▸ DC blocker (StreamProcessing.dc_block)
-    high-passes any stream, PDM or PCM, at 1 Hz as its first step. Note a
-    constant/DC pattern decodes to ~0 when blocked (its mean is the whole signal).
+    `dc_block` (default False) subtracts the mean, removing a mic's density bias (a
+    density well off 50%). Off, the result is the TRUE density on the wire: an all-ones
+    stream reads full-scale +1 (DC), all-zeros −1, 50% ~0. The app does not set it:
+    Filter & Gain ▸ DC blocker (StreamProcessing.dc_block) high-passes any stream, PDM
+    or PCM, at 1 Hz as its first step. A constant/DC pattern decodes to ~0 when blocked
+    (its mean is the whole signal).
 
     The result is rounded but NOT clipped to int16: a stream whose bias plus signal reaches
     full scale (the low-pass can also overshoot a little) keeps its shape, so Filter & Gain's
-    DC blocker can still centre it. Clipping first would cut one side of the waveform for
-    good, which the old in-decode mean subtraction never did. Playback, WAV export and any
-    Filter & Gain setting clip to the output range themselves.
+    DC blocker can still centre it. Playback, WAV export and any Filter & Gain setting clip
+    to the output range themselves.
 
     Returns (pcm: int64, about the int16 range, out_rate_hz, M) where M is the integer
     decimation factor (input samples per output sample). When the native rate is
@@ -92,6 +90,81 @@ def decode_pdm(bits: np.ndarray, native_rate: float,
 _RATE_RECOVERY_SUBSAMPLE = 4096   # samples per probe window (bounds memory)
 
 
+def _even_runs(sample_at: np.ndarray, gaps: np.ndarray) -> np.ndarray:
+    """`sample_at` respaced evenly within each run between transport gaps: a run keeps its
+    first and last positions and the samples between are spread uniformly across it."""
+    out = np.asarray(sample_at, dtype=np.int64).copy()
+    bounds = [0] + [int(g) + 1 for g in np.asarray(gaps).tolist()] + [out.size]
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        m = e - s
+        if m > 2:
+            span = int(out[e - 1]) - int(out[s])
+            out[s:e] = int(out[s]) + np.rint(np.arange(m) * (span / (m - 1))).astype(np.int64)
+    return out
+
+
+# Transport-gap detection (see AudioStore.transport_gaps). A step longer than
+# `tolerance` x the channel's nominal step is a gap.
+_GAP_TOLERANCE = 4.0          # multiples of the lower-quartile row step (NORMAL ports)
+_FLOW_GAP_TOLERANCE = 32.0    # multiples of the stream's average step (TX/RX/ASYNC ports)
+_CADENCE_BLOCK = 64           # samples per block when measuring a stream's average step
+# A NORMAL-port step shorter than this fraction of the stream's average step is an in-row
+# step between samples grouped onto one row. A group of m <= 8 samples whose in-row step
+# s is at least this fraction of the average A has a row step of at most
+# m*A - (m-1)*s <= (m+3)/3 * s, under `_GAP_TOLERANCE` x s.
+_IN_ROW_FRACTION = 0.75
+
+
+def _stream_step(sample_at: np.ndarray) -> float:
+    """A stream's average step in capture samples, robust to transport gaps: the median,
+    over consecutive blocks of up to `_CADENCE_BLOCK` samples, of each block's average
+    step. A gap inflates only the blocks that contain it."""
+    n = sample_at.size
+    if n < 2:
+        return 0.0
+    b = max(1, min(_CADENCE_BLOCK, (n - 1) // 16))
+    marks = np.asarray(sample_at[::b], dtype=np.int64)
+    if marks.size < 2:
+        return 0.0
+    return float(np.median(np.diff(marks))) / b
+
+
+def _gap_indices(sample_at: np.ndarray, flow: bool,
+                 tolerance: Optional[float] = None,
+                 expected_step: float = 0.0) -> np.ndarray:
+    """Indices `i` where the step from sample `i` to `i+1` is a transport gap.
+
+    NORMAL ports: the nominal step is the 25th-percentile ROW step, and the default
+    tolerance is `_GAP_TOLERANCE`. Steps shorter than `_IN_ROW_FRACTION` of the stream's
+    average step are in-row steps of a SampleGrouping port and are left out of the
+    percentile, so a group's step to its next row is not read as a gap. The average step
+    is the smaller of `_stream_step` and `expected_step` (the capture samples per sample
+    at the port's rate, 0 when unknown). With the rate known, a mostly idle port whose
+    bursts are one step apart keeps those steps, and its idle stretches are gaps.
+
+    Flow-controlled ports (`flow`): the port declines transport opportunities, so the
+    lower quartile is the opportunity step rather than the stream's, and a run of
+    declined opportunities can be many stream steps long. The nominal step is the
+    stream's average step (`_stream_step`) and the default tolerance is
+    `_FLOW_GAP_TOLERANCE`."""
+    if sample_at is None or sample_at.size < 2:
+        return np.zeros(0, dtype=np.int64)
+    d = np.diff(np.asarray(sample_at, dtype=np.int64))
+    if flow:
+        nominal = _stream_step(sample_at)
+        tol = _FLOW_GAP_TOLERANCE if tolerance is None else float(tolerance)
+    else:
+        avg = _stream_step(sample_at)
+        if expected_step > 0.0 and (not avg > 0.0 or expected_step < avg):
+            avg = float(expected_step)
+        rows = d[d >= avg * _IN_ROW_FRACTION] if avg > 0.0 else d
+        nominal = float(np.percentile(rows if rows.size else d, 25))
+        tol = _GAP_TOLERANCE if tolerance is None else float(tolerance)
+    if not np.isfinite(nominal) or nominal <= 0.0:
+        return np.zeros(0, dtype=np.int64)
+    return np.flatnonzero(d > nominal * tol).astype(np.int64)
+
+
 def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
     """Recover a port's native rate (a PDM port's bit rate, a PCM port's sample rate)
     from its own per-sample capture-sample anchors, for use when the core reported no
@@ -100,21 +173,16 @@ def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
     `sample_at` is non-decreasing and, under standard SampleGrouping/Spacing, its
     consecutive diffs are BIMODAL: small gaps between samples grouped onto the same
     row and one large gap to the next active row (see CDpConfig::computeSampleRate
-    — rate = (SampleGrouping+1) * rowRate / (Interval+1)). np.median(np.diff(...))
-    picks the small intra-row gap and overestimates the bit rate by several times,
-    which drives the wrong decimation factor M in decode_pdm (wrong pitch/speed).
+    — rate = (SampleGrouping+1) * rowRate / (Interval+1)), so a median of the diffs
+    picks the small intra-row gap and overestimates the rate.
 
-    The AVERAGE spacing over a whole run of rows — (last - first) / (count - 1) —
-    is exact regardless of how the samples clump within a row, because it just
-    divides the true elapsed capture-sample span by the number of steps; unlike a
-    per-diff statistic, it isn't fooled by which gap size is more numerous. A single
-    probe is still vulnerable to a reconfig gap (the port going silent mid-capture
-    stretches one span disproportionately), so take a few short probes — head, mid,
-    tail — and use their MEDIAN so one distorted probe can't dominate.
+    The rate is the AVERAGE spacing over a run of rows — (last - first) / (count - 1) —
+    which is exact however the samples clump within a row. Three short probes (head,
+    mid, tail) are taken and their MEDIAN used, so a reconfig gap stretching one probe
+    does not dominate.
 
-    Each probe only touches a small, strided slice (bounded by
-    `_RATE_RECOVERY_SUBSAMPLE`), so this stays O(1)-ish memory even on a
-    100M-sample channel — no full-array np.diff / np.median."""
+    Each probe touches a slice of at most `_RATE_RECOVERY_SUBSAMPLE` samples, so memory
+    stays bounded on any channel length."""
     n = sample_at.size
     if n < 2 or capture_rate_hz <= 0.0:
         return 0.0
@@ -135,8 +203,7 @@ def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
 
 # --- min/max render pyramid -------------------------------------------------
 # Multi-resolution min/max so pan/zoom renders from pre-binned envelopes and
-# never scans the full per-channel array — the technique pro waveform viewers use
-# to stay smooth over very long captures.
+# never scans the full per-channel array.
 _PYRAMID_FACTOR = 8
 _PYRAMID_MIN_LEN = 1024
 
@@ -171,9 +238,8 @@ class StreamProcessing:
 
     `dc_block` runs the DC blocker (dsp.filters.dc_block: a 2nd-order zero-phase Butterworth
     high-pass at 1 Hz), for a PDM mic's density bias or a PCM stream's offset, drifting or
-    not. It was Decode ▸ Block PDM DC Bias, which subtracted the mean of every PDM port in
-    the window; here it is one stream's, for any stream. `highpass_hz` is the corner of the 4th-order zero-phase Butterworth high-pass, or None
-    for none; `gain_db` is applied after it. The result is rounded and saturates at the
+    not. `highpass_hz` is the corner of the 4th-order zero-phase Butterworth high-pass, or
+    None for none; `gain_db` is applied after it. The result is rounded and saturates at the
     stream's full scale, as a DAC would. `allow_clipping` is the choice the user made in
     the dialog (whether a gain that clips may be applied); it is kept so a saved workspace
     reopens the dialog as it was left."""
@@ -238,8 +304,11 @@ class AudioStore:
     _native_rates: Dict[Tuple[int, int], float] = field(default_factory=dict)
     _pyramids: Dict[Tuple[int, int, int], list] = field(default_factory=dict)
     _sample_at: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
-    # Memoised transport_gaps() per channel — see _gaps_cached().
+    # Memoised default-tolerance transport_gaps() per channel, read-only arrays.
     _gap_cache: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
+    # Channels of flow-controlled ports (flow_mode != 0), whose gaps use the stream's
+    # average step (see _gap_indices).
+    _flow: set = field(default_factory=set)
     # Memoised gap-split envelope windows — see envelope(). Bounded, oldest out first.
     _split_cache: Dict[tuple, tuple] = field(default_factory=dict)
     # TRUE per-index transport positions for flow-controlled channels, captured before
@@ -251,6 +320,16 @@ class AudioStore:
     # processed ones that every view, playback and export reads.
     _processing: Dict[Tuple[int, int], StreamProcessing] = field(default_factory=dict)
     _raw: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict)
+    # Streams drawn EVENLY SPACED rather than where each sample was transported (see
+    # set_evenly_spaced). Their true positions wait in _transport_at, as a flow-controlled
+    # port's do, so gap detection still reads where the bus actually carried them.
+    _even: set = field(default_factory=set)
+    # Memoised timing_is_irregular() per stream and transport_step() per channel.
+    _irregular_cache: Dict[Tuple[int, int], bool] = field(default_factory=dict)
+    _step_cache: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
+    # Capture samples per second of the positions in _sample_at, 0 when unknown; with
+    # `_rates` it gives a NORMAL port's expected step for transport_gaps().
+    _capture_rate_hz: float = 0.0
 
     @classmethod
     def from_session(cls, session, mmap_dir: Optional[str] = None,
@@ -303,7 +382,8 @@ class AudioStore:
         slicing), not per-sample Python dicts, so 50M+ samples stay manageable.
         `capture_rate_hz` lets a PDM stream recover its bit rate from its own sample
         spacing when the core reports no verified rate (else it can't be decimated)."""
-        store = cls(_rates=dict(rates), _native_rates=dict(rates))
+        store = cls(_rates=dict(rates), _native_rates=dict(rates),
+                    _capture_rate_hz=float(capture_rate_hz))
         native_rates = dict(rates)   # immutable snapshot: store._rates is overwritten
         #                              with the decimated rate for PDM dataports below,
         #                              but every channel must decimate from the SAME
@@ -327,13 +407,11 @@ class AudioStore:
         # group by capture sample in a single pass: start_sample is the primary
         # (first-listed) lexsort key, so a run of equal (device, dp, channel) is one
         # contiguous, already-time-sorted slice — no separate per-channel argsort.
-        # (Ordering by start_sample, not the core's per-(dp,channel) `index`, is
-        # deliberate: that counter RESETS to 0 on every bus reconfiguration, so equal
-        # index values recur once per config epoch; a dense[index]=value placement kept
-        # only the LAST epoch and dropped earlier ones. start_sample is globally
-        # monotonic, so this stitches all epochs into one correct, time-ordered channel.
+        # Ordered by start_sample, not the core's per-(dp,channel) `index`: that counter
+        # RESETS to 0 on every bus reconfiguration, while start_sample is globally
+        # monotonic, so all config epochs stitch into one time-ordered channel.
         # No index gap zero-fill: the waveform is drawn in capture-sample space, so real
-        # gaps read as gaps, not silence.)
+        # gaps read as gaps, not silence.
         order = np.lexsort((start_sample, channel, dp, device))
         sdev, sdp, sch = device[order], dp[order], channel[order]
         changed = (np.diff(sdev) != 0) | (np.diff(sdp) != 0) | (np.diff(sch) != 0)
@@ -384,10 +462,9 @@ class AudioStore:
                 if (native_rates.get(devp, 0.0) <= 0.0 and store._rates.get(devp, 0.0) <= 0.0
                         and capture_rate_hz > 0.0 and n > 1):
                     # No verified rate from the core, as for the PDM case above: measure it
-                    # from the samples' own spacing. Without it the stream could not be
-                    # high-passed (no Nyquist), played at its pitch (it fell back to
-                    # 48 kHz), or labelled with a rate. The waveform never needed it: it is
-                    # drawn at each sample's capture position.
+                    # from the samples' own spacing. The rate drives the high-pass (Nyquist),
+                    # playback pitch and the rate label; the waveform is drawn at each
+                    # sample's capture position and does not use it.
                     measured = _recover_rate(dense_sat, capture_rate_hz)
                     if measured > 0.0:
                         store._rates[devp] = measured
@@ -395,37 +472,33 @@ class AudioStore:
 
             # Flow-controlled ports (TX/RX/ASYNC) transport on a jittered schedule, so
             # dense_sat lands the samples at irregular capture times and a bit-exact sine
-            # would render visibly distorted. A real receiver de-jitters via its FIFO,
-            # clocking the samples out at the long-term AVERAGE input rate. Mirror that:
-            # replace the jittered anchors with a uniform ramp across the same delivered
-            # span (first->last transport), and report that measured average as the rate.
-            # The intended source rate is unknown/arbitrary in general, so it is measured,
-            # not assumed. NORMAL (flow_mode 0) is already uniform and left untouched; the
+            # would render visibly distorted. A receiver de-jitters through its FIFO,
+            # clocking the samples out at the AVERAGE input rate. The store does the same
+            # per run between transport gaps: each run is respaced evenly from its first
+            # transport to its last (_even_runs), and the rate is the runs' average,
+            # (samples - runs) / (sum of run spans) x capture rate, so a dropout is
+            # neither filled with audio nor counted in the rate. The source rate is
+            # measured, not assumed. NORMAL (flow_mode 0) is left as transported; the
             # per-interval transport jitter remains visible in the Samples/grid view.
             fm = int(flow_mode[r0]) if flow_mode is not None else 0
             if fm != 0 and dense_sat.size > 1:
-                # Gap detection must read the TRUE transport positions, so stash them
-                # before the ramp replaces them. The de-jitter below makes the anchors
-                # perfectly uniform by construction, which erases the very step a
-                # dropout consists of — transport_gaps() would then find nothing on any
-                # flow-controlled port, exactly where the waveform most needs breaking.
-                store._transport_at[key] = np.ascontiguousarray(dense_sat)
-                # Use the CURRENT anchor count: a PDM branch above already decimated
-                # dense_sat to signed.size, so `n` (the pre-decimation bit count) would
-                # mismatch the value array and corrupt _sample_at. m == signed.size here.
-                m = dense_sat.size
-                span = int(dense_sat[-1]) - int(dense_sat[0])
-                if span > 0:
-                    dense_sat = (int(dense_sat[0])
-                                 + np.rint(np.arange(m) * (span / (m - 1)))).astype(np.int64)
-                    if capture_rate_hz > 0.0:
-                        avg = (m - 1) / span * capture_rate_hz
-                        # Update BOTH the display rate and the native (pre-decimation)
-                        # rate: native_rate() feeds the plot title + Statistics bandwidth,
-                        # so leaving it at the 96 kHz opportunity rate would keep showing
-                        # the inflated rate the de-jitter is meant to remove.
-                        store._rates[devp] = avg
-                        store._native_rates[devp] = avg
+                # Gap detection reads the true transport positions, kept here because the
+                # respaced positions replace dense_sat. dense_sat.size is the decoded
+                # sample count (signed.size), after any PDM decimation above.
+                true_at = np.ascontiguousarray(dense_sat)
+                store._transport_at[key] = true_at
+                store._flow.add(key)
+                gaps = _gap_indices(true_at, flow=True)
+                dense_sat = _even_runs(true_at, gaps)
+                d_gap = (true_at[gaps + 1] - true_at[gaps]) if gaps.size else true_at[:0]
+                run_span = int(true_at[-1]) - int(true_at[0]) - int(d_gap.sum())
+                run_steps = true_at.size - 1 - gaps.size
+                if run_span > 0 and run_steps > 0 and capture_rate_hz > 0.0:
+                    avg = run_steps / run_span * capture_rate_hz
+                    # Both the playback rate and the native rate: native_rate() feeds
+                    # the plot title and the Statistics bandwidth.
+                    store._rates[devp] = avg
+                    store._native_rates[devp] = avg
 
             store._sample_at[key] = dense_sat
             if mmap_dir is not None:
@@ -448,9 +521,7 @@ class AudioStore:
     # ---- queries ----
     def _stream_index(self) -> Dict[Tuple[int, int], List[int]]:
         """(device, dp) -> sorted channel list, built once from the (immutable-after-build)
-        channel keys and cached. streams()/channels() are called in nested loops at several
-        sites; scanning every channel key per call was O(streams x keys) — quadratic on wide
-        (mic-array) captures."""
+        channel keys and cached."""
         idx = getattr(self, "_stream_idx", None)
         if idx is None:
             idx = {}
@@ -532,9 +603,8 @@ class AudioStore:
         contiguous sample-index array, which knows nothing about capture positions,
         so one decimated bin can aggregate the silence before a dropout together
         with the loud audio after it — and the resulting [min,max] bar renders at
-        the pre-gap position as a jump from zero that no decoded sample contains
-        (reported on dev6 dp2 at 103,667,003.52 us, where the last decoded sample
-        of the region is 0). Splitting recomputes the two sides from the raw samples
+        the pre-gap position as a jump from zero that no decoded sample contains.
+        Splitting recomputes the two sides from the raw samples
         so each is exact, and anchors them at the region's true last/first index.
         There is at most one straddling bin per gap, so the extra work is negligible.
         """
@@ -561,12 +631,9 @@ class AudioStore:
         hi = np.asarray(hi_arr[i0:i1], dtype=np.int64)
         x = (np.arange(len(lo)) + i0) * factor + factor // 2
         if factor > 1:
-            # Splitting walks every bin in Python, which on a gappy flow-controlled stream is
-            # the costliest part of showing a store again (a Link switch rebuilds the plots
-            # over the same windows). A channel's samples change only through
-            # set_processing, which drops its entries, so the answer for a window is fixed:
-            # memoise it, returned read-only so no caller can edit the memo through its
-            # result.
+            # The split result for a window is memoised. A channel's samples change only
+            # through set_processing, which drops its entries. Results are returned
+            # read-only so no caller can edit the memo through its result.
             ck = (key, i0, i1, factor, n)
             hit = self._split_cache.get(ck)
             if hit is None:
@@ -583,10 +650,9 @@ class AudioStore:
         """Split any bin that spans a transport gap into its two true halves.
 
         `factor == 1` bins hold a single sample and can never straddle, so the
-        caller skips this entirely at full zoom — which is also why the artifact
-        only appears when zoomed out far enough to decimate.
+        caller skips this entirely at full zoom.
         """
-        gaps = self._gaps_cached(key)
+        gaps = self.transport_gaps(*key)
         if gaps.size == 0:
             return x, lo, hi
         samples = self._channels.get(key)
@@ -627,17 +693,6 @@ class AudioStore:
                 np.asarray(out_lo, dtype=np.int64),
                 np.asarray(out_hi, dtype=np.int64))
 
-    def _gaps_cached(self, key):
-        """Memoised transport_gaps: envelope() runs on every pan/zoom tick, and the
-        underlying diff+median over a multi-million-sample position array is far too
-        expensive to repeat per frame. Gaps are a property of the decoded data, so
-        the answer never changes for a given channel."""
-        g = self._gap_cache.get(key)
-        if g is None:
-            g = self.transport_gaps(key[0], key[1], key[2])
-            self._gap_cache[key] = g
-        return g
-
 
     def pyramid_levels(self, device: int, dp: int, channel: int) -> int:
         return len(self._pyramid((device, dp, channel)))
@@ -651,6 +706,16 @@ class AudioStore:
         i0 = int(_ss(sat, start_sample, side="left"))
         i1 = int(_ss(sat, stop_sample, side="right"))
         return i0, i1
+
+    def stream_index_range(self, device: int, dp: int,
+                           start_sample: int, stop_sample: int) -> Tuple[int, int]:
+        """Map a capture-sample window to the [i0, i1) sample-index slice of one
+        (device, dataport), through its first channel's sample positions (the slice
+        export_wav applies to every channel). (0, 0) for a stream with no channels."""
+        chs = self.channels(device, dp)
+        if not chs:
+            return 0, 0
+        return self.index_range_for_samples(device, dp, chs[0], start_sample, stop_sample)
 
     def sample_at_index(self, device: int, dp: int, channel: int,
                         index: int) -> Optional[int]:
@@ -669,7 +734,7 @@ class AudioStore:
         return self._sample_at.get((device, dp, channel))
 
     def transport_gaps(self, device: int, dp: int, channel: int,
-                       tolerance: float = 4.0) -> np.ndarray:
+                       tolerance: Optional[float] = None) -> np.ndarray:
         """Audio-sample indices `i` where NO samples were decoded between index `i`
         and `i+1` — i.e. the port stopped transporting and later resumed.
 
@@ -679,35 +744,114 @@ class AudioStore:
         its polyline at these indices, otherwise the two active regions are joined by
         a straight line implying audio that was never decoded.
 
-        Reads `_transport_at` when present — the TRUE transport positions of a
-        flow-controlled channel, stashed before the de-jitter ramp replaced
-        `_sample_at` with a uniform one. Reading the de-jittered array would find
-        nothing on any flow-controlled port: the ramp is uniform BY CONSTRUCTION, so
-        it erases the very step a dropout consists of.
+        Reads `_transport_at` when present: the true transport positions of a
+        flow-controlled channel or of an Evenly Spaced stream, whose `_sample_at` holds
+        respaced positions.
 
-        `tolerance` is the multiple of the channel's nominal per-sample step that
-        still counts as continuous. The nominal step is the 25th PERCENTILE diff, not
-        the median: the median is only robust while gaps are a minority, and inverts
-        once they are ~half the steps (an intermittent, bursty port), at which point
-        it reports the GAP width as "nominal" and detects nothing. The lower quartile
-        keeps tracking the active cadence well past that point. The default 4x clears
-        ordinary flow-control jitter (a TX/RX/ASYNC port legitimately skips transport
-        opportunities, giving 2x steps) while still catching a real dropout, which is
-        orders of magnitude larger — not a marginal call.
+        `tolerance` is the multiple of the channel's nominal step that still counts as
+        continuous; None selects the default for the port's kind. A NORMAL port's
+        nominal step is its 25th-percentile row step (in-row steps of samples grouped
+        onto one row left out, the stream's rate and capture rate giving the expected
+        average step) and the default is 4x. A
+        flow-controlled (TX/RX/ASYNC) port's nominal step is the stream's average step
+        and the default is 32x, since a run of declined transport opportunities can
+        be several stream steps long. See _gap_indices.
 
-        Returns the indices as an int64 array (empty when the channel is absent,
-        shorter than 2 samples, or gap-free)."""
+        The default-tolerance result is computed once per channel and returned as a
+        read-only array; gaps depend only on the decoded positions, which never change.
+        Returns int64 indices (empty when the channel is absent, shorter than 2
+        samples, or gap-free)."""
         key = (device, dp, channel)
+        if tolerance is None:
+            g = self._gap_cache.get(key)
+            if g is not None:
+                return g
         sat = self._transport_at.get(key)
         if sat is None:
             sat = self._sample_at.get(key)
-        if sat is None or sat.size < 2:
-            return np.zeros(0, dtype=np.int64)
-        d = np.diff(np.asarray(sat, dtype=np.int64))
-        nominal = float(np.percentile(d, 25))
-        if not np.isfinite(nominal) or nominal <= 0.0:
-            return np.zeros(0, dtype=np.int64)
-        return np.flatnonzero(d > nominal * float(tolerance)).astype(np.int64)
+        if sat is None:
+            g = np.zeros(0, dtype=np.int64)
+        else:
+            rate = self._rates.get((device, dp), 0.0)
+            expected = self._capture_rate_hz / rate if rate > 0.0 else 0.0
+            g = _gap_indices(sat, key in self._flow, tolerance, expected_step=expected)
+        if tolerance is None:
+            g.flags.writeable = False
+            self._gap_cache[key] = g
+        return g
+
+    # ---- even spacing for a stream transported on an irregular schedule ----
+    #
+    # Payload Interval Skipping carries a stream whose rate does not divide the row rate
+    # (44.1 kHz over 48 kHz rows: 147 of every 160 intervals carry a sample), so the samples
+    # arrive in a regular pattern of steps and skips. Drawn where they arrived, a sine is
+    # visibly lumpy and the spectrogram's columns are placed by that schedule. A receiver
+    # clocks them out evenly, so the Audio pane can too: each run of samples between real
+    # transport gaps is respaced evenly from its first sample to its last, which is the
+    # stream's average rate and moves no sample by more than the skip pattern's spread.
+    # Flow-controlled ports are respaced the same way, per run, when the store is built
+    # (see from_audio_columns), and are not offered this.
+
+    def timing_is_irregular(self, device: int, dp: int) -> bool:
+        """Whether the stream's samples arrive unevenly (a skipping pattern), so drawing them
+        evenly spaced changes the picture. False for flow-controlled ports, already even."""
+        devp = (int(device), int(dp))
+        cached = self._irregular_cache.get(devp)
+        if cached is None:
+            cached = self._irregular_cache[devp] = self._timing_is_irregular(*devp)
+        return cached
+
+    def _timing_is_irregular(self, device: int, dp: int) -> bool:
+        for ch in self.channels(device, dp):
+            key = (device, dp, ch)
+            if key in self._flow:
+                return False                     # respaced when the store was built
+            sat = self._transport_at.get(key, self._sample_at.get(key))
+            if sat is None or sat.size < 3:
+                continue
+            d = np.diff(np.asarray(sat, dtype=np.int64))
+            gaps = set(self.transport_gaps(device, dp, ch).tolist())
+            steps = np.delete(d, sorted(gaps)) if gaps else d
+            if steps.size and float(steps.max() - steps.min()) > 0.25 * float(np.median(steps)):
+                return True
+        return False
+
+    def evenly_spaced(self, device: int, dp: int) -> bool:
+        return (int(device), int(dp)) in self._even
+
+    def transport_step(self, device: int, dp: int, channel: int) -> float:
+        """The channel's average step between transported samples, in capture samples,
+        over its runs (transport gaps excluded): the step Evenly Spaced draws it at."""
+        key = (int(device), int(dp), int(channel))
+        step = self._step_cache.get(key)
+        if step is None:
+            sat = self._transport_at.get(key, self._sample_at.get(key))
+            step = 0.0
+            if sat is not None and sat.size >= 2:
+                d = np.diff(np.asarray(sat, dtype=np.int64))
+                gaps = self.transport_gaps(*key)
+                runs = np.delete(d, gaps) if gaps.size else d
+                step = float(runs.mean()) if runs.size else 0.0
+            self._step_cache[key] = step
+        return step
+
+    def set_evenly_spaced(self, device: int, dp: int, on: bool) -> bool:
+        """Draw the (device, dp) stream evenly spaced (on) or where it was transported (off).
+        Returns whether anything changed."""
+        devp = (int(device), int(dp))
+        if bool(on) == (devp in self._even) or (on and not self.timing_is_irregular(*devp)):
+            return False
+        for ch in self.channels(*devp):
+            key = (devp[0], devp[1], ch)
+            if on:
+                true = np.asarray(self._sample_at[key], dtype=np.int64)
+                self._transport_at[key] = true
+                self._sample_at[key] = _even_runs(true, self.transport_gaps(*key))
+            elif key in self._transport_at:
+                self._sample_at[key] = self._transport_at.pop(key)
+        (self._even.add if on else self._even.discard)(devp)
+        self._split_cache.clear()                # envelope windows were cut at the old positions
+        return True
 
     # ---- per-stream Filter & Gain (DC blocker, high-pass, gain) ----
     def raw_samples(self, device: int, dp: int, channel: int) -> np.ndarray:
@@ -817,7 +961,7 @@ class AudioStore:
                 s = resample(s, native, out_rate)
             cols.append(np.clip(np.round(s), lo, hi).astype(dt))
         # Pad shorter channels with silence to the LONGEST (zero-fill), matching
-        # export_wav — truncating to the shortest dropped tail audio on the others.
+        # export_wav.
         n = max((c.size for c in cols), default=0)
         nch = len(cols)
         out = np.zeros(n * nch, dtype=dt)
@@ -918,10 +1062,8 @@ class AudioStore:
         out = []
         for dev, dp in (streams if streams is not None else self.streams()):
             rng = None
-            if sample_range is not None:
-                chs = self.channels(dev, dp)
-                if chs:
-                    rng = self.index_range_for_samples(dev, dp, chs[0], *sample_range)
+            if sample_range is not None and self.channels(dev, dp):
+                rng = self.stream_index_range(dev, dp, *sample_range)
             path = os.path.join(directory, f"{prefix}_dev{dev}_dp{dp}.wav")
             out.append(self.export_wav(dev, dp, path, index_range=rng,
                                        target_rate=target_rate))

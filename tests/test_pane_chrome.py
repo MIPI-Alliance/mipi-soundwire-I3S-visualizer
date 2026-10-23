@@ -1,12 +1,14 @@
-"""Pane chrome from the 3.0.19 review: what the axes, pickers and band labels show.
+"""Pane chrome: what the axes, pickers and band labels show.
 
 - Capture and Audio carry no axis titles ("Time", "Amplitude"): the ticks carry the unit,
   and the room goes to the traces.
 - Audio's Y axis labels -1, 0 and +1 at full scale, and only the data's two extremes and 0
-  when zoomed, in plain values. Its end labels used to be culled (pyqtgraph keeps an
-  overflowing label only on an axis WITHOUT a grid), which left just "0".
+  when zoomed, in plain values. The end labels survive with the grid on (pyqtgraph keeps
+  an overflowing label only on an axis WITHOUT a grid).
 - Every Link picker draws the same chevron, the Commands one and those in the dock title
   bars; it is in the shipped assets.
+- A tree section's open / closed arrow is drawn in its heading's colour in each theme, not
+  the platform's black, and on a selected heading it sits on the row's fill.
 - The timeline's Link-name column is as narrow as the names allow.
 - The waveform colours and line weight are reachable from the View menu.
 - In All Links, lanes of different lengths share one window and put their ticks at the
@@ -68,7 +70,7 @@ def test_amp_ticks_full_scale_and_zoomed():
 
 def test_the_full_scale_labels_survive_with_the_grid_on(win):
     axis = win._audio_view._plots[0][0].getAxis("left")
-    assert axis.grid is not False                     # the case that culled them
+    assert axis.grid is not False                     # the grid is on
     assert _labels(axis) == ["-1", "0", "+1"]
 
 
@@ -119,8 +121,8 @@ def test_the_band_labels_are_as_narrow_as_the_names_allow():
 
 
 def test_the_view_menu_opens_the_waveform_preferences(win, monkeypatch):
-    """Preferences is in macOS's application menu (Settings…), where it was not found;
-    View names it for what it holds."""
+    """Preferences is in macOS's application menu (Settings…); View also offers it, named
+    for what it holds."""
     from swi3s_studio.ui.preferences_dialog import PreferencesDialog
     opened = []
     monkeypatch.setattr(PreferencesDialog, "exec", lambda self: opened.append(self) or 0)
@@ -128,3 +130,37 @@ def test_the_view_menu_opens_the_waveform_preferences(win, monkeypatch):
                if a.text().replace("&", "").startswith("Waveform Colors"))
     act.trigger()
     assert len(opened) == 1
+
+
+def test_a_tree_sections_arrow_is_drawn_in_its_heading_colour():
+    """Each theme draws the Registers tree's open / closed arrow with its own text colour
+    (the heading's), from the shipped assets, not the platform's black; a selected heading's
+    arrow sits on the row's fill in the light shade of its white text."""
+    import re
+
+    from swi3s_studio.ui import theme
+    from swi3s_studio.ui.theme import VizTheme
+    QApplication.instance() or QApplication([])
+    original = VizTheme.MODE
+    try:
+        for mode in ("dark", "light"):
+            theme.apply_palette(mode)
+            sheet = theme.analyzer_stylesheet()
+
+            def arrow(selector, sheet=sheet):
+                m = re.search(re.escape(selector) + r"\s*\{\s*image:\s*url\(([^)]*)\)", sheet)
+                assert m, f"{selector} has no arrow in the {mode} theme"
+                return pathlib.Path(m.group(1))
+            for state, glyph in (("closed", "right"), ("open", "down")):
+                path = arrow(f"QTreeView::branch:has-children:{state}")
+                assert path.name == f"chevron-{glyph}-{mode}.svg" and path.is_file()
+                assert f'stroke="{VizTheme.TEXT}"' in path.read_text(), (
+                    f"the {mode} {glyph} arrow is not the heading's colour {VizTheme.TEXT}")
+                selected = arrow(f"QTreeView::branch:has-children:{state}:selected")
+                assert selected.name == f"chevron-{glyph}-dark.svg"   # light, on the fill
+            fill = re.search(r"QTreeView::branch:selected[^{]*\{\s*background:\s*([^;]+);",
+                             sheet)
+            assert fill and fill.group(1).strip() == VizTheme.ACCENT, (
+                f"a selected heading's arrow is not on the selection fill in the {mode} theme")
+    finally:
+        theme.apply_palette(original)

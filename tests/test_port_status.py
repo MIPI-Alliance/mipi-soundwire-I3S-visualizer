@@ -1,9 +1,9 @@
 """Peripheral-reported status registers (`analysis.port_status`).
 
 A peripheral reports on itself through its `IntStat_*` / `DevStat_*` latched bits and its
-saturating `EC_*` error counters. Those replies were always on the wire and the register
-map always resolved them to field names — but nothing read their VALUES, so a capture in
-which a peripheral raised `IntStat_PortImpDef_1` decoded clean and said so.
+saturating `EC_*` error counters. `analysis.port_status` reads the VALUES of those replies
+and classifies each bit or counter as a fault, an Implementation-Defined interrupt, a
+lifecycle event or live state.
 
 Commands are built by hand here rather than from a demo fixture: the module is pure
 (command dict + register map -> findings), and hand-built replies pin one classification
@@ -44,12 +44,10 @@ def test_a_fault_bit_is_named_and_attributed_to_its_port():
 def test_an_impdef_interrupt_is_reported_but_not_called_a_fault():
     """`IntStat_PortImpDef_1` (bit 7) is Implementation-Defined: the spec assigns it no
     meaning, so the analyzer must surface it rather than diagnose a fault it cannot
-    actually name. This is the bit a real 44.1 kHz loopback capture raised on DP1 while
-    decoding otherwise clean.
+    actually name.
 
     The label carries the FIELD NAME and nothing else: `ImpDef` is in the name, which is
-    the spec's own term, so the old trailing "(vendor-defined)" restated the name in a
-    word the specification does not use."""
+    the spec's own term; "vendor" is a word the specification does not use."""
     r = port_status.reports_for(_read(_DP1 + 0x00, bytes([0x80])))[0]
     assert not r.faults
     assert [n for n, _ in r.vendor] == ["IntStat_PortImpDef_1"]
@@ -142,7 +140,7 @@ def test_the_statistics_section_leads_with_the_counters_that_prompt_investigatio
     interrupts are top-level rows, and only the per-port live state folds away.
 
     The count row is named for what actually fired — ImpDef here — because ImpDef is the
-    spec's term where 'vendor' was not, and an SDCA bit would say SDCA."""
+    spec's term (not 'vendor'), and an SDCA bit would say SDCA."""
     from swi3s_studio.analysis.measurements import _peripheral_report_rows
 
     class FakeSession:

@@ -1,11 +1,8 @@
 """What a MainWindow shows must follow from its Links. `check_window` recomputes it.
 
-A test that checks the field it just set passes when the window shows something stale: a
-reopened workspace had every Link's offset right while every band but the first was drawn
-at offset 0, and an offset change left the remembered cursor instant at the old offset.
-Neither is visible in the field, only in what was derived from it. So this derives each
-displayed quantity again, from the Links alone, and compares it with what is on screen.
-Call it after anything that changes the Links: a round-trip, an offset, a removal.
+`check_window` derives each displayed quantity again, from the Links alone, and compares
+it with what is on screen. Call it after anything that changes the Links: a round-trip,
+an offset, a removal.
 """
 from __future__ import annotations
 

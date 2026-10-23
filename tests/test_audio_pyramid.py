@@ -55,12 +55,9 @@ def test_memmap_backing():
 def test_reconfig_index_reset_keeps_all_epochs():
     """The core numbers audio samples with a per-(dp,channel) `index` that RESETS on
     every bus reconfiguration, so the same index recurs once per config epoch. The
-    store must key each channel on start_sample (globally monotonic), NOT on index —
-    otherwise the old dense[index]=value (last-write-wins) kept only the FINAL epoch
-    and dropped every earlier one, so the audio view showed nothing where a data port
-    was first enabled (the Dev6 DP2 bug on the pdm768 capture). Two epochs reuse the
-    same index range at disjoint capture times; all samples must survive, time-ordered,
-    with monotonic capture anchors."""
+    store keys each channel on start_sample (globally monotonic), NOT on index. Two
+    epochs reuse the same index range at disjoint capture times; all samples survive,
+    time-ordered, with monotonic capture anchors."""
     K = 50
     audio = []
     for i in range(K):                        # epoch 1: index 0..K-1, early samples

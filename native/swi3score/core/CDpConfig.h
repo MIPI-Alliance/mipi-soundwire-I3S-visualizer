@@ -8,6 +8,7 @@
 #ifndef SWI3S_CDPCONFIG_H
 #define SWI3S_CDPCONFIG_H
 
+#include <map>
 #include <string>
 #include <vector>
 #include <LogicPublicTypes.h>
@@ -135,14 +136,13 @@ struct SwI3sConfig
     // THE MANAGER SLOT HAS NO REGISTER. Only the twelve peripherals are addressable, so
     // registersFromConfig emits entries for indices 1..12 and BuildConfig can only ever
     // fill those; index 0 survives a CSV round trip but is invisible on the wire. A
-    // decoded capture therefore leaves it at its default, which is honest rather than
-    // guessed — see the note in registersFromConfig.
+    // decoded capture therefore leaves it at its default — see the note in
+    // registersFromConfig.
     //
-    // Defaults match the authoring model, INCLUDING the deliberate asymmetry:
-    // CdsDriveType defaults to 1 (Normal) against its register reset of 0, because a
-    // config that never mentions it must keep reading as it always did; CdsEndDriveEarly
-    // defaults to 0 (drive to the end of the UI) WITH its reset, that being the ordinary
-    // behaviour. See the CDS_* constants in bus_config.py for the full reasoning.
+    // Defaults match the authoring model: CdsDriveType defaults to 1 (Normal) against
+    // its register reset of 0, so a config that never mentions it reads as Normal;
+    // CdsEndDriveEarly defaults to 0 (drive to the end of the UI), its reset. See the
+    // CDS_* constants in bus_config.py.
     static const int kCdsSources = 13;               // Manager + Device 0..11
     int  CdsBitWidth = 0;                            // excess-1: UIs per CDS bit - 1
     std::vector<int>  CdsGuard;                      // 0 off, 1 G0, 2 G1
@@ -156,22 +156,13 @@ struct SwI3sConfig
 
     std::vector<SwI3sDpConfig> dps;   // index = dataport number
 
-    // CLAMPED TO THE PROTOCOL'S OWN LIMITS, because this value is used as a MODULUS and as an
-    // array bound, and NumColumns arrives from an imported config CSV with no validation:
-    // LoadCsv takes it straight from parseInt, so `NumColumns_REG,-1` reached
-    // Decoder::run()'s `mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount`
-    // as a zero. That is undefined behaviour, and it splits by platform in the worst possible
-    // way — ARM64 sdiv silently yields 0 and the decode produces quiet nonsense, while x86_64
-    // idiv raises SIGFPE and kills the process, so the CI runners crash on a file the
-    // maintainer's Mac merely mis-decodes. A more negative value (-100 -> -99) skipped the
-    // crash and poisoned every row/column calculation instead.
-    //
-    // CLAMPING RATHER THAN REJECTING, and in the ACCESSOR rather than at each use: the raw
-    // register value stays in NumColumns for whatever wants to report or round-trip it, while
-    // everything that computes with the count gets a usable one. Decoder::run(),
-    // CPayloadEngine::buildRuntime (which hands it to CDataPort/CFlowControlPort::Configure)
-    // and configsEqual all read it through here; layoutGrid already applied this floor to its
-    // own local copy, which is why the grid paths never crashed and the live decode did.
+    // Column count (NumColumns + 1), CLAMPED to [kMinColumnCount, kMaxColumnCount]. It is
+    // used as a MODULUS and as an array bound, and NumColumns arrives unvalidated from an
+    // imported config CSV (LoadCsv takes it straight from parseInt); a zero modulus is
+    // undefined behaviour. The raw register value stays in NumColumns for reporting and
+    // round-trip; everything that computes with the count reads it through here —
+    // Decoder::run(), CPayloadEngine::buildRuntime (which hands it to
+    // CDataPort/CFlowControlPort::Configure) and configsEqual.
     int columnCount() const
     {
         const int c = NumColumns + 1;
@@ -208,9 +199,26 @@ struct SwI3sConfig
         return false;
     }
 
+    // What LoadCsv did not read as written, one line per field: a port disabled for its
+    // DeviceNumber_REG, a value masked or clamped to its register field, a cell that is
+    // not a number or a boolean, values beyond the last data-port column. Cleared and
+    // filled by every LoadCsv; empty for a config built any other way.
+    std::vector<std::string> warnings;
+
     // Load a visualizer-format CSV. Returns false (and sets 'error') on a
     // malformed file. Missing optional fields fall back to defaults.
     bool LoadCsv(const std::string& path, std::string& error);
+
+private:
+    // Fills `warnings` from what LoadCsv recorded while reading.
+    void collectWarnings(const std::map<std::string, std::vector<std::string>>& badCells,
+                         const std::vector<std::string>& fieldOrder,
+                         const std::map<std::string, std::vector<std::string>>& extraCells,
+                         const std::vector<std::string>& noDevice,
+                         const std::vector<int>& rawSampleSize,
+                         const std::vector<int>& rawEnableCh,
+                         const std::vector<int>& rawDpNumber,
+                         const std::vector<bool>& gotDpNumber);
 };
 
 #endif // SWI3S_CDPCONFIG_H

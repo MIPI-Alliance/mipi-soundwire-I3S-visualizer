@@ -1,5 +1,5 @@
-"""Timing mode — a Qt port of the standalone SWI3S Spec Calculator
-(`timing-analysis/app/spec_calculator.py`), covering both forwarded-clock
+"""Timing mode — the SWI3S Spec Calculator (the Qt counterpart of
+`timing-analysis/app/spec_calculator.py`), covering both forwarded-clock
 single-ended PHYs.
 
 A per-side **spec selector** picks what each end of the bus is built to: SWI3S
@@ -12,10 +12,8 @@ PHY1 (FBCSE-slow) and PHY2 (FBCSE-fast) share the setup/hold inequality
 structure exactly — the SWI3S spec documents them together (§11.2) and points
 both at the same RX/TX timing tables and measurement waveforms — so only the
 Specification values differ (PHY1's Peripheral/Manager high-Z and output-hold
-times are slower; its mandatory F_CLK is half). They are two spec sources rather
-than a separate PHY switch, because "which spec is this side built to" is one
-question, not two: a PHY1 Manager talking to a PHY2 Peripheral is expressible,
-and a global PHY switch could not say it.
+times are slower; its mandatory F_CLK is half). They are two spec sources, chosen
+per side, so a PHY1 Manager talking to a PHY2 Peripheral is expressible.
 
 The inequalities themselves are unchanged across all of this — every spec here
 describes the same physical event graph — but a tabulated clock-to-output number
@@ -43,50 +41,42 @@ so there is no manual corner picker. The page:
   point) clamped to whatever the selected pair may legally clock — not PHY2's
   13.2 MHz mandatory maximum, which is a worst-case corner no design targets.
 
-  The **launch mode** is an architectural choice, not a tighter number. An analog
-  delay line gives Man_t_DD as a range, and the inequalities absorb its
-  min-to-max spread on both MP legs at once — the max erodes setup while only the
-  min funds hold — so tightening the range cannot improve both. A clock-launched
-  edge (2x or 4x) lands on a known clock phase, so min == max and the spread
-  disappears.
+  The **launch mode** selects how the Manager places its data edge. An analog
+  delay line gives Man_t_DD as a range, whose min-to-max spread the inequalities
+  absorb on both MP legs at once (the max erodes setup, only the min funds hold).
+  A clock-launched edge (2x or 4x) lands on a known clock phase, so min == max.
 
   It governs all three Manager output timings together — t_DD, t_ZD and t_DZ —
-  because one Manager has one output stage: if its data edge comes from a
-  multiplied clock then it HAS that clock, and its output enable and disable come
-  from it too. A clocked t_DD beside an analog t_ZD and t_DZ is not a conservative
-  model, it is two different devices.
+  because one Manager has one output stage.
 
-  t_DD and t_ZD are in fact the two DATA LAUNCH METHODS — from an already-driving
-  output, or out of high-Z — and both must satisfy the same setup and hold
-  requirements at the receiver, which is why the revision states them identically
-  ("9–23 ns or (0.5 UI 2x CLK, 0.25 UI 4x CLK)" for each) rather than merely
-  similarly. What the mode dictates is that they are clocked and at what
-  RESOLUTION: a 4x clock offers 0.00, 0.25, 0.50 and 0.75 UI, a 2x clock only 0.00
-  and 0.50. So t_DD is fixed at the placement the selector names, and t_ZD / t_DZ
-  stay editable, snapped to a point the selected clock can actually place. On the
-  EDE column only t_DZ is exempt, because EDE is a redefinition of t_DZ and says
-  nothing about the launch methods.
+  t_DD and t_ZD are the two DATA LAUNCH METHODS — from an already-driving output,
+  or out of high-Z — and both must satisfy the same setup and hold requirements at
+  the receiver; the revision states them identically ("9–23 ns or (0.5 UI 2x CLK,
+  0.25 UI 4x CLK)" for each). A clocked mode sets their RESOLUTION: a 4x clock
+  offers 0.00, 0.25, 0.50 and 0.75 UI, a 2x clock only 0.00 and 0.50. The rows
+  stay editable, snapped to a point the selected clock can place.
 
-  The two clock options are bounded from
-  opposite ends (4x by hold, 2x by setup), so which is viable depends on F_CLK —
-  the hint beneath the selector reports that bound at the current rate.
-- A "Timing Inequality Results" tree: one always-expanded row per inequality
+  The two clock options are bounded from opposite ends (4x by hold, 2x by setup),
+  so which is viable depends on F_CLK — the hint beneath the selector reports that
+  bound at the current rate.
+- A "Timing Inequalities" tree: one always-expanded row per inequality
   (MP/PM × setup/hold), each evaluated at *its own* worst corner, with the
   symbolic equation in the header and Specification / Example child rows showing
-  the numeric substitution, Margin, and Max Frequency (setup inequalities only) —
-  failing margins / F_max coloured red.
+  the numeric substitution, Margin, and Max Frequency (every leg whose margin
+  scales with UI; "—" where no rate bounds it) — failing margins / F_max coloured
+  red.
 - One Specification-vs-Example parameter grid per section (shared name column,
   Spec and Example min/max side by side, then the unit).
 
-All compute lives in `swi3s_studio.timing` (ported verbatim from the standalone
-timing-analysis app and validated against its reference spreadsheets); this view
-only edits CalcRow ranges and formats the CalcResults.
+All compute lives in `swi3s_studio.timing` (validated against the timing-analysis
+reference spreadsheets); this view only edits CalcRow ranges and formats the
+CalcResults.
 """
 from __future__ import annotations
 
 import math
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QSize, Qt, Signal
 from PySide6.QtGui import (
@@ -121,6 +111,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import import_notes
 from ..timing import (
     INEQUALITIES,
     PP_PLACEMENT_LABELS,
@@ -164,13 +155,13 @@ SIDES = ("spec", "proposed")
 # Streamlit app's SECTIONS).
 SECTIONS: List[Tuple[str, List[str]]] = [
     ("RX Thresholds", ["V_IH", "V_IL"]),
-    ("TX Timing", ["Man_t_DD", "Per_t_DD"]),
     ("RX Timing", ["Man_t_IS", "Man_t_IH", "Per_t_IS", "Per_t_IH"]),
+    ("TX Timing", ["Man_t_DD", "Per_t_DD"]),
     ("Handover Timing", ["Man_t_DZ", "Per_t_DZ", "Man_t_ZD", "Per_t_ZD"]),
-    ("Rise/Fall Times", ["t_RF Man CLK", "t_RF Man DATA", "t_RF Per DATA"]),
-    ("Noise / Supply / Rise Fall Time Tolerance",
-     ["δ (V_SEOS tol)", "α (V_noise / V_SEOS)", "τ (per-edge slew)"]),
-    ("Bus Properties", ["bus length (cm)", "t_PD,mis fraction"]),
+    ("Rise/Fall Times", ["t_RF Man CLK", "t_RF Man DATA", "t_RF Per DATA",
+                         "τ (per-edge slew)"]),
+    ("System Properties", ["δ (V_SEOS tol)", "α (V_noise / V_SEOS)", "bus length (cm)",
+                           "t_PD,mis fraction"]),
 ]
 
 # All rows as masters (lock off), used to build the widgets and seed values.
@@ -180,30 +171,32 @@ _ROW_BY_NAME: Dict[str, CalcRow] = {r.name: r for r in _ALL_ROWS}
 
 # PHY1 (FBCSE-slow) shares PHY2's inequality structure exactly — the SWI3S spec
 # (v1.1r06 §11.2) documents PHY1 & PHY2 together and points both at the SAME
-# tables (Table 128 RX setup/hold, Table 129 TX timing, Table 130 EndDriveEarly)
-# and the SAME setup/hold measurement waveforms (Figures 174–179).
+# tables ("PHY1 & PHY2 Input Timing" for RX setup/hold, "PHY1 & PHY2 Output Timing" for
+# TX timing, "PHY2 Output Timing: Effect of EndDriveEarly" for EndDriveEarly) and the SAME
+# "PHY1 & PHY2 Measurement" waveforms
+# (§11.2.7).
 #
 # But the two tables are structured DIFFERENTLY, and the difference matters when
 # reasoning about a revision rather than just reading a number:
 #
-#   Table 128 (INPUT: Man/Per_tIS, tIH) is genuinely shared — ONE row per
-#   parameter, no PHY1/PHY2 distinction. (r06 renamed these with a `_Min`
+#   The "PHY1 & PHY2 Input Timing" table (Man/Per_tIS, tIH) is genuinely shared — ONE row
+#   per parameter, no PHY1/PHY2 distinction. (r06 names these with a `_Min`
 #   suffix: Per_tIS_Min etc., a max on the min a datasheet may publish.)
 #
-#   Table 129 (OUTPUT) prints EVERY parameter as a separate PHY1 row and PHY2
-#   row and NEVER collapses them. Three rows differ; three agree:
+#   The "PHY1 & PHY2 Output Timing" table prints EVERY parameter as a separate PHY1 row
+#   and PHY2 row and NEVER collapses them. Three rows differ; three agree:
 #       differ:  Per_tDD 14-50/2-20 · Per_tZD 14-50/2-18 · Man_tZD 14-30/2-18
 #       agree:   Man_tDD 7-18 · Man_tDZ 0-10 · Per_tDZ 0-10
 #   Only the differing rows need an override, so only they appear below — but
 #   the agreeing ones are two coincident rows, NOT one shared value. Do not
-#   reason from "Table 129 doesn't split it": it splits everything. If a future
-#   revision diverges Man_tDD, this dict is where PHY1's row belongs.
+#   reason from "the output timing table doesn't split it": it splits everything. If a
+#   future revision diverges Man_tDD, this dict is where PHY1's row belongs.
 #
-# Everything else (V thresholds §11.2.2, t_RF Table 127 — a single PHY1&2 table,
-# noise, bus geometry) is shared or is not a device-spec value at all.
+# Everything else (V thresholds §11.2.2, t_RF in the single "PHY1 & PHY2 Output Ramp Time"
+# table, noise, bus geometry) is shared or is not a device-spec value at all.
 _PHY1_SPEC: Dict[str, ParamRange] = {
-    # Table 129 §11.2.3 — the PHY1 rows that DIFFER from PHY2 (PHY2 values, for
-    # contrast, live in the default rows).
+    # "PHY1 & PHY2 Output Timing" table, §11.2.3 — the PHY1 rows that DIFFER from PHY2
+    # (PHY2 values, for contrast, live in the default rows).
     "Per_t_DD": ParamRange(14.0, 32.0, 50.0),   # Per_tDD  14–50 ns  (PHY2 2–20)
     "Per_t_ZD": ParamRange(14.0, 32.0, 50.0),   # Per_tZD  14–50 ns  (PHY2 2–18)
     "Man_t_ZD": ParamRange(14.0, 22.0, 30.0),   # Man_tZD  14–30 ns  (PHY2 2–18)
@@ -213,89 +206,61 @@ _PHY1_SPEC: Dict[str, ParamRange] = {
 #
 # Held here as ParamRanges rather than read from SpecPreset because the preset
 # carries a SINGLE value for t_ZD and t_IH — enough for SoundWire, where they are
-# single-valued, but the SWI3S proposal revises them as ranges. Taking them from
-# the preset collapsed min onto max (Per_t_IH became 1.5-1.5 instead of 0-1.5).
+# single-valued, but the SWI3S proposal revises them as ranges.
 _PHY2_PROPOSED: Dict[str, ParamRange] = {
     "Man_t_DD": ParamRange(9.0, 16.0, 23.0),    # 7-18   -> 9-23
     "Man_t_ZD": ParamRange(9.0, 16.0, 23.0),    # 2-18   -> 9-23 (tracks Man_t_DD)
     "Per_t_DD": ParamRange(2.0, 5.5, 9.0),      # 2-20   -> 2-9
     "Per_t_ZD": ParamRange(2.0, 5.5, 9.0),      # 2-18   -> 2-9  (tracks Per_t_DD)
     "Per_t_IH": ParamRange(0.0, 0.75, 1.5),     # 0-4.5  -> 0-1.5
+    "Man_t_DZ": ParamRange(0.0, 4.5, 9.0),      # 0-10   -> 0-9
+    "Per_t_DZ": ParamRange(0.0, 4.5, 9.0),      # 0-10   -> 0-9
 }
 
-# The subset of the proposal that also applies to a PHY1 side.
+# The proposal for a PHY1 side.
 #
 # The split follows how the SPEC IS STRUCTURED, not which numbers happen to
-# coincide (v1.1r06, verified against Tables 128/129):
+# coincide (v1.1r06, verified against the "PHY1 & PHY2 Input Timing" and "PHY1 & PHY2
+# Output Timing" tables):
 #
-#   Table 128 (INPUT) is genuinely shared — one row per parameter, no PHY1/PHY2
-#   distinction at all. Revising Per_tIH 0-4.5 -> 0-1.5 therefore revises it for
+#   The "PHY1 & PHY2 Input Timing" table is genuinely shared — one row per parameter, no
+#   PHY1/PHY2 distinction at all. Revising Per_tIH 0-4.5 -> 0-1.5 therefore revises it for
 #   BOTH PHYs; there is no PHY1 row left holding 4.5. It carries.
 #
-#   Table 129 (OUTPUT) prints EVERY parameter as a separate PHY1 row and PHY2
-#   row — it never collapses the two. So a revision to PHY2's row says nothing
+#   The "PHY1 & PHY2 Output Timing" table prints EVERY parameter as a separate PHY1 row
+#   and PHY2 row — it never collapses the two. So a revision to PHY2's row says nothing
 #   about PHY1's, even where the two currently hold the same numbers:
 #     Per_tDD  PHY1 14-50 vs PHY2 2-20   |  Man_tDD PHY1 7-18 == PHY2 7-18
 #     Per_tZD  PHY1 14-50 vs PHY2 2-18   |  Man_tDZ 0-10      == 0-10
 #     Man_tZD  PHY1 14-30 vs PHY2 2-18   |  Per_tDZ 0-10      == 0-10
 #
-# Man_t_DD is in the second column — two rows that agree today. Carrying the
-# 9-23 revision onto PHY1 is a DECISION (the rows are identical, so revising
-# them identically is coherent), not something Table 129 implies.
+# Man_t_DD, Man_t_DZ and Per_t_DZ are in the second column — rows that agree today. Their
+# PHY2 revisions (9-23, 0-9, 0-9) carry onto PHY1 by decision, not because the "PHY1 & PHY2
+# Output Timing" table implies it.
 #
-# Per_t_DD and Per_t_ZD are in the FIRST column, and get PHY1's OWN revised
-# maximum: 50 -> 44 ns, supplied for PHY1 rather than derived. That is the point
-# of keeping them out of the PHY2 carry-over — pasting PHY2's proposed 9 ns onto
-# a row whose PHY1 value is 50 would have invented a revision nobody wrote,
-# whereas 44 is a number stated for this PHY. The minimum is untouched at 14.
+# Per_t_DD, Per_t_ZD and Man_t_ZD are in the FIRST column, and get PHY1's OWN revised
+# ranges, stated for PHY1 rather than derived from PHY2's.
 _PHY1_PROPOSED: Dict[str, ParamRange] = {
-    "Man_t_DD": _PHY2_PROPOSED["Man_t_DD"],      # Table 129, per-PHY rows that agree
-    "Per_t_IH": _PHY2_PROPOSED["Per_t_IH"],      # Table 128, one shared row
-    "Per_t_DD": ParamRange(14.0, 29.0, 44.0),    # PHY1 14-50 -> 14-44
-    "Per_t_ZD": ParamRange(14.0, 29.0, 44.0),    # PHY1 14-50 -> 14-44 (tracks Per_t_DD)
+    "Man_t_DD": _PHY2_PROPOSED["Man_t_DD"],      # output timing, per-PHY rows that agree
+    "Man_t_DZ": _PHY2_PROPOSED["Man_t_DZ"],      # 0-10  -> 0-9
+    "Per_t_DZ": _PHY2_PROPOSED["Per_t_DZ"],      # 0-10  -> 0-9
+    "Per_t_IH": _PHY2_PROPOSED["Per_t_IH"],      # input timing, one shared row
+    "Per_t_DD": ParamRange(14.0, 28.0, 42.0),    # PHY1 14-50 -> 14-42
+    "Per_t_ZD": ParamRange(17.0, 29.5, 42.0),    # PHY1 14-50 -> 17-42
+    "Man_t_ZD": ParamRange(22.0, 39.0, 56.0),    # PHY1 14-30 -> 22-56
 }
 
-# The EDE candidate, as a function of UI because the Manager's values are UI
-# fractions.  See `_ede_ranges` for the placement argument and for what this column
-# used to carry.
-#
-# CLOCK RESOLUTION CONSTRAINS THE GRID, and the keeper is what sets the multiplier:
-# the launch and the release must clear one full rail-to-rail swing PLUS the keeper's
-# response time (13.83 + 3.00 = 16.83 ns at the slow corner, 0.46 UI), which on a
-# 1/4 UI grid means TWO steps. So:
-#
-#     Man_t_DD  0.25 UI     the launch
-#     Man_t_ZD  0.25 UI     the other launch method, same point
-#     Man_t_DZ  0.75 UI     the EDE release, two steps on
-#
-# A 1/2 UI grid DOES contain a pair 16.83 ns apart -- 0.50 and 1.00 UI -- so the keeper
-# is not what rules 2x out. Table 130's ceiling is (0.60 UI + 10 ns = 0.873 UI here),
-# together with the definition of an early release: the boundary is neither, and with it
-# excluded a 1/2 UI grid has no point left above the launch. An earlier version of this
-# column had the launch at 0.50 UI and read as passing only because the keeper leg
-# charged t_keeper (3 ns) where it owes the whole swing (13.83): two ten-nanosecond
-# errors cancelling.
-#
-# The Manager's t_DZ is referenced to the START of its last driven UI, which is
-# Table 130's EDE convention; `CalcInputs.Man_ede` shifts it onto the end-of-UI
-# footing the inequalities use, so it is POSITIVE here. The PERIPHERAL's release is
-# not a value on this grid and is not a row: it is an interval from its own ramp
-# completion, carried by `CalcInputs.Per_ede_hold_*`.
+# The EDE candidate's analog turn-on / turn-off range, ns. The column's values are in
+# `_ede_ranges`. The PERIPHERAL's release is not a row: it is an interval from its own
+# ramp completion, carried by `CalcInputs.Per_ede_hold_*`.
 _EDE_TURN_MIN, _EDE_TURN_MAX = 3.0, 9.0     # 3:1 analog turn-on / turn-off
 
-# The EDE rows that are UI FRACTIONS rather than absolute nanoseconds. These must
-# follow F_CLK, because "0.25 UI" is the definition and an absolute value left over from
-# another rate is not stale-but-usable, it is wrong. Refreshed by
-# `_refresh_ede_rate_rows`.
+# The EDE rows that are UI FRACTIONS rather than absolute nanoseconds. They follow
+# F_CLK: `_refresh_ede_rate_rows` rewrites them at the new rate.
 #
-# EMPTY NOW, AND THE MACHINERY STAYS. The settled proposal has no rate-relative Manager
-# value: the launch is the revision's analog 9-23 ns and the release is `Man_t_DZ,max` = 0
-# against the end-of-UI reference, both absolute (`_ede_ranges`). Deleting the refresh
-# would be the wrong tidy-up -- the 0.25 / 0.75 UI grid is still selectable through the
-# launch mode combo, and any future placement stated as a fraction has to re-enter here or
-# it silently carries across a rate change. So the list is the thing that empties, not the
-# code that reads it, and `test_ede_ui_relative_rows_follow_the_rate` asserts the
-# behaviour rather than the membership.
+# EMPTY: every EDE value is absolute (`_ede_ranges`). A placement stated as a fraction of
+# the UI must be listed here, or it carries across a rate change unscaled.
+# `test_ede_ui_relative_rows_follow_the_rate` checks the behaviour, not the membership.
 _EDE_UI_RELATIVE_ROWS: tuple[str, ...] = ()
 
 
@@ -305,70 +270,29 @@ def _UI_ns(f_clk_MHz: float, duty_min: float = 0.45) -> float:
 
 
 def _ede_ranges(UI_ns: float) -> Dict[str, ParamRange]:
-    """The EDE column's proposed values.  `UI_ns` is unused and kept deliberately -- see below.
+    """The EDE column's proposed values, all absolute nanoseconds.
 
-    ONLY THE PERIPHERAL HAS A MECHANISM.  The two classes reach a zero-UI handover
-    differently, and once `Man_t_DZ` is read as the parameter Table 129 actually
-    tabulates, only one of them needs anything new:
+    `UI_ns` is unused: no value here is a UI fraction (so `_EDE_UI_RELATIVE_ROWS` is
+    empty). The parameter stays so a rate-relative seed needs no new argument through
+    `_seed_range`.
 
-        Manager     stops driving AT the UI boundary, i.e. `Man_t_DZ,max` = 0 against
-                    Table 129 Note 1's own reference.  That is the BOTTOM OF THE
-                    RATIFIED 0-10 ns RANGE, not a new parameter -- and `Man_t_DZ` is a
-                    pure delay from the Manager's internal timing reference for its own
-                    clock edge (Note 3), so the move to high-Z can be gated from that
-                    edge.  Its launch stays the revision's analog 9-23 ns.
+        Manager     launches (t_DD, t_ZD) at the revision's analog 9-23 ns and stops
+                    driving AT the UI boundary: `Man_t_DZ,max` = 0 against Note 1's own
+                    reference in the "PHY1 & PHY2 Output Timing" table, the bottom of the
+                    ratified 0-10 ns range.
+                    `Man_t_DZ` is a pure delay from the Manager's internal timing
+                    reference for its own clock edge (Note 3), so the move to high-Z
+                    can be gated from that edge. This is not an EndDriveEarly release:
+                    `_man_ede_for` returns False and the EndDriveEarly ceiling does not bound it.
+                    `CalcInputs.Man_ede` keeps a mid-UI Manager release expressible
+                    from code.
 
-        Peripheral  has no mid-UI reference (Sec. 11.1.5), so it cannot aim at a
-                    clock instant at all. It holds its own COMPLETED level for
-                    3-9 ns and then releases. That interval is
-                    `CalcInputs.Per_ede_hold_*`, NOT a row here -- there is no
-                    clock-referenced number that expresses it.
+        Peripheral  has no mid-UI reference (Sec. 11.1.5). It holds its own COMPLETED
+                    level for 3-9 ns and then releases. That interval is
+                    `CalcInputs.Per_ede_hold_*`, NOT a row here. Its t_DD, t_ZD and
+                    t_IH are the revision's values.
 
-    So the Manager is not doing EndDriveEarly on this column at all: its release is on
-    time under the ordinary end-of-UI reference, which is why `_man_ede_for` returns
-    False and Table 130 does not bound it.  `CalcInputs.Man_ede` stays in the model
-    because a mid-UI Manager release is still expressible from code, and the tests
-    exercise it.
-
-    THE 4x CLOCKED GRID IS RETIRED, and the reasoning that produced it is worth keeping
-    because it was wrong in an instructive way.  The grid was argued from the bus keeper:
-    the launch and release must clear one rail-to-rail swing plus the keeper's response
-    (13.83 + 3.00 = 16.83 ns at the slow corner, 0.46 UI), which on a 1/4 UI grid means
-    TWO steps -- and sweeping all six ordered pairs left exactly one that also cleared
-    P->M contention and hold, 0.25 / 0.75.  Every number in that sweep was correct.
-
-    What it could not show is the option it did not contain.  The keeper leg is
-    `t_DZ - t_DD,max - t_swing`, so it is MONOTONE IN THE RELEASE: later is strictly
-    better, and the boundary is the best release the UI holds.  0.75 UI is 9.16 ns WORSE
-    than the boundary on the very leg it was chosen for.  The sweep excluded 1.00 UI by
-    construction -- on the grounds that the boundary is not an "early" release, which is
-    true and stops mattering once the release is not meant to be early -- so an interior
-    point was the best of what remained rather than the best available.  What the keeper
-    actually constrains is the LAUNCH: `Man_t_DD,max <= UI - t_swing [- t_keeper]`, which
-    is 22.79 ns forced and 19.79 ns observing at 12.288 MHz, against the revision's 23.
-    That shortfall is the proposal's one residual ask and no clock fixes it.
-
-    A clocked launch remains a legitimate f_max option and this column does not seed one:
-    it lifts the keeper's rate ceiling from 12.22 to 24.40 MHz, buys 0.16 ns on MP hold,
-    and MP setup -- the revision's own leg -- gives out at 12.21 MHz, so the headroom has
-    nowhere to go.  Select 4x in the launch mode combo to see it.
-
-    `UI_ns` IS UNUSED NOW AND THE PARAMETER STAYS.  Every value here is absolute
-    nanoseconds, because none of them is a UI fraction any more -- which is also why
-    `_EDE_UI_RELATIVE_ROWS` is empty.  Keeping the signature means a future rate-relative
-    seed does not have to re-thread it through `_seed_range`, and the caller reads the
-    same either way.
-
-    Two things this used to carry, both retired:
-
-      * `Per_t_DZ = ParamRange(UI/3, 2UI/3, UI)` -- a 3:1 turn-off ratio applied to a
-        POSITION in the UI rather than to a delay. Nothing derived it, it credited the
-        peripheral with a release spread several times the parameter's whole range,
-        and because it was UI-scaled it manufactured a rate dependence. The
-        peripheral's release is no longer a row at all.
-      * a Manager launch at 0.50 UI, which fails the keeper by 4.68 ns once the addend is
-        the full swing rather than t_keeper. It looked fine only because the two errors
-        cancelled.
+    No clocked launch is seeded; select 4x in the launch mode combo to see one.
     """
     return {
         # The launch, and the OTHER launch method: the revision's own analog range,
@@ -377,37 +301,15 @@ def _ede_ranges(UI_ns: float) -> Dict[str, ParamRange]:
         # requirements at the receiver, so the revision states them identically.
         "Man_t_DD": ParamRange(9.0, 16.0, 23.0),
         "Man_t_ZD": ParamRange(9.0, 16.0, 23.0),
-        # The release: AT the boundary, under Table 129 Note 1's end-of-UI reference.
+        # The release: AT the boundary, under the end-of-UI reference of Note 1 of the
+        # "PHY1 & PHY2 Output Timing" table.
         # Collapsed to a point because it is gated from a clock edge the Manager owns.
-        # M->P contention tolerates up to 6.10 ns here at its worst corner -- a co-packaged
-        # peripheral, since both of that leg's bus terms are credits -- so there is room to
-        # state it looser than zero. 0 is what the proposal asks and what the keeper wants.
         "Man_t_DZ": ParamRange(0.0, 0.0, 0.0),
         # Peripheral: the revision's own values, unchanged.
         "Per_t_DD": ParamRange(2.0, 5.5, 9.0),
-        # ALSO UNCHANGED, and that is a finding rather than an omission.
-        #
-        # The EDE paper asks for Per_t_ZD,min to rise from 2 to 6 ns, to close the leg
-        # that bounds the LEVEL at a zero-UI handover -- `PP_hold_ho`, which binds whenever
-        # the MANAGER released, because the level at risk is then Manager-to-peripheral
-        # data (see `CalcResults._PP_DATA_LEGS`). Seeded as 6-9 that is a 1.5:1 range, and
-        # a peripheral has NO CLOCK -- its t_ZD is analog end to end, so PVT gives about
-        # 3:1. A 1.5:1 part is not buildable, which
-        # `test_ede_peripheral_values_are_not_tighter_than_3_to_1` correctly rejects.
-        #
-        # Made buildable the ask does not survive, and the decisive objection needs no
-        # scope argument at all: at 3:1 the max moves with the min to 6-18 ns, and the
-        # setup legs read the MAX -- so buying the level leg costs about nine nanoseconds
-        # on MP setup, a peripheral driving an acquired UI with the MANAGER sampling,
-        # which is required traffic by anyone's reading of the scope and is already
-        # negative. The window against the out-of-scope P->P setup leg is empty too
-        # (1.51:1 where a PVT part needs 3:1), but that objection alone would settle
-        # nothing now that the leg it protects is known to be out of scope.
-        #
-        # So the level leg is the one this proposal does not close with a buildable
-        # peripheral, a handover UI is what answers it, and the column says so by seeding
-        # the revision's own value rather than an unbuildable one. Raised in
-        # ../timing-analysis/docs/MODEL_AUDIT.md.
+        # Also the revision's own value. A peripheral's t_ZD is analog (about 3:1 over
+        # PVT); `test_ede_peripheral_values_are_not_tighter_than_3_to_1` rejects a
+        # tighter range. See ../timing-analysis/docs/MODEL_AUDIT.md.
         "Per_t_ZD": ParamRange(2.0, 5.5, 9.0),
         "Per_t_IH": ParamRange(0.0, 0.75, 1.5),
     }
@@ -419,15 +321,13 @@ _PROPOSED_BY_SPEC: Dict[str, Dict[str, ParamRange]] = {
     "SWI3S_PHY1": _PHY1_PROPOSED,
 }
 
-# Mandatory max F_CLK is 6.6 MHz (PHY1) / 13.2 MHz (PHY2) — Table 126. The spec
-# gives no nominal, so these are TARGETS to open on, not limits: the limit is
-# `fclk_ceiling_MHz`, which clamps whatever is seeded here.
+# Mandatory max F_CLK is 6.6 MHz (PHY1) / 13.2 MHz (PHY2) — the "PHY1 & PHY2 Clock
+# Frequencies" table. The spec gives no nominal, so these are TARGETS to open on, not
+# limits: the limit is `fclk_ceiling_MHz`, which clamps whatever is seeded here.
 #
-# PHY2 opens on 12.288 MHz — 256 x 48 kHz, the audio design point — rather than
-# the 13.2 MHz mandatory maximum. 13.2 is a worst-case corner nobody targets, and
-# opening there made every margin read as the answer at a rate the design does not
-# run at. PHY1 keeps 6.4, which matches the SE reference spreadsheet.
-_SPEC_FCLK_TARGET: Dict[str, float] = {"SWI3S_PHY1": 6.4, "SWI3S_PHY2": 12.288}
+# PHY2 opens on 12.288 MHz — 256 x 48 kHz, the audio design point — not the
+# 13.2 MHz mandatory maximum. PHY1 opens on its mandatory maximum, 6.6 MHz.
+_SPEC_FCLK_TARGET: Dict[str, float] = {"SWI3S_PHY1": 6.6, "SWI3S_PHY2": 12.288}
 _FCLK_TARGET_DEFAULT = 12.288
 
 
@@ -510,7 +410,12 @@ def _side_of_row(name: str) -> Optional[str]:
         return "Per"
     return None
 
-_RED = QColor(VizTheme.SEM_ERROR)
+def _red() -> QColor:
+    """The failing-margin red of the palette in force (read per use, so it follows a
+    theme switch)."""
+    return QColor(VizTheme.SEM_ERROR)
+
+
 _FMAX_COLS = ["Inequality", "Spec margin (ns)", "Example margin (ns)", "ΔMargin (ns)",
               "Spec F_max (MHz)", "Example F_max (MHz)", "ΔF_max (MHz)"]
 
@@ -538,7 +443,7 @@ _GAP_W = _px(40)        # gap between the Spec and Example groups
 _HEAD_INDENT = _px(4)   # ~½ char: nudge titles/top-bar in to sit under the card borders
 _LABEL_CELL_W = _px(96)  # Spec/Example label cell — numbers align under each other
 _COMBO_W = _px(140)     # ramp-model combo width (fits "exponential")
-_SECTION_GAP = _px(14)  # vertical gap between sections
+_SECTION_GAP = _px(6)   # vertical gap between sections
 
 
 def _scaled_stylesheet() -> str:
@@ -558,19 +463,14 @@ def _base_font() -> QFont:
 # its first member — same pattern as the setup/hold headings, which own their "_ho"
 # sibling).
 #
-# NAMED FOR WHO OWES WHAT TO WHOM, not for a direction arrow. "Manager-to-Peripheral
-# Hold" states the data direction and leaves the obligation to be inferred, and the
-# inference is the part a reader gets wrong: every one of these legs pairs ONE device's
-# output timing against ANOTHER device's receiver window, so the title should say which
-# is which.
+# NAMED FOR WHO OWES WHAT TO WHOM, not for a direction arrow: every leg pairs ONE device's
+# output timing against ANOTHER device's receiver window, and the title says which is which.
 #
-# THE REQUIREMENT NAMES THE LEG, NOT THE MECHANISM. These read "Setup" rather than
-# "Launching" because the launch is a step on the way and setup is the goal — the leg is
-# not satisfied by launching, it is satisfied by the level being ready in time for the
-# other device's window. Same for hold: what is bounded is that the level persists.
+# THE REQUIREMENT NAMES THE LEG, NOT THE MECHANISM: "Setup" (the level is ready in time for
+# the other device's window), not "Launching"; "Holding" (the level persists).
 #
-# P->P gets letters because it is the only family with two devices of the same class, and
-# they are the same letters the terms use: A drives, B samples, on all four of its legs.
+# P->P, the only family with two devices of the same class, uses the letters the terms use:
+# A drives, B samples, on all four of its legs.
 _INEQ_LABEL = {
     "MP_setup": "Manager Setup for Peripheral",
     "MP_hold": "Manager Holding for Peripheral",
@@ -582,20 +482,15 @@ _INEQ_LABEL = {
     # title as the t_DD one.
     "PP_setup": "Peripheral A Setup for Peripheral B",
     "PP_hold": "Peripheral A Holding for Peripheral B",
-    # Named by DIRECTION, like the setup/hold headings above, now that there are
-    # three of them: "Manager releases" was legible against one counterpart but
-    # not against two, and the reader has to infer the acquirer either way.
-    # "Handover Contention" (3.0.19): a bare
-    # "Handover" did not say what is bounded, and "Non-Contention" was dropped earlier
-    # as too long. The equation on each row still shows the bound itself.
+    # Named by DIRECTION, like the setup/hold headings above. The equation on each row
+    # shows the bound itself.
     "MP_contention": "Handover Contention — Manager to Peripheral",
     "PM_contention": "Handover Contention — Peripheral to Manager",
     "PP_contention": "Handover Contention — Peripheral to Peripheral",
-    # NAMED FOR WHO RELEASES, not for whose keeper: there is one keeper and it is in the
-    # Manager ({ASW3805}), so "Bus Keeper — Manager Releasing" means that one keeper with
-    # the MANAGER as the device letting go. The pair shared a single heading before; two
-    # headings because they are two inequalities with their own corners and their own
-    # binding device, and a shared title read as one margin quoted twice.
+    # NAMED FOR WHO RELEASES, not for whose keeper: there is one keeper, in the Manager
+    # ({ASW3805}), so "Bus Keeper — Manager Releasing" means that keeper with the MANAGER
+    # letting go.
+    # Two headings: two inequalities, each with its own corners and binding device.
     "keeper_Man": "Bus Keeper — Manager Releasing",
     "keeper_Per": "Bus Keeper — Peripheral Releasing",
 }
@@ -619,22 +514,17 @@ _INEQ_GROUPS = [
     ("MP_contention", ("MP_contention",)),
     ("PM_contention", ("PM_contention",)),
     ("PP_contention", ("PP_contention",)),
-    # One heading per RELEASING device. They are the same keeper, and the previous single
-    # heading said so — but it also put two independent margins under one title, so a
-    # reader who saw a fail had to work out whose corner it belonged to before knowing
-    # which device to change.
+    # One heading per RELEASING device: the same keeper, two independent margins.
     ("keeper_Man", ("keeper_Man",)),
     ("keeper_Per", ("keeper_Per",)),
 ]
 
 # Reference numbers, 1) … 17), in DISPLAY order — so "inequality 9" names the same row on
-# screen, in the summary text and in conversation. One map, derived from the display
-# grouping and read by both renderers, because two independent numberings would drift the
-# moment either order changed and a stale number is worse than none.
+# screen and in the summary text. One map, derived from the display grouping and read by
+# both renderers.
 #
-# ")" AND NOT ".", which is Rod's point and a real one: these equations are full of the "·"
-# multiplication operator and of decimals like "1.44·8.30", so a leading "1." reads as part
-# of the arithmetic rather than as a label.
+# ")" AND NOT ".": the equations are full of the "·" operator and of decimals like
+# "1.44·8.30", so a leading "1." would read as part of the arithmetic.
 _INEQ_NUMBER = {ineq: n for n, ineq in enumerate(
     (m for _base, members in _INEQ_GROUPS for m in members), start=1)}
 
@@ -643,11 +533,10 @@ _INEQ_NUMBER = {ineq: n for n, ineq in enumerate(
 # Clickable terms: symbol → the INPUT ROW it comes from
 # ---------------------------------------------------------------------------
 #
-# Clicking a term highlights every occurrence of the same thing, and "the same thing" is
-# THE ROW A READER WOULD EDIT rather than the printed symbol. That choice is what makes the
-# feature answer a question worth asking -- "where does the Manager's clock slew act?"
-# highlights twelve legs and the `t_RF Man CLK` row above -- and it is the same rule the
-# symbols themselves already follow (`_trf_sym`: name the lane so the term points at the row).
+# Clicking a term highlights every occurrence of the same thing: THE ROW A READER WOULD
+# EDIT rather than the printed symbol. Clicking the Manager's clock slew highlights every
+# leg it acts on and the `t_RF Man CLK` row above. The symbols follow the same rule
+# (`_trf_sym`: name the lane so the term points at the row).
 #
 # So `Man_t_DD,pure` and `Man_t_DD` are ONE key: the `,pure` suffix is an anchor conversion
 # of one row's value, not a second parameter. A crossing keys on its t_RF LANE, because that
@@ -655,9 +544,9 @@ _INEQ_NUMBER = {ineq: n for n, ineq in enumerate(
 # gathered `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK` is still one lane however many
 # crossings it nets.
 #
-# FOUR TERMS HAVE NO ROW and key on themselves, or they would be the only unclickable text
-# on the page: `UI` (derived from the F_CLK spin box), `Man_t_Keeper_Response` and
-# `Per_t_hold` (CalcInputs fields the grid does not expose). Listed rather than detected, so
+# TERMS WITH NO ROW key on themselves, so they stay clickable: `UI` (derived from the
+# F_CLK spin box), `Man_t_Keeper_Response` and `Per_t_hold` (CalcInputs fields the grid
+# does not expose). Listed rather than detected, so
 # a NEW row-less term fails `test_every_printed_term_resolves_to_a_key` instead of silently
 # becoming unclickable.
 _ROWLESS_TERM_KEYS = ("UI", "Man_t_Keeper_Response", "Per_t_hold")
@@ -726,10 +615,8 @@ class _RichTextDelegate(QStyledItemDelegate):
     subset supports class selectors, so a toggle costs one repaint and never touches the
     text, the metrics or the computed results.
 
-    THE HIT-TEST AND THE PAINT SHARE `_doc` AND `_origin` DELIBERATELY. They are the only
-    two places that turn an item into laid-out glyphs, and if they compute the origin
-    differently the clickable boxes drift from the drawn text — invisible until someone
-    clicks near a term's edge, which is exactly where a reader aims.
+    THE HIT-TEST AND THE PAINT SHARE `_doc` AND `_origin`, so the clickable boxes stay on
+    the drawn text.
     """
 
     def __init__(self, parent=None, keys=None):
@@ -740,14 +627,10 @@ class _RichTextDelegate(QStyledItemDelegate):
         doc = QTextDocument()
         doc.setDefaultFont(opt.font)
         doc.setDocumentMargin(0)
-        # ANCHORS TAKE THE TEXT COLOUR EXPLICITLY. `color: inherit` looks like the right
-        # answer and is not: Qt's rich-text CSS resolves it to BLACK rather than to the
-        # paint context's Text role, so on the dark palette every anchored symbol rendered
-        # near-invisible against the panel while the substitution numbers escaped it (their
-        # table cell sets a colour of its own) -- a half-dimmed page that reads as a font
-        # bug. Naming the colour is safe here because the doc is rebuilt on every paint, so
-        # a palette switch is picked up; and only column 0 uses this delegate, so the red
-        # negative margins in the Margin column are untouched.
+        # ANCHORS TAKE THE TEXT COLOUR EXPLICITLY: Qt's rich-text CSS resolves
+        # `color: inherit` to BLACK rather than to the paint context's Text role. The doc
+        # is rebuilt on every paint, so a palette switch is picked up; only column 0 uses
+        # this delegate, so the red negative margins in the Margin column are untouched.
         css = [f"a {{ color: {VizTheme.TEXT}; text-decoration: none; }}"]
         css += [f".{_key_class(k)} {{ background-color: {VizTheme.HILITE_BG}; }}"
                 for k in sorted(self.keys())]
@@ -785,15 +668,9 @@ class _RichTextDelegate(QStyledItemDelegate):
         Qt does the glyph maths: every term is an anchor, so `anchorAt` resolves a point to
         a term without this code knowing anything about character widths or subscripts.
 
-        `opt` MUST COME FROM THE VIEW'S OWN `initViewItemOption`, which is why the caller
-        passes it in rather than this method building one. Constructing a
-        QStyleOptionViewItem here and calling `initFrom(view)` looks equivalent and is not:
-        `initFrom` copies the palette and the font METRICS but leaves `opt.font` at Qt's
-        default 9 pt, while paint receives the view's 15 px font. The two documents then lay
-        out at different widths -- 512.8 against 606.5 on the first leg -- so the hit boxes
-        drifted further from the glyphs the further right the term sat, and clicking `DATA`
-        in `Man_t_RF,DATA` selected `Per_t_IS` two terms along. Sharing `_doc` and `_origin`
-        was not enough: the drift came in through the option, one level above the guard.
+        `opt` MUST COME FROM THE VIEW'S OWN `initViewItemOption`, so the caller passes it
+        in: `initFrom(view)` leaves `opt.font` at Qt's default 9 pt while paint receives
+        the view's font, and the hit-test document would lay out at a different width.
         """
         doc = self._doc(opt)
         local = QPointF(pos) - self._origin(opt, doc, widget)
@@ -811,10 +688,8 @@ class _RichTextDelegate(QStyledItemDelegate):
 class _TermTree(QTreeWidget):
     """The results tree, with clickable terms.
 
-    Clicking a term toggles it; clicking anywhere with no term under the pointer clears
-    the set, which is the cheapest "undo everything" and needs no chrome. The pointing-hand
-    cursor is the only affordance the page has — nothing else here is clickable, so without
-    it the feature is invisible.
+    Clicking a term toggles it; clicking in empty space clears the set (see `_hit`). The
+    pointer turns to a pointing hand over a term.
     """
 
     term_clicked = Signal(str)
@@ -829,12 +704,8 @@ class _TermTree(QTreeWidget):
     def _hit(self, pos) -> Tuple[Optional[str], bool]:
         """(term key under `pos`, whether `pos` is on this row's text at all).
 
-        The second half is what stops a near-miss from wiping the reader's work. The
-        operators between terms are deliberately not click targets, so a click on a `−`
-        lands on the text but on no term: that is INERT, while a click in genuinely empty
-        space clears. Without the distinction, aiming at a term and catching the sign beside
-        it threw away every highlight -- the least forgiving possible response to a 2-pixel
-        miss.
+        The operators between terms are not click targets, so a click on a `−` lands on
+        the text but on no term: that is INERT, while a click in empty space clears.
         """
         index = self.indexAt(pos)
         if not index.isValid() or index.column() != 0:
@@ -848,10 +719,8 @@ class _TermTree(QTreeWidget):
     def _key_at(self, pos) -> Optional[str]:
         """The term under `pos`, using the option the VIEW hands the delegate.
 
-        `initViewItemOption` is the whole point of doing this here rather than in the
-        delegate: it is the view's own initialisation, so the document the hit-test lays out
-        is the document paint lays out — same font, same metrics, same width. Building an
-        option by hand instead cost a scaling error that grew with x (see
+        `_hit` initialises the option with the view's own `initViewItemOption`, so the
+        document the hit-test lays out is the document paint lays out (see
         `_RichTextDelegate.key_at`).
         """
         return self._hit(pos)[0]
@@ -910,8 +779,7 @@ def _subscript(name: str) -> str:
 
     Symbols are written `Prefix_t_TOKEN[,qualifier…]` and the spec writes `Prefix_tTOKEN`
     (`Man_tDD` here is `Man_t_DD`), so the underscore before the token is this file's marker
-    for "subscript from here". `Keeper_Response` is a token like any other under that rule —
-    it was the one symbol spelled the spec's way, which is why it alone rendered upright.
+    for "subscript from here". `Keeper_Response` is a token like any other under that rule.
     """
     return _SUB_RE.sub(lambda m: f"<sub>{m.group(1)}{m.group(2)}</sub>", name)
 
@@ -956,7 +824,9 @@ def _unit_for(row: CalcRow) -> str:
 def _spin_qss() -> str:
     """QAbstractSpinBox styling to match the Visualizer entry look (the theme
     sheets style QLineEdit but not spin boxes). Buttonless boxes are also set via
-    setButtonSymbols; zeroing the sub-controls here keeps the frame tight."""
+    setButtonSymbols; zeroing the sub-controls here keeps the frame tight. The buttons'
+    `subcontrol-origin: border` is required: without it, a styled spin box on Windows lays
+    its edit field out 1 px wide and shows no value."""
     t = VizTheme
     return f"""
     QAbstractSpinBox {{
@@ -972,18 +842,57 @@ def _spin_qss() -> str:
         border-color: {t.BORDER};
     }}
     QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
-        width: 0; height: 0; border: none;
+        subcontrol-origin: border; width: 0px; height: 0px; border: none;
     }}
     """
 
 
+
+# Keys an earlier version's settings carry that set_from_dict reads or ignores by design.
+_LEGACY_KEYS = frozenset({"phy", "lock_mgr_lanes", "spec::man_shape", "spec::per_shape"})
+
+
+def _unknown_choice(key: str, value, combo: QComboBox) -> str:
+    return (f"'{key}' {value!r} is not one of the choices offered; "
+            f"{combo.currentText() or combo.currentData()!r} is kept")
+
+
+def _set_spin(spin, value, label: str, clamped: List[str]) -> None:
+    """Set a spin box from a saved number, adding `label` to `clamped` when the number is
+    outside the box's range (the box takes the nearest end)."""
+    v = float(value)
+    spin.setValue(v)
+    if v < spin.minimum() or v > spin.maximum():
+        clamped.append(f"{label} = {v:g} (read as {spin.value():g})")
+
+
+class _DoubleClickLabel(QLabel):
+    """A title that reports a double-click (the maximize toggle, as on a pane's title)."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 - Qt override
+        if ev.button() == Qt.LeftButton:
+            ev.accept()
+            self.doubleClicked.emit()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+
 class TimingView(QWidget):
+    # A double-click on the Timing Inequalities title: the window toggles the maximized view
+    # (set_maximized), as its ⤢ button and View ▸ Maximize Pane do.
+    maximizeRequested = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self._loading = False
+        self._maximized = False
         self._min: Dict[Tuple[str, str], QDoubleSpinBox] = {}
         self._max: Dict[Tuple[str, str], QDoubleSpinBox] = {}
         self._row_labels: Dict[str, QLabel] = {}
+        # Every style built from the palette, as (widget, css builder), so retheme() can
+        # rebuild them.
+        self._themed: List[Tuple[QWidget, Callable[[], str]]] = []
         self._man_shape: Optional[QComboBox] = None      # shared across Spec + Example
         self._per_shape: Optional[QComboBox] = None
 
@@ -992,10 +901,8 @@ class TimingView(QWidget):
         self.setFont(_base_font())                        # scales combos/buttons/tree text
         self.setStyleSheet(_scaled_stylesheet())
 
-        # Title, then the bus it describes. Both left-aligned and full width:
-        # sharing the title's row with the Reset/Save/Load buttons clips the
-        # title, because the bar is pinned to the results width and the buttons
-        # win the squeeze.
+        # Title, then the bus it describes. Both left-aligned and full width, with
+        # no buttons on the title's row (they would clip it).
         self._title = QLabel("SWI3S & SoundWire Timing Calculator")
         self._title.setStyleSheet(_TITLE_CSS)
         self._title.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
@@ -1005,7 +912,7 @@ class TimingView(QWidget):
         # fixed title, so the configuration is legible at a glance without the
         # title itself changing under the reader.
         self._subtitle = QLabel("")
-        self._subtitle.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+        self._theme(self._subtitle, lambda: f"color:{VizTheme.TEXT_DIM};")
         self._subtitle.setContentsMargins(_HEAD_INDENT, 0, 0, _px(6))
         root.addWidget(self._subtitle)
 
@@ -1024,12 +931,27 @@ class TimingView(QWidget):
         body = QVBoxLayout(host)
         body.setContentsMargins(0, 0, 0, 0)
 
-        body.addWidget(self._section_label("Timing Inequality Results"))
-        # The only affordance besides the cursor: nothing else on this page is clickable,
-        # so an unmentioned click target is one nobody finds.
+        # The title row: the title, and the window's ⤢ button at the tree's right edge
+        # (add_title_button). Its width follows the tree's (_unify_section_widths).
+        self._results_head = QWidget()
+        head = QHBoxLayout(self._results_head)
+        head.setContentsMargins(0, 0, 0, 0)
+        self._results_title = _DoubleClickLabel("Timing Inequalities")
+        self._results_title.setStyleSheet(_HEADER_CSS)
+        self._results_title.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
+        self._results_title.doubleClicked.connect(self.maximizeRequested.emit)
+        head.addWidget(self._results_title)
+        head.addStretch(1)
+        self._head_layout = head
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.addWidget(self._results_head)
+        head_row.addStretch(1)
+        body.addLayout(head_row)
+        # Names the clickable terms, the page's only click targets.
         self._trace_hint = QLabel("Click a term to trace it through every inequality and "
                                   "its input row; click it again, or any blank space, to clear.")
-        self._trace_hint.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+        self._theme(self._trace_hint, lambda: f"color:{VizTheme.TEXT_DIM};")
         self._trace_hint.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         body.addWidget(self._trace_hint)
         # The highlight set lives on the view and is read by the delegate through a
@@ -1044,9 +966,9 @@ class TimingView(QWidget):
         # would absorb the fit padding and creep wider on every recompute.
         self._tree.header().setStretchLastSection(False)
         # Plain header text, not table-cell chrome: no section background or borders.
-        self._tree.header().setStyleSheet(
+        self._theme(self._tree.header(), lambda: (
             f"QHeaderView::section {{ background:{VizTheme.FRAME_BG}; border:none;"
-            " padding:2px 6px; }")
+            " padding:2px 6px; }"))
         # Always fully expanded and not collapsible — the per-side rows carry the
         # margin + F_max, so there's nothing to hide.
         self._tree.setRootIsDecorated(False)
@@ -1064,7 +986,8 @@ class TimingView(QWidget):
         tree_row.addStretch(1)           # keep the bordered tree only as wide as its content
         body.addLayout(tree_row)
 
-        body.addWidget(self._build_param_panes())
+        self._params = self._build_param_panes()
+        body.addWidget(self._params)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1073,15 +996,6 @@ class TimingView(QWidget):
 
         self._sync_spec_controls()          # size picker only applies to a SoundWire side
         self._reset_to_defaults()           # seed values + first compute
-
-    @staticmethod
-    def _section_label(text: str) -> QLabel:
-        """A body section header — larger than the 12px body text (HEADER_CSS),
-        so section titles read as titles, not as another row of parameters."""
-        lab = QLabel(text)
-        lab.setStyleSheet(_HEADER_CSS)
-        lab.setContentsMargins(_HEAD_INDENT, 0, 0, 0)   # line up under the card border
-        return lab
 
     def _fit_tree_height(self) -> None:
         """Size the breakdown tree to its currently-visible rows (top-level items
@@ -1117,8 +1031,9 @@ class TimingView(QWidget):
         w = getattr(self, "_results_width", 0)
         for card in getattr(self, "_section_cards", []):
             card.setFixedWidth(w)
-        if getattr(self, "_topbar", None) is not None:
-            self._topbar.setFixedWidth(w)
+        for bar in (getattr(self, "_topbar", None), getattr(self, "_results_head", None)):
+            if bar is not None:
+                bar.setFixedWidth(w)
 
     def showEvent(self, e) -> None:      # noqa: N802 - Qt override
         super().showEvent(e)
@@ -1127,17 +1042,28 @@ class TimingView(QWidget):
         self._fit_tree_height()
         self._unify_section_widths()
 
+    # ---- maximized: the Timing Inequalities given the whole page ----
+    def add_title_button(self, button: QWidget) -> None:
+        """Put `button` (the window's ⤢) at the right of the Timing Inequalities title."""
+        self._head_layout.addWidget(button)
+
+    def is_maximized(self) -> bool:
+        return self._maximized
+
+    def set_maximized(self, on: bool) -> None:
+        """Give the Timing Inequalities the whole page: the part above the scrolled area (the
+        page title and the top bar) is hidden, and the parameter sections still scroll below
+        the inequalities. Off, the whole page."""
+        self._maximized = bool(on)
+        for w in (self._title, self._subtitle, self._topbar):
+            w.setVisible(not self._maximized)
+
     # ---- top control bar ----
     def _build_top_bar(self) -> QVBoxLayout:
         # One labelled control per row, so nothing clips when the bar is pinned
-        # to the (narrower) results width — three pickers do not fit side by
-        # side at this scale, and a cramped row silently overlaps its
-        # neighbour's text rather than eliding.
-        #
-        # Reset/Save/Load are NOT here: they sit on the title row, which has
-        # spare width and no left-hand content of its own. Left on their own row
-        # after the PHY picker was folded into the spec selector, they read as a
-        # detached strip of buttons belonging to nothing.
+        # to the (narrower) results width: a cramped row overlaps its
+        # neighbour's text rather than eliding. Reset/Save/Load sit on the
+        # F_CLK row.
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
@@ -1149,10 +1075,6 @@ class TimingView(QWidget):
         # normalisation (SoundWire t_OV is anchored at the END of the slew, a full
         # t_RF later than SWI3S t_DD). Defaults are SWI3S both sides, which is the
         # validated single-spec path.
-        #
-        # Two rows rather than one: the three labelled pickers do not fit beside
-        # each other at this scale, and a cramped row silently overlaps its
-        # neighbour's text rather than eliding.
         spec = QHBoxLayout()
         spec.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         spec.setSpacing(_px(6))
@@ -1166,15 +1088,27 @@ class TimingView(QWidget):
         spec.addStretch(1)
         outer.addLayout(spec)
 
+        # The Manager / Peripheral edge-ramp models, one of each, shared by Spec and
+        # Example.
+        ramp = QHBoxLayout()
+        ramp.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
+        ramp.setSpacing(_px(6))
+        self._man_shape = self._make_shape_combo()
+        self._per_shape = self._make_shape_combo()
+        ramp.addWidget(QLabel("Manager ramp model"))
+        ramp.addWidget(self._man_shape)
+        ramp.addSpacing(_px(16))
+        ramp.addWidget(QLabel("Peripheral ramp model"))
+        ramp.addWidget(self._per_shape)
+        ramp.addStretch(1)
+        outer.addLayout(ramp)
+
         # SoundWire's small/large system envelope (C_Bus / L_Bus, Tables 4-5).
         # Meaningless for an all-SWI3S bus, so the whole row is HIDDEN unless a
-        # side is SoundWire — not merely disabled. A greyed control still asks
-        # the reader to work out why it is greyed; on the default all-SWI3S page
-        # it was a permanent dead row.
+        # side is SoundWire — not merely disabled.
         #
-        # Wrapped in a widget because hiding a QHBoxLayout is not a thing: Qt
-        # hides widgets, and a layout with every child hidden still holds its
-        # spacing.
+        # Wrapped in a widget: Qt hides widgets, and a layout with every child
+        # hidden still holds its spacing.
         self._size_row = QWidget()
         size_row = QHBoxLayout(self._size_row)
         size_row.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
@@ -1190,13 +1124,12 @@ class TimingView(QWidget):
         size_row.addStretch(1)
         outer.addWidget(self._size_row)
 
-        # Manager launch architecture. Not a tighter number — a choice of how the
-        # Manager launches its data edge. An analog delay line carries a
-        # min-to-max spread that the inequalities absorb on BOTH sides at once
-        # (the max erodes MP setup, only the min funds MP hold), so tightening it
-        # cannot improve both legs. A clock-launched edge lands on a known clock
-        # phase, so min == max and the spread disappears. Only meaningful for a
-        # SWI3S Manager; a SoundWire one has no such option.
+        # Manager launch architecture: how the Manager launches its data edge. An
+        # analog delay line carries a min-to-max spread that the inequalities
+        # absorb on BOTH sides at once (the max erodes MP setup, only the min
+        # funds MP hold). A clock-launched edge lands on a known clock phase, so
+        # min == max. Only meaningful for a SWI3S Manager; a SoundWire one has no
+        # such option.
         launch_row = QHBoxLayout()
         launch_row.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         launch_row.setSpacing(_px(6))
@@ -1212,12 +1145,10 @@ class TimingView(QWidget):
         outer.addLayout(launch_row)
 
         # The clock modes are rate-dependent: 4x is bounded by hold, 2x by setup,
-        # so which one is viable changes with F_CLK. Report that rather than
-        # leaving the user to discover it from a red margin. On its own row so it
-        # can run to full width — at the pinned results width it does not fit
-        # beside the combo, and a cramped label clips instead of eliding.
+        # so which one is viable changes with F_CLK; this hint reports it. On its
+        # own row so it can run to full width.
         self._launch_hint = QLabel("")
-        self._launch_hint.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+        self._theme(self._launch_hint, lambda: f"color:{VizTheme.TEXT_DIM};")
         self._launch_hint.setWordWrap(True)
         self._launch_hint.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         outer.addWidget(self._launch_hint)
@@ -1226,11 +1157,9 @@ class TimingView(QWidget):
         # cleared = none, and the three handover inequalities lose their N_HO·UI
         # term with it.
         #
-        # A checkbox rather than a spinner because the interesting question is
-        # binary: does this bus need a dedicated UI to hand over, or can it do it
-        # inside the bit cadence? `CalcInputs.handover_UIs` remains a float, so
-        # "programmed to be longer for a larger system" (§11.1.1.1) is still
-        # expressible from code — the UI just does not offer it yet.
+        # A checkbox: one UI or none. `CalcInputs.handover_UIs` is a float, so
+        # "programmed to be longer for a larger system" (§11.1.1.1) is
+        # expressible from code only.
         #
         # Reseeded from the selected PHYs on Reset / spec change (PHY2 scheduled,
         # PHY1 not), but freely overridable: allocating a UI on PHY1 is legal, and
@@ -1252,8 +1181,6 @@ class TimingView(QWidget):
         self._pp_combo = QComboBox()
         for _key, _label in PP_PLACEMENT_LABELS.items():
             self._pp_combo.addItem(_label, _key)
-        # It was the one combo here with no minimum, so it sized to the CURRENT item and
-        # elided the longer placements the moment one was picked.
         self._pp_combo.setMinimumWidth(_px(215))   # fits "driver near, sampler far"
         self._pp_combo.setCurrentIndex(self._pp_combo.findData("unknown"))
         self._pp_combo.currentIndexChanged.connect(self._on_pp_placement_changed)
@@ -1261,11 +1188,10 @@ class TimingView(QWidget):
         ho_row.addStretch(1)
         outer.addLayout(ho_row)
 
-        # Says which case is on screen, because clearing the box on PHY2 makes
-        # the handover legs fail with the CURRENT numbers — that is the true
-        # answer, not a bug, and the reason EndDriveEarly needs its own timing.
+        # Says which case is on screen: clearing the box on PHY2 makes the
+        # handover legs fail with the CURRENT numbers, which is the spec's answer.
         self._ho_hint = QLabel("")
-        self._ho_hint.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+        self._theme(self._ho_hint, lambda: f"color:{VizTheme.TEXT_DIM};")
         self._ho_hint.setWordWrap(True)
         self._ho_hint.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         outer.addWidget(self._ho_hint)
@@ -1286,13 +1212,8 @@ class TimingView(QWidget):
         clk.addWidget(self._fclk)
         clk.addWidget(QLabel("MHz"))       # unit after the box, like the rest of the page
         clk.addStretch(1)
-        # Reset/Save/Load ride the F_CLK row rather than a row of their own: it
-        # is the shortest labelled row, so there is width to spare, and their
-        # right edge lands on the card/tree edge. On their own row — where they
-        # sat beside the PHY picker before it was folded into the spec selector
-        # — they read as a detached strip belonging to nothing. Not on the title
-        # row either: that bar is pinned to the results width and the buttons
-        # win the squeeze, clipping the title.
+        # Reset/Save/Load ride the F_CLK row: it is the shortest labelled row, so
+        # there is width to spare, and their right edge lands on the card/tree edge.
         for text, slot in (("Reset", self._reset_to_defaults),
                            ("Save Example", self._save_proposed),
                            ("Load Example", self._load_proposed)):
@@ -1307,7 +1228,7 @@ class TimingView(QWidget):
         # envelope tops out below SWI3S PHY2's mandatory 13.2 MHz) and when a
         # margin depends on hysteresis SoundWire does not guarantee.
         self._ceiling_label = QLabel("")
-        self._ceiling_label.setStyleSheet(f"color:{VizTheme.SEM_ERROR};")
+        self._theme(self._ceiling_label, lambda: f"color:{VizTheme.SEM_ERROR};")
         self._ceiling_label.setWordWrap(True)
         self._ceiling_label.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         outer.addWidget(self._ceiling_label)
@@ -1340,10 +1261,15 @@ class TimingView(QWidget):
         outer = QVBoxLayout(host)
         outer.setContentsMargins(0, 0, 0, 0)
         self._section_cards: List[QFrame] = []   # widths unified to the results tree
-        for i, (section_title, row_names) in enumerate(SECTIONS):
-            if i > 0:
-                outer.addSpacing(_SECTION_GAP)   # separate a section title from the rows above
-            outer.addWidget(self._section_label(section_title))
+        # One name-column width for every card, wide enough for the widest section title
+        # (it sits in that column), so the boxes line up across the sections.
+        probe = QLabel()
+        probe.setStyleSheet(_HEADER_CSS)
+        probe.ensurePolished()
+        self._name_col_w = max([_NAME_COL_W] + [
+            probe.fontMetrics().horizontalAdvance(title) + _px(8) for title, _rows in SECTIONS])
+        for section_title, row_names in SECTIONS:
+            outer.addSpacing(_SECTION_GAP)
             card = self._build_section(section_title, row_names)
             self._section_cards.append(card)
             card_row = QHBoxLayout()
@@ -1359,9 +1285,7 @@ class TimingView(QWidget):
 
         The pair is not fixed, because the comparison the page makes is not fixed:
         normally it is the spec as it stands against a proposed revision, but on
-        an EDE bus it shifts up a step to the revision against EDE. A heading of
-        "Specification" over proposed-revision values would be simply wrong, and
-        the headings are the only thing telling a reader which is which.
+        an EDE bus it shifts up a step to the revision against EDE.
         """
         man = self._man_spec_combo.currentData()
         per = self._per_spec_combo.currentData()
@@ -1385,24 +1309,24 @@ class TimingView(QWidget):
 
     def _build_section(self, section_title: str, row_names: List[str]) -> QWidget:
         # A rounded, 1px-bordered card (matching the results tree) holding the
-        # section's grid — and, for Rise/Fall, the ramp pickers above it.
+        # section's grid, its title in the grid's top-left cell beside the column
+        # headings.
         card = QFrame()
         card.setObjectName("card")
-        card.setStyleSheet(
+        self._theme(card, lambda: (
             f"QFrame#card {{ border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER};"
-            f" border-radius:{VizTheme.CORNER_RADIUS}px; }}")
+            f" border-radius:{VizTheme.CORNER_RADIUS}px; }}"))
         col = QVBoxLayout(card)
-        col.setContentsMargins(10, 8, 10, 8)
-        col.setSpacing(6)
-        if section_title == "Rise/Fall Times":
-            col.addWidget(self._build_shape_row())      # ramp pickers before the params
+        col.setContentsMargins(10, 6, 10, 6)
+        col.setSpacing(0)
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)     # set, not inherited: the card's own spacing is 0
         grid.setVerticalSpacing(2)
         # Fixed column widths so Spec and Example boxes line up vertically across
         # every section (regardless of each section's unit text width).
-        grid.setColumnMinimumWidth(0, _NAME_COL_W)
+        grid.setColumnMinimumWidth(0, self._name_col_w)
         for c in (1, 2, 5, 6):
             grid.setColumnMinimumWidth(c, _BOX_W)
         for c in (3, 7):
@@ -1413,6 +1337,9 @@ class TimingView(QWidget):
         lh, rh = self._col_head(left_lab), self._col_head(right_lab)
         self._left_heads = getattr(self, "_left_heads", []) + [lh]
         self._right_heads = getattr(self, "_right_heads", []) + [rh]
+        title = QLabel(section_title)
+        title.setStyleSheet(_HEADER_CSS)
+        grid.addWidget(title, 0, 0, 2, 1, Qt.AlignLeft | Qt.AlignVCenter)
         grid.addWidget(lh, 0, 1, 1, 2)
         grid.addWidget(rh, 0, 5, 1, 2)
         for c in (1, 2, 5, 6):
@@ -1421,23 +1348,6 @@ class TimingView(QWidget):
             self._add_param_row(name, grid, r)
         col.addLayout(grid)
         return card
-
-    def _build_shape_row(self) -> QWidget:
-        """The Manager / Peripheral edge-ramp model pickers — one of each, shared by
-        Spec and Example — shown under the Rise/Fall title, above the t_RF params.
-        The two combos share column 1 so they line up vertically."""
-        holder = QWidget()
-        grid = QGridLayout(holder)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setVerticalSpacing(2)
-        grid.setColumnStretch(2, 1)
-        self._man_shape = self._make_shape_combo()
-        self._per_shape = self._make_shape_combo()
-        grid.addWidget(QLabel("Manager Ramp Model"), 0, 0)
-        grid.addWidget(self._man_shape, 0, 1)
-        grid.addWidget(QLabel("Peripheral Ramp Model"), 1, 0)
-        grid.addWidget(self._per_shape, 1, 1)
-        return holder
 
     def _make_shape_combo(self) -> QComboBox:
         cb = QComboBox()
@@ -1458,9 +1368,7 @@ class TimingView(QWidget):
     def _add_param_row(self, name: str, grid: QGridLayout, gridrow: int) -> None:
         row = _ROW_BY_NAME[name]
         lab = QLabel(_display_name(name))
-        # Held so `_sync_row_highlight` can wash it: a term's key IS a row name, so the
-        # click can point at the box a reader would edit, which is the whole reason the
-        # keys are rows rather than symbols.
+        # Held so `_sync_row_highlight` can wash it: a term's key IS a row name.
         self._row_labels[name] = lab
         grid.addWidget(lab, gridrow, 0)
         dec = _decimals_for(row)
@@ -1513,8 +1421,7 @@ class TimingView(QWidget):
             mn = self._min[(side, row.name)].value() / sc
             mx = self._max[(side, row.name)].value() / sc
             # `is_window` travels with the row: dropping it here would re-collapse the
-            # threshold window on the way from the spin boxes to the model, which is the
-            # whole defect, and only in the UI path where it is hardest to see.
+            # threshold window on the way from the spin boxes to the model.
             out.append(CalcRow(row.name, row.binds,
                                ParamRange(mn, 0.5 * (mn + mx), mx), row.linked_to,
                                row.is_window))
@@ -1550,28 +1457,23 @@ class TimingView(QWidget):
     def _man_ede_for(self, side: str) -> bool:
         """Whether the MANAGER releases early on `side`.  It does not, on either.
 
-        THE MANAGER'S RELEASE IS NOT AN EndDriveEarly RELEASE, and that is the settled
-        position rather than a simplification.  `CalcInputs.Man_ede` means one specific
-        thing: that `Man_t_DZ` is referenced to the START of the last driven UI, one UI
-        earlier than Table 129 Note 1's reference, which is Table 130's convention for a
-        mid-UI release.  The proposal has the Manager stopping AT the boundary --
-        `Man_t_DZ,max` = 0 under the ORDINARY reference -- so the shift does not apply,
-        Table 130 does not bound it, and the launch grid has nothing to place.
+        THE MANAGER'S RELEASE IS NOT AN EndDriveEarly RELEASE.  `CalcInputs.Man_ede`
+        means that `Man_t_DZ` is referenced to the START of the last driven UI, one UI
+        earlier than the reference of Note 1 of the "PHY1 & PHY2 Output Timing" table, which
+        is the calculator's convention for a mid-UI EndDriveEarly release.  The proposal has the
+        Manager stopping AT the boundary -- `Man_t_DZ,max` = 0 under the ORDINARY reference -- so
+        the shift does not apply, the EndDriveEarly ceiling does not bound it, and the launch grid
+        has nothing to place.
         `_ede_ranges` sets the value; this predicate says which reference it is against.
+        With `Man_ede` true and a row of 0.0, `_effective_t_dz_ns` would put the release
+        a whole UI early.
 
-        Getting this wrong is not subtle in its effect: with `Man_ede` true and a row of
-        0.0, `_effective_t_dz_ns` would put the release a whole UI early.
+        `Man_ede` stays in `CalcInputs` for a mid-UI Manager release:
+        `tests/test_timing_vs_reference.py` evaluates a 0.25 / 0.75 grid placement
+        through it.
 
-        `Man_ede` stays in `CalcInputs` because a mid-UI Manager release is still a thing
-        the model can express -- `tests/test_timing_vs_reference.py` evaluates the retired
-        0.25 / 0.75 grid placement through it, which is how the two models are held to
-        agreeing about the placement they both retired.
-
-        A method rather than an inline condition because `_sync_man_tdd_rows` needs the
-        same answer to decide whether Table 130's ceiling bounds the Man_t_DZ row. Two
-        spellings of one predicate is how the launch mode came to snap the Specification
-        column's tabulated values: the code had the right rule and only one of the
-        places that applied it agreed with it.
+        `_sync_man_tdd_rows` calls this too, to decide whether the EndDriveEarly ceiling bounds
+        the Man_t_DZ row: keep one predicate for both.
         """
         return False
 
@@ -1582,18 +1484,9 @@ class TimingView(QWidget):
         that offers it -- "9-23 ns or (0.5 UI 2x CLK, 0.25 UI 4x CLK)" -- is in the
         PHY2 revision. Ratified PHY1 and PHY2 tabulate analog output delays and give
         a Manager no multiplied clock to launch from, so the Specification column is
-        always ANALOG however the selector is set. Same shape as `Man_ede` above,
-        and for the same reason: the column is what decides, not the combo.
-
-        THIS FIXES A DESTRUCTIVE BUG rather than tightening a definition. The mode
-        was applied to both columns, so selecting 2x snapped the SPEC column's
-        tabulated values onto a 0.5 UI grid -- and `snap_to_launch_grid(2.0)` is
-        0.00, so PHY2's Man_t_DD 7-18, Man_t_ZD 2-18 and Man_t_DZ 0-10 all became
-        0.00. A Manager launching data with zero delay is not a conservative
-        rendering of anything; every leg reading those rows on that column was
-        nonsense, silently. The tooltip and read-only loop in `_sync_man_tdd_rows`
-        already scoped itself to `("proposed", ...)`, so the code had the right rule
-        and only the value writes disagreed with it.
+        always ANALOG however the selector is set. As with `Man_ede` above, the
+        column decides, not the combo: a clocked mode on the Specification column
+        would snap its tabulated values onto the grid.
         """
         if side != "proposed":
             return LaunchMode.ANALOG
@@ -1644,8 +1537,8 @@ class TimingView(QWidget):
                 f"{_INEQ_NUMBER[ineq]}) {ineq.replace('_', ' ')}",
                 f"{bs.margin_ns:+.2f}", f"{bp.margin_ns:+.2f}",
                 f"{bp.margin_ns - bs.margin_ns:+.2f}",
-                self._fmt_fmax(bs.F_max_MHz) if bs.is_setup else "—",
-                self._fmt_fmax(bp.F_max_MHz) if bp.is_setup else "—",
+                self._fmt_fmax(bs.F_max_MHz),
+                self._fmt_fmax(bp.F_max_MHz),
                 "—",
             ]))
         return "\n".join(lines)
@@ -1666,17 +1559,25 @@ class TimingView(QWidget):
                 d[f"{side}::{row.name}::max"] = self._max[(side, row.name)].value()
         return d
 
-    def set_from_dict(self, d: dict) -> None:
+    def set_from_dict(self, d: dict, source: Optional[str] = None) -> None:
+        """Restore the inputs `to_dict` saved. With a `source` (the file's name), a key this
+        version does not read, a choice none of the selectors offers and a number outside
+        its field's range (set to the nearest end) are reported through import_notes."""
+        notes: List[str] = []
+        known = set(self.to_dict()) | _LEGACY_KEYS
+        unknown = sorted(str(k) for k in d if k not in known and not str(k).endswith("::pick"))
+        if unknown:
+            more = f", and {len(unknown) - 5} more" if len(unknown) > 5 else ""
+            notes.append(f"{len(unknown)} setting(s) this version does not read, ignored: "
+                         f"{', '.join(unknown[:5])}{more}")
         self._loading = True
         try:
             # Legacy "lock_mgr_lanes" is ignored; a legacy per-side "spec::man_shape"
             # falls back into the now-shared picker.
             #
-            # A legacy "phy" key predates the per-side spec selector, when the PHY
-            # was one global switch. PHY1 is now a spec source, so an old PHY1
-            # workspace restores as PHY1 on BOTH sides — which is what the single
-            # switch meant. An explicit man_spec/per_spec always wins, so this only
-            # applies to workspaces written before the selector existed.
+            # A legacy "phy" key (one global PHY switch, before the per-side spec
+            # selector) restores as that PHY on BOTH sides. An explicit
+            # man_spec/per_spec always wins.
             legacy_phy = d.get("phy")
             legacy_default = ("SWI3S_PHY1" if legacy_phy == 1 else "SWI3S_PHY2")
             # A dict with no spec keys predates the cross-spec selector, so it can
@@ -1686,15 +1587,23 @@ class TimingView(QWidget):
                 j = combo.findData(d.get(key, legacy_default))
                 if j >= 0:
                     combo.setCurrentIndex(j)
+                else:
+                    notes.append(_unknown_choice(key, d.get(key, legacy_default), combo))
             k = self._size_combo.findData(d.get("sw_system_size", "small"))
             if k >= 0:
                 self._size_combo.setCurrentIndex(k)
+            else:
+                notes.append(_unknown_choice("sw_system_size", d.get("sw_system_size"),
+                                             self._size_combo))
             # A dict with no launch_mode predates the selector, so it can only
             # have described the analog delay.
             lm = self._launch_combo.findData(
                 d.get("launch_mode", LaunchMode.ANALOG.value))
             if lm >= 0:
                 self._launch_combo.setCurrentIndex(lm)
+            else:
+                notes.append(_unknown_choice("launch_mode", d.get("launch_mode"),
+                                             self._launch_combo))
             # A dict with no handover_ui predates the checkbox, so fall back to
             # what the selected PHYs imply — which is what that version computed.
             self._ho_ui_check.setChecked(bool(d.get(
@@ -1706,38 +1615,52 @@ class TimingView(QWidget):
             pp = self._pp_combo.findData(d.get("pp_placement", "unknown"))
             if pp >= 0:
                 self._pp_combo.setCurrentIndex(pp)
+            else:
+                notes.append(_unknown_choice("pp_placement", d.get("pp_placement"),
+                                             self._pp_combo))
             self._sync_spec_controls()
+            clamped: List[str] = []
             if "fclk_target" in d:
-                self._fclk.setValue(float(d["fclk_target"]))
-            self._set_shape(self._man_shape, d.get("man_shape", d.get("spec::man_shape")))
-            self._set_shape(self._per_shape, d.get("per_shape", d.get("spec::per_shape")))
+                _set_spin(self._fclk, d["fclk_target"], "fclk_target", clamped)
+            for combo, key, legacy in ((self._man_shape, "man_shape", "spec::man_shape"),
+                                       (self._per_shape, "per_shape", "spec::per_shape")):
+                value = d.get(key, d.get(legacy))
+                self._set_shape(combo, value)
+                if value is not None and combo is not None and combo.findData(value) < 0:
+                    notes.append(_unknown_choice(key, value, combo))
             for side in SIDES:
                 for row in _ALL_ROWS:
-                    self._apply_keys(side, row.name, d)
+                    self._apply_keys(side, row.name, d, clamped)
+            if clamped:
+                more = f", and {len(clamped) - 3} more" if len(clamped) > 3 else ""
+                notes.append(f"{len(clamped)} value(s) outside their field's range set to the "
+                             f"nearest end: {', '.join(clamped[:3])}{more}")
         finally:
             self._loading = False
+        if source is not None:
+            for msg in notes:
+                import_notes.warn(source, msg)
         # A saved Man_t_DD is only meaningful under the analog mode; if the
         # restored launch mode is clocked, the mode wins and the row says so.
         self._sync_man_tdd_rows()
         self._update_title()
         self._recompute()
 
-    def _apply_keys(self, side: str, name: str, d: dict) -> None:
+    def _apply_keys(self, side: str, name: str, d: dict,
+                    clamped: Optional[List[str]] = None) -> None:
         # A legacy "::pick" key (pre-auto-corner) is simply ignored.
         kmin, kmax = f"{side}::{name}::min", f"{side}::{name}::max"
+        out = clamped if clamped is not None else []
         if kmin in d:
-            self._min[(side, name)].setValue(float(d[kmin]))
+            _set_spin(self._min[(side, name)], d[kmin], kmin, out)
         if kmax in d:
-            self._max[(side, name)].setValue(float(d[kmax]))
+            _set_spin(self._max[(side, name)], d[kmax], kmax, out)
 
     # ---- actions ----
     def _update_title(self) -> None:
         """Fixed page title, with the selected bus named beneath it.
 
-        The title used to carry the configuration ("SWI3S PHY2 Timing
-        Calculator"), which meant it changed under the reader and could not say
-        what the page covers. The pickers already show the configuration, and
-        the subtitle restates the pair because which side is which changes the
+        The subtitle restates the pair because which side is which changes the
         answer.
         """
         man = self._man_spec_combo.currentData()
@@ -1752,10 +1675,9 @@ class TimingView(QWidget):
                     per_spec: SpecSource, size) -> ParamRange:
         """The range a row seeds to for `side`, from the spec tables.
 
-        Extracted from `_reset_to_defaults` so that re-seeding a SINGLE row —
-        which `_sync_man_tdd_rows` does when the launch mode hands Man_t_DD back
-        — reads the same source as a full reset, rather than a second copy of
-        this precedence order that could drift from it.
+        Used by `_reset_to_defaults` and by `_sync_man_tdd_rows` (which re-seeds a
+        SINGLE row when the launch mode hands Man_t_DD back), so both read one
+        precedence order.
 
         The read-only Specification column shows the spec as it stands; the
         editable Example column seeds from the proposed revision, so the page
@@ -1767,9 +1689,7 @@ class TimingView(QWidget):
 
         When a side is on the EDE source the comparison SHIFTS UP a step: the
         baseline becomes the proposed revision (not the current spec) and the
-        candidate becomes EDE. The current spec is settled enough to stop being
-        the thing EDE is measured against — what matters is what EDE adds ON TOP
-        of the revision. Column headers follow, via _column_labels().
+        candidate becomes EDE. Column headers follow, via _column_labels().
         """
         which = _side_of_row(row.name)
         spec = man_spec if which == "Man" else per_spec
@@ -1784,8 +1704,7 @@ class TimingView(QWidget):
                 # Baseline: the proposed revision.
                 rng = _PHY2_PROPOSED.get(row.name)
             else:
-                # Candidate: EDE, whose t_DZ / clocked values are UI fractions,
-                # so they depend on the target rate.
+                # Candidate: EDE (`_ede_ranges`).
                 rng = _ede_ranges(_UI_ns(self._fclk.value())).get(row.name)
         elif side == "proposed" and row.name in proposal:
             rng = proposal[row.name]
@@ -1852,15 +1771,12 @@ class TimingView(QWidget):
     def _on_launch_changed(self, *_a) -> None:
         """The launch mode changes no spec table, so it must NOT reseed.
 
-        It deliberately does not route through `_on_spec_changed`: that calls
+        It does not route through `_on_spec_changed`: that calls
         `_reset_to_defaults`, which would re-seed every row and reset F_CLK to
-        the PHY default — silently discarding a user's target rate just because
-        they compared two launch options.
+        the PHY default.
 
-        It does re-derive the ONE row it governs (see `_sync_man_tdd_rows`),
-        which is not a reseed: that row is the mode's output, not the user's
-        input, and showing the tabulated range while the model used the grid
-        point is what sent a reader looking for a bug that was on screen.
+        It does re-derive the rows it governs (see `_sync_man_tdd_rows`), which
+        is not a reseed: those rows are the mode's output, not the user's input.
         """
         self._update_launch_hint()
         self._sync_man_tdd_rows()
@@ -1881,6 +1797,23 @@ class TimingView(QWidget):
         if self._hl:
             self._hl.clear()
             self._refresh_highlight()
+
+    def _theme(self, widget: QWidget, css: Callable[[], str]) -> None:
+        """Style `widget` from the palette now, and again on every retheme()."""
+        self._themed.append((widget, css))
+        widget.setStyleSheet(css())
+
+    def retheme(self) -> None:
+        """Re-read the palette (View ▸ Appearance, or the OS switching when it is followed):
+        the page stylesheet, every palette-built style, the highlighted input rows, and the
+        results, whose failing margins carry the palette's red. The tree's equations need
+        nothing: the delegate reads the palette on every paint."""
+        self.setStyleSheet(_scaled_stylesheet())
+        for widget, css in self._themed:
+            widget.setStyleSheet(css())
+        self._sync_row_highlight()
+        self._recompute()
+        self._tree.viewport().update()
 
     def _refresh_highlight(self) -> None:
         """Repaint only. No recompute, no rebuild — see `self._hl`."""
@@ -1920,8 +1853,7 @@ class TimingView(QWidget):
 
         One when ticked, none when cleared. `CalcInputs.handover_UIs` is a float
         so a longer programmed allocation stays expressible from code; the UI
-        offers only the binary case, which is the one that changes the answer's
-        character rather than its size.
+        offers only the binary case.
         """
         return 1.0 if self._ho_ui_check.isChecked() else 0.0
 
@@ -1930,11 +1862,8 @@ class TimingView(QWidget):
 
         Clearing it on PHY2 makes the handover legs FAIL at the current numbers,
         because PHY2's t_ZD,min (2 ns) cannot cover a t_DZ,max of 10 ns without a
-        UI to separate the reference edges. That is the true answer, and the
-        reason EndDriveEarly needs timing values of its own — it reaches a
-        zero-UI handover by releasing ~half a UI early, i.e. by changing t_DZ,
-        not by removing the requirement. Said here so a red margin reads as the
-        question it is rather than as a defect.
+        UI to separate the reference edges. The hint names EndDriveEarly, which
+        reaches a zero-UI handover by changing t_DZ.
         """
         man = self._man_spec_combo.currentData()
         per = self._per_spec_combo.currentData()
@@ -1964,12 +1893,10 @@ class TimingView(QWidget):
     def _refresh_ede_rate_rows(self) -> None:
         """Re-derive the EDE column's UI-fraction rows at the current rate.
 
-        Deliberately narrow. Reseeding the whole column on a rate change would
-        discard the user's edits, which is the trap `_on_launch_changed` avoids —
-        but the four rows in `_EDE_UI_RELATIVE_ROWS` are *defined* as fractions of
-        the UI, so carrying an absolute value across a rate change would show a
-        number that is not the proposal at either rate. Everything else in the
-        column, edits included, is left untouched.
+        Only the rows in `_EDE_UI_RELATIVE_ROWS`, which are *defined* as fractions
+        of the UI, are rewritten. Everything else in the column, edits included,
+        is left untouched: reseeding the whole column would discard the user's
+        edits.
         """
         if self._loading:
             return
@@ -1990,29 +1917,23 @@ class TimingView(QWidget):
             self._loading = False
 
     # Every Manager output timing the launch mode governs. All three, or none: one
-    # Manager has one output stage, so a t_DD on a clock grid point beside an
-    # analog t_ZD and t_DZ is not a conservative model, it is two different
-    # devices. See `calculator._man_tzd_clocked`.
+    # Manager has one output stage. See `calculator._man_tzd_clocked`.
     #
-    # Man_t_DD is FIXED by the mode -- the selector names its placement, "4× CLK
-    # launch (0.25 UI)" -- while t_ZD and t_DZ are only constrained to the mode's
-    # RESOLUTION. A 4× clock offers 0.00, 0.25, 0.50 and 0.75 UI and the three do
-    # not have to agree; a 2× clock offers 0.00 and 0.50. So those two stay
-    # editable and are snapped to a placeable point rather than pinned to t_DD's.
+    # Each is constrained to the mode's RESOLUTION: a 4× clock offers 0.00, 0.25,
+    # 0.50 and 0.75 UI and the three do not have to agree; a 2× clock offers 0.00
+    # and 0.50. They stay editable and are snapped to a placeable point.
     _LAUNCH_ROWS = ("Man_t_DD", "Man_t_ZD", "Man_t_DZ")
     # Nothing is pinned. The mode says which points exist; the rows say which are
-    # used. A 4x clock offers three interior placements, so fixing t_DD to one of
-    # them made designs like EDE's (4x resolution, t_DD at 0.50 UI) inexpressible.
+    # used.
     _LAUNCH_FIXED_ROWS: tuple[str, ...] = ()
 
     def _launch_driven_rows(self) -> tuple[str, ...]:
         """Which of `_LAUNCH_ROWS` the launch mode governs on the current column.
 
         All three, on every column including EDE. EDE changes what t_DZ MEANS, not
-        whether the selected clock can place it — a release the clock cannot
-        generate is not a proposal. The same rule decides the margins, in
-        `calculator._man_tzd_clocked` / `_man_tdz_clocked`; one rule read in both
-        places, or the row and the term drift apart again.
+        whether the selected clock can place it. The same rule decides the margins, in
+        `calculator._man_tzd_clocked` / `_man_tdz_clocked`; keep the two in step, or
+        the row and the term disagree.
         """
         return self._LAUNCH_ROWS
 
@@ -2020,8 +1941,7 @@ class TimingView(QWidget):
         """Move the editable clocked rows onto a point the selected clock places.
 
         An off-grid t_ZD or t_DZ describes a Manager that cannot be built with the
-        selected clock, which reads as a perfectly good number rather than as the
-        impossibility it is. Snapped on `editingFinished` so it does not fight the
+        selected clock. Snapped on `editingFinished` so it does not fight the
         user mid-keystroke; the model snaps too (`_man_clocked_grid_ns`), so a
         margin is never computed from an unplaceable value even between edits.
         """
@@ -2065,21 +1985,15 @@ class TimingView(QWidget):
         """Show the Manager output timings the launch mode actually puts in force.
 
         A clocked launch OVERRIDES the tabulated values in `_man_tdd_range`,
-        `_man_tzd_ns` and `_man_tdz_parts` — that is what the selector means, not
-        a side effect — so leaving the rows showing tabulated ranges made the
-        picker move the margins while the parameters those margins are computed
-        from sat unchanged on screen. The number in force was nowhere on the page.
-        Both columns, because `launch_mode` is shared.
+        `_man_tzd_ns` and `_man_tdz_parts`, so the rows show the values in force.
+        Each column follows its own mode (`_launch_mode_for`).
 
-        Man_t_DD is the mode's own output, so min == max and read-only. t_ZD and
-        t_DZ are seeded to the data edge's point — the one placement the selector
-        names, so the least surprising default — and left EDITABLE, because which
-        grid point each sits on is a design choice the mode only constrains to its
-        resolution. Handing all of them back to the analog mode RE-SEEDS from
-        `_seed_range` rather than restoring what was there before, which does lose
-        a hand edit across a round trip through a clocked mode. That is deliberate:
-        while the mode held, an analog-range edit was being ignored by the model,
-        so there is no edited value to honour — only a stale number.
+        A governed row is seeded from `_seed_range`, snapped to the grid (min ==
+        max), and left EDITABLE: which grid point each sits on is a design choice
+        the mode only constrains to its resolution. Handing them back to the analog
+        mode RE-SEEDS from `_seed_range` rather than restoring what was there
+        before, so a hand edit is lost across a round trip through a clocked mode;
+        while the mode held, the model ignored an analog-range edit.
         """
         mode = LaunchMode(self._launch_combo.currentData())
         man_spec = self._man_spec_combo.currentData()
@@ -2097,9 +2011,8 @@ class TimingView(QWidget):
                 for side in SIDES:
                     # PER SIDE, via the same predicate the margins use. The
                     # Specification column is always analog, so it reseeds tabulated
-                    # here however the selector is set -- otherwise the rows on screen
-                    # and the values that column computes from disagree, which is the
-                    # exact drift `_launch_driven_rows` warns about.
+                    # here however the selector is set, matching the values that
+                    # column computes from.
                     clk = launch_mode_tDD_ns(self._launch_mode_for(side),
                                              self._fclk.value(), 0.45)
                     if clk is None or name not in driven:
@@ -2107,19 +2020,11 @@ class TimingView(QWidget):
                         lo, hi = float(rng.min), float(rng.max)
                     else:
                         # RESEED FROM THE COLUMN, THEN SNAP -- statelessly, never by
-                        # snapping whatever the box currently shows. Snapping the
-                        # displayed value accumulates damage across mode changes: a
-                        # 0.75 UI release visited at 2x rounds to 1.00 UI, and
-                        # returning to 4x then finds 1.00 UI already on-grid and
-                        # keeps it, so the design's placement is lost by a detour.
-                        # Reseeding is idempotent and shows each mode's honest
-                        # rendering of the same intent.
+                        # snapping whatever the box currently shows: snapping the
+                        # displayed value accumulates rounding across mode changes.
                         #
-                        # AND TABLE 130 BOUNDS THE EDE RELEASE, so the row shows the
-                        # latest legal point rather than the nearest one. Without it a
-                        # 1/2 UI grid rounds the 0.75 UI seed UP to the boundary and
-                        # displays 1.00 UI -- a release the table forbids and which is
-                        # not early at all, reading as a working 2x EDE design.
+                        # THE EndDriveEarly CEILING BOUNDS AN EDE RELEASE (`ceil_ns`), so the row
+                        # shows the latest legal point rather than the nearest one.
                         rng = self._seed_range(side, row, man_spec, per_spec, size)
                         ede_dz = (name == "Man_t_DZ" and self._man_ede_for(side))
                         lo = hi = snap_to_launch_grid(
@@ -2159,9 +2064,7 @@ class TimingView(QWidget):
 
         The two clock modes are bounded from opposite ends — 4x by hold (its
         0.25 UI delay shrinks as the clock speeds up), 2x by setup (its 0.5 UI
-        delay consumes half the UI) — so which is viable depends on F_CLK. A
-        user changing the rate would otherwise discover the limit only as a red
-        margin, with nothing to say which mode to switch to.
+        delay consumes half the UI) — so which is viable depends on F_CLK.
         """
         mode = LaunchMode(self._launch_combo.currentData())
         driven = self._launch_driven_rows()
@@ -2173,32 +2076,24 @@ class TimingView(QWidget):
             f_max, bound = launch_mode_max_fclk_MHz(mode)
             grid = launch_grid_UI(mode) or 0.0
             over = "  ⚠ above this mode's limit" if f > f_max else ""
-            # Say what it FIXES and what it merely CONSTRAINS. A reader who sees
-            # three rows change needs to know t_DD is the mode's own placement
-            # while t_ZD / t_DZ are choices on its grid — otherwise the editable
-            # ones look like a bug and the read-only one looks arbitrary.
+            # Say what it FIXES and what it merely CONSTRAINS to its grid.
             free = [n for n in driven if n not in self._LAUNCH_FIXED_ROWS]
             txt = (f"Man_t<sub>DD</sub> = {t_lo:.2f} ns fixed · viable to "
                    f"~{f_max:.1f} MHz (bound by {bound}){over}")
             if free:
                 txt += (f" · also clocks {' and '.join(_display_name(n) for n in free)}"
                         f", editable on this clock's {grid:g} UI grid")
-        # An earlier version of this hint claimed the selector applied to the
-        # baseline column only. It does not: launch_mode is shared, so it drives
-        # Man_t_DD in BOTH columns. On an EDE bus the choice is a live trade, so
-        # say which way rather than implying it does not apply.
+        # On an EDE bus, name the column the selector applies to (see _launch_mode_for).
         if is_ede(self._man_spec_combo.currentData()):
-            txt += ("  ·  applies to BOTH columns. The EDE column is seeded for "
-                    "a 2× clocked Manager (0.50 UI), preferred on Manager power "
-                    "and no worse on timing: 4× costs MP hold (−0.7) and buys "
-                    "only +0.2 keeper, the peripheral's leg binding either way")
+            txt += ("  ·  applies to the EDE column only; the Specification column "
+                    "keeps its tabulated analog delays. The EDE column is seeded with "
+                    "the analog 9–23 ns launch")
         self._launch_hint.setText(txt)
 
     def _sync_spec_controls(self) -> None:
         """Show only the controls the selected pair can actually act on."""
         # The SoundWire system-size envelope applies to a SoundWire side only.
-        # Hidden, not disabled: on the default all-SWI3S page a greyed row is
-        # just a question the reader has to answer for themselves.
+        # Hidden, not disabled.
         mixed = (is_soundwire(self._man_spec_combo.currentData())
                  or is_soundwire(self._per_spec_combo.currentData()))
         self._size_row.setVisible(mixed)
@@ -2242,12 +2137,19 @@ class TimingView(QWidget):
                 else:
                     import json
                     payload = json.load(f)
-            self._deserialize_side("proposed", payload or {})
+            with import_notes.collect() as notes:
+                self._deserialize_side("proposed", payload or {},
+                                       source=import_notes.source_name(path))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Load Example", f"Load failed: {exc}")
             return
         self._sync_man_tdd_rows()       # a loaded Man_t_DD cannot outrank the mode
         self._recompute()
+        show = getattr(self.window(), "show_import_warnings", None)
+        if callable(show):
+            show(notes, import_notes.source_name(path))
+        else:
+            import_notes.extend(notes)
 
     def _serialize_side(self, side: str) -> dict:
         out: dict = {}
@@ -2258,19 +2160,35 @@ class TimingView(QWidget):
             }
         return out
 
-    def _deserialize_side(self, side: str, payload: dict) -> None:
+    def _deserialize_side(self, side: str, payload: dict, source: Optional[str] = None) -> None:
+        """Set one side's ranges from {row: {"min", "max"}}. With a `source`, a row this
+        version does not have, an entry that is not a mapping and a number outside its
+        field's range are reported through import_notes."""
+        unknown: List[str] = []
+        clamped: List[str] = []
         self._loading = True
         try:
             for name, body in payload.items():
-                if (side, name) not in self._min:
+                if (side, name) not in self._min or not isinstance(body, dict):
+                    unknown.append(str(name))
                     continue
                 if "min" in body:
-                    self._min[(side, name)].setValue(float(body["min"]))
+                    _set_spin(self._min[(side, name)], body["min"], f"{name} min", clamped)
                 if "max" in body:
-                    self._max[(side, name)].setValue(float(body["max"]))
+                    _set_spin(self._max[(side, name)], body["max"], f"{name} max", clamped)
                 # a legacy "pick" key is ignored (corners are auto-selected now)
         finally:
             self._loading = False
+        if source is None:
+            return
+        if unknown:
+            more = f", and {len(unknown) - 5} more" if len(unknown) > 5 else ""
+            import_notes.warn(source, f"{len(unknown)} row(s) this version does not have or "
+                                      f"cannot read, ignored: {', '.join(unknown[:5])}{more}")
+        if clamped:
+            more = f", and {len(clamped) - 3} more" if len(clamped) > 3 else ""
+            import_notes.warn(source, f"{len(clamped)} value(s) outside their field's range set "
+                                      f"to the nearest end: {', '.join(clamped[:3])}{more}")
 
     # ---- compute + render ----
     def _recompute(self, *_a) -> None:
@@ -2333,12 +2251,11 @@ class TimingView(QWidget):
         self._unify_section_widths()
 
     def _add_side_term(self, parent: QTreeWidgetItem, label: str, b, fclk: float) -> None:
-        # F_max only bounds F_CLK for the setup inequalities; hold rows show "—".
+        # F_max on every leg whose margin scales with UI, setup or not; "—" where no rate
+        # bounds it, "FAIL" where no rate closes it.
         # Unit trails the number ("… MHz") to match the Margin column's "… ns".
         x = b.F_max_MHz
-        if not b.is_setup:
-            fmax = "—"
-        elif not math.isfinite(x):
+        if not math.isfinite(x):
             fmax = "—"
         elif x <= 0:
             fmax = "FAIL"
@@ -2351,11 +2268,11 @@ class TimingView(QWidget):
                 f'<td>{self._numeric_only(b.terms)}</td></tr></table>')
         child = QTreeWidgetItem(parent, [html, f"{b.margin_ns:+.2f} ns", fmax])
         if b.margin_ns < 0:
-            child.setForeground(1, QBrush(_RED))
-        if b.is_setup and (not math.isfinite(x) or x <= 0 or x < fclk):
-            child.setForeground(2, QBrush(_RED))
+            child.setForeground(1, QBrush(_red()))
+        if (math.isfinite(x) and x < fclk) or (b.is_setup and not math.isfinite(x)):
+            child.setForeground(2, QBrush(_red()))
 
-    # ---- equation formatting (ported from spec_calculator) ----
+    # ---- equation formatting (as in spec_calculator) ----
     @staticmethod
     def _equation_text(terms) -> str:
         pieces: List[str] = []
@@ -2382,25 +2299,27 @@ class TimingView(QWidget):
         multiplication against the symbol beside it.
 
         The swing term `1.67·Man_t_RF` expands too, for the OTHER operand's sake: the
-        multiplier is in the symbol but the slew in force is not, so the row used to print
-        8.33 and leave `t_RF = 5.00` to be recovered by division. Which operand is missing
+        multiplier is in the symbol but the slew in force is not. Which operand is missing
         decides this, not which one is named -- see `Term.factors`.
 
         A GATHERED crossing shows all THREE numbers: `(1.44 − 0.45)·5.00`. Its symbol is
         `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK` — two crossings of one pin netted into a
-        single product — and printing only the netted coefficient would leave the reader unable
-        to check the netting against the symbol beside it, which is the entire reason this row
-        expands products in the first place. `Term.factors` carries the coefficients first and
+        single product — so the reader can check the netting against the symbol beside it.
+        `Term.factors` carries the coefficients first and
         the row value last, so the count of entries is what selects the form.
 
         Terms with no product to show (`Man_t_DD`, `Per_t_IS`) and terms whose printed
-        number IS the operand (`1·UI`) stay single numbers.
+        number IS the operand (`1·UI`) stay single numbers. A single number is the term's own
+        value, its contribution with the operator taken off, so a subtracted negative value
+        reads `− (−2.00)` and the row adds up to the margin.
         """
         pieces: List[str] = []
         for i, t in enumerate(terms):
             f = getattr(t, "factors", None)
+            op = getattr(t, "op", None) or ("-" if t.value_ns < 0 else "+")
             if not f:
-                num = f"{abs(t.value_ns):.2f}"
+                own = t.value_ns if op == "+" else -t.value_ns
+                num = f"{abs(own):.2f}" if round(own, 2) >= 0 else f"(−{abs(own):.2f})"
             elif len(f) == 2:
                 num = f"{f[0]:.2f}·{f[1]:.2f}"
             else:
@@ -2409,11 +2328,9 @@ class TimingView(QWidget):
                     f"{c:.2f}" if k == 0 else f" {'−' if c < 0 else '+'} {abs(c):.2f}"
                     for k, c in enumerate(f[:-1]))
                 num = f"({inner})·{f[-1]:.2f}"
-            op = getattr(t, "op", None) or ("-" if t.value_ns < 0 else "+")
             display_op = "−" if op == "-" else "+"
-            # THE SAME KEY AS THE SYMBOL, which is what makes "and the numbers" free:
-            # `_numeric_only` walks `terms` in the same order as `_equation_text`, one
-            # number per term, so the two rows need no alignment work to agree.
+            # THE SAME KEY AS THE SYMBOL: `_numeric_only` walks `terms` in the same order
+            # as `_equation_text`, one number per term, so the two rows agree.
             num = _anchored(_term_key(t.symbol), num)
             if i == 0:
                 pieces.append(("−" if op == "-" else "") + num)

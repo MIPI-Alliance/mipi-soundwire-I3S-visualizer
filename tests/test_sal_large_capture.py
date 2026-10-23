@@ -1,9 +1,7 @@
 """Large-.sal guards: cost estimation, the refuse-before-OOM check, and windowed load.
 
-A .sal is a zip of delta-coded transitions, so it expands enormously: a reported capture
-was 291 MB on disk, 2.25 GB uncompressed, and ~2.25 bn transitions = ~18 GB of uint64
-edge arrays. Opening it whole exhausted a 24 GB machine and left it unresponsive with no
-error, because every stage (zip inflate -> blob decode -> edge array) was whole-file.
+A .sal is a zip of delta-coded transitions, so it expands enormously: every transition
+becomes 8 bytes of uint64 edge array.
 
 Two defences, both covered here:
   1. estimate_cost() predicts the peak from the zip DIRECTORY only (no inflation), so
@@ -27,12 +25,8 @@ def _edges(n=5000, seed=3, step=40):
     """Transition samples with deltas in [1, step).
 
     `step` matters more than it looks: the v3 varint is single-BYTE only for deltas
-    <= 64, so a small step exercises none of the multi-byte encodings. That gap let a
-    real bug ship — the skipped-block parity counted bytes < 0x80 as one-per-delta,
-    but encode_v3_delta(65) == b"\x40\x40" has TWO such bytes, so an odd over-count
-    inverted the window's initial line level (samples right, polarity wrong,
-    silently). Tests that sweep windows should use several steps; see
-    test_windowed_v3_matches_full_decode.
+    <= 64, so a small step exercises none of the multi-byte encodings. Tests that sweep
+    windows should use several steps; see test_windowed_v3_matches_full_decode.
     """
     return np.cumsum(np.random.default_rng(seed).integers(1, step, size=n)).astype(np.uint64)
 
@@ -72,8 +66,7 @@ def test_windowed_v3_matches_full_decode(chunk, step):
     level at the window start (which depends on the parity of everything skipped).
 
     Parametrized over `step` so multi-byte varint deltas are covered: at step=40 every
-    delta encodes to one byte and the skipped-block parity bug that inverted the line
-    level was invisible. See _edges."""
+    delta encodes to one byte. See _edges."""
     e = _edges(step=step)
     last = int(e[-1])
     for init in (False, True):
@@ -129,19 +122,14 @@ def test_streaming_window_reads_the_level_from_the_block_header(step, monkeypatc
     """On a Logic-2 blob the window's opening level comes from a block HEADER, and no
     block before the window is decoded at all.
 
-    All a skipped block ever contributed was the line level at the window's start — one
-    bit — and deriving it by counting transitions is O(START OFFSET). On the reported
-    291 MB / 176 s capture that made the same 0.5 s window cost 0.85 s at the start and
-    28.07 s at 175.5 s, per channel. Each block header already carries `level`, the state
-    at that block's start, and the block containing s0 is decoded ANYWAY because it
-    overlaps the window — so its own transitions give the level at s0 and nothing earlier
-    matters. Verified on the real capture: header level agreed with the decoded parity on
-    400/400 blocks of both channels, and the fast path reproduced the parity path's
-    initial state AND samples byte-for-byte on every window tried.
+    A skipped block contributes only the line level at the window's start — one bit — and
+    deriving it by counting transitions is O(START OFFSET). Each block header carries
+    `level`, the state at that block's start, and the block containing s0 is decoded ANYWAY
+    because it overlaps the window — so its own transitions give the level at s0 and
+    nothing earlier matters.
 
     `_count_and_discard` is booby-trapped here: reaching it means a skipped block is being
-    decoded again, which is the regression this exists to catch. The step sweep keeps
-    multi-byte delta codes in play (see _edges).
+    decoded. The step sweep keeps multi-byte delta codes in play (see _edges).
     """
     e = _edges(step=step)
     blob = _logic2_blob(e)
@@ -164,10 +152,9 @@ def test_unstamped_block_levels_are_refused_rather_than_guessed(tmp_path):
 
     build_channel_v3 writes `level` only on the first block and 0 on the rest, so reading
     a later block's header would open the window at the wrong level — samples right,
-    polarity wrong, silently, which is the exact failure mode the parity walk was written
-    to avoid. The fast path therefore requires evidence of stamping (a nonzero level on
-    some skipped non-first block) and raises otherwise; load_capture retries by parity, so
-    the answer stays correct and only the speed is given up.
+    polarity wrong, silently. The fast path therefore requires evidence of stamping (a
+    nonzero level on some skipped non-first block) and raises otherwise; load_capture
+    retries by parity, so the answer stays correct and only the speed is given up.
     """
     e = _edges()
     blob = sb.build_channel_v3(False, e, chunk_size=250)
@@ -215,8 +202,8 @@ def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
 
     Every other fixture here is written STORED, where ZipExtFile.seek() is a real seek. On a
     compressed member it is read-and-discard, and the walk also re-seeks to zero for each
-    candidate start offset — so the compressed path has different performance AND a different
-    code path through zipfile, and was untested. A real Logic 2 capture is compressed."""
+    candidate start offset — a different code path through zipfile. A real Logic 2 capture
+    is compressed."""
     e = _edges()
     blob = sb.build_channel_v3(False, e, chunk_size=250)
     stored = _write_sal(tmp_path, blob, blob, name="stored.sal")
@@ -228,10 +215,9 @@ def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
 
 
 def test_capture_span_channels_filter_restricts_the_walk(tmp_path):
-    """`channels=` must limit which blobs are walked — that is the fix for the pre-flight
-    span read blocking the GUI, and a filter that is silently ignored would look identical
-    from the outside. Asserted by giving the two channels DIFFERENT lengths: filtering to the
-    shorter one must return the shorter span, not the max over both."""
+    """`channels=` must limit which blobs are walked. Asserted by giving the two channels
+    DIFFERENT lengths: filtering to the shorter one must return the shorter span, not the
+    max over both."""
     short = _edges(n=200)
     long_ = _edges(n=2000)
     b_short = sb.build_channel_v3(False, short, chunk_size=250)
@@ -294,8 +280,12 @@ def test_guard_disabled_with_zero(tmp_path):
 
 def test_window_passes_a_budget_the_full_load_would_fail(tmp_path):
     """The whole point: a window makes an otherwise-refused capture openable. The
-    same budget must reject the full load and accept a small window."""
-    e = _edges(n=20000)
+    same budget must reject the full load and accept a small window.
+
+    The capture is large enough that a quarter of its whole-file peak exceeds the
+    window model's fixed terms (one chunk's decode and the zip reader, see
+    saleae_sal.window_peak_bytes)."""
+    e = _edges(n=400_000)
     blob = sb.build_channel_v3(False, e, chunk_size=500)
     path = _write_sal(tmp_path, blob, blob)
     full = ss.estimate_cost(path)
@@ -316,12 +306,10 @@ def test_available_memory_is_sane():
 def test_multibyte_varint_skip_block_keeps_the_line_level():
     """A block skipped entirely before the window must contribute the RIGHT parity.
 
-    Regression: the skip path counted bytes < 0x80 as one-per-delta, but a multi-byte
-    code whose MSB digit is < 0x40 has two such bytes (encode_v3_delta(65) ==
-    b"\\x40\\x40"). An odd over-count flipped the parity, so the window opened with the
-    line level INVERTED — transitions correct, polarity wrong, no error raised. Every
-    delta here is 100 (two bytes, both < 0x80) with an odd count per block, which is
-    the shape that flips it.
+    A multi-byte code whose MSB digit is < 0x40 has two bytes < 0x80 (encode_v3_delta(65)
+    == b"\\x40\\x40"), so counting such bytes one-per-delta over-counts. Every delta here
+    is 100 (two bytes, both < 0x80) with an odd count per block: an odd over-count would
+    open the window with the line level INVERTED.
     """
     e = np.cumsum(np.full(30, 100, dtype=np.int64)).astype(np.uint64)
     for init in (False, True):
@@ -340,9 +328,8 @@ def test_guard_fails_closed_when_memory_is_unknown(tmp_path, monkeypatch):
     """available_memory_bytes() == 0 means UNKNOWN, not unlimited.
 
     psutil is the accurate path but may be absent, and stock macOS has no
-    SC_AVPHYS_PAGES — so the budget was 0 and `if budget > 0` silently skipped the
-    check, disabling the guard on exactly the machines it was written for. It must
-    fall back to a finite budget instead."""
+    SC_AVPHYS_PAGES, so the reading can be 0. The guard must fall back to a finite
+    budget instead of skipping the check."""
     monkeypatch.setattr(ss, "available_memory_bytes", lambda: 0)
     monkeypatch.setattr(ss, "total_memory_bytes", lambda: 0)
     assert ss._UNKNOWN_BUDGET > 0
@@ -359,18 +346,10 @@ def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch,
     """Free RAM, then a fraction of TOTAL, then a small constant — each rule more cautious
     than the last, and each saying which one it used.
 
-    It used to fall straight to a flat 8 GiB, which was the same value as the cap it had
-    and therefore INVISIBLE on any machine with more than ~14 GB free, while being ~3.6x too
-    permissive on a 4 GB one (8.59 GB allowed against the 2.40 GB a psutil reading gives).
-    That is failing OPEN on the machines least able to absorb it, in the branch whose own
-    comment promised to fail closed — and it was silent, which is why an install missing
-    psutil ran on a degraded guard without anyone noticing.
-
-    WHAT IS ASSERTED IS PER-RULE CAUTION, NOT A GLOBAL ORDERING, because a global ordering is
-    not available: total RAM cannot know occupancy, so on a machine that is 75% full the
-    total-derived budget legitimately exceeds the free-derived one, so free > total > unknown
-    across three different figures is false. The claim that IS true is that the same figure
-    through a weaker rule yields a smaller budget.
+    WHAT IS ASSERTED IS PER-RULE CAUTION, NOT A GLOBAL ORDERING: total RAM cannot know
+    occupancy, so on a machine that is 75% full the total-derived budget legitimately exceeds
+    the free-derived one. The claim that IS true is that the same figure through a weaker
+    rule yields a smaller budget.
     """
     import logging
 
@@ -409,11 +388,10 @@ def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch,
 
 def test_the_memory_probes_agree_with_psutil_on_this_platform():
     """The stdlib route must match psutil where both work — it is the fallback for installs
-    that lack it, and a fallback nobody has compared to the truth is a guess.
+    that lack it.
 
     Only the probe for THIS platform is asserted; the others correctly return 0 here. Windows
-    has no sysconf and macOS publishes no SC_AVPHYS_PAGES, so before these existed psutil was
-    the ONLY working path on both — which is how a missing dependency became invisible.
+    has no sysconf and macOS publishes no SC_AVPHYS_PAGES, so each platform has its own probe.
     """
     import sys
 
@@ -437,18 +415,9 @@ def test_the_memory_probes_agree_with_psutil_on_this_platform():
 def test_the_peak_estimate_carries_the_decode_transient():
     """est_peak_bytes must include the edge-build transient, and only on the edge term.
 
-    load_capture applied _STREAM_TRANSIENT to the WINDOWED branch only -- the path that
-    allocates least -- while the whole-file branch, which allocates most, used the bare
-    sum. It therefore under-predicted the real peak by 1.9x-3.6x on measured captures:
-    0.314 GB predicted / 0.598 actual, 0.596 / 2.125, 0.275 / 0.921. On a 103 GB machine
-    that let a capture predicted at 20.29 GB reach ~60 GB resident with no prompt, and
-    macOS memory compression then made every navigation pay for it -- the minute-long
-    stall that no per-move Python tuning reaches.
-
     The transient belongs on the edge arrays alone: building them holds the delta run, its
     cumsum, the mask and the concatenate at once, while the inflated blob is one flat
-    allocation. Modelled that way the same three captures predict 0.733 / 2.134 / 0.948
-    against 0.598 / 2.125 / 0.921 actual -- within a few percent, erring high.
+    allocation.
     """
     cost = ss.SalCost(file_bytes=1_000, uncompressed_bytes=2_000_000_000,
                       est_transitions=1_000_000, est_edge_bytes=8_000_000,
@@ -466,9 +435,6 @@ def test_a_whole_channel_decode_holds_the_output_and_one_block(chunk):
     the uint64 output plus at most one block's int64 deltas — 2x the result when one block
     is the whole channel, and close to 1x when there are many.
 
-    It used to keep every block's deltas, concatenate them and cumsum the concatenation,
-    three full-size arrays at once: 8.6 GB for the 2.4 GB of edges in a 54 MB capture,
-    which the estimate (rightly, at the time) put past the memory guard on a 64 GB machine.
     tracemalloc sees NumPy's allocations, so this is exact, not an RSS sample.
     """
     import tracemalloc
@@ -489,15 +455,7 @@ def test_a_whole_channel_decode_holds_the_output_and_one_block(chunk):
 
 
 def test_the_budget_is_capacity_and_a_large_load_is_only_labelled(monkeypatch, tmp_path):
-    """The budget is 0.6 x free memory and nothing else; 8 GiB only labels a load large.
-
-    It was min(0.6 x free, 8 GiB), so a 64 GB or 96 GB machine REFUSED a capture predicted
-    at 14 GB: the dialog chose a window, and All raised SalTooLargeError. The cap was meant
-    to hand the decision to a person past 8 GiB, but nothing let them make it. It was also
-    covering for an estimate that under-predicted 3x (the 103 GB machine that reached
-    ~60 GB resident); the estimate is now measured against RSS, and the decode is watched
-    while it runs (test_a_decode_is_stopped_when_free_memory_runs_low).
-    """
+    """The budget is 0.6 x free memory and nothing else; 8 GiB only labels a load large."""
     for free_gb in (4, 16, 64, 103, 1024):
         monkeypatch.setattr(ss, "available_memory_bytes", lambda g=free_gb: int(g * 1e9))
         assert ss.memory_budget() == int(free_gb * 1e9 * ss._MEM_HEADROOM), f"{free_gb} GB"

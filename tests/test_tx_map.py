@@ -55,7 +55,7 @@ def test_gui_exposes_tx_map_buttons():
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
-    # TX map now lives on Bus Grid pane buttons (not the View menu).
+    # TX map lives on Bus Grid pane buttons.
     assert win._toggles_btn.isCheckable() and win._persist_btn.isCheckable()
     assert win._toggles_btn.text() == "Show Toggles"
     assert not win._persist_btn.isEnabled()          # only meaningful once toggles are on
@@ -186,7 +186,7 @@ def test_tx_virtual_scroll_pages_the_capture():
 
 
 def test_tx_raster_uses_operational_geometry_not_preamble():
-    """Regression: on a cold start segment 0 is the narrow slow-clock preamble (e.g.
+    """On a cold start segment 0 is the narrow slow-clock preamble (e.g.
     2 col). The TX map must render at the OPERATIONAL geometry (the audio config /
     decoder column_count), not force the whole raster to the preamble width — and its
     scrollbar extent (tx_total_rows) must use the same geometry."""

@@ -55,10 +55,7 @@ def test_session_symbols_around():
 
 def test_symbol_rows_match_command_rows():
     """The windowed symbol viewer must number rows on the SAME continuous bus-row
-    scale as the command table, AND emit one symbol per 10 rows once aligned.
-    (Regressions: the viewer used to mis-frame multi-config captures onto a
-    different scale; and a comma found after a hunt was stamped with the row where
-    hunting began, so spacing looked irregular instead of a clean 10-row cadence.)"""
+    scale as the command table, AND emit one symbol per 10 rows once aligned."""
     sess = Session.from_demo(8)
     segs = sess.segments
     assert segs and all(s["column_count"] >= 2 for s in segs)

@@ -7,9 +7,8 @@ from .link_events import link_events
 from .measurements import capture_measurements
 from .responses import manager_response_name, peripheral_response_name, ping_name, response_summary
 
-# NOTE: the standalone clash/validate hand-port was removed — Bus-Visualizer mode's
-# placement, clash detection, and validation now come from the first-party Visualizer
-# engine (swi3s_studio/swviz, see model/viz_engine.py), verified by test_visualizer_engine.
+# Bus-Visualizer placement, clash detection and validation live in swi3s_studio/swviz,
+# driven through swi3s_studio/model/viz_engine.py.
 
 __all__ = ["command_error", "is_error", "count_errors", "error_rows",
            "capture_measurements", "grid_diff", "grid_diff_report", "register_diff",

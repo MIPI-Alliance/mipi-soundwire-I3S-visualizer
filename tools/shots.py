@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Render SWI3S Studio views to PNGs for quick visual review — "render and look".
 
-Iterating on layout is much faster when you can see the rendered page instead of
-guessing from the code. This dumps one PNG per view using Qt's offscreen
-platform, so it runs headless (local, CI, or an agent) with no display.
+Dumps one PNG per view using Qt's offscreen platform, so it runs headless
+(local, CI, or an agent) with no display.
 
     python tools/shots.py                     # all views -> ./shots/*.png
     python tools/shots.py timing analysis     # only those views

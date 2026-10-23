@@ -1,8 +1,7 @@
 """
 Bit slot data structures for SWI3S visualizer.
 
-This module provides type-safe data structures to replace string-based
-state encoding for bit slots in the frame.
+Type-safe data structures for the state of bit slots in the frame.
 
 Classes:
     BitSlotData: Data for a normal bit slot
@@ -19,8 +18,7 @@ from .enums import DirectionType, DisplayField, SlotType
 # Pattern Constants
 # =============================================================================
 
-# Pre-compiled regex patterns for label parsing (performance optimization)
-# These patterns are used by bit_slot.py and canvas_renderer.py
+# Pre-compiled regex patterns for label parsing
 PATTERN_CB = re.compile(r"^C(\d+)B(-?\d+)$")      # CXbY format
 PATTERN_SC = re.compile(r"^S(\d+)C(\d+)$")       # SXcY format
 PATTERN_SB = re.compile(r"^S(\d+)B(-?\d+)$")     # SXbY format
@@ -65,7 +63,7 @@ class BitSlotData:
             String like "SXCY", "SXBY", "CXBY", or "" depending on selected fields
         """
         if display_fields is None:
-            # Default: channel + bit (original behavior)
+            # Default: channel + bit
             return f"C{self.channel}B{self.bit}"
 
         parts = []
@@ -89,7 +87,7 @@ class BitSlotData:
             BitSlotData instance, or None if label doesn't match format
         """
         # Try all supported formats using pre-compiled patterns
-        # Format: cXbY (original)
+        # Format: cXbY
         match = PATTERN_CB.fullmatch(label)
         if match:
             return cls(

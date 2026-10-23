@@ -8806,14 +8806,14 @@
   "ncols": 24,
   "nrows": 32
  },
- "spec_figures/Figure_10_PDM_Streams_With_Sample_Grouping.csv": {
+ "spec_figures/PDM_Streams_With_Sample_Grouping.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 320,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_11_Mixed_PCM_and_PDM.csv": {
+ "spec_figures/Mixed_PCM_and_PDM.csv": {
   "clashes": [],
   "issues": [
    [
@@ -8833,7 +8833,7 @@
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_12_Mixing_PCM_Sample_Rates_and_Widths.csv": {
+ "spec_figures/Mixing_PCM_Sample_Rates_and_Widths.csv": {
   "clashes": [],
   "issues": [
    [
@@ -8853,189 +8853,189 @@
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_137_PCM_Stream.csv": {
+ "spec_figures/PCM_Stream.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 248,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_138_PDM_Streams_Without_Sample_Grouping_DLV_PHY.csv": {
+ "spec_figures/PDM_Streams_Without_Sample_Grouping_DLV_PHY.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_139_PDM_Streams_With_Sample_Grouping_DLV_PHY.csv": {
+ "spec_figures/PDM_Streams_With_Sample_Grouping_DLV_PHY.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_13_High_Bandwidth_PCM.csv": {
+ "spec_figures/High_Bandwidth_PCM.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_140_1_Low_Power_PDM_Mic_Stream_DLV_PHY.csv": {
+ "spec_figures/1_Low_Power_PDM_Mic_Stream_DLV_PHY.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 256,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_141_24_Columns_DLV_PHY.csv": {
+ "spec_figures/24_Columns_DLV_PHY.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 544,
   "ncols": 24,
   "nrows": 32
  },
- "spec_figures/Figure_142_PCM_Streams_FBSCE_PHY2.csv": {
+ "spec_figures/PCM_Streams_FBSCE_PHY2.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_143_PDM_Streams_Without_Sample_Grouping_FBSCE_PHY2.csv": {
+ "spec_figures/PDM_Streams_Without_Sample_Grouping_FBSCE_PHY2.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 192,
   "ncols": 6,
   "nrows": 32
  },
- "spec_figures/Figure_144_PDM_Streams_With_Sample_Grouping_FBCSE_PHY2.csv": {
+ "spec_figures/PDM_Streams_With_Sample_Grouping_FBCSE_PHY2.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 192,
   "ncols": 6,
   "nrows": 32
  },
- "spec_figures/Figure_145_1_Slow_PDM_Mic_FBCSE_PHY1.csv": {
+ "spec_figures/1_Slow_PDM_Mic_FBCSE_PHY1.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 64,
   "ncols": 2,
   "nrows": 32
  },
- "spec_figures/Figure_146_3_PDM_Mics_FBCSE_PHY1.csv": {
+ "spec_figures/3_PDM_Mics_FBCSE_PHY1.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 128,
   "ncols": 4,
   "nrows": 32
  },
- "spec_figures/Figure_147_Guard_Bits.csv": {
+ "spec_figures/Guard_Bits.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_148_Wide_Bits.csv": {
+ "spec_figures/Wide_Bits.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 322,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_149_PDM_Streams_with_PHY_Tail_Bits.csv": {
+ "spec_figures/PDM_Streams_with_PHY_Tail_Bits.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_150_PDM_Streams_with_PHY_Tail_Bits_No_Sample_Grouping.csv": {
+ "spec_figures/PDM_Streams_with_PHY_Tail_Bits_No_Sample_Grouping.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 448,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_151_PDM_Streams_with_PHY_Tail_Bits_Small_Sample_Grouping.csv": {
+ "spec_figures/PDM_Streams_with_PHY_Tail_Bits_Small_Sample_Grouping.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_152_PCM_Streams_with_PHY_Tail_Bits.csv": {
+ "spec_figures/PCM_Streams_with_PHY_Tail_Bits.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 352,
   "ncols": 24,
   "nrows": 32
  },
- "spec_figures/Figure_153_PCM_AND_PDM_Streams_with_PHY_Tail_Bits.csv": {
+ "spec_figures/PCM_AND_PDM_Streams_with_PHY_Tail_Bits.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 346,
   "ncols": 20,
   "nrows": 32
  },
- "spec_figures/Figure_155_2_PDM_Mics_in_8_Columns.csv": {
+ "spec_figures/2_PDM_Mics_in_8_Columns.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 256,
   "ncols": 8,
   "nrows": 32
  },
- "spec_figures/Figure_156_2_PDM_Mics_in_8_Columns_Using_EndHalfEarly.csv": {
+ "spec_figures/2_PDM_Mics_in_8_Columns_Using_EndHalfEarly.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 256,
   "ncols": 8,
   "nrows": 32
  },
- "spec_figures/Figure_159_Single_Mic_PHY1_FBCSE.csv": {
+ "spec_figures/Single_Mic_PHY1_FBCSE.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 64,
   "ncols": 2,
   "nrows": 32
  },
- "spec_figures/Figure_160_Single_Mic_Using_SRI_for_Reduced_Control_Bandwidth_PHY1_FBCSE.csv": {
+ "spec_figures/Single_Mic_Using_SRI_for_Reduced_Control_Bandwidth_PHY1_FBCSE.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 544,
   "ncols": 32,
   "nrows": 32
  },
- "spec_figures/Figure_5_1_Row_with_DLV_PHY.csv": {
+ "spec_figures/1_Row_with_DLV_PHY.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 368,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_6_8_PDM_Streams_with_PHY3.csv": {
+ "spec_figures/8_PDM_Streams_with_PHY3.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 512,
   "ncols": 16,
   "nrows": 32
  },
- "spec_figures/Figure_7_1_PDM_Stream_with_PHY1.csv": {
+ "spec_figures/1_PDM_Stream_with_PHY1.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 64,
   "ncols": 2,
   "nrows": 32
  },
- "spec_figures/Figure_8_2_PDM_Streams_at_Mixed_Rates_with_PHY1.csv": {
+ "spec_figures/2_PDM_Streams_at_Mixed_Rates_with_PHY1.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 128,
   "ncols": 4,
   "nrows": 32
  },
- "spec_figures/Figure_9_PDM_Streams_Without_Sample_Grouping.csv": {
+ "spec_figures/PDM_Streams_Without_Sample_Grouping.csv": {
   "clashes": [],
   "issues": [],
   "ncells": 416,

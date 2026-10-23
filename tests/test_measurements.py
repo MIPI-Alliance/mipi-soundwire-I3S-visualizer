@@ -16,7 +16,7 @@ def test_measurements():
     assert d["Region 1"] == "8col"
     assert d["Region 2"] == "16col"
     # Command count lives under the Commands section (the "Commands" key is the section
-    # header now, value "").
+    # header, value "").
     assert d["Count"] == str(len(sess.commands))
     assert d["Errors"] == "0"
     # Bus-config segments summary (three geometries in order).
@@ -75,10 +75,27 @@ def test_per_config_rates_when_bus_reconfigures():
     assert c1 > c0 and abs(c0 - 3.072) < 0.01 and abs(c1 - 12.288) < 0.01
 
 
+def test_a_regions_clock_is_the_average_one_the_status_bar_shows():
+    """Edges land on whole samples, so a 24.576 MHz UI at 500 MS/s is spaced 20 and 21
+    samples, and the median of those spacings is the commoner integer. Each region's UI
+    is therefore the mean, which is the decoder's own whole-capture figure and matches
+    the status bar."""
+    sess = Session.from_demo(300)
+    audio = [st for st in sess.section_ui_stats() if st["column_count"] == 16]
+    assert audio, "the demo has a 16-column audio region"
+    ui_hz = 1e9 / audio[0]["ui_ns"]
+    assert abs(ui_hz - sess.ui_rate_hz) / sess.ui_rate_hz < 1e-3, (ui_hz, sess.ui_rate_hz)
+    stats = sess.section_ui_stats()
+    clocks = [r[1] for r in capture_measurements(sess) if r[0] == "  clock"]
+    assert len(clocks) == len(stats) > 1, clocks
+    for st, v in zip(stats, clocks):
+        assert v == f"{1e9 / st['ui_ns'] / 2e6:.4f} MHz", (st, v)
+        assert abs(float(v.split()[0]) - sess.ui_rate_hz / 2e6) < 0.002, (st, v)
+
+
 def test_bus_configs_leads_the_regions_section():
     """Bus configs comes FIRST in Regions: it says how many regions there are and which
-    geometries they use, which is the frame the per-region rates are read against. Behind
-    them it read as a footnote to the last region rather than a summary of all of them."""
+    geometries they use, which is the frame the per-region rates are read against."""
     sess = Session.from_demo(300)
     rows = capture_measurements(sess)
     labels = [m for (m, *_rest) in rows]
@@ -117,15 +134,9 @@ def _demo_reads():
 def test_demo_carries_an_immediate_and_a_deferred_read():
     """The demo emits both read shapes, and they decode.
 
-    Until 3.0.13 no demo emitted a Read of any kind, so nothing exercised the ReadSetup /
-    ReadData transport at all — which is why the statistics split below went unnoticed and
-    why a packetless ReadData read as CRC-invalid to one test's weaker predicate.
-
-    Pins the frame as well as the decode. An earlier version of the demo's payload helper
-    stopped at the data CRC and omitted the PM spacer + Manager Response that CLOSE the
-    phase; the immediate read then produced no record at all and no error — the next
-    command's comma abandoned the phase mid-spacer. Counting errors would not have caught
-    that. Counting RECORDS does."""
+    Pins the frame as well as the decode: the read phase must close with the PM spacer +
+    Manager Response, or the next command's comma abandons it mid-spacer and the read
+    produces no record and no error. So the test counts RECORDS, not errors."""
     _s, reads = _demo_reads()
     kinds = [(c.get("command"), c.get("peripheral_response")) for c in reads]
     assert ("ReadA32", 0) in kinds, f"no immediate read (READ_DATA_NOW): {kinds}"
@@ -149,9 +160,7 @@ def test_demo_carries_an_immediate_and_a_deferred_read():
 
 def test_deferred_read_is_one_statistics_group_not_two():
     """A deferred read is two wire records but ONE logical read, and the statistics group by
-    logical identity. Grouped by the raw wire name it showed as "ReadA32 / 0 bytes read"
-    beside an unconnected "ReadData" group holding the real bytes — two rows a reader cannot
-    join up, for one read they asked for."""
+    logical identity: the ReadData delivery folds into its ReadA32 setup, bytes included."""
     from swi3s_studio.analysis import measurements as M
     s, _reads = _demo_reads()
     rows = M._command_rows(s)

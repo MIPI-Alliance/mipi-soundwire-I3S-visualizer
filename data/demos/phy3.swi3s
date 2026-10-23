@@ -1,0 +1,176 @@
+{
+  "links": [
+    {
+      "source": {
+        "type": "demo",
+        "audio_samples_per_channel": 48000,
+        "cold_start": true,
+        "phy": 3,
+        "variant": "",
+        "dp_names": {
+          "0.0": "AMP1",
+          "0.1": "AMP2",
+          "0.2": "MIC1",
+          "0.3": "MIC2"
+        },
+        "region_names": {
+          "1": "1x44.1k, 1x48k, 2x3.072M"
+        }
+      },
+      "name": "Link 1",
+      "offset_ps": 0,
+      "overlay": [],
+      "device_regmaps": {},
+      "device_names": {},
+      "device_hub_depths": {},
+      "device_scramblers": [],
+      "stream_colors": [],
+      "stream_processing": [],
+      "even_timing": [],
+      "view": {
+        "commands": {
+          "filters": {
+            "kinds": [
+              "Commit Point",
+              "SSCR",
+              "SSPA",
+              "WriteA32"
+            ],
+            "kinds_none": false,
+            "devices": [],
+            "groups": [],
+            "errors_only": false,
+            "text": ""
+          },
+          "col_widths": {
+            "Time (\u00b5s)": 88,
+            "PhaseID": 78,
+            "Opcode": 98,
+            "Address": 94,
+            "Register": 229,
+            "Data": 94,
+            "Response": 313
+          }
+        },
+        "audio": {
+          "channels": [
+            [
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1,
+              0
+            ],
+            [
+              0,
+              3,
+              0
+            ]
+          ],
+          "x_range_s": [
+            0.44005695489675867,
+            0.4635973380439373
+          ],
+          "vertical_zoom": false,
+          "decimation": [],
+          "spectrogram": [],
+          "spectrogram_frames": []
+        },
+        "capture": {
+          "x_range_s": [
+            0.0,
+            1.16413743464
+          ],
+          "rsp_markers": false,
+          "samples": false,
+          "hide_legend": true
+        }
+      }
+    }
+  ],
+  "active_link": 0,
+  "bookmarks": [],
+  "cursor": 1783387,
+  "mode": "Analysis",
+  "view": {
+    "tx_map": false,
+    "tx_persist": false,
+    "grid_rows": 64,
+    "tx_start_row": 0,
+    "show_clock": true,
+    "window": {
+      "docks": "AAAA/wAAAAD9AAAAAwAAAAEAAAHnAAABlvwCAAAAAfwAAACcAAABlgAAAMsBAAAg+gAAAAACAAAAA/sAAAASAFIAZQBnAGkAcwB0AGUAcgBzAQAAAAD/////AAAAqgD////7AAAAFABTAHQAYQB0AGkAcwB0AGkAYwBzAQAAAAD/////AAAAYAD////7AAAAEgBCAG8AbwBrAG0AYQByAGsAcwEAAAAA/////wAAAGAA////AAAAAgAABXYAAACY/AEAAAAB+wAAABAAVABpAG0AZQBsAGkAbgBlAQAAAAAAAAV2AAAAYwD///8AAAADAAAFdgAAAdH8AQAAAAH8AAAAAAAABXYAAAOFAP////oAAAADAQAAAAb7AAAADgBCAHUAcwBHAHIAaQBkAQAAAAD/////AAABcgD////7AAAADgBDAGEAcAB0AHUAcgBlAQAAAAD/////AAADEQD////7AAAABgBDAEQAUwEAAAAA/////wAAAFEA////+wAAAAoAQQB1AGQAaQBvAQAAAAD/////AAACqwD////7AAAADgBTAGEAbQBwAGwAZQBzAQAAAAD/////AAABxAD////7AAAADABUAGkAbQBpAG4AZwEAAAAA/////wAAA4UA////AAADiwAAAZYAAAAEAAAABAAAAAgAAAAI/AAAAAA="
+    },
+    "timeline_ps": [
+      0,
+      8328810000
+    ],
+    "commands_header": {
+      "hidden": [
+        "Row",
+        "\u0394Rows",
+        "\u0394Time (\u00b5s)",
+        "Devices",
+        "Packet\nLength",
+        "Group\nMask",
+        "CRC"
+      ],
+      "columns": [
+        "Row",
+        "\u0394Rows",
+        "Time (\u00b5s)",
+        "\u0394Time (\u00b5s)",
+        "PhaseID",
+        "Devices",
+        "Packet\nLength",
+        "Opcode",
+        "Address",
+        "Register",
+        "Data",
+        "Group\nMask",
+        "CRC",
+        "Response"
+      ],
+      "sort": null
+    },
+    "samples": {
+      "ports": [],
+      "channels": [],
+      "op": "\u2014",
+      "value": ""
+    },
+    "registers": {
+      "device": 0,
+      "expanded": [
+        "DP0",
+        "SLC"
+      ],
+      "hidden": [
+        "csv",
+        "default",
+        "ui"
+      ]
+    },
+    "statistics": {
+      "collapsed": [],
+      "expanded": []
+    },
+    "timing_pane": {
+      "region": "16 col  (0.00\u20131.00 s)",
+      "filter": [
+        "Manager",
+        "Device -1 DP-1",
+        "AMP1 \u00b7 Device 0 DP0",
+        "AMP2 \u00b7 Device 0 DP1",
+        "MIC1 \u00b7 Device 0 DP2",
+        "MIC2 \u00b7 Device 0 DP3",
+        "CDS (Col 0)"
+      ],
+      "hidden": []
+    }
+  },
+  "version": 4
+}

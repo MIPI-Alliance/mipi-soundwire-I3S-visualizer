@@ -68,9 +68,7 @@ def test_sal_export_rejects_same_channel():
 def test_sal_export_is_logic2_v3():
     """Logic 2 refuses a .sal whose blobs are the documented version-0 export
     ("an older version … could not be opened"); it opens only the version-3
-    internal format + a meta.json with version 22. Pin the writer to that layout
-    (reverse-engineered from a real Logic Pro 16 capture, see the maintainers' .sal format notes)
-    so it can't silently regress to v0."""
+    internal format + a meta.json with version 22. Pin the writer to that layout."""
     cap = build_capture_from_levels(swi3score.make_demo_levels(64))
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "v3.sal")
@@ -91,8 +89,8 @@ def test_sal_export_is_logic2_v3():
         "3c53414c4541453e030000006700000001000000000000000000000000000000")
     assert meta["data"]["legacySettings"]["sampleRate"]["digital"] == cap.sample_rate_hz
     # Logic 2 validates meta.json against a schema before opening — it needs the full
-    # set of data.* keys a real v22 capture has (verified across real Logic Pro 16
-    # .sal files). Missing any of these is the "file schema is invalid" rejection.
+    # set of data.* keys a v22 capture has. Missing any of these is the "file schema is
+    # invalid" rejection.
     required = {"renderViewState", "captureStartTime", "timingMarkers", "measurements",
                 "highLevelAnalyzers", "analyzers", "rowsSettings", "captureSettings",
                 "legacyDevice", "legacySettings", "digitalTriggerTime", "name",

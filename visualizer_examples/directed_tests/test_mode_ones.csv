@@ -1,4 +1,4 @@
-AppVersion,2.1.12
+AppVersion,3.1.0
 NumColumns_REG,15
 SkippingDenominator_REG,1
 PHY3Enabled,False
@@ -6,13 +6,15 @@ S0Width,1
 S1TailWidth_REG,0
 EnforceS1Handover,True
 CDS_BitWidth_REG,0
-CDS_GuardEnabled_REG,False
-CDS_GuardPolarity_REG,False
-CDS_TailWidth_REG,0
 EnforceCDSHandover,True
 RowRate,3072.0
 Description,Test mode one exercised
 RowsToDraw,5
+CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_GuardPolarityPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_TailWidthPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_DriveTypePerSource,1,1,1,1,1,1,1,1,1,1,1,1,1
+CDS_EndDriveEarlyPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ManagerDataport,False,False,False,False,False,False,False,False,False,False,False,False
 EnableCh_REG,0b1,0b1,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0
@@ -41,6 +43,7 @@ FCP_Offset_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
 Name,DP0,DP1,DP2,DP3,DP4,DP5,DP6,DP7,DP8,DP9,DP10,DP11
+DataPortNumber,0,1,2,3,4,5,6,7,8,9,10,11
 EnforceHandover,False,False,False,False,False,False,False,False,False,False,False,False
 Enabled,True,True,False,False,False,False,False,False,False,False,False,False
 DisplayFields,cb,cb,sc,sc,sc,,,,,,,

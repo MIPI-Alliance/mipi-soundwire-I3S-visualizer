@@ -1,36 +1,15 @@
 """The release gate is ONE definition, and the docs must describe reality.
 
-Both guards here exist because of the same 3.0.11 incident. `ci.yml` declared a lint/type
-job from 3.0.7 onward but the workflow never executed, no human ran ruff or mypy either,
-and `docs/DEVELOPMENT.md`'s release checklist — a hand-maintained PROSE list — never
-mentioned them. Two partial gates, each assumed to subsume the other.
-445 ruff findings and 448 mypy errors accumulated over five releases and surfaced on the
-first PUBLIC pull request of the v3 line.
+The gate is `tools/gate.py`. These tests fail the build if:
 
-Nothing could have caught that, because "the gate" existed only as English. It is now
-`tools/gate.py`, and these tests fail the build if:
-
-  * `ci.yml` declares a check that `tools/gate.py` does not run (they can no longer drift), or
+  * `ci.yml` declares a check that `tools/gate.py` does not run, or
   * the docs repeat any of the stale "CI runs nowhere" claims, or stop saying where CI
-    actually does run (that claim went stale silently, and had already reached a release
-    tag annotation that was about to be signed).
+    actually does run.
 
-THIS FILE HAS TWO HALVES, and the second exists because the first is not enough. Drift
-guards read SOURCE TEXT, which is the right tool for "does ci.yml still name this check" and
-"do the docs still say where CI runs" — claims about documents. It is the wrong tool for the
-gate's own control flow, and for a full release cycle that was all this file had: every
-assertion was a substring search, and nothing imported or called either tool. A review
-demonstrated the cost on tools/gate.py by changing `main()` to print its failures and then
-`return 0`, leaving the literal "return 1" behind as a comment for the grep to find — all 17
-tests still passed in 0.08 s. `bash tests/gate.sh` would have printed FAIL and exited 0, and
-exit 0 IS the gate. tools/mypy_gate.py was in the same position for the same reason (nothing
-called it), so its ratchet is covered here too.
-
-So the behavioural half below EXECUTES both tools with their slow parts stubbed: the exit
-code is asserted from a seeded outcome, not read off the source. Checked against real
-mutations rather than assumed — `return 0` in place of `return 1` fails four of these, and a
-regression predicate that can never be true fails three more, including the one guarding
-`--allow-incomparable` against being widened past the environment case.
+THIS FILE HAS TWO HALVES. The drift guards read SOURCE TEXT, the right tool for "does ci.yml
+still name this check" and "do the docs still say where CI runs" — claims about documents.
+The behavioural half EXECUTES tools/gate.py and tools/mypy_gate.py with their slow parts
+stubbed: the exit code is asserted from a seeded outcome, not read off the source.
 """
 import importlib.util
 import json
@@ -46,25 +25,19 @@ _CI = os.path.join(_ROOT, ".github", "workflows", "ci.yml")
 _GATE = os.path.join(_ROOT, "tools", "gate.py")          # the implementation
 _GATE_SH = os.path.join(_ROOT, "tests", "gate.sh")       # bash wrapper
 _GATE_PS1 = os.path.join(_ROOT, "tests", "gate.ps1")     # PowerShell wrapper
-# A version reference in a release-notes file, EXCLUDING a spec citation. "Section 14.1.10"
-# parses as 14.1.10 and compares greater than every 3.0.x release, so the forward-reference guard
-# below failed the moment the notes described a spec feature — and these notes cite sections
-# constantly. Narrowed rather than allowlisted, which is the rule tools/leak_scan.py follows for
-# the identical collision — a §10.x spec citation against its private-IP pattern, which is why
-# that pattern carries a § lookbehind of its own. Naming the address here would trip the
-# scanner on this very file, which is the self-matching trap leak_scan.py avoids by building
-# its patterns from parts.
+# A version reference in a release-notes file, EXCLUDING a spec citation: "Section 14.1.10"
+# parses as 14.1.10 and compares greater than every 3.0.x release. Narrowed rather than
+# allowlisted, as tools/leak_scan.py does for a §10.x spec citation against its private-IP
+# pattern. Do not name an address here: the scanner would flag this file.
 _VERSION_NOT_A_CITATION = (
     # not introduced by a citation word or §
     r"(?<!§)(?<!Section )(?<!section )(?<!Table )(?<!table )(?<!Figure )(?<!figure )"
-    # not starting PART-WAY through a longer dotted number: \b alone let "section 9.1.6.2"
-    # match its tail "1.6.2", which no lookbehind for "section " can see.
+    # not starting PART-WAY through a longer dotted number: the tail "1.6.2" of
+    # "section 9.1.6.2" is out of reach of any lookbehind for "section ".
     r"(?<![\w.])"
-    r"v?(\d+)\.(\d+)\.(\d+)"          # `v?` — "v3.1.0" is a version reference too, and \b
-                                       # rejected it outright (v and 3 are both word chars)
+    r"v?(\d+)\.(\d+)\.(\d+)"          # `v?` — "v3.1.0" is a version reference too
     # reject a FOURTH part, but allow a sentence-final period: only a dot FOLLOWED BY A DIGIT
-    # means "this is a longer citation". The stricter (?![\d.]) killed "ships in 3.0.19." —
-    # the same distinction tools/leak_scan.py's _IPV4_TAIL had to make.
+    # means "this is a longer citation" (as in tools/leak_scan.py's _IPV4_TAIL).
     r"(?!\.?\d)"
 )
 
@@ -78,9 +51,8 @@ def _read(path: str) -> str:
 
 
 def _yaml_code(path: str) -> str:
-    """ci.yml with comment lines stripped. Both guards below look for a construct that the
-    file also DESCRIBES in a comment ("it was `continue-on-error: true` …"), so scanning the
-    raw text finds the explanation and reports a false failure."""
+    """ci.yml with comment lines stripped. The guards below look for constructs the file's
+    comments may also DESCRIBE, so the raw text would report a false failure."""
     return "\n".join(ln for ln in _read(path).splitlines()
                      if not ln.lstrip().startswith("#"))
 
@@ -88,16 +60,14 @@ def _yaml_code(path: str) -> str:
 # Commands in ci.yml that are SETUP, not checks — they install or prepare, they do not
 # assert anything, so the gate has no counterpart for them.
 _CI_SETUP = ("apt-get", "pip install --upgrade pip", "python -m pip install -r",
-             "pip install -r requirements.txt", "pip install --upgrade pip ruff mypy")
+             "pip install -r requirements.txt", "pip install -r requirements-dev.txt")
 
 # A CI check the gate deliberately does NOT run, each with the reason. Adding to this list is
 # a conscious decision; the point is that it cannot happen by omission.
 _NOT_IN_GATE = {
-    # Coverage GATES as of 3.0.13 (--cov-fail-under), but in CI only. The local gate does not
-    # run it on purpose: it would mean a second, instrumented pass over the whole suite
-    # (~2.5 min on top of the run that is already there) to re-measure a number that moves
-    # slowly and is environment-sensitive anyway. This is the documented "neither gate
-    # subsumes the other" split, not an omission — see docs/DEVELOPMENT.md.
+    # Coverage GATES (--cov-fail-under) in CI only. The local gate skips the second,
+    # instrumented pass over the whole suite (~2.5 min): the documented "neither gate
+    # subsumes the other" split — see docs/DEVELOPMENT.md.
     "--cov=swi3s_studio": "coverage gates in CI only; the local gate skips the instrumented "
                           "second pass (see DEVELOPMENT.md, 'Neither gate subsumes the other')",
 }
@@ -116,8 +86,7 @@ def _ci_run_commands(ci: str) -> list[str]:
     """Every command ci.yml actually executes, from `run:` steps (inline and block form).
 
     Shell backslash continuations are joined, or the tail of a multi-line command arrives as
-    its own entry and looks like an unrecognised check (the `apt-get install` package list
-    did exactly that on the first attempt)."""
+    its own entry and looks like an unrecognised check."""
     cmds, in_block, indent = [], False, 0
     for raw in ci.splitlines():
         line = raw.rstrip()
@@ -142,7 +111,7 @@ def _ci_run_commands(ci: str) -> list[str]:
     return cmds
 
 
-# --- P2/P3: the gate script is the single definition -------------------------------------
+# --- the gate script is the single definition --------------------------------------------
 
 def test_gate_exists_and_reports_every_failure():
     assert os.path.isfile(_GATE), "tools/gate.py is the release gate; it must exist"
@@ -154,9 +123,8 @@ def test_gate_exists_and_reports_every_failure():
 
 
 def test_gate_is_cross_platform():
-    """The gate was bash-only for one commit, which excluded the WINDOWS half of the release
-    gate — no bash on PATH there, and native/build_local.sh is a Unix compile path. That
-    re-created the very gap the gate exists to close, so pin the platform handling."""
+    """The gate runs on Windows too, where there is no bash on PATH and
+    native/build_local.sh is a Unix compile path: pin the platform handling."""
     text = _read(_GATE)
     assert 'os.name == "nt"' in text, "gate.py must branch for Windows"
     assert "build_local.sh" in text and "pip" in text, \
@@ -170,8 +138,7 @@ def test_gate_is_cross_platform():
 
 
 def test_wrappers_delegate_and_hold_no_logic():
-    """Two shells, one implementation. A wrapper that grows its own checks is how the gate
-    and CI drifted in the first place."""
+    """Two shells, one implementation: a wrapper holds no checks of its own."""
     run_all = os.path.join(_ROOT, "tests", "run_all.sh")
     for path, name in ((_GATE_SH, "gate.sh"), (_GATE_PS1, "gate.ps1"), (run_all, "run_all.sh")):
         text = _read(path)
@@ -185,15 +152,8 @@ def test_wrappers_delegate_and_hold_no_logic():
 def test_gate_runs_every_check_ci_declares():
     """If ci.yml grows a check, the gate must grow it too.
 
-    DEFAULT-DENY, and that matters. The first version of this guard compared five hardcoded
-    (ci_frag, gate_frag) pairs — so it only re-verified the checks its author already knew
-    about. The 3.0.12 review proved it: appending a whole new `security:` job running
-    `bandit -r swi3s_studio` to a copy of ci.yml left the test GREEN, because the new job
-    matched none of the five pairs. A guard against "a check declared but never enforced"
-    that is itself blind to new checks reproduces the very incident it exists to prevent.
-
-    Now every `run:` command in ci.yml must be accounted for: setup, mapped to a gate check,
-    or consciously listed in _NOT_IN_GATE with a reason. Anything else fails."""
+    DEFAULT-DENY: every `run:` command in ci.yml must be accounted for: setup, mapped to a
+    gate check, or consciously listed in _NOT_IN_GATE with a reason. Anything else fails."""
     ci = _yaml_code(_CI)
     gate = _read(_GATE)
     unaccounted = []
@@ -219,8 +179,7 @@ def test_gate_runs_every_check_ci_declares():
 
 
 def test_lint_job_is_blocking():
-    """It was `continue-on-error: true` while never executing anywhere. Now that the tree is
-    clean, an advisory lint job is just a slower way to accumulate 445 findings."""
+    """The lint job is blocking: no `continue-on-error`."""
     ci = _yaml_code(_CI)
     lint = ci[ci.index("  lint:"):]
     assert "continue-on-error" not in lint.split("steps:")[0], \
@@ -228,8 +187,8 @@ def test_lint_job_is_blocking():
 
 
 def test_mypy_result_is_not_discarded():
-    """`mypy … || true` meant the type state was UNMEASURED, not clean — 448 errors when
-    someone finally looked."""
+    """No CI step swallows its own failure with `|| true`, and mypy runs through the
+    non-regression gate."""
     ci = _yaml_code(_CI)
     assert "|| true" not in ci, "no CI step may swallow its own failure with `|| true`"
     assert "tools/mypy_gate.py" in ci, "mypy must run through the non-regression gate"
@@ -247,7 +206,7 @@ def test_mypy_baseline_is_present_and_per_file():
 
 def test_release_checklist_points_at_the_gate_script():
     """The checklist must delegate to the executable definition rather than re-listing the
-    checks in prose, which is what drifted."""
+    checks in prose."""
     dev = _read(os.path.join("docs", "DEVELOPMENT.md"))
     assert "tools/gate.py" in dev, \
         "docs/DEVELOPMENT.md must name tools/gate.py as the gate"
@@ -256,15 +215,10 @@ def test_release_checklist_points_at_the_gate_script():
         "the checklist must give the Windows entry point too — that half was once impossible"
 
 
-# --- P7: the docs must not describe a CI that no longer matches reality ------------------
+# --- the docs must not describe a CI that no longer matches reality ----------------------
 
-# The exact claims that WERE in these docs and became false once the workflow started
-# running. A literal list, deliberately: my first two attempts used a regex for "a negation
-# reaching a run/execute verb", which flagged a TRUE statement about where CI is not enabled,
-# and then "a check gate.py does not run" (not about CI at all). Prose is a bad thing to
-# pattern-match; pin the sentences that actually went stale and extend the list if a new
-# formulation appears — "No CI actually runs" was missed by the first version of this list
-# and sat in docs/TESTING.md for a full release.
+# Stale claims that CI runs nowhere. A literal list, not a regex: prose is a bad thing to
+# pattern-match. Extend the list if a new formulation appears.
 _STALE_CI_CLAIMS = [
     "does not currently run anywhere",
     "does not currently execute anywhere",
@@ -278,8 +232,7 @@ _STALE_CI_CLAIMS = [
 
 
 def test_docs_do_not_repeat_the_stale_ci_claims():
-    """These sentences were true when written and became false without anyone noticing —
-    including inside a release tag annotation that was about to be signed."""
+    """None of the docs repeats a claim from _STALE_CI_CLAIMS."""
     for doc in _DOCS:
         low = _read(doc).lower()
         for claim in _STALE_CI_CLAIMS:
@@ -300,11 +253,8 @@ def test_docs_state_where_ci_actually_runs():
 
 # --- leak scan: "leak" is broader than secrets -------------------------------------------
 #
-# The narrow definition (a grep for a handful of known strings) was published INTO the tree:
-# docs/DEVELOPMENT.md carried the pattern list itself, which named a git host, a repository,
-# a lab machine's address and an SSH key file. A list of the strings you are trying not to
-# publish is itself the leak. These guards keep the scanner honest and keep the concrete
-# names out of the repository.
+# A list of the strings you are trying not to publish is itself the leak. These guards keep
+# the scanner honest and keep the concrete names out of the repository.
 
 _LEAK_SCAN = os.path.join(_ROOT, "tools", "leak_scan.py")
 
@@ -321,13 +271,14 @@ def test_leak_scan_carries_no_site_specific_names():
     text = _read(_LEAK_SCAN)
     assert "SWI3S_LEAK_PATTERNS" in text, "no way to supply site-specific patterns"
     # A hostname-shaped literal in the scanner would be the same mistake it exists to prevent.
-    assert not re.search(r"[a-z0-9-]+\\?\.(?:apple|internal|corp|local)\b", text, re.I), \
+    # Generic internal suffixes only: naming an employer's domain here would publish the very
+    # string this test keeps out of the scanner (the site patterns hold those).
+    assert not re.search(r"[a-z0-9-]+\\?\.(?:internal|local|lan|intranet)\b", text, re.I), \
         "tools/leak_scan.py contains a site-specific host name; move it to the env-var file"
 
 
 def test_leak_scan_is_loud_when_only_partly_configured():
-    """A scan that silently covers less than it appears to is the failure mode of this whole
-    area (see the lint job that never ran)."""
+    """The scanner says so when it covers less than it appears to."""
     text = _read(_LEAK_SCAN)
     assert "NOT covered by this run" in text, \
         "the scanner must say so when no site-pattern file is configured"
@@ -344,10 +295,8 @@ def test_published_docs_do_not_re_add_a_pattern_list():
 # --- the three version literals must agree ----------------------------------------------
 #
 # The release checklist says to bump `swi3s_studio.__version__`, `pyproject.toml::version`
-# and `swviz/version.py::APP_VERSION` together. The third was missed for 3.0.9, 3.0.10 AND
-# 3.0.11 — it sat at 3.0.8 while the app shipped 3.0.11. It only surfaces when the package
-# isn't importable (`app_version()` prefers the live value), so nothing failed and nobody
-# noticed. A prose checklist step that is skipped three times running should be a test.
+# and `swviz/version.py::APP_VERSION` together. A stale APP_VERSION only surfaces when the
+# package isn't importable (`app_version()` prefers the live value), so it is pinned here.
 
 def test_the_three_version_literals_agree():
     import re as _re
@@ -367,43 +316,102 @@ def test_the_three_version_literals_agree():
         "literal that silently sat at 3.0.8 for three releases")
 
 
-def test_ci_tolerates_only_the_incomparable_outcome():
-    """CI may forgive NOT COMPARABLE, and nothing else.
+def test_the_package_metadata_is_valid_and_ships_its_assets():
+    """pyproject.toml is configuration setuptools accepts, it lists every package, and its
+    package-data names every file the package reads from beside its modules (the theme's
+    icons): a wheel holds only what [tool.setuptools] names. Checked with setuptools' own
+    validator, so no build is needed."""
+    import fnmatch
+    import warnings
 
-    `ci.yml` calls tools/mypy_gate.py DIRECTLY, not through tools/gate.py, so it cannot
-    interpret exit 3 the way the local gate does. That shipped in 3.0.12 and made the lint
-    job fail on every run of the published repository — a permanent red cross for an
-    environment difference. The fix is a flag on the tool, not shell plumbing in the YAML.
+    pytest.importorskip("setuptools")
+    from setuptools.config.pyprojecttoml import read_configuration
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")               # "[tool.setuptools] is still beta"
+        conf = read_configuration(os.path.join(_ROOT, "pyproject.toml"))
+    tool = conf["tool"]["setuptools"]
+    pkg_root = pathlib.Path(_ROOT, "swi3s_studio")
+    on_disk = {".".join(d.relative_to(_ROOT).parts) for d in [pkg_root, *pkg_root.rglob("*")]
+               if (d / "__init__.py").is_file()}
+    assert set(tool["packages"]) == on_disk
+    data = tool.get("package-data", {})
+    missing = []
+    for f in pkg_root.rglob("*"):
+        if not f.is_file() or f.suffix in (".py", ".pyc") or "__pycache__" in f.parts:
+            continue
+        owner = f.parent
+        while not (owner / "__init__.py").is_file():
+            owner = owner.parent
+        rel = f.relative_to(owner).as_posix()
+        if not any(fnmatch.fnmatch(rel, g) for g in data.get(".".join(
+                owner.relative_to(_ROOT).parts), [])):
+            missing.append(f.relative_to(_ROOT).as_posix())
+    assert not missing, f"not in [tool.setuptools.package-data], so not in a wheel: {missing}"
 
-    What this pins is the SHAPE of the tolerance: --allow-incomparable must map exit 3 alone.
-    The obvious way to break it later is to widen the same escape hatch to a regression."""
-    ci = _read(".github/workflows/ci.yml")
+
+def test_ci_runs_the_baselines_mypy_and_compares():
+    """CI compares, or fails: the lint job installs requirements-dev.txt, which pins the mypy
+    version the baseline records, and does not pass --allow-incomparable, so NOT COMPARABLE
+    (exit 3) fails the lint job instead of passing it without a comparison."""
+    ci = _yaml_code(_CI)
+    lint = ci.split("  lint:", 1)[1]
+    with open(os.path.join(_ROOT, "tools", "mypy_baseline.json"), encoding="utf-8") as f:
+        recorded = json.load(f)["env"]["mypy"]
+    install = [c for c in _ci_run_commands(lint) if "pip install -r requirements-dev.txt" in c]
+    assert install, "the lint job does not install requirements-dev.txt"
+    pins = [ln.split("#", 1)[0].strip() for ln in _read("requirements-dev.txt").splitlines()]
+    assert f"mypy=={recorded}" in pins, (
+        f"requirements-dev.txt must pin mypy=={recorded}, the version "
+        f"tools/mypy_baseline.json records, or the ratchet cannot compare: {pins}")
+    runs = [c for c in _ci_run_commands(lint) if "tools/mypy_gate.py" in c]
+    assert runs and not any("--allow-incomparable" in c for c in runs), runs
+
+
+def test_ci_and_the_setup_scripts_install_the_dev_requirements():
+    """One list of what testing needs: requirements-dev.txt carries the runtime set and the
+    tools, every CI job installs it rather than naming packages of its own, and the setup
+    scripts install it."""
+    lines = [ln.split("#", 1)[0].strip() for ln in _read("requirements-dev.txt").splitlines()]
+    names = {re.split(r"[<>=!~ ]", ln, maxsplit=1)[0].lower() for ln in lines if ln}
+    assert "-r requirements.txt" in lines
+    assert {"pytest", "pytest-cov", "ruff", "mypy"} <= names, names
+    installs = [c for c in _ci_run_commands(_yaml_code(_CI))
+                if "pip install" in c and "--upgrade pip" not in c
+                and c.split("#", 1)[0].split()[4:] != ["./native"]]      # the core alone
+    assert len(installs) == 4, installs            # test, perf, coverage, lint
+    assert installs and all("-r requirements-dev.txt" in c for c in installs), installs
+    for script in ("tools/setup_dev.sh", "tools/setup_dev.ps1"):
+        assert "pip install -r requirements-dev.txt" in _read(script), script
+
+
+def test_allow_incomparable_maps_only_the_not_comparable_branch():
+    """The flag's early return sits inside the NOT-COMPARABLE branch; the regression and the
+    could-not-run exits stay reachable."""
     src = _read("tools/mypy_gate.py")
-    assert "--allow-incomparable" in ci, \
-        "the mypy step must tolerate NOT COMPARABLE explicitly, or CI is red forever"
-    assert "--allow-incomparable" in src, "the flag has to exist in the tool"
-
-    # The flag's return must be inside the NOT-COMPARABLE branch only. Both the regression
-    # and the could-not-run exits have to stay reachable and unguarded by it.
-    head, _, tail = src.partition("--allow-incomparable")
+    head, _, _tail = src.partition('if "--allow-incomparable" in sys.argv')
     assert "NOT COMPARABLE" in head, "the flag is handled outside the not-comparable branch"
-    assert "return 0" in tail.split("return")[0] + "return 0", "the flag must return success"
     for needed, why in (("return 1", "a regression must still fail"),
                         ("SystemExit(2)", "mypy failing to run must still fail")):
         assert needed in src, f"{needed} is gone from mypy_gate.py — {why}"
 
 
-def test_ci_installs_numpy_for_the_type_check():
-    """mypy follows imports into installed stubs. Without numpy the lint job checked the tree
-    against no array types AND read the ratchet's environment fingerprint as '?', which can
-    match no baseline — the check was both weaker and permanently incomparable."""
-    ci = _read(".github/workflows/ci.yml")
-    lint = ci.split("  lint:", 1)[1]
-    install = [c for c in _ci_run_commands(lint) if "pip install" in c and "mypy" in c]
-    assert install, "the lint job installs no mypy?"
-    assert any("numpy" in c for c in install), \
-        "the lint job must install numpy, or mypy type-checks against no array stubs: " \
-        + str(install)
+def test_the_ratchet_reads_no_site_packages(monkeypatch):
+    """mypy reads no installed package, so its count depends on the source and mypy's own
+    version only, and the fingerprint records exactly that."""
+    import subprocess
+    m = _load_tool("mypy_gate.py")
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "mypy 9.9.9 (compiled: yes)\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "Success: no issues found\n", "")
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    m._run_mypy()
+    assert all("--no-site-packages" in c for c in seen), seen
+    assert m._env_fingerprint() == {"mypy": "9.9.9", "site_packages": "not read"}
+    assert not any("numpy" in " ".join(c) for c in seen), seen
 
 
 # --------------------------------------------------------------------------------------
@@ -416,7 +424,8 @@ def test_ci_installs_numpy_for_the_type_check():
 # --------------------------------------------------------------------------------------
 
 _GATE_CHECKS = ("check_native", "check_pytest", "check_per_suite",
-                "check_tool", "check_mypy", "check_leaks", "check_native_cpp")
+                "check_tool", "check_mypy", "check_leaks", "check_screenshots",
+                "check_native_cpp")
 
 
 def _load_tool(filename: str):
@@ -432,8 +441,7 @@ def _run_gate(failed=(), not_run=(), argv=("tools/gate.py",)):
     """Run gate.main() with every check stubbed out and the outcome seeded.
 
     Seeding the two lists the checks would have appended to isolates the aggregation from
-    the checks themselves — the checks have their own tests (the suite they run), while
-    "a non-empty _FAILED must exit nonzero" has had none.
+    the checks themselves.
     """
     g = _load_tool("gate.py")
     for name in _GATE_CHECKS:
@@ -454,15 +462,14 @@ def test_the_gate_exits_zero_only_when_nothing_failed():
 
 
 def test_the_gate_exits_nonzero_when_a_check_failed():
-    """The mutation that proved this file was untested: main() printing FAIL and returning 0.
-    "Exit 0 is the gate" (docs/DEVELOPMENT.md, the release checklist) is what this asserts."""
+    """A failed check makes main() return nonzero: "Exit 0 is the gate" (docs/DEVELOPMENT.md,
+    the release checklist)."""
     assert _run_gate(failed=["pytest not-perf"]) == 1, \
         "a failed check must make the gate exit nonzero"
 
 
 def test_the_gate_reports_every_failure_so_one_cannot_hide_the_rest(capsys):
-    """The aggregating design: checks all run and every failure is named. A gate that stopped
-    at the first red would send someone round the loop once per defect."""
+    """The aggregating design: checks all run and every failure is named."""
     rc = _run_gate(failed=["native build", "ruff", "leak scan"])
     out = capsys.readouterr().out
     assert rc == 1
@@ -532,8 +539,7 @@ def test_the_ratchet_passes_an_unchanged_count(tmp_path):
 
 
 def test_the_ratchet_fails_a_file_that_gained_an_error(tmp_path):
-    """The mutation here was `regressions = []`, which reported no regression whatever mypy
-    found. One more error in one file must fail."""
+    """One more error in one file must fail."""
     assert _run_ratchet({_F1: 4}, {_F1: 3}, tmp_path) == 1
 
 
@@ -554,27 +560,34 @@ def test_the_ratchet_reports_an_incomparable_environment_as_three(tmp_path):
                         base_env={"mypy": "9.9.9", "numpy": "0.0.1"}) == 3
 
 
-def test_allow_incomparable_maps_only_the_environment_case_to_success(tmp_path):
-    assert _run_ratchet({_F1: 3}, {_F1: 3}, tmp_path,
+def test_allow_incomparable_maps_only_the_environment_case_to_success(tmp_path, capsys):
+    """Exit 0, and the output says no comparison ran: a regression is NOT caught there."""
+    assert _run_ratchet({_F1: 30}, {_F1: 3}, tmp_path,
                         argv=("tools/mypy_gate.py", "--allow-incomparable"),
                         base_env={"mypy": "9.9.9", "numpy": "0.0.1"}) == 0
+    out = capsys.readouterr().out
+    assert "does NOT catch a regression" in out
+    assert "would still fail" not in out
 
 
 def test_allow_incomparable_does_not_swallow_a_regression(tmp_path):
-    """The escape hatch CI needs, and the one way it must never be widened. This is the case
-    the textual test claimed to pin by checking where the flag's name appeared in the file."""
+    """The escape hatch CI needs never maps a regression to success."""
     assert _run_ratchet({_F1: 4}, {_F1: 3}, tmp_path,
                         argv=("tools/mypy_gate.py", "--allow-incomparable")) == 1
 
 
-def _run_ratchet_per_platform(by_platform, baseline, tmp_path, capsys):
-    """As _run_ratchet, but with one mypy result per platform, so the combining is real."""
+def _run_ratchet_per_platform(by_platform, baseline, tmp_path, capsys, per_platform=None):
+    """As _run_ratchet, but with one mypy result per platform, so the combining is real.
+    `per_platform`, when given, is the baseline's per-platform counts."""
     m = _load_tool("mypy_gate.py")
     m._run_mypy_on = lambda plat: (dict(by_platform[plat]), f"<mypy {plat}>")
     m._env_fingerprint = lambda: dict(_BASE_ENV)
     path = tmp_path / "baseline.json"
-    path.write_text(json.dumps({"env": dict(_BASE_ENV), "total": sum(baseline.values()),
-                                "per_file": dict(baseline)}), encoding="utf-8")
+    record = {"env": dict(_BASE_ENV), "total": sum(baseline.values()),
+              "per_file": dict(baseline)}
+    if per_platform is not None:
+        record["per_platform"] = per_platform
+    path.write_text(json.dumps(record), encoding="utf-8")
     m._BASELINE = str(path)
     saved = sys.argv
     sys.argv = ["tools/mypy_gate.py"]
@@ -585,9 +598,8 @@ def _run_ratchet_per_platform(by_platform, baseline, tmp_path, capsys):
 
 
 def test_the_ratchet_checks_every_platform_and_names_the_one_that_regressed(tmp_path, capsys):
-    """mypy checks one platform per run, and only the host's unless told otherwise, so an
-    error in a Windows-only branch passed the ratchet on a Mac. Every platform is run, and a
-    regression on any one of them fails and says which."""
+    """mypy checks one platform per run, and only the host's unless told otherwise. Every
+    platform is run, and a regression on any one of them fails and says which."""
     code, out = _run_ratchet_per_platform(
         {"darwin": {_F1: 3}, "linux": {_F1: 3}, "win32": {_F1: 5}}, {_F1: 3}, tmp_path, capsys)
     assert code == 1
@@ -595,9 +607,61 @@ def test_the_ratchet_checks_every_platform_and_names_the_one_that_regressed(tmp_
 
 
 def test_the_ratchet_passes_when_every_platform_holds(tmp_path, capsys):
-    code, out = _run_ratchet_per_platform(
-        {"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3}}, {_F1: 3}, tmp_path, capsys)
+    by_platform = {"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3}}
+    code, out = _run_ratchet_per_platform(by_platform, {_F1: 3}, tmp_path, capsys,
+                                          per_platform=by_platform)
     assert code == 0 and "darwin 3, linux 2, win32 3" in out
+
+
+def test_a_regression_on_a_platform_below_the_worst_count_fails(tmp_path, capsys):
+    """Each platform is compared with its own baseline count: linux going 2 -> 3 fails even
+    though darwin and win32 already count 3."""
+    code, out = _run_ratchet_per_platform(
+        {"darwin": {_F1: 3}, "linux": {_F1: 3}, "win32": {_F1: 3}}, {_F1: 3}, tmp_path, capsys,
+        per_platform={"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3}})
+    assert code == 1
+    assert "2 -> 3" in out and "on linux" in out and "on darwin" not in out, out
+
+
+def test_a_baseline_without_per_platform_counts_compares_each_platform_with_per_file(
+        tmp_path, capsys):
+    code, _ = _run_ratchet_per_platform(
+        {"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3}}, {_F1: 3}, tmp_path, capsys)
+    assert code == 0
+    code, out = _run_ratchet_per_platform(
+        {"darwin": {_F1: 3}, "linux": {_F1: 4}, "win32": {_F1: 3}}, {_F1: 3}, tmp_path, capsys)
+    assert code == 1 and "on linux" in out
+
+
+def test_update_records_each_platforms_counts(tmp_path, capsys):
+    m = _load_tool("mypy_gate.py")
+    by_platform = {"darwin": {_F1: 3}, "linux": {_F1: 2}, "win32": {_F1: 3, _F2: 1}}
+    m._run_mypy_on = lambda plat: (dict(by_platform[plat]), "")
+    m._env_fingerprint = lambda: dict(_BASE_ENV)
+    m._BASELINE = str(tmp_path / "baseline.json")
+    saved = sys.argv
+    sys.argv = ["tools/mypy_gate.py", "--update"]
+    try:
+        assert m.main() == 0
+    finally:
+        sys.argv = saved
+    base = json.loads((tmp_path / "baseline.json").read_text(encoding="utf-8"))
+    assert base["per_platform"] == by_platform
+    assert base["per_file"] == {_F1: 3, _F2: 1} and base["total"] == 4
+
+
+def test_the_checked_in_baseline_has_counts_for_every_platform():
+    """per_file is each file's worst count over the platforms the ratchet runs."""
+    m = _load_tool("mypy_gate.py")
+    with open(os.path.join(_ROOT, "tools", "mypy_baseline.json"), encoding="utf-8") as f:
+        base = json.load(f)
+    per_platform = base.get("per_platform", {})
+    assert set(per_platform) == set(m._PLATFORMS), sorted(per_platform)
+    worst: dict = {}
+    for counts in per_platform.values():
+        for path, n in counts.items():
+            worst[path] = max(worst.get(path, 0), n)
+    assert worst == base["per_file"]
 
 
 def test_the_ratchet_runs_mypy_for_each_supported_platform():
@@ -607,26 +671,23 @@ def test_the_ratchet_runs_mypy_for_each_supported_platform():
 
 
 def test_the_ratchet_fails_a_baseline_naming_a_deleted_file(tmp_path):
-    """A stale entry lets a recreated file inherit a count nobody reviewed (found in the
-    3.0.12 review): fewer errors than the stale number read as 'improved' and exited 0."""
+    """A baseline naming a deleted file fails: a stale entry would let a recreated file
+    inherit a count nobody reviewed."""
     gone = os.path.join("swi3s_studio", "no_such_module_here.py")
     assert _run_ratchet({_F1: 3}, {_F1: 3, gone: 4}, tmp_path) == 1
 
 
 # ---------------------------------------------------------------- release notes are ONE file
-# v3.0.17 was described three separate times by hand — a signed tag annotation, a release
-# body, and the publish branch's commit message — with nothing tying any of them to the tree.
-# They disagreed, and one announced a memory-guard fix that landed AFTER the tag. The fix is
-# structural: one reviewed file per release, in the tree and therefore in the tag, referenced
-# by every consumer instead of restated. These guard the two ways that can rot.
+# One reviewed file per release, in the tree and therefore in the tag, referenced by every
+# consumer instead of restated. These guard the two ways that can rot.
 
 def _notes_path(version: str) -> str:
     return os.path.join("docs", "releases", f"v{version}.md")
 
 
 def test_the_current_version_has_a_release_notes_file():
-    """Written DURING the cycle, not at push time. Writing it at push time is what let a claim
-    about post-tag work into the notes: by then the work existed, so it read as true."""
+    """The current version's notes file exists and its title names the version; it is
+    written DURING the cycle, not at push time."""
     from swi3s_studio import __version__
     rel = _notes_path(__version__)
     full = os.path.join(_ROOT, rel)
@@ -641,17 +702,14 @@ def test_the_current_version_has_a_release_notes_file():
 
 
 def test_the_release_notes_claim_no_later_version():
-    """The exact defect, pinned. A description may look back but never forward: naming a LATER
-    version means it is describing work this tag does not contain.
+    """A description may look back but never forward: naming a LATER version means it is
+    describing work this tag does not contain.
 
-    Scoped PER SECTION, not by splitting at the exempt heading: splitting at '## Not in this
-    release' and checking only what came before leaves every section AFTER it unchecked,
-    including the one v3.0.17's notes end with. An exemption has to be the exempt section
-    itself, not everything downstream of it.
+    Scoped PER SECTION: only the '## Not in this release' section itself is exempt, not every
+    section after it.
 
-    A SPEC CITATION IS NOT A VERSION — see _VERSION_NOT_A_CITATION for why the pattern is
-    narrowed rather than the string allowlisted, and the test below for the narrowing checked in
-    both directions.
+    A SPEC CITATION IS NOT A VERSION — see _VERSION_NOT_A_CITATION, and the test below for the
+    narrowing checked in both directions.
     """
     import re as _re
 
@@ -684,20 +742,19 @@ def test_the_release_notes_claim_no_later_version():
 
 
 def test_the_citation_narrowing_works_in_both_directions():
-    """The narrowing must not have bought its way out of the false positive by ceasing to catch
-    real forward references. Both directions, on the shapes that actually occur in these notes."""
+    """The narrowing rejects spec citations and still catches real forward references, on the
+    shapes that occur in these notes."""
     import re as _re
 
     def hits(text):
         return [m.group(0) for m in _re.finditer(_VERSION_NOT_A_CITATION, text)]
 
-    # Each of these is a shape that broke a previous draft of the pattern, not a guess.
     for citation in ("Section 14.1.10", "section 9.1.6.2", "§14.1.10", "see Section 14.1.10.",
                      "Table 125.4.1", "Figure 174.1.2",
-                     "per Section 9.1.6.2.1 the SSP"):     # matched its tail "1.6.2" once
+                     "per Section 9.1.6.2.1 the SSP"):     # its tail "1.6.2" is no version
         assert not hits(citation), f"citation read as a version: {citation!r} -> {hits(citation)}"
     for version in ("ship in 3.0.19", "landed in 4.0.0",
-                    "v3.1.0 adds",                         # \b rejected this outright once
+                    "v3.1.0 adds",                         # a leading v
                     "3.0.99 work", "ships in 3.0.19.",     # sentence-final period
                     "(3.0.20)"):
         assert hits(version), f"real version reference MISSED: {version!r}"
@@ -713,8 +770,7 @@ def test_every_released_version_kept_its_notes():
 
 
 def test_the_publish_tool_refuses_a_tree_with_no_notes(tmp_path):
-    """Behavioural, not a substring search — the half of this file that exists because the
-    drift guards could not fail."""
+    """Behavioural, not a substring search: check_release_notes on a synthetic tree."""
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
@@ -735,7 +791,7 @@ def test_the_publish_tool_refuses_a_tree_with_no_notes(tmp_path):
     notes, problems = pt.check_release_notes(str(tmp_path))
     assert notes and not problems, f"a valid notes file was rejected: {problems}"
 
-    # An unfinalised file is not publishable, same rule as the changelog header.
+    # An unfinalised file ("(in development)" in its title) is not publishable.
     target.write_text("# SWI3S Studio v9.9.9 (in development)\n\nBody.\n", encoding="utf-8")
     _, problems = pt.check_release_notes(str(tmp_path))
     assert any("in development" in p for p in problems), problems
@@ -748,10 +804,8 @@ def test_the_publish_tool_refuses_a_tree_with_no_notes(tmp_path):
 
 def test_preview_mode_allows_unfinished_notes_and_says_so(tmp_path):
     """A preview publishes an UNFINISHED cycle, so the '(in development)' refusal has to be
-    lift-able — but only by saying plainly that it is a preview. Releases stay strict.
-
-    The failure this prevents is a branch that looks exactly like a release branch: same shape,
-    same tree assembly, same subject line. A reader has no way to tell without being told.
+    lift-able — but only by saying plainly, in subject and body, that it is a preview.
+    Releases stay strict.
     """
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -793,9 +847,39 @@ def test_preview_mode_allows_unfinished_notes_and_says_so(tmp_path):
     assert "release tag" in flat(rel), "the release message SHOULD name the tag it differs from"
 
 
+def _assembled_tree(tmp_path, text):
+    """A minimal assembled tree: the scanner itself plus one file, no .git."""
+    import shutil
+    dest = tmp_path / "tree"
+    (dest / "tools").mkdir(parents=True)
+    shutil.copy2(os.path.join(_ROOT, "tools", "leak_scan.py"), dest / "tools")
+    (dest / "README.md").write_text(text, encoding="utf-8")
+    return dest
+
+
+def test_the_publish_leak_check_fails_without_site_patterns(tmp_path, monkeypatch, capsys):
+    """Structural patterns alone do not cover host, repository or third-party names, so a
+    publish scan that ran none of the site patterns is a failure, and the scan's header is
+    printed either way."""
+    pt = _load_tool("publish_tree.py")
+    dest = _assembled_tree(tmp_path, "A bus analyzer.\n")
+    monkeypatch.delenv("SWI3S_LEAK_PATTERNS", raising=False)
+    problems = pt.check_leak_scan(str(dest))
+    assert any("SWI3S_LEAK_PATTERNS" in p for p in problems), problems
+    assert "0 site-specific" in capsys.readouterr().out
+
+    pats = tmp_path / "patterns.txt"
+    pats.write_text("zzqq-not-in-this-tree\n", encoding="utf-8")
+    monkeypatch.setenv("SWI3S_LEAK_PATTERNS", str(pats))
+    assert pt.check_leak_scan(str(dest)) == []
+    assert "1 site-specific" in capsys.readouterr().out
+
+    pats.write_text("bus analy[sz]er\n", encoding="utf-8")
+    assert pt.check_leak_scan(str(dest)) == ["leak scan failed on the assembled tree"]
+
+
 def test_the_branch_message_is_derived_from_the_notes_verbatim():
-    """The preamble is computed; the body is the file. Nothing is retyped, which is the whole
-    point — a retyped body is what drifted."""
+    """The preamble is computed; the body is the file, verbatim."""
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "publish_tree", os.path.join(_ROOT, "tools", "publish_tree.py"))
@@ -855,9 +939,9 @@ def test_the_full_gate_does_not_run_the_opt_in_native_cpp_suite():
 
 
 def test_the_ratchet_reads_plain_output_and_refuses_output_it_cannot_read(monkeypatch):
-    # With FORCE_COLOR set, mypy coloured even a pipe, no error line was parsed, and the
-    # gate passed "0 errors against a baseline of 134". The run asks for plain output with
-    # the colour variables removed, and a failing run with nothing read is refused.
+    # With FORCE_COLOR set, mypy colours even a pipe and no error line parses. The run asks
+    # for plain output with the colour variables removed, and a failing run with nothing
+    # read is refused.
     import subprocess
     m = _load_tool("mypy_gate.py")
     seen = {}
@@ -872,3 +956,199 @@ def test_the_ratchet_reads_plain_output_and_refuses_output_it_cannot_read(monkey
         m._run_mypy()
     assert exc.value.code == 2
     assert "--no-color-output" in seen["cmd"] and "FORCE_COLOR" not in seen["env"]
+
+
+# --- the native probe asserts WHICH swi3score it imported ---------------------------------
+
+def _check_native_with_probe(monkeypatch, core_path, windows):
+    """Run gate.check_native with the build stubbed green and the probe reporting
+    `core_path` as swi3score.__file__, at the ABI session.py requires."""
+    import subprocess
+    g = _load_tool("gate.py")
+    src = _read(os.path.join("swi3s_studio", "session.py"))
+    want = re.search(r"_REQUIRED_SCORE_ABI\s*=\s*(\d+)", src).group(1)
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        out = "" if len(calls) == 1 else f"{want}\n9.9.9\n{core_path}\n"
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    monkeypatch.setattr(g, "_run", fake_run)
+    monkeypatch.setattr(g, "_WINDOWS", windows)
+    g._FAILED[:] = []
+    g.check_native()
+    return list(g._FAILED)
+
+
+def test_the_native_probe_refuses_a_root_pyd_shadowing_the_windows_build(monkeypatch):
+    """Windows builds into site-packages; a stale swi3score*.pyd in the checkout root comes
+    first on PYTHONPATH and carries the same ABI number, so the path is what is checked."""
+    import sysconfig
+    stale = os.path.join(_ROOT, "swi3score.cp312-win_amd64.pyd")
+    assert _check_native_with_probe(monkeypatch, stale, windows=True) == [
+        "native core imported is not the one just built"]
+    fresh = os.path.join(sysconfig.get_path("platlib"), "swi3score.cp312-win_amd64.pyd")
+    assert _check_native_with_probe(monkeypatch, fresh, windows=True) == []
+
+
+def test_the_native_probe_requires_the_core_built_beside_the_checkout(monkeypatch):
+    import sysconfig
+    built = os.path.join(_ROOT, "swi3score" + sysconfig.get_config_var("EXT_SUFFIX"))
+    assert _check_native_with_probe(monkeypatch, built, windows=False) == []
+    elsewhere = os.path.join(sysconfig.get_path("platlib"), "swi3score.so")
+    assert _check_native_with_probe(monkeypatch, elsewhere, windows=False) == [
+        "native core imported is not the one just built"]
+
+
+# --- an empty pattern file, a mypy run that stopped early, check 5's file count, check 6's core
+
+def _check_leaks_with_output(monkeypatch, stdout, returncode=0, patterns="/some/patterns.txt"):
+    """Run gate.check_leaks with the scan reporting `stdout`; (FAILED, NOT_RUN) after it."""
+    import subprocess
+    g = _load_tool("gate.py")
+    monkeypatch.setattr(g, "_run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, returncode, stdout, ""))
+    if patterns is None:
+        monkeypatch.delenv("SWI3S_LEAK_PATTERNS", raising=False)
+    else:
+        monkeypatch.setenv("SWI3S_LEAK_PATTERNS", patterns)
+    g._FAILED[:] = []
+    g._NOT_RUN[:] = []
+    g.check_leaks()
+    return list(g._FAILED), list(g._NOT_RUN)
+
+
+def test_a_pattern_file_with_no_patterns_is_not_run_not_clean(monkeypatch):
+    head = "leak scan — the working tree: 5 files (5 text, 0 binary), {n} patterns " \
+           "(13 structural, {m} site-specific)\n\nno leaks found\n"
+    failed, not_run = _check_leaks_with_output(monkeypatch, head.format(n=13, m=0))
+    assert failed == [] and len(not_run) == 1 and "holding no patterns" in not_run[0]
+    assert _check_leaks_with_output(monkeypatch, head.format(n=16, m=3)) == ([], [])
+    failed, not_run = _check_leaks_with_output(monkeypatch, head.format(n=13, m=0),
+                                               patterns=None)
+    assert failed == [] and "unset" in not_run[0]
+    failed, _ = _check_leaks_with_output(monkeypatch, "no leaks found\n")
+    assert failed and "names no pattern counts" in failed[0]
+
+
+def test_the_ratchet_refuses_a_run_that_stopped_before_checking_the_tree(monkeypatch):
+    """A blocking error makes mypy print one error line and stop; that one line is not a
+    count of the tree, so the run is exit 2 whatever the baseline holds for that file."""
+    import subprocess
+    m = _load_tool("mypy_gate.py")
+    out = ("swi3s_studio/ui/main_window.py:1: error: Invalid syntax  [syntax]\n"
+           "Found 1 error in 1 file (errors prevented further checking)\n")
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 2, out, ""))
+    with pytest.raises(SystemExit) as exc:
+        m._run_mypy_on("linux")
+    assert exc.value.code == 2
+
+
+def test_the_publish_leak_check_fails_a_scan_that_read_fewer_files_than_ship(
+        tmp_path, monkeypatch):
+    """A file in the assembled tree is published whatever .gitignore says (git archive
+    exports tracked files), so a scan that left one out fails check 5."""
+    pt = _load_tool("publish_tree.py")
+    dest = _assembled_tree(tmp_path, "A bus analyzer.\n")
+    pats = tmp_path / "patterns.txt"
+    pats.write_text("zzqq-not-in-this-tree\n", encoding="utf-8")
+    monkeypatch.setenv("SWI3S_LEAK_PATTERNS", str(pats))
+    assert pt.check_leak_scan(str(dest)) == []
+    (dest / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (dest / "packaging" / "build").mkdir(parents=True)
+    (dest / "packaging" / "build" / "forced.md").write_text("x\n", encoding="utf-8")
+    assert pt.check_leak_scan(str(dest)) == [
+        "the leak scan read 3 of the 4 files in the assembled tree; every file in it ships"]
+
+
+def test_check_6_compiles_the_core_from_the_assembled_trees_own_sources(tmp_path, monkeypatch):
+    """The core the suite imports is built from a copy of the assembled tree's native/, in a
+    work directory outside it, never copied from beside this checkout; a failed build is a
+    problem, not a fallback."""
+    import subprocess
+    pt = _load_tool("publish_tree.py")
+    monkeypatch.setattr(pt, "_WINDOWS", False)
+    dest, work = tmp_path / "dest", tmp_path / "work"
+    (dest / "native").mkdir(parents=True)
+    work.mkdir()
+    (dest / "native" / "build_local.sh").write_text("# published rev\n", encoding="utf-8")
+    calls = []
+
+    def fake_build(cmd, **kw):
+        calls.append(cmd)
+        script = pathlib.Path(cmd[-1])
+        assert script.read_text(encoding="utf-8") == "# published rev\n"
+        (script.parent.parent / "swi3score.cpython-312-test.so").write_bytes(b"core")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(pt.subprocess, "run", fake_build)
+    lib, problem = pt.build_core(str(dest), str(work))
+    assert problem is None and os.listdir(lib) == ["swi3score.cpython-312-test.so"]
+    assert str(work) in calls[0][-1] and str(dest) not in calls[0][-1]
+    assert sorted(p.name for p in dest.rglob("*")) == ["build_local.sh", "native"]
+
+    monkeypatch.setattr(pt.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 1, "", "compiler error\n"))
+    lib, problem = pt.build_core(str(dest), str(tmp_path / "work2"))
+    assert lib is None and "did not build" in problem and "compiler error" in problem
+
+
+# --- check 5 runs this checkout's scanner; symlinks are entries; the build is from HEAD
+
+def test_the_publish_leak_check_runs_this_checkouts_scanner_not_the_trees(
+        tmp_path, monkeypatch):
+    """An assembled tree from an older commit carries that commit's scanner; check 5 scans
+    it with this checkout's tools/leak_scan.py, so the current patterns apply."""
+    pt = _load_tool("publish_tree.py")
+    dest = _assembled_tree(tmp_path, "mounted at /" + "Volumes/Disk/work/x.csv\n")
+    (dest / "tools" / "leak_scan.py").write_text(
+        "print('leak scan — the working tree: 2 files (2 text, 0 binary), 1 patterns "
+        "(0 structural, 1 site-specific)')\nprint()\nprint('no leaks found')\n",
+        encoding="utf-8")
+    pats = tmp_path / "patterns.txt"
+    pats.write_text("zzqq-not-in-this-tree\n", encoding="utf-8")
+    monkeypatch.setenv("SWI3S_LEAK_PATTERNS", str(pats))
+    assert pt.check_leak_scan(str(dest)) == ["leak scan failed on the assembled tree"]
+
+
+def test_a_symlink_to_a_directory_is_counted_and_checked(tmp_path, monkeypatch):
+    """A link to a directory ships as a link: check 5 counts it and the scan reads its
+    target, and check 2 resolves that target."""
+    pt = _load_tool("publish_tree.py")
+    dest = _assembled_tree(tmp_path, "A bus analyzer.\n")
+    (dest / "data" / "real").mkdir(parents=True)
+    (dest / "data" / "real" / "b.txt").write_text("x\n", encoding="utf-8")
+    pats = tmp_path / "patterns.txt"
+    pats.write_text("zzqq-not-in-this-tree\n", encoding="utf-8")
+    monkeypatch.setenv("SWI3S_LEAK_PATTERNS", str(pats))
+    os.symlink("real", dest / "data" / "relative")
+    assert pt._file_count(str(dest)) == 4
+    assert pt.check_leak_scan(str(dest)) == []
+    os.symlink(str(dest / "data" / "real"), dest / "data" / "absolute")
+    assert pt._file_count(str(dest)) == 5
+    assert pt.check_leak_scan(str(dest)) == ["leak scan failed on the assembled tree"]
+    (dest / "docs" / "internal").mkdir(parents=True)
+    os.symlink("internal", dest / "docs" / "tier")
+    assert pt.check_dangling(str(dest)) == ["docs/tier"]
+
+
+def test_the_publish_tree_is_built_from_head_and_says_so(tmp_path, monkeypatch):
+    """With no sha the tree is HEAD's: the usage says so, and uncommitted changes to tracked
+    files are reported because they are not in it."""
+    import subprocess
+    pt = _load_tool("publish_tree.py")
+    assert "from HEAD: uncommitted changes are NOT included" in pt.__doc__
+    assert "from the working tree" not in pt.__doc__
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    (repo / "a.md").write_text("one\n", encoding="utf-8")
+    for cmd in (["git", "init", "-q"], ["git", "add", "a.md"],
+                ["git", "commit", "-q", "-m", "a"]):
+        subprocess.run(cmd, cwd=repo, check=True, env=env, capture_output=True)
+    monkeypatch.setattr(pt, "_ROOT", str(repo))
+    (repo / "untracked.md").write_text("x\n", encoding="utf-8")
+    assert pt.uncommitted_changes() == []
+    (repo / "a.md").write_text("two\n", encoding="utf-8")
+    assert [ln[3:] for ln in pt.uncommitted_changes()] == ["a.md"]

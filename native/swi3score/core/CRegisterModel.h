@@ -36,8 +36,10 @@ public:
     // Promote staged (_NEXT) values to live (_CURR) for the commit groups in
     // 'groupMask'. SLC/geometry registers are Commit Group 0; each data port
     // commits iff (its CommitGroupMemb & groupMask) != 0 (Section 9.1.10.4).
-    // Call this at the SSP row for a CONFIRM_COMMIT'd SSCR.
-    void Commit(U8 groupMask);
+    // Only the devices selected in 'deviceMask' (bit n = Device n) commit; a zero mask
+    // selects none (Section 8.1.1.5.1, the "Commit Phase for SSCR and DSCR Commands"
+    // table). Call this at the SSP row for a CONFIRM_COMMIT'd SSCR.
+    void Commit(U8 groupMask, U16 deviceMask);
 
     // Debug what-if: force `value` into the register at `addr` for `dev`, exactly
     // like a WriteA32 (stages at _NEXT for dual-ranked, immediate otherwise). The
@@ -115,9 +117,8 @@ public:
     // Spec-defined reset byte for the register at `baseAddr` (the value an
     // un-written register reads as). This is the SINGLE place per-register resets
     // live for the decode path — get() falls back to it, so no decode site
-    // hardcodes a reset. Cross-checked against data/registers.json by a test, so
-    // a non-zero spec reset can never be silently dropped (the bug that made
-    // ScramblerEn default OFF). Address is the normalised _NEXT-base form.
+    // hardcodes a reset. Cross-checked against data/registers.json by a test
+    // (test_register_model.py). Address is the normalised _NEXT-base form.
     static U8 resetOf(U32 baseAddr);
 
 private:
@@ -126,7 +127,7 @@ private:
         std::map<U32, U8> next;  // staged values awaiting Commit
         // Parallel provenance for cur/next (Source). Only the write/read entry points
         // stamp these and only Snapshot() reads them, so the decode/config maps above
-        // stay plain U8 (BuildConfig/get/CommittedSnapshot are unchanged).
+        // stay plain U8.
         std::map<U32, U8> curSrc;
         std::map<U32, U8> nextSrc;
     };

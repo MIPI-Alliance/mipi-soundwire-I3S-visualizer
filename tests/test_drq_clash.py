@@ -4,17 +4,11 @@ A DRQ's direction is not the parent data port's: `Device._drq_direction()` defin
 the opposite ("PortDirection_REG: True = SINK DP -> DRQ SOURCE"), because a Sink DP's flow
 control port DRIVES its DRQ to ask for data, while a Source DP samples it. Every other slot
 type takes its direction from `PortDirection_REG` directly, so for those the two forms of the
-question agree and nothing distinguishes them.
+question agree.
 
-The engine's clash check read `PortDirection_REG` anyway, which inverted the verdict for DRQ
-bits in both directions: two devices genuinely DRIVING one DRQ column — a physical two-driver
-collision — was recorded as a benign read overlap (and never registered as a write at all),
-while several devices legally SAMPLING one DRQ column was reported as a bus clash.
-
-WHY THIS NEEDED A HAND-BUILT CONFIG: the 96 vendored goldens carry no DRQ collision, so
-`test_visualizer_engine.py` (bits + bus_clashes + read_overlaps + warnings, the authoritative
-parity test) passes identically with the check inverted or correct. Fixing the inversion moves
-no golden. That is precisely why the bug survived, and why the case is pinned here instead.
+Two devices DRIVING one DRQ column is a bus clash; several devices SAMPLING one DRQ column
+is a read overlap. The vendored goldens in `test_visualizer_engine.py` carry no DRQ
+collision, so this file pins the case with a hand-built config.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_drq_clash.py
 """
@@ -76,7 +70,7 @@ def test_two_driven_drqs_in_one_column_are_a_bus_clash():
 
 def test_two_sampled_drqs_in_one_column_are_a_read_overlap():
     """Two Source DPs sample the same DRQ column. Multiple readers of one bit are legal, so
-    this is a read overlap — the direction the same inverted check got wrong the other way."""
+    this is a read overlap."""
     bm = _two_ports_sharing_a_drq_column(port_direction=False)
     assert _FCP_COLUMN in bm.read_overlaps, (
         f"two SAMPLED DRQs in column {_FCP_COLUMN} must be a read overlap; "
@@ -87,9 +81,8 @@ def test_two_sampled_drqs_in_one_column_are_a_read_overlap():
 
 
 def test_a_driven_drq_is_registered_as_a_write():
-    """The write must reach the clash detector, not just be classified. The inverted branch
-    also skipped `add_write` for a driven DRQ, so the column read as unoccupied to whatever
-    was placed next — a clash the model would then never see at all."""
+    """A driven DRQ reaches the clash detector through `add_write`, so the column reads as
+    occupied to whatever is placed next."""
     bm = _two_ports_sharing_a_drq_column(port_direction=True)
     drq_bits = [b for b in bm.bits if bm.bit_index(b.row, b.column) == _FCP_COLUMN]
     assert drq_bits, f"expected a bit placed at column {_FCP_COLUMN}"

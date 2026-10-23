@@ -15,16 +15,13 @@ numpy>=1.24
 pyarrow>=14.0
 
 # Runtime — memory headroom for the large-capture open guard (ingest/saleae_sal.py).
-# Optional in the sense that the guard falls back to a conservative fixed budget
-# without it, but then it cannot see ACTUAL free memory — declare it so the accurate
-# path is the normal one.
+# Without it the guard falls back to a conservative fixed budget instead of reading
+# actual free memory.
 psutil>=5.9
 
 # Runtime — Qt GUI
-# Below 6.12: with PySide6 6.12.0 the process crashes as the interpreter exits, after every
-# test has passed (a segfault on macOS, "pure virtual method called" and an abort on Linux),
-# and 6.11.1 does not. Keep this in step with pyproject.toml.
-PySide6>=6.6,<6.12
+# Keep this in step with pyproject.toml.
+PySide6>=6.6
 pyqtgraph>=0.13
 
 # Build — native swi3score decode core (pybind11); required by `pip install ./native`

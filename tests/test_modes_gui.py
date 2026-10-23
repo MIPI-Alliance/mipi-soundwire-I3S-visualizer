@@ -196,7 +196,7 @@ def test_workspace_carries_authoring():
     win._mode_mgr.switch_to(VISUALIZATION)
     win._authoring.config().dataports[5].enabled = True
     win._authoring.config().dataports[5].enable_ch = 0b101
-    # Timing page: set the Spec bus-length range (corners are auto-selected now, so
+    # Timing page: set the Spec bus-length range (corners are auto-selected, so
     # pin min == max to make the round-trip assertion exact).
     win._timing_page._min[("spec", "bus length (cm)")].setValue(42.0)
     win._timing_page._max[("spec", "bus length (cm)")].setValue(42.0)

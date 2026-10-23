@@ -98,7 +98,7 @@ def test_live_switch_rethemes_window():
     # Every colour-caching view exposes retheme() (so apply_theme reaches them all).
     for view in (win._authoring, win._viz_grid, win._grid_view, win._audio_view,
                  win._timeline, win._reg_view, win._cmd_view, win._symbol_view,
-                 win._raw_view, win._eye_view, win._meas_view):
+                 win._raw_view, win._eye_view, win._meas_view, win._timing_page):
         assert callable(getattr(view, "retheme", None)), type(view).__name__
 
     # The persisted preference reflects the last switch.
@@ -106,14 +106,70 @@ def test_live_switch_rethemes_window():
     print("ok: live MainWindow switch re-themes grid + keeps capture/cursor")
 
 
+def test_the_timing_page_follows_a_live_switch():
+    """The Timing Calculator follows View ▸ Appearance: each way, every style it builds
+    from the palette, and the red of a failing margin, are the new palette's."""
+    _app = QApplication.instance() or QApplication([])
+    from PySide6.QtWidgets import QTreeWidgetItemIterator
+
+    from swi3s_studio.ui.main_window import MainWindow
+
+    apply_palette("dark")
+    win = MainWindow()
+    page = win._timing_page
+    for mode in ("light", "dark"):
+        win.apply_theme(mode)
+        assert VizTheme.ENTRY_BG in page.styleSheet(), mode
+        assert f"color:{VizTheme.TEXT_DIM};" in page._subtitle.styleSheet(), mode
+        assert f"color:{VizTheme.TEXT_DIM};" in page._trace_hint.styleSheet(), mode
+        assert VizTheme.FRAME_BG in page._tree.header().styleSheet(), mode
+        reds = set()
+        it = QTreeWidgetItemIterator(page._tree)
+        while it.value():
+            if it.value().text(1).startswith("-"):
+                reds.add(it.value().foreground(1).color().name().lower())
+            it += 1
+        assert reds == {VizTheme.SEM_ERROR.lower()}, (mode, reds)
+
+
+def test_the_visualizer_dialog_button_follows_a_live_switch():
+    """The Bus Visualizer's CDS Settings "Open…" button sets its own style; each way, it is
+    the new palette's entry look."""
+    _app = QApplication.instance() or QApplication([])
+    from PySide6.QtWidgets import QPushButton
+
+    from swi3s_studio.ui.main_window import MainWindow
+
+    apply_palette("light")
+    win = MainWindow()
+    (button,) = [b for b in win._authoring.findChildren(QPushButton) if b.text() == "Open…"]
+    for mode in ("dark", "light"):
+        win.apply_theme(mode)
+        assert f"background:{VizTheme.ENTRY_BG};" in button.styleSheet(), mode
+        assert f"color:{VizTheme.TEXT};" in button.styleSheet(), mode
+
+
+def test_the_link_names_beside_the_timeline_follow_a_live_switch():
+    """The Link name beside each timeline band is drawn in the theme's text colour, each
+    way, so it never stays black on the dark palette."""
+    _app = QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+
+    apply_palette("light")
+    win = MainWindow()
+    win.load_demo_links()
+    assert len(win._ribbon_labels) >= 2
+    for mode in ("dark", "light", "dark"):
+        win.apply_theme(mode)
+        for label in win._ribbon_labels:
+            assert f"color: {VizTheme.TEXT};" in label.styleSheet(), mode
+
 # --- VizTheme's palette keys must stay DECLARED for a type checker ----------------------
 #
 # apply_palette() setattr()s every palette key onto VizTheme, so a type checker sees none
-# of them unless they are declared as bare annotations. Before they were, mypy reported
-# 243 "type[VizTheme] has no attribute" errors across 15 files — 54% of the entire tree's
-# type debt, from this one dynamic-assignment pattern. These tests pin the declaration
+# of them unless they are declared as bare annotations. These tests pin the declaration
 # against the palettes in both directions, so adding a colour without declaring it (or
-# declaring one that no palette defines) fails the build instead of quietly re-opening it.
+# declaring one that no palette defines) fails the build.
 
 def _annotations():
     from swi3s_studio.ui.theme import VizTheme

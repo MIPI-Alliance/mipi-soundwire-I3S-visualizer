@@ -10,8 +10,7 @@ An SSPA in the capture announces a real SSP, so it can supply that anchor. The d
 already re-anchors when it *reaches* one — but that only fixes rows from the SSPA
 onward; everything before it still decodes at the arbitrary phase. Feeding the row
 through the manual-SSP path reduces it modulo the LCM of the ports' interval periods, so
-the phase holds from row 0 and the WHOLE capture decodes cleanly. Measured on the sliced
-demo below: the pre-SSPA region goes from about -14 dB tone SNR to about +38 dB.
+the phase holds from row 0 and the WHOLE capture decodes cleanly.
 """
 import os
 import tempfile
@@ -129,7 +128,7 @@ def test_lock_applies_backwards_as_well_as_forwards(partial_capture, config_csv)
 
 
 def test_without_the_lock_the_pre_sspa_region_is_garbled(partial_capture, config_csv):
-    """Pins the bug the lock fixes, so the test above can't pass vacuously (e.g. if the
+    """Pins the decode without the lock, so the test above can't pass vacuously (e.g. if the
     slice happened to start already in phase). Forcing SSP auto (-1) restores the
     decoder's own behaviour: it re-anchors only when it REACHES the SSPA, so the region
     before it is at the arbitrary phase while the region after is clean."""

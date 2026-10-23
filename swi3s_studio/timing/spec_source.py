@@ -29,15 +29,13 @@ derivation. The three divergences that bite, in order of size:
    scopes it to its Clock pin, because SWI3S's two pins swap clock/data roles
    between Link Control and audio mode while SoundWire's do not. The Schmitt
    assumption is therefore not spec-guaranteed for a SoundWire *Data* receiver.
-   Treated globally (assumed OFF for SoundWire Data RX) rather than as a
-   per-receiver flag: it is worth ~0.9 ns at the baseline and changes no verdict.
-   :func:`schmitt_delta_ns` quantifies it so it can be reported, not hidden.
+   Treated globally (assumed OFF for SoundWire Data RX); :func:`schmitt_delta_ns`
+   quantifies it so it is reported.
 
 ``t_DZ`` is deliberately NOT reconciled (§4.3): SoundWire ends it at an abstract
 high-impedance event and SWI3S at a measurable 10 % V_SEOS departure, which makes
 the SWI3S number arrive systematically ~1 ns later for the same driver. Each
-spec's published value is used verbatim and the caveat surfaced, rather than
-inventing an offset that would look like a spec value.
+spec's published value is used verbatim and the caveat surfaced.
 """
 
 from __future__ import annotations
@@ -110,15 +108,11 @@ PROPOSAL_UI_RELATIVE_NOTE = (
 class LaunchMode(str, Enum):
     """How the Manager launches its data edge.
 
-    This is an *architectural* choice, not just a tighter number, and the
-    distinction is what makes it worth modelling: an analog delay line has a
-    min-to-max spread that the inequalities must absorb on both sides, while a
-    clock-launched edge is deterministic — min == max — so the spread vanishes.
-    Under the proposal that spread is 14 ns (9..23), and removing it is worth
-    more than any tightening of the range would be.
+    An analog delay line has a min-to-max spread (14 ns, 9..23, under the
+    proposal) that the inequalities absorb on both sides; a clock-launched edge
+    is deterministic — min == max — so the spread vanishes.
 
-    The trade runs in opposite directions on the two MP legs, which is why the
-    spec needs both clock options rather than picking one:
+    The two clock options trade in opposite directions on the two MP legs:
 
     * ``CLK4`` (0.25 UI) leaves the most setup room but the least hold, and is
       bounded by **hold** — 0.25*UI shrinks with the clock period, so it runs
@@ -151,8 +145,7 @@ def launch_grid_UI(mode: LaunchMode) -> float | None:
     """The clock's RESOLUTION, in UI, or None for analog.
 
     Numerically the same as the data edge's placement in `_LAUNCH_UI_FRACTION`,
-    and deliberately a separate function because it means something different and
-    is used differently.  The placement says where the DATA edge lands; the
+    but a different quantity.  The placement says where the DATA edge lands; the
     resolution says which points the Manager can place ANY clocked output on:
 
         2x   multiples of 0.50 UI  ->  0.00, 0.50
@@ -160,13 +153,7 @@ def launch_grid_UI(mode: LaunchMode) -> float | None:
 
     A 4x clock therefore offers three interior points, and t_ZD, t_DZ and t_DD do
     NOT have to pick the same one -- the EDE proposal is exactly such a design
-    (t_DD 0.50, t_ZD 0.00, t_DZ 0.50).  A 2x clock offers only 0.50, which is why
-    the EDE column's placements had to be checked against a 1/2 UI grid before 2x
-    could be recommended.
-
-    Collapsing the two meanings is what made an earlier version of this model force
-    every clocked Manager output onto the data edge's point, which is a real
-    restriction on the design space and not a conservative simplification.
+    (t_DD 0.50, t_ZD 0.00, t_DZ 0.50).  A 2x clock offers only 0.50.
     """
     return _LAUNCH_UI_FRACTION.get(mode)
 
@@ -177,32 +164,24 @@ def snap_to_launch_grid(value_ns: float, mode: LaunchMode, f_clk_MHz: float,
     """`value_ns` moved to the nearest point the mode's clock can actually place.
 
     Analog leaves it alone.  Under a clocked mode an off-grid value describes a
-    Manager that cannot be built with the selected clock, which reads as a
-    perfectly good number rather than as the impossibility it is -- so it is
-    snapped, and the caller reports that it was.
+    Manager that cannot be built with the selected clock, so it is snapped, and the
+    caller reports that it was.
 
     `floor_ns` is a lower bound the result may not fall below -- pass the row's
-    tabulated minimum.  Nearest-point snapping ROUNDS DOWN THROUGH IT otherwise, and
-    on a coarse grid it rounds down to zero: the PHY2 revision's Man_t_DD,min of
-    9.0 ns is 0.246 UI, so a 2x clock's nearest point is 0.00 UI and the row reads
-    0.00 -- a Manager launching data with no delay at all, which the same revision's
-    9 ns minimum exists to forbid.  It is also knife-edge: EDE's 0.25 UI seed is
-    9.155 ns, which rounds the other way to 0.50 UI, so 0.155 ns of seed decided
-    between 0.00 and 18.31.  With a floor the answer is the lowest placeable point
-    that still honours the minimum.
+    tabulated minimum.  Without it nearest-point snapping can round down through the
+    minimum, on a coarse grid to zero (the PHY2 revision's 9.0 ns Man_t_DD,min is
+    0.246 UI, whose nearest 2x point is 0.00 UI).  With a floor the answer is the
+    lowest placeable point that still honours the minimum.
 
-    `ceil_ns` is the mirror image and exists for one caller: Table 130's cap on an
-    EndDriveEarly release (`ede_release_ceiling_ns`).  Nearest-point snapping rounds
-    UP through it just as readily -- a 0.75 UI release on a 1/2 UI grid rounds to
-    1.00 UI, the boundary, which the table forbids -- so the result is the HIGHEST
-    placeable point that still honours the cap.
+    `ceil_ns` is the mirror image, for the EndDriveEarly ceiling on an EndDriveEarly release
+    (`ede_release_ceiling_ns`): the result is the HIGHEST placeable point that still
+    honours the cap (nearest-point snapping would take a 0.75 UI release on a 1/2 UI
+    grid to 1.00 UI, the boundary the ceiling forbids).
 
-    WHERE THE TWO CONFLICT THE CEILING WINS, and that case is not pathological: on a
-    1/2 UI grid nothing sits between EDE's 0.75 UI seed and the 0.873 UI cap, which is
-    exactly the statement "a 2x clock cannot express EDE".  The ceiling is a
-    specification bound while the floor is the row's own low end, so the honest
-    rendering is the latest legal point -- and the keeper leg then fails, which is how
-    the impossibility reaches the reader as a number rather than as a comment.
+    WHERE THE TWO CONFLICT THE CEILING WINS: the ceiling bounds the release, the floor
+    is the row's own low end.  On a 1/2 UI grid nothing sits between EDE's
+    0.75 UI seed and the 0.873 UI cap, so the result is the latest legal point and
+    the keeper leg then fails.
     """
     grid = launch_grid_UI(mode)
     if grid is None or f_clk_MHz <= 0:
@@ -210,11 +189,8 @@ def snap_to_launch_grid(value_ns: float, mode: LaunchMode, f_clk_MHz: float,
     step = grid * 1000.0 * duty_min / f_clk_MHz
     if step <= 0:
         return value_ns
-    # Half away from zero, NOT the built-in round(), which is half-to-even: a
-    # t_ZD exactly between two points would land on 0.00 UI from one side of the
-    # grid and 0.50 UI from the other, which is a coin flip dressed as a rule.
-    # A tie is arbitrary either way; this at least makes it the same arbitrary
-    # answer every time, and matches what a reader expects "nearest" to mean.
+    # Half away from zero, NOT the built-in round(), which is half-to-even: a tie
+    # resolves to the same point from either side of the grid.
     k = value_ns / step
     snapped = (math.floor(k + 0.5) if k >= 0 else math.ceil(k - 0.5)) * step
     if floor_ns is not None and snapped < floor_ns - 5e-4:
@@ -224,29 +200,32 @@ def snap_to_launch_grid(value_ns: float, mode: LaunchMode, f_clk_MHz: float,
     return snapped
 
 
-# Table 130 bounds an EndDriveEarly release at 0.60 UI + 10 ns from the START of the
-# last driven UI.  It is a CEILING on the release placement, and it is the ONLY thing
-# that forbids the UI boundary: no inequality does.  A release at 1.00 UI feeds the
-# keeper generously and leaves M->P contention comfortable -- the acquiring peripheral
-# cannot start at the edge whatever the Manager does, since it owes a flight, a
-# detection and its own t_ZD,min -- so a model without this bound reports the boundary
-# as a working design, and a 1/2 UI grid as able to express EDE.
+# THE EndDriveEarly CEILING IS THIS CALCULATOR'S WORKING BOUND, NOT THE SPECIFICATION'S. It
+# bounds an EndDriveEarly release at 0.60 UI + 10 ns from the START of the last driven UI.
+# It is a CEILING on the release placement, and it is the ONLY thing that forbids the UI
+# boundary: no inequality does.
+#
+# The "PHY2 Output Timing: Effect of EndDriveEarly" table (v1.1 r10) states neither the bound
+# nor that reference. It gives Per_tDZ_EndDriveEarly a 20.0 ns minimum from the clock edge
+# that launched the data and a maximum (TBD) from the next edge, a 3.5 ns minimum of settled
+# output before the release (Per_ / Man_tOutputSettledBeforeEDE), and leaves
+# Man_tDZ_EndDriveEarly TBD. The EDE legs, this ceiling and the EDE column's seeds are not
+# yet brought to that table.
 _EDE_RELEASE_CEIL_UI_FRAC = 0.60
 _EDE_RELEASE_CEIL_TURN_NS = 10.0
 
 
 def ede_release_ceiling_ns(UI_ns: float) -> float:
-    """The latest an EndDriveEarly release may sit, per Table 130.
+    """The latest an EndDriveEarly release may sit: the calculator's EndDriveEarly ceiling
+    (see above; not the specification's).
 
     31.97 ns at 12.288 MHz, which is 0.873 UI: the 0.75 UI placement clears it and the
     boundary does not.
 
-    Computed rather than written as a UI fraction because the 10 ns turn-off allowance
-    is ABSOLUTE, so the cap's position in UI moves with the rate -- and it moves the
-    unhelpful way.  As the rate rises the UI shrinks while the 10 ns does not, so above
-    ~18 MHz (where 0.40*UI < 10 ns) the cap sits past the boundary and stops binding at
-    all; the definition of an early release is what forbids the boundary there.  Below
-    that rate this is the tighter bound of the two and the one worth reporting.
+    The 10 ns turn-off allowance is ABSOLUTE, so the cap's position in UI moves with
+    the rate: above ~18 MHz (where 0.40*UI < 10 ns) the cap sits past the boundary and
+    stops binding, and the definition of an early release is what forbids the boundary
+    there.  Below that rate this is the tighter bound of the two.
     """
     return _EDE_RELEASE_CEIL_UI_FRAC * UI_ns + _EDE_RELEASE_CEIL_TURN_NS
 
@@ -256,8 +235,8 @@ def launch_mode_tDD_ns(mode: LaunchMode, f_clk_MHz: float,
     """(min, max) Man_t_DD for a clock-launched edge, or None for analog.
 
     A clock-launched edge lands on a known clock phase, so the min and max
-    collapse to the same value — that determinism, not the magnitude, is the
-    point. UI matches ``CalcInputs.UI_ns`` (half-period x duty floor).
+    collapse to the same value. UI matches ``CalcInputs.UI_ns`` (half-period x
+    duty floor).
     """
     frac = _LAUNCH_UI_FRACTION.get(mode)
     if frac is None:
@@ -291,13 +270,24 @@ def is_ede(spec: SpecSource) -> bool:
 
 
 def is_proposed(spec: SpecSource) -> bool:
-    """True for a not-yet-ratified SWI3S revision.
+    """True for the proposed PHY2 revision source, `SWI3S_PHY2_PROP`.
 
-    Kept separate from `is_soundwire` because the distinction the UI needs is
-    "is this a published number?" — a proposed value must never be presented
-    with the same authority as a tabulated one.
+    The UI uses it to keep that source out of the spec selector (it seeds the
+    Example column instead) and to route its rows through `preset()`. It is NOT
+    the test for "unratified": the EDE source is unratified too and is offered in
+    the selector. See `is_unratified`.
     """
     return spec.endswith("_PROP")
+
+
+def is_unratified(spec: SpecSource) -> bool:
+    """True for every source whose values are not ratified specification: the
+    proposed revision and the EDE proposal built on it.
+
+    A result computed from one carries `PROPOSAL_NOTE`: a proposed value must
+    never be presented with the same authority as a tabulated one.
+    """
+    return is_proposed(spec) or is_ede(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -339,13 +329,12 @@ def output_anchor_frac(spec: SpecSource, shape: RampShape) -> float:
     SWI3S t_DD stops at V_OL (20 % V_SEOS); SoundWire t_OV stops at V_OH (80 %),
     a full t_RF later. Returns 0.0 for a value that is already a pure delay.
 
-    FIGURE 174 GOVERNS, NOT TABLE 129'S WORDING. The table says Per_tZD is measured "to the
-    start point on the V-Ramp or G-Ramp" and Per_tDD to the "earliest change in data output",
-    which read as a 0 % anchor and would make this whole conversion a no-op. The figure shows
-    otherwise: both are drawn from the clock's V_IH,rising / V_IL,falling crossing to 20 % OF
-    THE RAMP. The table text is inaccurate; the drawing is what the parameters mean. Reviewed
-    and settled 2026-08-13 — see `docs/anchors.md`, which also records the argument that was
-    made for the other reading so it is not re-litigated from scratch.
+    THE PERIPHERAL OUTPUT TIMING FIGURE GOVERNS, NOT THE WORDING OF THE "PHY1 & PHY2 Output
+    Timing" TABLE. The table says Per_tZD is measured "to the start point on the V-Ramp or
+    G-Ramp" and Per_tDD to the "earliest change in data output", which read as a 0 % anchor and would make this whole conversion a no-op. The
+    figure shows otherwise: both are drawn from the clock's V_IH,rising / V_IL,falling crossing to
+    20 % OF THE RAMP. The table text is inaccurate; the drawing is what the parameters mean. See
+    `docs/anchors.md`.
 
     t_DZ IS EXEMPT and is used raw everywhere: it marks the instant the driver goes high-Z,
     which is abrupt. There is no ramp portion inside it to take back out.
@@ -376,25 +365,22 @@ def clock_anchor_frac(spec: SpecSource, shape: RampShape) -> float:
                              + tabulated
                              − [data V=0 → data anchor]   ← output_anchor_frac
 
-    **SWI3S returns 0.0 deliberately.** Its Manager anchors (Fig. 176) are
+    **SWI3S returns 0.0 deliberately.** Its Manager anchors (Manager Output Timing figure) are
     symmetric — clock 20 % and data 20 % — so the two offsets are equal and
     cancel, leaving the tabulated value already pure. Its Peripheral case
-    (Fig. 174) is asymmetric, but the model's −t_RF/3 there is calibrated
-    against the SE reference spreadsheet (58/58) and is NOT re-derived here:
-    disturbing a validated path to close a SoundWire-side gap is a bad trade.
+    (Peripheral Output Timing figure) is asymmetric, but the model's −t_RF/3 there is calibrated
+    against the SE reference spreadsheet (58/58) and is NOT re-derived here.
 
     **SoundWire returns V=0 → V_TP_Clock,max**, because t_OV and t_ZD start at
-    the clock's threshold crossing rather than the start of its ramp. Omitting it
-    understated a SoundWire transmitter's delay by 1.083·t_RF (5.85 ns at
-    t_RF = 5.4). It survived the 2026-08-03 data-side correction because that fix
-    addressed the *end* anchor and looked complete on its own.
+    the clock's threshold crossing rather than the start of its ramp: 1.083·t_RF
+    (5.85 ns at t_RF = 5.4).
 
     Same reference plane, so no propagation term: SoundWire v1.3 §5.2.1
     Permission 1 {1010} states the timing parameters are specified "with respect
     to the Clock signal at the external Clock signal node", which for a Manager
     is its own Clock output pin (§5.1.5.1). Both t_OV endpoints are therefore at
-    the transmitting device's own boundary, exactly as SWI3S Fig. 176 is, so the
-    two are directly comparable and t_PD stays outside on both sides.
+    the transmitting device's own boundary, exactly as the SWI3S Manager Output Timing figure is, so
+    the two are directly comparable and t_PD stays outside on both sides.
     """
     if not is_soundwire(spec):
         return 0.0
@@ -414,44 +400,29 @@ def pure_output_delay(
     """Convert a tabulated clock-to-output time into the pure delay the
     inequalities need (clock event → start of physical slew at the TX pin).
 
-    THE BACK-OUT IS A FIXED OFFSET, NOT A FUNCTION OF THE OPERATING SLEW, and it took a
-    reading of Fig. 174 to see why. The tabulated number was MEASURED at the spec's own
-    reference test condition, so the slew portion embedded in it is the one realised at
-    THAT slew — for SWI3S, `offset · 5.0 ns` = 1.667 ns. Per_t_DD,max,pure is therefore
-    18.333 ns and Per_t_DD,min,pure 0.333 ns, t_RF-independent.
-
-    This used to multiply by the OPERATING t_RF, which made the conversion track a
-    parameter the measurement cannot depend on: at the 8.3 ns slow corner it backed out
-    2.767 ns and reported Per_t_DD,max,pure as 17.233 — 1.1 ns of delay the device never
-    saves, handed back on exactly the corner where the leg is thinnest. The operating slew
-    is charged, correctly and heavily, by the crossing envelopes; it must not also be
-    credited here.
+    THE BACK-OUT IS A FIXED OFFSET, NOT A FUNCTION OF THE OPERATING SLEW. The tabulated
+    number was MEASURED at the spec's own reference test condition (Peripheral Output Timing
+    figure), so the slew portion embedded in it is the one realised at THAT slew — for SWI3S,
+    `offset · 5.0 ns` = 1.667 ns. Per_t_DD,max,pure is therefore 18.333 ns and Per_t_DD,min,pure
+    0.333 ns, t_RF-independent. The operating slew is charged by the crossing envelopes; it must not
+    also be credited here.
 
     The reference slew is each SIDE's own (`preset(spec, side).tRF_ns`), which matters on a
     mixed bus. For SoundWire it is the least-bad reading rather than a stated nominal: that
     field is t_Slew_Clock MAX, since the spec publishes no nominal — see the CAUTION on
     `SpecPreset.tRF_ns`.
 
-    Replaces the Peripheral-only hardcode this calculator used while both sides
-    were SWI3S. That hardcode was correct then and wrong the moment a side
-    becomes SoundWire, in both directions: a SoundWire Peripheral would have
-    received SWI3S's −t_RF/3, and a SoundWire Manager no correction at all when
-    t_OV needs the larger end-of-slew conversion (§4.2).
-
-    Two values are exempt, for different reasons:
+    Two values take a different conversion from the general one:
 
     * The SWI3S **Manager** t_DD is measured between symmetric anchors
-      (Fig. 176), so the slew portions cancel and the tabulated number is
-      already pure. Per_t_DD (Fig. 174) is asymmetric and is not.
+      (Manager Output Timing figure), so the slew portions cancel and the tabulated number is
+      already pure. Per_t_DD (Peripheral Output Timing figure) is asymmetric and is not.
 
-    * A SoundWire **min** corner is ``t_OH_Data``, which is not a
-      clock-referenced delay at all. SoundWire v1.3 Table 15 measures it
-      "from: V_Data >= V_OH_Data_Min / <= V_OL_Data_Max, to: Data output
-      becoming high impedance" — a *duration* the data stays valid, beginning
-      where t_OV ends. There is no clock-edge-to-slew-start portion to remove,
-      so converting it subtracts a slew that was never in the number. Doing so
-      cost 7.2 ns of phantom pessimism on the SW↔SW MP hold margin
-      (−2.83 → −10.03) before this was caught.
+    * A SoundWire **min** corner takes the clock-side re-anchor only. The
+      t_DD,min slot holds ``t_ZD_Data,Min`` (see `preset`), which is
+      clock-referenced at the clock's V_TP threshold and ends at low impedance,
+      before the slew, so no data-side portion is embedded in it to remove:
+      the result is ``t_spec + clock_anchor_frac · t_RF,ref``.
     """
     if not is_soundwire(spec) and side == "Man":
         return t_spec_ns                       # already pure — anchors cancel
@@ -485,12 +456,9 @@ def schmitt_delta_ns(
 
         Δ = (V_IH_eff − V_IL_eff) / swing_TX · (1 − τ)
 
-    SoundWire guarantees hysteresis only on its Clock pin, so this is the honest
-    cost to quote for a SoundWire Data receiver (§4.5). Exposed as a number
-    rather than a flag: it is worth ~0.9 ns at the baseline and changes no
-    verdict, which does not justify threading a receiver property through the
-    envelope construction — but it should be *reported*, not silently claimed
-    as margin.
+    SoundWire guarantees hysteresis only on its Clock pin, so this is the cost
+    to report for a SoundWire Data receiver (§4.5). It is reported as a number
+    (~0.9 ns at the baseline), not applied to the envelope.
     """
     vdd_plus = 1.0 + VDD_tol
     vdd_minus = 1.0 - VDD_tol
@@ -541,16 +509,17 @@ class SpecPreset:
     F_CLK_max_MHz: float
 
 
-# SWI3S v1.1r06 Tables 126 / 128 / 129. Man and Per differ, so both are held.
+# SWI3S v1.1r06: the "PHY1 & PHY2 Clock Frequencies", "PHY1 & PHY2 Input Timing" and
+# "PHY1 & PHY2 Output Timing" tables. Man and Per differ, so both are held.
 #
 # The two timing tables are structured differently, which matters when reasoning
 # about a proposed revision rather than just reading a value:
 #
-#   Table 128 (INPUT: t_IS, t_IH) is genuinely shared — ONE row per parameter,
-#   no PHY1/PHY2 distinction at all.
+#   The "PHY1 & PHY2 Input Timing" table (t_IS, t_IH) is genuinely shared — ONE row per
+#   parameter, no PHY1/PHY2 distinction at all.
 #
-#   Table 129 (OUTPUT) prints every parameter as a separate PHY1 row and PHY2
-#   row and never collapses them. Per_tDD, Per_tZD and Man_tZD differ between
+#   The "PHY1 & PHY2 Output Timing" table prints every parameter as a separate PHY1 row
+#   and PHY2 row and never collapses them. Per_tDD, Per_tZD and Man_tZD differ between
 #   the PHYs; Man_tDD (7-18), Man_tDZ and Per_tDZ (0-10) are two rows that
 #   happen to AGREE — not one shared value. The duplication below is therefore
 #   deliberate: if a revision diverges them, each PHY has a row to change.
@@ -630,8 +599,7 @@ _SW13: dict[SpecSource, dict] = {
 # Hold-side bound for a SoundWire transmitter: t_ZD_Data,MIN, taken from the
 # per-supply table below rather than t_OH_Data.
 #
-# t_OH_Data (6.7 ns) is the WRONG parameter here and this model used it until
-# 2026-08-04. Per SoundWire v1.3:
+# t_OH_Data (6.7 ns) is not the right parameter here. Per SoundWire v1.3:
 #   * Table 15 measures t_OH_Data "from data first becoming valid TO Data output
 #     becoming high impedance" — data-referenced, not clock-referenced.
 #   * It is a Permission ({1209}, §5.2.3), not a Requirement.
@@ -749,7 +717,7 @@ def launch_mode_max_fclk_MHz(mode: LaunchMode, *, tRF_ns: float = 5.0,
     """Highest f_clk at which a clock-launched mode closes both MP legs.
 
     Returns ``(f_max_MHz, binding_leg)``. The two modes fail from OPPOSITE
-    ends, which is the whole reason the spec needs both:
+    ends:
 
     * 4x is bounded by **hold** — its 0.25*UI launch delay shrinks as the clock
       speeds up, until it no longer covers the receiver's hold requirement.

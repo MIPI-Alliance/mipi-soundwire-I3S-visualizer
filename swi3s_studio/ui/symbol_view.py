@@ -80,10 +80,8 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self.setHorizontalHeaderLabels(_COLS)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         # Per-cell selection (spreadsheet-style), matching the Command table: copy one
-        # cell, or drag out an arbitrary range. Safe even though this pane drives the
-        # shared cursor, because the cursor now follows the CURRENT cell's row
-        # (currentCellChanged -> _on_current_cell) rather than selectedRows() — a
-        # partial-row cell selection would report no selected row. See copyable.py.
+        # cell, or drag out an arbitrary range. The shared cursor follows the current
+        # cell's row (currentCellChanged -> _on_current_cell). See copyable.py.
         from .copyable import enable_copy
         enable_copy(self, cells=True)             # ⌘/Ctrl+C copies the selected cells (TSV)
         self.setAlternatingRowColors(True)
@@ -181,11 +179,8 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self._populating = True
         prev_sel = self._suppress_select
         self._suppress_select = True          # setRowCount churns selection; don't echo it
-        self.setUpdatesEnabled(False)         # bulk-fill a VISIBLE table without a per-item
-        #                                       relayout/repaint (offscreen elides these; on a real
-        #                                       display filling up to 1024 rows x 8 cols one setItem
-        #                                       at a time otherwise triggers a repaint storm on every
-        #                                       settled cursor move — same fix as decoded_sample_view).
+        self.setUpdatesEnabled(False)         # bulk-fill a visible table without a per-item
+        #                                       relayout/repaint
         self.blockSignals(True)               # repopulating shouldn't emit selection
         try:
             self.setRowCount(len(symbols))
@@ -217,7 +212,7 @@ class SymbolView(RowOriginMixin, QTableWidget):
                          meanings[r]]
                 for c, text in enumerate(cells):
                     item = QTableWidgetItem(text)
-                    if c == 5:                        # Kind column (shifted by the new Disp + RD columns)
+                    if c == 5:                        # Kind column
                         item.setForeground(_KIND_COLOR.get(kind, QColor(VizTheme.SYM_UNKNOWN)))
                     if c == 4 and "!" in text:        # disparity (RD) violation stands out
                         item.setForeground(QColor(VizTheme.SEM_ERROR))
@@ -254,9 +249,8 @@ class SymbolView(RowOriginMixin, QTableWidget):
             return
         idx = 0
         if bus_row is not None:
-            # Symbol rows are ascending, so bisect to the first symbol at that bus row
-            # (was a linear next() scan over up to 1024 symbols per cursor move); fall
-            # back to the first symbol when there's no exact match.
+            # Symbol rows are ascending, so bisect to the first symbol at that bus row;
+            # fall back to the first symbol when there's no exact match.
             br = int(bus_row)
             i = bisect.bisect_left(self._symbol_rows, br)
             idx = i if (i < len(self._symbol_rows) and self._symbol_rows[i] == br) else 0
@@ -265,8 +259,7 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self.blockSignals(True)
         try:
             # Highlight the WHOLE row, not one cell: under per-cell selection
-            # (SelectItems) selectRow() marks only the current column's cell, which
-            # reads as a stray dot rather than "this is the symbol you picked".
+            # (SelectItems) selectRow() marks only the current column's cell.
             self.setCurrentCell(idx, max(0, self.currentColumn()))
             self.setRangeSelected(
                 QTableWidgetSelectionRange(idx, 0, idx, self.columnCount() - 1), True)

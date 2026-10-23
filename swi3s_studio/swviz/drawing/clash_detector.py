@@ -33,10 +33,7 @@ class SlotClashCategory(Enum):
 
 
 class SlotOccupancyType(Enum):
-    """Types of slot occupancy for clash detection.
-
-    Using an enum instead of strings for faster comparison and type safety.
-    """
+    """Types of slot occupancy for clash detection."""
     WRITE = "write"
     READ = "read"
     GUARD = "guard"
@@ -56,7 +53,7 @@ ClashType = SlotClashCategory
 class BitSlotOccupancy:
     """Tracks occupancy for a single bit slot."""
     device: int
-    slot_type: SlotOccupancyType  # Using enum for performance
+    slot_type: SlotOccupancyType
     canvas_ids: List[int] = field(default_factory=list)  # For handover arrows
 
 
@@ -95,7 +92,7 @@ class ClashInfo:
 class ClashDetector:
     """Detects and tracks bus clashes across bit slots.
 
-    Replaces 16 parallel arrays with clean dictionary-based tracking.
+    Occupancy is tracked per bit slot in a dictionary.
     """
 
     def __init__(self, NumColumns_REG: int):
@@ -177,7 +174,7 @@ class ClashDetector:
 
         Returns the FIRST matching occupant only. Safe for WRITE/TAIL, which
         the engine only ever adds once per (bit_slot, device). GUARD and
-        HANDOVER can have several occupants at once now that the CDS region
+        HANDOVER can have several occupants at once because the CDS region
         is per-source (Manager + up to 12 devices sharing one guard/handover
         column) — use _get_devices_for_type for those.
 

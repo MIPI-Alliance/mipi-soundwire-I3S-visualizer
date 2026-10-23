@@ -65,7 +65,8 @@ def _opcode_name(phase: int, op: int) -> str:
 
 
 def _peripheral_response(phase: int, token: int) -> str:
-    """Peripheral Response token name, resolved within the phase (Table 67)."""
+    """Peripheral Response token name, resolved within the phase ("Assignment of Robust
+    Token Numbers (Peripheral)" table)."""
     if token < 0:
         return "?"
     if token == 0:
@@ -265,11 +266,10 @@ class _Annotator:
 
     def _st_read_data(self, kind, val) -> str:
         # `read_bytes` data bytes, then CRC16 H/L, then a PM spacer + mgr response.
-        # INVARIANT: entered only with read_bytes >= 1 — the byte count is excess-1
-        # encoded (val+1 at line ~202, so a valid count is >= 1), and _st_read_resp
-        # only transitions here when read_bytes > 0. So the first call always takes
-        # the data branch and sets count=2 before the CRC branch runs; the CRC path
-        # can't be reached with a stale count==0.
+        # INVARIANT: entered only with read_bytes >= 1 (the byte count is excess-1
+        # encoded in _st_packet, and _st_read_resp transitions here only when
+        # read_bytes > 0). The first call takes the data branch and sets count=2
+        # before the CRC branch runs.
         if self.read_bytes > 0:
             label = f"Read Data[{self._rd_idx}] = 0x{(val & 0xFF):02X}" if (val is not None and val >= 0) else f"Read Data[{self._rd_idx}]"
             self._rd_idx += 1

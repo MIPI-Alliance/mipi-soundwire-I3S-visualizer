@@ -1,7 +1,7 @@
 """Bus-grid slot vocabulary — the single source of truth for the integer ``slot``
 kind carried on every grid cell.
 
-Three producers historically named these kinds independently; this enum unifies them:
+The kinds are shared by:
 
 - **C++ decode** (`native/swi3score/core/CDataPort.h` ``SwI3sSlot``): emits
   ``GridCell.slot`` for a decoded capture. Its ints for ``Empty..Drq`` (0..6) are
@@ -12,8 +12,7 @@ Three producers historically named these kinds independently; this enum unifies 
 
 Ints 7–9 (S0/S1/Handover) are placement-only kinds the C++ decode never emits as
 data cells but the Visualizer authoring engine does. ``tests/test_grid_slots.py``
-pins 1–6 to ``swi3score.SLOT_NAMES`` so a C++ enum reorder is caught at test time
-instead of silently mis-colouring the grid.
+pins 1–6 to ``swi3score.SLOT_NAMES``, catching a C++ enum reorder.
 """
 from __future__ import annotations
 

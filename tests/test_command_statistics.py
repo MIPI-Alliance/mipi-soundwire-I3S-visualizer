@@ -1,15 +1,15 @@
 """Expandable per-command statistics.
 
-The Statistics pane's Commands section used to be one flat count per command kind.
-Each kind is now a collapsible GROUP whose detail rows carry the breakdown:
+In the Statistics pane's Commands section each command kind is a collapsible GROUP
+whose detail rows carry the breakdown:
 
   * Ping      -> per-peripheral response states (PING_ATTACHED, PING_ATTACHED_BUSY,
                  PING_ALERT, PING_ALERT_BUSY, NO_RESPONSE)
   * Read/Write -> per-device command count, bytes read/written, and error count
 
-That needed a SECOND fold level in MeasurementsView: a detail row is visible only when
-both its group is expanded and its section is not collapsed. Groups start collapsed, so
-the section still reads as one line per command kind until you ask for more.
+MeasurementsView has a SECOND fold level: a detail row is visible only when both its
+group is expanded and its section is not collapsed. Groups start collapsed, so the
+section reads as one line per command kind until you ask for more.
 """
 import pytest
 
@@ -100,9 +100,7 @@ def test_ping_detail_shows_an_alert_on_a_present_peripheral():
 
 
 def test_ping_detail_does_not_invent_attached_peripherals():
-    """The regression this fixes: the demo used to drive PING_ATTACHED for all twelve
-    peripherals, so the breakdown claimed twelve attached devices on a bus that
-    configures one. Only devices the demo actually has may report ATTACHED."""
+    """Only devices the demo actually has may report ATTACHED."""
     for kw, present in [(dict(phy=2, cold_start=True), {0}),
                         (dict(phy=1, cold_start=True), {0}),
                         (dict(phy=3, cold_start=True), {0}),
@@ -160,8 +158,7 @@ def test_write_byte_total_matches_the_decoded_payloads():
 
 
 def test_kinds_without_a_breakdown_are_not_groups(rows):
-    """An arrow that expands to nothing is worse than no arrow: SSCR/SSPA have no
-    per-device breakdown, so they stay plain rows."""
+    """SSCR/SSPA have no per-device breakdown, so they stay plain rows (no arrow)."""
     cmds = _section(rows, "Commands")
     for r in cmds:
         if r[0].strip() in ("SSCR", "SSPA"):
@@ -251,7 +248,7 @@ def test_group_state_survives_a_repopulate(view, rows):
 
 
 def test_section_headers_still_fold(view):
-    """The original single-level behaviour is intact."""
+    """Section headers fold their rows (the first fold level)."""
     header = sorted(view._sections)[0]
     children = view._sections[header]
     assert children
@@ -265,12 +262,10 @@ def test_section_headers_still_fold(view):
 
 # --- a group's own error row must fold WITH the group -----------------------------------
 #
-# Found by the 3.0.11 release review. `_rw_detail_rows` reports a device's error count as
-# kind "fail" (red), but MeasurementsView only adopted kind "detail" into the open group.
-# The errors row therefore stayed visible under a COLLAPSED group and, worse, ended the
-# group — so every following device's rows leaked out too. No fixture reaches it: none of
-# the demo captures contains a CRC-errored Read/Write, so the whole suite passed. These
-# tests use the row shape directly, and pin the kind-vocabulary contract that was violated.
+# `_rw_detail_rows` reports a device's error count as kind "fail" (red); MeasurementsView
+# adopts it into the open group like a "detail" row, so it folds with the group and does
+# not end it. None of the demo captures contains a CRC-errored Read/Write, so these tests
+# use the row shape directly, and pin the kind-vocabulary contract.
 
 def _fold_rows():
     """The exact shape _rw_detail_rows emits when device 0 has errors and device 1 follows."""
@@ -303,9 +298,8 @@ def test_an_error_row_does_not_orphan_the_devices_after_it(view):
 
 
 def test_every_detail_kind_is_adopted_by_its_group():
-    """The contract the leak broke: whatever kinds the detail builders emit must all be
-    kinds MeasurementsView folds. Guards the seam rather than one row shape, so adding a
-    new styled child kind can't silently reintroduce this."""
+    """Whatever kinds the detail builders emit must all be kinds MeasurementsView folds.
+    Guards the seam rather than one row shape, so a new styled child kind is covered."""
     from swi3s_studio.analysis import measurements as m
     from swi3s_studio.ui.measurements_view import _GROUPED_KINDS
 

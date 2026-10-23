@@ -5,11 +5,10 @@ Links, row and UI numbers share no origin, so they are elapsed time at a rate th
 SHARE, and each is shown only when they do: one UI (row) rate on both Links, across the
 whole interval between the bookmarks.
 
-What these pin is that "share" is judged on the timing IN FORCE there. It used to be one
-number per capture, the rate at its END, so a pair in a region running another geometry
-borrowed the final rate: the PHY2 demo's 8-column region rows at 3.072 MRows/s, but its
+What these pin is that "share" is judged on the timing IN FORCE there, per region, not on
+one capture-wide rate: the PHY2 demo's 8-column region rows at 3.072 MRows/s, but its
 capture ends at 16 columns and 1.536 MRows/s, which a flow-control Link in 16 columns also
-runs, so ΔRows was shown, at the wrong rate.
+runs.
 
 The fixture is the two-Link demo pair at offset 0, one timeline at 500 MHz. Regions
 (samples): PHY2 demo, 8 columns [1,279,847, 2,321,513) and 16 columns from 2,321,513; the
@@ -59,7 +58,7 @@ def _delta(win, s1, link1, s2, link2):
 
 
 def test_the_regions_measure_the_rates_each_geometry_runs(pair):
-    """The premise, and the fix's foundation: per-region rates, not one per capture."""
+    """Per-region rates, not one per capture."""
     _win, phy2, fc = pair
     assert _region(phy2, 8)[3] == pytest.approx(3_072_000, rel=1e-4)
     assert _region(phy2, 16)[3] == pytest.approx(1_536_000, rel=1e-4)
@@ -72,7 +71,7 @@ def test_the_regions_measure_the_rates_each_geometry_runs(pair):
 def test_rows_are_withheld_where_the_row_rates_differ_and_uis_still_shown(pair):
     """Link 1 in 8 columns (3.072 MRows/s), Link 2 in 16 (1.536): no common row timing,
     so no ΔRows. Both run a 24.576 MHz UI, so ΔUI is shown. The capture-wide rates (1536
-    and 1536) said otherwise."""
+    and 1536) agree."""
     win, phy2, fc = pair
     r8, r16 = _region(phy2, 8), _region(fc, 16)
     s1, s2 = 1_600_000, 2_000_000
@@ -124,8 +123,8 @@ def test_a_bring_up_has_no_rows_to_share(pair):
 
 def test_one_links_counts_are_exact_across_a_ui_rate_change():
     """Within one Link ΔUI is a count. On DLV the UI rate rises fourfold at the Safe-Lock-4
-    to 16-column commit, so the old sample gap over the capture-wide (final) UI rate counted
-    the Safe-Lock stretch four times over."""
+    to 16-column commit, so the sample gap over the capture-wide (final) UI rate is far
+    from the count."""
     from swi3s_studio.session import Session
     from swi3s_studio.ui.main_window import MainWindow
     QApplication.instance() or QApplication([])
@@ -138,5 +137,5 @@ def test_one_links_counts_are_exact_across_a_ui_rate_change():
     count = phy3.ui_index(s2) - phy3.ui_index(s1)
     assert dui == f"{count:,}"
     old = (s2 - s1) * phy3.ui_rate_hz / phy3.sample_rate_hz
-    assert abs(old - count) / count > 0.1               # what it used to say: far off
+    assert abs(old - count) / count > 0.1               # the capture-wide estimate: far off
     assert drows == f"{phy3.bus_row_for_sample(s2) - phy3.bus_row_for_sample(s1):,}"

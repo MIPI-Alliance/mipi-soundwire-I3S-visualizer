@@ -23,10 +23,9 @@ See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for a pane-by-pane walkthrough (i
 partial captures and finding the SSP), [`docs/architecture.md`](docs/architecture.md) for
 the design, and [`docs/TESTING.md`](docs/TESTING.md) for the test strategy.
 
-> **Successor to the SWI3S Traffic Visualizer.** SWI3S Studio grew out of, and
-> supersedes, the MIPI SoundWire I3S Traffic Visualizer — the **Visualization** mode
-> is that tool, and Studio adds the **Timing** and **Analysis** modes around it. It is
-> this repository's next major line (v3); the visualizer's v1/v2 releases remain
+> **Successor to the SWI3S Traffic Visualizer.** The **Visualization** mode is the MIPI
+> SoundWire I3S Traffic Visualizer; Studio adds the **Timing** and **Analysis** modes
+> around it. This is the repository's v3 line; the visualizer's v1/v2 releases remain
 > available as their `v1.*` / `v2.*` tags.
 
 ## Running
@@ -46,9 +45,13 @@ fresh build of the native core — which is what you want after pulling changes 
 `native/`. The compiled module isn't tracked in git, and the app reports an "out of date —
 rebuild" message if it spots a stale one.
 
-Both launchers pick the newest **3.11–3.13** they can find, because PySide6 / pyarrow / numpy
-have no 3.14+ wheels yet and pip would otherwise try to build Arrow from source. On 3.14 use
-the manual setup below, once wheels exist for your platform.
+Ctrl+C in the terminal that launched the app quits it as File ▸ Quit does; if that quit
+hangs, a second Ctrl+C ends the process at once.
+
+Both launchers pick the newest **3.11–3.13** they can find, and refuse a newer one. Python
+3.14 is tested on Windows x64 (CI and the release gate install `requirements.txt` there);
+on Windows 3.14 use the manual setup below. On other platforms 3.14 is unverified: if
+PySide6 or pyarrow has no wheel for it there, pip tries to build Arrow from source and fails.
 
 **The virtualenv lives outside the repo** — `~/.cache/swi3s-studio/…`, or
 `%LOCALAPPDATA%\swi3s-studio\…` on Windows — so it is safe to clone under a
@@ -78,9 +81,7 @@ sudo zypper install python3-devel  # SUSE
 ```
 
 macOS (Xcode command-line tools) and the python.org Windows installers ship the headers
-already. If they're missing, the build now stops at configure time and says so; it used
-to fail confusingly part-way through compiling with `fatal error: Python.h: No such file
-or directory`.
+already. If they're missing, the build stops at configure time and says so.
 
 **No root / no sudo?** You don't need it — you need *a* Python that has headers, or a private
 copy of them. Pick the first option that works; each is self-contained in your home directory.
@@ -172,8 +173,19 @@ PYTHONPATH=. python3 -m swi3s_studio.app
 ```
 
 After pulling changes that touch `native/`, rebuild the core
-(`python3 -m pip install ./native`). The compiled module isn't tracked in git; the app
-reports an "out of date — rebuild" message if it detects a stale build.
+(`python3 -m pip install --force-reinstall --no-deps ./native`; pip rebuilds a local
+directory even at the same package version, so the plain `python3 -m pip install ./native`
+the app's message gives rebuilds it too). The compiled module isn't tracked in git; the app
+reports an "out of date" message, with the rebuild command, when the core's ABI number is
+lower than the app requires, and not otherwise.
+
+**A `swi3score*.so` at the checkout's root is imported first.** `bash native/build_local.sh`
+(the offline build, and the build `tests/gate.sh` runs on macOS and Linux) writes the module
+there, and `PYTHONPATH=.`, which `./run.sh` and the recipe above both set, puts it ahead of
+the one pip installed. If that file exists, rebuild it with `bash native/build_local.sh`
+after pulling `native/` changes, or delete it so the installed build is used.
+`python3 -c 'import swi3score; print(swi3score.__file__)'`, run from the checkout's root,
+names the module in use.
 
 ### Command line
 
@@ -195,7 +207,7 @@ Exit codes, for scripting:
 | code | meaning |
 |---|---|
 | 0 | model written, nothing critical found |
-| 1 | error — bad usage, missing config, unwritable output. No model written. |
+| 1 | error — bad usage, missing config, a config that does not load (for example a row with the wrong number of cells), unwritable output. No model written. |
 | 2 | model written, **but** it contains a bus clash or a truncated DRQ |
 
 ### Windows
@@ -216,8 +228,8 @@ Exit codes, for scripting:
   `pip install .\native` fails with a "Microsoft Visual C++ 14.0 or greater is required"
   error.
 - **Use the `py` launcher** to get a supported version if several Pythons are installed.
-  `run.ps1` auto-selects the newest **3.11–3.13** (PySide6/pyarrow/numpy have no 3.14+
-  wheels yet, so a 3.14 default would fail to install).
+  `run.ps1` auto-selects the newest **3.11–3.13** and refuses 3.14. On x64 Windows 3.14
+  installs and passes the suite: use the manual setup above with it.
 - **Windows on ARM (Parallels, Surface Pro X).** Install the **x64** build of Python, not
   the arm64 one: `pyarrow` ships no `win_arm64` wheel, so pip would try (and fail) to
   build Arrow from source. Windows-on-ARM runs x64 Python fine under emulation, and all
@@ -246,7 +258,8 @@ swi3s_studio/   Python app: ingest, store, model, analysis, dsp, timing, ui
   timing/              SWI3S PHY timing calculator
 native/         swi3score C++ decode core + pybind11 bindings (scikit-build-core)
 data/registers.json    SWI3S register map (source of truth)
-docs/           USER_GUIDE, DEVELOPMENT, TESTING, architecture, PACKAGING, releases/, …
+docs/           USER_GUIDE, DEVELOPMENT, TESTING, architecture, PACKAGING, STYLE_GUIDE, anchors,
+                releases/, …
 tests/          Python suites + run_all.sh
 ```
 
@@ -272,31 +285,34 @@ so); the decode after it is watched, and stopped if free memory runs low. See `d
 Several SWI3S Links (one Manager and its Peripherals each) can be open at once, from one
 file or several, on one shared time base; see the User Guide's *Multiple Links*.
 
-**File ▸ Open Demo Capture ▸ PHY1 / PHY2 / PHY3** runs a synthetic capture for the chosen
-PHY, each with a §5.1.2 Cold Start spliced in front and the same audio content (DP0 at
+**File ▸ Open Demo Capture ▸ PHY1 / PHY2 / PHY2 (Flow Control) / PHY3 (DLV)** runs a
+synthetic capture. PHY1, PHY2 and PHY3 each have a §5.1.2 Cold Start spliced in front and the
+same audio content (DP0 at
 44.1 kHz by payload interval skipping, DP1 at 48 kHz): PHY1 a slow 4-column FBCSE bus whose ports are repositioned
 mid-capture, PHY2 an FBCSE bus stepping 2→8→16 columns, PHY3 the differential DLV variant
-with a recovered bit clock. All sample at 500 MHz (a real analyzer's fixed rate — a
-non-integer number of samples per UI). *PHY2 (Flow Control)* and *PHY2 (Two Links)* are
-there too.
+with a recovered bit clock. *PHY2* opens two Links: that PHY2 bus as Link 1 and the *PHY2
+(Flow Control)* demo as Link 2, later on the shared timeline. All sample at 500 MHz (a real
+analyzer's fixed rate — a non-integer number of samples per UI). Each entry opens with a
+bundled workspace (`data/demos/*.swi3s`) that names its data ports and config regions and
+sets up the panes and the dock layout.
 
 **Decode ▸ Import Visualizer CSV…** applies a Visualizer config CSV to the open capture —
 decoding with that data-port config from row 0 (for a capture that begins *after* the setup
 commit, where the port geometry isn't on the wire to snoop), or, on a capture with several
-config regions, in the region under the cursor only — or compares it, or the
+config regions, in the region under the playhead only — or compares it, or the
 authored config, against the decode. See the User Guide's *Partial captures &
 finding the SSP* for the full workflow.
 
 **File ▸ Locate Sub-Capture…** finds every recurrence of a smaller reference capture and
-bookmarks each; **File ▸ Export Capture…** writes the open capture out as a `.sal`, `.bin`
+places a cursor at each; **File ▸ Export Capture…** writes the open capture out as a `.sal`, `.bin`
 or CSV, whole or a window.
 
 ## Workspaces, compare, export
 
 - **Save / Open Workspace** — a `.swi3s` file (JSON inside): every Link's capture source,
   name and offset, config CSV, SSP row, what-if overlay, Filter & Gain, data-port and region
-  names, bookmarks,
-  cursor, authored config and timing inputs, and the whole view (each Link's Commands
+  names, cursors,
+  playhead, authored config and timing inputs, and the whole view (each Link's Commands
   filter and Audio and Capture views, the pane layout, zooms, the side panes' settings).
   Captures are named relative to the workspace, so a folder holding both can move, and a
   capture it cannot find is asked for. Results re-decode on open, so it stays portable.
@@ -304,17 +320,30 @@ or CSV, whole or a window.
   the authored config) against the decode: differing grid cells outlined, a per-cell
   report, expected register values overlaid (the Registers pane's *Clear Compare* removes
   it).
-- **Decode ▸ Per-Dataport Scrambler…** — override the descrambler per (device, data
+- **Decode ▸ Dataport Scramblers…** — override the descrambler per (device, data
   port): Auto / On / Off, then re-decode (fixes a mis-snooped `ScramblerEn`, which
   otherwise turns the stream into noise).
-- **Export** — Audio as WAV (choose streams + range, optional band-limited resample),
+- **Export** — Audio as WAV (**Audio ▸ Export…**: choose streams + range, optional band-limited resample),
   Commands as CSV, Bus Grid as SVG/PNG. See [`docs/PACKAGING.md`](docs/PACKAGING.md) for a
   standalone bundle.
 
 ## Tests
 
+The test tools — pytest, pytest-cov, ruff and mypy at the version the type ratchet compares
+against — are listed in `requirements-dev.txt`, which also installs the runtime set. One
+script installs them and builds the decode core, into the same venv `run.sh` / `run.ps1` use:
+
+```bash
+bash tools/setup_dev.sh               # macOS / Linux  (--test: then run the suite)
+.\tools\setup_dev.ps1                 # Windows        (-Test:  then run the suite)
+```
+
+It prints the venv's activate command and the test commands. By hand, in any environment:
+`python3 -m pip install -r requirements-dev.txt` and `python3 -m pip install ./native`.
+
 ```bash
 bash tests/gate.sh                    # THE release gate: suite + perf + ruff + mypy + ABI
+python3 tools/screenshots.py          # just the screenshots check (build/screenshots/)
 bash tests/gate.sh --quick            # dev loop (skips perf + the process-isolated pass)
 python3 -m pytest                     # the functional suite (perf is deselected by default)
 bash tests/run_all.sh                 # every suite in its own process (gate.py --only per-suite)
@@ -323,16 +352,22 @@ bash tests/run_all.sh --perf          # the perf benchmarks instead
 bash tests/run_all.sh --native        # also run the native C++ suite
 ```
 
-`gate.sh` is what a release must pass, on macOS **and** Windows, at the release commit — it
+`gate.sh` is what a release must pass, on macOS, Windows **and** Linux, at the release commit — it
 rebuilds the native core and asserts `score_abi`, then runs the suite, the perf gate, the
-process-isolated pass, `ruff`, and a mypy non-regression check, reporting every failure
-rather than stopping at the first. It needs `ruff` and `mypy` on `PATH`
-(`brew install ruff mypy`), and treats a missing tool as a failure rather than a silent skip.
+process-isolated pass, `ruff`, a mypy non-regression check, the leak scan and the screenshots
+check, reporting every failure rather than stopping at the first. The screenshots check
+renders every mode in light and dark on the platform's own style, fails on wrong-theme panes,
+widgets a live theme switch missed, faint or missing text and clipped labels, and leaves a
+contact sheet in `build/screenshots/contact_sheet.png` to review. It needs `ruff` and `mypy` on `PATH` or importable by the
+gate's Python, mypy at the version `tools/mypy_baseline.json` records under `env` (the pin in
+`requirements-dev.txt`), and treats a missing tool as a failure rather than a silent skip.
+Another mypy version reports the ratchet NOT COMPARABLE, listed under NOT RUN HERE, which is
+not a pass.
 
 The runner is a pytest wrapper, so it covers exactly what `ci.yml` declares. CI runs on this
-repository, and its lint/type job became blocking in 3.0.12 — but it has no process-isolated
-per-suite pass and no stale-core ABI assertion, so the enforced gate remains `tools/gate.py`,
-run by hand on macOS and Windows at the release commit. See docs/DEVELOPMENT.md.
+repository and its lint/type job is blocking, but it has no process-isolated per-suite pass
+and no stale-core ABI assertion, so the enforced gate is `tools/gate.py`, run by hand on
+macOS, Windows and Linux at the release commit. See docs/DEVELOPMENT.md.
 
 A single suite runs directly (GUI suites need the Qt offscreen platform):
 
@@ -352,7 +387,7 @@ Version numbers, branches and tags follow [`GOVERNANCE.md`](GOVERNANCE.md): a mi
 release adds functionality, and a sub-minor release carries fixes only.
 
 **Supported:** 3.x, the current major version. Fixes are made on its latest minor
-version, currently 3.0; within a major version releases stay compatible, so moving up to
+version, currently 3.1; within a major version releases stay compatible, so moving up to
 the latest minor version is how an older 3.x install gets a fix. The SWI3S Traffic
 Visualizer's `v1.*` and `v2.*` releases are no longer maintained.
 

@@ -8,17 +8,9 @@ interval it must place exactly
 data slots, wherever ChannelGrouping happens to break them across rows. Grouping is a
 *layout* control: it decides how the slots are arranged, never how many there are.
 
-That invariant was violated whenever the enabled-channel count was not a multiple of
-ChannelGrouping. The trailing group is then PARTIAL (3 channels in groups of 2 leaves a
-group of 1), and `CDataPort::advanceChannel` reset the group's channel countdown to the
-nominal `mEffChannelGrouping` instead of the partial group's real size — so the last
-group transported as if it were full and the port emitted one extra DATA cell per
-interval (7 where 3x2x1 = 6), walking channel_index past the enabled channels.
-
-The vendored swviz engine clamped this correctly (`_advance_channel` sizes the group
-with a `min`), which is why the two engines disagreed and why the reference model was
-the authority. Guarding the invariant directly, rather than one config's placement,
-because it is the property the user can state without reading either engine.
+When the enabled-channel count is not a multiple of ChannelGrouping the trailing group
+is PARTIAL (3 channels in groups of 2 leaves a group of 1) and transports only its real
+channel count. The vendored swviz engine is the reference.
 """
 import os
 import pathlib
@@ -72,15 +64,15 @@ def _data_cells(path: str, dp: int = 0, rows: int = _ROWS):
 
 
 def test_the_reported_config_places_six_slots_per_interval():
-    """The reported case: 3 channels, ChannelGrouping 2, SampleGrouping 1 (2 samples),
-    1 bit each -> 6 slots per interval. The core placed 7."""
+    """3 channels, ChannelGrouping 2, SampleGrouping 1 (2 samples), 1 bit each -> 6
+    slots per interval."""
     cells = _data_cells(_CSV, rows=8)          # the file's own RowsToDraw = 8, one interval
     assert len(cells) == 3 * 2 * 1
 
 
 def test_reported_config_matches_the_reference_model():
-    """Placement + channel/bit identity must equal the vendored swviz engine, which
-    was already correct here. (The `sample` field is deliberately NOT compared: swviz
+    """Placement + channel/bit identity must equal the vendored swviz engine. (The
+    `sample` field is deliberately NOT compared: swviz
     reports an engine-reconstructed ABSOLUTE ordinal, the core reports the
     transport-scoped sample_in_group — a documented convention difference, not a
     placement one. See swviz/core/engine.py's global_sample.)"""
@@ -100,8 +92,7 @@ def test_reported_config_matches_the_reference_model():
 def test_slot_budget_holds_for_every_grouping(nch, cg):
     """channels x samples x bits per interval, for every channel/grouping pair.
 
-    Includes the multiples (where grouping divides evenly and the bug was invisible)
-    so the test also pins that the fix didn't break the common case. ChannelGrouping 0
+    Includes the multiples, where grouping divides evenly. ChannelGrouping 0
     means "one group of all channels"; a grouping wider than the channel count is
     clamped — both must still balance the budget.
     """
@@ -131,9 +122,7 @@ def test_slot_budget_holds_across_sample_shapes(sg, ss):
 
 
 def test_channel_index_never_escapes_the_enabled_set():
-    """The other half of the bug: over-running the partial group walked channel_index
-    past the enabled channels. Every emitted cell must name a channel that is actually
-    enabled (the standalone v2 visualizer raised IndexError on exactly this)."""
+    """Every emitted cell must name a channel that is actually enabled."""
     for nch in range(1, 9):
         for cg in range(0, 9):
             path = _config(nch, cg, 1, 0)
@@ -146,9 +135,8 @@ def test_channel_index_never_escapes_the_enabled_set():
 
 
 def test_every_sample_and_channel_appears_exactly_once_per_interval():
-    """Stronger than counting: with a partial trailing group each (sample, channel)
-    pair must be transported exactly once per interval — a duplicate would keep the
-    total right while still transporting the wrong thing."""
+    """With a partial trailing group each (sample, channel) pair must be transported
+    exactly once per interval."""
     path = _config(3, 2, 1, 0, rows=12)              # one interval
     try:
         cells = _data_cells(path, rows=12)

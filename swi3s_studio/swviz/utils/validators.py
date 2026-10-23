@@ -1,9 +1,7 @@
 """
 Validation utilities for MIPI SoundWire I3S Visualizer.
 
-Two validation categories, intentionally separated so the settings category
-can serve as source material for written requirements in the SWI3S
-specification:
+Two validation categories:
 
     - Ranges   — register bit-field bounds. In hardware these are enforced
                  by the registers themselves; we check them here because the
@@ -102,8 +100,8 @@ class DataPortValidator:
     """Validates DataPort configurations (plus the associated FCP).
 
     validate() is the single public entry point. It runs range checks first,
-    then settings checks. The two groups are cleanly separated internally so
-    that settings rules can be enumerated as SWI3S specification requirements.
+    then settings checks; each settings check is one SWI3S specification
+    requirement.
     """
 
     def __init__(self, interface: Any):
@@ -634,10 +632,9 @@ class DataPortValidator:
 class InterfaceValidator:
     """Validates Interface configurations.
 
-    validate() is the single public entry point. No range checks here yet —
-    interface registers are validated through field descriptors elsewhere —
-    but the method layout mirrors DataPortValidator so additions land
-    consistently.
+    validate() is the single public entry point. There are no range checks:
+    interface registers are validated by their field descriptors. The method
+    layout mirrors DataPortValidator.
     """
 
     def __init__(self, interface: 'Interface'):

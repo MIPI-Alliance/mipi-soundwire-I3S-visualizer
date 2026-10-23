@@ -35,6 +35,7 @@ from PySide6.QtGui import QColor, QCursor, QFont
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QToolTip, QVBoxLayout, QWidget
 
 from ..nputil import searchsorted as _ss
+from ..nputil import searchsorted_many
 from . import line_style
 from .grid_view import bookmark_pair_color as _bookmark_pair_color
 from .grid_view import dp_line_color  # shared stable per-(device,dp) hue (grid/audio/capture)
@@ -43,9 +44,8 @@ from .plot_widgets import XWheelViewBox
 from .port_names import port_label
 from .theme import VizTheme, analyzer_stylesheet
 
-# Trace and marker colours are read from VizTheme at use, not copied at import: this
-# module is imported before app.py applies the saved theme, so a copy held the default
-# (dark) palette until the first theme switch rebound it. The Column-0 (CDS) markers are
+# Trace and marker colours are read from VizTheme at use, never copied at import: this
+# module is imported before app.py applies the saved theme. The Column-0 (CDS) markers are
 # TEXT: neutral high-contrast (the repeating grid). A confirmed commit's marker is drawn
 # where the commit TAKES EFFECT (its Commit Synchronization Point), in SEM_SYNC so it
 # matches the timeline's "Commit Sync Point" marker and stands out from the neutral CDS
@@ -58,9 +58,8 @@ _PLL_ERR_COLOR = QColor(0xD3, 0x2F, 0x2F)
 # The Commit ring is a pxMode (fixed-pixel, always-round) scatter, so it can't shrink in
 # data space when zoomed out. Instead its pixel diameter tracks the visible column width,
 # clamped to [MIN, MAX]: MIN just encircles the RSP down-triangle (~9 px) when zoomed all
-# the way out; MAX is the comfortable zoomed-in size. Keeps it from ballooning over the
-# packed grid at low zoom while still hugging the triangle up close.
-_COMMIT_RING_MIN, _COMMIT_RING_MAX = 10.8, 16.2   # 10% smaller than the original 12/18
+# the way out; MAX is the comfortable zoomed-in size.
+_COMMIT_RING_MIN, _COMMIT_RING_MAX = 10.8, 16.2
 
 # Vertical extent of a CDS-column marker line (spans just past both traces) and the
 # y at which its down-pointing arrow head sits, in the plot's 0..2.8 trace space.
@@ -71,6 +70,22 @@ _BIT_DOT, _MSB_DOT = 6, 9                   # bit-sample dot px size; larger for
 _MAX_CH_LABELS = 48                          # per-lane cap: label MSBs with CHn only when few
 #                                              enough are in view to be legible (else too dense)
 _RIGHT_PAD = 0.16                           # blank fraction on the right so the legend clears the trace
+
+
+def _decimate_edges(win: np.ndarray, lo: int, hi: int, slots: int) -> np.ndarray:
+    """At most 3 edges per slot of [lo, hi]: a slot's first and last edges, and one between
+    when their count is odd, so each slot toggles with the same parity as the line and the
+    drawn level is exact at every slot boundary, whatever the zoom and scroll.
+
+    The bounds are searched in the edges' own dtype (nputil.searchsorted_many), so a uint64
+    window is never copied to float64; truncating them keeps them in order."""
+    idx = searchsorted_many(win, np.linspace(lo, hi, slots + 1))
+    idx[-1] = win.size
+    first, end = idx[:-1], idx[1:]
+    count = end - first
+    busy = count > 0
+    keep = [first[busy], (end - 1)[count >= 2], (first + 1)[(count >= 3) & (count % 2 == 1)]]
+    return win[np.unique(np.concatenate(keep))]
 
 
 def _step_xy_from(win: np.ndarray, init_level: bool, lo: int, hi: int, y0: float, y1: float):
@@ -102,9 +117,8 @@ class _RawTimeAxis(pg.AxisItem):
         self._offset = 0.0                    # added to every label (see set_time_offset)
 
     def tickValues(self, minVal, maxVal, size):
-        """Ticks at round values of the LABELLED time: in All Links each lane is offset,
-        and ticks chosen in its own time fell at 2 / 7 / 12 ms under another lane's
-        5 / 10 / 15."""
+        """Ticks at round values of the LABELLED time (this capture's time plus the
+        set_time_offset offset), so offset lanes in All Links tick together."""
         off = self._offset
         return [(sp, [v - off for v in vals])
                 for sp, vals in super().tickValues(minVal + off, maxVal + off, size)]
@@ -198,9 +212,8 @@ class RawCaptureView(QWidget):
         self._dn_curve = self._plot.plot()
         self._apply_trace_pens()
         # PHY3 (DLV): the recovered bit clock (virtual-PLL output) drawn in the bottom band
-        # under the differential signal, over the audio region only. A SOLID trace (a dashed
-        # pen on the long per-UI polyline is pathologically slow for Qt to stroke — it was a
-        # major cause of the zoom stall — and reads faintly when zoomed out).
+        # under the differential signal, over the audio region only. A SOLID trace: a dashed
+        # pen on the long per-UI polyline is too slow for Qt to stroke.
         self._rec_clk_curve = self._plot.plot(
             pen=pg.mkPen(VizTheme.TEXT, width=1))
         self._dlv = False
@@ -253,7 +266,7 @@ class RawCaptureView(QWidget):
         # with zoom (12–18 px), which would otherwise blow up the key's circle; this keeps
         # the legend marker small, matching the CDS triangle's scale.
         self._commit_legend_marker = pg.ScatterPlotItem(
-            symbol="o", size=9.9, pxMode=True, brush=None,      # 10% smaller (was 11)
+            symbol="o", size=9.9, pxMode=True, brush=None,
             pen=pg.mkPen(VizTheme.SEM_SYNC, width=2))
         # Per-port sample markers are ScatterPlotItems created on demand in
         # set_port_marks (one per active device/dp/channel, so the legend + colours
@@ -287,10 +300,9 @@ class RawCaptureView(QWidget):
         # Re-render the step traces for whatever sample window is in view as the
         # user zooms/pans — so the whole capture is always available (independent
         # of the time cursor) without building step arrays for every edge at once.
-        # Coalesce bursts through a short timer: a fast wheel-zoom fires many range
-        # changes, and rebuilding the step arrays synchronously on each one backs up
-        # the event loop (laggy, and the zoom overshoots). The timer throttles the
-        # rebuild to ~1 per interval, always rendering the LATEST range.
+        # Coalesce bursts through a short timer (a fast wheel-zoom fires many range
+        # changes): it throttles the rebuild to ~1 per interval, always rendering the
+        # LATEST range.
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(30)
@@ -322,7 +334,7 @@ class RawCaptureView(QWidget):
         self._clock_btn.toggled.connect(self._on_clock_toggled)
         self._show_clock = True
         # Show/Hide the symbol-key legend, so it can be moved out of the way to read the
-        # waveform behind it. Clicking the legend itself also hides it (see _hide_legend).
+        # waveform behind it. Clicking the legend itself also hides it (_legend_click above).
         self._legend_btn = QPushButton("Hide Legend")
         self._legend_btn.setCheckable(True)
         self._legend_btn.setChecked(True)
@@ -330,7 +342,7 @@ class RawCaptureView(QWidget):
                                     "legend itself to hide it)")
         self._legend_btn.toggled.connect(self._on_legend_toggled)
         two_row = QPushButton("Row Zoom")
-        two_row.setToolTip("Zoom to two bus rows around the cursor")
+        two_row.setToolTip("Zoom to two bus rows around the playhead")
         two_row.clicked.connect(lambda: self.zoom_to_rows(2))
         reset = QPushButton("Reset Zoom")
         reset.clicked.connect(self.reset_zoom)
@@ -405,11 +417,10 @@ class RawCaptureView(QWidget):
     def _apply_clock_visibility(self) -> None:
         """Show/hide whichever physical trace (DP or DN) carries the clock. The data
         line is on DP when _dp_is_data, so the clock is the OTHER trace. Always re-show
-        the data curve: an FBCSE flip between captures swaps which curve is the clock,
-        so without this the previously-hidden clock could stay hidden as the new data
-        line and the data trace would vanish. When the clock is hidden, collapse the
-        Y range/axis to just the data band so the data fills the pane (like AudioView),
-        instead of leaving a blank half where the clock was."""
+        the data curve: an FBCSE flip between captures swaps which curve is the clock.
+        When the clock is hidden, collapse the Y range/axis to just the data band so the
+        data fills the pane (like AudioView), instead of leaving a blank half where the
+        clock was."""
         clock_curve = self._dn_curve if self._dp_is_data else self._dp_curve
         data_curve = self._dp_curve if self._dp_is_data else self._dn_curve
         clock_curve.setVisible(self._show_clock)
@@ -423,7 +434,7 @@ class RawCaptureView(QWidget):
             axis.setTicks([[(2.0, self._top_name), (0.5, self._bot_name)]])
             self._cds_y_bot, self._cds_y_top, self._cds_y_arrow = _CDS_Y_BOT, _CDS_Y_TOP, _CDS_Y_ARROW
         else:
-            # Clock hidden → fill the pane with the data trace (always the top band now).
+            # Clock hidden → fill the pane with the data trace (always the top band).
             lo, hi, tick, name = _DP_BAND_LO, _DP_BAND_HI, 2.0, self._top_name
             ylo, yhi = lo - 0.2, hi + 0.4
             self._plot.setYRange(ylo, yhi, padding=0)
@@ -549,16 +560,14 @@ class RawCaptureView(QWidget):
         self._commit_arrows.setPen(pg.mkPen(VizTheme.SEM_SYNC, width=2))   # hollow ring: recolour the outline
         self._commit_legend_marker.setPen(pg.mkPen(VizTheme.SEM_SYNC, width=2))  # legend swatch ring
         # The legend background/border/label colours are baked from the palette at build
-        # time; re-apply them here or the key box keeps the STARTUP theme's background
-        # after a switch (showed as a light box in dark mode / a dark box in light mode).
+        # time; re-apply them here.
         if self._port_legend is not None:
             _lg_bg = QColor(VizTheme.FRAME_BG); _lg_bg.setAlpha(220)
             self._port_legend.setBrush(pg.mkBrush(_lg_bg))
             self._port_legend.setPen(pg.mkPen(VizTheme.BORDER))
             self._port_legend.setLabelTextColor(VizTheme.TEXT)
             # setLabelTextColor updates the color OPT but doesn't re-render the labels'
-            # HTML, so existing labels keep the old colour (dark text on the now-dark box).
-            # Force each to re-render with the new colour.
+            # HTML: force each to re-render with the new colour.
             for _sample, label in list(self._port_legend.items):
                 label.setText(label.text, color=VizTheme.TEXT)
         self._recolor_ports()             # port palette + swatches follow the theme
@@ -725,9 +734,8 @@ class RawCaptureView(QWidget):
 
 
     def _refresh_port_legend(self) -> None:
-        """Show the per-port legend entries only while the overlay is enabled — so a
-        capture opened with Sample Bits off doesn't list ports that aren't drawn
-        (which reads as "decoded but not shown"). CDS/Commit keys always remain."""
+        """Show the per-port legend entries only while the overlay is enabled.
+        CDS/Commit keys always remain."""
         for item in self._lane_dots.values():
             try:
                 self._port_legend.removeItem(item)
@@ -964,9 +972,7 @@ class RawCaptureView(QWidget):
                 # A DLV segment's start_sample is the CDS COLUMN (Column 2) of its first row,
                 # which sits a couple of UIs AFTER that row's opening (RSP) edge. Snap each
                 # boundary back to the row-start RSP so the per-row column-count lookup below
-                # puts the WHOLE first operational row on the new geometry — otherwise that
-                # row's RSP precedes the col-2 boundary, it's drawn with the old (Safe-Lock)
-                # cycle count, and its data transitions fall between the recovered clock edges.
+                # puts the WHOLE first operational row on the new geometry.
                 if syncs.size:
                     idx = np.clip(np.searchsorted(syncs, starts, side="right") - 1, 0, syncs.size - 1)
                     starts = syncs[idx].astype(np.int64)
@@ -984,8 +990,7 @@ class RawCaptureView(QWidget):
         # DLV: there is no forwarded clock — clock_edges IS the DP wire and data_edges the
         # complementary DN wire. The top "V(DP−DN)" trace must show the DP polarity (high =
         # Sync1 / logical 1) so a Row Sync Point — the Sync0→Sync1 (S0→S1) 0→1 edge the RSP
-        # marks — lands on a RISING edge of the shown signal. Drawing DN there (the previous
-        # behaviour) inverted it, so every RSP appeared on a falling edge. The bottom band
+        # marks — lands on a RISING edge of the shown signal. The bottom band
         # then carries the physical DN (LC bring-up) / recovered clock (audio).
         if dlv:
             self._dp_edges, self._dp_init = clk, clk_init      # TOP = DP wire (differential +)
@@ -1001,7 +1006,7 @@ class RawCaptureView(QWidget):
         else:
             self._top_name = "DP" if dp_is_data_line else "DN"   # data line's physical name
             self._bot_name = "DN" if dp_is_data_line else "DP"   # clock line's physical name
-        # Data is now always the top band, so the per-port dots stack there.
+        # Data is always the top band, so the per-port dots stack there.
         self._dp_is_data = True
         self._apply_clock_visibility()       # keep the clock hidden/shown per the toggle
         prev_total, prev_rate = self._total, self._rate
@@ -1015,8 +1020,7 @@ class RawCaptureView(QWidget):
         self._apply_zoom_limit()             # bound zoom/pan to the new capture extent
         # A re-decode of the SAME capture (identical extent + rate) — enabling the lazy
         # Sample Bits overlay, or a what-if register/scrambler override — must NOT
-        # disturb the user's current zoom or the Sample Bits toggle (both would
-        # otherwise reset here, which reads as the view "jumping" on every override).
+        # disturb the user's current zoom or the Sample Bits toggle.
         # Only a genuinely new capture re-fits the view and resets the lazy overlay.
         same_capture = (prev_total == self._total and prev_rate == self._rate
                         and prev_total > 1)
@@ -1024,10 +1028,9 @@ class RawCaptureView(QWidget):
             self._plot.setXRange(prev_x0, prev_x1, padding=0.0)
             self._render_range(int(prev_x0 * self._rate), int(prev_x1 * self._rate))
             return
-        # A fresh capture starts with the (lazy) Sample Bits overlay OFF, so the
-        # button label matches reality — the toggle state persists on the reused
-        # widget otherwise, reading "Hide Samples" with nothing drawn until the
-        # user toggles it. Block signals so this reset doesn't trigger a collect.
+        # A fresh capture starts with the (lazy) Sample Bits overlay OFF and the button
+        # reset to match (the toggle state otherwise persists on the reused widget).
+        # Block signals so this reset doesn't trigger a collect.
         self._samp_btn.blockSignals(True)
         self._samp_btn.setChecked(False)
         self._samp_btn.setText("Show Samples")
@@ -1107,11 +1110,10 @@ class RawCaptureView(QWidget):
         if total <= 0:
             return [], []
         to_s = 1.0 / self._rate
-        # Bound the work: drawing every cycle of every row is O(rows), so a wide zoom-out
-        # over millions of recovered rows stalled the GUI thread (re-run on each pan/zoom).
-        # Decimate whole ROWS so the drawn cycle count stays ~_MAX_EDGES — a coarse "clock is
-        # here" pulse train when zoomed out, full per-cycle detail once zoomed in — and build
-        # the square wave with NumPy (no Python loop over rows/cycles).
+        # Bound the work: drawing every cycle of every row is O(rows), re-run on each
+        # pan/zoom. Decimate whole ROWS so the drawn cycle count stays ~_MAX_EDGES — a coarse
+        # "clock is here" pulse train when zoomed out, full per-cycle detail once zoomed in —
+        # and build the square wave with NumPy (no Python loop over rows/cycles).
         row_stride = (total // self._MAX_EDGES) + 1 if total > self._MAX_EDGES else 1
         ks = starts[::row_stride]
         ke = ends[::row_stride]
@@ -1138,14 +1140,7 @@ class RawCaptureView(QWidget):
         i1 = int(_ss(edges, hi, side="right"))
         win = edges[i0:i1]
         if win.size > self._MAX_EDGES:               # too many to draw — decimate (overview)
-            # Each edge is a level toggle, so a kept edge's level depends on how many
-            # real edges precede it. Dropping every Nth edge stays level-correct only
-            # when N is ODD (an even number of dropped toggles between kept edges nets
-            # to zero); an even stride would invert the trace downstream. (This still
-            # aliases sub-stride activity — a per-pixel high/low/transition envelope
-            # would also show that, but parity correctness comes first.)
-            stride = (int(win.size // self._MAX_EDGES) + 1) | 1
-            win = win[::stride]
+            win = _decimate_edges(win, lo, hi, self._MAX_EDGES // 3)
         init = bool(initial) ^ bool(i0 & 1)
         return _step_xy_from(win, init, lo, hi, y0, y1)
 
@@ -1241,10 +1236,7 @@ class RawCaptureView(QWidget):
     def _snap_click(self, sample: int) -> int:
         """Magnetically snap a click to a shown CDS/Commit Row-Sync-Point marker when it
         lands within ~1 UI of one, so the cursor sits EXACTLY on the marker's RSP edge.
-        Otherwise a click a few samples off the RSP drifts visibly from the RSP-anchored
-        commit ring / CDS triangle as you zoom in (they track the marker sample, the
-        cursor tracked the raw click). Away from any marker the exact sample is kept, so
-        fine waveform positioning still works."""
+        Away from any marker the exact sample is kept."""
         if not self._show_cds or self._ui_samples <= 0:
             return sample
         parts = [m for m in (self._commit_samples, self._cds_samples) if m.size]

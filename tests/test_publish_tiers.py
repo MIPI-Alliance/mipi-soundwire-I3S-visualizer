@@ -1,23 +1,19 @@
 """Three tiers of content, and the rules that keep them apart.
 
-The repository serves three audiences, and conflating them is how it bloats:
-
   T0  dev_docs/       local only, gitignored — session notes, transcripts, probe scripts
   T1  docs/internal/  engineering artefacts the maintainers need, not users
   T2  everything else what a user or an outside contributor needs
 
-Only T2 is published. The prune is therefore a PATH ("drop docs/internal/"), not a list that
-can drift out of step with the tree — the lesson from the release gate, which spent five
-releases as a prose list that no longer matched `ci.yml`.
+Only T2 is published. The prune is a PATH ("drop docs/internal/"), not a list of files.
 
-Two rules make it enforceable, both DEFAULT-DENY:
+Two rules, both DEFAULT-DENY:
 
-  * nothing published may REFERENCE something unpublished — otherwise pruning leaves dangling
-    links in shipping code and docs. This is not hypothetical: before the split, 18 references
-    to the now-internal docs lived in files that stay public, six of them in shipping code.
+  * nothing published may REFERENCE something unpublished, so pruning leaves no dangling
+    links in shipping code and docs.
   * every tracked path must be CLASSIFIED, so a new top-level file forces a decision instead
     of defaulting to published.
 """
+import functools
 import os
 import re
 import subprocess
@@ -32,7 +28,7 @@ _PUBLIC_ROOTS = (
     "README.md", "LICENSE.md", "GOVERNANCE.md", "CONTRIBUTING.md", "CODEOWNERS", ".gitignore",
     ".github/",
     ".mipi/",                                # upstream-owned; present only once published
-    "pyproject.toml", "requirements.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
+    "pyproject.toml", "requirements.txt", "requirements-dev.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
     "docs/",                                 # docs/internal/ is carved out below
 )
@@ -40,13 +36,7 @@ _PUBLIC_ROOTS = (
 # Files the UPSTREAM project owns, declared in tools/publish_tree.py and grafted in at
 # publish time. They must be ABSENT here and PRESENT once published — see the test below.
 def _upstream_owned() -> tuple[str, ...]:
-    """Read the list from the publish tool rather than restating it.
-
-    Two hand-maintained copies drift, and the drift is invisible: a path added to
-    the tool but not here would be grafted with nothing asserting it arrived, and
-    one added here but not to the tool would fail a published tree for a file
-    nothing grafts. Importing by path keeps one definition.
-    """
+    """Read the list from the publish tool, imported by path, so there is one definition."""
     import importlib.util
     path = os.path.join(_ROOT, "tools", "publish_tree.py")
     spec = importlib.util.spec_from_file_location("publish_tree", path)
@@ -58,12 +48,9 @@ def _upstream_owned() -> tuple[str, ...]:
 _UPSTREAM_OWNED = _upstream_owned()
 
 
-# The enforcing files necessarily CONTAIN the path they forbid, exactly as the leak scanner
-# and the reference-model guard do. Self-exclusion, not an allowlist for real violations.
-# Files that must NAME the tier boundary to do their job: this test, the tool that prunes the
-# tier, and the leak scanner (which exempts the internal tier from published-only patterns, so
-# that a third-party capture name can be flagged in what ships while staying legitimate in an
-# internal record). Everything else citing docs/internal/ is a dead link once published.
+# Files that must NAME the tier boundary to do their job, excluded from the reference check:
+# this test, the tool that prunes the tier, and the leak scanner (which exempts the internal
+# tier from published-only patterns).
 _SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py", "tools/leak_scan.py"}
 
 # The three patterns .gitignore uses for the compiled core, so the walk in _files() agrees
@@ -72,12 +59,8 @@ _BUILD_PRODUCT = re.compile(r"^swi3score.*\.(so|pyd|dylib)$")
 
 
 def _files() -> list[str]:
-    """Tracked paths in a source tree; a filesystem walk in a PUBLISHED tree.
-
-    These tests must run in both, because the published tree is precisely where the tier
-    rules matter — and it has no .git, so a git-only listing raised CalledProcessError and
-    took the whole file down with it (4 failures, found by tools/publish_tree.py running the
-    suite on a pruned tree)."""
+    """Tracked paths in a source tree; a filesystem walk in a tree without .git (a published
+    tree)."""
     out = subprocess.run(["git", "ls-files"], cwd=_ROOT, capture_output=True, text=True)
     if out.returncode == 0 and out.stdout.strip():
         return [p for p in out.stdout.splitlines() if p]
@@ -86,20 +69,12 @@ def _files() -> list[str]:
     found = []
     for base, dirs, names in os.walk(_ROOT):
         dirs[:] = [d for d in dirs if d not in skip]
-        # macOS AppleDouble sidecars are filesystem metadata git never tracks;
-        # one undeletable leftover on the Windows VM failed this otherwise.
-        #
-        # The built native core is the same kind of thing: .gitignore keeps
-        # /swi3score*.{so,pyd,dylib} out of the listing above, but a walk has no such rule,
-        # and the gate REBUILDS that file into the tree root before running the suite. So on
-        # any tree without .git — both VM guests, and a published tree — the gate produced
-        # the very artefact that then failed this test as unclassified. Matching the
-        # gitignore patterns rather than the bare suffix, so a binary someone genuinely
-        # commits still has to be classified.
+        # Skip what git never lists: macOS AppleDouble sidecars, and the built native core
+        # (matched by the .gitignore patterns, not the bare suffix, so a committed binary
+        # still has to be classified).
         names = [n for n in names
                  if not n.startswith('._') and not _BUILD_PRODUCT.match(n)]
-        # POSIX separators: every rule below is a "docs/…" style prefix, so a
-        # backslash path matches nothing and the whole file misfires on Windows.
+        # POSIX separators: every rule below matches a "docs/…" style prefix.
         found += [os.path.relpath(os.path.join(base, n), _ROOT).replace(os.sep, "/")
                   for n in names]
     return sorted(found)
@@ -116,19 +91,42 @@ def _read(rel: str) -> str:
         return f.read()
 
 
+@functools.lru_cache(maxsize=None)
+def _load(name: str, rel: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, os.path.join(_ROOT, rel))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _decoded(rel: str) -> str:
+    """A file's text as tools/leak_scan.py reads it: UTF-8, UTF-16, or a binary's printable
+    runs."""
+    with open(os.path.join(_ROOT, rel), "rb") as f:
+        return _load("_tiers_leak_scan", "tools/leak_scan.py").decode_bytes(f.read())[0]
+
+
 def test_nothing_published_references_something_internal():
-    """The rule that makes the prune safe. A public file citing docs/internal/... becomes a
-    dead link the moment the tree is published, and a reader cannot tell whether the target
-    was pruned or never existed."""
+    """No public file cites docs/internal/... or a maintainers'-tier file, by path or by a
+    link relative to the citing file (publish_tree.cites_internal): the link would be dead
+    once the tree is published. Every file is read, whatever its extension; a symlink is
+    checked by its target."""
+    pt = _load("_tiers_publish_tree", "tools/publish_tree.py")
     offenders = []
     for rel in _files():
         if rel.startswith(_INTERNAL) or rel in _SELF or rel in _INTERNAL_FILES:
             continue
-        if not rel.endswith((".md", ".py", ".cpp", ".h", ".toml", ".sh", ".ps1", ".yml")):
+        full = os.path.join(_ROOT, rel)
+        if os.path.islink(full):
+            target = os.readlink(full)
+            if pt.cites_internal(rel, target) or pt._into_internal(rel, target):
+                offenders.append(f"{rel} -> {target}")
             continue
-        for i, line in enumerate(_read(rel).splitlines(), 1):
-            if _INTERNAL in line or "internal/" + "TECH_DEBT" in line \
-                    or any(f in line for f in _INTERNAL_FILES):
+        if not os.path.isfile(full):
+            continue
+        for i, line in enumerate(_decoded(rel).splitlines(), 1):
+            if pt.cites_internal(rel, line) or "internal/" + "TECH_DEBT" in line:
                 offenders.append(f"{rel}:{i}: {line.strip()[:90]}")
     assert not offenders, (
         "published files reference docs/internal/, which will not exist in the published "
@@ -148,8 +146,7 @@ def test_every_tracked_path_is_classified():
 
 
 def test_the_split_is_intact():
-    """Asserts something in BOTH contexts rather than skipping in one — a test that quietly
-    does nothing is the failure mode this whole area keeps producing.
+    """Asserts in BOTH contexts rather than skipping in one.
 
     Source tree: the internal tier is populated and the user-facing docs are public.
     Published tree: the internal tier is GONE and the user-facing docs are still there."""
@@ -176,23 +173,11 @@ def test_dev_docs_never_reaches_a_tree():
 
 
 def test_the_governance_files_upstream_owns_are_actually_declared():
-    """Reading the list from the tool removed the drift, and with it the guard.
+    """The governance paths whose content the upstream project decides are declared in
+    `_UPSTREAM_OWNED`, named independently here so a path deleted from the tool still fails.
 
-    `_UPSTREAM_OWNED` is now imported rather than restated, so the two copies
-    cannot disagree — but a path DELETED from the tool would also vanish from the
-    assertion, and the file would be dropped on the next publish with nothing
-    complaining. So name the governance paths independently here.
-
-    These three are the ones whose content is a decision of the upstream project
-    rather than of this codebase. CODEOWNERS is the sharpest case and the reason
-    this test exists: it names PEOPLE, so it changes upstream with nothing here
-    moving. A stale copy in this tree carried "@NielWarren" after upstream had
-    corrected it to "@nielwarren582", and the v3.0.13 preview would have reverted
-    that — a one-token diff, in the file deciding who must approve a PR.
-
-    Deliberately NOT the whole governance layer: GOVERNANCE.md, CONTRIBUTING.md,
-    LICENSE.md and the CLA files are identical in both trees and shared by
-    agreement, so carrying them is not a divergence risk.
+    GOVERNANCE.md, CONTRIBUTING.md, LICENSE.md and the CLA files are not in the list: they
+    are identical in both trees.
     """
     for path in ("CODEOWNERS", ".mipi/project.yml",
                  ".github/workflows/config-check.yml"):
@@ -203,15 +188,11 @@ def test_the_governance_files_upstream_owns_are_actually_declared():
 
 
 def test_upstream_owned_files_are_absent_here_and_present_once_published():
-    """Publishing is a tree REPLACEMENT onto a repository with its own history, so a file its
-    maintainers added is invisible to us and a naive replacement DELETES it. That nearly
-    shipped: an upstream pull request had added a project-identity file and a config-check
-    workflow, and the tree built from here would have reverted both without saying so.
+    """Upstream-owned files are absent from this tree and present in a published one.
 
-    The rule that resolves it is one-directional ownership — we do not carry these at all, and
-    the publish tool grafts them in from upstream. Carrying our own copy would be worse than
-    dropping them, because it would silently OVERWRITE theirs. Asserted in both contexts, so
-    neither half can quietly become a no-op."""
+    Publishing REPLACES the tree on a repository with its own history; the publish tool
+    grafts these files in from upstream, and a copy carried here would overwrite theirs.
+    Asserted in both contexts."""
     files = set(_files())
     if _is_published_tree():
         missing = [p for p in _UPSTREAM_OWNED if p not in files]
@@ -227,9 +208,7 @@ def test_upstream_owned_files_are_absent_here_and_present_once_published():
 
 
 def test_the_publish_tool_declares_the_same_upstream_set():
-    """Two lists of the same thing drift — the release gate spent five releases proving it. A
-    test comparing them is cheaper than merging them, because the tool must run in a published
-    tree where this file is only a test."""
+    """Every upstream-owned path appears as a quoted string in tools/publish_tree.py."""
     src = _read("tools/publish_tree.py")
     for path in _UPSTREAM_OWNED:
         assert f'"{path}"' in src, (
@@ -244,11 +223,8 @@ _CONFLICT_DUP = re.compile(r"^(?P<stem>.+?) (?:\(\d+\)|\d+)(?P<ext>\.[^.]*)?$")
 
 
 def test_no_sync_conflict_duplicates_are_tracked():
-    """A `git add -A` in a synced directory commits the sync service's conflict copies, and
-    the tier rules above cannot catch it: every duplicate sits INSIDE an already-classified
-    prefix, so prefix-based default-deny waves it through. Three reached a release branch this
-    way, one of them a byte-identical copy of a release-gate wrapper — the worst kind, because
-    a stale second copy of a gate is something a person runs by mistake and believes."""
+    """No tracked path is a file-sync conflict copy. The tier rules above cannot catch one:
+    each duplicate sits INSIDE an already-classified prefix."""
     files = set(_files())
     dups = []
     for p in sorted(files):
@@ -265,11 +241,8 @@ def test_no_sync_conflict_duplicates_are_tracked():
 def test_the_tier_boundary_has_one_definition():
     """`publish_tree` prunes the internal tier and `leak_scan` exempts it — from the same path.
 
-    Both must name it (they are in _SELF for that reason), which means the string exists twice
-    and can drift. A drift would be silent and asymmetric: the scanner would exempt a directory
-    the pruner still ships, or flag one it already removed, and either way the published tier
-    would not be the scanned tier. leak_scan's comment claims this test keeps them in sync, so
-    the test has to exist for the comment to be true.
+    Both name it (they are in _SELF for that reason); this test keeps the two strings, and
+    this file's, equal.
     """
     import importlib.util
 
@@ -293,3 +266,50 @@ def test_the_publish_tool_prunes_the_same_internal_files():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert tuple(mod._INTERNAL_FILES) == _INTERNAL_FILES
+
+
+def test_the_publish_reference_check_reads_every_file_type(tmp_path):
+    """publish_tree's check 2 reads a build spec, a requirements or CMake text file, JSON,
+    CSV, SVG and .gitignore as well as source and docs; the files that define the boundary
+    are exempt."""
+    pt = _load("_tiers_publish_tree", "tools/publish_tree.py")
+    assert pt._BOUNDARY_FILES == _SELF
+    citing = {"swi3s-studio.spec": "datas=[('docs/internal/x.md', '.')]\n",
+              "native/CMakeLists.txt": "# see CLAUDE.md\n",
+              "data/fixture.json": '{"doc": "docs/internal/notes.md"}\n',
+              "data/table.csv": "a,docs/internal/t.md\n",
+              "docs/figure.svg": "<svg><!-- docs/internal/fig.md --></svg>\n",
+              ".gitignore": "# CLAUDE.md is local\n",
+              "data/utf16.txt": "docs/internal/u.md\n"}
+    clean = {"README.md": "A bus analyzer.\n",
+             "tools/publish_tree.py": "_INTERNAL = 'docs/internal/'\n"}
+    for rel, text in {**citing, **clean}.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if rel == "data/utf16.txt":
+            path.write_bytes(text.encode("utf-16"))
+        else:
+            path.write_text(text, encoding="utf-8")
+    assert pt.check_dangling(str(tmp_path)) == sorted(citing)
+
+
+def test_a_relative_link_into_the_internal_tier_is_dangling(tmp_path):
+    """A link resolved from the citing file's directory, in Markdown, a Markdown reference
+    definition, HTML, or a symlink target, is dangling when it lands in docs/internal/; a
+    link elsewhere, a URL and an anchor are not."""
+    pt = _load("_tiers_publish_tree", "tools/publish_tree.py")
+    citing = {"docs/DEVELOPMENT.md": "see [the perf notes](internal/PERFORMANCE.md)\n",
+              "docs/USER_GUIDE.md": "see [x](./internal/x.md#part)\n",
+              "docs/sub/page.md": "[ref]: ../internal/y.md\n",
+              "docs/page.html": '<a href="internal/z.html">z</a>\n',
+              "tools/notes.md": "[d](../docs/internal/)\n"}
+    clean = {"README.md": "[guide](docs/USER_GUIDE.md) "
+                          "[web](https://example.invalid/internal/x)\n",
+             "docs/TESTING.md": "[a](#internal) [b](../tools/internal/x.md) internal/ prose\n"}
+    for rel, text in {**citing, **clean}.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    os.symlink("internal/TECH_DEBT.md", tmp_path / "docs" / "debt.md")
+    os.symlink("../docs/USER_GUIDE.md", tmp_path / "tools" / "guide.md")
+    assert pt.check_dangling(str(tmp_path)) == sorted([*citing, "docs/debt.md"])

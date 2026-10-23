@@ -1,10 +1,9 @@
-// Minimal standalone replacement for the Saleae SDK's LogicPublicTypes.h.
+// Minimal standalone replacement for the analyzer SDK's LogicPublicTypes.h.
 //
-// The SWI3S decode classes (reused verbatim from the Saleae plugin) include
-// <LogicPublicTypes.h> only for the integer typedefs + BitState. This shim
-// provides exactly those, so the decode core builds with ZERO Saleae SDK
-// dependency. It is placed first on the include path; the plugin build keeps
-// using the real SDK header.
+// The vendored SWI3S decode classes include <LogicPublicTypes.h> only for the
+// integer typedefs + BitState. This shim provides exactly those, so the decode
+// core builds with no SDK dependency. It is placed first on the include path;
+// the plugin build uses the real SDK header.
 
 #ifndef LOGICPUBLICTYPES
 #define LOGICPUBLICTYPES

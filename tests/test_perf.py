@@ -1,10 +1,9 @@
 """Performance-regression benchmarks: wall-clock CEILINGS on the hot paths.
 
-These are cliff detectors, not micro-benchmarks — a perf regression of the kind the
-3.0.6 review found (multi-second engine builds, per-row CSV loops) should FAIL CI here
-instead of being re-discovered at the next review. Ceilings are deliberately generous
-(several x the observed time) to tolerate shared-CI-runner jitter; they catch order-of-
-magnitude cliffs, not small drifts. Marked `perf` so they run in their own CI job
+These are cliff detectors, not micro-benchmarks — an order-of-magnitude regression
+(multi-second engine builds, per-row CSV loops) FAILS here. Ceilings are deliberately
+generous (several x the observed time) to tolerate shared-CI-runner jitter; they catch
+order-of-magnitude cliffs, not small drifts. Marked `perf` so they run in their own CI job
 (`pytest -m perf`) and are excluded from the normal suite (`pytest -m "not perf"`).
 
 Run: PYTHONPATH=. python3 -m pytest -m perf tests/test_perf.py
@@ -18,6 +17,7 @@ import time
 
 import pytest
 import swi3score
+from conftest import record_perf
 
 from swi3s_studio import decode
 from swi3s_studio.ingest import digital_csv
@@ -25,13 +25,18 @@ from swi3s_studio.ingest import digital_csv
 pytestmark = pytest.mark.perf
 
 
+# GitHub's shared runners (GITHUB_ACTIONS=true) run the two whole-window cascades below at
+# about 2.2x a Mac's time, so they get their own ceilings, at ~2x the medians the
+# `perf margins` section prints there (Link switch ~770 ms, cursor move ~118 ms). The cliffs
+# the tests exist for cost 2.5-4x.
+_SHARED_RUNNER = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
 @pytest.fixture(autouse=True)
 def _no_gc_pause():
     """Collect first, then keep the cyclic GC out of the timed region. A gen-2 pass over
-    whatever an earlier test left behind lands on one timed call at random and doubles
-    it: pooled behind ~1,300 functional tests the cursor-move worst case read 496 ms
-    against a ~39 ms baseline, and 36 ms run alone. That is the host process, not the
-    code under test, and no ceiling here is about it."""
+    whatever an earlier test left behind lands on one timed call at random and can double
+    it; that cost is the host process, not the code under test."""
     gc.collect()
     gc.disable()
     try:
@@ -62,17 +67,8 @@ def test_engine_build_ceiling():
     Speed is NOT a goal of the Python model. swi3score, the C++ core, is the fast
     implementation; swviz/models/dataport.py is a functional model of a hardware
     implementation, published in the MIPI specification, and it optimises for a spec
-    reader's comprehension instead. Three hoists that existed here purely for speed
-    (a `_num_cols` cached in initialize(), and locals for `_num_channels` in
-    clock_tick() and _effective_channel_grouping()) were removed for that reason; they
-    cost ~7% on the build below, which is three orders of magnitude clear of the
-    ceiling and therefore irrelevant.
-
-    An earlier version of this docstring argued the opposite — it named the three
-    hoists and warned that they "read as redundant, so they get removed by
-    well-meaning cleanups". That framing sent three successive review drops into the
-    same argument. The ceiling below is a runaway guard (an accidental O(n^2), a
-    re-decode per tick), not a defence of micro-optimisation.
+    reader's comprehension instead. The ceiling below is a runaway guard (an accidental
+    O(n^2), a re-decode per tick), not a defence of micro-optimisation.
     """
     from swi3s_studio.swviz.core.engine import BusModelBuilder
     from swi3s_studio.swviz.models.interface import Interface
@@ -96,7 +92,7 @@ def test_engine_build_ceiling():
 
 def test_digital_csv_import_ceiling():
     """Vectorized digital-CSV import over ~100k rows — guards channel_transition_counts +
-    infer_sample_rate + load_capture (all rewritten from per-row Python loops in 3.0.6)."""
+    infer_sample_rate + load_capture (all vectorized, no per-row Python loops)."""
     n = 100_000
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "big.csv")
@@ -114,8 +110,8 @@ def test_digital_csv_import_ceiling():
 
 
 # --- Whole-capture-scan cliff detectors -------------------------------------
-# The class of regression that keeps surfacing only in user testing: a per-cursor-move
-# / per-toggle op that scans the WHOLE capture (O(#UIs)) instead of O(active/#edges).
+# A per-cursor-move / per-toggle op must not scan the WHOLE capture (O(#UIs)) instead of
+# O(active/#edges).
 # It hides from the other perf tests because they use tiny captures — these use a large
 # SYNTHETIC capture (edges only, no decode) so the O(#UIs) path is unmistakably slow
 # while the correct O(#edges) path stays sub-second. See the maintainers' performance notes.
@@ -137,9 +133,8 @@ def _big_capture():
 
 def test_link_control_decode_ceiling():
     """Cold/Warm-start detection must read only a bounded PREFIX of the edges — a bring-up
-    is a few dozen slow pulses at the very start. Scanning + sorting the whole capture
-    (both orientations) made a 420M-edge capture take ~26s (fix 4988d1c). Over 30M edges
-    the prefix scan is ~1ms; a regression to the full sort/scan is ~1s+."""
+    is a few dozen slow pulses at the very start. Over 30M edges the prefix scan is ~1ms;
+    a full sort/scan of the capture (both orientations) is ~1s+."""
     from swi3s_studio.analysis.link_control import decode_link_control
     dt = _elapsed(lambda: decode_link_control(_big_capture()))
     assert dt < 0.5, f"decode_link_control took {dt:.2f}s (ceiling 0.5s) — scanning all edges again?"
@@ -147,10 +142,10 @@ def test_link_control_decode_ceiling():
 
 def test_tx_persist_columns_ceiling():
     """TX-map persistence must scan the region's DATA EDGES (O(#edges)), never every UI
-    with np.logical_or.at — that made a long audio region take ~90s (fix e3397c4). Drive
-    the scan over a 30M-UI region with sparse data edges: the correct path is <0.1s, an
-    O(#UIs) regression is several seconds. (A throwaway demo session's capture/segment is
-    swapped for the big synthetic one — tx_persist_columns only reads those two.)"""
+    with np.logical_or.at. Drive the scan over a 30M-UI region with sparse data edges: the
+    correct path is <0.1s, an O(#UIs) regression is several seconds. (A throwaway demo
+    session's capture/segment is swapped for the big synthetic one — tx_persist_columns
+    only reads those two.)"""
     from swi3s_studio.session import Session
     cap = _big_capture()
     sess = Session.from_demo(64)
@@ -168,14 +163,13 @@ def test_command_filter_first_keystroke_ceiling():
 
     QSortFilterProxyModel re-tests every source row on the first invalidateFilter, and the
     row-text cache is cold after set_commands/set_peripheral_maps — so the first character
-    typed into Filter ▸ Expression renders the whole table on the GUI thread. It used to do
-    that through self.data(self.index(row, col)) for all twelve columns: 0.58 s at 10k
-    commands, 2.9 s at 50k and 11.5 s at 200k, recurring after every load, re-decode and
-    Clear All Filters. Building the same string via _display_text (no QModelIndex, no role
-    dispatch) is ~10x cheaper.
+    typed into Filter ▸ Expression renders the whole table on the GUI thread, after every
+    load, re-decode and Clear All Filters. The row string is built via _display_text (no
+    QModelIndex, no role dispatch), ~10x cheaper than self.data(self.index(row, col)) for
+    all twelve columns.
 
     A CEILING, NOT A BENCHMARK: generous enough for a loaded runner, tight enough to catch
-    the index+role path being reintroduced — that would blow 6 s at 50k rows.
+    the index+role path (~6 s at 50k rows).
     """
     from PySide6.QtWidgets import QApplication
 
@@ -207,10 +201,8 @@ def test_command_filter_first_keystroke_ceiling():
 def test_guard_suppressing_build_stays_linear_in_rows():
     """A build whose data writes suppress their own guards, once per row.
 
-    `remove_bits_matching` used to rebuild the whole `bits` list per call, so this shape went
-    QUADRATIC in the row count: 0.21 s at 500 rows, 2.18 s at 2000, 36.59 s at 8000 — 4x the
-    rows costing 17x the time. Deferring the removals to one `compact()` makes it linear
-    (0.10 / 0.43 / 2.00 s).
+    `remove_bits_matching` defers its removals to one `compact()`, so the build stays linear
+    in the row count; rebuilding the whole `bits` list per call is QUADRATIC.
 
     Asserts the SHAPE, not just a ceiling: a wall-clock limit alone would pass on a fast
     machine even if the quadratic term came back, so this checks that 4x the rows costs well
@@ -256,10 +248,10 @@ def test_low_entropy_locate_ceiling():
     """The tight wall-clock ceiling for the low-entropy sub-capture search.
 
     A constant (never-toggling) sub-pattern makes almost every offset in the main capture an
-    exact match, which without a cap on collected hits is O(N * hits) and stalled the UI for
-    minutes. tests/test_subcapture.py keeps a LOOSE bound in the default suite — a hang is
-    worth catching on every config — and the ceiling that would actually notice a slowdown
-    lives here, where runner jitter cannot redden an ordinary run.
+    exact match, which without a cap on collected hits is O(N * hits). tests/test_subcapture.py
+    keeps a LOOSE bound in the default suite — a hang is worth catching on every config — and
+    the ceiling that would actually notice a slowdown lives here, where runner jitter cannot
+    redden an ordinary run.
     """
     import numpy as np
 
@@ -289,17 +281,13 @@ def test_decoded_samples_rebuild_ceiling():
     """A cursor move that leaves the Samples window rebuilds the pane — bound that rebuild.
 
     The Decoded Samples pane is a QTableWidget refilled WHOLESALE, not a virtual model, so
-    re-centring costs 2 * _SAMPLE_HALF_WINDOW * len(_COLS) fresh QTableWidgetItems. At the
-    original half-window of 4000 that is 48,000 items, which profiled at ~99 ms of a 142 ms
-    cursor move on a 2520x1350 dpr-2.0 display — the whole of a reported "the cursor jumps
-    instantly, then the app hangs for a moment" complaint, because jumping is precisely what
-    leaves the window. Hiding the dock took the same move to 43 ms, which is what identified
-    this pane rather than the decode.
+    re-centring costs 2 * _SAMPLE_HALF_WINDOW * len(_COLS) fresh QTableWidgetItems, on the
+    GUI thread, on every cursor move that leaves the loaded window.
 
-    Two things can redden this: raising _SAMPLE_HALF_WINDOW back up, or making _fill_row more
-    expensive per cell. Both are the same defect from the user's side. The ceiling is loose
-    because offscreen Qt elides the per-item layout that dominates on a real display — it is
-    here to catch the order of magnitude, and 8000 rows would need ~9x the budget.
+    Two things can redden this: raising _SAMPLE_HALF_WINDOW, or making _fill_row more
+    expensive per cell. The ceiling is loose because offscreen Qt elides the per-item layout
+    that dominates on a real display — it is here to catch the order of magnitude, and 8000
+    rows would need ~9x the budget.
     """
     from PySide6.QtWidgets import QApplication
 
@@ -332,11 +320,7 @@ def test_tx_persist_inline_threshold_stays_inline():
 
     TX-map persistence scans a whole config region. main_window computes it on the GUI
     thread when the region is at or below this many UIs and on a worker thread above, so
-    the constant IS the freeze a cursor move can cause. It was 32 M with a comment claiming
-    "sub-~0.3s"; the scan actually measures ~32 ns/UI (19.2 M UIs of a real 4.7 s capture
-    took 616 ms), so 32 M admitted ~1.0 s. A 4.7 s capture's own region fell under the
-    threshold, which made the first cursor move into it a ~550 ms freeze with TX
-    persistence on -- 530 ms median measured against 28 ms with it off.
+    the constant IS the freeze a cursor move can cause. The scan measures ~32 ns/UI.
 
     This drives the scan over a region of exactly the threshold size and holds it to a
     ceiling a user would not notice, so raising the constant reddens the gate. The ceiling
@@ -369,36 +353,24 @@ def test_tx_persist_inline_threshold_stays_inline():
 
 
 def test_cursor_move_budget_with_every_dock_visible():
-    """The WHOLE cursor cascade, with every dock open — the thing users actually feel.
+    """The WHOLE cursor cascade, with every dock open.
 
-    Every other ceiling here times one function. The complaint is always "moving the cursor
-    takes half a second", and that is a cascade across ten docks: raw view, register replay,
-    command selection, CDS symbols, Decoded Samples, and the bus grid. No test drove it, so
-    the 99 ms-per-move Samples pane and the ~550 ms TX-persistence freeze both shipped
-    green, and the numbers that found them (28 ms with persistence off, 47 ms median under
-    cProfile with ten docks visible, 530 ms with it on) lived only in commit messages.
+    Every other ceiling here times one function; this drives the cascade across ten docks:
+    raw view, register replay, command selection, CDS symbols, Decoded Samples, and the bus
+    grid.
 
-    Measured on the reported capture, per move: 142 ms median before 3.0.17, 57 ms after.
-
-    THE FIXTURE IS THE POINT. It was from_demo(600) -- 314 k UIs -- and at that size a
-    capture-PROPORTIONAL per-move cost barely registers: the Samples-pane defect that cost
-    ~99 ms on the real 4.7 s capture adds only ~19 ms there, so no ceiling loose enough to
-    survive a shared runner could have caught the very bug this test exists for.
-    from_demo(20000) costs ~1.9 s to build and lands at 10.2 M UIs / 408 commands / 3 config
-    regions, within a factor of two of the reported capture (19.2 M UIs, 423 commands, 2
-    regions) on every axis that matters. The same defect is 29.8 ms -> 94.7 ms median on it.
+    THE FIXTURE SIZE IS THE POINT: on a small demo a capture-PROPORTIONAL per-move cost
+    barely registers. from_demo(20000) costs ~1.9 s to build and lands at 10.2 M UIs / 408
+    commands / 3 config regions, the scale of a multi-second real capture.
 
     Baseline here is 29.8-31.0 ms median / 38.5-38.8 ms worst, stable to ~1 ms across runs,
-    so the ceilings sit at ~4x and ~6x. That headroom is for a slower runner, not for drift:
-    a 3x slower machine still comes in around 90/115 ms.
+    so the ceilings sit at ~4x and ~6x. That headroom is for a slower runner, not for drift.
 
-    What this deliberately does NOT chase is a KNOWN constant being raised. The pane
-    regression above reaches ~95 ms and passes the 120 ms ceiling on purpose -- it is caught
-    absolutely and deterministically by _SAMPLE_HALF_WINDOW <= 1000 in
-    test_decoded_samples_rebuild_ceiling and by the counts in tests/test_cursor_cost.py. A
-    wall clock's job here is the cost nobody has bounded yet: a new scan on the cascade, a
-    pane that stopped checking its dock, an O(capture) call added to a paint path. Splitting
-    it that way is what lets this ceiling stay loose enough to be trustworthy.
+    A KNOWN constant being raised is caught deterministically elsewhere: by
+    _SAMPLE_HALF_WINDOW <= 1000 in test_decoded_samples_rebuild_ceiling and by the counts in
+    tests/test_cursor_cost.py. This wall clock catches the cost nobody has bounded yet: a
+    new scan on the cascade, a pane that stopped checking its dock, an O(capture) call added
+    to a paint path.
     """
     import time
 
@@ -439,13 +411,18 @@ def test_cursor_move_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
-    assert median < 0.12, (
+    ceiling, worst_ceiling = (0.24, 0.5) if _SHARED_RUNNER else (0.12, 0.25)
+    base, worst_base = ("~118", "~143") if _SHARED_RUNNER else ("~30", "~39")
+    record_perf("cursor move", median, ceiling, worst, worst_ceiling)
+    assert median < ceiling, (
         f"median cursor move {median * 1000:.0f} ms across {shown} visible docks over "
-        f"{len(ce):,} UIs (ceiling 120 ms, baseline ~30 ms; worst {worst * 1000:.0f} ms). "
+        f"{len(ce):,} UIs (ceiling {ceiling * 1000:.0f} ms, baseline {base} ms; worst "
+        f"{worst * 1000:.0f} ms). "
         "Something on the cascade is doing work proportional to the capture on the GUI "
         "thread — see tests/test_cursor_cost.py for which counts to check first.")
-    assert worst < 0.25, (
-        f"worst cursor move {worst * 1000:.0f} ms (ceiling 250 ms, baseline ~39 ms), median "
+    assert worst < worst_ceiling, (
+        f"worst cursor move {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms, "
+        f"baseline {worst_base} ms), median "
         f"{median * 1000:.0f} ms. A single move stalling while the rest are fast is a COLD "
         "path — a first-visit scan running inline instead of on a worker "
         "(_TX_PERSIST_SYNC_MAX_UIS) is the shape that did this before.")
@@ -459,14 +436,13 @@ def test_link_switch_budget_with_every_dock_visible():
     make it cheap (the Timing pane's measurement, the command table's column fit, the audio
     store's gap-split envelope windows) are pinned DETERMINISTICALLY by counts in
     tests/test_links_gui.py, because a ceiling loose enough for a shared runner cannot see
-    them: measured here, 0.6-1.1 s per switch before them, 195-315 ms after. This is the
-    cliff detector for what those counts do not cover, a new O(capture) step on the bind.
-    Ceilings at ~3x the measured median / ~4x the worst.
+    them. This is the cliff detector for what those counts do not cover, a new O(capture)
+    step on the bind. Ceilings at ~3x the measured median / ~4x the worst.
 
-    WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. The same bind measures 754-799 ms median
-    there, for this release and for 3.0.19 alike, so the macOS ceiling of 750 ms sat on the
-    baseline and failed by chance; the worst has reached 2.18 s. ~2x the Windows median
-    still catches the cliff, which costs 2.5-4x.
+    WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. The same bind measures ~770 ms median
+    there, with a worst of up to ~2.2 s; ~2x the Windows median still catches the cliff,
+    which costs 2.5-4x. A shared GitHub runner (_SHARED_RUNNER) gets the same ceilings, from
+    the ~770 ms medians it measures.
     """
     import sys
     import time
@@ -498,9 +474,10 @@ def test_link_switch_budget_with_every_dock_visible():
         times.append(time.perf_counter() - t0)
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
-    windows = sys.platform == "win32"
-    ceiling, worst_ceiling = (1.5, 2.4) if windows else (0.75, 1.2)
-    base, worst_base = ("~760", "~810") if windows else ("~250", "~315")
+    slow = sys.platform == "win32" or _SHARED_RUNNER
+    ceiling, worst_ceiling = (1.5, 2.4) if slow else (0.75, 1.2)
+    base, worst_base = ("~770", "~820") if slow else ("~345", "~365")
+    record_perf("Link switch", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
         f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms, "
         f"baseline {base} ms; worst {worst * 1000:.0f} ms). Something on the bind is doing "
@@ -529,16 +506,9 @@ with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
 
 # SAMPLE CURRENT RSS ACROSS THE LOAD AND TAKE THE MAX. Not `ru_maxrss`, which is a
 # high-water mark for the whole PROCESS and therefore measures the load only when the load is
-# the biggest thing that process ever did. Three attempts at this, and the two that used
-# maxrss were both wrong on a platform the author was not looking at:
-#   * fixture built in the same process -> baseline already huge; reported 0.164 GB for a load
-#     that truly took 0.580 GB, and would have passed a 3x under-prediction;
-#   * `maxrss` after minus `maxrss` before, in one process -> exactly 0 on a second test
-#     platform, where IMPORTING peaks at ~0.9 GB and then releases it, so a 0.2 GB load never
-#     exceeds the earlier transient. Subtracting two such processes does not help either:
-#     they share that same import transient.
-# Sampling the CURRENT footprint is immune to anything that happened before the load, and it
-# measures precisely what est_peak_bytes models — the peak of the load itself.
+# the biggest thing that process ever did (on some platforms IMPORTING peaks higher than a
+# small load). Sampling the CURRENT footprint is immune to anything that happened before the
+# load, and it measures precisely what est_peak_bytes models — the peak of the load itself.
 _SAL_PEAK_PROBE = r"""
 import json, sys, threading, time
 try:
@@ -571,26 +541,17 @@ print(json.dumps({"predicted": cost.est_peak_bytes, "before": before, "peak": pe
 
 
 def test_the_peak_estimate_matches_a_measured_load(tmp_path):
-    """est_peak_bytes is a PREDICTION OF RSS, and nothing compared it to an RSS.
+    """est_peak_bytes is a PREDICTION OF RSS; this compares it to a measured RSS.
 
-    That gap is why a 291 MB capture predicted at 20.29 GB actually reached ~60 GB on a
-    103 GB machine: _STREAM_TRANSIENT was applied only to the windowed branch, so the
-    whole-file branch under-predicted by 1.9x-3.6x on measured captures. The model was then
-    recalibrated by hand against three real captures -- which nothing preserves, so it can
-    drift straight back.
-
-    This closes the loop: build a .sal, load it whole in a clean subprocess, and compare the
-    prediction against that process's own peak RSS. Two bounds, and the directions mean
-    different things:
+    Build a .sal, load it whole in a clean subprocess, and compare the prediction against
+    that process's own peak RSS. Two bounds, and the directions mean different things:
       * predicted >= actual -- the guard must never promise a load will fit and be wrong.
-        This is the assertion that catches the 60 GB defect: the bare sum (a transient of
-        1) predicts 0.18 GB where this fixture measures 0.20 GB.
+        The bare sum (a transient of 1, i.e. _STREAM_TRANSIENT missing from the whole-file
+        branch) predicts 0.18 GB where this fixture measures 0.20 GB.
       * predicted <= 3x actual -- the guard must not refuse loads that would have fitted,
-        which is the failure mode of "just multiply everything by a big number". The old
-        whole-file transient of 4 against today's leaner decode is 3.2x and trips it.
-    Measured pred/actual: 1.67 here (10M transitions per channel; 4M had become too small
-    to measure once the decode stopped holding three copies), and 1.96 on a 54 MB capture
-    with 302M transitions, whose largest block is a quarter of its channel.
+        which is the failure mode of "just multiply everything by a big number". A
+        whole-file transient of 4 is 3.2x and trips it.
+    Measured pred/actual: 1.67 here (10M transitions per channel).
     """
     import json
     import subprocess
@@ -641,13 +602,11 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
 def test_zoom_and_pan_budget():
     """Wheel-zoom and pan on a timeline ribbon carrying 100k commands.
 
-    What a zoom costs is the ribbon's per-pixel tick decimation. It used to walk EVERY
-    command once per view change, in Python, so it was linear in the command count: 9 / 76 /
-    299 ms median per step at 10k / 100k / 400k commands. It is now a bisect to the view and
-    a vectorised per-column maximum (tests/test_timeline_decimation.py pins that the answer
-    did not change): ~2.3 ms median at 100k, ~3 ms at 400k, and ~2 ms zoomed in at any
-    count. The ceilings sit at ~10x that, which a slow shared runner clears and a return to
-    a per-command Python loop (76 ms here) does not. tests/test_timeline_interaction.py
+    What a zoom costs is the ribbon's per-pixel tick decimation: a bisect to the view and a
+    vectorised per-column maximum (tests/test_timeline_decimation.py pins the answer):
+    ~2.3 ms median at 100k, ~3 ms at 400k, and ~2 ms zoomed in at any count. The ceilings
+    sit at ~10x that, which a slow shared runner clears and a per-command Python loop
+    (76 ms here) does not. tests/test_timeline_interaction.py
     pins by COUNT that a zoom moves no cursor and rebuilds no pane, which is the rest.
     """
     import time
@@ -694,11 +653,9 @@ def test_zoom_and_pan_budget():
 def test_the_widest_line_weight_paints_within_budget(monkeypatch):
     """Preferences ▸ Waveforms lets the Audio and Capture traces be up to 4 px wide, and a
     pen wider than 1 px is stroked far more slowly. Measured on the full-size demo (a
-    1400 px wide paint, median of 7): Audio's four tracks 6.3 / 15.6 / 16.0 ms at 1 / 2 /
-    4 px; Capture 4.7 / 46.8 / 47.1 ms run alone, ~26 ms at 4 px here. The cost is a step
-    from 1 px to anything wider, not a slope, and Capture has drawn at 2 px all along, so
-    4 px adds nothing 2 px did not. The ceilings sit at ~5x the 4 px figures: a cliff,
-    not drift."""
+    1400 px wide paint, median of 7): ~16 ms for Audio's four tracks and ~26 ms for Capture
+    at 4 px. The cost is a step from 1 px to anything wider, not a slope. The ceilings sit
+    at ~5x the 4 px figures: a cliff, not drift."""
     from PySide6.QtWidgets import QApplication
 
     from swi3s_studio.ui import line_style

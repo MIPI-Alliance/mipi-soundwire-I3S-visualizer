@@ -81,10 +81,8 @@ class BitInfo:
 class BusModelWarnings:
     """Warnings/diagnostics collected while building a BusModel.
 
-    Split off from BusModel so the primary clash outputs (bus_clashes /
-    device_clashes / read_overlaps) stay on the model proper, while the
-    broader set of validation / mismatch / truncation warnings lives in
-    one cohesive bag.
+    The primary clash outputs (bus_clashes / device_clashes / read_overlaps)
+    stay on BusModel; the validation / mismatch / truncation warnings live here.
     """
 
     # Validation issues (warnings that don't block drawing)
@@ -157,9 +155,8 @@ class BusModel:
     bits: List[BitInfo] = field(default_factory=list)
 
     # Position index: bit_index -> the bits at that index, kept in sync with `bits`
-    # by add_bit / remove_bits_matching. Makes get_bits_at O(1) instead of a full
-    # scan (it is called per clash and per handover candidate while building). Not
-    # part of equality/repr — `bits` remains the authoritative, ordered list.
+    # by add_bit / remove_bits_matching. Makes get_bits_at O(1). Not part of
+    # equality/repr — `bits` remains the authoritative, ordered list.
     _bits_by_index: Dict[int, List[BitInfo]] = field(
         default_factory=dict, repr=False, compare=False)
 
@@ -280,12 +277,8 @@ class BusModel:
 
         DEFERRED, NOT IMMEDIATE. The position bucket is updated at once — so
         `get_bits_at` and the clash logic are exact straight away — but `bits` is left
-        alone and the removal recorded for `compact()` to apply in a single pass.
-        Rebuilding `bits` here made this O(total bits placed) PER CALL, despite the
-        comment above claiming the bucket kept it cheap: 390 us at 20k bits, 800 us at 40k,
-        and it is called once per row for a very ordinary authoring pattern (a data write
-        suppressing its own guard), so a build went quadratic in the row count — 4.6 s at
-        8000 rows. Deferring makes the whole build one compaction instead of one per row.
+        alone and the removal recorded for `compact()` to apply in a single pass, so a
+        build costs one compaction rather than an O(total bits placed) rebuild per call.
 
         Args:
             bit_index: Global sequential index

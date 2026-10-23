@@ -1,12 +1,11 @@
-"""The timeline's tick and commit-point decimation is the SAME answer, computed faster.
+"""The timeline's tick and commit-point decimation equals a per-command reference loop.
 
-It used to be one Python iteration per command per view change (76 ms per wheel step at
-100k commands, linear in the count); it is now a bisect to the view plus a vectorised
-per-column maximum. The reference below is the old loop, copied verbatim, and the new code
-must equal it exactly — which command wins each pixel column AND the order of the list —
-over random commands of every paint rank, listed out of time order, with colliding and
-duplicate starts, under a filter, at many zooms, and in a negative domain (a stack of Links
-puts a later Link's view below its sample 0).
+The decimation is a bisect to the view plus a vectorised per-column maximum. The reference
+below is one Python iteration per command, and the decimation must equal it exactly — which
+command wins each pixel column AND the order of the list — over random commands of every
+paint rank, listed out of time order, with colliding and duplicate starts, under a filter,
+at many zooms, and in a negative domain (a stack of Links puts a later Link's view below its
+sample 0).
 """
 import os
 import random
@@ -33,7 +32,7 @@ _KINDS = [
 
 
 def _reference_ticks(r):
-    """The pre-3.0.19 _decimated_ticks body, verbatim."""
+    """Reference for _decimated_ticks: one iteration per command."""
     drawn_px = set()
     ticks = []
     for cmd in reversed(r._draw_order):
@@ -51,7 +50,7 @@ def _reference_ticks(r):
 
 
 def _reference_commit_points(r):
-    """The pre-3.0.19 _decimated_commit_points body, verbatim."""
+    """Reference for _decimated_commit_points: one iteration per commit point."""
     seen_px = set()
     xs = []
     for cp in r._commit_points:
@@ -141,3 +140,34 @@ def test_widths_and_an_empty_ribbon():
     assert empty._decimated_ticks() == [] and empty._decimated_commit_points() == []
     empty.set_events([], 1000)
     assert empty._decimated_ticks() == []
+
+
+def test_every_filter_change_between_two_paints_is_drawn():
+    """set_draw_filter replaces its set on every call, so several calls between two paints
+    each have to reach the ticks: Clear All Filters pushes the filter more than once."""
+    r, cmds, rng = _ribbon(200, n=3000, total=5_000_000)
+    starts = [c.get("start_sample", 0) for c in cmds]
+    _same(r)
+    for _ in range(10):
+        r.set_draw_filter([s for s in starts if rng.random() < 0.3])
+        _same(r)
+        r.set_draw_filter(None)
+        r.set_draw_filter([s for s in starts if rng.random() < 0.5])
+        _same(r)
+        r.set_draw_filter([s for s in starts if rng.random() < 0.1])
+        r.set_draw_filter(None)
+        _same(r)
+
+
+def test_every_events_and_commit_points_update_between_two_paints_is_drawn():
+    """set_events and set_commit_points replace their lists too: from one to eight updates
+    between two paints, the last one is what is drawn."""
+    r, _cmds, rng = _ribbon(201, n=2000, total=1_000_000)
+    events = [list(_ribbon(300 + i, n=2000, total=1_000_000)[1]) for i in range(4)]
+    points = [rng.sample(range(1_000_000), 150 - 30 * i) for i in range(4)]
+    for k in range(1, 9):
+        _same(r)
+        for j in range(k):
+            r.set_events(events[j % 4], 1_000_000)
+            r.set_commit_points(points[j % 4])
+        _same(r)

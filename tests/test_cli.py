@@ -1,20 +1,15 @@
 """The command-line interface: argument dispatch, and the headless model dump.
 
-`-o/--output` is restored from the v2 Visualizer CLI, where it was the batch entry point for
-regression tooling. Three properties matter more than the file's contents, and none of them is
-visible from a passing run:
+`-o/--output` is the batch entry point. Three properties are pinned:
 
 * **`-o` IMPLIES HEADLESS, LITERALLY.** Not "does not show a window" — does not import Qt or the
-  UI package at all. That is what makes it usable from a build machine, and it is fragile in one
-  direction: any module-level Qt import added to `app.py` silently breaks it while every other
-  test stays green. Pinned in a subprocess, because sys.modules in THIS process is already
+  UI package at all, so it runs on a build machine. Any module-level Qt import added to
+  `app.py` breaks it. Pinned in a subprocess, because sys.modules in THIS process is already
   polluted by the rest of the suite.
-* **Each exit code means exactly one thing.** A batch caller branches on them. argparse's default
-  for a usage error is SystemExit(2), which collided with "wrote a model, and it contains a bus
-  clash" — so a misspelled flag would have been read as a finding about the bus.
+* **Each exit code means exactly one thing.** A batch caller branches on them. A usage error
+  exits 1, not argparse's default 2, which means "wrote a model, and it contains a bus clash".
 * **The batch JSON and the UI's Export are the same bytes.** Both go through
-  `viz_engine`/`JSONHandler.save_bus_model`; v2 grew a second hand-written reporting path here
-  and it drifted from the GUI's notifications panel.
+  `viz_engine`/`JSONHandler.save_bus_model`.
 """
 from __future__ import annotations
 
@@ -44,7 +39,7 @@ def _example(*parts):
 # instead of quietly testing the wrong thing. Their properties are asserted below rather than
 # assumed: "the first config in the corpus" happens to carry a bus clash, and correctly exits 2.
 _CLEAN = _example("spec_figures",
-                  "Figure_150_PDM_Streams_with_PHY_Tail_Bits_No_Sample_Grouping.csv")
+                  "PDM_Streams_with_PHY_Tail_Bits_No_Sample_Grouping.csv")
 _CLASH = _example("directed_tests", "intentional_errors", "clash_logic_1.csv")       # 14 bus clashes -> exit 2
 
 
@@ -104,8 +99,7 @@ def test_headless_writes_a_loadable_bus_model(tmp_path):
     r = _run("-c", _CLEAN, "-o", str(out))
     assert r.returncode == 0, r.stderr
     assert out.is_file()
-    # Round-trips through the loader, which is the reason the BUS model was chosen over the
-    # legacy frame model (v2's help text said "frame"; its code wrote this).
+    # The BUS model round-trips through the loader.
     from swi3s_studio.swviz.io.json_handler import JSONHandler
     model = JSONHandler.load_bus_model(str(out))
     assert model.num_rows > 0 and model.num_columns > 0
@@ -121,8 +115,8 @@ def test_headless_creates_the_output_directory(tmp_path):
 # ---------------------------------------------------------------- one meaning per exit code
 
 def test_a_usage_error_exits_one_not_two(tmp_path):
-    """2 means "wrote a model with a bus clash". argparse's default would have used it for a
-    typo, so a batch script could not tell a mistake from a finding."""
+    """2 means "wrote a model with a bus clash", so a usage error exits 1 and a batch script
+    can tell a mistake from a finding."""
     r = _run("-o", str(tmp_path / "m.json"))              # -o with no -c
     assert r.returncode == 1, f"exit {r.returncode}; stderr={r.stderr!r}"
     assert "requires -c" in r.stderr
@@ -152,14 +146,44 @@ def test_a_clean_config_exits_zero():
     assert _run("-c", _CLEAN, "-o", os.devnull).returncode == 0
 
 
+_SPLIT_GUARD = _example("directed_tests", "intentional_errors", "CDS_split_guard_1.csv")
+
+
+def _truncated_copy(tmp_path):
+    """_SPLIT_GUARD with one cell dropped from its last row, which the CSV handler rejects."""
+    lines = pathlib.Path(_SPLIT_GUARD).read_text(encoding="utf-8").splitlines()
+    assert lines[-1].startswith("DisplayFields,"), "fixture's last row moved"
+    lines[-1] = lines[-1].rsplit(",", 1)[0]
+    bad = tmp_path / "truncated.csv"
+    bad.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return bad
+
+
+def test_a_csv_that_does_not_load_exits_one_and_writes_nothing(tmp_path):
+    """A row-shape error makes the CSV handler stop part-way, before the CDS registers are
+    derived. No model is built from that: -o exits 1 with the handler's message."""
+    out = tmp_path / "m.json"
+    r = _run("-c", str(_truncated_copy(tmp_path)), "-o", str(out))
+    assert r.returncode == 1, f"exit {r.returncode}; stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "DisplayFields" in r.stderr, r.stderr
+    assert not out.exists()
+
+
+def test_build_bus_model_refuses_a_csv_that_does_not_load(tmp_path):
+    """The UI's render path and the CLI share build_bus_model, so both see the failure."""
+    with pytest.raises(ValueError, match="did not load"):
+        viz_engine.build_bus_model(str(_truncated_copy(tmp_path)))
+    bm, _i, _v = viz_engine.build_bus_model(_SPLIT_GUARD)
+    assert bm.bus_clashes, "the intact fixture builds, with its bus clash"
+
+
 # ---------------------------------------------------------------- the batch and UI agree
 
 @pytest.mark.parametrize("config", _EXAMPLES,
                          ids=[os.path.basename(c)[:-4] for c in _EXAMPLES])
 def test_batch_json_is_identical_to_the_ui_export(config, tmp_path):
-    """Every config in the corpus. The whole point of routing -o through viz_engine rather
-    than re-implementing the dump is that these cannot diverge; asserting it on one config
-    would not have caught a divergence that depends on a warning only some configs raise."""
+    """Every config in the corpus: -o goes through viz_engine, like the UI's Export, and a
+    divergence can depend on a warning only some configs raise."""
     out = tmp_path / "m.json"
     rc = _run("-c", config, "-o", str(out)).returncode
     assert rc in (0, 2), f"{config} exited {rc}"
@@ -180,27 +204,22 @@ def test_qt_options_are_passed_through_not_rejected():
 
 
 def test_demo_flags_still_parse():
-    """These were string matches against argv before the parser existed; the behaviour they
-    drive is unchanged, so they must keep working exactly."""
+    """--demo and --demo-bringup parse as flags, and are off by default."""
     assert cli.parse(["x", "--demo"])[0].demo is True
     assert cli.parse(["x", "--demo-bringup"])[0].demo_bringup is True
     assert cli.parse(["x"])[0].demo is False
 
 
 def test_help_describes_the_bus_model_not_a_frame_model():
-    """v2's help said "frame model" while its code wrote the bus model. The behaviour is v2's;
-    the text is corrected. If someone "fixes" the text back, this fails."""
+    """The help text says "bus model", which is what -o writes, not "frame model"."""
     help_text = cli.build_parser().format_help()
     assert "bus model" in help_text.lower()
     assert "frame model" not in help_text.lower()
 
 
 # ---------------------------------------------------------------- the launchers forward argv
-# BOTH launchers swallowed every argument for the whole v3 line: `run.sh` ended in a bare
-# `exec … -m swi3s_studio.app` with no "$@", and run.ps1 took only -Rebuild. Nothing noticed
-# because there was nothing worth passing until the app grew a command line — and then the first
-# real use of it (`./run.sh -c cfg.csv -o out.json`) opened the UI and wrote no file, which looks
-# like the CLI is broken rather than the launcher.
+# Both launchers forward their arguments to the app: run.sh through "$@", run.ps1 through
+# ValueFromRemainingArguments.
 #
 # Read as TEXT rather than executed: run.sh builds a venv and can install ~200 MB of wheels, and
 # run.ps1 does not run here at all. Both are thin wrappers, so the property is textual — the
@@ -256,11 +275,9 @@ def test_both_launchers_agree_about_which_flags_open_no_window():
 
 
 # ------------------------------------------------- the launchers, EXECUTED rather than read
-# The text guards above are drift guards, and this file's own neighbour (test_release_gate.py)
-# documents at length why those are not enough: they assert that source LOOKS right. A quoting
-# slip, a loop that builds the array but never uses it, or a `set -u` failure on an empty array
-# all leave the text matching and the behaviour broken — which is the exact shape of the bug
-# being fixed here, one level down.
+# The text guards above assert that source LOOKS right. A quoting slip, a loop that builds the
+# array but never uses it, or a `set -u` failure on an empty array all leave the text matching
+# and the behaviour broken.
 #
 # So run.sh is RUN, with every expensive step stubbed: a fake venv whose activate script puts a
 # fake `python` on PATH, and stamps newer than their sources so the dependency install and the
@@ -315,7 +332,7 @@ def _make_stub(tmp_path, passthrough=False):
 
     # Stamps newer than their sources -> skip `pip install` and the native build entirely.
     # Newer than the sources, not merely "now": a tree extracted with its commit's times on a
-    # machine whose clock is behind has sources in the future, and run.sh then rebuilt.
+    # machine whose clock is behind has sources in the future.
     sources = [pathlib.Path(_ROOT) / "requirements.txt",
                *(f for f in (pathlib.Path(_ROOT) / "native").rglob("*") if f.is_file())]
     after = max([time.time(), *(f.stat().st_mtime for f in sources)]) + 1
@@ -378,8 +395,7 @@ def test_run_sh_keeps_rebuild_for_itself(stub_launcher_env):
 @pytest.mark.parametrize("args", [("--rebuild", "--demo"), ("--demo", "--rebuild")])
 def test_run_sh_rebuilds_wherever_rebuild_is_given(stub_launcher_env, args):
     """The forwarding loop drops --rebuild from any position, so the build step has to see it
-    in any position too: read from $1 alone, `./run.sh --demo --rebuild` neither rebuilt nor
-    passed the flag on."""
+    in any position too."""
     env, record = stub_launcher_env
     r, forwarded = _launch(env, record, *args)
     assert r.returncode == 0, f"run.sh failed: {r.stdout!r} {r.stderr!r}"
@@ -388,8 +404,8 @@ def test_run_sh_rebuilds_wherever_rebuild_is_given(stub_launcher_env, args):
 
 
 def test_run_sh_reads_its_arguments_in_one_place():
-    """Two readings of one argument list drift: the build step read only $1 for --rebuild
-    while the forwarding loop dropped it from any position. One loop reads them all."""
+    """One loop reads all the arguments, so the build step and the forwarding see the same
+    list."""
     sh = pathlib.Path(_RUN_SH).read_text(encoding="utf-8")
     code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
     assert code.count('"$@"') == 1, "run.sh reads its arguments in more than one place"
@@ -427,10 +443,8 @@ def test_run_sh_is_quiet_about_a_window_it_will_not_open(stub_launcher_env):
 
 
 # ---------------------------------------------------------------- usage names the real command
-# `./run.sh -h` printed `usage: swi3s-studio …` — a command that does not exist on a fresh
-# checkout, while the launcher is how the README says to run this. A usage line whose first word
-# is not retypable is worse than no usage line, because it sends the reader off to install
-# something. The launcher announces itself via $SWI3S_LAUNCHER; everything else is inferred.
+# The usage line's first word is a command the reader can retype. The launcher announces itself
+# via $SWI3S_LAUNCHER; everything else is inferred.
 
 def test_the_launcher_name_reaches_the_usage_line():
     env_before = os.environ.get("SWI3S_LAUNCHER")
@@ -469,8 +483,7 @@ def test_run_sh_really_produces_its_own_name_in_usage(stub_launcher_passthrough)
 
     STUBBED, not bare: run.sh keys its venv cache on the checkout's PATH, so a bare `bash run.sh
     -h` passes only where that cache is warm, and anywhere else (a fresh clone, CI, the tree
-    publish_tree assembles) starts creating a venv and installing wheels. publish_tree's check 6 caught it on the assembled
-    tree: a test that depends on this machine's caches is not a test.
+    publish_tree assembles) starts creating a venv and installing wheels.
     """
     env, record = stub_launcher_passthrough
     r = subprocess.run(["bash", _RUN_SH, "-h"], cwd=_ROOT, env=env,

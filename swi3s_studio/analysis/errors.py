@@ -6,7 +6,7 @@ from typing import Iterable, List, Optional, Tuple
 from . import port_status
 
 _SINGLE_DEVICE_PHASES = {"Write", "ReadSetup", "ReadData", "CalibratePhy"}
-# Peripheral Response error tokens (Table 67).
+# Peripheral Response error tokens ("Assignment of Robust Token Numbers (Peripheral)" table).
 _PERIPH_ERRORS = {12: "PROTOCOL_ERROR", 13: "COMMAND_ERROR",
                   14: "TRANSPORT_ERROR", 15: "COMMANDS_BLOCKED"}
 
@@ -31,8 +31,7 @@ def command_error(cmd: dict) -> Optional[str]:
     command whose SSP landed while a Payload Interval Skipping port was part-way through
     its skip pattern (Section 9.1.6.2.1 — CommandRec::unexpectedSspError), and a Read
     whose reply carried a peripheral-reported fault or ImpDef/SDCA interrupt (see
-    :mod:`.port_status` — the device's own account, which no amount of correct wire
-    decoding can substitute for).
+    :mod:`.port_status`).
     """
     if cmd.get("enablech_curr_error"):
         return _ENABLECH_CURR_MSG
@@ -62,8 +61,7 @@ def command_error(cmd: dict) -> Optional[str]:
     if pr in _PERIPH_ERRORS:
         return _PERIPH_ERRORS[pr]
     # GetStatus/Ping error responses land in the per-device ping_status list (12
-    # tokens), NOT the scalar peripheral_response — flag those too, or count_errors
-    # under-reports a peripheral reporting an error to a status poll.
+    # tokens), not the scalar peripheral_response; flag those too.
     ping = cmd.get("ping_status")
     if ping:
         for dev, tok in enumerate(ping):

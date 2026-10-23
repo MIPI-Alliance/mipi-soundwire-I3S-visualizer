@@ -29,8 +29,7 @@ def test_no_row_index_gutter():
 
 
 def test_decimal_is_as_wide_as_its_contents_not_the_space_left():
-    # Stretched, the last column took whatever the others left, so in All Links one
-    # stacked table's Decimal was wide and the next one's narrow.
+    # The last column (Decimal) is sized to its contents, not stretched into the space left.
     from swi3s_studio.ui.decoded_sample_view import DecodedSampleView
     v = DecodedSampleView()
     v.set_sample_rate(1e6)
@@ -72,16 +71,10 @@ def test_extending_the_window_does_not_re_enter_at_the_far_end():
     """An edge load must not provoke a second one at the OPPOSITE end.
 
     prepend_samples re-anchors the view with sb.setValue() after inserting rows. The
-    scrollbar is a separate object from the table, so the blockSignals() around the insert
-    never covered that call, and the new value can land within _EDGE_PAD of either end —
-    which _on_scroll read as the user scrolling there and answered with another edgeReached.
-    A scroll-to-TOP extend therefore also appended a chunk at the BOTTOM: double the row
-    building, and at _MAX_LOADED it evicted the very rows the user had scrolled up to reach.
-
-    test_window_is_bounded_and_lazily_extends could not see it. With the original 4000-row
-    window, 12000 + 4000 was exactly _MAX_LOADED, so the stray append's own eviction landed
-    the row count back on the expected number. This asserts the absence of the cascade
-    itself, and that `_sample_range` still describes what is actually loaded.
+    scrollbar is a separate object from the table, so a blockSignals() around the insert
+    does not cover that call, and the new value can land within _EDGE_PAD of either end,
+    where _on_scroll would read it as the user scrolling there. This asserts there is no
+    re-entry, and that `_sample_range` still describes what is actually loaded.
     """
     w, _ = _win()
     sv = w._sample_view
@@ -154,11 +147,10 @@ def test_programmatic_select_does_not_echo():
 
 
 def test_cursor_into_bringup_is_not_yanked_back_by_sample_view():
-    """Regression: with the Decoded-Samples pane visible, moving the cursor into the
-    link bring-up (which has no matching audio sample row) must leave it there. The
-    cursor cascade calls sample_view.select_sample(), whose selection echo used to
-    re-emit sampleSelected -> snap the cursor to the nearest LOADED row (back near the
-    old position) — the "click once, cursor doesn't move; click again, it does" bug."""
+    """With the Decoded-Samples pane visible, moving the cursor into the link bring-up
+    (which has no matching audio sample row) must leave it there. The cursor cascade
+    calls sample_view.select_sample(), which must not re-emit sampleSelected and snap
+    the cursor to the nearest LOADED row."""
     w, _ = _win()
     # Park the cursor in decoded audio (a wide region with real sample rows loaded).
     audio = w._session.audio_start_sample

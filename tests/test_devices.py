@@ -120,12 +120,12 @@ def test_command_table_peripheral_register_name():
     rmap = RegisterMap.load()
     pm = PeripheralRegisterMap.from_json(
         pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
-    cmd = {"command": "WriteA32", "has_address": True, "address": 0x10000007,
+    cmd = {"command": "WriteA32", "has_address": True, "address": 0x10000104,
            "device_mask": 0b1, "data": [0x2A], "has_manager_packet": True, "crc_valid": True}
     m = CommandTableModel([cmd], rmap, 1)
     assert m._register_label(cmd) == "Device-defined (Local)"     # no map yet
     m.set_peripheral_maps({0: pm})
-    assert m._register_label(cmd) == "AMP_LEVEL"                  # device 0's vendor map
+    assert m._register_label(cmd) == "GAIN"                  # device 0's vendor map
     other = dict(cmd, device_mask=0b10)                          # different device, no map
     assert m._register_label(other) == "Device-defined (Local)"
 
@@ -140,7 +140,7 @@ def test_register_view_expansion_survives_rebuild():
         pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text(encoding="utf-8"))
     rv = RegisterView(rmap)
     df = DeviceRegisterFile(rmap, 0)
-    df.apply_write(0x10000007, bytes([0x2A]))
+    df.apply_write(0x10000104, bytes([0x2A]))
     rv.set_files({0: df})
     rv.set_peripheral_maps({0: pm})
 
@@ -168,12 +168,12 @@ def test_register_view_compare_shows_csv_only_device():
     rmap = RegisterMap.load()
     rv = RegisterView(rmap)
     df = DeviceRegisterFile(rmap, 0)
-    df.apply_write(0x10000007, bytes([0x2A]))
+    df.apply_write(0x10000104, bytes([0x2A]))
     rv.set_files({0: df})                    # only device 0 is tracked at the cursor
     picker_devs = lambda: {rv._device.itemData(i) for i in range(rv._device.count())}
     assert picker_devs() == {0}
     # Expected config references device 3 (absent from the current files).
-    rv.set_expected([(3, 0x10000007, 0x11)])
+    rv.set_expected([(3, 0x10000104, 0x11)])
     assert 3 in picker_devs(), picker_devs()     # CSV-only device now selectable
     rv.clear_expected()
     assert picker_devs() == {0}                  # and dropped when compare is cleared

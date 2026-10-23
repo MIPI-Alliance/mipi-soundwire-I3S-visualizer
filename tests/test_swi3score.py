@@ -68,10 +68,7 @@ def test_dscr_disable_drops_port_from_audio_and_samples():
     """A DSCR (a synced commit that does NOT re-anchor the SSP) that clears a port's
     EnableCh must DROP that port from BOTH the audio decode and the samples (bit) view,
     while the surviving port continues UNINTERRUPTED (a DSCR preserves interval phase).
-
-    Regression: the decoder used to commit a DSCR immediately WITHOUT reconfiguring the
-    payload engine, so a disabled port kept emitting audio + bit samples (the Dev6 DP3
-    'enabled after EnableCh=0' bug). dp1 is disabled halfway; dp0 must stay bit-exact."""
+    dp1 is disabled halfway; dp0 must stay bit-exact."""
     N = 64
     levels = swi3score.make_dscr_disable_levels(N)
 
@@ -109,9 +106,7 @@ def test_dscr_disable_drops_port_from_audio_and_samples():
 def test_dscr_disabling_last_port_stops_audio():
     """Disabling the LAST enabled port must stop its audio. BuildConfig returns "no config"
     when nothing is enabled, so the reconfigure has to drop the port to an EMPTY engine
-    rather than bailing and keeping it. Regression for the long-capture Dev6 DP3 bug (the
-    port kept decoding to the end of the capture because it was the last one disabled);
-    the earlier dp1-only fixture missed it because dp0 remained enabled."""
+    rather than bailing and keeping it."""
     N = 64
     levels = swi3score.make_dscr_disable_levels(N, disable_all=True)
     src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
@@ -129,8 +124,8 @@ def test_immediate_single_ranked_write_reconfigures_decode():
     single-ranked WriteA32 (PortControl.ScramblerEn, 0x0B) takes committed effect
     immediately, so clearing it mid-stream must reconfigure the decode NOW. The port is
     scrambled on the wire throughout; before the write the decode descrambles (matches the
-    sine), after it stops (diverges). Regression: a decode that only reconfigures at commits
-    keeps descrambling and the whole stream would match."""
+    sine), after it stops (diverges). A decode that only reconfigured at commits would keep
+    descrambling, and the whole stream would match."""
     N = 64
     levels = swi3score.make_immediate_scrambler_levels(N)
     src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
@@ -153,12 +148,11 @@ def test_immediate_single_ranked_write_reconfigures_decode():
 
 
 def test_windowed_bit_samples_match_full_across_mid_interval_reconfigure():
-    """C5: a windowed bit-sample re-decode whose window STRADDLES a MID-INTERVAL,
+    """A windowed bit-sample re-decode whose window STRADDLES a MID-INTERVAL,
     phase-preserving reconfigure must place the surviving port's sample points on the SAME
-    bus rows as the full decode. Regression: the windowed replay used to Configure() (which
-    resets row_in_interval -> 0) at the reconfigure, where the live decode uses phase-
-    preserving Reconfigure(); for an Interval>1 port reconfigured mid-interval that drifted
-    the Raw-Capture sample-point markers after the reconfigure by the interval offset."""
+    bus rows as the full decode: the windowed replay, like the live decode, uses the
+    phase-preserving Reconfigure() there, not Configure() (which resets row_in_interval
+    -> 0)."""
     import numpy as np
 
     from swi3s_studio.ingest import transitions
@@ -211,7 +205,7 @@ def test_decode_progress_unknown_before_run():
 
 
 def test_enablech_curr_write_error_rule():
-    """FEATURE #3: a WriteA32 to an EnableCh _CURR register address (0xC1/0xD0/0xD1 — the
+    """A WriteA32 to an EnableCh _CURR register address (0xC1/0xD0/0xD1 — the
     dual-ranked channel-enable register's committed rank, written directly instead of via
     the normal _NEXT -> Commit path) must be flagged an error UNLESS the addressed port's
     Interval is 1 Row (Interval register == 0, i.e. every row transports so there's no
@@ -233,7 +227,7 @@ def test_enablech_curr_write_error_rule():
 
 
 def test_enablech_curr_error_field_defaults_false_on_normal_demo():
-    """The new command field must exist on every decoded command and default to False:
+    """The command field must exist on every decoded command and default to False:
     the synthetic demo's control traffic never writes an EnableCh _CURR address, so no
     command should be flagged (a false positive here would mean the address/offset check
     is too broad and is catching ordinary _NEXT writes or unrelated registers)."""
@@ -248,9 +242,8 @@ def test_enablech_curr_error_field_defaults_false_on_normal_demo():
 def test_scrambler_resets_on():
     # PortControl.ScramblerEn resets to 1 (scrambling ON). The demo writes it OFF only for
     # DP0/DP2 (to show unscrambled transport alongside scrambled); DP1/DP3 are never
-    # written, so they must decode as scrambler-on by DEFAULT — the reset-seed regression
-    # guard (a capture that leaves it at reset must decode as scrambled, else a square-wave
-    # payload comes back as noise).
+    # written, so they must decode as scrambler-on by DEFAULT (a capture that leaves it at
+    # reset must decode as scrambled).
     dec = decode_demo()
     by_dp = {dp["dp_number"]: dp["scrambler_en"]
              for dp in dec.config_dataports()["dataports"] if dp["enabled"]}
@@ -284,10 +277,9 @@ def test_audio_roundtrips_to_sine():
 
 def test_measured_ui_rate():
     """The decoder reports the forwarded-clock UI rate from the capture. The demo
-    source is 4 samples/UI at 98.304 MHz, so the UI rate is ~24.576 MHz. (Guards
+    source is 4 samples/UI at 98.304 MHz, so the UI rate is ~24.576 MHz. (Covers
     the continuous UI-rate tracker: a wrong rate scales the reported row rate and
-    every audio sample rate — the symptom of the cold-start clock-change bug where
-    a tone played back at 1/4 pitch.)"""
+    every audio sample rate.)"""
     dec = decode_demo()
     assert abs(dec.measured_ui_rate_hz - 98_304_000 / 4) < 1000, dec.measured_ui_rate_hz
     # row rate = ui rate / columns.
@@ -295,11 +287,9 @@ def test_measured_ui_rate():
 
 
 def test_audio_rate_stable_with_audio_decode():
-    """Decoding WITH audio must not change the measured UI rate vs without — the
-    cold-start regression was that extra (now CRC-valid) commands suppressed the
-    rate-correcting resync only when audio decode was on, leaving the reported rate 4x
-    low. The UI rate (not the final column count, which now varies with how far each
-    path tracks the 2->8->16 geometry) is the invariant."""
+    """Decoding WITH audio must not change the measured UI rate vs without. The UI rate
+    (not the final column count, which varies with how far each path tracks the
+    2->8->16 geometry) is the invariant."""
     levels = swi3score.make_demo_levels(300)
     rates = []
     for audio_on in (False, True):
@@ -349,7 +339,7 @@ def test_register_override_section_scoped():
 
 def test_register_override_no_cross_port_corruption():
     """Applying an override to one port (via a COPY of the live register model)
-    must not perturb the other ports' audio (Risk R2 — no live-staging corruption)."""
+    must not perturb the other ports' audio (no live-staging corruption)."""
     base = _audio_counts([])
     ovr = _audio_counts([(1, 0, 0x20C1, 0x00)])   # only dev0/dp0 affected (_CURR alias)
     assert ovr.get((0, 0), 0) < base.get((0, 0), 0), (base, ovr)   # dp0 did drop
@@ -362,9 +352,8 @@ def test_wide_bit_layout_spans_columns():
     (BitWidth+1) adjacent columns in the grid — so the renderer merges them into a
     `C{ch}B{bit} xN` cell, matching the Visualizer. The bit IDENTITY is stamped on
     EVERY UI of the wide bit (not just the sample point), so it's correct for a source
-    (sampled first UI) AND a sink (sampled last UI). Previously a wide SINK bit was
-    mislabelled — the pair straddled rows as `C0B15, C0B14` with a phantom leading
-    `C-1B*` held column. A wide bit needs HorizontalCount increased to have room."""
+    (sampled first UI) AND a sink (sampled last UI), with no phantom `C-1B*` held column.
+    A wide bit needs HorizontalCount increased to have room."""
     from swi3s_studio.model.registers import DP_BASE, DP_STRIDE
     from swi3s_studio.session import Session
     s = Session.from_demo(64, cold_start=True)

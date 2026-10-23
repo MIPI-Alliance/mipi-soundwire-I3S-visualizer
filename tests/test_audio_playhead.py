@@ -1,11 +1,10 @@
-"""Play-head sweep regression tests (no audio device needed).
+"""Play-head sweep tests for multi-data-port playback where the streams differ in
+length (no audio device needed).
 
-Covers two fixes for multi-data-port playback where the streams differ in length:
   1. `_mix_selected` zero-fills to the LONGEST selected stream (like pcm_play /
-     export_wav), so a data port that ends early doesn't truncate the whole mix.
+     export_wav), so a data port that ends early does not truncate the mix.
   2. `_sweep_reference` anchors the cursor sweep on the LONGEST stream, so the play
-     head reaches the true end instead of sticking at a shorter DP's last sample
-     (which made replay re-snap to a fixed mid-capture location).
+     head reaches the end of the capture.
 """
 import os
 

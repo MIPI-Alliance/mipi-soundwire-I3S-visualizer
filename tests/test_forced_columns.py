@@ -1,22 +1,15 @@
-"""Region-scoped forced column count, and the CSV-import geometry bug behind it.
+"""Config-CSV import geometry, and the region-scoped forced column count.
 
-Two defects, one user report ("the Analyzer opens the CSV as 7 columns vs 16 in the
-Visualizer"):
+1. **Config CSV import and the Safe-Lock seed.** `_configure_source_for_phy` seeds
+   `forced_column_count` from the cold-start Safe-Lock width and stores it on the
+   session; `forcedColumnCount` outranks the CSV in `Decoder::run`. Importing a config
+   CSV onto an open cold-start capture must CLEAR that stored seed, so the decode runs at
+   the CSV width and the grid (sized `max(column_count, furthest placed cell + 1)`)
+   spans the CSV's columns.
 
-1. **The stale Safe-Lock seed.** `_configure_source_for_phy` seeded
-   `forced_column_count` from the cold-start Safe-Lock width and stored it on the
-   session. That store is sticky, and `forcedColumnCount` outranks the CSV in
-   `Decoder::run`. So importing a config CSV onto an already-open cold-start capture
-   kept decoding at the Safe-Lock width (2), and the grid — sized
-   `max(column_count, furthest placed cell + 1)` — collapsed to the furthest cell.
-   Skipping the seed when a CSV is present was not enough: it had to be CLEARED,
-   because an earlier decode had already stored it.
-
-2. **No way to say "use this width here".** Even decoding correctly, a capture whose
-   geometry the wire never carried (post-commit, no NumColumns commit to snoop) or
-   whose blind detection mis-locked had no override that didn't misframe every other
-   region. Hence `Session.force_column_count_at` — pinned per config region, because a
-   capture that genuinely reconfigures mid-stream has several real widths.
+2. **Region-scoped pin.** `Session.force_column_count_at` overrides the width of one
+   config region (for geometry the wire never carried, or a mis-locked blind detection),
+   leaving the other regions at their own widths.
 """
 import json
 
@@ -30,9 +23,8 @@ CSV_COLUMNS = 16          # NumColumns_REG 15 -> 16 columns
 def _write_config_csv(path, *, columns=CSV_COLUMNS, second_port=True):
     """A minimal v3 config CSV: two 3-channel ports, DP1 optional.
 
-    With DP1 the furthest placed cell is column 15, so a collapsed grid still spans 16
-    and the bug is invisible in the width alone. Dropping DP1 moves the furthest cell to
-    column 6 — which is exactly the "7 columns" the user reported.
+    With DP1 the furthest placed cell is column 15, so a collapsed grid still spans 16.
+    Dropping DP1 moves the furthest cell to column 6, so a collapsed grid spans 7.
     """
     enable = "0b111,0b111" if second_port else "0b111,0b0"
     rows = [
@@ -74,8 +66,8 @@ def _write_config_csv(path, *, columns=CSV_COLUMNS, second_port=True):
 def _grid_width(session, sample):
     """What the Bus Grid actually draws: max(axis width, furthest placed cell + 1).
 
-    Mirrors GridView.set_cells so the assertion is about the rendered grid, not just the
-    session attribute the bug happened to corrupt.
+    Mirrors GridView.set_cells so the assertion is about the rendered grid, not just a
+    session attribute.
     """
     cells = session.grid_cells_at(int(sample), 8)
     axis = int(session.column_count_at(int(sample)))
@@ -83,15 +75,14 @@ def _grid_width(session, sample):
 
 
 # --------------------------------------------------------------------------
-# 1. The stale Safe-Lock seed
+# 1. Config CSV import and the Safe-Lock seed
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("phy,cold_start", [(2, True), (2, False), (1, False)])
 def test_config_csv_import_decodes_at_the_csv_width(tmp_path, phy, cold_start):
     """Importing a config CSV must decode at the CSV's column count.
 
-    Parametrized over the cold start specifically: only that path recovers a Safe-Lock
-    width to go stale, so a single-PHY test would have passed throughout the bug.
+    Parametrized over the cold start: only that path recovers a Safe-Lock width.
     """
     csv = _write_config_csv(tmp_path / "cfg.csv")
     s = Session.from_demo(48, phy=phy, cold_start=cold_start)
@@ -101,11 +92,8 @@ def test_config_csv_import_decodes_at_the_csv_width(tmp_path, phy, cold_start):
 
 
 def test_config_csv_import_clears_a_stale_safe_lock_seed(tmp_path):
-    """The regression itself: the seed must be cleared, not merely skipped.
-
-    `_configure_source_for_phy` had `if not self._config_csv and safe_lock_columns:` —
-    correct for a session OPENED with a CSV, wrong for one imported later, because the
-    earlier decode already stored the seed on the session.
+    """Importing a CSV clears the Safe-Lock seed an earlier decode stored on the session,
+    rather than merely skipping it.
     """
     csv = _write_config_csv(tmp_path / "cfg.csv")
     s = Session.from_demo(48, phy=2, cold_start=True)
@@ -115,10 +103,10 @@ def test_config_csv_import_clears_a_stale_safe_lock_seed(tmp_path):
 
 
 def test_config_csv_import_does_not_collapse_the_grid(tmp_path):
-    """The user-visible symptom: a 16-column config drawn as 7 columns.
+    """A 16-column config draws as 16 columns.
 
-    DP1 is disabled so the furthest placed cell is column 6; with the bug the grid is
-    sized off that cell (7) instead of the CSV's 16.
+    DP1 is disabled so the furthest placed cell is column 6; the grid must still be sized
+    by the CSV's 16, not that cell (7).
     """
     csv = _write_config_csv(tmp_path / "cfg.csv", second_port=False)
     s = Session.from_demo(48, phy=2, cold_start=True)
@@ -128,10 +116,8 @@ def test_config_csv_import_does_not_collapse_the_grid(tmp_path):
 
 
 def test_config_csv_import_keeps_commands_decodable(tmp_path):
-    """Framing at the wrong width doesn't just mis-draw — it mis-parses.
-
-    At 2 columns the demo's commands came out CRC-red; the grid was the visible half of
-    a decode-wide failure. Pins the parse, not just the geometry.
+    """After a CSV import every command decodes CRC-valid: pins the parse, not just the
+    geometry.
     """
     csv = _write_config_csv(tmp_path / "cfg.csv")
     s = Session.from_demo(48, phy=2, cold_start=True)
@@ -141,8 +127,8 @@ def test_config_csv_import_keeps_commands_decodable(tmp_path):
 
 
 def test_cold_start_without_csv_still_seeds_safe_lock():
-    """Guard the fix's blast radius: the seed exists so the blind detector can't
-    mis-lock on a tightly-packed layout. Only the CSV path may clear it."""
+    """Without a CSV the cold start still seeds the Safe-Lock width, so the blind
+    detector cannot mis-lock on a tightly-packed layout. Only the CSV path clears it."""
     s = Session.from_demo(48, phy=2, cold_start=True)
     assert s._forced_column_count == 2
     assert [seg["column_count"] for seg in s.segments][0] == 2
@@ -160,8 +146,7 @@ def test_dlv_still_forces_its_own_column_count():
 # --------------------------------------------------------------------------
 
 def test_force_column_count_pins_only_the_cursor_region():
-    """The whole point of region scoping: pinning one region must leave the earlier
-    ones at the width read off the wire."""
+    """Pinning one region leaves the earlier ones at the width read off the wire."""
     s = Session.from_demo(48, phy=2, cold_start=True)
     assert len(s.segments) >= 2, "need a multi-geometry capture"
     first_width = int(s.segments[0]["column_count"])
@@ -210,8 +195,8 @@ def test_force_column_count_rejects_an_illegal_width():
 
 
 def test_repinning_the_same_width_is_a_no_op():
-    """Re-decoding a large capture is expensive; setting a pin to what it already is
-    must not trigger one (mirrors set_ssp_row / set_register_overrides)."""
+    """Setting a pin to its current value does not re-decode (mirrors set_ssp_row /
+    set_register_overrides)."""
     s = Session.from_demo(48, phy=2, cold_start=True)
     sample = int(s.segments[1]["start_sample"]) + 500
     s.force_column_count_at(sample, 12)
@@ -238,8 +223,7 @@ def test_pin_survives_a_workspace_round_trip():
 
 
 def test_pin_drives_the_timeline_forced_badge():
-    """The band must be able to say '(forced)' — a pinned width that looks snooped is
-    the failure mode this label exists to prevent."""
+    """A pinned region's timeline band is labelled '(forced)'; an unpinned one is not."""
     from PySide6.QtWidgets import QApplication
 
     from swi3s_studio.ui.timeline import TimelineRibbon
@@ -257,10 +241,9 @@ def test_pin_drives_the_timeline_forced_badge():
 def test_forced_outline_is_confined_to_the_pinned_region():
     """Render check: the '(forced)' outline must cover the pinned band and nothing else.
 
-    Drawn with drawRect, which FILLS with the painter's current brush — an easy way to
-    paint a solid rectangle across the whole strip instead of an outline. Diffing a
-    forced against an unforced render localises exactly which pixels the flag changes,
-    without asserting on a colour the theme is free to restyle.
+    The outline is drawn with drawRect, which FILLS with the painter's current brush.
+    Diffing a forced against an unforced render localises the pixels the flag changes,
+    without asserting on a theme colour.
     """
     from PySide6.QtWidgets import QApplication
 
@@ -275,9 +258,8 @@ def test_forced_outline_is_confined_to_the_pinned_region():
                 {"start_sample": 500_000, "column_count": 12, "row_base": 100}]
         if forced:
             segs[1]["forced"] = True
-        # set_events before set_segments: only set_events resets the view window, and
-        # without it everything maps off-screen and the render is blank (load_session
-        # calls them in this order for the same reason).
+        # set_events before set_segments: only set_events resets the view window
+        # (load_session uses the same order).
         tl.set_events([{"start_sample": 0}, {"start_sample": 999_999}], 1_000_000)
         tl.set_segments(segs, 1_000_000)
         return tl, tl.grab().toImage()
@@ -300,9 +282,8 @@ def test_menu_action_pins_the_cursor_region_and_labels_it():
     """The whole feature through the real UI: Analyzer ▸ Force Column Count re-decodes
     off the GUI thread, and when it lands the timeline band says '(forced)'.
 
-    Covers the wiring the unit tests can't: that main_window tags the band segments,
-    that the async `done` callback runs, and that an untouched region keeps its own
-    label (a global force would have relabelled region 0 too).
+    Covers the wiring: main_window tags the band segments, the async `done` callback
+    runs, and an untouched region keeps its own label.
     """
     import time
 

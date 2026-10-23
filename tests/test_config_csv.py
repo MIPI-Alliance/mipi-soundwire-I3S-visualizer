@@ -44,8 +44,7 @@ def test_bus_config_csv_roundtrip_preserves_display_and_manager():
 def test_cds_per_source_roundtrip_and_legacy_migration():
     """Per-source CDS guard/tail must survive a to_csv -> from_csv_text round trip, and a
     legacy (pre-per-source) scalar-only CSV must migrate its global guard/tail onto ALL 13
-    sources (Manager + 12 devices share the CDS). Guards the config-CSV upgrade pipeline —
-    exactly the fields that could silently regress when the format is next extended."""
+    sources (Manager + 12 devices share the CDS). Guards the config-CSV upgrade pipeline."""
     from swi3s_studio.model.bus_config import (
         CDS_GUARD_G0,
         CDS_GUARD_G1,
@@ -98,18 +97,13 @@ def test_a_malformed_column_count_cannot_reach_the_decoder_as_a_modulus():
     """NumColumns_REG is not validated on the way in, and columnCount() is used as a MODULUS.
 
     `LoadCsv` takes the field straight from parseInt, and `Decoder::run` computes
-    `mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount`. A CSV saying
-    `NumColumns_REG,-1` therefore made that a division by zero — undefined behaviour that
-    SPLITS BY PLATFORM in the worst direction: ARM64's sdiv quietly yields 0 and the capture
-    mis-decodes, while x86_64's idiv raises SIGFPE and kills the process. The maintainer's Mac
-    and both test guests are ARM64; the CI runners are x86_64, so the crash lands where nobody
-    is watching. A more negative value (-100 -> -99) skipped the crash and poisoned every
-    row/column calculation instead.
+    `mColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount`, so an unclamped
+    `NumColumns_REG,-1` is a division by zero (SIGFPE on x86_64, a silent mis-decode on
+    ARM64).
 
     Clamped in columnCount() itself, so the live decode AND the audio engine (which hands the
-    same value to CDataPort/CFlowControlPort::Configure) both get a legal count. The grid paths
-    already applied this floor to their own local copy, which is why only the decode crashed.
-    A legal count must still pass through untouched — that is the other half of this test.
+    same value to CDataPort/CFlowControlPort::Configure) both get a legal count. A legal count
+    passes through untouched.
     """
     import numpy as np
 
@@ -144,7 +138,8 @@ def test_grid_dp_needs_enabled_channel():
     def dp1_cells(en_hc):
         replay = [{"is_write": True, "device_mask": 0b10, "address": a, "data": bytes([v])}
                   for a, v in [(0x2180, 0x0d), (0x2181, en_hc), (0x2183, 0x0f)]]
-        replay.append({"is_commit": True, "commit_confirmed": True, "group_mask": 0xFFFF})
+        replay.append({"is_commit": True, "commit_confirmed": True, "group_mask": 0xFFFF,
+                       "device_mask": 0b10})
         cells = swi3score.grid_from_commands(replay, 8, force_columns=16)
         return sum(1 for c in cells if not c.get("is_cds") and c.get("dp") == 1)
     assert dp1_cells(0x41) == 0, "EnableCh0=0 must place no cells (0x41 = HCount set, ch0 off)"
@@ -152,8 +147,8 @@ def test_grid_dp_needs_enabled_channel():
 
 
 def test_grid_effect_slice_ignores_interleaved_reads():
-    """Regression for the bus-grid staged-write leak: the grid replay (writes+commits
-    only) is index-aligned to its OWN effective-sample list, so a READ before the cursor
+    """The grid replay (writes+commits only) is index-aligned to its OWN
+    effective-sample list, so a READ before the cursor
     can't pull a FUTURE write into the slice. With write@100, read@200, write@300 to one
     register, the grid as-of 250 must contain ONLY write@100 — never the future write@300
     (which would enable a dataport before its command)."""
@@ -200,7 +195,7 @@ def test_gui_capture_open_actions():
     win = MainWindow()
     # open_capture still threads a config_csv through (workspace-reload path uses it).
     assert "config_csv" in inspect.signature(win.open_capture).parameters
-    # The old "Open Capture with Config CSV" menu wrapper is gone.
+    # There is no "Open Capture with Config CSV" menu wrapper.
     assert not hasattr(win, "open_capture_with_config")
     assert hasattr(win, "open_visualizer_csv")        # File (Visualizer) ▸ Open Visualizer CSV
     assert hasattr(win, "open_visualizer_config")     # Decode ▸ Import Visualizer CSV
@@ -212,7 +207,7 @@ def test_gui_capture_open_actions():
     # Importing a Visualizer CSV changes the decode, so it is in Decode, not File.
     decode = [a.text().replace("&", "") for a in win._decode_menu.actions()]
     assert "Import Visualizer CSV…" in decode, decode
-    # The old flat gating lists are gone (File actions guard at call time instead).
+    # No flat gating lists: File actions guard at call time.
     assert not hasattr(win, "_file_gated") and not hasattr(win, "_file_always")
 
 
@@ -255,7 +250,7 @@ def test_apply_config_csv_reapply_same_path_rebuilds_after_edit():
     edited must rebuild the CSV grid/register baseline. An already-current CSV normalizes
     to its own path, so _reload_csv_seed's path-keyed memo would otherwise serve the stale
     seed while the C++ re-decode re-reads the file — a silent baseline↔audio mismatch.
-    Regression for apply_config_csv invalidating the memo on every explicit apply."""
+    apply_config_csv invalidates the memo on every explicit apply."""
     from swi3s_studio.model.bus_config import demo_config
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "cfg.csv")
@@ -288,9 +283,9 @@ def test_gui_exposes_open_visualizer_config():
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()
-    win.load_demo()                                # the demo is no longer preloaded in __init__
-    # The GUI Apply Config CSV wrapper folded into open_visualizer_config; the session
-    # method it drives still exists (exercised by the tests above).
+    win.load_demo()                                # the demo is not preloaded in __init__
+    # open_visualizer_config is the GUI entry point; the session method it drives is
+    # exercised by the tests above.
     assert hasattr(win, "open_visualizer_config")
     assert hasattr(win._session, "apply_config_csv")
     labels = [a.text() for a in win._decode_menu.actions()]
@@ -358,8 +353,7 @@ def test_open_visualizer_csv_switches_mode_and_loads():
 def test_visualizer_file_dir_memory_independent_of_analyzer():
     """The Visualizer's config-CSV load/save dialogs browse from (and update) their own
     last-directory memory ("visualizer"), independent of the Analyzer's ("analyzer").
-    Regression: the authoring Load/Save buttons opened at "" / cwd and never remembered,
-    so the two modes shared no scoping. Verifies both the dialog START dir and the
+    Verifies both the dialog START dir and the
     remember-on-use, without touching the real filesystem picker."""
     from PySide6.QtWidgets import QApplication, QFileDialog
     QApplication.instance() or QApplication([])
@@ -395,13 +389,9 @@ def test_visualizer_file_dir_memory_independent_of_analyzer():
 
 def test_imposing_a_wider_config_warns_instead_of_silently_dropping_ports(monkeypatch):
     """A config whose ports need columns beyond the capture's decoded width has those ports
-    simply NOT PLACED. That used to be silent: the grid came back narrower with fewer ports,
-    which reads as "the config didn't load" rather than "this config is wider than this
-    capture". Now it is one prompt, and declining aborts.
+    simply NOT PLACED, so the import shows one prompt naming them, and declining aborts.
 
-    Asserted on the MESSAGE, not just the prompt count, so a future refactor that keeps
-    prompting but stops naming the offending ports still fails. Both answers are exercised:
-    an abort-only test cannot tell "declining works" from "the spy never fired at all"."""
+    Asserted on the MESSAGE, not just the prompt count, and both answers are exercised."""
     from PySide6.QtWidgets import QApplication, QMessageBox
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
@@ -450,12 +440,10 @@ def test_the_collision_check_sees_what_the_csv_will_encode():
 
     The writer collapses anything outside {-1} u [0, 11] onto device 0, because the register
     cannot hold the -1 Manager sentinel and has nowhere else to put an out-of-range value.
-    The checker used to key on the RAW attribute, so two ports at -2 and -9 sharing a
-    dp_number compared as different, passed the check, and were then merged by the export —
-    a real collision the user only saw after reloading. Both now go through
-    `csv_device_identity`.
+    Both go through `csv_device_identity`, so two ports at -2 and -9 sharing a dp_number
+    collide in the check before the export merges them.
 
-    The other half matters just as much: the Manager and a genuine device 0 sharing a
+    The Manager and a genuine device 0 sharing a
     dp_number is LEGITIMATE (the flag distinguishes them on the wire and on reload), so
     keying on the collapsed number alone would invent a collision.
     """

@@ -1,13 +1,13 @@
 """Filter & Gain: one audio stream's DC blocker, 4th-order zero-phase Butterworth high-pass
-and gain, laid out like Audacity's Amplify.
+and gain.
 
 Amplification and New Peak Amplitude are two views of one number, both in dB: the peak is
-measured after the DC blocker and the high-pass, so changing either moves it, and while the gain has not
-been edited it follows the peak to keep the stream normalised to 0 dBFS. With Allow
-clipping off, a gain that would take the peak above full scale cannot be applied, as in
-Audacity. Preview shows the result in the waveform while the dialog is open; Cancel puts
-back what was there, and Apply keeps it. Revert, offered when the stream has a setting,
-removes it and returns the decoded samples.
+measured after the DC blocker and the high-pass, so changing either moves it, and while the
+gain has not been edited it follows the peak to keep the stream normalised to 0 dBFS. With
+Allow clipping off, a gain that would take the peak above full scale cannot be applied.
+Preview shows the result in the waveform while the dialog is open; Cancel puts back what was
+there, and Apply keeps it. Revert, offered when the stream has a setting, removes it and
+returns the decoded samples.
 """
 from __future__ import annotations
 

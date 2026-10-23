@@ -1,15 +1,11 @@
 """A config CSV imported into ONE region of a capture that reconfigures mid-stream.
 
 The whole-capture import (Session.apply_config_csv) puts the decoder in its CSV mode:
-one config from row 0, no snooped width changes, no re-sync. On a capture with a
-Safe-Lock-2 -> 8 -> 16 column cold start that framed every region at the CSV's width,
-turned every command CRC-red and lost the audio of the regions the CSV was not for (a
-user's 8-column CSV on a three-region capture: 5,978 valid commands became 1,971 invalid
-ones, 43M audio samples became 6M). The app warned and then did it anyway.
+one config from row 0, no snooped width changes, no re-sync.
 
 Session.apply_config_csv_at makes the CSV the region's register state instead, through
 the section-scoped what-if path, and the window takes that route whenever the capture
-has more than one region. The demo's cold start has the same three regions.
+has more than one region. The demo's cold start has three regions (2 -> 8 -> 16 columns).
 """
 import os
 import tempfile
@@ -79,8 +75,7 @@ def test_the_csv_changes_its_region_and_no_other(demo, tmp_path):
 
 
 def test_every_command_still_decodes(demo, tmp_path):
-    """The defect the user saw first: commands are framed by the region's width, and the
-    whole-capture import framed them all at the CSV's."""
+    """Commands stay framed by each region's width, not the CSV's."""
     s = _fresh()
     s.apply_config_csv_at(_mid(s, 1), _csv_of_region(s, 1, tmp_path / "r1.csv", drop_dp=3))
     assert len(s.commands) == len(demo.commands)
@@ -144,8 +139,8 @@ def test_a_workspace_names_the_regions_csv_relative_to_itself(tmp_path):
 def test_a_first_region_with_no_config_on_the_wire_takes_the_csv():
     """Every later region is opened by a reconfigure, which is where the decoder folds a
     region's settings in. A capture that starts after its setup commit has none in its
-    first region, so the CSV never reached the payload engine until the decode start
-    applied section 0's settings itself (Decoder::run)."""
+    first region; the decode start applies section 0's settings itself (Decoder::run), so
+    the CSV reaches the payload engine."""
     full = Session.from_demo(_SAMPLES, phy=2, cold_start=True)
     t0 = int(full.segments[-1]["start_sample"]) + 20000
     late = full.capture.subcapture(t0, int(full.capture.clock_edges[-1]))

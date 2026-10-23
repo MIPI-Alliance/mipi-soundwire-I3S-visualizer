@@ -178,14 +178,12 @@ def test_pcm_play_decimation():
 
 def test_the_session_releases_the_native_audio_once_it_has_copied_it():
     """The decode's own AudioSample vector is 72 B/sample and the Session copies all of it
-    into NumPy columns (56 B/sample) at load — 449 MB against 349 MB on the 6.24M-sample
-    demo, with no second reader for the native side. So the Session hands it back.
+    into NumPy columns (56 B/sample) at load, so the Session releases the native vector.
 
-    Everything the app actually reads must survive that: the columns, the dict-list `audio`
-    property built from them, the audio store, and WAV export (all fed by the columns; the
-    per-DP rates come from the snooped config, not the samples). And reading the decoder's
-    audio afterwards must RAISE — an empty list there would be indistinguishable from a
-    capture that carried no audio, which is a wrong answer that looks like data."""
+    Everything the app reads survives that: the columns, the dict-list `audio` property
+    built from them, the audio store, and WAV export (all fed by the columns; the per-DP
+    rates come from the snooped config, not the samples). Reading the decoder's audio
+    afterwards RAISES, so it cannot read as a capture that carried no audio."""
     import pytest
 
     from swi3s_studio.session import Session

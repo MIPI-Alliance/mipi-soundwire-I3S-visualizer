@@ -1,9 +1,8 @@
 """File ▸ Open Capture's one-page dialog (ui/open_capture_dialog.py) and the open it drives.
 
-It replaced a chain of modal questions (clock, data, "another Link?", a blind start and
-length for a large .sal, Open Capture Time Window, the analog CSV dialog) with one page that
-says what the file is first. These pin its defaults, what it refuses, what it returns, and
-that Open Capture loads exactly what it asked for. Captures are synthetic (TESTING.md).
+One page says what the file is, then takes the clock/data pairs, Link names, the window to
+decode and the analog thresholds. These pin its defaults, what it refuses, what it returns,
+and that Open Capture loads exactly what it asked for. Captures are synthetic (TESTING.md).
 """
 import os
 
@@ -51,8 +50,8 @@ def test_one_link_named_link_1_on_the_busiest_clock_and_a_data_line():
 
 
 def test_building_the_dialog_raises_nothing_in_a_slot(monkeypatch):
-    # PySide prints a slot's exception and carries on, so a build-order bug (the window's
-    # first value validating before the Into radios existed) passed every other test here.
+    # PySide prints a slot's exception and carries on, so excepthook is hooked to see one
+    # (e.g. the window's first value validating before the Into radios exist).
     import sys
     raised = []
     monkeypatch.setattr(sys, "excepthook", lambda *exc: raised.append(exc[1]))
@@ -145,7 +144,7 @@ def test_when_all_does_not_fit_it_opens_on_the_largest_window_that_does():
 
 def test_a_large_load_that_fits_is_labelled_and_left_on_all():
     """Past the large-load mark (8 GiB in the app) the dialog says so and stays on All: the
-    mark used to cap the budget, which chose a window and made All a refusal."""
+    mark labels a load, it does not cap the budget."""
     QApplication.instance() or QApplication([])
     dlg = OpenCaptureDialog(_probe(cost=14 * 10**9), [], budget_bytes=20 * 10**9,
                             large_bytes=8 * 10**9)
@@ -190,7 +189,7 @@ def test_the_request_carries_everything_asked_for():
 
 def test_a_two_channel_default_lets_the_loader_orient_the_clock():
     dlg = _dlg(_probe(n=2, edges=None))
-    assert dlg.result_request().links[0].auto_clock      # unknown counts: as before, auto
+    assert dlg.result_request().links[0].auto_clock      # unknown counts: auto
     dlg.rows()[0].clock.setCurrentIndex(1)
     dlg.rows()[0].data.setCurrentIndex(0)
     assert not dlg.result_request().links[0].auto_clock  # swapped by hand: as chosen
@@ -467,9 +466,8 @@ def test_every_format_opens_the_window_asked_for_and_a_workspace_reopens_it(
 
 
 def test_a_dlv_csv_window_is_taken_at_the_rate_it_loads_at(tmp_path, monkeypatch):
-    # A complementary pair loads at its true DLV rate (the timestamp quantum), not at the
-    # rate the finest edge spacing suggests, which is the probe's: converted with the
-    # probe's, a window of half a millisecond decoded 25 µs, in the wrong place.
+    # A complementary pair loads at its true DLV rate (the timestamp quantum), the rate the
+    # probe reports; the window is converted at that rate.
     import random
 
     from swi3s_studio.ingest import probe as probe_mod
@@ -494,7 +492,7 @@ def test_a_dlv_csv_window_is_taken_at_the_rate_it_loads_at(tmp_path, monkeypatch
     win.open_capture()
     pump_loads(win)
     cap = win.links[0].session.capture
-    assert cap.sample_rate_hz != pr.sample_rate_hz            # the case: the rates differ
+    assert cap.sample_rate_hz == pr.sample_rate_hz == 500_000_000
     s0, s1 = win.links[0].session.source["window"]
     assert (s0, s1) == Session.window_samples(asked, cap.sample_rate_hz)
     # the span asked for, to the sample (the end sample is kept: one more)
@@ -667,11 +665,11 @@ def test_numbers_read_at_a_glance():
     assert _dlg(names=["Link 1"], prefer_add=True)._offset.text() == "0.000 ms"
 
 
-# ---- review: queued opens, the probe's busy wait, odd channels, the window's end ----------
+# ---- queued opens, the probe's busy wait, odd channels, the window's end ------------------
 
 def test_a_queued_open_keeps_its_other_links(monkeypatch):
     # An open asked for while another capture decodes is queued, then started from the queue;
-    # it was counted twice, so its own follow-on Links looked superseded and were dropped.
+    # it is counted once, so its own follow-on Links are not taken as superseded.
     from swi3s_studio.ui.main_window import MainWindow
     monkeypatch.setattr(MainWindow, "_event_loop_live", True)
     win = _window()

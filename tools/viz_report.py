@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Dedicated visualizer test runner + statistics report.
 
-The upstream visualizer suite (`test/testsuite.py`) was a single command that ran the
-regression + CSV round-trip over every example config AND emitted a `summary.md` with
-aggregate statistics and run-over-run deltas. Studio moved the pass/fail gate to pytest
-(test_visualizer_engine / _placement / _roundtrip / _grid_cross_engine), which is
-stronger for CI but dropped that human-readable report. This restores it — and goes a
-little beyond: it also checks the CSV round-trip and prints per-config metrics.
+Runs the regression + CSV round-trip over every example config and writes a `summary.md`
+with aggregate statistics, run-over-run deltas and per-config metrics. The pass/fail gate
+is pytest (test_visualizer_engine / _placement / _roundtrip / _grid_cross_engine); this is
+the human-readable report.
 
     python3 tools/viz_report.py                 # run + write tests/visualizer/summary.md
     python3 tools/viz_report.py --check         # also exit non-zero on any regression/round-trip fail

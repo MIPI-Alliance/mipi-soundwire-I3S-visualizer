@@ -10,9 +10,8 @@ Logic 2 will not open a ``.sal`` whose blobs are the documented version-0 binary
 export (it reports "an older version … could not be opened") and validates
 ``meta.json`` against a schema before opening; a native project uses the
 **version-3** compressed internal blob (``type=100``) and a ``meta.json`` with
-``version: 22`` carrying a full set of ``data`` keys. This writer emits both,
-reverse-engineered from several real Logic Pro 16 captures (see
-the maintainers' .sal format notes and ``saleae_binary.parse_channel_v3``).
+``version: 22`` carrying a full set of ``data`` keys. This writer emits both (see
+``saleae_binary.parse_channel_v3``).
 
 Version-3 blob header, exactly as Logic writes it (little-endian)::
 
@@ -66,8 +65,8 @@ _ROW_ID_NS = uuid.UUID("5731335f-5354-5544-494f-5f73616c6578")   # "SWI3S_STUDIO
 # Logic 2 requires a trigger-store member in the project ZIP; without it the project
 # fails to load ("Failed to load file") even with a valid meta.json + digital blobs.
 # It's a fixed 32-byte <SALEAE> v3 blob (type 103): identifier, version 3, type 103,
-# a 1 byte, then 15 zero bytes — byte-identical across every real capture inspected
-# (independent of trigger settings / channels / rate), so it's emitted as a constant.
+# a 1 byte, then 15 zero bytes, independent of trigger settings / channels / rate,
+# so it's emitted as a constant.
 _TRIGGER_STORE = saleae_binary.SALEAE_MAGIC + struct.pack("<II", saleae_binary.V3_VERSION, 103) \
     + struct.pack("<B", 1) + b"\x00" * 15
 
@@ -127,15 +126,13 @@ def _meta_json(sample_rate_hz: int, channels: list[tuple[int, str]],
 
     `channels` is an ordered list of (device_channel, display_name). Logic 2
     validates meta.json against a schema before it opens the project, so this emits
-    the full set of ``data`` keys a real v22 capture has (verified across several
-    real Logic Pro 16 ``.sal`` files): renderViewState, captureStartTime,
+    the full set of ``data`` keys a real v22 capture has: renderViewState, captureStartTime,
     timingMarkers, measurements, highLevelAnalyzers, analyzers, rowsSettings,
     captureSettings, legacyDevice (+capabilities), legacySettings, digitalTriggerTime,
     name, dataTable, analyzerTrigger, timeManager, captureNotes — plus top-level
     binData. Our own `saleae_sal.read_info` keys off `data.legacySettings.sampleRate.
     digital` and `binData`, both present, so the export still round-trips in-package.
-    (legacyDeviceCalibration is omitted — it's absent from some real files, i.e.
-    optional.)"""
+    legacyDeviceCalibration is optional and omitted."""
     view_scale = (total_samples / sample_rate_hz) if sample_rate_hz and total_samples else 1.0
     max_channel = max((ch for ch, _ in channels), default=0)
     rows = [{
@@ -183,9 +180,7 @@ def _meta_json(sample_rate_hz: int, channels: list[tuple[int, str]],
             "name": "SWI3S Studio",
             "deviceType": "LogicPro16",
             # isSimulation False (+ isPhysicalDevice True below) matches a real capture
-            # so Logic doesn't pop the "This Capture Contains Simulated Data!" banner —
-            # the exporter usually re-emits real captured edges (from .bin/.csv), not a
-            # simulation.
+            # so Logic doesn't pop the "This Capture Contains Simulated Data!" banner.
             "isSimulation": False,
             "capabilities": {
                 "channelCapabilities": _channel_capabilities(max_channel),

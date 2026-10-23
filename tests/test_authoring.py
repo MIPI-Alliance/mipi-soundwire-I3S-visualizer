@@ -7,8 +7,8 @@
 - Every data port gets a name in the CSV (defaults like the Visualizer).
 
 Clash detection / validation parity is covered end-to-end by
-`test_visualizer_engine.py` (the Visualizer's own 89-config JSON testsuite), since
-Bus-Visualizer mode is now driven by the vendored Visualizer engine.
+`test_visualizer_engine.py` (the Visualizer's own JSON testsuite); Bus-Visualizer
+mode is driven by the vendored Visualizer engine.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_authoring.py
 """
@@ -26,7 +26,7 @@ def test_notifications_use_renamed_data_port():
     """A per-DP notification must identify the port by device + DataPortNumber +
     user-assigned name (e.g. 'Dev0 DP3 (LeftMic)'), not the bare default 'DP{index}'. And
     the no-channel case must read 'drawn but no channel enabled' — the port is DRAWN, not
-    enabled (enabled means >=1 channel-enable bit set). Regression for both."""
+    enabled (enabled means >=1 channel-enable bit set)."""
     cfg = demo_config()
     dp = cfg.dataports[3]
     dp.enabled = True                     # drawn on the grid...
@@ -47,13 +47,10 @@ def test_notification_names_the_dataport_number_not_the_slot_index():
     """The number in a notification label is the port's DataPortNumber, not its position in
     the config.
 
-    They coincide in every example config, so this only shows up where a port is numbered
-    independently of its slot — a peripheral using its own DP0 in a later column, as the
-    flow-control demo's four devices do. Labelling by index there names a port that does not
-    exist on that device.
-
-    3.0.13 fixed the same defect for grid CELLS and missed this path, which kept saying
-    'Dev1 DP5' for device 1's DP0. Two boundaries, one mapping — this pins the second."""
+    They coincide in every example config, so this uses a port numbered independently of its
+    slot — a peripheral using its own DP0 in a later column, as the flow-control demo's four
+    devices do. Labelling by index there names a port that does not exist on that device.
+    Grid cells use the same mapping; this pins the notification path."""
     cfg = demo_config()
     dp = cfg.dataports[5]                 # slot 5 ...
     dp.enabled = True
@@ -160,19 +157,18 @@ def test_export_decoder_config_as_visualizer_csv():
 
 
 def test_cds_settings_dialog_owns_every_cds_field():
-    """The interface column's four CDS rows are one "CDS Settings" button now, and this
-    pins what that collapse must not lose.
+    """The interface column edits every CDS field through one "CDS Settings" button.
 
     WHAT IT GUARDS:
 
     1. `cds_guard_enabled` / `cds_tail_enabled` are READ-ONLY properties derived from the
-       per-source lists. `_on_iface_edit` loops over every interface row and setattr's it;
-       the CDS rows are gone but `_populate` still loops the same dict, so a skip is still
-       needed — for the button, which answers to no attribute at all (`_IFACE_NON_ATTR`).
+       per-source lists. `_on_iface_edit` loops over every interface row and setattr's it,
+       and `_populate` loops the same dict, so the button, which answers to no attribute at
+       all, is skipped (`_IFACE_NON_ATTR`).
     2. NOTHING COMMITS UNTIL OK, including a change made two dialogs deep. The per-source
        dialogs are opened BY the settings dialog and hand their result back to it, so a
        cancelled outer dialog must discard an accepted inner one.
-    3. The row's tooltip carries the at-a-glance read the four rows used to give.
+    3. The row's tooltip summarises the CDS settings at a glance.
 
     exec() blocks headless, so accepted dialogs are simulated by driving the widgets and
     the accept path directly.
@@ -192,7 +188,7 @@ def test_cds_settings_dialog_owns_every_cds_field():
     panel = AuthoringPanel()
     _lab, btn = panel._iface["cds_settings"]
     assert isinstance(btn, QPushButton)
-    # The four old rows are gone — a stale one would KeyError in _populate.
+    # No separate CDS rows — a stale one would KeyError in _populate.
     for gone in ("cds_bit_width", "cds_guard_enabled", "cds_tail_enabled",
                  "enforce_cds_handover"):
         assert gone not in panel._iface, gone
@@ -245,23 +241,13 @@ def test_cds_settings_dialog_owns_every_cds_field():
 
 
 def test_cds_dialogs_are_laid_out_within_their_own_bounds():
-    """The layout defects that only a RENDER shows — pinned as geometry, since the first
-    version of these dialogs passed every property assertion while being visibly broken.
+    """Layout properties that only a RENDER shows, pinned as geometry:
 
-    Each check is a real defect that shipped:
-
-      * CLIPPED CONTROL. The settings dialog's handover checkbox carried its own text in
-        the narrow value column, so "Enforce CDS Handover" was cut off at the window edge.
-        Every child must fit inside the dialog.
-      * A WINDOW THAT RESIZED ON SELECTION. The drive-type note used to be per-selection,
-        and the dialog re-widened when the wording changed length, so picking a value made
-        the window jump. Width is fixed and must not depend on the values shown.
-      * COLUMN ALIGNMENT. Controls in the value column started at different x — the
-        checkbox centred itself, and the two per-source buttons sized to their own text so
-        the summaries beside them were ragged.
-      * ROWS CUT IN HALF / OVERLAPPING SCROLLBAR. The per-source dialogs put 13 rows in a
-        320 px scroll area, which sliced the last visible row and drew its scrollbar over
-        the right-hand button column. There is no scroll area now: all 13 rows must be
+      * NO CLIPPED CONTROL. Every child must fit inside the dialog.
+      * FIXED WIDTH. The width must not depend on the values shown.
+      * COLUMN ALIGNMENT. Controls in the value column start at the same x, and the
+        summaries beside the per-source buttons line up.
+      * ALL ROWS SHOWN. The per-source dialogs have no scroll area: all 13 rows must be
         inside the dialog.
     """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -292,10 +278,8 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
 
         THIS IS THE CHECK THAT CATCHES ELIDED TEXT, and an overflow test does not. Given a
         fixed dialog width Qt does not let a control overhang the window — it SHRINKS the
-        control and clips the text inside it. So the checkbox whose label read "Enforce CDS
-        Handc…" had a geometry entirely within the dialog; what was wrong is that its width
-        was below its sizeHint. Comparing against the dialog rectangle passes that defect,
-        which was confirmed by re-injecting it.
+        control and clips the text inside it, so the control's geometry stays inside the
+        dialog while its width is below its sizeHint.
 
         Word-wrapped labels are exempt: their sizeHint is the one-line width by design, and
         wrapping is what they are for.
@@ -329,18 +313,15 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     plain = settings()
     assert not squeezed(plain), f"clipped in the settings dialog: {squeezed(plain)}"
 
-    # AND AT A WIDER FONT, which is the whole point of measuring rather than eyeballing:
-    # every width here used to be a constant tuned on one platform's metrics, so the Windows
-    # CI jobs clipped controls that macOS fitted comfortably.
+    # AND AT A WIDER FONT: widths come from font metrics, so the check must hold at the
+    # wider metrics a Windows runner produces.
     #
     # THE STRESS FONT IS DERIVED FROM METRICS, NOT A POINT SIZE, because a point size is not
-    # a width. 13pt was tried first and it stresses Windows while macOS passes it at 21pt --
-    # so the fix looked verified locally and failed CI twice. Growing the size until the
-    # widest label reaches the width the Windows runner actually produced makes the check
-    # equivalent on every platform, whatever family is available.
+    # a width. Growing the size until the widest label reaches the width the Windows runner
+    # produced makes the check equivalent on every platform, whatever family is available.
     app = QApplication.instance()
     base = QFont(app.font())
-    WINDOWS_LABEL_PX = 272          # what "Enforce Handover" measured on that runner
+    WINDOWS_LABEL_PX = 272          # "Enforce Handover" width on the Windows runner
     try:
         wide = QFont(base)
         for pt in range(base.pointSize() or 9, 72):
@@ -369,12 +350,10 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     # One value column: the bit-width strip, the checkbox and every per-source button all
     # start at the same x.
     #
-    # THE CHECKBOX IS MEASURED AT ITS INDICATOR, not at its widget rectangle. The widget was
-    # aligned and the drawn square was not: the panel sets
+    # THE CHECKBOX IS MEASURED AT ITS INDICATOR, not at its widget rectangle: the panel sets
     # `QCheckBox::indicator { subcontrol-position: center }` for its own 64 px bool rows, this
     # dialog inherits it from its parent, and centring makes the square's position depend on
-    # the widget's width — so under a different font it drifts off the column edge while every
-    # widget-level assertion still passes. That is what the first version of this test missed.
+    # the widget's width.
     plain.setStyleSheet(authoring_stylesheet())    # the rule only exists via the panel
     plain.show()
     QApplication.instance().processEvents()
@@ -389,8 +368,7 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
         btn = lab.parent().findChild(QPushButton)
         xs.add(btn.mapTo(plain, btn.rect().topLeft()).x())
     assert len(xs) == 1, f"the value column is not aligned: {sorted(xs)}"
-    # ...and the summaries line up with each other, which they did not when each button
-    # sized to its own text.
+    # ...and the summaries line up with each other.
     sxs = {plain._summaries[k].mapTo(plain, plain._summaries[k].rect().topLeft()).x()
            for k in ("drive", "ede", "guard", "tail")}
     assert len(sxs) == 1, f"summaries ragged: {sorted(sxs)}"
@@ -399,8 +377,7 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     # A summary long enough to need eliding must still be RECOVERABLE. Summary length is
     # unbounded (a guard config can name three polarities across twelve devices), so it
     # elides rather than widening the window — but the whole string has to be in the
-    # tooltip, or the shortening is just a nicer-looking truncation. This case was found by
-    # this test, not by looking: "Manager tail 3; 12 devices tail 3" overran by 2 px.
+    # tooltip, or the shortening is just a nicer-looking truncation.
     long = settings(tail=[3] * 13)
     long.show()
     QApplication.instance().processEvents()
@@ -421,15 +398,9 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
 def test_one_selected_colour_across_every_selector_including_off():
     """Green marks the CHOSEN option in a group — including when that option means "off".
 
-    A previous revision gave a selected "Off"/"0" its own blue-grey, reasoning that green
-    reads as on/active and that thirteen green "Off" buttons look like everything is enabled.
-    That broke a convention rather than clarifying one, and broke it INCONSISTENTLY: the
-    per-source CDS guard dialog went blue-grey while `GuardSelectorDialog` — the per-DP guard,
-    one click away, offering the identical Off / Guard 0 / Guard 1 — stayed green.
-
-    So this pins the convention itself, across the per-source dialogs AND the older per-DP one
-    that established it, because the failure mode was two dialogs disagreeing rather than one
-    dialog being wrong. There is exactly ONE selected style; the label carries the value and
+    This pins the convention across the per-source dialogs AND the per-DP
+    `GuardSelectorDialog` that established it (it offers the identical Off / Guard 0 /
+    Guard 1). There is exactly ONE selected style; the label carries the value and
     the colour carries the selection. A bus-wide "nothing is set" reading belongs in the
     summary TEXT, which `cds_summary` provides and which this asserts alongside.
     """
@@ -456,8 +427,8 @@ def test_one_selected_colour_across_every_selector_including_off():
 
     QApplication.instance() or QApplication([])
 
-    # Exactly ONE selected colour and one selected style exist. A second constant is how the
-    # divergence started, so the count is the guard — `_SELECTED`/`_UNSELECTED` are the two
+    # Exactly ONE selected colour and one selected style exist, so the count is the guard —
+    # `_SELECTED`/`_UNSELECTED` are the two
     # base colours and `_SEL_CSS`/`_UNSEL_CSS` their stylesheets; anything else is a third.
     sel_names = sorted(n for n in vars(dlg_mod) if "SEL" in n)
     assert sel_names == ["_SELECTED", "_SEL_CSS", "_UNSELECTED", "_UNSEL_CSS"], sel_names
@@ -485,20 +456,17 @@ def test_one_selected_colour_across_every_selector_including_off():
     drive._set_all(CDS_DRIVE_SPECIAL)
     assert drive._rows[0][CDS_DRIVE_SPECIAL].styleSheet() == _SEL_CSS
 
-    # The "nothing is set" reading lives in the summary text, which is what the second
-    # colour was being stretched to say.
+    # The "nothing is set" reading lives in the summary text.
     assert cds_summary([0] * 13, "guard") == "off"
     assert cds_summary([CDS_EDE_FULL_UI] * 13, "ede") == "All Full"
     assert cds_summary([CDS_DRIVE_NORMAL] * 13, "drive") == "all Normal"
 
 
 def test_cds_guard_polarity_roundtrip():
-    """Regression: to_csv() used to hardcode CDS_GuardPolarity_REG=False on export
-    (Studio didn't model polarity), silently dropping Guard 1 on every save. Both
-    cds_guard_enabled and cds_guard_polarity must now survive CSV and dict
-    round-trips, with the polarity row written exactly once. cds_guard_enabled/polarity
-    are now derived (read-only) from the per-source cds_guard list — drive them via the
-    Manager's slot (index 0), which is what the legacy singular properties reflect."""
+    """Both cds_guard_enabled and cds_guard_polarity survive CSV and dict round-trips,
+    with the polarity row written exactly once. cds_guard_enabled/polarity are derived
+    (read-only) from the per-source cds_guard list — drive them via the Manager's slot
+    (index 0), which is what the legacy singular properties reflect."""
     from swi3s_studio.model.bus_config import CDS_GUARD_G1
 
     cfg = BusConfig()
@@ -519,9 +487,8 @@ def test_cds_guard_polarity_roundtrip():
 
 def test_wide_bit_interval_overflow_detected():
     """A wide-bit DP (BitWidth>0) whose data can't fit its interval must raise an
-    interval-overflow warning. Regression: expected_bits omitted the wide-bit span,
-    so once wide-bit repeats inflated the placed-bit count past the un-widened
-    expected, a real overflow was silently missed."""
+    interval-overflow warning: expected_bits includes the wide-bit span, so the
+    wide-bit repeats in the placed-bit count do not hide an overflow."""
     from swi3s_studio.model import viz_engine
 
     def _build(bit_width, interval):
@@ -540,8 +507,8 @@ def test_wide_bit_interval_overflow_detected():
         return bm.warnings.interval_overflow_warnings
 
     # bit_width=1 over a 2-row interval (14 UIs): an 8-bit sample needs 16 UIs wide.
-    # 14 placed bits already meet the OLD un-widened expected (8), so the overflow
-    # was hidden; now expected is the widened 16 and the warning fires.
+    # 14 placed bits meet the un-widened count (8); expected is the widened 16, so the
+    # warning fires.
     overflow = _build(bit_width=1, interval=1)
     assert overflow == [("DP0", 16, 14)], overflow
     # The same geometry with narrow bits (BitWidth=0) genuinely fits — no warning
@@ -557,9 +524,9 @@ def test_per_source_cds_handover_placement_and_clash():
     that drove the tail hands over at the region end, reconciling with a same-device
     data port there.
 
-    Regression: a Device-0 guard's handover was dumped at the region-final column,
-    spuriously clashing with a Manager data port that legitimately owns that column
-    (its own tail + handover reconcile). See the four cases below."""
+    A Device-0 guard's handover therefore does not land at the region-final column, where
+    a Manager data port can legitimately own the column (its own tail + handover
+    reconcile). See the four cases below."""
     import tempfile as _tf
 
     from swi3s_studio.model import viz_engine
@@ -583,7 +550,7 @@ def test_per_source_cds_handover_placement_and_clash():
             _cells, clashes, _i, _c, _r = viz_engine.render_payload(path)
         return sorted({col for (_row, col) in (clashes or {})})
 
-    # THE reported case: Manager G1 + Device-0 G0 guards, Manager tail width 3, and a
+    # Manager G1 + Device-0 G0 guards, Manager tail width 3, and a
     # MANAGER data port at the region-end column (col5). Same device as the Manager's
     # own tail+handover there => no clash. Device-0 (guard only) hands over at col2.
     assert _clash_cols({0: 2, 1: 1}, {0: 3}, dp_dev=-1, dp_col=5) == []
@@ -606,18 +573,16 @@ def test_cds_drive_type_reaches_both_engines_and_the_grid_label():
     i = Device i-1) — one device may hold a passive 1 while another drives both levels.
 
     THE DEFAULT IS NORMAL FOR EVERY SOURCE, NOT THE REGISTER'S RESET. registers.json gives
-    CDS 0x86 bit 7 a reset of 0 (Special), but a config that never mentions the field must
-    keep reading the way it always has — otherwise every file written before the field
-    existed, including all 89 example configs, would start drawing CDS_SP. The deviation is
-    deliberate and is asserted here so it is not "corrected" later.
+    CDS 0x86 bit 7 a reset of 0 (Special), but a config that never mentions the field reads
+    as Normal, so a file written before the field existed (every example config) does not
+    draw CDS_SP. The deviation is deliberate.
 
     TWO CSV ENGINES READ THIS FILE FORMAT and both must carry the field: BusConfig
     (Studio's authoring model) and swviz's CSVHandler (the placement engine's). A field
     added to one and not the other round-trips through a save and vanishes on load.
 
-    THE LABEL IS THE POINT. Special is annotated ("CDS_SP") and Normal is not, because a
-    passively-driven one is a decode hazard while an actively driven CDS is what every
-    reader already assumes. The CDS bit is ONE cell and the sources may disagree, so a
+    THE LABEL. Special is annotated ("CDS_SP") and Normal is not: a passively-driven one is
+    a decode hazard. The CDS bit is ONE cell and the sources may disagree, so a
     mixed config reads "CDS_SPx" — the same `x`-means-they-differ convention the guard
     labels already use.
     """
@@ -693,9 +658,8 @@ def test_cds_summary_cannot_report_an_all_special_bus_as_off():
     """The `any()` shortcut the guard and tail summaries share is WRONG for drive type.
 
     Guard and tail encode "not set" as 0, so an all-zero list means off. Drive type encodes
-    SPECIAL as 0 — so the same test reports a bus where every source holds a passive one as
-    "off", the exact opposite of the truth, and the summary that is supposed to warn you
-    would reassure you instead. Drive type reports the exception against Normal.
+    SPECIAL as 0, so the same test would report an all-Special bus as "off". Drive type
+    reports the exception against Normal.
     """
     from swi3s_studio.model.bus_config import CDS_DRIVE_NORMAL as N
     from swi3s_studio.model.bus_config import CDS_DRIVE_SPECIAL as S
@@ -712,7 +676,7 @@ def test_cds_summary_cannot_report_an_all_special_bus_as_off():
 
 
 def _all_texts(gv):
-    """Every text item's string in the scene — the CDS label is two items now."""
+    """Every text item's string in the scene — the CDS label is two items."""
     out = set()
     for item in gv._scene.items():
         f = getattr(item, "text", None)
@@ -727,8 +691,7 @@ def test_special_drive_labels_the_cds_cells_and_defeats_the_render_cache():
     The cache is the subtle half. `set_bus_model` skips a rebuild when its content key
     matches, and CDS_DriveType moves no cell: same bits, same clashes, same dimensions. So
     the symbol has to be IN the key, or flipping drive type would leave the old label on
-    screen until some unrelated edit happened to invalidate the cache — a bug that would
-    look like the setting doing nothing.
+    screen until some unrelated edit happened to invalidate the cache.
     """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -758,7 +721,7 @@ def test_special_drive_labels_the_cds_cells_and_defeats_the_render_cache():
     gv.set_bus_model(cells, clashes, ncols, nrows, cds_symbol="CDS")
     assert cds_texts() == {"CDS"}
     # Identical cells; only the symbol differs. A cache hit here would keep "CDS". The label
-    # is two lines now and each is its own text item, so the flags line shows up separately.
+    # is two lines and each is its own text item, so the flags line shows up separately.
     gv.set_bus_model(cells, clashes, ncols, nrows,
                      cds_symbol=cds_symbol(CDS_DRIVE_SPECIAL))
     assert cds_texts() == {"CDS"} and "SP" in _all_texts(gv), \
@@ -777,12 +740,10 @@ def test_cds_end_drive_early_is_per_source_through_both_engines():
     THE TWO NEIGHBOURS DEFAULT OPPOSITELY RELATIVE TO THEIR RESETS, and that is the trap
     worth pinning: CDS_DriveType defaults to 1 AGAINST its reset of 0 (a file with no row
     must keep reading as it always did), while CDS_EndDriveEarly defaults to 0 WITH its
-    reset (full-UI drive is the ordinary behaviour). One looks like a bug next to the other,
-    so both are asserted here together.
+    reset (full-UI drive is the ordinary behaviour). Both are asserted here together.
 
     NOT the timing calculator's `Man_ede`/`Per_ede`, which model EndDriveEarly for a DATA
-    handover. Same idea, different register, different consumer — asserted nowhere, but said
-    here because the names collide.
+    handover: same idea, different register, different consumer.
     """
     from swi3s_studio.model.bus_config import (
         CDS_DRIVE_NORMAL,
@@ -835,11 +796,9 @@ def test_cds_end_drive_early_is_per_source_through_both_engines():
 def test_a_truncated_per_source_row_takes_the_fields_default_not_zero():
     """A short 13-wide row must fall back per FIELD, because 0 is not always "unset".
 
-    Both engines used to read a missing cell through a plain int parse, which yields 0. On
-    the tail that is right (no tail). On CDS_DriveType 0 means SPECIAL, so a row truncated
-    by a hand edit or a partial write would silently relabel the whole bus as passively
-    driven — the one case where "absent" and "zero" are different answers. The per-source
-    tables carry each field's default for exactly this.
+    A missing cell takes the field's default from the per-source tables, not a plain int
+    parse's 0. On the tail 0 is the default (no tail); on CDS_DriveType 0 means SPECIAL, so
+    "absent" and "zero" are different answers.
     """
     from swi3s_studio.model.bus_config import (
         CDS_DRIVE_NORMAL,
@@ -868,16 +827,10 @@ def test_manager_dataport_beats_device_number_in_either_row_order_in_both_engine
     flag. They only look like rival encodings of one field; in fact the flag decides whether
     the number applies at all.
 
-    THE BUG THIS PINS: BusConfig.from_csv_text applied the flag the instant it read it, on
-    the stated assumption that the flag row is "written after DeviceNumber_REG". True of files
-    it writes itself, false of a hand-edited or third-party one — and in that case the later
-    DeviceNumber row overwrote the Manager assignment, so a Manager port silently became a
-    peripheral. swviz's loader was always order-independent, so THE SAME FILE decoded two
-    different ways depending on which engine read it: treat a bare device number from a CSV
-    with suspicion.
+    ORDER-INDEPENDENT: a hand-edited or third-party file may put DeviceNumber_REG after the
+    flag row, and the flag still wins. Treat a bare device number from a CSV with suspicion.
 
-    Asserted in BOTH orders and BOTH engines, because a fix to one engine that leaves the
-    other alone recreates the divergence rather than fixing it.
+    Asserted in BOTH orders and BOTH engines: the two must decode the same file the same way.
     """
     from swi3s_studio.swviz.io.csv_handler import CSVHandler
     from swi3s_studio.swviz.models.interface import Interface
@@ -906,8 +859,7 @@ def test_manager_dataport_beats_device_number_in_either_row_order_in_both_engine
             # The two engines must agree, which is the actual invariant.
             assert iface.get_dp_device(0) == cfg.dataports[0].device_number, name
 
-    # And a device number still applies where the flag is FALSE — the fix must not have
-    # turned every port into a Manager port.
+    # And a device number still applies where the flag is FALSE.
     mixed = "ManagerDataport,True," + ",".join(["False"] * 11)
     cfg = BusConfig.from_csv_text("\n".join(base + [dev_row, mixed]) + "\n")
     assert cfg.dataports[0].device_number == -1
@@ -921,12 +873,6 @@ def _cds_write(dev, addr, val):
 def test_cds_crosses_the_csv_register_boundary_in_both_directions():
     """The CDS reaches the Analyzer's registers, and comes back from them — both ways.
 
-    THE GAP THIS CLOSES was total, not partial: the C++ core's CSV loader recognised no
-    `CDS_*` field and `registersFromConfig` emitted only the DP block plus NumColumns /
-    SkippingDenominator, so *Import Visualizer CSV* produced no CDS register state at all —
-    not the per-source drive type or end-drive-early, and not the pre-existing bit width,
-    guard or tail either. Nothing was wrong with the numbers; the whole block was absent.
-
     DIRECTION 1 (config -> registers): an authored CSV must emit CDS 0x1186 (drive type) and
     0x1187 (bit width / end-drive-early / guard enable+polarity / tail) for each device, with
     the value taken from that DEVICE's own per-source slot — the CDS is time-multiplexed and
@@ -937,8 +883,8 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
 
     THE MANAGER SLOT (index 0) IS UNRECOVERABLE and asserted to stay at its default. Only
     peripherals have an addressable register block, so nothing on the wire says how the
-    Manager drives the CDS. Leaving it at the default is the honest answer — deriving it from
-    a peripheral's value would invent a fact the capture does not contain.
+    Manager drives the CDS; deriving it from a peripheral's value would invent a fact the
+    capture does not contain.
     """
     import swi3score
 
@@ -1005,12 +951,9 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
 
 
 def test_the_cds_csv_round_trips_through_the_cpp_loader_too():
-    """A third CSV reader now parses the CDS rows, and must agree with the other two.
-
-    `SwI3sConfig::LoadCsv` recognised no CDS field, so its view of a config silently differed
-    from BusConfig's and swviz's. Two engines disagreeing on one file is a defect; three is
-    worse. Checked through the register
-    emission, which is the only window onto the C++ struct from Python.
+    """A third CSV reader, `SwI3sConfig::LoadCsv`, parses the CDS rows, and must agree with
+    BusConfig and swviz. Checked through the register emission, which is the only window onto
+    the C++ struct from Python.
 
     The legacy scalar rows are covered too: a pre-per-source file broadcasts its single
     guard/tail to every source, which is what both Python loaders do.
@@ -1044,19 +987,14 @@ def test_the_cds_csv_round_trips_through_the_cpp_loader_too():
 
 
 def test_the_cds_cell_shows_both_flags_on_a_second_line_and_widens_only_itself():
-    """`CDS_SPx` overflowed a 44 px cell, and end-drive-early had no representation at all.
-
-    TWO PROBLEMS, ONE CELL. The single-line label ran out of room the moment the sources
-    disagreed about drive type (58 px of text in a 44 px column), and a per-device setting with
-    real decode consequences — end-drive-early — was invisible on the grid entirely. So the
-    cell reads "CDS" over a flags line, and the flags carry both fields with the same
-    `x`-means-they-disagree suffix the guard labels use.
+    """The CDS cell reads "CDS" over a flags line, and the flags carry drive type and
+    end-drive-early with the same `x`-means-they-disagree suffix the guard labels use.
 
     ONLY THE CDS COLUMN GROWS. Widening every column would cost horizontal room on a view whose
     job is fitting up to 32 columns on screen, so the extra width is confined to the CDS run —
     and is taken from the RENDERED text width, so it is right for whatever the flags say rather
     than a guessed constant. A config with nothing unusual to report keeps a plain "CDS" and an
-    unchanged, uniform grid, which is every one of the 89 example configs.
+    unchanged, uniform grid, which is every example config.
     """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -1074,7 +1012,7 @@ def test_the_cds_cell_shows_both_flags_on_a_second_line_and_widens_only_itself()
     F, E = CDS_EDE_FULL_UI, CDS_EDE_HALF_EARLY
 
     # The label vocabulary: nothing to say -> one line; each field contributes a flag; a
-    # mixed bus gets the x suffix. EDE is what had no representation before.
+    # mixed bus gets the x suffix.
     assert cds_symbol([N] * 13, [F] * 13) == "CDS"
     assert cds_symbol([SP] * 13, [F] * 13) == "CDS\nSP"
     assert cds_symbol([SP] + [N] * 12, [F] * 13) == "CDS\nSPx"
@@ -1097,7 +1035,7 @@ def test_the_cds_cell_shows_both_flags_on_a_second_line_and_widens_only_itself()
                          cds_symbol=cds_symbol(cfg.cds_drive_type, cfg.cds_end_drive_early))
         return gv
 
-    # Nothing unusual: a uniform grid, exactly as before this feature existed.
+    # Nothing unusual: a uniform grid.
     plain = render([N] * 13, [F] * 13)
     assert plain._col_extra == {}, plain._col_extra
     assert plain._colw(0) == _CW and plain._cx(1) - plain._cx(0) == _CW

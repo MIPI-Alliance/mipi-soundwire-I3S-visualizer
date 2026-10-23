@@ -1,9 +1,9 @@
 """Bus-Visualizer engine adapter.
 
 Bus-Visualizer mode is driven by the **SWI3S Visualizer engine** — the first-party,
-non-UI placement / clash / validation engine in `swi3s_studio.swviz` — rather than a
-re-implementation, so placement, clash detection, and validation match the historical
-Visualizer bit-for-bit. This module is the single seam: it builds a `BusModel` from a
+non-UI placement / clash / validation engine in `swi3s_studio.swviz` — so placement,
+clash detection, and validation match the Visualizer bit-for-bit. This module is the
+single seam: it builds a `BusModel` from a
 v2.0 CSV exactly the way the engine's headless batch path does (`num_rows =
 VizConfig.rows_to_draw`; `BusModelBuilder(interface, num_rows, viz).build()`).
 
@@ -25,7 +25,11 @@ logging.getLogger("swi3s_visualizer").setLevel(logging.ERROR)
 def build_bus_model(csv_path: str, num_rows: int | None = None):
     """Load a v2.0 CSV through the Visualizer's CSV handler and build the merged
     BusModel. Returns (bus_model, interface, viz_config). `num_rows` defaults to the
-    config's RowsToDraw, matching the engine's headless build."""
+    config's RowsToDraw, matching the engine's headless build.
+
+    Raises ValueError, carrying the handler's message, when the CSV does not load: a
+    failed load leaves the interface partly populated (derived CDS registers and port
+    state unset), so no model is built from it."""
     from ..swviz.core.engine import BusModelBuilder
     from ..swviz.io.csv_handler import CSVHandler
     from ..swviz.models.interface import Interface
@@ -33,7 +37,13 @@ def build_bus_model(csv_path: str, num_rows: int | None = None):
 
     iface = Interface()
     viz = VizConfig()
-    CSVHandler.load_csv(csv_path, iface, viz)
+    res = CSVHandler.load_csv(csv_path, iface, viz)
+    if not res.success:
+        raise ValueError(f"{os.path.basename(csv_path)} did not load: "
+                         f"{res.error_message or 'the CSV handler reported a failure'}")
+    from .. import import_notes
+    for note in res.notes():
+        import_notes.warn(import_notes.source_name(csv_path), note)
     rows = int(viz.rows_to_draw if num_rows is None else num_rows)
     bus_model = BusModelBuilder(iface, rows, viz).build()
     return bus_model, iface, viz
@@ -56,8 +66,7 @@ def model_json(csv_path: str, num_rows: int | None = None) -> dict:
 
 
 # Visualizer authoring SlotType (swviz.models.enums) -> the shared GridSlot ints the
-# GridView renders. Built from named members on both sides (not magic numbers) so the
-# mapping is self-documenting and can't silently skew if either vocabulary changes.
+# GridView renders. Built from named members on both sides, not magic numbers.
 # CDS is handled separately (is_cds); EMPTY/CLASH are never emitted as data cells.
 def _build_slot_to_grid():
     from ..swviz.models.enums import SlotType
@@ -106,17 +115,12 @@ def render_payload(csv_path: str, num_rows: int | None = None):
 
     # A cell's `dp` is the LOGICAL DataPortNumber, not swviz's slot index. The two diverge
     # whenever a config numbers a port differently from its position in the file — four
-    # peripherals each using their own DP0, for instance — and the C++ core already reports
-    # the logical number (Decoder.cpp: `dpNumber >= 0 ? dpNumber : slot index`). Without this
-    # map the same key meant two different things depending on which engine produced the
-    # cells, so the grid labelled device 1's DP0 as "DP5" and the cross-engine test compared
-    # a number against an index.
+    # peripherals each using their own DP0, for instance — and the C++ core reports the
+    # logical number (Decoder.cpp: `dpNumber >= 0 ? dpNumber : slot index`).
     #
     # Mapped HERE, at the single boundary both engines' cells pass through, because the index
     # is a real index inside swviz: _detect_truncated_drq groups bits by it and looks them up
-    # by enumerate() position, so redefining it in the engine would silently stop that
-    # detection for precisely the configs this fixes. Every example config in the corpus uses
-    # the identity mapping, which is why 89 of them never caught this.
+    # by enumerate() position.
     _logical_dp = [dpv.dp_number if getattr(dpv, "dp_number", -1) >= 0 else i
                    for i, dpv in enumerate(_viz.data_ports)]
 
@@ -127,15 +131,11 @@ def render_payload(csv_path: str, num_rows: int | None = None):
             return slot_index
         return _logical_dp[slot_index]
 
-    # The SLOT index travels alongside the logical number, because they answer different
-    # questions and the grid needs both. `dp` identifies the port to a human (and to the
-    # C++ core, for cross-engine comparison); `dp_index` identifies the config ROW, which
-    # is what the colour key must key on. Several slots may legally share one
-    # DataPortNumber — "a device may not reuse a data-port number; the same number across
-    # different devices is fine" (BusConfig.duplicate_dp_numbers) — so a smart-amp config
-    # giving each of four devices its own DP0/DP1 has unique (device, dp) pairs but only
-    # two distinct numbers. Colouring by the number merged those eight ports into two
-    # colours; the slot index is 1:1 with a port and stays put as others enable/disable.
+    # The SLOT index travels alongside the logical number. `dp` identifies the port to a
+    # human (and to the C++ core, for cross-engine comparison); `dp_index` identifies the
+    # config ROW, which is what the colour key keys on. Several slots may share one
+    # DataPortNumber across devices (BusConfig.duplicate_dp_numbers); the slot index is 1:1
+    # with a port and stays put as others enable/disable.
     def _slot_of(slot_index):
         return -1 if slot_index is None or slot_index < 0 else int(slot_index)
 
@@ -174,12 +174,8 @@ def render_payload(csv_path: str, num_rows: int | None = None):
     # e.g. "Dev0 DP3 (LeftMic)", so a notification clearly names its data port (and follows
     # a rename). Model_json/goldens use the encoder directly, not this path.
     #
-    # The number must come through _logical_dp for the same reason the cells do: on a config
-    # where DataPortNumber differs from the slot index, labelling by index named a port that
-    # does not exist. Fixing the cells alone left this path saying "Dev1 DP5" for device 1's
-    # DP0 — the identical defect one boundary over, which is exactly the trap the debt
-    # register's "label doubling as a serialization key" note warns about. The DICT KEY stays
-    # the engine's raw "DP{index}", because that is the string the engine actually emitted.
+    # The number comes through _logical_dp, as the cells' does. The DICT KEY stays the
+    # engine's raw "DP{index}", the string the engine emitted.
     issues = issues_from_model(bm)
     dp_labels = {}
     for i, dpv in enumerate(_viz.data_ports):

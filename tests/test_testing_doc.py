@@ -1,10 +1,6 @@
 """docs/TESTING.md names every test suite, and no suite that is gone.
 
-It is the document an audit starts from ("does every feature have a suite?"), and it drifted
-the way prose does: by 3.0.19 it said 65 suites against 98 on disk, described 47, and still
-told readers to run each file as a script, which by then executed nothing. A count in prose
-cannot be kept true by hand; a check that each file is NAMED can, and adding a file forces
-the one line that says what it is for.
+Adding a test file forces the one line in the doc that says what it is for.
 """
 import os
 import re

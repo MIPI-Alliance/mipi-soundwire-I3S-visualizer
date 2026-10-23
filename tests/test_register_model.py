@@ -2,6 +2,8 @@
 
 Run: python3 -m pytest tests/test_register_model.py
 """
+import pytest
+
 from swi3s_studio import decode_capture
 from swi3s_studio.ingest import transitions
 from swi3s_studio.model import DeviceRegisterFile, Provenance, RegisterMap, apply_commands
@@ -44,7 +46,8 @@ def test_field_summary():
 
 def test_enum_decode():
     rm = RegisterMap.load()
-    # PM_Action enum: link state-machine actions decode to names (Table 20).
+    # PM_Action enum: link state-machine actions decode to names (the "Effect of Explicitly
+    # Commiting a Peripheral Management Action" table).
     assert "PM_Action=Enter_Dormant" in rm.field_summary(0x1011, 0x04)
     assert "PM_Action=Enter_Sleeping" in rm.field_summary(0x1011, 0x08)
     assert "PM_Action=Stay_Attached" in rm.field_summary(0x1011, 0x00)
@@ -100,7 +103,7 @@ def test_decode_reset_table_matches_spec():
     # The C++ decode path sources un-written register values from a single reset
     # table (CRegisterModel::resetOf). It must match the spec model
     # (data/registers.json) for EVERY DP-block register, so a non-zero spec reset
-    # can never be silently dropped (the bug that made ScramblerEn default OFF).
+    # can never be silently dropped.
     import swi3score
 
     from swi3s_studio.model.registers import DP_BASE
@@ -161,8 +164,7 @@ def test_register_override_unifies_grid_registers_audio():
 def test_register_override_next_rank_only():
     """Overriding a register's _NEXT rank stages ONLY _NEXT: _CURR is untouched, so the
     decode (which reads _CURR) is unchanged. This is the causal model — to change the
-    committed value, edit _CURR directly (previous test). Regression for a _NEXT edit
-    copying to _CURR."""
+    committed value, edit _CURR directly (previous test)."""
     from swi3s_studio.session import Session
     s = Session.from_demo(64)
     dev = sorted(s.register_files_at(None))[0]
@@ -179,11 +181,10 @@ def test_register_override_next_rank_only():
 
 
 def test_register_map_sourced_from_cpp_matches_python_oracle():
-    """The register map's VALUES now come from the C++ decode authority (same model
-    as grid + audio) via register_files_at. The retired Python replay (apply_commands)
-    is kept as an independent oracle: at several cursor samples, the C++-sourced files
-    must match the oracle for NEXT + CURR + written/default provenance. This guards
-    the migration and asserts the two implementations can't silently drift."""
+    """The register map's VALUES come from the C++ decode authority (same model as grid
+    + audio) via register_files_at. The Python replay (apply_commands) is an independent
+    oracle: at several cursor samples, the C++-sourced files must match it for NEXT +
+    CURR + written/default provenance."""
     from swi3s_studio.model import DeviceRegisterFile, apply_commands
     from swi3s_studio.session import Session
     s = Session.from_demo(64)
@@ -214,9 +215,9 @@ def test_register_map_sourced_from_cpp_matches_python_oracle():
 
 
 def test_register_read_overlay():
-    """Reads reveal the device's live value (READ provenance) — now modelled by the
-    C++ authority (CRegisterModel::ApplyRead), not a Python overlay. A CRC-valid
-    ReadA32 routed through _build_register_files must surface with READ provenance."""
+    """Reads reveal the device's live value (READ provenance), modelled by the C++
+    authority (CRegisterModel::ApplyRead). A CRC-valid ReadA32 routed through
+    _build_register_files must surface with READ provenance."""
     from swi3s_studio.session import Session
     s = Session.from_demo(8)
     read_cmd = {"has_read_data": True, "read_data_crc_valid": True, "has_address": True,
@@ -227,7 +228,7 @@ def test_register_read_overlay():
 
 
 def test_register_reads_sourced_from_cpp_match_oracle():
-    """Reads are now modelled in the C++ authority (register_files come from
+    """Reads are modelled in the C++ authority (register_files come from
     registers_from_commands via ApplyRead). Cross-check against the independent
     apply_commands oracle (which models reads its own way): a write→commit→read
     stream must agree on value/curr_value AND provenance (WRITTEN vs READ) for every
@@ -241,7 +242,7 @@ def test_register_reads_sourced_from_cpp_match_oracle():
     cmds = [
         {"command": "WriteA32", "crc_valid": True, "has_address": True,
          "address": 0x1081, "data": bytes([0x0F]), "device_mask": 0b1},
-        {"is_commit": True, "commit_confirmed": True, "group_mask": 0x01},
+        {"is_commit": True, "commit_confirmed": True, "group_mask": 0x01, "device_mask": 0b1},
         {"has_read_data": True, "read_data_crc_valid": True, "has_address": True,
          "device_mask": 0b1, "address": 0x200B, "read_data": bytes([0x08])},   # single-ranked
         {"has_read_data": True, "read_data_crc_valid": True, "has_address": True,
@@ -264,6 +265,9 @@ def test_register_reads_sourced_from_cpp_match_oracle():
             assert cf.provenance(a) == of.provenance(a), \
                 f"provenance mismatch dev{dev} 0x{a:04X}: {cf.provenance(a)} vs {of.provenance(a)}"
             checked += 1
+    # The commit promoted the write, and the _NEXT read left _CURR as committed.
+    assert cpp[0].curr_value(0x1081) == 0x0F
+    assert cpp[0].curr_provenance(0x1081) == Provenance.WRITTEN
     # The reads must actually be present and READ-tagged (not just trivially equal).
     assert cpp[0].value(0x200B) == 0x08 and cpp[0].provenance(0x200B) == Provenance.READ
     assert cpp[0].value(0x1081) == 0x07 and cpp[0].provenance(0x1081) == Provenance.READ
@@ -273,10 +277,7 @@ def test_register_reads_sourced_from_cpp_match_oracle():
 def test_last_access_provenance_wins():
     """The register map colours a value by its LAST access: a write AFTER a read reads
     WRITTEN (green), a read AFTER a write reads READ (purple), with the value from that
-    last access. Regression for the two-pass bug where registers_from_commands applied
-    every write/commit then every read, so a read always won and a write-after-read
-    stayed purple. Covers a dual-ranked _NEXT register (the case that surfaced it) and a
-    single-ranked one."""
+    last access. Covers a dual-ranked _NEXT register and a single-ranked one."""
     from swi3s_studio.session import Session
     s = Session.from_demo(8)
     for addr in (0x1081, 0x200B):     # dual-ranked _NEXT, then single-ranked
@@ -295,9 +296,7 @@ def test_last_access_provenance_wins():
 def test_commit_takes_effect_at_ssp_not_command():
     """Selecting a commit COMMAND places the cursor at the command (so the grid /
     register map show the PRE-commit state there); the separate 'Commit Point' row
-    sits at the SSP where the commit actually takes effect. Regression for the commit
-    appearing to take effect at the command (command_cursor_sample used to jump the
-    commit command to its SSP)."""
+    sits at the SSP where the commit actually takes effect."""
     from swi3s_studio.session import Session
     s = Session.from_demo(64, cold_start=True)
     commit = next(c for c in s.commands
@@ -308,11 +307,9 @@ def test_commit_takes_effect_at_ssp_not_command():
     cmd_cur = s.command_cursor_sample(commit)
     assert cmd_cur == s._sample_at_bus_row(int(commit["bus_row"]))
     assert s.bus_row_for_sample(cmd_cur) == int(commit["bus_row"])
-    # The load-bearing guard against the one-UI-late regression: the RSP the cursor lands
-    # on must be STRICTLY BEFORE the command's Column-0 closing edge (start_sample). If
-    # _sample_at_bus_row ever regressed back to the closing edge, cmd_cur would equal
-    # start_sample and this fails — the tautology above (cmd_cur == _sample_at_bus_row)
-    # would not, since both sides move together.
+    # The RSP the cursor lands on is STRICTLY BEFORE the command's Column-0 closing edge
+    # (start_sample). The check above (cmd_cur == _sample_at_bus_row) cannot see a move to
+    # the closing edge, since both sides move together.
     assert cmd_cur < int(commit["start_sample"]), (
         f"command cursor {cmd_cur} must precede the Column-0 closing edge "
         f"{int(commit['start_sample'])} by one UI (the RSP), not sit on it")
@@ -329,9 +326,7 @@ def test_commit_takes_effect_at_ssp_not_command():
 def test_commit_point_uses_core_effective_row():
     """The commit point (where a confirmed sync-point commit takes effect) is sourced
     from the decode core's authoritative `effective_row` — the SSP the streaming decode
-    actually committed at — not a Python re-estimate. Regression for the pdm768 capture
-    where the re-estimated marker sat ~16 rows AFTER the real SSP, so a correctly decoded
-    first audio sample (emitted right at the SSP) looked like it preceded the commit."""
+    actually committed at — not a Python re-estimate."""
     from swi3s_studio.session import Session
     s = Session.from_demo(64, cold_start=True)
     commit = next(c for c in s.commands
@@ -348,8 +343,7 @@ def test_commit_and_command_cursor_land_on_rsp():
     """Spec: the Commit Synchronization Point is coincident with a Row Sync Point, and a
     command phase begins at a Row Sync Point. So a commit point / command cursor must land
     ON the RSP rising edge (where the CDS / commit markers sit), not the Column-0 closing
-    (falling) edge one UI later. Regression for cursors sitting on the falling edge that
-    follows the correct RSP. The RSP still maps back to the row it opens (side='right')."""
+    (falling) edge one UI later. The RSP still maps back to the row it opens (side='right')."""
     from swi3s_studio.session import Session
     s = Session.from_demo(64, cold_start=True)
     spu = int(max(1, s.sample_rate_hz / s.ui_rate_hz))
@@ -371,8 +365,8 @@ def test_segment_selection_is_rsp_aligned():
     rising edge opening Column 0), one UI before the segment's closing-edge start_sample.
     The bus grid forces the column count from _segment_for_sample, so that selection must
     treat the RSP as already IN the new segment — else the grid draws the OLD width for one
-    UI after the commit (register map updated at the RSP, grid lagging). Regression for the
-    large capture's first commit; the single-segment demo never exercised the force path."""
+    UI after the commit (register map updated at the RSP, grid lagging). The single-segment
+    demo does not exercise the force path, so the test sets a synthetic two-width geometry."""
     import numpy as np
 
     from swi3s_studio.session import Session
@@ -410,8 +404,7 @@ def test_windowed_bit_samples_match_full_decode():
     it reconstructs each visible window from transport checkpoints instead of collecting
     the whole capture. It must be bit-exact — for any UI window, bit_samples_window must
     return exactly the bits the authoritative full decode (collect_bit_samples) produced
-    in that window. Regression guard: the full decode is the oracle, so a phase/anchor
-    bug in the windowed path surfaces here."""
+    in that window. The full decode is the oracle."""
     import numpy as np
     import swi3score
 
@@ -468,9 +461,7 @@ def test_windowed_bit_samples_match_full_decode():
 
 def test_override_does_not_promote_other_staged_registers():
     """A what-if register override forces ONLY its own register (both ranks); it must
-    NOT commit (_NEXT->_CURR) every other staged register. Regression for editing
-    NumColumns_NEXT copying NEXT->CURR across all registers — the override path used to
-    ForceWrite then Commit(0xFF) (force every group), promoting all staged values."""
+    NOT commit (_NEXT->_CURR) every other staged register."""
     from swi3s_studio.session import Session
     s = Session.from_demo(8)
     cmds = [   # two dual-ranked DP writes, no commit -> staged in _NEXT, _CURR at reset
@@ -491,12 +482,10 @@ def test_override_does_not_promote_other_staged_registers():
 
 
 def test_a_register_array_expands_to_one_register_per_index():
-    """The spec's tables collapse a run of addresses into one row — Table 166's
-    "0x20-0x2F  EC_TestFailCh<c>" is sixteen whole-byte per-channel counters, one per
-    address. The loader used to drop any row whose offset was a range, so those addresses
-    resolved to NOTHING: the per-channel test-fail counters, the SDCA and ImpDef interrupt
-    status, and the DP interrupt cascade were all invisible to the register view and to the
-    peripheral-report analysis."""
+    """The spec's tables collapse a run of addresses into one row — the "Peripheral Register
+    Map for Data Port (DPn_*)" table's "0x20-0x2F  EC_TestFailCh<c>" is sixteen whole-byte
+    per-channel counters, one per address. The loader expands such a row to one register
+    per address."""
     rm = RegisterMap.load()
     for ch in (0, 3, 15):
         r = rm.resolve(0x2020 + ch)
@@ -509,8 +498,8 @@ def test_a_register_array_expands_to_one_register_per_index():
 def test_a_bit_array_numbers_its_members_ascending_from_the_lowest_address():
     """IntStat_SDCA spreads 64 interrupt bits over 0x40-0x47 and IntStat_ImpDef 32 over
     0x4C-0x4F, ascending: the lowest-numbered member is at the LOWEST address and at bit 0
-    (Table 169's own column layout). Getting the direction wrong would name every raised
-    interrupt after a different one."""
+    (the "Peripheral Register Map for System and Link Control (SLC_*)" table's own column
+    layout)."""
     rm = RegisterMap.load()
     assert "IntStat_SDCA00=1" in rm.field_summary(0x1040, 0x01)
     assert "IntStat_SDCA07=1" in rm.field_summary(0x1040, 0x80)
@@ -543,9 +532,61 @@ def test_filler_ranges_resolve_without_flooding_the_register_list():
         assert r and r.register.name == "Reserved"
     reserved = [s for s in rm.blocks["DP"] if s.name == "Reserved" and s.offset == 0x40]
     assert len(reserved) == 1 and reserved[0].span == 48
-    # DP 0x70-0x7F is vendor space, and this capture's DUT writes 0x70.
+    # DP 0x70-0x7F is vendor space.
     assert rm.resolve(0x2070).register.name == "ImpDef"
     # A dual-ranked filler range aliases its _CURR across the WHOLE span, not just its
     # first byte: DP 0xB0-0xBF ImpDef_NEXT aliases to 0xF0-0xFF.
     curr = rm.resolve(0x2000 + 0xFF)
     assert curr and curr.register.name == "ImpDef" and curr.rank == "CURR"
+
+
+# ---- CDS and PHY Control registers are dual-ranked ----------------------------------
+#
+# Like SLC, the CDS block (0x1100) and the PHY1/2/3 Control blocks (0x100/0x200/0x300) hold
+# _NEXT registers at offsets 0x80..0xBF and their _CURR aliases at 0xC0..0xFF, and are fixed
+# Commit Group 0 members (Section 9.1.10.4.1).
+
+def _cur_next(rows, dev, addr):
+    by = {(d, a): (cur, has_cur, nxt) for d, a, cur, has_cur, _cs, nxt, _hn, _ns in rows}
+    return by.get((dev, addr))
+
+
+@pytest.mark.parametrize("addr", [0x1187, 0x1184, 0x0181, 0x0281, 0x0388])
+def test_a_cds_or_phy_next_write_waits_for_a_commit(addr):
+    import swi3score
+    write = {"is_write": True, "device_mask": 0b1, "address": addr, "data": bytes([0x5A])}
+    commit = {"is_commit": True, "commit_confirmed": True, "group_mask": 0b1, "device_mask": 0b1}
+    cur, has_cur, nxt = _cur_next(swi3score.registers_from_commands([write]), 0, addr)
+    assert nxt == 0x5A and not (has_cur and cur == 0x5A)          # staged in _NEXT only
+    cur, has_cur, _ = _cur_next(swi3score.registers_from_commands([write, commit]), 0, addr)
+    assert has_cur and cur == 0x5A                                  # promoted by Commit Group 0
+
+
+def test_a_cds_curr_alias_write_changes_nothing():
+    """A CDS register's _CURR alias is read-only (Dual-CURR-RO, data/registers.json): a
+    WriteA32 to it leaves both ranks as they were, in the C++ model and the Python replay."""
+    import swi3score
+
+    from swi3s_studio.model.registers import DeviceRegisterFile, RegisterMap
+    write = {"is_write": True, "device_mask": 0b1, "address": 0x11C6, "data": bytes([0x3C])}
+    row = _cur_next(swi3score.registers_from_commands([write]), 0, 0x1186)
+    assert row is None or (not (row[1] and row[0] == 0x3C) and row[2] != 0x3C), row
+    rm = RegisterMap.load()
+    assert rm.resolve(0x11C6).register.access == "Dual-CURR-RO"
+    dev = DeviceRegisterFile(rm, 0)
+    dev.apply_write(0x11C6, bytes([0x3C]))
+    assert dev.curr_value(0x1186) != 0x3C and dev.value(0x1186) != 0x3C
+
+
+def test_a_phy_curr_alias_write_is_immediate_and_mirrors_next():
+    """A PHY Control register's _CURR alias is writable (RW): the write sets both ranks with no
+    Commit, in the C++ model and the Python replay."""
+    import swi3score
+
+    from swi3s_studio.model.registers import DeviceRegisterFile, RegisterMap
+    write = {"is_write": True, "device_mask": 0b1, "address": 0x01C1, "data": bytes([0x3C])}
+    cur, has_cur, nxt = _cur_next(swi3score.registers_from_commands([write]), 0, 0x0181)
+    assert has_cur and cur == 0x3C and nxt == 0x3C
+    dev = DeviceRegisterFile(RegisterMap.load(), 0)
+    dev.apply_write(0x01C1, bytes([0x3C]))
+    assert dev.curr_value(0x0181) == 0x3C and dev.value(0x0181) == 0x3C
