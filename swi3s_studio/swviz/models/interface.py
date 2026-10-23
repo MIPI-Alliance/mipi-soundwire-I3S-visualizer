@@ -63,9 +63,9 @@ class Interface:
     # CDS_DriveType: 0 = Special (a CDS 1 is left high-Z, bus keeper holds), 1 = Normal
     # (both levels actively driven). The register is in each device's own CDS block, so
     # the authoritative value is the per-source list below; this scalar is the MANAGER's,
-    # derived on load for the same reason CDS_GuardPolarity_REG is. It does not move any
-    # column, so the placement engine ignores both — they are carried so the CSV
-    # round-trips and the renderer can annotate the Special case.
+    # derived on load like CDS_GuardPolarity_REG. Neither moves a column, so the placement
+    # engine ignores both; they are carried so the CSV round-trips and the renderer can
+    # annotate the Special case.
     CDS_DriveType_REG: int = ValidatedInt('CDS_DriveType_REG', 0, 1, 'CDS drive type')  # type: ignore[assignment]
     # CDS_EndDriveEarly (0x87 bit 4): 0 = drive the full UI, 1 = stop half a UI early.
     # Mandatory on PHY3. Per source like the drive type; this scalar is the Manager's,
@@ -147,23 +147,17 @@ class Interface:
         # aggregates the engine's column budget is computed from.
         self.CDS_Guard_PerSource: List[int] = [0] * 13
         self.CDS_Tail_PerSource: List[int] = [0] * 13
-        # Per-source CDS_DriveType, same 13-entry convention: 1 Normal, 0 Special. All
-        # Normal, deliberately NOT the register's reset of 0 — a CSV with no such row is
-        # every file written before the field existed, and must keep reading as it did.
+        # Per-source CDS_DriveType, same 13-entry convention: 1 Normal, 0 Special.
+        # Defaults to all Normal, not the register's reset of 0, so a CSV with no such
+        # row reads as Normal.
         self.CDS_DriveType_PerSource: List[int] = [1] * 13
-        # Per-source CDS_EndDriveEarly: 0 full UI, 1 stop half a UI early. Here the
-        # register's reset of 0 IS the sensible default (full-UI drive is the ordinary
-        # behaviour), unlike CDS_DriveType above where it is not — the two neighbours
-        # default oppositely relative to their resets on purpose.
+        # Per-source CDS_EndDriveEarly: 0 full UI, 1 stop half a UI early. Defaults to
+        # the register's reset of 0 (unlike CDS_DriveType_PerSource above).
         self.CDS_EndDriveEarly_PerSource: List[int] = [0] * 13
 
     @property
     def data_ports(self) -> List['DataPort']:
-        """Return flat list of all DataPorts sorted by dp_index.
-
-        This property provides backward compatibility with code that
-        expects interface.data_ports to be a list.
-        """
+        """Return flat list of all DataPorts sorted by dp_index."""
         all_dps: List['DataPort'] = []
         for device in self.devices.values():
             all_dps.extend(device.data_ports)

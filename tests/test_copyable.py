@@ -27,7 +27,7 @@ def _win():
 def test_command_table_copies_selected_row_as_tsv():
     win = _win()
     cv = win._cmd_view
-    # Per-cell selection now (the cursor follows the CURRENT cell, not selectedRows),
+    # Per-cell selection (the cursor follows the CURRENT cell, not selectedRows),
     # so cells are individually selectable/copyable and ranges drag out.
     assert cv.selectionMode() == QAbstractItemView.ExtendedSelection
     assert cv.selectionBehavior() == QAbstractItemView.SelectItems
@@ -83,13 +83,9 @@ def test_copy_empty_selection_is_noop():
 
 
 def test_cds_pane_copies_a_single_cell():
-    """The CDS symbol pane supports per-cell copy, like the Command table.
-
-    It used to be row-select only (`enable_copy(multi=True)`), so ⌘C always copied
-    the whole symbol row — you could not lift out just a Time or a Raw value. The
-    blocker was that its cursor sync read `selectedRows()`, which reports nothing for
-    a partial-row selection; it now follows the CURRENT cell's row instead, the same
-    way the Command table does.
+    """The CDS symbol pane supports per-cell copy, like the Command table: ⌘C on one
+    cell copies just that Time or Raw value. Its cursor sync follows the CURRENT cell's
+    row, the same way the Command table does.
     """
     win = _win()
     sv = win._symbol_view
@@ -109,9 +105,8 @@ def test_cds_pane_copies_a_single_cell():
 def test_cds_pane_copies_a_cell_block_as_tsv():
     """Dragging out a rectangle copies a TSV grid — spreadsheet-ready.
 
-    NOTE the behaviour assert: setSelected() bypasses SelectionBehavior (that policy
-    governs MOUSE selection), so the copy half of this test passes under row-select
-    too. The assert is what ties it to the user-visible change.
+    setSelected() bypasses SelectionBehavior (that policy governs MOUSE selection), so
+    the selectionBehavior assert is what pins per-cell selection.
     """
     win = _win()
     sv = win._symbol_view
@@ -131,9 +126,8 @@ def test_cds_pane_copies_a_cell_block_as_tsv():
 
 
 def test_cds_cell_selection_still_drives_the_cursor():
-    """Per-cell selection must not break the pane's cursor sync: clicking any cell
-    still emits the row's sample. This is what made `cells=True` unsafe before —
-    selectedRows() is empty for a partial row, so the cursor stopped following."""
+    """Per-cell selection keeps the pane's cursor sync: clicking any cell emits the
+    row's sample (selectedRows() is empty for a partial row, so the sync cannot use it)."""
     win = _win()
     sv = win._symbol_view
     assert sv.selectionBehavior() == QAbstractItemView.SelectItems
@@ -157,3 +151,23 @@ def test_cds_programmatic_select_highlights_the_whole_row():
     rows = sv.selectionModel().selectedRows()
     assert rows, "programmatic select did not select a full row"
     assert sv.currentRow() == rows[0].row(), "current cell left on a different row"
+
+
+def test_register_rows_of_two_blocks_copy_as_two_lines_in_tree_order():
+    """Rows of different blocks can share their row number under their block; each is its
+    own TSV line, in the order the tree shows them."""
+    from swi3s_studio.model import RegisterMap
+    from swi3s_studio.ui.register_view import RegisterView
+    QApplication.instance() or QApplication([])
+    view = RegisterView(RegisterMap.load())
+    tree = view._tree
+    slc, cds = tree.topLevelItem(0), tree.topLevelItem(1)
+    assert slc.childCount() > 1 and cds.childCount() > 1
+    tree.clearSelection()
+    for item in (cds.child(1), slc.child(1), slc):
+        item.setSelected(True)
+    QGuiApplication.clipboard().clear()
+    copy_selection(tree)
+    lines = QGuiApplication.clipboard().text().split("\n")
+    assert [ln.split("\t")[0] for ln in lines] == [
+        slc.text(0), slc.child(1).text(0), cds.child(1).text(0)], lines

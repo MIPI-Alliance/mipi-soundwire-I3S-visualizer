@@ -1,6 +1,6 @@
 """SWI3S register model: the spec map + per-device register state.
 
-Loads ``data/registers.json`` (the Raven-extracted source of truth) into a
+Loads ``data/registers.json`` (the source of truth, extracted from the spec) into a
 :class:`RegisterMap` that can resolve a 32-bit WriteA32/ReadA32 address to its
 block / register / field decode, and a :class:`DeviceRegisterFile` that tracks
 each register's value AND provenance (DEFAULT reset value / WRITTEN on the wire /
@@ -49,15 +49,19 @@ CURR_RANK_OFFSET = 0x40
 # DP CommitGroupMemb (single-ranked, offset 0x0A, reset 0b0001 = Commit Group 0):
 # a data port commits iff its membership mask intersects the commit's group mask.
 DP_COMMIT_GROUP_OFFSET = 0x0A
-# PHY electrical + CDS transport region bases (Table 164). One instance each.
+DEVICE_COUNT = 12               # bits in a command's Device Mask
+# PHY electrical + CDS transport region bases ("Peripheral Address Map Blocks for SWI3S
+# Interface Registers" table). One instance each.
 PHY1_BASE = 0x100
 PHY2_BASE = 0x200
 PHY3_BASE = 0x300
 CDS_BASE = 0x1100
 
-# SWI3S peripheral address-region map (spec Tables 163 + 164). Used to label an
-# address by its region when it isn't a register we model (e.g. device-defined
-# space, PFP/Hub blocks). Ordered, non-overlapping, covering the full 32-bit space.
+# SWI3S peripheral address-region map (the spec's "Peripheral Top-Level Address Map",
+# "Peripheral Address Map Regions for Local SWI3S Registers" and "Peripheral Address Map
+# Blocks for SWI3S Interface Registers" tables). Used to label an address by its region
+# when it isn't a register we model (e.g. device-defined space, PFP/Hub blocks). Ordered,
+# non-overlapping, covering the full 32-bit space.
 ADDRESS_REGIONS = [
     (0x00000000, 0x000000FF, "PHY0 (reserved)"),
     (0x00000100, 0x000001FF, "PHY1 (FBCSE)"),
@@ -81,7 +85,7 @@ ADDRESS_REGIONS = [
 
 
 def region_name(address: int) -> str:
-    """The Table 163/164 region an address falls in (e.g. 'Device-defined
+    """The `ADDRESS_REGIONS` region an address falls in (e.g. 'Device-defined
     (Local)'), for labelling addresses outside the registers we model."""
     a = int(address) & 0xFFFFFFFF
     for lo, hi, name in ADDRESS_REGIONS:
@@ -245,8 +249,7 @@ def _expand_array(base: RegisterSpec, array: Optional[dict]) -> List[RegisterSpe
     absent
         Filler (Reserved / ImpDef): identical bytes with nothing to index. Kept as the
         SINGLE spec the table shows, spanning the range, so the register view lists one
-        row rather than fifty that all say "Reserved" — while every address in the span
-        still resolves, so a write into it is identifiable instead of unknown.
+        row; every address in the span still resolves.
 
     Bit ordering here is the spec's own table layout (Table 166 / Table 169), not an
     inference. One correction: Table 169 prints ``IntCascade_DP11`` at 0x2A bit 1, a
@@ -309,9 +312,16 @@ class RegisterMap:
 
     @classmethod
     def load(cls, path: str = DEFAULT_REGISTERS_JSON) -> "RegisterMap":
+        """Read a spec register map. A register whose offset is neither a number nor a
+        range, a field whose bits are not `[hi:lo]` or `[n]`, and an `array` of an unknown
+        kind are reported through import_notes under the file's name."""
+        from .. import import_notes
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         rm = cls(meta=doc.get("_meta", {}))
+        no_offset: List[str] = []
+        bad_bits: List[str] = []
+        bad_array: List[str] = []
         for blk in doc.get("blocks", []):
             name = blk["name"]
             regs: List[RegisterSpec] = []
@@ -320,12 +330,14 @@ class RegisterMap:
             for r in blk["registers"]:
                 offset, span = _parse_offset_span(r.get("offset"))
                 if offset is None:
+                    no_offset.append(f"{name}.{r.get('name', '?')}")
                     continue
                 fields = []
                 for fdef in r.get("fields", []):
                     try:
                         hi, lo = _parse_bits(fdef["bits"])
-                    except (ValueError, KeyError):
+                    except (ValueError, KeyError, AttributeError):
+                        bad_bits.append(f"{name}.{r.get('name', '?')}.{fdef.get('name', '?')}")
                         continue
                     fields.append(FieldSpec(
                         name=fdef.get("name", "?"), hi=hi, lo=lo,
@@ -343,7 +355,11 @@ class RegisterMap:
                     dual_ranked=bool(r.get("dual_ranked", False)),
                     curr_offset=curr_off, fields=fields, span=span,
                 )
-                for spec in _expand_array(base, r.get("array")):
+                arr = r.get("array")
+                if (isinstance(arr, dict) and base.span > 1
+                        and arr.get("kind") not in ("bits", "register")):
+                    bad_array.append(f"{name}.{base.name}")
+                for spec in _expand_array(base, arr):
                     regs.append(spec)
                     for k in range(spec.span):
                         nxt[spec.offset + k] = spec
@@ -355,6 +371,15 @@ class RegisterMap:
             rm.blocks[name] = regs
             rm._by_next[name] = nxt
             rm._by_curr[name] = cur
+        src = import_notes.source_name(path)
+        for items, what in (
+                (no_offset, "register(s) with an offset that is neither a number nor a range "
+                            "skipped"),
+                (bad_bits, "field(s) with an unreadable bits spec skipped"),
+                (bad_array, "array row(s) of an unknown kind kept as one register")):
+            if items:
+                more = f", and {len(items) - 3} more" if len(items) > 3 else ""
+                import_notes.warn(src, f"{len(items)} {what}: {', '.join(items[:3])}{more}")
         return rm
 
     def resolve(self, address: int) -> Optional[ResolveResult]:
@@ -412,11 +437,14 @@ class DeviceRegisterFile:
     byte from the spec on read (provenance DEFAULT). Only explicitly set
     addresses are stored, so this scales across 32 data ports x 12 devices.
 
-    Dual-ranked registers are modelled with the hardware's two ranks: a WriteA32
-    updates the **_NEXT** value (staged); a confirmed Commit whose device mask
-    includes this device and whose commit-group mask intersects the register's
-    group copies _NEXT -> **_CURR** (live). The view shows both. Single-ranked
-    registers apply immediately (stored as _NEXT, with no separate _CURR).
+    Dual-ranked registers are modelled with the hardware's two ranks: a WriteA32 to
+    the _NEXT alias updates the **_NEXT** value (staged); a confirmed Commit whose
+    device mask includes this device and whose commit-group mask intersects the
+    register's group copies _NEXT -> **_CURR** (live). A WriteA32 to the _CURR alias
+    sets both ranks at once (Dual-Curr-is-RW, "Register Access Type" table), except where the
+    _CURR alias is read-only (CDS, Dual-CURR-RO), whose writes have no effect. The view shows
+    both.
+    Single-ranked registers apply immediately (stored as _NEXT, with no separate _CURR).
     """
 
     def __init__(self, rmap: RegisterMap, device: int, pmap=None):
@@ -446,10 +474,35 @@ class DeviceRegisterFile:
         self._cells[address] = _Cell(value & 0xFF, prov)
 
     def apply_write(self, address: int, data: bytes, prov: Provenance = Provenance.WRITTEN) -> None:
-        """Apply a WriteA32: consecutive bytes from `address`. Dual-ranked writes
-        stage at _NEXT only — they reach _CURR via commit()."""
+        """Apply a WriteA32: consecutive bytes from `address`. A byte at a dual-ranked
+        register's _NEXT alias stages there and reaches _CURR via commit(). A byte at its
+        _CURR alias sets _CURR and _NEXT both, by the _NEXT-base address, with no Commit
+        (Dual-Curr-is-RW, "Register Access Type" table), and a byte at a read-only _CURR alias
+        (Dual-CURR-RO) changes nothing, as C++ CRegisterModel::applyWrite does."""
         for i, b in enumerate(data):
-            self._set(address + i, int(b), prov)
+            addr = address + i
+            base = self._next_base_of_curr(addr)
+            if base is not None and self._curr_read_only(addr):
+                continue
+            if base is None:
+                self._set(addr, int(b), prov)
+            else:
+                self._set(base, int(b), prov)
+                self._curr[base] = _Cell(int(b) & 0xFF, prov)
+
+    def _curr_read_only(self, address: int) -> bool:
+        res = self.rmap.resolve(address)
+        return res is not None and res.register.access == "Dual-CURR-RO"
+
+    def _next_base_of_curr(self, address: int) -> Optional[int]:
+        """The _NEXT-base address of the dual-ranked register whose _CURR alias holds
+        `address`, or None when `address` is not a _CURR alias."""
+        res = self.rmap.resolve(address)
+        if res is None or not res.register.dual_ranked or res.rank != "CURR":
+            return None
+        spec = res.register
+        return address - (spec.curr_offset - spec.offset
+                          if spec.curr_offset is not None else CURR_RANK_OFFSET)
 
     def apply_read(self, address: int, data: bytes) -> None:
         """Apply a Read's returned bytes: the device reported its live value for
@@ -461,12 +514,9 @@ class DeviceRegisterFile:
         for i, b in enumerate(data):
             addr = address + i
             b = int(b) & 0xFF
-            res = self.rmap.resolve(addr)
-            if res is not None and res.register.dual_ranked and res.rank == "CURR":
-                spec = res.register
-                curr_delta = (spec.curr_offset - spec.offset
-                              if spec.curr_offset is not None else CURR_RANK_OFFSET)
-                self._curr[addr - curr_delta] = _Cell(b, Provenance.READ)
+            base = self._next_base_of_curr(addr)
+            if base is not None:
+                self._curr[base] = _Cell(b, Provenance.READ)
             else:
                 self._set(addr, b, Provenance.READ)
 
@@ -552,6 +602,12 @@ class DeviceRegisterFile:
 
 
 
+def selects_one_device(device_mask: int) -> bool:
+    """True when `device_mask` selects exactly one of the DEVICE_COUNT devices: the
+    only WriteA32 the register model applies (Section 8.1.2.2)."""
+    return bin(int(device_mask) & ((1 << DEVICE_COUNT) - 1)).count("1") == 1
+
+
 def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = None,
                    peripheral_maps: Optional[Dict[int, "object"]] = None) -> Dict[int, DeviceRegisterFile]:
     """Build per-device register files by replaying CRC-valid WriteA32 and Commit
@@ -561,8 +617,11 @@ def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = No
     vs what is merely staged). A CRC-valid Read's returned data also populates the
     addressed register(s) — a read reveals the live device value, so it fills in the
     map just like a write snooped from the bus. The target of a write/commit/read is
-    each set bit of its device mask. If `up_to_sample` is given, only commands started
-    at or before it are applied — the register state as-of a time cursor.
+    each set bit of its device mask. A WriteA32 is applied only when its mask selects
+    exactly one device (Section 8.1.2.2), as in C++ CRegisterModel::OnCommand; a Commit
+    or a read applies to every device its mask selects, and a zero mask selects none.
+    If `up_to_sample` is given, only commands started at or before it are applied — the
+    register state as-of a time cursor.
 
     `peripheral_maps` optionally maps a device number to its vendor register map, so
     addresses in device-defined space resolve their reset/fields per device.
@@ -584,18 +643,14 @@ def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = No
             continue
         mask = c.get("device_mask", 0)
         if c.get("command") == "WriteA32" and c.get("crc_valid") and c.get("has_address"):
-            for dev in range(12):
-                if mask & (1 << dev):
-                    file_for(dev).apply_write(c["address"], c["data"])
+            if selects_one_device(mask):
+                file_for((mask & -mask).bit_length() - 1).apply_write(c["address"], c["data"])
         elif c.get("is_commit") and c.get("commit_confirmed"):
             group_mask = int(c.get("group_mask", 0))
-            # A device_mask==0 commit is bus-wide: apply to every device we track
-            # (mirrors C++ CRegisterModel::Commit, which iterates only touched
-            # devices). When nothing is tracked yet, targets is [] and this is
-            # correctly a no-op -- commit() only promotes a device's staged _NEXT
-            # cells, and an untouched device has none, so materialising files for the
-            # full 0..11 range would change nothing.
-            targets = [d for d in range(12) if mask & (1 << d)] or list(files)
+            # Only the devices the mask selects commit; a zero mask selects none
+            # (Section 8.1.1.5.1, "Commit Phase for SSCR and DSCR Commands" table), as in
+            # C++ CRegisterModel::Commit.
+            targets = [d for d in range(DEVICE_COUNT) if mask & (1 << d)]
             for dev in targets:
                 file_for(dev).commit(group_mask)
         elif (c.get("has_read_data") and c.get("read_data_crc_valid")
@@ -603,7 +658,7 @@ def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = No
             # Read-back: the device returned its live value for this address range.
             read_data = c.get("read_data") or b""
             if read_data:
-                for dev in range(12):
+                for dev in range(DEVICE_COUNT):
                     if mask & (1 << dev):
                         file_for(dev).apply_read(c["address"], read_data)
     return files

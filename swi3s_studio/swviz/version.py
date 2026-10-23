@@ -2,19 +2,16 @@
 
 `APP_VERSION` is the FALLBACK stamped into saved configs when the package isn't
 importable; `app_version()` prefers the live `swi3s_studio.__version__`. It is one of the
-three version literals the release checklist bumps, and it silently missed 3.0.9, 3.0.10
-and 3.0.11 — sitting at 3.0.8 while the app shipped 3.0.11. A wrong version string is
-worse than none, so tests/test_release_gate.py now pins it to `__version__`; the bump is
-enforced rather than remembered.
+three version literals the release checklist bumps; tests/test_release_gate.py pins it to
+`__version__`.
 
 `MIN_COMPATIBLE_CSV_VERSION` documents the oldest CSV the loader reads without
-conversion. NOTE: it is currently advisory only — the loader does not gate on it (the
-CSV format hasn't had a breaking change, so every v2.x config loads directly, and
-older v1.73 files are auto-converted on import). Wire a `parse_version` comparison
-into `csv_handler.load_csv` if/when a breaking format change needs to reject old files.
+conversion. It is advisory only: the loader does not gate on it. Every v2.x config loads
+directly, and v1.73 files are auto-converted on import. Wire a `parse_version` comparison
+into `csv_handler.load_csv` if a breaking format change needs to reject old files.
 """
 
-APP_VERSION = '3.0.20'      # pinned to swi3s_studio.__version__ by tests
+APP_VERSION = '3.1.0'      # pinned to swi3s_studio.__version__ by tests
 MIN_COMPATIBLE_CSV_VERSION = '2.1.11'
 
 

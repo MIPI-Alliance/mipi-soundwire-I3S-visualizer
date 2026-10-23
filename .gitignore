@@ -7,9 +7,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Virtual environments
-.venv/
-venv/
+# Virtual environments, as a directory or as a symlink to one (no trailing slash, which would
+# match only a directory)
+.venv
+venv
 env/
 
 # Build output (PyInstaller top-level build/dist, CMake native/build, wheels)
@@ -48,7 +49,8 @@ native/build/
 *.sal
 /bus_config.csv
 /init.csv
-/frame_model.json          # "Save Bus Model…" JSON export (scratch, app-generated)
+# "Save Bus Model…" JSON export (scratch, app-generated)
+/frame_model.json
 
 # render-and-look output (tools/shots.py)
 /shots/

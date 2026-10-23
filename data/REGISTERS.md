@@ -6,12 +6,15 @@ WriteA32/ReadA32 addresses to register + field names.
 
 ## Provenance
 
-- **Spec:** MIPI SoundWire I3S (SWI3S) Specification v1.1r06 (2026-05-03).
-- **Source tables:** 163, 164, 166, 167, 168, 169, 170, 171 (§15.2.1–15.2.5) for
-  SLC/DP; 173/174 (CDS transport), 176/177 (PHY1/PHY2), 178/179/180 (PHY3);
-  `PM_Action` values from Table 20 (§5.1.3).
-- **Extracted via** Raven, library `@swi3s-specification`, thread
-  `39b06b5c-93f8-4f49-8a88-e6255fa6b366` (reuse this thread for follow-ups).
+- **Spec:** MIPI SoundWire I3S (SWI3S) Specification v1.1 r08 (`_meta.spec`), with the
+  r06 → r08 field deltas listed in `_meta.conventions` applied.
+- **Source tables (r08):** 165–182, §14.2.1–14.2.11 (`_meta.source_tables`,
+  `_meta.source_sections`), covering SLC, DP, CDS transport and PHY1/PHY2/PHY3.
+  `PM_Action` values are from the link-control section (§5.1.3).
+- **Table and section numbers are not stable keys.** r08 renumbered the register chapter
+  (§15.2 → §14.2, tables 163–171 → 165–182) without moving a register, so the file is keyed
+  on register/field name + block + offset + bit range. Table numbers elsewhere in this
+  document (the FlowMode caveat below) are r06 citations.
 
 ## Schema
 
@@ -67,8 +70,8 @@ Start physical-layer signalling on the raw DP/DN lines (spec §5.1.2). That sign
 2. **`EnableCh0`/`PrepareCh0` are not with the other channel enables** — they live
    in DP `0x81` bits [7]/[6] (sharing the byte with `HorizontalCount[4:0]`), while
    `EnableCh1–7`/`8–15` are at `0x90`/`0x91`. A classic address→field decode trap.
-3. **`FlowMode` (DP `0x0E[1:0]`) rank is ambiguous in the spec** — Table 166 lists
-   it single-ranked, Table 168 lists access "Dual". This file represents it
+3. **`FlowMode` (DP `0x0E[1:0]`) rank is ambiguous in the spec** — r06's Table 166 lists
+   it single-ranked, r06's Table 168 lists access "Dual". This file represents it
    single-ranked at `0x0E` (no `_CURR`). Verify against silicon/DisCo before
    treating `0x4E` as `FlowMode_CURR`.
 4. **Collapsed arrays.** Large repeating arrays (`IntStat_SDCA[63:0]` `0x40`–`0x47`,
@@ -76,4 +79,5 @@ Start physical-layer signalling on the raw DP/DN lines (spec §5.1.2). That sign
    `0x20`–`0x2F`) are single range-entries with a bit-mapping description rather
    than one object per byte — expand programmatically if the UI needs per-byte rows.
 
-Regenerate / extend: reuse the Raven thread above against `@swi3s-specification`.
+Regenerate / extend: re-extract from the r08 source tables listed above, matching
+registers by name, block, offset and bit range.

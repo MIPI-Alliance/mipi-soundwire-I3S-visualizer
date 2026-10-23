@@ -1,26 +1,16 @@
 """Bit removal in the bus model is DEFERRED but EXACT.
 
-`remove_bits_matching` used to rebuild the whole `bits` list on every call. That made a
-build quadratic in the row count for a very ordinary authoring pattern — a data write
-suppressing its own guard, once per row. Measured on two same-device guarded ports:
+`remove_bits_matching` updates the position bucket immediately and records the rest of the
+removal for `compact()`. This file pins the contract:
 
-    rows    before     after
-     500     0.21 s    0.10 s
-    2000     2.18 s    0.43 s      (4x the rows cost 10x the time, before)
-    8000    36.59 s    2.00 s      (4x the rows cost 17x the time, before)
-
-Removal now updates the position bucket immediately and records the rest for `compact()`.
-That is a correctness contract, not just a speedup, and it is what this file pins:
-
-  * the bucket (what the clash logic reads) is exact AT ONCE — a deferred removal must never
-    let a suppressed guard take part in a later clash decision;
+  * the bucket (what the clash logic reads) is exact AT ONCE — a deferred removal never lets
+    a suppressed guard take part in a later clash decision;
   * `bits` is exact after `compact()`, which `BusModelBuilder.build()` calls once placement
     finishes, before anything reads the list;
   * `get_bits_in_row` compacts for itself, so a direct BusModel user cannot see a stale row.
 
-The 96 vendored configs (test_visualizer_engine) are the equivalence net for the values
-themselves: several of them exercise guard/tail suppression, and their goldens compare bits
-exactly, so a wrongly-timed compaction shows up there.
+The vendored configs in test_visualizer_engine cover the values themselves: several exercise
+guard/tail suppression, and their goldens compare bits exactly.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_bus_model_compaction.py
 """

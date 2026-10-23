@@ -6,10 +6,9 @@
 // per-phase response. The decoder always re-hunts the K.28.7 comma to frame
 // the next phase, so it tolerates arbitrary idle gaps between phases.
 //
-// Scope note: WriteA32/ReadA32/Ping command fields and Ping peripheral status
-// are decoded. Non-Ping peripheral responses and multi-phase ReadData payload
-// are emitted at phase granularity for now (see TODOs) -- enough for control
-// visibility and for register snooping (which only needs Write/Commit).
+// Decoded: WriteA32/ReadA32/SSPA/SSCR/DSCR command fields, Ping peripheral
+// status, Write/ReadSetup/ReadData/Commit responses and ReadData payloads.
+// CalibratePhy / Unblock / ExitDormant are emitted at phase granularity.
 
 #ifndef SWI3S_CCOMMANDTRANSPORTPARSER_H
 #define SWI3S_CCOMMANDTRANSPORTPARSER_H

@@ -41,7 +41,7 @@ def test_response_summary():
     s = response_summary(ping)
     # Per-device breakdown; runs of same-status devices collapse into ranges.
     assert s == "0: PING_ATTACHED, 1: PING_ALERT, 2-11: NO_RESPONSE", s
-    # The dp_dn.csv cases: one device responds, the rest are undriven (NO_RESPONSE).
+    # One device responds, the rest are undriven (NO_RESPONSE).
     one = lambda t: response_summary({"phase": "GetStatus", "ping_status": [t] + [-1] * 11,
                                       "peripheral_response": -1, "manager_response": -1})
     assert one(0) == "0: PING_ATTACHED, 1-11: NO_RESPONSE", one(0)
@@ -49,9 +49,8 @@ def test_response_summary():
 
 
 def test_commit_peripheral_response_decoded():
-    """The Command Transport parser now surfaces a commit's peripheral response
-    (COMMIT_READY/…): the 12 per-device tokens used to be consumed and dropped, so
-    an SSCR showed only the Manager Response. The demo's SSCR must now carry a
+    """The Command Transport parser surfaces a commit's peripheral response
+    (COMMIT_READY/…) from its 12 per-device tokens. The demo's SSCR carries a
     peripheral response, shown alongside the manager one."""
     from swi3s_studio.session import Session
     s = Session.from_demo(8)

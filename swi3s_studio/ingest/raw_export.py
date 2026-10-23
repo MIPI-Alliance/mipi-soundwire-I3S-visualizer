@@ -13,7 +13,7 @@ ways to get a capture's clock+data lines out of SWI3S Studio:
   level at that instant. Round-trips through ``digital_csv.load_capture``.
 
 Both round-trip through this package; the CSV is also readable by any spreadsheet /
-NumPy / pandas, which is the point of the workaround.
+NumPy / pandas.
 """
 from __future__ import annotations
 
@@ -118,8 +118,8 @@ def export_csv(capture: Capture, path: str, *,
         w = csv.writer(f)
         w.writerow(["Time [s]", *names])             # header via csv (handles any quoting)
         # Data rows are plain numbers (no CSV quoting needed): build + write them in blocks
-        # joined with csv's \r\n terminator instead of a per-row writerow() call (~2x on a
-        # multi-million-row export). Chunked so peak memory stays bounded.
+        # joined with csv's \r\n terminator instead of a per-row writerow() call. Chunked
+        # so peak memory stays bounded.
         CHUNK = 1 << 16
         for base in range(0, n, CHUNK):
             end = min(base + CHUNK, n)

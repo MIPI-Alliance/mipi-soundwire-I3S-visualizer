@@ -5,6 +5,7 @@ re-queried, and rebuilds register state as-of a time cursor.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import os
 import threading
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
@@ -12,7 +13,12 @@ from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 import numpy as np
 import swi3score
 
-from .analysis.link_control import LinkControlResult, decode_link_control
+from .analysis.link_control import (
+    LinkControlResult,
+    clock_resumes,
+    decode_link_control,
+    decode_link_controls,
+)
 from .ingest import saleae_binary, transitions
 from .ingest.capture import Capture
 from .model import DeviceRegisterFile, Provenance, RegisterMap
@@ -20,7 +26,7 @@ from .nputil import searchsorted as _searchsorted
 
 # ABI the Python side expects from the swi3score native module (see bindings.cpp
 # `score_abi`). Bump both together when a binding's return shape changes.
-_REQUIRED_SCORE_ABI = 12
+_REQUIRED_SCORE_ABI = 16
 
 
 # A config CSV imposed on ONE region (Session.apply_config_csv_at) is kept in the source
@@ -117,9 +123,7 @@ def zero_based_row(bus_row, origin) -> int:
 def _require_score_abi() -> None:
     """Fail with a clear, actionable message if the loaded swi3score native module is
     older than this Python code expects. The .so is built locally (not tracked in git),
-    so pulling new code without rebuilding leaves it stale — and a stale binding whose
-    return shape changed otherwise surfaces as a cryptic 'not enough values to unpack'
-    (e.g. registers_from_commands going from 6- to 8-tuples)."""
+    so pulling new code without rebuilding leaves it stale."""
     abi = int(getattr(swi3score, "score_abi", 0))
     if abi < _REQUIRED_SCORE_ABI:
         raise RuntimeError(
@@ -197,6 +201,7 @@ class Session:
             # normalized_path returns a fresh temp file for an upgraded (legacy/v2.0)
             # CSV; own it so apply_config_csv can delete it when it's replaced.
             self._config_csv_tmp = norm if norm != config_csv else None
+            visualizer_csv.report_csv_warnings(norm, config_csv)
             config_csv = norm
         else:
             self._config_csv_tmp = None
@@ -247,6 +252,7 @@ class Session:
         # and tell the decoder to skip NRZS and read the CDS at Column 2. FBCSE (PHY1/2)
         # and mid-stream captures keep the forwarded-clock source.
         self._link_control = decode_link_control(capture)
+        self._later_link_controls: Optional[List[LinkControlResult]] = None   # link_controls
         self._decode_checking_bringup(settings, decoder_ready)
 
         # Per-device peripheral (vendor) register maps, keyed by device number.
@@ -260,7 +266,7 @@ class Session:
         # Whole-capture register state, sourced from the C++ decode authority (same
         # as register_files_at, whole-capture / no overrides).
         self.register_files: Dict[int, DeviceRegisterFile] = self._build_register_files(
-            self._config_commands(), None)
+            self._config_commands_since_reset(), None)
         # _link_control was decoded up front (source selection); keep it (property caches).
         # For DLV, capture the virtual PLL's recovered Row Sync Points NOW, from the real
         # DlvSampleSource — a later in-place re-decode (scrambler / register what-if)
@@ -297,10 +303,9 @@ class Session:
         run_watched(self.decoder)
 
         self.commands: List[dict] = self.decoder.commands()
-        # Audio is kept columnar (struct-of-arrays) — a dense mic-array capture
-        # decodes tens of millions of samples, and materialising that as a Python
-        # list of per-sample dicts is what froze the UI. `audio` (the dict list) is
-        # still available as a lazy property for any caller that wants it.
+        # Audio is kept columnar (struct-of-arrays): a dense mic-array capture decodes
+        # tens of millions of samples. `audio` (the dict list) is available as a lazy
+        # property for any caller that wants it.
         self._refresh_audio()
         self.column_count: int = self.decoder.column_count
         self.row_rate_khz: float = self.decoder.row_rate_khz
@@ -308,16 +313,17 @@ class Session:
         self.segments: List[dict] = self.decoder.segments()
 
     def _decode_checking_bringup(self, settings, decoder_ready=None) -> None:
-        """Decode, then drop the detected bring-up if the decode contradicts it.
+        """Decode, then drop any detected bring-up the decode contradicts: the first
+        (`_check_first_bringup`), then each later one (`_check_later_bringups`)."""
+        self._check_first_bringup(settings, decoder_ready)
+        self._check_later_bringups(settings, decoder_ready)
+
+    def _check_first_bringup(self, settings, decoder_ready=None) -> None:
+        """Decode, then drop the detected first bring-up if the decode contradicts it.
 
         The detector reads only the raw edges, and a capture with NO bring-up can satisfy
-        it: on the PHY1, PHY2 and flow-control demos recorded without a cold start, and on
-        a cold-start demo joined after audio began, it found a Cold or Warm Start whose
-        "audio start" had 3 to 36 CRC-valid commands before it. A real bring-up precedes
-        audio mode, so no CRC-valid command (CRC-16: not by chance) decodes inside one, and
-        none did in any genuine bring-up tried. A phantom is not harmless: it swapped the
-        Capture pane's DP/DN labels (each one claimed the bring-up rode the data line) and
-        drew invented bring-up phases on the Timeline.
+        it. A real bring-up precedes audio mode, so no CRC-valid command (CRC-16: not by
+        chance) decodes inside one.
 
         A detection that names a PHY or a Safe-Lock width also STEERS the decode (the PHY3
         path, a column seed). So a rejected one that steered is decoded again without it,
@@ -355,6 +361,50 @@ class Session:
             restore()                                      # no evidence either way: keep it
             self._link_control = lc
             self._decode_with(settings, decoder_ready)
+
+    def _check_later_bringups(self, settings, decoder_ready=None) -> None:
+        """Drop a later bring-up the decode contradicts.
+
+        The decode does not run inside a later one (from its clock stop to its restart the
+        Link is inactive and nothing is decoded), so the evidence is what follows it: a
+        genuine bring-up decodes CRC-valid commands after its restart, framed at the
+        Safe-Lock count it selected. One after which none decodes, up to the next bring-up
+        or the end, is checked by decoding once without it, and dropped if that decode finds
+        CRC-valid commands from its clock stop to there (the Link never went down: its
+        clock only paused). A genuine bring-up never pays the extra decode."""
+        later = self.link_controls[1:]
+        if not later:
+            return
+        spans = self._later_spans(later)
+        suspects = [r for r, (restart, _stop, end) in zip(later, spans)
+                    if not self._valid_commands_between(restart, end)]
+        if not suspects:
+            return
+        everything = self._later_link_controls or []
+        self._later_link_controls = [r for r in everything
+                                     if not any(r is x for x in suspects)]
+        self._decode_with(settings, decoder_ready)
+        dropped = [r for r, (_restart, stop, end) in zip(later, spans)
+                   if any(r is x for x in suspects) and self._valid_commands_between(stop, end)]
+        self._later_link_controls = [r for r in everything
+                                     if not any(r is x for x in dropped)]
+        if len(dropped) < len(suspects):
+            self._decode_with(settings, decoder_ready)      # the kept ones restart again
+
+    def _later_spans(self, later) -> List[Tuple[int, int, int]]:
+        """(restart, clock stop, end) per later bring-up: where the decode restarts, where
+        the Link stopped before it, and where the next one's stop (or the capture) ends
+        what it opens."""
+        stops = [int(r.clock_stop_sample if r.clock_stop_sample is not None
+                     else self._restart_sample(r)) for r in later]
+        ends = stops[1:] + [1 << 62]
+        return [(self._restart_sample(r), stop, end)
+                for r, stop, end in zip(later, stops, ends)]
+
+    def _valid_commands_between(self, lo: int, hi: int) -> bool:
+        """Whether a CRC-valid command decodes with its start in [lo, hi)."""
+        return any(c.get("crc_valid") and lo <= int(c.get("start_sample", 0)) < hi
+                   for c in self.commands)
 
     def _valid_commands_inside(self, lc) -> int:
         """CRC-valid commands decoded inside a detected bring-up: from its first non-Idle
@@ -406,9 +456,8 @@ class Session:
         # vector has no second reader: the audio store, playback, the plots, PDM decode and
         # WAV export all consume the columns, `audio` below builds its dict list from them,
         # and a re-decode constructs a new Decoder rather than re-reading this one. So hand
-        # the native memory back — 72 B/sample against the columns' 56, which was 449 MB of
-        # the ~1.8 GB a 1 s demo cost. `getattr`: an older core has no release_audio and
-        # simply keeps holding it, exactly as before (no ABI bump, nothing breaks).
+        # the native memory back (72 B/sample against the columns' 56). `getattr`: an older
+        # core has no release_audio and keeps holding it.
         release = getattr(self.decoder, "release_audio", None)
         if callable(release):
             release()
@@ -446,6 +495,88 @@ class Session:
         if self._link_control is None:
             self._link_control = decode_link_control(self.capture)
         return self._link_control
+
+    @property
+    def link_controls(self) -> List[LinkControlResult]:
+        """Every link bring-up the decode follows: `link_control` first (sequence 'none'
+        when the capture starts in audio mode), then each later start sequence after the
+        Link went inactive (decode_link_controls), at each of which the decode restarts
+        (`_restart_points`). Lazy + cached, and computed with the decode in __init__, so the
+        gap search runs in the load worker rather than on the GUI thread.
+
+        Only bring-ups of the decode's PHY family, or naming no PHY, are listed: PHY3 ones
+        on a DLV decode, PHY1 and PHY2 ones on an FBCSE one. A bring-up of the other family
+        would switch the decode between the forwarded clock and the recovered one, while the
+        sample source, the UI index every sample maps through and the Capture pane's drawing
+        are each fixed per capture; so the decode runs on through it in the old geometry,
+        and nothing presents it as a restart: not the Timeline, the Bus Grid or the register
+        replay."""
+        found = getattr(self, "_later_link_controls", None)
+        if found is None:
+            found = self._later_link_controls = decode_link_controls(self.capture)[1:]
+        # The first is read live: a rejected bring-up replaces it after the first decode.
+        dlv = self.is_dlv
+        later = [r for r in found if r.phy_name is None or (r.phy_name == "PHY3") == dlv]
+        return [self.link_control] + later
+
+    @staticmethod
+    def _strip_start(r: LinkControlResult) -> int:
+        """Where a later bring-up's strip begins: its first section (its Idle, the stretch
+        the clock stopped for)."""
+        return int(r.sections[0]["start"]) if r.sections else int(r.audio_start_sample or 0)
+
+    def bringup_at(self, sample: int) -> Optional[LinkControlResult]:
+        """The link bring-up whose strip contains `sample` — from its first section (a later
+        one's Idle, the stretch the clock stopped for) to its audio start — or None in audio
+        mode. The first bring-up's strip runs from the start of the capture; a capture that
+        starts in audio mode has none, and its later bring-ups still have theirs."""
+        lcs = self.link_controls
+        first = lcs[0]
+        if first.sequence != "none" and sample < int(first.audio_start_sample or 0):
+            return first
+        for r in lcs[1:]:
+            if r.audio_start_sample is not None and (
+                    self._strip_start(r) <= sample < int(r.audio_start_sample)):
+                return r
+        return None
+
+    def phy_at(self, sample: int) -> Optional[str]:
+        """The PHY named by the bring-up in force at `sample`: the last one whose strip
+        begins at or before it, the first's from the start of the capture. None where that
+        bring-up names none (no bring-up, or an unrecognised PHY number)."""
+        phy = self.link_control.phy_name
+        for r in self.link_controls[1:]:
+            if self._strip_start(r) <= sample:
+                phy = r.phy_name
+        return phy
+
+    @staticmethod
+    def _bus_reset_start(r: LinkControlResult) -> int:
+        """Where a Cold Start's Bus Reset begins (its LC:00, else the LC:10 rise)."""
+        sec = next((x for x in r.sections if x.get("name") == "Bus Reset"), None)
+        if sec is not None:
+            return int(sec["start"])
+        return int(r.bus_reset_sample if r.bus_reset_sample is not None
+                   else r.audio_start_sample or 0)
+
+    def _replay_start(self, sample: Optional[int]) -> int:
+        """The sample the config replay starts from for state as-of `sample` (None = the
+        end of the capture): the Bus Reset of the last later Cold Start the decode restarted
+        at, at or before it, else 0. Keyed on the Bus Reset, not on the segment the restart
+        opens: the bus is reset from there, while the decode has nothing to decode until
+        the restart (the Link is inactive), so from the reset on the registers read their
+        reset values. The resets are fixed per decode (`_configure_source_for_phy`)."""
+        resets = getattr(self, "_replay_resets", [])
+        i = len(resets) if sample is None else bisect.bisect_right(resets, int(sample))
+        return resets[i - 1] if i else 0
+
+    def _config_commands_since_reset(self) -> List[dict]:
+        """_config_commands() from the last Cold Start: the configuration the capture ends
+        in, which nothing before a bus reset contributes to."""
+        start = self._replay_start(None)
+        if not start:
+            return self._config_commands()
+        return [c for c in self._config_commands() if int(c.get("start_sample", 0)) >= start]
 
     @property
     def audio_start_sample(self) -> int:
@@ -578,8 +709,7 @@ class Session:
         """Distinct (device, dp) pairs present in the decoded audio."""
         # The decoder already tracks a sample rate per (device, dp), i.e. it knows
         # the distinct audio streams. Use that — it's a handful of keys — instead of
-        # a unique() over the tens of millions of audio rows, which is what made
-        # opening the scrambler dialog beach-ball for ~10s on dense captures.
+        # a unique() over the tens of millions of audio rows.
         rates_fn = getattr(self.decoder, "audio_sample_rates", None)
         if callable(rates_fn):
             keys = rates_fn()
@@ -689,6 +819,12 @@ class Session:
         scrambler / hub-depth / register what-if / config-CSV change re-runs the decode."""
         self._cds_horizontal_start = 0             # DLV CDS column (0 = FBCSE, CDS at Col 0)
         cap = self.capture
+        settings.restart_points = self._restart_points()
+        settings.resume_points = [] if self.is_dlv else clock_resumes(self.capture,
+                                                                      self.link_controls)
+        self._replay_resets: List[int] = sorted(
+            self._bus_reset_start(r) for r in self.link_controls[1:]
+            if r.sequence == "cold" and r.audio_start_sample is not None)
         if self.is_dlv:
             cols = int(self._forced_column_count or self.link_control.safe_lock_columns or 4)
             settings.dlv = True
@@ -705,17 +841,36 @@ class Session:
         if self._config_csv:
             # A config CSV pins the geometry, so the Safe-Lock seed must be CLEARED, not
             # merely skipped. It is sticky (stored on self by an earlier decode), and
-            # forcedColumnCount outranks the CSV in Decoder::run — so importing a CSV
-            # onto an already-open cold-start capture left the stale Safe-Lock width in
-            # force and decoded a 16-column config at 2 columns: the grid collapsed to
-            # the furthest placed cell (7 where the Visualizer shows 16) and the commands
-            # went CRC-red. Only the CSV-less path may seed it.
+            # forcedColumnCount outranks the CSV in Decoder::run. Only the CSV-less path
+            # may seed it.
             self._forced_column_count = 0
             settings.forced_column_count = 0
         elif self.link_control.safe_lock_columns:
             settings.forced_column_count = int(self.link_control.safe_lock_columns)
             self._forced_column_count = int(self.link_control.safe_lock_columns)
         return cap.sample_source()
+
+    def _restart_points(self) -> List[tuple]:
+        """The decoder's restart_points: one (restart, Safe-Lock columns, cold, inactive
+        from) per later bring-up in `link_controls`, whether or not the capture had a first
+        one. `restart` is the first clock edge after the bring-up's PhyStart, where audio
+        mode actually begins (Man_tPhyStart is 64–96 µs, so the nominal audio start can be
+        16 µs out either way); `inactive from` is the first sample after the clock stopped.
+        On DLV the clock is the DP wire, whose first edge after PhyStart is the first Row
+        Sync, where the recovered clock locks again."""
+        return [(self._restart_sample(r), int(r.safe_lock_columns or 0), r.sequence == "cold",
+                 int(r.clock_stop_sample) + 1 if r.clock_stop_sample is not None else 0)
+                for r in self.link_controls[1:] if r.audio_start_sample is not None]
+
+    def _restart_sample(self, r: LinkControlResult) -> int:
+        """The first clock edge after `r`'s PhyStart (its nominal audio start when there is
+        none): the UI the decoder restarts at."""
+        if r.phystart_sample is not None:
+            ce = self.capture.clock_edges
+            i = int(_searchsorted(ce, int(r.phystart_sample), side="right"))
+            if i < len(ce):
+                return int(ce[i])
+        return int(r.audio_start_sample or 0)
 
     def _redecode(self) -> None:
         """Rebuild the decoder from the current settings + overrides and re-run."""
@@ -761,7 +916,7 @@ class Session:
         self.ui_rate_hz = self.decoder.measured_ui_rate_hz
         self.segments = self.decoder.segments()
         self._reload_csv_seed()                  # config CSV may have changed (apply_config_csv)
-        self.register_files = self._build_register_files(self._config_commands(), None)
+        self.register_files = self._build_register_files(self._config_commands_since_reset(), None)
 
     def apply_config_csv(self, path: Optional[str]) -> None:
         """Impose a Visualizer config CSV on the ALREADY-OPEN capture (no reopen): a
@@ -778,6 +933,7 @@ class Session:
             self._discard_config_tmp()                        # drop the previous upgrade temp
             self._config_csv_tmp = norm if norm != path else None
             self._config_csv = norm
+            visualizer_csv.report_csv_warnings(norm, path)
         else:
             self.source.pop("config_csv", None)
             self._discard_config_tmp()
@@ -835,10 +991,9 @@ class Session:
 
         Backwards matters because the decoder's own SSPA handling only re-anchors from the
         row it fires on: everything BEFORE the first SSPA still decodes at the arbitrary
-        phase. Measured on a sliced demo: the region before the SSPA read -14 dB tone SNR
-        while the region after read +38 dB. Feeding the row through the manual-SSP path
-        reduces it modulo the LCM of the ports' interval periods, so the phase holds from
-        row 0 (see Decoder's mSspSyncRow) and the whole capture decodes cleanly.
+        phase. Feeding the row through the manual-SSP path reduces it modulo the LCM of the
+        ports' interval periods, so the phase holds from row 0 (see Decoder's mSspSyncRow)
+        and the whole capture decodes cleanly.
 
         No-op (returns False) when an explicit SSP row is already set, when the wire
         supplies its own SSP, when there is no SSPA, or when there is no audio to re-phase.
@@ -876,8 +1031,7 @@ class Session:
         # The manual SSP only re-phases anything when a config CSV supplied the port
         # geometry (see ssp_effective). Without one it can't take effect, so store the
         # row (for persistence) but skip the ~full-decode that would produce identical
-        # output — this is the "step the row to find the phase by ear" workflow, which
-        # otherwise re-decodes per keystroke for nothing.
+        # output.
         if not self._config_csv:
             self._store_ssp_row(row)
             return
@@ -920,7 +1074,11 @@ class Session:
             {"is_write": True, "device_mask": 1 << int(d), "address": int(a),
              "data": bytes([int(v) & 0xFF])} for d, a, v in seed]
         if replay:
-            replay.append({"is_commit": True, "commit_confirmed": True, "group_mask": 0xFFFF})
+            devices = 0
+            for d, _a, _v in seed:
+                devices |= 1 << int(d)
+            replay.append({"is_commit": True, "commit_confirmed": True, "group_mask": 0xFFFF,
+                           "device_mask": devices})
         return replay
 
     def _reload_csv_seed(self) -> None:
@@ -983,6 +1141,12 @@ class Session:
         if window is None:
             return cap
         src["window"] = [int(window[0]), int(window[1])]
+        if int(window[0]) < 0:
+            from . import import_notes
+            path = src.get("path") or src.get("clock") or src.get("clock_path") or ""
+            import_notes.warn(import_notes.source_name(path),
+                              f"the window starts at {int(window[0]) / max(1, cap.sample_rate_hz):.9g}"
+                              f" s, before the capture; it is read from 0 s")
         return cap.subcapture(int(window[0]), int(window[1]))
 
     @classmethod
@@ -1074,16 +1238,11 @@ class Session:
         given order verbatim."""
         from .ingest import analog
         from .ingest import wfm as wfm_ingest
-        clk = wfm_ingest.read_wfm(clock_path)
-        dat = wfm_ingest.read_wfm(data_path)
-        # The two files are supposed to be the two channels of ONE acquisition, sharing
-        # a time base — but they're read independently, and capture_from_analog below
-        # only takes clk["time"] (reused for both channels). If the files actually
-        # disagree (different record length or sample rate — e.g. the wrong pair was
-        # picked, or one channel was re-captured separately), reusing clk's time axis
-        # for dat's samples silently misaligns every data-edge sample position against
-        # the wrong time base. Catch that here with a clear, WFM-specific error rather
-        # than let it surface downstream as bogus/impossible edge samples.
+        clk, dat = wfm_ingest.read_wfm_pair(clock_path, data_path)
+        # The two files must be the two channels of ONE acquisition, sharing a time base:
+        # capture_from_analog below takes only clk["time"] (reused for both channels).
+        # Files that disagree (record length, sample rate or start time) raise a
+        # WFM-specific error here.
         n_clk, n_dat = clk["time"].size, dat["time"].size
         rate_clk, rate_dat = clk["sample_rate_hz"], dat["sample_rate_hz"]
         rate_tol = 1e-6 * max(rate_clk, rate_dat)
@@ -1098,9 +1257,12 @@ class Session:
                 "time base) — are they the two channels of one acquisition? "
                 f"({clock_path}: {n_clk} samples @ {rate_clk:.6g} Hz, t0={t0_clk:.6g}s vs "
                 f"{data_path}: {n_dat} samples @ {rate_dat:.6g} Hz, t0={t0_dat:.6g}s)")
+        from . import import_notes
         cap = analog.capture_from_analog(clk["time"], clk["volts"], dat["volts"],
                                          sample_rate_hz or None, clock_thresh, data_thresh,
-                                         auto_clock=auto_clock)
+                                         auto_clock=auto_clock,
+                                         source=f"{import_notes.source_name(clock_path)} + "
+                                                f"{import_notes.source_name(data_path)}")
         src = {"type": "wfm", "clock_path": clock_path, "data_path": data_path,
                "auto_clock": auto_clock, "clock_thresh": clock_thresh,
                "data_thresh": data_thresh, "sample_rate_hz": int(cap.sample_rate_hz)}
@@ -1131,10 +1293,12 @@ class Session:
 
         clock_name = _select(clock)
         data_name = _select(data)
+        from . import import_notes
         cap = analog.capture_from_analog(parsed["time"], channels[clock_name],
                                          channels[data_name],
                                          parsed["sample_rate_hz"] or None,
-                                         clock_thresh, data_thresh, auto_clock=auto_clock)
+                                         clock_thresh, data_thresh, auto_clock=auto_clock,
+                                         source=import_notes.source_name(path))
         src = {"type": "analog_csv", "path": path, "clock": clock_name, "data": data_name,
                "auto_clock": auto_clock, "clock_thresh": clock_thresh,
                "data_thresh": data_thresh}
@@ -1349,7 +1513,7 @@ class Session:
             # A config CSV is imposed (apply_config_csv): draw the grid from the CSV
             # baseline + any wire config so it matches the CSV, rather than the
             # decoder's snoop-only grid (empty for a post-commit capture).
-            replay = self._csv_replay + self._grid_replay(self._config_commands())
+            replay = self._csv_replay + self._grid_replay(self._config_commands_since_reset())
             return swi3score.grid_from_commands(replay, rows, force_columns=self.column_count,
                                                 dlv=self.is_dlv,
                                                 cds_horizontal_start=self._cds_horizontal_start)
@@ -1378,7 +1542,8 @@ class Session:
             elif c.get("is_commit"):
                 replay.append({"is_commit": True,
                                "commit_confirmed": bool(c.get("commit_confirmed")),
-                               "group_mask": int(c.get("group_mask", 0))})
+                               "group_mask": int(c.get("group_mask", 0)),
+                               "device_mask": int(c.get("device_mask", 0))})
         return replay
 
     def grid_cells_at(self, sample: Optional[int], rows: int = 32) -> List[dict]:
@@ -1409,7 +1574,8 @@ class Session:
         replay = self._grid_replay_in_effect(sample)
         # A config CSV imposed on the capture is the baseline from row 0 (its write+
         # commit replay prepended), so a post-commit capture matches the CSV and any
-        # real bus writes still layer on top (later replay entries win).
+        # real bus writes still layer on top (later replay entries win). It stays the
+        # baseline after a later Cold Start, as the decode keeps the CSV's ports there.
         if self._csv_replay:
             replay = self._csv_replay + replay
         # What-if overrides for the section under the cursor, folded in by the C++
@@ -1716,11 +1882,8 @@ class Session:
         every UI in that region so a column that only transports deeper in the region
         still lights up. `sample=None` uses the operational region. Column 0 is CDS.
 
-        Memoized on the region's (origin, cols, end_ui) — the cursor can sit anywhere
-        within a region and this scans every UI in it (an np.arange + two searchsorted +
-        logical_or.at over the whole region), so re-running it on every cursor move while
-        TX-map persistence is on was doing the full-region scan far more often than the
-        region actually changes. Invalidated on re-decode (_redecode) — a scrambler/hub/
+        Memoized on the region's (origin, cols, end_ui), since the cursor can sit anywhere
+        within a region. Invalidated on re-decode (_redecode) — a scrambler/hub/
         SSP/override change can move segment boundaries."""
         ce = self.capture.clock_edges
         de = self.capture.data_edges
@@ -1740,12 +1903,11 @@ class Session:
         else:
             # Which columns EVER toggled in the region. A UI toggled iff a data edge lands
             # in its [prev_edge, edge) window (same convention as the per-UI form:
-            # searchsorted(de, ce[i]) - searchsorted(de, ce[i-1]) > 0). Rather than scan
-            # every UI — a region can be 100s of millions of UIs, and np.logical_or.at over
-            # that is pathologically slow — walk the DATA EDGES in the region: each edge
-            # falls in exactly one UI (hence one column), so this is O(#data edges in the
-            # region) with a vectorised bincount. de[k] in [ce[i-1], ce[i]) ⇒ UI i =
-            # searchsorted(ce, de[k], side="right").
+            # searchsorted(de, ce[i]) - searchsorted(de, ce[i-1]) > 0). Instead of scanning
+            # every UI (a region can be 100s of millions of UIs), walk the DATA EDGES in the
+            # region: each edge falls in exactly one UI (hence one column), so this is
+            # O(#data edges in the region) with a vectorised bincount.
+            # de[k] in [ce[i-1], ce[i]) ⇒ UI i = searchsorted(ce, de[k], side="right").
             d0 = int(np.searchsorted(de, ce[lo - 1], side="left"))    # first edge >= window start
             d1 = int(np.searchsorted(de, ce[end_ui - 1], side="left"))  # first edge >= window end
             if d1 > d0:
@@ -1770,7 +1932,8 @@ class Session:
         replay dicts are precomputed once per decode (in effective order), so a cursor
         move is a bisect + list slice — no per-move dict rebuild of every command."""
         _eff, _cmds, replay, replay_eff = self._effective_sorted()
-        return replay[:bisect.bisect_right(replay_eff, int(sample))]
+        lo = bisect.bisect_left(replay_eff, self._replay_start(sample))   # a bus reset since?
+        return replay[lo:bisect.bisect_right(replay_eff, int(sample))]
 
     def _effective_sorted(self):
         """(eff_samples, commands, replay, replay_eff) — the config commands sorted by
@@ -1835,11 +1998,8 @@ class Session:
         # SSP (so the DP-enable edge coincides exactly with the width change). The
         # window must be sized with the POST-commit width, not the stale cold-start
         # width at `end`: a 2col->16col commit's SSP boundary is ~Row_Delay rows of
-        # the NEW (wide) geometry away, so a window using old_cols=2 undershoots it
-        # and the estimate lands ~a few thousand samples SHORT — inside the stale
-        # 2-col segment. Everything then keyed on _segment_for_sample(eff) mis-frames
-        # (the symbol pane reads a 16-col stream as 2-col → rows explode ~8x and it
-        # hunts a comma across millions of UIs; the grid renders the wrong width).
+        # the NEW (wide) geometry away, and a window sized with old_cols=2 lands inside
+        # the stale 2-col segment.
         after = [int(s["start_sample"]) for s in self.segments if int(s["start_sample"]) > end]
         wide = max(old_cols, self.column_count)
         window = end + int((row_delay + 3) * wide * spU * 1.5)
@@ -1848,8 +2008,7 @@ class Session:
             return min(cand)
         # No geometry change near the SSP: a best-effort Row_Delay estimate (spU is the
         # final measured UI rate, only approximate on a rate-changing cold start), but
-        # never defer past the next real geometry change — that would hide the commit
-        # even longer than the bug we're fixing.
+        # never defer past the next real geometry change.
         return min([est] + [b for b in after if b > window])
 
     def commit_point_samples(self) -> List[int]:
@@ -1920,13 +2079,11 @@ class Session:
         begins at its first row's Row Sync Point (the rising edge opening Column 0, one UI
         before start_sample), which is exactly where a width-changing sync-point commit
         takes effect and where the cursor is anchored. Comparing start_sample would leave
-        a cursor sitting on that RSP in the OLD segment, so the grid forced the old width
-        for one UI after the commit already took effect (register/grid disagreeing).
+        a cursor sitting on that RSP in the OLD segment.
 
         DLV is the exception: its `clock_edges` are the sparse DP transitions, so
         `_ui_for_sample` (an edge count) is NOT the source UI and would mis-select the
-        segment (it compressed the whole audio region onto the 4-col Safe-Lock segment).
-        The recovered UI can't be indexed off clock_edges, so DLV compares the real
+        segment. The recovered UI can't be indexed off clock_edges, so DLV compares the real
         `start_sample` instead — the ≤1-UI RSP-edge subtlety above is immaterial next to
         picking the right width for the entire region."""
         if not self.segments:
@@ -1971,8 +2128,8 @@ class Session:
         s = self.source or {}
         t = s.get("type")
         if t == "demo":
-            # Now that several demo captures exist (one per audio-mode PHY, plus the
-            # flow-control variant), name which one is loaded instead of a generic label.
+            # Name which demo is loaded (one per audio-mode PHY, plus the flow-control
+            # variant).
             if s.get("variant") == "flow_control":
                 return "Flow Control Demo Capture"
             phy = s.get("phy")
@@ -2000,11 +2157,15 @@ class Session:
 
     def section_ui_stats(self) -> List[dict]:
         """Per config-section UI (unit-interval) period statistics, in nanoseconds:
-        median / min / max of the clock-edge spacing within each section's sample
+        mean / min / max of the clock-edge spacing within each section's sample
         span. UI can change between sections (a mid-stream reconfiguration), so this
         is reported per section rather than one figure. Idle gaps (> 4x the section
-        median, e.g. between bursts) are excluded from min/max so they don't dwarf
-        the real UI. Returns one dict per section: section, column_count, ui_ns,
+        median, e.g. between bursts) are excluded so they don't dwarf the real UI.
+
+        The UI is the MEAN of the spacings, not their median: edges land on whole
+        samples, so a UI of 20.35 samples is spaced 20, 20, 21, ... and the median is
+        the commoner integer (off by up to half a sample per UI). Returns one dict per
+        section: section, column_count, ui_ns,
         ui_min_ns, ui_max_ns (empty if there are no clock edges)."""
         clk = np.asarray(self.capture.clock_edges, dtype=np.int64)
         rate = int(self.sample_rate_hz) or 1
@@ -2031,17 +2192,14 @@ class Session:
                 band = per[(per > 0) & (per < 4 * med)] if med > 0 else per
                 if band.size == 0:
                     band = per
-                out.append({"section": i, "column_count": cols, "ui_ns": med,
+                out.append({"section": i, "column_count": cols, "ui_ns": float(band.mean()),
                             "ui_min_ns": float(band.min()), "ui_max_ns": float(band.max())})
             return out
         for i, s in enumerate(segs):
             lo = starts[i]
             hi = starts[i + 1] if i + 1 < len(starts) else (int(clk[-1]) + 1 if clk.size else lo)
             # clock_edges is sorted, so bisect the segment's [lo, hi) span instead of a
-            # full-array boolean mask — the mask was O(segments x total_edges), which on a
-            # capture that reconfigures many times (each a segment) scanned all edges per
-            # segment and made "Measuring bus sections" take tens of seconds. Slicing is
-            # O(segments x log N + N).
+            # full-array boolean mask: O(segments x log N + N), not O(segments x N).
             i0 = int(np.searchsorted(clk, lo, side="left"))
             i1 = int(np.searchsorted(clk, hi, side="left"))
             a = clk[i0:i1]
@@ -2053,7 +2211,8 @@ class Session:
             if band.size == 0:
                 band = gaps
             out.append({"section": i, "column_count": int(s.get("column_count", 0)),
-                        "ui_ns": med, "ui_min_ns": float(band.min()), "ui_max_ns": float(band.max())})
+                        "ui_ns": float(band.mean()), "ui_min_ns": float(band.min()),
+                        "ui_max_ns": float(band.max())})
         return out
 
     def column_count_at(self, sample: Optional[int]) -> int:
@@ -2077,11 +2236,10 @@ class Session:
         yet belongs to the row it sits in.)
 
         DLV: `clock_edges` are the sparse DP transitions, so searchsorting them gives an
-        edge count, NOT the source UI index (it under-counts badly, which threw every
-        cursor→row/segment mapping off between the Timeline, Bus Grid and commands). The
-        recovered UI period is constant within a segment and rows are integer UIs, so the
-        UI index is the segment's `start_ui` plus how many recovered UIs `sample` sits past
-        that segment's Column-0 anchor (`start_sample`)."""
+        edge count, NOT the source UI index. The recovered UI period is constant within a
+        segment and rows are integer UIs, so the UI index is the segment's `start_ui` plus
+        how many recovered UIs `sample` sits past that segment's Column-0 anchor
+        (`start_sample`)."""
         sample = max(0, int(sample))
         if self.is_dlv:
             rc = self.recovered_clock()
@@ -2094,7 +2252,12 @@ class Session:
                 # across the commit. row_period = operational UI * operational columns.
                 seg_ui = ui * self.column_count / max(1, int(seg["column_count"]))
                 off = int(round((sample - int(seg["start_sample"])) / seg_ui))
-                return int(seg["start_ui"]) + max(0, off)
+                # A segment's UIs end where the next one's begin: the recovered clock skips
+                # a stopped Link's stretch, so a sample in it maps to the restart's UI.
+                nxt = next((int(b["start_ui"]) for a, b in zip(self.segments, self.segments[1:])
+                            if a is seg), None)
+                at = int(seg["start_ui"]) + max(0, off)
+                return at if nxt is None else min(at, nxt)
         return int(_searchsorted(self.capture.clock_edges, sample, side="right"))
 
     def _recovered_row_syncs(self) -> np.ndarray:
@@ -2166,8 +2329,8 @@ class Session:
             first = max(origin, lo_ui)
             k0 = (first - origin + cols - 1) // cols     # first Column-0 UI >= window start
             # Column-0 UIs are an arithmetic progression (origin + k0*cols, step cols); the
-            # RSP is the rising edge that OPENS each (ui - 1). Vectorize the walk (same values
-            # as the old per-UI append loop) and drop a negative RSP (only ui==0).
+            # RSP is the rising edge that OPENS each (ui - 1). Drop a negative RSP (only
+            # ui==0).
             uis = np.arange(origin + k0 * cols, end_ui, cols, dtype=np.int64)
             rsps = uis - 1
             rsps = rsps[rsps >= 0]
@@ -2194,9 +2357,8 @@ class Session:
         screen. Snapped to the Column-0 RSP of the row that contains the effect
         sample (same RSP edge as :meth:`cds_column_samples`)."""
         # The commit RSP samples don't depend on the viewport, so compute them ONCE
-        # (cached, invalidated on re-decode) and bisect to [lo, hi] — the Raw Capture
-        # pan/zoom fires this continuously, and a full config-command scan per call was
-        # O(all config commands) regardless of how far it's zoomed in.
+        # (cached, invalidated on re-decode) and bisect to [lo, hi]: the Raw Capture
+        # pan/zoom calls this continuously.
         allc = self._commit_rsp_samples_all()
         if allc.size == 0:
             return np.zeros(0, dtype=np.uint64)
@@ -2269,8 +2431,7 @@ class Session:
                 "index": np.asarray(c["index"], dtype=np.uint64)[order],
             }
             # Precompute the signed decimal value once (it only depends on the decoded
-            # audio) — samples_around used to recompute it over the whole table on
-            # every cursor move.
+            # audio).
             self._mark_cache["signed"] = self._signed(
                 self._mark_cache["value"], self._mark_cache["sample_size"])
             # Widest value span (marks are sorted by start; a value can only straddle
@@ -2287,8 +2448,7 @@ class Session:
 
         `start_ui` is the segment's ANCHOR UI, recorded at the CDS column
         (`_cds_horizontal_start` — Column 0 for FBCSE, Column 2 for DLV), so the CDS
-        offset is added back to count rows from Column 0. It's 0 for FBCSE (unchanged);
-        without it a DLV row came out one low (Column 0 mapped to row_base-1)."""
+        offset is added back to count rows from Column 0. It's 0 for FBCSE."""
         seg = self._segment_for_sample(int(sample))
         if seg is None:
             return 0
@@ -2300,7 +2460,7 @@ class Session:
         # is the last one at/before the sample, and rsp[k] IS bus row k (the decoder records
         # one RSP per row from Row 0 in mRowCounter order — the same numbering the commit's
         # effective_row / segment row_base use). So bus row = searchsorted(rsp, s) - 1 and the
-        # inverse is rsp[row]; a +1 here desynced the commit marker from the geometry change.
+        # inverse is rsp[row].
         if self.is_dlv:
             rsp = self._recovered_row_syncs()
             if rsp.size:
@@ -2310,9 +2470,8 @@ class Session:
 
     def bus_rows_for_samples(self, samples: np.ndarray) -> np.ndarray:
         """Vectorised :meth:`bus_row_for_sample` for an array of samples — used to
-        row-number a whole window at once (per-row Python calls were the navigation
-        hot spot). Assigns each sample to its segment, then computes rows with array
-        ops."""
+        row-number a whole window at once. Assigns each sample to its segment, then
+        computes rows with array ops."""
         s = np.asarray(samples, dtype=np.int64)
         if s.size == 0:
             return np.zeros(0, dtype=np.int64)
@@ -2355,16 +2514,11 @@ class Session:
             else:
                 break
         cols = max(1, int(seg["column_count"]))
-        # DLV: clock_edges aren't per-UI, so map row → sample through the recovered clock:
-        # the row's Column-0 mid-UI sample is start_sample + rows_in*cols*ui, and the
-        # row-opening (RSP) 0→1 edge is half a UI before it — the same PLL edge the RSP
-        # marks use, so cursor/commit anchoring lands on the marker.
         # DLV: return the ACTUAL recovered row-opening (RSP) edge for this bus row — the
         # exact inverse of bus_row_for_sample (which indexes the same edges). rsp[k] IS bus
         # row k (one RSP per row from Row 0, matching mRowCounter / a commit's effective_row),
         # so bus row R opens at rsp[R]. Jitter-proof, and cursors/commits land exactly on the
-        # RSP mark AND on where the clock/data change geometry (a +1 here desynced the commit
-        # marker from the column-count change by one row).
+        # RSP mark AND on where the clock/data change geometry.
         if self.is_dlv:
             rsp = self._recovered_row_syncs()
             if rsp.size:
@@ -2395,9 +2549,8 @@ class Session:
 
         Memoized on the normalized (hashable) filter tuple: the Samples pane calls this
         (via sample_marks_total / sample_position_of / samples_by_position) up to 4x per
-        cursor move with the SAME filters, and it was rebuilding the full-length boolean
-        mask (np.isin over every filter dimension + flatnonzero over ALL marks) every
-        time. Invalidated whenever `_mark_cache` is (re-decode; see _refresh_audio)."""
+        cursor move with the SAME filters. Invalidated whenever `_mark_cache` is
+        (re-decode; see _refresh_audio)."""
         key = self._filter_key(ports, channels, value_pred)
         cache = self._filtered_cache
         if cache is not None and cache[0] == key:
@@ -2450,8 +2603,7 @@ class Session:
         dev, dp, ch = m["device"][sel], m["dp"][sel], m["channel"][sel]
         val, ss, ix = m["value"][sel], m["sample_size"][sel], m["index"][sel]
         # Convert each column to a Python list ONCE (.tolist() also yields native ints, so
-        # no per-row int() cast) — scalar-indexing a NumPy array per row is ~2-3x slower on
-        # this Decoded-Samples hot path. Output identical.
+        # no per-row int() cast) instead of scalar-indexing a NumPy array per row.
         dev, dp, ch = dev.tolist(), dp.tolist(), ch.tolist()
         val, ss, ix = val.tolist(), ss.tolist(), ix.tolist()
         starts, rows, signed = starts.tolist(), rows.tolist(), signed.tolist()
@@ -2552,8 +2704,7 @@ class Session:
         None when there are no edges or the range is empty.
 
         DLV: clock_edges aren't per-UI, so map through the recovered-UI helper
-        (`_ui_for_sample`) — searchsorting the sparse edges gave far-too-small UIs, so
-        the window landed in the bring-up region and no audio-port bits were found."""
+        (`_ui_for_sample`); searchsorting the sparse edges gives far-too-small UIs."""
         if self.is_dlv:
             lo_ui = self._ui_for_sample(max(0, int(lo_sample)))
             hi_ui = self._ui_for_sample(int(hi_sample))
@@ -2743,9 +2894,15 @@ class Session:
         # bisect per cursor move — mirroring the grid path (_grid_replay_in_effect) —
         # instead of rebuilding the whole replay from the in-effect commands every move.
         reg_replay, reg_eff = self._reg_replay_sorted()
-        replay = reg_replay[:bisect.bisect_right(reg_eff, int(sample))]
-        sect = self.segment_index_for_sample(int(sample))
-        return self._build_register_files_from_replay(replay, sect)
+        reset = self._replay_start(sample)                              # a bus reset since?
+        lo = bisect.bisect_left(reg_eff, reset)
+        replay = reg_replay[lo:bisect.bisect_right(reg_eff, int(sample))]
+        index = self.segment_index_for_sample(int(sample))
+        # Between a later Cold Start's Bus Reset and its restart the decode is still in the
+        # old section, but the bus was reset: that section's what-ifs do not apply.
+        stale = bool(reset and self.segments
+                     and int(self.segments[index]["start_sample"]) < reset)
+        return self._build_register_files_from_replay(replay, None if stale else index)
 
     @staticmethod
     def _reg_replay_entry(c):
@@ -2757,7 +2914,8 @@ class Session:
                     "address": int(c.get("address", 0)), "data": bytes(c.get("data", b""))}
         if c.get("is_commit"):
             return {"is_commit": True, "commit_confirmed": bool(c.get("commit_confirmed")),
-                    "group_mask": int(c.get("group_mask", 0))}
+                    "group_mask": int(c.get("group_mask", 0)),
+                    "device_mask": int(c.get("device_mask", 0))}
         if (c.get("has_read_data") and c.get("read_data_crc_valid") and c.get("has_address")):
             return {"is_read": True, "device_mask": int(c.get("device_mask", 0)),
                     "address": int(c.get("address", 0)),
@@ -2791,6 +2949,19 @@ class Session:
         replay = [r for c in cmds if (r := self._reg_replay_entry(c)) is not None]
         return self._build_register_files_from_replay(replay, section)
 
+    @staticmethod
+    def _registers_snapshot(replay: List[dict], overrides: List[Tuple[int, int, int]]
+                            ) -> list:
+        """swi3score.registers_from_commands for `replay`: each confirmed Commit promotes the
+        devices its device mask selects, none when the mask is 0 (Section 8.1.1.5.1, Table
+        74), as register_history and model.registers.apply_commands do."""
+        return swi3score.registers_from_commands(replay, register_overrides=overrides)
+
+    def bus_reset_samples(self) -> List[int]:
+        """The samples where each later Cold Start's Bus Reset begins, ascending: the
+        points the register replay restarts from (`_replay_start`)."""
+        return list(getattr(self, "_replay_resets", []))
+
     def _build_register_files_from_replay(self, replay, section: Optional[int]
                                           ) -> Dict[int, DeviceRegisterFile]:
         """Build per-device files from the C++ register authority for a prebuilt `replay`
@@ -2821,7 +2992,7 @@ class Session:
         region = self._csv_section_cfg.get(section) if section is not None else None
         csv_bases = region.written if region is not None else set()
         override_bases = ov_next | ov_curr
-        snap = swi3score.registers_from_commands(replay, register_overrides=overrides)
+        snap = self._registers_snapshot(replay, overrides)
 
         files: Dict[int, DeviceRegisterFile] = {}
 
@@ -2836,7 +3007,9 @@ class Session:
         src_prov = {1: Provenance.WRITTEN, 2: Provenance.READ}
         # CSV-import baseline (Provenance.CSV): seed UNDERNEATH the snooped writes/reads
         # so a post-commit capture (nothing on the wire) shows the CSV config, while any
-        # real bus write/read re-seeds the same address below and wins.
+        # real bus write/read re-seeds the same address below and wins. The CSV is the
+        # capture's configuration through every bring-up (the decode keeps its ports
+        # across a later Cold Start too), so it seeds the state after a bus reset as well.
         for dev, addr, cur, has_cur, _cs, nxt, has_next, _ns in self._csv_snap:
             if (dev, addr) in override_bases:
                 continue
@@ -2987,12 +3160,8 @@ class Session:
         """Pin the bus column count for the config region containing `sample`, and
         re-decode. `columns` 0 removes the pin. Returns the section index affected.
 
-        Why per-region: a config CSV knows a geometry the wire may never have carried
-        (a post-commit capture has no NumColumns commit to snoop), and the blind column
-        detector can mis-lock. But a capture that genuinely reconfigures mid-stream has
-        several real widths, so forcing one over the whole capture misframes the others
-        (their commands go CRC-red). Pinning just the region under the cursor fixes the
-        region being looked at and leaves the rest decoding as the wire says.
+        Per-region: a capture that reconfigures mid-stream has several real widths, so
+        only the region under the cursor is pinned and the rest decode as the wire says.
 
         The section index is resolved from the CURRENT segments, before the re-decode:
         a pin changes framing *within* a region, but re-detected framing can also move
@@ -3037,12 +3206,9 @@ class Session:
         """Impose a Visualizer config CSV on the config region containing `sample` only,
         and re-decode. `path` None/"" removes that region's CSV. Returns the section index.
 
-        apply_config_csv imposes ONE config from row 0 and puts the decoder in its CSV
-        mode, which stops it following the wire: no snooped width changes, no re-sync. On
-        a capture that reconfigures mid-stream (Safe-Lock-2 -> 8 -> 16 columns) that framed
-        every region at the CSV's width, turned every command CRC-red and lost the audio
-        of the regions the CSV was not for. Here the CSV becomes the region's register
-        state instead, through the section-scoped what-if path (both ranks, so it is in
+        Unlike apply_config_csv (ONE config from row 0, with the decoder in its CSV mode,
+        which stops it following the wire), the CSV becomes the region's register
+        state, through the section-scoped what-if path (both ranks, so it is in
         effect without a commit) plus its width as a region pin, and every other region
         decodes as the wire says. An explicit pin or what-if on the region still wins.
 
@@ -3054,7 +3220,7 @@ class Session:
         elif self.csv_sections.pop(sect, None) is None:
             return sect
         self._store_csv_sections()
-        self._csv_section_cfg = self._read_csv_sections()
+        self._csv_section_cfg = self._read_csv_sections(report={sect} if path else set())
         self._redecode()
         return sect
 
@@ -3070,21 +3236,35 @@ class Session:
         for sect, path in sorted(self.csv_sections.items()):
             self.source[f"{CSV_SECTION_KEY}{sect}"] = path
 
-    def _read_csv_sections(self) -> Dict[int, RegionCsv]:
+    def _read_csv_sections(self, report: Optional[Set[int]] = None) -> Dict[int, RegionCsv]:
         """Each region CSV, read. Its overrides set a dual-ranked register's _CURR rank as
         well as the _NEXT the CSV writes, so the config is in effect from the region's
         start without the commit the wire never sent; `written` keeps the addresses as
         the CSV names them, which is how the register snapshot keys them. A CSV that
         cannot be read is skipped (the workspace's Locate asks for a missing one before
-        this runs), leaving that region decoding as the wire says."""
+        this runs), leaving that region decoding as the wire says.
+
+        The import warnings of the regions in `report` (all of them when None) are
+        reported: what the upgrade and the native loader did not read as written, and a
+        CSV skipped as unreadable."""
+        from . import import_notes
         from .ingest import visualizer_csv
         out: Dict[int, RegionCsv] = {}
         for sect, path in self.csv_sections.items():
+            loud = report is None or sect in report
             norm = ""
             try:
-                norm = visualizer_csv.normalized_path(path)
-                seed = swi3score.registers_from_csv(norm)
-            except Exception:                     # noqa: BLE001 - see the docstring
+                with contextlib.ExitStack() as quiet:
+                    if not loud:
+                        quiet.enter_context(import_notes.collect())
+                    norm = visualizer_csv.normalized_path(path)
+                    seed = swi3score.registers_from_csv(norm)
+                    visualizer_csv.report_csv_warnings(norm, path)
+            except Exception as exc:              # noqa: BLE001 - see the docstring
+                if loud:
+                    import_notes.warn(import_notes.source_name(path),
+                                      f"not read ({exc}); region {int(sect) + 1} decodes "
+                                      "as the wire says.")
                 continue
             finally:
                 if norm and norm != path:
@@ -3162,7 +3342,7 @@ class Session:
         else:
             self.peripheral_maps[device] = pmap
         if rebuild:
-            self.register_files = self._build_register_files(self._config_commands(), None)
+            self.register_files = self._build_register_files(self._config_commands_since_reset(), None)
 
     def _config_commands(self):
         """The config-relevant commands only — CRC-valid WriteA32, every Commit, and

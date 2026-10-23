@@ -16,11 +16,10 @@ from .capture import Capture
 
 # A SWI3S PHY2 link runs a 12.288 MHz forwarded DDR clock -> 24.576 MHz UI rate. A real
 # analyzer oversamples that clock heavily (tens of samples per UI), which is what gives
-# the Timing pane fine setup/hold resolution. Sampling only 4x/UI (as the demo first did)
-# quantises setup/hold to ~10 ns steps and collapses the eye histogram to a single bin
-# that touches 0 ns. 32 samples/UI (786.432 MHz) keeps the UI rate + edge COUNT identical
-# (edges scale with bus activity, not sample rate — see Capture) while resolving a clean,
-# center-aligned eye (~20 ns each side at ~1.3 ns resolution).
+# the Timing pane fine setup/hold resolution. 32 samples/UI (786.432 MHz) keeps the UI
+# rate + edge COUNT identical (edges scale with bus activity, not sample rate — see
+# Capture) while resolving a clean, center-aligned eye (~20 ns each side at ~1.3 ns
+# resolution).
 DEFAULT_SAMPLES_PER_UI = 32
 DEFAULT_SAMPLE_RATE_HZ = 786_432_000       # 32 * 24.576 MHz UI rate (clock stays 12.288 MHz)
 # PHY3 (DLV): the 16-col operational config holds the row rate at 3.072 MRows/s (the
@@ -37,10 +36,10 @@ PHY1_SAMPLE_RATE_HZ = 196_608_000                 # 32 * 6.144 MHz UI @ 4 cols -
 
 # A REAL logic analyzer samples at one fixed rate (its max), NOT a convenient multiple of
 # the SWI3S UI — so the demo captures use 500 MHz (2 ns period) throughout, giving a
-# NON-integer number of samples per UI (e.g. PHY2 24.576 MHz UI -> 20.345 samples/UI). This
-# exercises the decode the way a bench capture would: the FBCSE clock-edge recovery and the
-# DLV virtual PLL both work from actual (rounded, jittered) edge positions, not an assumed
-# integer grid. The per-PHY UI rates below turn into the float UI period at this rate.
+# NON-integer number of samples per UI (e.g. PHY2 24.576 MHz UI -> 20.345 samples/UI): the
+# FBCSE clock-edge recovery and the DLV virtual PLL both work from actual (rounded,
+# jittered) edge positions. The per-PHY UI rates below turn into the float UI period at
+# this rate.
 ANALYZER_SAMPLE_RATE_HZ = 500_000_000             # 2 ns period — the analyzer's fixed max rate
 FBCSE_UI_RATE_HZ = 24_576_000                     # PHY2 UI (12.288 MHz DDR clock)
 DLV_ROW_RATE_HZ = 3_072_000                       # PHY3 recovered-clock row reference
@@ -61,7 +60,7 @@ def build_capture_from_levels(levels, samples_per_ui: float = DEFAULT_SAMPLES_PE
     # One clock edge per UI at k*spu, ROUNDED to the sample grid — for a non-integer spu the
     # spacing then alternates by ±1 sample (the quantisation an off-multiple sample rate
     # produces on a bench). The decoder recovers the UI from the actual edges, so this is
-    # exactly the jitter a real capture presents. Integer spu reduces to the old k*spu grid.
+    # exactly the jitter a real capture presents. Integer spu gives an exact k*spu grid.
     clock_edges = np.rint(np.arange(1, n + 1, dtype=np.float64) * spu).astype(np.uint64)
 
     # A data transition wherever the level changes between consecutive UIs (with a leading
@@ -115,10 +114,10 @@ def build_dlv_capture_from_levels(levels, row_columns, samples_per_ui: int = DEF
         return Capture(clock_edges=empty, data_edges=empty.copy(),
                        initial_clock=False, initial_data=True, sample_rate_hz=sample_rate_hz)
     row_period = spu * float(cpr.max())           # constant across the capture (may be non-integer)
-    # Per-UI absolute sample position, fully vectorised (the old per-UI Python loop over ~25M
-    # UIs cost seconds on the 1 s demo). Row r's Column 0 is at (r+1)*row_period (a leading-low
-    # row precedes Row 0); its column c is c*(row_period/cols_r) past that. Build the row index
-    # and within-row column index of every UI with repeat()/cumsum, then position = base + c*w.
+    # Per-UI absolute sample position, fully vectorised. Row r's Column 0 is at
+    # (r+1)*row_period (a leading-low row precedes Row 0); its column c is
+    # c*(row_period/cols_r) past that. Build the row index and within-row column index of
+    # every UI with repeat()/cumsum, then position = base + c*w.
     ui_row = np.repeat(np.arange(cpr.size, dtype=np.int64), cpr)     # row of each UI
     ui_start = np.concatenate(([0], np.cumsum(cpr)[:-1]))            # first UI index of each row
     col_idx = np.arange(lv.size, dtype=np.int64) - ui_start[ui_row]  # column within the row

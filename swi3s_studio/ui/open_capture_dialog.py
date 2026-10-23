@@ -1,10 +1,7 @@
 """File ▸ Open Capture's one-page dialog: what the file is, its Links, how much to decode,
 and whether it replaces or adds to the open Links.
 
-It replaces a chain of small modal questions: a clock picker, a data picker, "Take another
-Link from this file?", a blind start and length for a large .sal, a separate Open Capture
-Time Window, and the analog CSV dialog. Everything here is decided before anything is decoded,
-from an `ingest.probe.CaptureProbe`.
+Everything here is decided before anything is decoded, from an `ingest.probe.CaptureProbe`.
 """
 from __future__ import annotations
 
@@ -59,8 +56,7 @@ def _gb(n: Optional[int]) -> str:
 
 
 def _edges(n: int, approx: bool) -> str:
-    """An edge count as the dialog shows it: to two or three figures (it is for picking the
-    busy line from the quiet one, and the larger counts are estimates anyway)."""
+    """An edge count as the dialog shows it: to two or three figures, `~` when approximate."""
     if n >= 1_000_000:
         return f"~{n / 1e6:.1f}M"
     if n >= 10_000:
@@ -197,7 +193,7 @@ class OpenCaptureDialog(QDialog):
         """`reference` is Locate Sub-Capture's form: the file is searched for, not opened as
         a Link, so it has one row and no name, and no Into. `budget_bytes` is what refuses
         a load (memory_budget); a cost past `large_bytes` (large_load_bytes) is labelled
-        large and still allowed, so the person deciding can see it."""
+        large and still allowed."""
         super().__init__(parent)
         self.probe = probe
         self._reference = bool(reference)
@@ -293,13 +289,13 @@ class OpenCaptureDialog(QDialog):
         il.addWidget(self._replace)
         il.addWidget(self._add)
         il.addSpacing(16)
-        self._offset_label = QLabel("Offset")
+        self._offset_label = QLabel("Time Offset")
         self._offset = QDoubleSpinBox()
-        self._offset.setDecimals(3)            # ms to the µs; Set Offset… takes ps
+        self._offset.setDecimals(3)            # ms to the µs; Set Time Offset… takes ps
         self._offset.setRange(-1e6, 1e6)
         self._offset.setSuffix(" ms")
         self._offset.setToolTip("Where this file's time zero sits on the open Links' timeline. "
-                                "Bookmarks ▸ Align Links on Bookmark Pair can set it from an "
+                                "Cursors ▸ Align Links on Cursor Pair can set it from an "
                                 "event later.")
         il.addWidget(self._offset_label)
         il.addWidget(self._offset)
@@ -376,10 +372,13 @@ class OpenCaptureDialog(QDialog):
         if self._fits(cost) or not span or not self.probe.windowed:
             self._all.setChecked(True)
             return
-        frac = max(0.0, min(1.0, self._budget / float(cost))) if cost else 1.0
+        longest = self.probe.largest_window_s(self._budget // max(1, len(self._rows)))
+        if longest is None or longest <= 0.0:
+            frac = max(0.0, min(1.0, self._budget / float(cost))) if cost else 1.0
+            longest = span * frac
         self._part.setChecked(True)
         self._t0.set_seconds(0.0)
-        self._t1.set_seconds(max(min(span, 1e-3), span * frac))
+        self._t1.set_seconds(max(min(span, 1e-3), longest))
 
     def _on_window_edited(self) -> None:
         if not self._part.isChecked():

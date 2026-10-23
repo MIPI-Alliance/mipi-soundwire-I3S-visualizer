@@ -3,7 +3,7 @@
 An SSPA (Stream Sync Point Announce — Announce phase, opcode 0x00) generates an SSP
 without committing anything. Its job is to re-assert data-port synchronization: a port
 that has drifted is pulled back into phase, and an *unexpected* SSPA raises a peripheral
-interrupt. Every demo region with active data ports now emits them at a ~100 ms cadence.
+interrupt. Every demo region with active data ports emits them at a ~100 ms cadence.
 
 The delicate part is WHERE. The decoder takes an SSPA's SSP as
 (row of its last CDS bit) + 1 + Row_Delay - SyncPointOffset and re-anchors every port's
@@ -75,11 +75,9 @@ def test_sspas_do_not_corrupt_the_capture(sessions, name, _kw, _n):
     """Adding SSPAs must not introduce a single CRC error anywhere: a mis-sized or
     mis-framed SSPA would desync the 8b10b stream and redden later commands too.
 
-    The `has_manager_packet` guard is the same rule `analysis/errors.py` applies, and it
-    matters: a ReadData phase carries NO Manager Packet, so there is no CRC over it and
-    `crc_valid` stays at its unset default. Without the guard this flagged a perfectly good
-    deferred-read delivery as corrupt — found the moment a demo first emitted one (3.0.13).
-    A phase with nothing to check cannot fail the check."""
+    The `has_manager_packet` guard is the same rule `analysis/errors.py` applies: a
+    ReadData phase carries NO Manager Packet, so there is no CRC over it and `crc_valid`
+    stays at its unset default. A phase with nothing to check cannot fail the check."""
     bad = [c for c in sessions[name].commands
            if c.get("has_manager_packet") and not c.get("crc_valid", True)]
     assert not bad, f"{name}: {len(bad)} CRC-invalid command(s)"
@@ -195,11 +193,9 @@ def test_timeline_marks_an_sspa_as_a_sync_point():
 def test_flow_control_handshake_stays_clean_across_an_sspa():
     """A correctly-placed SSPA must not invent a DRQ<->TxPresent violation.
 
-    CPayloadEngine::SyncToSSP used to clear the DRQ history unconditionally, so the first
-    TxPresent after any re-anchor had nothing to pair with — a real DRQ, sent d intervals
-    earlier, reported as a handshake failure. No demo exercised that until SSPAs existed.
-    The history is now preserved when the port is already at its sync point (an aligned
-    SSPA re-asserts the phase; it doesn't move it)."""
+    CPayloadEngine::SyncToSSP preserves the DRQ history when the port is already at its
+    sync point (an aligned SSPA re-asserts the phase; it doesn't move it), so the first
+    TxPresent after a re-anchor still pairs with the DRQ sent d intervals earlier."""
     import swi3score
 
     from swi3s_studio.ingest import transitions

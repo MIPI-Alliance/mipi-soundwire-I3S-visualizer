@@ -2,9 +2,11 @@
 
 A small wizard-style dialog for importing a peripheral (chip) register map and
 binding it to a device. It drives `model.regmap_import`: pick a vendor file
-(e.g. Cirrus-style XML) or a pre-normalized `.json`, preview what was inferred
+(vendor XML) or a pre-normalized `.json`, preview what was inferred
 (register/field counts, address range, coalesced fields, warnings), choose the
-target device, then accept to hand back a `PeripheralRegisterMap`.
+target device, then accept to hand back a `PeripheralRegisterMap`. On accept the
+report's warnings are raised through import_notes under the file's name, so the window
+that opened the dialog lists them in its Import warnings window.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .. import import_notes
 from ..model.regmap_import import ImportReport, PeripheralRegisterMap, import_text
 
 _PREVIEW_LIMIT = 50          # registers shown in the preview tree
@@ -46,6 +49,7 @@ class RegisterMapImportDialog(QDialog):
         self.setMinimumWidth(560)
         self.pmap: Optional[PeripheralRegisterMap] = None
         self.device: Optional[int] = None
+        self.report: Optional[ImportReport] = None
         self._path: str = ""
 
         root = QVBoxLayout(self)
@@ -68,7 +72,7 @@ class RegisterMapImportDialog(QDialog):
             self._device.addItem(f"Device {d}", d)
         self._device.setCurrentIndex(max(0, self._device.findData(device)))
         form.addRow("Bind to device:", self._device)
-        self._coalesce = QCheckBox("Coalesce indexed bits into ranged fields (amp_lvl[5:0])")
+        self._coalesce = QCheckBox("Coalesce indexed bits into ranged fields (gain[5:0])")
         self._coalesce.setChecked(True)
         self._coalesce.toggled.connect(lambda _=False: self._reimport())
         form.addRow("", self._coalesce)
@@ -118,17 +122,21 @@ class RegisterMapImportDialog(QDialog):
                 text = f.read()
             name = os.path.splitext(os.path.basename(self._path))[0]
             if self._path.lower().endswith(".json"):
-                self.pmap = PeripheralRegisterMap.from_json(text)
+                with import_notes.collect() as notes:
+                    self.pmap = PeripheralRegisterMap.from_json(text, os.path.basename(self._path))
                 report = _report_for_loaded(self.pmap)
+                report.warnings.extend(n.message for n in notes)
             else:
                 self.pmap, report = import_text(text, name, coalesce=self._coalesce.isChecked())
         except Exception as exc:  # noqa: BLE001 — surface any parse error to the user
             self.pmap = None
+            self.report = None
             self._summary.setText(f"<b>Import failed:</b> {exc}")
             self._warnings.setPlainText("")
             self._preview.clear()
             self._buttons.button(QDialogButtonBox.Ok).setEnabled(False)
             return
+        self.report = report
         self._show(report)
 
     def _show(self, report: ImportReport) -> None:
@@ -136,7 +144,7 @@ class RegisterMapImportDialog(QDialog):
                else f"0x{report.address_min:08X} – 0x{report.address_max:08X}")
         self._summary.setText(
             f"<b>{report.format}</b> · {report.register_count} registers · "
-            f"{report.raw_bit_count} bits → {report.field_count} fields · {rng}")
+            f"{report.raw_bit_count} {report.raw_unit} → {report.field_count} fields · {rng}")
         self._warnings.setPlainText(
             "\n".join(f"• {w}" for w in report.warnings) or "No warnings.")
         self._preview.clear()
@@ -154,6 +162,8 @@ class RegisterMapImportDialog(QDialog):
 
     def accept(self) -> None:
         self.device = self._device.currentData()
+        if self.report is not None and self.pmap is not None:
+            self.report.report_notes(os.path.basename(self._path))
         super().accept()
 
 

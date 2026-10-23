@@ -7,17 +7,15 @@ transitively through the golden suite, but this asserts it DIRECTLY: for each da
 port (solo-placed to avoid clash-interaction differences), the two engines put the
 same DP-owned cells at the same (row, col, slot).
 
-This is the explicit guard the 3.0.8 review asked for against the duplicated-engine
-risk; if one engine's cascade is changed without the other, this fails. The
-`test_cross_engine_all_configs_*` sweep over EVERY example config (all flow modes) is
-what would have caught the {ASW5203} TX_PRESENT-in-RX_CONTROLLED bug landing in only
-one engine — the older demo-only check ran a NORMAL config and never exercised it.
+If one engine's cascade changes without the other, this fails. The
+`test_cross_engine_all_configs_*` sweep runs EVERY example config (all flow modes), so a
+placement rule such as {ASW5203} TX_PRESENT in RX_CONTROLLED must land in both engines.
 
 Scope note: the sweep compares DATA + TX_PRESENT, which are DataPort-exclusive slots.
 The Flow Control Port's cells (DRQ, and the FCP's own guard/tail) are rendered by
-swviz but NOT by the C++ `grid_from_csv` (which lays out data ports only), a known
-structural difference — so they're out of scope here and their DataPort-guard/tail
-counterparts stay covered by test_visualizer_placement's golden.
+swviz but NOT by the C++ `grid_from_csv` (which lays out data ports only), so they are
+out of scope here; their DataPort-guard/tail counterparts are covered by
+test_visualizer_placement's golden.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_grid_cross_engine.py
 """
@@ -84,8 +82,8 @@ def _all_example_csvs():
 
 def test_cross_engine_all_configs_data_placement():
     """Every example config, every flow mode: the C++ core and swviz place the same
-    DATA + TX_PRESENT cells for each solo data port. This is the sweep that catches a
-    placement rule (e.g. {ASW5203} TX_PRESENT) landing in one engine but not the other."""
+    DATA + TX_PRESENT cells for each solo data port, so a placement rule (e.g. {ASW5203}
+    TX_PRESENT) must land in both engines."""
     csvs = _all_example_csvs()
     assert len(csvs) >= 89, f"expected the vendored example corpus, found {len(csvs)}"
     fails = []
@@ -106,9 +104,8 @@ def test_cross_engine_all_configs_data_placement():
 def test_txpresent_present_iff_flow_controlled():
     """{ASW5203}: TX_PRESENT is placed iff the DP is flow-controlled (TX_CONTROLLED,
     RX_CONTROLLED, or ASYNC) and never in NORMAL — asserted for BOTH engines. This is a
-    SPEC-conformance check, not an equivalence one: it catches a bug present identically
-    in both engines (as the RX_CONTROLLED omission originally was), which a cross-engine
-    equivalence test cannot see."""
+    SPEC-conformance check, not an equivalence one, so it catches a defect present
+    identically in both engines."""
     from swi3s_studio.swviz.models.enums import FlowMode
     base = BusConfig.from_csv(
         os.path.join(_EXAMPLES, "directed_tests", "rx_synchronous_flow_control.csv"))
@@ -135,17 +132,13 @@ def test_txpresent_present_iff_flow_controlled():
 def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
     """A cell's `dp` must be the DataPortNumber, identically in both engines.
 
-    The two definitions are indistinguishable across the whole example corpus, because every
-    config there numbers its ports by position. This fixture is the only one that separates
-    them — four peripheral ports each using their own DP0, on devices 0-3 — so it is named
-    explicitly rather than left to the corpus glob.
+    Every config in the example corpus numbers its ports by position, so this fixture — four
+    peripheral ports each using their own DP0, on devices 0-3 — is named explicitly to
+    separate the two. The C++ core reports `dpNumber >= 0 ? dpNumber : index`; swviz must
+    map its slot index the same way.
 
-    The C++ core always reported the logical number (`dpNumber >= 0 ? dpNumber : index`);
-    swviz's slot index reached the grid unmapped, so the same key meant a number from one
-    engine and an index from the other, and device 1's DP0 was labelled "DP5".
-
-    Asserted as an equivalence AND against the CSV's own declaration, so the test still bites
-    if both engines drift the same way — an equivalence check alone cannot see that.
+    Asserted as an equivalence AND against the CSV's own declaration, so the test also fails
+    if both engines drift the same way.
     """
     csv = os.path.join(_HERE, "fixtures", "flow_control_demo.csv")
     assert os.path.isfile(csv), f"missing fixture {csv}"
@@ -166,7 +159,7 @@ def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
             viz = {(c["device"], c["dp"]) for c in viz_engine.render_payload(path, rows)[0]
                    if c["dp"] >= 0 and not c.get("is_cds")}
 
-            # The fix: both engines report the DECLARED DataPortNumber, never the slot index.
+            # Both engines report the DECLARED DataPortNumber, never the slot index.
             for label, seen in (("C++", cpp), ("swviz", viz)):
                 assert {n for _dev, n in seen} == {dp_declared}, (
                     f"slot {i} declares DataPortNumber={dp_declared} but {label} reports "
@@ -174,9 +167,8 @@ def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
 
             # ...and on the device, INCLUDING the manager sentinel. A config encodes the
             # manager as device 0 + ManagerDataport=True because DeviceNumber_REG holds 0..11
-            # and cannot carry -1; both engines must recombine that pair. The C++ core read
-            # only the first half until 3.0.13, so manager ports impersonated device 0 — a
-            # real peripheral address, and this config has a genuine device-0 port too.
+            # and cannot carry -1; both engines must recombine that pair. This config also
+            # has a genuine device-0 peripheral port.
             assert cpp == viz, (
                 f"DP slot {i}: engines disagree on (device, dp): "
                 f"C++-only={sorted(cpp - viz)} swviz-only={sorted(viz - cpp)}")

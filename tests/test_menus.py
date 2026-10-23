@@ -1,10 +1,8 @@
 """The menu bar: Mode first, and each mode shows only what applies to it.
 
-The bar used to hold every menu in every mode (the Analyzer's disabled, some not even
-that: Devices, Bookmarks and Links stayed live in the Visualizer), and File carried all
-three modes' submenus. Now File holds the current mode's items, with ⌘O / ⌘S on its open
-and save; the Analyzer's menus appear only in the Analyzer; and an item that acts on a
-capture waits for one. Everything that re-decodes is under Decode.
+File holds the current mode's items, with ⌘O / ⌘S on its open and save; the Analyzer's
+menus appear only in the Analyzer; and an item that acts on a capture waits for one.
+Everything that re-decodes is under Decode.
 """
 import os
 
@@ -21,7 +19,7 @@ from swi3s_studio.ui.mode_controller import ANALYSIS, TIMING, VISUALIZATION
 _BAR = {
     VISUALIZATION: ["Mode", "File", "View", "Help"],
     TIMING: ["Mode", "File", "View", "Help"],
-    ANALYSIS: ["Mode", "File", "Commands", "Decode", "Devices", "Audio", "Bookmarks",
+    ANALYSIS: ["Mode", "File", "Commands", "Decode", "Devices", "Audio", "Cursors",
                "View", "Help"],
 }
 _FILE = {
@@ -64,8 +62,8 @@ def test_each_mode_shows_only_its_menus_and_file_items(win, mode):
 
 
 def test_switching_modes_keeps_every_file_item(win):
-    """QMenu.clear() deletes what it removes even when another menu owns it: refilling
-    File that way destroyed the previous mode's items on the first switch."""
+    """QMenu.clear() deletes what it removes even when another menu owns it, so File is
+    refilled without it and every mode's items survive repeated switches."""
     for mode in (VISUALIZATION, ANALYSIS, TIMING, VISUALIZATION, ANALYSIS):
         win._mode_mgr.switch_to(mode)
         assert _items(win._file_menu) == _FILE[mode], mode
@@ -104,26 +102,108 @@ def test_the_analyzers_menus_and_keys_are_off_elsewhere(win, mode):
     # Preferences is the waveform colours and weights: the Analyzer's, ⌘, included.
     for act in (win._colors_action, win._prefs_action):
         assert not act.isVisible() and not act.isEnabled()
-    assert not any(a.isVisible() for a in win._view_pane_actions)
+    # Of the View menu's pane items only Maximize Pane stays, in the Timing Calculator, where
+    # it gives the Timing Inequalities the whole page.
+    shown = [a for a in win._view_pane_actions if a.isVisible()]
+    assert shown == ([win._maximize_action] if mode == TIMING else []), [a.text() for a in shown]
 
 
 def test_capture_items_wait_for_a_capture(win):
     assert win._session is None
     assert win._needs_capture and not any(a.isEnabled() for a in win._needs_capture)
+    assert not any(a.isEnabled() for m in win._capture_menus for a in m.actions()
+                   if not a.isSeparator())
     win.load_demo()
     assert all(a.isEnabled() for a in win._needs_capture)
+
+
+def _usable(win):
+    """Every item a user can reach and pick in the bar, as (menu, ..., item) paths: the item
+    and each submenu on the way to it enabled (Audio's per-stream submenus are filled as
+    they open, so their entries are not walked)."""
+    from PySide6.QtWidgets import QMenu
+    out = set()
+    # Submenus by their item: QAction.menu() hands back a dead wrapper on PySide 6.11.
+    menus = {m.menuAction(): m for m in win.findChildren(QMenu)}
+
+    def walk(menu, path):
+        if menu is win._play_rate_menu or menu is win._process_menu:
+            return
+        menu.aboutToShow.emit()
+        for act in menu.actions():
+            if act.isSeparator() or not act.isVisible() or not act.isEnabled():
+                continue
+            here = path + (_text(act),)
+            if act in menus:
+                out.add(here + ("▸",))
+                walk(menus[act], here)
+            else:
+                out.add(here)
+    for act in win.menuBar().actions():
+        if act.isVisible() and act.isEnabled() and act in menus:
+            walk(menus[act], (_text(act),))
+    return out
+
+
+# With no capture open, these are what the Analyzer's menus offer: what opens a file, sets a
+# preference or arranges the window. Everything else acts on a capture and is greyed, the
+# playback device and bit depth included: they are for playing one.
+_WITHOUT_A_CAPTURE = {"Open Capture…", "Open Demo Capture", "Open Workspace…", "Quit",
+                      "Appearance", "Help"}
+
+
+@pytest.mark.parametrize("via", ["start", "a mode switch"])
+def test_with_no_capture_only_what_needs_none_is_offered(win, via):
+    """Entering the Analyzer enables its menus, and Qt passes that down to every submenu,
+    so the Commands Filter and Manual SSP Move submenus (and their items and keys) must
+    stay off without a capture."""
+    if via == "a mode switch":
+        win._mode_mgr.switch_to(VISUALIZATION)
+    win._mode_mgr.switch_to(ANALYSIS)
+    usable = _usable(win)
+    for path in usable:
+        menu, top = path[0], path[1]
+        assert menu in ("Mode", "View", "Help") or top in _WITHOUT_A_CAPTURE, path
+    assert not any(p[0] in ("Commands", "Decode", "Devices", "Cursors") for p in usable)
+    assert not win._play_rate_menu.menuAction().isEnabled()
+    assert not win._process_menu.menuAction().isEnabled()
+    assert not win._play_device_menu.menuAction().isEnabled()
+    assert not win._play_depth_menu.menuAction().isEnabled()
+    assert not win._align_links_action.isEnabled()
+
+
+def test_with_a_capture_every_capture_item_is_offered(win):
+    win._mode_mgr.switch_to(ANALYSIS)
+    win.load_demo()
+    win._mode_mgr.switch_to(VISUALIZATION)
+    win._mode_mgr.switch_to(ANALYSIS)
+    usable = _usable(win)
+    for act in win._needs_capture:
+        assert act.isEnabled(), _text(act)
+    # Two wait on more than a capture: Align on two Links, Remove … from This Region on a
+    # CSV imported into the region under the playhead.
+    own_rule = {win._align_links_action, win._remove_region_csv_action}
+    for menu in win._capture_menus:
+        off = [_text(a) for a in menu.actions()
+               if not a.isSeparator() and a not in own_rule and not a.isEnabled()]
+        assert not off, off
+    assert ("Commands", "Filter", "▸") in usable and ("Decode", "Manual SSP Move", "▸") in usable
+    assert win._play_rate_menu.menuAction().isEnabled()
+    assert win._process_menu.menuAction().isEnabled()
+    assert win._play_device_menu.menuAction().isEnabled()
+    assert win._play_depth_menu.menuAction().isEnabled()
+    assert not win._align_links_action.isEnabled(), "one Link: nothing to align"
 
 
 def test_decode_holds_what_re_decodes_and_audio_is_playback(win):
     win._mode_mgr.switch_to(ANALYSIS)
     assert _items(win._decode_menu) == ["Import Visualizer CSV…",
                                         "Remove Region's Visualizer CSV", "Force Column Count…",
-                                        "Hub Depths…", "Per-Dataport Scrambler…",
-                                        "Manual SSP Move"]
+                                        "Dataport Scramblers…", "Manual SSP Move"]
     assert _items(win._audio_menu) == ["Playback Output Device", "Playback Bit Depth",
                                        "Playback Decimation", "Filter & Gain",
-                                       "Export Audio as WAV…"]
-    assert _items(win._devices_menu) == ["Device Names…", "Peripheral Register Maps…"]
+                                       "Export…"]
+    assert _items(win._devices_menu) == ["Device Names…", "Register Maps…", "Hub Depths…"]
     assert "Signal Panes: All Links" in _items(win._links_menu)
 
 
@@ -143,7 +223,7 @@ def test_help_has_the_guide_and_about(win, monkeypatch):
     win._guide.close()
 
 
-# ---- the Links menu's items, where they went -------------------------------------------
+# ---- where the Links items live ---------------------------------------------------------
 
 def _all_menu_texts(win):
     out = []
@@ -192,7 +272,7 @@ def test_align_is_a_bookmarks_item_for_two_links():
     assert win._align_links_action.isEnabled()
 
 
-@pytest.mark.parametrize("item", ["Rename Link…", "Set Offset…", "Remove Link…",
+@pytest.mark.parametrize("item", ["Rename Link…", "Set Time Offset…", "Remove Link…",
                                   "Show This Link Everywhere"])
 def test_a_links_label_menu_acts_on_that_link(monkeypatch, item):
     from PySide6.QtWidgets import QMenu
@@ -208,7 +288,7 @@ def test_a_links_label_menu_acts_on_that_link(monkeypatch, item):
     monkeypatch.setattr(QMenu, "exec", lambda m, *_a: next(
         a for a in m.actions() if _text(a) == item))
     win._link_label_menu(win._ribbons[0], None)          # right-click Link 1's label
-    want = {"Rename Link…": ("rename", 0), "Set Offset…": ("offset", 0),
+    want = {"Rename Link…": ("rename", 0), "Set Time Offset…": ("offset", 0),
             "Remove Link…": ("remove", 0), "Show This Link Everywhere": ("show", 0)}[item]
     assert ran == [want]
 
@@ -371,20 +451,20 @@ def test_the_shortcuts_help_lists_the_analyzers_keys_only_in_the_analyzer(win, m
     win._mode_mgr.switch_to(VISUALIZATION)
     win.show_keyboard_shortcuts()
     elsewhere = shown[-1]
-    assert "Modes" in elsewhere and "Cursor navigation" not in elsewhere
+    assert "Modes" in elsewhere and "Playhead navigation" not in elsewhere
     assert "listed in the Bus Analyzer" in elsewhere
     assert "Preferences" not in elsewhere                 # ⌘, is the Analyzer's (it is off here)
     win._mode_mgr.switch_to(ANALYSIS)
     win.show_keyboard_shortcuts()
     here = shown[-1]
-    for title in ("Links", "Command filter", "Cursor navigation", "Waveform panes",
+    for title in ("Links", "Command filter", "Playhead navigation", "Waveform panes",
                   "Manual Stream Sync Point", "Waveform settings"):
         assert f"<b>{title}" in here, title               # every Analyzer group, by name
     assert "listed in the Bus Analyzer" not in here
 
 
 def test_the_status_bar_shows_what_the_window_just_did(win):
-    # Every self._status.setText(...) used to go to a hidden label.
+    # self._status must be the status bar's visible label.
     win.load_demo()
     win.show()
     win._kind_menu._fill([("Ping", "Ping")])              # a capture with no commit
@@ -394,3 +474,22 @@ def test_the_status_bar_shows_what_the_window_just_did(win):
     bar = win.statusBar()
     assert bar.isVisible() and win._status.isVisible() and bar.isAncestorOf(win._status)
     assert win._status.text() == "No commit in this capture"
+
+
+def test_no_item_writes_its_shortcut_into_its_text(win):
+    """A key belongs in setShortcut, which Qt draws in the platform's own notation. Written
+    into the text ("Next Cursor\\tCtrl+]") it is drawn as written. Each item listed here
+    has its key."""
+    from PySide6.QtWidgets import QMenu
+    win._mode_mgr.switch_to(ANALYSIS)
+    win.load_demo()
+    seen = {}
+    for menu in win.findChildren(QMenu):
+        for act in menu.actions():
+            assert "\t" not in act.text(), act.text()
+            seen[_text(act)] = act
+    for item, key in (("Next SSCR/DSCR Commit", "Ctrl+>"), ("Previous SSCR/DSCR Commit", "Ctrl+<"),
+                      ("Move SSP −1 Row", "Ctrl+K"), ("Move SSP +1 Row", "Ctrl+L"),
+                      ("Toggle Cursor at Playhead", "Ctrl+B"), ("Next Cursor", "Ctrl+]"),
+                      ("Previous Cursor", "Ctrl+[")):
+        assert seen[item].shortcut().toString() == key, item

@@ -31,11 +31,32 @@ def test_a_tone_peaks_at_its_frequency_and_level(hz, amp):
 
 
 def test_a_tone_between_bins_reads_within_the_windows_scalloping():
-    """Off a bin centre a Hann window loses up to 1.42 dB, which is the price of its low
-    leakage; 1 kHz sits a third of a bin off."""
+    """Off a bin centre the Blackman-Harris window loses up to 0.83 dB; 1 kHz sits a third
+    of a bin off."""
     s = spectrogram(_tone(1000.0, 1.0), 0, _RATE * 2, 50, 32768)
     assert np.all(np.abs(s.db.argmax(axis=1) * _BIN - 1000.0) <= _BIN)
-    assert np.all((s.db.max(axis=1) > -1.42) & (s.db.max(axis=1) <= 0.0))
+    assert np.all((s.db.max(axis=1) > -0.83) & (s.db.max(axis=1) <= 0.0))
+
+
+def test_an_off_bin_tone_leaks_neither_across_the_spectrum_nor_into_dc():
+    """A full-scale tone between bins stays under -90 dB beyond 5 bins and -100 dB beyond 10,
+    and the bottom bins carry no DC term, in every column alike."""
+    s = spectrogram(_tone(1000.0, 1.0), 0, _RATE * 2, 40, 32768)
+    k = int(s.db[0].argmax())
+    away = np.abs(np.arange(s.db.shape[1]) - k)
+    assert s.db[:, (away > 5) & (np.arange(s.db.shape[1]) >= 5)].max() < -90
+    assert s.db[:, away > 10].max() < -100
+    assert s.db[:, :5].max() < -110
+
+
+def test_a_full_scale_tones_skirt_reaches_the_colour_floor_about_70_bins_away():
+    """The 4-term window's leakage from an unquantised full-scale tone stays above the Audio
+    pane's -120 dB colour floor out to about 70 bins, and is below it beyond 80."""
+    x = 32768 * np.sin(2 * np.pi * 1000.0 * np.arange(_RATE * 2) / _RATE)
+    s = spectrogram(x, 0, _RATE * 2, 40, 32768)
+    away = np.abs(np.arange(s.db.shape[1]) - int(s.db[0].argmax()))
+    assert s.db[:, (away > 50) & (away <= 60)].max() > -120
+    assert s.db[:, away > 80].max() < -120
 
 
 def test_one_column_per_frame_centred_in_the_stretch_asked_for():
@@ -63,8 +84,7 @@ def test_short_and_empty_streams():
 def test_a_glitch_shows_from_half_a_frame_before_it_and_no_earlier(nfft):
     """The frames are centred on their columns, so a click shows in every column whose
     frame holds it: from nfft/2 samples before the click to nfft/2 after, and nowhere
-    else. That is why a click appears before it happens, and why the frame size is the
-    user's choice."""
+    else, so a click appears before it happens."""
     x = np.zeros(48_000, dtype=np.int64)
     x[24_000] = 30_000                                      # one sample, in silence
     s = spectrogram(x, 0, x.size, x.size, 32768, nfft=nfft)  # a column per sample
@@ -186,7 +206,7 @@ def test_vertical_zoom_leaves_a_spectrogram_alone(win):
 
 def test_each_bin_is_drawn_centred_on_its_frequency(monkeypatch):
     """Bin k of an n-point frame is k * rate / n; the image is placed so its pixel row is
-    centred there, not spread evenly from 0 to Nyquist (which put 3000 Hz at ~3017 Hz)."""
+    centred there, not spread evenly from 0 to Nyquist."""
     from PySide6.QtWidgets import QApplication
     monkeypatch.setenv("SWI3S_DEMO_SAMPLES", "3000")
     QApplication.instance() or QApplication([])

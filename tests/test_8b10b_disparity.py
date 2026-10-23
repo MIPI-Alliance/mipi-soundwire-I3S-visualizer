@@ -1,15 +1,9 @@
 """8b/10b decoder running-disparity coverage.
 
-Regression guard for the intermittent Write-CRC bug: the decoder must accept BOTH
-running-disparity (RD-/RD+) forms of every 256 data bytes. The original table
-builder only synthesised the complement (RD+) form for *unbalanced* sub-blocks,
-so the two *balanced* exceptions -- 5b/6b D.07 and 3b/4b D.x.3 -- were missing
-their RD+ codewords (000111 and 0011). The transmitter emits whichever form
-balances the running disparity, so a byte like 0xE7 decoded fine most of the time
-and failed only when the RD+ form happened to be on the wire -- surfacing as
-intermittent CRC errors on register Write packets while Pings (robust tokens)
-were unaffected. EncodeByte only ever emits the RD- form, so round-trip tests
-never caught it; this test builds both forms from the standard tables directly.
+The decoder accepts BOTH running-disparity (RD-/RD+) forms of every one of the 256
+data bytes, including the two *balanced* exceptions, 5b/6b D.07 and 3b/4b D.x.3,
+whose RD+ codewords are 000111 and 0011. EncodeByte emits only the RD- form, so this
+test builds both forms from the standard tables directly.
 
 Run: python3 -m pytest tests/test_8b10b_disparity.py
 """
@@ -74,7 +68,7 @@ def test_both_disparity_forms_decode():
 
 
 def test_balanced_exceptions_specifically():
-    """The two balanced RD+ codewords that were the actual bug decode correctly."""
+    """The two balanced RD+ codewords (D.07 000111, D.x.3 0011) decode correctly."""
     # 5b/6b D.07 RD+ = 000111 (0x07); pair with a known-good fghj to make 0xE7.
     d = swi3score.decode_codeword((0x07 << 4) | 0x01)   # x=7, y=7 -> 0xE7
     assert d["valid"] and d["value"] == 0xE7, d

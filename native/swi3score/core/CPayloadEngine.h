@@ -40,8 +40,7 @@ struct AudioSample
     // For RX_CONTROLLED/ASYNC, the capture sample where the DRQ that requested
     // this data was observed on the bus (0 = none / not a DRQ-gated sample).
     // Populated when the FCP is re-driven during decode; lets the UI/tests tie a
-    // transported sample back to its handshake. Reserved-but-populated so the
-    // audio return shape is final for the whole flow-control feature.
+    // transported sample back to its handshake.
     U64 drqSample = 0;
 };
 
@@ -155,7 +154,6 @@ private:
         int dpIndex = 0;
         int deviceNum = -1;
         bool scramblerEn = false;
-        int  sampleSize = 0;
         SwI3sDpConfig cfg;               // the config this runtime was built from (so a
                                          // mid-stream reconfigure can tell if it changed)
         bool hasFcp = false;             // DRQ active (RxControlled / Async)
@@ -168,18 +166,17 @@ private:
         ChannelRuntime channels[16];
         // DIAGNOSTIC (SWI3S_SRC_SHIFT): delay the level<->bit association for a
         // source port by N UIs, to probe peripheral clock-to-data round-trip skew.
-        struct PendingBit { bool has = false; int channel = 0; int bitInChannel = 0; bool isData = false; };
+        struct PendingBit { bool has = false; int channel = 0; int bitInChannel = 0;
+                            int sampleSize = 0; bool isData = false; };
         std::deque<PendingBit> pending;
-        // Flow control (RxControlled / Async): the DRQ bit read at each FCP sample
-        // point, oldest..newest, one per non-skipped interval. The handshake pipeline
-        // looks back d = FlowControlDelay+1 intervals for Earlier_FCP_DRQ (SWI3S
         // Flow control (RxControlled / Async): DRQ bits read at the FCP sample point,
         // indexed by NON-SKIPPED interval number so the handshake lookback is robust
         // to whether the DRQ column falls before or after the data window within an
         // interval. `drqHistory[i - drqBase]` is interval i's DRQ; the window is bounded
         // (only the last d+2 intervals are ever read). `txpInterval` counts validated
-        // TxPresent intervals so Earlier_FCP_DRQ = interval (txpInterval - d). Startup
-        // assumes DRQ=1 for the first d intervals (SWI3S §14.2.2 Table 156).
+        // TxPresent intervals so Earlier_FCP_DRQ = interval (txpInterval - d), with
+        // d = FlowControlDelay+1. Startup assumes DRQ=1 for the first d intervals
+        // (SWI3S §14.2.2, the "Selection of FCP_DRQ Bit in Source DP" table).
         std::deque<char> drqHistory;
         U64 drqBase = 0;               // interval index of drqHistory.front()
         U64 drqCount = 0;              // total DRQ intervals seen (next interval index)

@@ -4,9 +4,8 @@ Renders from the AudioStore render pyramid via `envelope()` on every view-range
 change, so pan/zoom cost is O(visible pixels), not O(samples).
 
 Layout: a draggable QSplitter with, on the left, per-stream show/hide checkboxes
-and, on the right, a vertical stack of independent PlotWidgets in a scroll area
-(one PlotWidget per track scrolls reliably; a nested GraphicsLayoutWidget does
-not). X axes are linked across tracks; Y is fit to the data explicitly.
+and, on the right, a vertical stack of independent PlotWidgets in a scroll area,
+one per track. X axes are linked across tracks; Y is fit to the data explicitly.
 """
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..dsp.spectrogram import FRAME_SIZES, NFFT, spectrogram
+from ..dsp.spectrogram import FRAME_SIZES, NFFT, held_spectrogram, spectrogram
 from . import line_style
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
@@ -50,6 +49,11 @@ _MAX_POINTS = 2000
 # real dropout (orders of magnitude wider) is unambiguous; the margin only has to
 # clear the rounding of a bin boundary and the ragged last bin.
 _GAP_BIN_TOLERANCE = 4.0
+# Zoomed in until each sample has this many pixels of the track's width, a waveform is
+# drawn as its samples: a stem from zero to each value, with a dot on it. Closer than
+# this the dots merge, and the line through the samples (or their min/max) reads better.
+_STEM_MIN_PX = 6.0
+_STEM_DOT_PX = 5
 
 # Waveform colours share the bus grid's stable per-(device,dp) hues, so a stream is the
 # same colour in both views, as the theme's LINE variant (readable on the plot in light
@@ -59,6 +63,10 @@ from swi3s_studio.ui.grid_view import dp_line_color as _dp_color  # noqa: E402
 
 _FADE_MS = 50.0             # playback de-click ramp (fade-in / fade-out)
 _TRACK_H = 120              # min pixels per stacked track so waveforms aren't squashed
+# The channel list is as wide as its longest entry (checkbox and text) plus its margins, its
+# scroll bar and this much room, and never narrower than _CHANNEL_LIST_MIN.
+_CHANNEL_LIST_ROOM = 8
+_CHANNEL_LIST_MIN = 80
 # A spectrogram lane's colour scale, dB re full scale: the floor is what a quiet 16-bit
 # stream's noise sits at, so silence reads dark and the noise floor is still visible.
 _SPECTRO_DB = (-120.0, 0.0)
@@ -67,9 +75,7 @@ _SPECTRO_COLUMNS = 1400     # frames per redraw: about one per pixel of a wide p
 
 def _amp_ticks(ymin: float, ymax: float) -> list:
     """Y ticks for a track: at full scale -1, 0 and +1; zoomed to the data, only its two
-    extremes and 0 (when 0 is in range), as plain values. pyqtgraph's own ticks on a
-    zoomed track were five or more, in an SI-scaled unit ("Amplitude (x0.001)", 200,
-    -200, -400) that a reader had to convert back."""
+    extremes and 0 (when 0 is in range), as plain values."""
     if ymin <= -1.0 and ymax >= 1.0:
         return [[(-1.0, "-1"), (0.0, "0"), (1.0, "+1")]]
 
@@ -83,11 +89,9 @@ def _amp_ticks(ymin: float, ymax: float) -> list:
 
 
 def _transport_icon(kind: str, color: str = "#ffffff", px: int = 13) -> QIcon:
-    """Paint a play / pause / stop glyph as a solid-colour QIcon. The buttons use the
-    accent recipe (white text), but Windows renders the ◼/▶ font glyphs as *coloured*
-    emoji regardless of a U+FE0E text-presentation selector — the Stop square came out
-    dark. Painting the shape ourselves in the button's text colour guarantees it stays
-    monochrome and matches the label in both light and dark themes."""
+    """Paint a play / pause / stop glyph as a solid-colour QIcon in the button's text
+    colour, so it stays monochrome in both themes. Font glyphs are not used: Windows
+    renders ◼/▶ as coloured emoji even with a U+FE0E text-presentation selector."""
     pm = QPixmap(px, px)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -108,7 +112,7 @@ def _transport_icon(kind: str, color: str = "#ffffff", px: int = 13) -> QIcon:
 
 
 class _PcmSource(QIODevice):
-    """Pull-mode audio source for QAudioSink (replaces feeding it a QBuffer).
+    """Pull-mode audio source for QAudioSink.
 
     It serves the decoded PCM and then *silence forever*, so it never returns a
     short read. Two consequences make playback clean:
@@ -201,9 +205,9 @@ class _TimeAxis(pg.AxisItem):
         self._rate = float(rate_hz or 0.0)
 
     def tickValues(self, minVal, maxVal, size):
-        """Ticks at round values of the LABELLED time (see set_time_offset): in All Links
-        each lane is offset, and ticks chosen in its own time did not line up with
-        another lane's. The axis is in samples, so the offset is too."""
+        """Ticks at round values of the LABELLED time (see set_time_offset), so the
+        offset lanes of All Links tick at the same instants. The axis is in samples, so
+        the offset is too."""
         off = self._offset * self._rate
         if not off:
             return super().tickValues(minVal, maxVal, size)
@@ -245,14 +249,39 @@ class _AmpAxis(pg.AxisItem):
     """The amplitude axis. Its labels sit at the very ends of the range (-1 / +1 at full
     scale, the data's extremes when zoomed), so half of each overflows the axis. pyqtgraph
     keeps a label that overflows by up to 15 px, but only while the axis has no grid: with
-    one, boundingRect() is exactly the plot and an end label is culled, which left only
-    "0" on every track. Restore that margin with the grid on."""
+    one, boundingRect() is exactly the plot and an end label is culled. This restores
+    that margin with the grid on."""
 
     _OVERFLOW = 10
 
     def boundingRect(self):
         m = self._OVERFLOW
         return super().boundingRect().adjusted(0, -m, 0, m)
+
+
+def _let_title_shrink(plot) -> None:
+    """Keep a track's title from setting its width: pyqtgraph gives a title a minimum width
+    of its text, which in a narrow pane widens the track past its widget (and tracks are
+    X-linked by pixel). The minimum is released each time pyqtgraph sets it, and a title
+    that does not fit starts at the left edge, so the stream's name is what shows."""
+    label = plot.titleLabel
+    update = label.updateMin
+
+    def update_min():
+        update()
+        label.setMinimumWidth(0)
+        hint = label._sizeHint[Qt.SizeHint.MinimumSize]
+        label._sizeHint[Qt.SizeHint.MinimumSize] = (0, hint[1])
+        label.updateGeometry()
+    label.updateMin = update_min
+    update_min()
+    resize = label.resizeEvent
+
+    def resized(ev):
+        resize(ev)
+        if label.item.boundingRect().width() > label.width():
+            label.item.setPos(0, label.item.pos().y())
+    label.resizeEvent = resized
 
 
 class AudioView(QWidget):
@@ -277,6 +306,8 @@ class AudioView(QWidget):
     # Right-click a channel ▸ Rename…: (dev, dp). The window asks for the name, since the
     # names are the Link's (Session.dp_names), and hands them back via set_stream_names.
     streamRenameRequested = Signal(int, int)
+    # Right-click a channel ▸ Evenly Spaced / As Transported: (device, dp, evenly spaced).
+    streamTimingRequested = Signal(int, int, bool)
     #: the visible X range changed: (start, end) in seconds of this capture (LinkLanes)
     viewRangeChanged = Signal(float, float)
     #: playback started (one output device: the window stops any other lane)
@@ -316,6 +347,7 @@ class AudioView(QWidget):
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setSizes([180, 900])
+        self._fit_width = -1        # the width _fit_channel_list last gave the list
 
         all_btn = QPushButton("All")
         all_btn.clicked.connect(lambda: self._set_all_channels(True))
@@ -354,7 +386,7 @@ class AudioView(QWidget):
                 b.setEnabled(False)
                 b.setToolTip("Audio playback unavailable (QtMultimedia not present)")
         if _HAVE_AUDIO:
-            self._play_btn.setToolTip("Play the selected data port(s) from the cursor (multiple are mixed to mono)")
+            self._play_btn.setToolTip("Play the selected data port(s) from the playhead (multiple are mixed to mono)")
         self._vzoom_btn = QPushButton("Vertical Zoom In")
         self._vzoom_btn.setCheckable(True)
         self._vzoom_btn.setToolTip("Scale each waveform's amplitude to fill the track "
@@ -543,15 +575,14 @@ class AudioView(QWidget):
             item = self._chan_box.takeAt(0)
             w = item.widget()
             if w is not None:
-                # Off screen now: deleteLater runs on a later pass of the event loop, and
-                # until then the old Link's checkboxes drew under the new ones.
+                # Detach now: deleteLater runs on a later pass of the event loop, and
+                # until then the old Link's checkboxes would draw under the new ones.
                 w.setParent(None)
                 w.deleteLater()
         self._checks = {}
         # Stable per-(dev,dp,ch) colour, assigned in stream order — used for BOTH the
         # waveform pen and the channel checkbox text, so a track is identified by
-        # colour, not just its DP name (and the colour doesn't shuffle as channels are
-        # toggled, unlike a per-selection index).
+        # colour, not just its DP name, and keeps it as channels are toggled.
         self._lane_colors = {}
         for dev, dp in store.streams():
             for ch in store.channels(dev, dp):
@@ -568,7 +599,30 @@ class AudioView(QWidget):
                 self._chan_box.addWidget(cb)
                 self._checks[(dev, dp, ch)] = cb
         self._chan_box.addStretch(1)
+        self._fit_channel_list(force=True)
         self._rebuild_plots(preserve_zoom=False)
+
+    def channel_list_fit_width(self) -> int:
+        """The width the channel list takes to show its longest entry: the widest checkbox
+        (indicator and text) plus the list's margins, its scroll bar, its frame and
+        _CHANNEL_LIST_ROOM, at least _CHANNEL_LIST_MIN."""
+        widest = max((cb.sizeHint().width() for cb in self._checks.values()), default=0)
+        m = self._chan_box.contentsMargins()
+        bar = self._chan_scroll.verticalScrollBar().sizeHint().width()
+        frame = 2 * self._chan_scroll.frameWidth()
+        return max(_CHANNEL_LIST_MIN,
+                   widest + m.left() + m.right() + bar + frame + _CHANNEL_LIST_ROOM)
+
+    def _fit_channel_list(self, force: bool = False) -> None:
+        """Size the channel list to its entries (channel_list_fit_width). Without `force`
+        only while the list is at the width this last gave it, so a width dragged on the
+        splitter or restored from a workspace stays."""
+        if not force and self._splitter.sizes()[0] != self._fit_width:
+            return
+        width = self.channel_list_fit_width()
+        total = sum(self._splitter.sizes())
+        self._splitter.setSizes([width, max(1, total - width)])
+        self._fit_width = int(self._splitter.sizes()[0])
 
     def _label_check(self, cb, dev: int, dp: int, ch: int) -> None:
         """The channel's checkbox: an asterisk when the stream has a high-pass or gain (what
@@ -587,6 +641,7 @@ class AudioView(QWidget):
         """The store's processing changed: relabel the channels and redraw the tracks."""
         for (dev, dp, ch), cb in self._checks.items():
             self._label_check(cb, dev, dp, ch)
+        self._fit_channel_list()
         self._rebuild_plots()
 
     def streams(self):
@@ -611,8 +666,7 @@ class AudioView(QWidget):
     def set_stream_colors(self, overrides: line_style.Overrides, redraw: bool = True) -> None:
         """The shown Link's per-stream colour overrides (see line_style). Afterwards it
         recolours the tracks in place; a bind, which sets them just before set_store draws
-        the new Link, passes `redraw=False` (redrawing the OLD Link's tracks in the new
-        Link's colours was a fifth of a Link switch)."""
+        the new Link, passes `redraw=False`."""
         self._stream_overrides = dict(overrides or {})
         if redraw and self._checks:
             self._recolor_streams()
@@ -624,6 +678,7 @@ class AudioView(QWidget):
         if redraw and self._checks:
             for (dev, dp, ch), cb in self._checks.items():
                 self._label_check(cb, dev, dp, ch)
+            self._fit_channel_list()
             self._rebuild_plots()
 
     def _stream_menu(self, widget, pos, dev: int, dp: int, ch: int = 0) -> None:
@@ -648,6 +703,20 @@ class AudioView(QWidget):
             act.setCheckable(True)
             act.setChecked(key in self._spectro and self.spectrogram_frame(key) == n)
             frames[act] = n
+        # Timing: where each sample is drawn. Offered for a stream transported unevenly (a
+        # Payload Interval Skipping pattern); see AudioStore.set_evenly_spaced.
+        store = self._store
+        even_now = bool(store is not None and store.evenly_spaced(dev, dp))
+        offer = bool(store is not None and (even_now or store.timing_is_irregular(dev, dp)))
+        menu.addSeparator()
+        as_sent = menu.addAction("As Transported")
+        evenly = menu.addAction("Evenly Spaced")
+        for act, on in ((as_sent, not even_now), (evenly, even_now)):
+            act.setCheckable(True)
+            act.setChecked(on)
+            act.setEnabled(offer)
+        if not offer:
+            evenly.setToolTip("This stream's samples already arrive evenly spaced")
         menu.addSeparator()
         rename = menu.addAction("Rename…")
         pick = menu.addAction("Color…")
@@ -660,6 +729,9 @@ class AudioView(QWidget):
             self.set_spectrogram(key, chosen is spec)
         elif chosen in frames:
             self.set_spectrogram_frame(key, frames[chosen])
+        elif chosen in (as_sent, evenly):
+            if (chosen is evenly) != even_now:
+                self.streamTimingRequested.emit(dev, dp, chosen is evenly)
         elif chosen is rename:
             self.streamRenameRequested.emit(dev, dp)
         elif chosen is process:
@@ -783,7 +855,7 @@ class AudioView(QWidget):
         self._clear_tracks()
         x_lo, x_hi = self._x_extent()
         for dev, dp, ch in self._selected():
-            rate = self._store.rate(dev, dp)             # stored/render rate (unused for x now)
+            rate = self._store.rate(dev, dp)             # stored/render rate (not used for x)
             native = self._store.native_rate(dev, dp)    # on-bus rate (label)
             bits = self._store.sample_bits(dev, dp, ch)
             proc = self._store.processing(dev, dp)
@@ -806,6 +878,7 @@ class AudioView(QWidget):
                                               orientation="left")})
             pw.setMinimumHeight(_TRACK_H)
             plot = pw.getPlotItem()
+            _let_title_shrink(plot)
             plot.hideButtons()                    # drop the corner auto-range "A" button
             plot.getViewBox().setDefaultPadding(0.0)   # waveform starts flush at t=0
             plot.showGrid(x=True, y=True, alpha=VizTheme.PLOT_GRID_ALPHA)
@@ -819,10 +892,19 @@ class AudioView(QWidget):
                 plot.getAxis("left").setTicks(_amp_ticks(-1.0, 1.0))
                 color = self._lane_colors.get((dev, dp, ch)) or _dp_color(dev, dp)
                 curve = plot.plot(pen=pg.mkPen(color, width=line_style.weight("audio")))
+                # The samples' dots, drawn only when zoomed in to them (_render_stems).
+                curve.sample_dots = pg.ScatterPlotItem(
+                    size=_STEM_DOT_PX, symbol="s", pen=None, brush=pg.mkBrush(color))
+                plot.addItem(curve.sample_dots)
             n = self._store.samples(dev, dp, ch).size
             plot.sigXRangeChanged.connect(
                 lambda _vb, rng, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
                     self._render(p, c, a, d, k, rng, b))
+            # A wider or narrower track gives each sample more or fewer pixels: whether it
+            # is drawn as stems can change with no change of range.
+            plot.getViewBox().sigResized.connect(
+                lambda vb, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
+                    self._render(p, c, a, d, k, vb.viewRange()[0], b))
             self._render(plot, curve, dev, dp, ch, (x_lo, x_hi), bits)
             plot.setXRange(x_lo, x_hi, padding=0)
             if self._link is not None:
@@ -853,7 +935,7 @@ class AudioView(QWidget):
             self._link.setXRange(prev_range[0], prev_range[1], padding=0)
         # Make the host tall enough that the scroll area actually scrolls.
         self._tracks_host.setMinimumHeight(_TRACK_H * max(1, len(self._plots)) + 8)
-        self._apply_cursor()                  # position the cursor lines
+        self._place_cursor_lines()            # the cursor did not move: no follow
         self._apply_bookmark_lines()          # (re)draw bookmark lines on the fresh plots
 
     def set_bookmarks(self, marks) -> None:
@@ -931,6 +1013,13 @@ class AudioView(QWidget):
         # back to capture samples so the curve sits at its true capture-time offset.
         cs0, cs1 = int(rng[0]), int(rng[1])
         i0, i1 = self._store.index_range_for_samples(dev, dp, ch, cs0, cs1)
+        dots = getattr(curve, "sample_dots", None)
+        width = float(plot.getViewBox().width())
+        if dots is not None and 0 < i1 - i0 and (i1 - i0) * _STEM_MIN_PX <= width:
+            self._render_stems(plot, curve, dots, dev, dp, ch, i0, i1, bits)
+            return
+        if dots is not None:
+            dots.setData([], [])
         x_idx, lo, hi = self._store.envelope(dev, dp, ch, i0, i1, max_points=_MAX_POINTS)
         if x_idx.size == 0:
             curve.setData([], [])
@@ -956,10 +1045,39 @@ class AudioView(QWidget):
         curve.setData(xs, ys, connect=self._connect_mask(dev, dp, ch, xi if
                                                          (sat is not None and sat.size) else None,
                                                          x))
+        self._fit_y(plot, lo, hi)
+
+    def _render_stems(self, plot, curve, dots, dev, dp, ch, i0, i1, bits) -> None:
+        """Draw samples [i0, i1) of a channel as themselves: a stem from zero to each value
+        and a dot on it, at its capture position. One sample beyond each end of the view is
+        drawn too, so a stem does not pop in only once its centre is inside. A transport gap
+        needs no break: no stem joins one sample to the next."""
+        store: Any = self._store
+        n = int(store.samples(dev, dp, ch).size)
+        i0, i1 = max(0, i0 - 1), min(n, i1 + 1)
+        scale = float(1 << (bits - 1)) if bits and bits > 1 else 1.0
+        v = np.asarray(store.samples(dev, dp, ch)[i0:i1], dtype=np.float64) / scale
+        sat = store.sample_positions(dev, dp, ch)
+        if sat is not None and sat.size:
+            x = np.asarray(sat[i0:i1], dtype=np.float64)
+        else:
+            x = np.arange(i0, i1, dtype=np.float64)
+        xs = np.repeat(x, 2)
+        ys = np.zeros(xs.size, dtype=np.float64)
+        ys[1::2] = v
+        # Each stem is its own two vertices: connect zero -> value, never value -> the next
+        # stem's zero. An array rather than "pairs", which a clip to the view can misalign.
+        conn = np.zeros(xs.size, dtype=np.uint8)
+        conn[0::2] = 1
+        curve.setData(xs, ys, connect=conn)
+        dots.setData(x, v)
+        self._fit_y(plot, v, v)
+
+    def _fit_y(self, plot, lo, hi) -> None:
+        """The track's Y range: full scale, or fitted to the drawn values (Vertical Zoom)."""
         if self._vzoom and lo.size:
             # Vertical Zoom: fit Y to the visible data so a low-amplitude signal fills
-            # the track. Let pyqtgraph auto-tick the zoomed range (the fixed ±1/±0.5
-            # ticks would fall outside it).
+            # the track, ticked at the data's extremes and 0 (_amp_ticks).
             ymin = float(min(lo.min(), hi.min()))
             ymax = float(max(lo.max(), hi.max()))
             if ymax - ymin < 1e-9:            # flat/silent channel — avoid a zero span
@@ -976,21 +1094,31 @@ class AudioView(QWidget):
         view (dsp/spectrogram.py), placed in capture samples by the frames' centres. The
         image is stretched evenly between the first and last centre, so a transport gap
         inside the view is drawn as continuous rather than as a hole (the waveform breaks
-        its line there)."""
+        its line there). A stream on an uneven schedule drawn As Transported is analysed
+        as transported: each sample held until the next, read at the stream's average step
+        (held_spectrogram)."""
         store: Any = self._store
         if store is None:
             return
         cs0, cs1 = int(rng[0]), int(rng[1])
-        i0, i1 = store.index_range_for_samples(dev, dp, ch, cs0, cs1)
         x = store.samples(dev, dp, ch)
         full = float(1 << (bits - 1)) if bits and bits > 1 else 1.0
-        spec = spectrogram(x, i0, i1, _SPECTRO_COLUMNS, full,
-                           nfft=self.spectrogram_frame((dev, dp, ch)))
+        nfft = self.spectrogram_frame((dev, dp, ch))
+        sat = store.sample_positions(dev, dp, ch)
+        held = bool(sat is not None and sat.size and not store.evenly_spaced(dev, dp)
+                    and store.timing_is_irregular(dev, dp))
+        if held:
+            spec = held_spectrogram(x, sat, cs0, cs1, store.transport_step(dev, dp, ch),
+                                    _SPECTRO_COLUMNS, full, nfft=nfft)
+        else:
+            i0, i1 = store.index_range_for_samples(dev, dp, ch, cs0, cs1)
+            spec = spectrogram(x, i0, i1, _SPECTRO_COLUMNS, full, nfft=nfft)
         if spec.db.size == 0:
             img.clear()
             return
-        sat = store.sample_positions(dev, dp, ch)
-        if sat is not None and sat.size:
+        if held:
+            xs = spec.centres.astype(np.float64)
+        elif sat is not None and sat.size:
             xs = np.asarray(sat[np.clip(spec.centres, 0, sat.size - 1)], dtype=np.float64)
         else:
             xs = spec.centres.astype(np.float64)
@@ -1011,8 +1139,8 @@ class AudioView(QWidget):
 
         The waveform is one polyline, so without this a port that stops transporting
         and resumes later is joined by a straight segment implying audio values that
-        were never on the bus (reported at ~103-133 s on a real capture). pyqtgraph's
-        `connect` array is per-VERTEX: entry i is 1 to draw i->i+1. Each envelope bin
+        were never on the bus. pyqtgraph's `connect` array is per-VERTEX: entry i is 1
+        to draw i->i+1. Each envelope bin
         contributes two vertices (lo, hi), and the lo->hi pair must stay joined (it is
         the bin's extent bar), so only the hi->next-lo link — the odd entries — is
         cleared at a gap.
@@ -1027,12 +1155,8 @@ class AudioView(QWidget):
 
         Returns the string ``'all'`` when the trace is continuous, so the common
         case keeps pyqtgraph's default fast path and allocates nothing. It must be
-        ``'all'`` and NOT ``None``: pyqtgraph validates this argument and raises
-        ``ValueError: connect argument must be "all", "pairs", "finite", or array``
-        on None. Because _render runs from sigXRangeChanged, such a raise happens
-        inside the zoom handler — the axes repaint but the curve never updates, so
-        the waveform silently vanishes on zoom (and on a gap-free capture, where the
-        mask is always the continuous case, it never draws at all)."""
+        ``'all'`` and NOT ``None``: pyqtgraph raises ``ValueError`` on None, and since
+        _render runs from sigXRangeChanged the curve would then not update on zoom."""
         n = int(x.size)
         if n < 2:
             return 'all'
@@ -1137,21 +1261,32 @@ class AudioView(QWidget):
         self._apply_cursor()
 
     def _apply_cursor(self) -> None:
+        """The cursor moved: draw it there, and bring it into view."""
+        self._place_cursor_lines()
+        self._follow_cursor()
+
+    def _place_cursor_lines(self) -> None:
         if self._store is None:
             return
-        s = self._cursor_sample
         # X is capture-sample space, shared by every track, so the cursor line is at the
         # capture sample directly on all of them (no per-channel index mapping).
         for line in self._cursor_lines:
-            line.setPos(s)
-        # Follow the shared cursor: if it falls outside the current zoom window, pan
-        # (keeping the span — zoom is never changed) so it stays visible. The tracks
-        # are X-linked, so panning the link moves them all. Skipped while hidden so a
-        # stale/zero view range can't perturb the zoom. Also skipped *while playing*:
-        # each pan re-renders every track's envelope (sigXRangeChanged -> _render), and
-        # that main-thread burst starves the (Python) pull-source readData on the audio
-        # thread -> stutter. During playback the cursor line still moves; the view just
-        # doesn't auto-scroll (the user can scroll, or it re-follows once stopped).
+            line.setPos(self._cursor_sample)
+
+    def _follow_cursor(self) -> None:
+        """If the cursor falls outside the current zoom window, pan (keeping the span — zoom
+        is never changed) so it stays visible. Only for a cursor that MOVED: a rebuild of the
+        tracks leaves the window where the user put it, cursor in view or not.
+
+        The tracks are X-linked, so panning the link moves them all. Skipped while hidden so
+        a stale/zero view range can't perturb the zoom. Also skipped *while playing*: each
+        pan re-renders every track's envelope (sigXRangeChanged -> _render), and that
+        main-thread burst starves the (Python) pull-source readData on the audio thread ->
+        stutter. During playback the cursor line still moves; the view just doesn't
+        auto-scroll (the user can scroll, or it re-follows once stopped)."""
+        if self._store is None:
+            return
+        s = self._cursor_sample
         if self._link is not None and self.isVisible() and not self.is_playing:
             x0, x1 = self._link.getViewBox().viewRange()[0]
             span = x1 - x0
@@ -1163,10 +1298,30 @@ class AudioView(QWidget):
             return
         if not plot.sceneBoundingRect().contains(ev.scenePos()):
             return
-        # X is the capture sample under the pointer — seek there directly.
+        # X is the capture sample under the pointer; zoomed in to the samples, the
+        # playhead snaps to the nearest one.
         x = plot.vb.mapSceneToView(ev.scenePos()).x()
         ev.accept()
-        self.seeked.emit(int(round(x)))
+        self.seeked.emit(self._snap_to_sample(plot, dev, dp, ch, x))
+
+    def _snap_to_sample(self, plot, dev, dp, ch, x: float) -> int:
+        """`x` as a capture sample; on a waveform lane drawn as individual samples (its
+        sample dots shown: _STEM_MIN_PX or more per sample), the capture position of the
+        sample nearest `x`."""
+        store = self._store
+        lane = next((c for p, c, d, q, k, _n in self._plots if p is plot), None)
+        if store is None or lane is None or isinstance(lane, pg.ImageItem):
+            return int(round(x))
+        x0, x1 = plot.getViewBox().viewRange()[0]
+        i0, i1 = store.index_range_for_samples(dev, dp, ch, int(x0), int(x1))
+        if not (0 < i1 - i0 and (i1 - i0) * _STEM_MIN_PX <= float(plot.getViewBox().width())):
+            return int(round(x))
+        pos = store.sample_positions(dev, dp, ch)
+        if pos is None or not len(pos):
+            return int(round(x))
+        j = int(np.searchsorted(pos, x))
+        near = [k for k in (j - 1, j) if 0 <= k < len(pos)]
+        return int(min((int(pos[k]) for k in near), key=lambda p: abs(p - x)))
 
     def _on_plot_hover(self, scene_pos, plot) -> None:
         """Show the bus row under the pointer as a tooltip (X is capture-sample space)."""
@@ -1239,8 +1394,7 @@ class AudioView(QWidget):
         """Pick the selected (dev, dp) whose stream reaches FURTHEST from the cursor,
         returning (dev, dp, chan0, start_idx, native_rate) for the play-head sweep — or
         None if nothing is playable. The mono mix plays to the LONGEST selected stream,
-        so the cursor must sweep against that stream; using the arbitrary first DP would
-        stall the head at a shorter DP's end while the longer ones are still sounding."""
+        so the cursor sweeps against that stream."""
         best = -1.0
         ref = None
         for (d, p) in dps:
@@ -1310,10 +1464,7 @@ class AudioView(QWidget):
         # native audio-sample index by native_rate/play_rate.
         #
         # Cursor sweep reference: the selected data port whose stream extends FURTHEST
-        # from the cursor. The mix plays to the LONGEST stream, so anchoring the sweep
-        # on the arbitrary first DP would freeze the play head at that DP's last sample
-        # while the longer DPs are still sounding (the head "sticks" mid-capture and
-        # replaying just re-snaps to it).
+        # from the cursor, since the mix plays to the LONGEST stream (_sweep_reference).
         ref = self._sweep_reference(dps, sel, int(rate)) or (dev, dp, chans[0], i0,
                                                              int(round(self._store.rate(dev, dp))) or int(rate))
         ref_dev, ref_dp, ref_ch, ref_i0, ref_native = ref
@@ -1386,8 +1537,7 @@ class AudioView(QWidget):
             return                                            # freeze the cursor while fading
         if out_frames >= self._play_nframes:                  # clip end (incl. baked fade)
             # Land the cursor exactly on the final sample: the last sweep tick can be up
-            # to one timer interval short of the end, so without this the play head visibly
-            # stops early (e.g. ~90% through) even though the whole clip has played.
+            # to one timer interval short of the end.
             end_idx = self._play_start_idx + int(max(0, self._play_nframes - 1) * self._play_idx_per_frame)
             end_samp = self._store.sample_at_index(self._play_dev, self._play_dp,
                                                     self._play_chan0, end_idx)
@@ -1479,10 +1629,22 @@ class AudioView(QWidget):
     def plot_count(self) -> int:
         return len(self._plots)
 
+    def visible_sample_range(self):
+        """The visible window as a capture-sample span (s0, s1), the X range every
+        track shares, or None with no tracks. Each stream maps it to its own sample
+        indices (AudioStore.stream_index_range), since streams differ in rate and
+        start position."""
+        if not self._plots or self._store is None:
+            return None
+        x0, x1 = self._plots[0][0].viewRange()[0]
+        return int(max(0, x0)), int(max(0, x1))
+
     def visible_index_range(self):
         """The visible window as the first plot channel's [i0, i1) audio-sample-index
-        slice (the export dialog windows playback by index). The plot X is capture
-        samples, so map it back through the channel's sample positions."""
+        slice, the form set_visible_index_range restores. The plot X is capture
+        samples, so map it back through the channel's sample positions. The indices
+        belong to that one channel: another stream's slice of the same window comes
+        from visible_sample_range."""
         if not self._plots or self._store is None:
             return None
         plot, _c, dev, dp, ch, _n = self._plots[0]

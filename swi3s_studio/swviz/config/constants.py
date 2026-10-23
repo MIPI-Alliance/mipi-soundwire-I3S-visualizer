@@ -74,8 +74,8 @@ class SpecialDevices:
     """Special device numbers for JSON export and clash detection"""
     MANAGER = -1      # S0, S1, their handovers, manager data ports
     UNIVERSAL = -2    # CDS bit + CDS turnaround handover (any device may drive it)
-    VISUALIZER = -3   # deprecated: legacy handover sentinel; handovers now carry their
-                      # real device (Manager -1 or peripheral 0-11) + the HANDOVER slot
+    VISUALIZER = -3   # deprecated; handovers carry their real device
+                      # (Manager -1 or peripheral 0-11) + the HANDOVER slot
     MIN_REGULAR = 0   # Regular device numbers: 0-11
     MAX_REGULAR = 11
 
@@ -112,7 +112,6 @@ class CanvasColors:
 class Colors:
     """Color palette for data ports and UI elements"""
     # Data port colors (12 colors for 12 data ports)
-    # Thanks to Eddie for the colours
     DP_COLORS: Tuple[str, ...] = (
         '#FF80BF',  # DP0 - Pink
         '#FFA080',  # DP1 - Coral

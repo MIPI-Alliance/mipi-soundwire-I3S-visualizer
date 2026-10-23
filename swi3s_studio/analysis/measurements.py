@@ -4,10 +4,9 @@ bandwidth) for the Statistics panel.
 Output is grouped into ordered, collapsible sections — each led by a
 ``(title, "", "header")`` row that MeasurementsView renders as a fold header:
 
-    Link Control  →  Regions  →  Commands  →  Data Ports
+    Link Control  →  Regions  →  Commands  →  Peripheral Reports  →  Data Ports
 
-(Link Control first because it's the bring-up context; then the bus geometry, then
-what ran on it, then the audio streams.) Rows within a section are ``(label, value)``
+Rows within a section are ``(label, value)``
 or ``(label, value, kind)`` where kind is 'pass'/'fail' (green/red value) or None.
 """
 from __future__ import annotations
@@ -69,11 +68,7 @@ def _region_rows(session) -> List[Row]:
     """The Regions section body: the bus-config summary, then one block per bus-config
     geometry (a 'region' is a span of constant column count; >1 means the bus
     reconfigured mid-capture, e.g. cold-start 2col → 8col). Lists each region's measured
-    clock/UI/row rate; with a single geometry, the headline rates once.
-
-    Bus configs comes FIRST because it says how many regions there are and what
-    geometries they use — the frame a reader needs before the per-region rates mean
-    anything. Behind the rates it read as a footnote to them."""
+    clock/UI/row rate; with a single geometry, the headline rates once."""
     rows: List[Row] = []
     segs = getattr(session, "segments", []) or []
     if segs:
@@ -126,10 +121,10 @@ _PING_STATES = ("PING_ATTACHED", "PING_ATTACHED_BUSY", "PING_ALERT",
 def _ping_detail_rows(pings: List[dict]) -> List[Row]:
     """Per-peripheral Ping response breakdown.
 
-    Each Ping carries 12 PingInfo tokens, one per peripheral (Table 67). A token < 0
-    means the device never drove the field (the undriven all-ones symbol) = NO_RESPONSE.
-    Only devices that ever responded get a row — listing all 12 for a two-device bus
-    would bury the signal."""
+    Each Ping carries 12 PingInfo tokens, one per peripheral (the "Assignment of Robust
+    Token Numbers (Peripheral)" table). A token < 0 means the device never drove the field
+    (the undriven all-ones symbol) = NO_RESPONSE. A device that only ever read NO_RESPONSE
+    gets a single row."""
     from .responses import peripheral_response_name
 
     per_dev: dict = {}                     # device -> Counter of state names
@@ -146,7 +141,7 @@ def _ping_detail_rows(pings: List[dict]) -> List[Row]:
     rows: List[Row] = []
     for dev in sorted(per_dev):
         counts = per_dev[dev]
-        # A device that ONLY ever read NO_RESPONSE isn't on the bus; don't give it 5 rows.
+        # A device that ONLY ever read NO_RESPONSE is not on the bus: one row, no breakdown.
         if set(counts) == {"NO_RESPONSE"}:
             rows.append((f"    Device {dev}", f"{counts['NO_RESPONSE']:,} NO_RESPONSE",
                          "detail"))
@@ -155,8 +150,8 @@ def _ping_detail_rows(pings: List[dict]) -> List[Row]:
         for name in _PING_STATES:
             if counts.get(name):
                 rows.append((f"      {name}", f"{counts[name]:,}", "detail"))
-        # Anything outside the five expected GetStatus states (a protocol/command error
-        # token in the PingInfo field) is worth surfacing rather than silently dropping.
+        # Tokens outside the five expected GetStatus states (a protocol/command error
+        # token in the PingInfo field) are listed too.
         for name in sorted(set(counts) - set(_PING_STATES)):
             rows.append((f"      {name}", f"{counts[name]:,}", "detail", ))
     return rows
@@ -199,17 +194,13 @@ def _fold_deferred_reads(cmds: List[dict]) -> List[dict]:
 
     A DEFERRED read is two command records: the ReadSetup answered REMOTE_READ_DEFERRED
     carrying no data, then a later ReadData carrying the payload and inheriting the setup's
-    address and byte count. Grouped by the raw wire name, that showed as a permanent
-    "ReadA32 / 0 bytes read" group next to a separate "ReadData" group holding the real
-    bytes — two rows a reader has no way to connect, for one read they asked for. An
-    IMMEDIATE read is a single record and is untouched here.
+    address and byte count. An IMMEDIATE read is a single record and is untouched here.
 
     The delivery is folded back into its setup, contributing its payload so the byte totals
     land on the read that requested them. Input dicts are never mutated.
 
     An ORPHAN delivery — a capture that starts after the setup, so nothing to fold into —
-    stays a record of its own rather than being dropped. Losing it would under-report a read
-    that genuinely happened, which is worse than showing it unpaired.
+    stays a record of its own.
     """
     out: List[dict] = []
     awaiting: dict = {}                     # device tuple -> index in `out` of its setup
@@ -256,10 +247,8 @@ def _command_rows(session) -> List[Row]:
     rows.append(("Errors", str(count_errors(session.commands))))
 
     by_kind: dict = {}
-    # Grouped on LOGICAL command identity, so a deferred read is one entry rather than a
-    # "ReadA32 / 0 bytes" row beside an unconnected "ReadData" row. Count/Errors above stay
-    # on the raw wire records — they describe what was decoded, not how it is grouped (and
-    # the two already differed, since records with no command name are skipped below).
+    # Grouped on LOGICAL command identity, so a deferred read is one entry
+    # (_fold_deferred_reads). Count/Errors above count the raw wire records.
     for c in _fold_deferred_reads(session.commands):
         k = c.get("command", "")
         if k:
@@ -267,8 +256,7 @@ def _command_rows(session) -> List[Row]:
     for kind in sorted(by_kind):
         cmds = by_kind[kind]
         detail = _command_detail_rows(kind, cmds)
-        # Only make it a fold when there is something behind it; otherwise a plain row
-        # (an arrow that expands to nothing is worse than no arrow).
+        # Only make it a fold when there is something behind it; otherwise a plain row.
         rows.append((f"  {kind}", str(len(cmds)), "group" if detail else None))
         rows.extend(detail)
 
@@ -319,9 +307,8 @@ def _peripheral_report_rows(session) -> List[Row]:
 
     Every ``IntStat_*`` / ``DevStat_*`` bit and ``EC_*`` counter the Manager read back,
     decoded from the replies (see :mod:`.port_status`). Faults and ImpDef/SDCA
-    interrupts each get a top-level, always-visible row — the point is that a raised bit
-    prompts investigation without anyone expanding anything — and the live state folds
-    away per port."""
+    interrupts each get a top-level, always-visible row; the live state folds away per
+    port."""
     from .port_status import summarize
 
     s = summarize(session.commands)
@@ -334,15 +321,12 @@ def _peripheral_report_rows(session) -> List[Row]:
         detail = f"{value}" if name.startswith(("EC_", "COUNT_")) else f"{count}×"
         rows.append((f"  {port} {name}", f"{detail}, from row {first_row:,}", "fail"))
     if s.vendor:
-        # ImpDef is the spec's term (SDCA fields land in the same bucket — class-defined
-        # rather than implementation-defined), so name whichever actually fired instead of
-        # "vendor", which is not a term the specification uses.
+        # Name whichever of ImpDef / SDCA (the spec's terms) actually fired; SDCA fields
+        # share the vendor bucket.
         kinds = sorted({("SDCA" if "SDCA" in name else "ImpDef") for _p, name in s.vendor})
         rows.append((f"{' / '.join(kinds)} interrupts", str(len(s.vendor))))
         for (port, name), (count, first_row, _v) in sorted(s.vendor.items()):
-            # The spec assigns no meaning, so report it rather than colouring it as a fault
-            # we cannot diagnose. Nothing is appended to say so: the FIELD NAME already
-            # carries ImpDef/SDCA, and repeating it after the name adds no information.
+            # Uncoloured: the spec assigns these fields no meaning.
             rows.append((f"  {port} {name}", f"{count}× at row {first_row:,}"))
     for port in sorted(s.state):
         live = s.state[port]
@@ -363,8 +347,7 @@ def capture_measurements(session, store=None) -> List[Row]:
     """The full Statistics table: five ordered, collapsible sections (Link Control,
     Regions, Commands, Peripheral Reports, Data Ports), each led by a
     ``(title, "", "header")`` row. Pass the already-built AudioStore as `store` to avoid
-    rebuilding it here — rebuilding a multi-million-sample store on the GUI thread froze
-    the UI at load."""
+    rebuilding it here, on the GUI thread."""
     rows: List[Row] = []
 
     def section(title: str, body: List[Row]) -> None:

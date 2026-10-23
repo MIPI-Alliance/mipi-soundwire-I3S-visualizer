@@ -1,11 +1,9 @@
-"""The Bus Grid is a pane group of its own.
+"""The Bus Grid is a pane group of its own, with its own picker and Link.
 
-It used to be in the bottom group with Capture, CDS, Audio, Samples and Timing, which can
-come to show every Link at once; the grid cannot (two grids do not fit across), so it got a
-group, a picker and a Link of its own. The grid's code reads the ACTIVE Link's session and
-cursor, so every way in to it (a cursor move, a bind, its own toolbar, the dock being raised,
-its menu actions, a theme switch) has to run on the grid's Link. These pin each, by recording
-which Session is in force when the grid renders.
+The grid's code reads the ACTIVE Link's session and cursor, so every way in to it (a cursor
+move, a bind, its own toolbar, the dock being raised, its menu actions, a theme switch) has
+to run on the grid's Link. These pin each, by recording which Session is in force when the
+grid renders.
 """
 import os
 
@@ -114,8 +112,7 @@ def test_a_layout_saved_before_the_split_puts_the_grid_on_the_bottom_s_link(two)
 
 def test_renaming_a_port_redraws_the_grid_s_link_not_the_active_one(two, monkeypatch):
     """Rename… in the Audio pane acts on the bottom group's Link (here Link 2), but the grid
-    shows Link 1 and must be redrawn as Link 1, with Link 1's names. It used to call the
-    grid's render directly, as the active Link, and drew Link 2's names on Link 1's grid."""
+    shows Link 1 and must be redrawn as Link 1, with Link 1's names."""
     from PySide6.QtWidgets import QInputDialog
     win, first, second = two
     first.set_dp_name(0, 0, "First's port")

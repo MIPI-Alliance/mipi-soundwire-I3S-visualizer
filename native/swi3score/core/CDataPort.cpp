@@ -34,6 +34,7 @@ void CDataPort::initializeTransport()
     mChannelIndex = 0;
     mChannelsInGroupRemaining = mEffChannelGrouping - 1;
     mBitInChannel = mCfg.SampleSize;
+    mSampleSizeLoaded = mCfg.SampleSize;
     mWideBitRemaining = mCfg.BitWidth;
     mTxpPending = mCfg.txpEnabled();
 }
@@ -59,11 +60,8 @@ void CDataPort::SyncToSSP()
     // The SSP defines row_in_interval == 0 and clears accumulated skipping
     // (Section 9.1.6.2.1). The interval that BEGINS at the SSP is then started like
     // any other: it spends the accumulator's first step (A += Numerator) and takes
-    // its own skip decision, exactly as Initialize() does. Clearing the accumulator
-    // WITHOUT starting the interval left that step unspent, so every later decision
-    // landed one interval late -- the decode read the interval the device had
-    // skipped (idle bus, sample of 0) and skipped the next one, dropping the sample
-    // that was really transported there.
+    // its own skip decision, exactly as Initialize() does; otherwise that step stays
+    // unspent and every later skip decision lands one interval late.
     mRowInInterval = 0;
     mSkippingAccumulator = 0;
     mGuardPending = false;
@@ -78,7 +76,7 @@ CDataPort::State CDataPort::SaveState() const
              mGuardPending, mTailRemaining, static_cast<int>(mPhase),
              mSpacingSlotsRemaining, mSampleInGroup, mSamplesInGroupRemaining,
              mChannelGroupBaseChannel, mChannelIndex, mChannelsInGroupRemaining,
-             mBitInChannel, mWideBitRemaining, mTxpPending };
+             mBitInChannel, mWideBitRemaining, mTxpPending, mSampleSizeLoaded };
 }
 
 void CDataPort::RestoreState(const State& s)
@@ -100,6 +98,7 @@ void CDataPort::RestoreState(const State& s)
     mBitInChannel = s.bitInChannel;
     mWideBitRemaining = s.wideBitRemaining;
     mTxpPending = s.txpPending;
+    mSampleSizeLoaded = s.sampleSizeLoaded;
 }
 
 bool CDataPort::advanceSkippingAccumulator()
@@ -130,7 +129,7 @@ bool CDataPort::computeFresh() const
     return mChannelGroupBaseChannel == 0
         && mChannelIndex == 0
         && mSampleInGroup == 0
-        && mBitInChannel == mCfg.SampleSize
+        && mBitInChannel == mSampleSizeLoaded
         && mSamplesInGroupRemaining == mCfg.SampleGrouping
         && mWideBitRemaining == 0
         && mTxpPending == mCfg.txpEnabled();
@@ -163,10 +162,8 @@ DpEmit CDataPort::clock_tick()
             // the LAST UI (the settled value), like a sink, REGARDLESS of
             // PortDirection. (Sampling a source's FIRST UI would read the unsettled
             // leading edge of the wide bit; this is only invisible for BitWidth==0,
-            // where first UI == last UI.) Separately, peripheral-SOURCED data arrives
-            // ~1 UI late (clock-to-data round-trip skew), so it must be sampled one
-            // column later than its register HorizontalStart -- see CPayloadEngine's
-            // source sample-shift.
+            // where first UI == last UI.) Peripheral-SOURCED data's clock-to-data
+            // round-trip skew is handled by CPayloadEngine's source sample-shift.
             bool emitPoint = (mWideBitRemaining == 0);
 
             SwI3sSlot kind = mTxpPending ? SwI3sSlot::TxPresent : SwI3sSlot::Data;
@@ -175,12 +172,11 @@ DpEmit CDataPort::clock_tick()
             // (possibly wide) bit — mChannelIndex/mBitInChannel don't change until the
             // wide bit completes — so both columns of a wide bit carry the same bit and
             // the grid merges the pair *within its row* into `C{ch}B{bit} xN`. This is
-            // independent of where the sample point falls (the last UI), which
-            // previously left a wide sink bit's other column labelled with the
-            // neighbouring bit (and a phantom leading held column).
+            // independent of where the sample point falls (the last UI).
             e.channel = mChannelOfIndex[mChannelIndex];
             e.sampleInGroup = mSampleInGroup;
             e.bitInChannel = (kind == SwI3sSlot::TxPresent) ? 0 : mBitInChannel;
+            e.sampleSize = mSampleSizeLoaded;
             if (emitPoint) {
                 e.sampleHere = true;        // the settled sample UI (sniffer marker)
                 e.freshTransport = computeFresh();
@@ -215,13 +211,7 @@ void CDataPort::advanceRow()
     // Channel-group spacing is a WITHIN-row gap and must not survive the row.
     // Spacing only counts down inside the transport window, so a window that
     // closes before the countdown finishes would otherwise carry the remainder
-    // into the next row and eat its first in-window UI — the next row's data then
-    // starts one column late (and alternates, as the error re-accrues). The 1.74
-    // visualizer cleared this explicitly when the column passed
-    // HorizontalStart+HorizontalCount (its `done_with_row` latch, which also set
-    // channel_group_is_spacing = 0); the v2/v3 rewrite folded that latch into the
-    // in-window predicate and dropped the side effect. Verified against 1.74 over
-    // 768 register combinations: without this, 180 of them mis-place data.
+    // into the next row and eat its first in-window UI.
     if (mPhase == kSpacing) {
         mPhase = kActive;
         mSpacingSlotsRemaining = 0;
@@ -256,6 +246,7 @@ void CDataPort::advanceBitInChannel()
     }
     if (mBitInChannel == 0) {
         mBitInChannel = mCfg.SampleSize;
+        mSampleSizeLoaded = mCfg.SampleSize;
         advanceChannel();
     } else {
         --mBitInChannel;
@@ -269,13 +260,8 @@ void CDataPort::advanceChannel()
         mChannelIndex = mChannelGroupBaseChannel;
         // Reset to THIS group's channel count, not the nominal grouping. The trailing
         // group is PARTIAL when the enabled-channel count isn't a multiple of
-        // ChannelGrouping (3 channels in groups of 2 leaves a group of 1). Resetting
-        // to the full mEffChannelGrouping made that last group transport as if it
-        // were full, so the port emitted one extra DATA cell per interval and walked
-        // mChannelIndex past the enabled channels — the interval carried
-        // channels x samples x bits + 1 slots (7 where 3x2x1 = 6). Mirrors the same
-        // clamp in advanceChannelGroup (and in swviz's _advance_channel, which had
-        // it; this is what made the two engines disagree).
+        // ChannelGrouping (3 channels in groups of 2 leaves a group of 1). Mirrors the
+        // same clamp in advanceChannelGroup and in swviz's _advance_channel.
         int groupChannels = mNumChannels - mChannelGroupBaseChannel;
         if (groupChannels > mEffChannelGrouping) groupChannels = mEffChannelGrouping;
         mChannelsInGroupRemaining = (groupChannels > 1) ? groupChannels - 1 : 0;

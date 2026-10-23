@@ -1,29 +1,14 @@
 """Channel-group spacing must not carry across a row boundary.
 
-Reported on spacing_question.csv (v2.1.12, reproduced identically in the v3 C++
-core): with Spacing=2, HorizontalStart=1, HorizontalCount=1, the first data UI of
-row 1 landed in column 2 instead of column 1. The spacing that should have been
-terminated at the end of row 0 was still counting down and consumed row 1's first
-in-window UI; the error then alternates row to row as it re-accrues.
-
 Spacing is an inter-channel-group gap WITHIN a row. It only ticks inside the
 transport window, so if the window closes before the countdown finishes, the
-remainder must be discarded rather than carried forward.
+remainder must be discarded rather than carried forward (CDataPort::advanceRow()).
+A carried countdown consumes the next row's first in-window UI: with Spacing=2,
+HorizontalStart=1, HorizontalCount=1, row 1's first data UI would land in column 2
+instead of column 1, alternating row to row.
 
-The 1.74 visualizer (the original golden bus model) got this right via its
-`done_with_row` latch, which cleared `channel_group_is_spacing` when the column
-passed HorizontalStart+HorizontalCount:
-
-    elif column_number > self.horizontal_start_REG + self.horizontal_count_REG :
-        self.done_with_row = True
-        self.channel_group_is_spacing = 0        # <-- terminates AT the row end
-
-The v2/v3 rewrite folded that latch into the in-transport-window predicate, which
-reproduces the gating but silently dropped this side effect. Fixed in
-CDataPort::advanceRow().
-
-Expected placement is 1.74's, obtained by driving its DataPort class directly with
-the same registers (note 1.74 encodes channels_REG as N-1).
+Expected placement is the 1.74 visualizer's, obtained by driving its DataPort class
+directly with the same registers (note 1.74 encodes channels_REG as N-1).
 """
 import os
 import tempfile
@@ -95,8 +80,7 @@ def _data_cols_swviz(path, rows):
 
     Studio runs two: the C++ decode core (a capture on the wire) and swviz (a config
     CSV in the Visualizer tab). They implement the same §14.2.5 algorithm, so a
-    placement bug must be fixed in BOTH — the first pass at this fix landed only in
-    the C++ core, and the Visualizer tab still mis-placed the reported CSV.
+    placement bug must be fixed in BOTH.
     """
     from swi3s_studio.model import viz_engine
     model = viz_engine.model_json(path, num_rows=rows)
@@ -115,14 +99,9 @@ _ENGINES = [("cpp", _data_cols), ("swviz", _data_cols_swviz)]
 
 @pytest.mark.parametrize("engine,place", _ENGINES)
 def test_spacing_does_not_leak_into_the_next_row(engine, place):
-    """The reported case: every row's first data UI must sit at HorizontalStart.
+    """Every row's first data UI must sit at HorizontalStart.
 
-    Without the fix row 1 starts at column 2 (spacing from row 0 ate column 1) and
-    row 2 swings back to column 1 — the alternating error the user observed.
-    1.74 golden: {0: [1, 2], 1: [1, 2]}.
-
-    Run against BOTH placement engines: the first fix landed only in the C++ core, so
-    this same CSV still rendered wrong in the Visualizer tab (swviz).
+    1.74 golden: {0: [1, 2], 1: [1, 2]}. Run against BOTH placement engines.
     """
     with tempfile.TemporaryDirectory() as td:
         got = place(_csv(td), 4)
@@ -133,15 +112,14 @@ def test_spacing_does_not_leak_into_the_next_row(engine, place):
 @pytest.mark.parametrize("engine,place", _ENGINES)
 @pytest.mark.parametrize("spacing,hcount,expect", [
     # (Spacing, HorizontalCount) -> 1.74's placement, HorizontalStart=1, 2 channels.
-    (2, 1, {0: [1, 2], 1: [1, 2]}),      # the reported config
+    (2, 1, {0: [1, 2], 1: [1, 2]}),      # the base config
     (3, 1, {0: [1, 2], 1: [1, 2]}),      # wider gap, same narrow window
     (2, 0, {0: [1], 1: [1], 2: [1], 3: [1]}),   # single-column window
     (1, 1, {0: [1, 2], 1: [1, 2]}),      # Spacing=1 -> no gap at all
 ])
 def test_spacing_matches_1_74_golden(spacing, hcount, expect, engine, place):
     """Cross-checked against the 1.74 visualizer's DataPort driven with the same
-    registers. These four are a spot-check of a 768-configuration sweep in which
-    the unfixed core mis-placed 180 and the fixed core matched 1.74 exactly."""
+    registers: a four-configuration spot-check."""
     with tempfile.TemporaryDirectory() as td:
         path = _csv(td, Spacing_REG=spacing, HorizontalCount_REG=hcount)
         got = place(path, 4)
@@ -150,7 +128,7 @@ def test_spacing_matches_1_74_golden(spacing, hcount, expect, engine, place):
 
 @pytest.mark.parametrize("engine,place", _ENGINES)
 def test_first_data_ui_is_always_at_horizontal_start(engine, place):
-    """Invariant behind the bug: whatever the spacing, no row may begin its data
+    """Invariant: whatever the spacing, no row may begin its data
     later than HorizontalStart. Any row that does has inherited a stale countdown."""
     for spacing in (0, 1, 2, 3, 4):
         for hstart in (1, 2, 3):

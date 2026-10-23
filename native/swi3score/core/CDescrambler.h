@@ -8,8 +8,8 @@
 //
 // A No-Toggle detector (FSM NT_0..NT_16) forces a bit inversion after 16
 // consecutive unchanged received bits to bound DC content; the descrambler
-// inverts its 17th recovered bit to stay in lockstep. Verified against the
-// spec's Test Cases 1-3 (see test/test_descrambler.cpp).
+// inverts its 17th recovered bit to stay in lockstep. Matches the spec's
+// Test Cases 1-3.
 
 #ifndef SWI3S_CDESCRAMBLER_H
 #define SWI3S_CDESCRAMBLER_H

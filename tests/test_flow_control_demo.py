@@ -1,4 +1,4 @@
-"""Flow-control demo: bit-exact round-trip + the mid-phase SPM framing-lock fix.
+"""Flow-control demo: bit-exact round-trip + the mid-phase SPM framing lock.
 
 The synthetic flow-control demo (swi3score.make_demo_levels_flow_control) carries the
 four data ports a bus sniffer actually sees — one per flow mode, on four devices:
@@ -13,12 +13,11 @@ Audio is sampled UNIFORMLY at 48 kHz; only the TRANSPORT is jittered (determinis
 opportunities, so audio() is the de-jittered 48 ksps stream and round-trips bit-exact
 to the generated sine.
 
-This file also guards the decoder fix that made dev1 decode at all: a K.28.7 SPM
-pattern that appears by chance inside a Write payload/CRC byte must NOT re-frame or
-abandon the in-progress phase (SWI3S v1.1 §7.2.2 {ASW1907}: hold symbol alignment by
-counting bits mod 10 mid-phase; §8.2.1 {ASW2206}: a mid-phase SPM only ARMS header
-detection). Before the fix, dev1's WriteA32(0x2090, 0x60) forged a comma and its whole
-config block was dropped.
+It also pins the mid-phase framing lock: a K.28.7 SPM pattern that appears by chance
+inside a Write payload/CRC byte must NOT re-frame or abandon the in-progress phase
+(SWI3S v1.1 §7.2.2 {ASW1907}: hold symbol alignment by counting bits mod 10 mid-phase;
+§8.2.1 {ASW2206}: a mid-phase SPM only ARMS header detection). dev1's
+WriteA32(0x2090, 0x60) forms such a pattern.
 """
 import math
 import os
@@ -61,10 +60,7 @@ def test_flow_demo_loads_clean_via_session_cold_start():
     """Load the demo the way the APP does — Session.from_demo(cold_start=True) — and
     assert the decode is error-free. A cold-started decoder leaves PHY-select seeded at
     Safe-Lock-2 and GROWS the column count by snooping the commit, so the capture must
-    present the 2->16 ladder. Regression: the demo originally jumped straight to 16
-    columns, so cold_start left the decoder stuck at 2 columns and EVERY command
-    mis-framed (2622 CRC errors) — invisible to the raw-levels/cold_start=False path the
-    other tests use. Runs at a realistic size so the audio phase (where it broke) is
+    present the 2->16 ladder. Runs at a realistic size so the audio phase is
     exercised."""
     from collections import Counter
 
@@ -82,10 +78,9 @@ def test_flow_demo_loads_clean_via_session_cold_start():
 
 
 def test_flow_all_four_devices_present():
-    """All four peripheral devices (one per flow mode) must decode. Regression for the
-    mid-phase-SPM desync that dropped device 1 (TX_CONTROLLED): its config-block write
-    WriteA32(0x2090, 0x60) forms a spurious K.28.7 comma at a sub-symbol offset, which
-    used to re-frame the decoder and wipe the device's registers."""
+    """All four peripheral devices (one per flow mode) must decode, including device 1
+    (TX_CONTROLLED), whose config write WriteA32(0x2090, 0x60) forms a spurious K.28.7
+    comma at a sub-symbol offset."""
     dec = _decode_flow()
     devices = {dp["device_number"] for dp in dec.config_dataports()["dataports"]
                if dp["enabled"] and dp["enable_ch"]}
@@ -102,8 +97,8 @@ def test_flow_modes_decoded_per_device():
 
 def test_flow_audio_bit_exact_all_modes():
     """Every stream — across all four flow modes, jittered transport included — must
-    round-trip BIT-EXACT to the uniformly-sampled 48 kHz sine. This is the headline
-    validation: TX_PRESENT gating de-jitters the transport back to the source stream."""
+    round-trip BIT-EXACT to the uniformly-sampled 48 kHz sine: TX_PRESENT gating
+    de-jitters the transport back to the source stream."""
     dec = _decode_flow(200)
     by = defaultdict(list)
     for a in dec.audio():
@@ -130,9 +125,8 @@ def test_flow_flow_mode_surfaced_on_samples():
 
 def test_flow_all_modes_deliver_full_rate():
     """Every flow mode delivers the full audio rate over the capture — no sustained
-    under-run. Guards the ASYNC model: the source must honor the sink's standing DRQ and
-    deliver every sample (bounded 0/1-interval delay), NOT decline ~half of them (which
-    made dev3 run at ~24 kHz / an octave low). All four devices' single-channel-equivalent
+    under-run. In the ASYNC model the source honors the sink's standing DRQ and delivers
+    every sample (bounded 0/1-interval delay). All four devices' single-channel-equivalent
     counts must be within 15% of the NORMAL reference."""
     from swi3s_studio.session import Session
     s = Session.from_demo(4000, cold_start=True, variant="flow_control")
@@ -170,8 +164,8 @@ def test_flow_display_dejittered_uniform():
 def test_flow_drq_cells_on_bus_grid():
     """The DRQ (flow-control-port) cells must appear on the bus grid. The grid layout
     drives a CFlowControlPort per drq-enabled port in lockstep with the data port and
-    emits DRQ cells; without it the FCP is invisible (the reported bug). Check the
-    analyzer's navigated grid_cells_at path for slot==DRQ in the audio phase."""
+    emits DRQ cells. Checks the analyzer's navigated grid_cells_at path for slot==DRQ in
+    the audio phase."""
     import swi3score
 
     from swi3s_studio.session import Session
@@ -203,7 +197,7 @@ def test_flow_normal_reference_is_ungated():
 
 def test_flow_writes_all_crc_valid():
     """Every config WriteA32 in the flow-control stream decodes CRC-valid — i.e. no
-    frame is corrupted by a spurious in-payload comma (the framing-lock fix keeps the
+    frame is corrupted by a spurious in-payload comma (the framing lock keeps the
     phase aligned through payload+CRC)."""
     dec = _decode_flow(60)
     writes = [c for c in dec.commands() if c["command"] == "WriteA32"]
@@ -238,19 +232,16 @@ def test_flow_delay_decoded_from_registers():
 
 
 def test_flow_control_delay_round_trips_through_registers():
-    """A config CSV's DPn_FlowControlDelay must survive registers_from_csv — it is bit 7
-    of 0x0E, and the register emit used to drop it (forcing 0), which made a config-CSV
-    baseline mismatch a real decode for RX/ASYNC ports. The demo's config leaves it at the
-    reset default (1), so every 0x0E register for a DRQ mode must carry bit 7 set.
+    """A config CSV's DPn_FlowControlDelay (bit 7 of 0x0E) must survive
+    registers_from_csv. The demo's config leaves it at the reset default (1), so every
+    0x0E register for a DRQ mode must carry bit 7 set.
 
-    Resolved from __file__, not the working directory. registers_from_csv returns [] for a
-    path it cannot open rather than raising, so a CWD-relative name failed here as
-    `assert []` — reading like a decode regression instead of a missing file.
+    The fixture path is resolved from __file__: registers_from_csv returns [] for a path it
+    cannot open rather than raising.
 
-    The fixture lives under tests/fixtures/ rather than visualizer_examples/ deliberately:
-    three suites glob that corpus recursively, and this config is the only one whose
-    DataPortNumber differs from its slot index (four peripherals each using their own DP0),
-    which trips a cross-engine divergence recorded in the maintainers' debt register."""
+    The fixture stays under tests/fixtures/, outside the visualizer_examples/ corpus that
+    three suites glob: its DataPortNumber differs from its slot index (four peripherals each
+    using their own DP0)."""
     import swi3score
     csv = os.path.join(_FIXTURES, "flow_control_demo.csv")
     assert os.path.isfile(csv), f"missing fixture {csv}"
@@ -266,7 +257,7 @@ def test_flow_control_delay_round_trips_through_registers():
 
 def test_flow_drq_sample_annotated_on_samples():
     """Each decoded flow-controlled sample carries drq_sample — the capture position of
-    the DRQ that permitted it (ABI 7). Guards against the field being left dead-zero."""
+    the DRQ that permitted it (ABI 7); the field is populated, not left zero."""
     dec = _decode_flow(200)
     drq_ports = [a for a in dec.audio() if a["device"] in (2, 3)]   # RX / ASYNC
     assert drq_ports, "no DRQ-mode samples"
@@ -279,19 +270,15 @@ def test_audio_idle_cds_is_d10_2_not_flat(phy, variant):
     """The CDS idle between keep-alive Pings during the audio phase must be the D10.2
     Protocol-Spacer pattern 0101010101 (SWI3S §8.1.2.9 / §7.1.1.3, {ASW2201}: with no
     Command to send the Manager drives a continuous alternating 0-1 idle stream, one CDS
-    bit per Row), NOT all-ones. Regression: the demo synthesiser filled idle Rows with
-    all-ones, which NRZS-holds the FBCSE bus flat (a dead line, no idle zebra) — invisible
-    to the decode/bit-exact tests because idle bits carry no phase. All four menu demos
+    bit per Row), NOT all-ones, which NRZS-holds the FBCSE bus flat. All four menu demos
     share the fillIdleWithPings chokepoint, so this checks every PHY plus flow control.
     Framed on the audio segment, every full idle symbol must decode to 0x155 (0101010101)
     and none to 0x2AA (the 1010 inverse).
 
-    All-ones (0x3FF) is NOT simply banned any more: since 3.0.11 a Ping's PingInfo field
-    leaves ABSENT peripherals undriven, and an undriven bus IS all ones (it decodes to
-    token -1 = NO_RESPONSE). Those are legitimate and bounded — at most one per
-    peripheral, so at most kMaxPeripherals in a row. A flat-idle regression is the
-    opposite shape: hundreds of consecutive all-ones symbols where the idle stream should
-    be. So the assertion is on the RUN LENGTH, which still bites the original bug."""
+    All-ones (0x3FF) symbols are legitimate where a Ping's PingInfo field leaves ABSENT
+    peripherals undriven (an undriven bus decodes to token -1 = NO_RESPONSE): at most one
+    per peripheral, so at most kMaxPeripherals in a row. The assertion is therefore on the
+    RUN LENGTH of consecutive all-ones symbols."""
     from collections import Counter
 
     from swi3s_studio.session import Session
@@ -318,15 +305,10 @@ def test_manager_dataports_emit_no_peripheral_registers():
     emitted as one.
 
     A config CSV encodes the manager as device 0 + ManagerDataport=True, because
-    DeviceNumber_REG holds 0..11 and cannot carry the -1 sentinel. The C++ CSV reader took
-    only the first half until 3.0.13 and explicitly documented ManagerDataport as ignored, so
-    every manager port impersonated device 0 — which is a REAL peripheral address, and this
-    fixture has a genuine device-0 port as well. The result was 103 register writes addressed
-    to device 0 against 23 for each of its peers, including two conflicting values for the
-    same DP0 FlowMode register.
-
-    The emitter itself was always correct: both loops in registersFromConfig skip
-    deviceNum < 0. Only the sentinel had to survive the parse.
+    DeviceNumber_REG holds 0..11 and cannot carry the -1 sentinel. The CSV reader must decode
+    the pair to the sentinel; both loops in registersFromConfig skip deviceNum < 0. This
+    fixture also has a genuine device-0 peripheral port, so every device must carry the same
+    number of writes and no (device, address) may be written twice.
     """
     import swi3score
     csv = os.path.join(_FIXTURES, "flow_control_demo.csv")

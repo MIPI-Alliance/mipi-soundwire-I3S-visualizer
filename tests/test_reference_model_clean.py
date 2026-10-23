@@ -3,19 +3,8 @@
 `swi3s_studio/swviz/models/dataport.py` and `flow_control_port.py` are the golden
 reference model for the SWI3S transport algorithm and are published in the MIPI
 specification. They therefore carry NO `#` comments: the spec text is the explanation, and
-implementation rationale belongs in docs/ or in the tests, not in the deliverable.
-
-This exists because comments are invisible to every other test in the suite, so nothing
-else can catch the drift — and the drift was real. v2.1.12 shipped exactly one comment in
-each file (`state: ... # created in initialize()`). By 3.0.11 dataport.py had 21 lines
-carrying `#` and flow_control_port.py 4, added across three unrelated commits: a perf
-hoist (43779d7), the spacing row-boundary fix (f680b14), and the partial-channel-group
-fix. Each looked locally reasonable; together they put ~20 lines of implementation
-commentary into a spec artefact. The v2-era comment was dropped too, so the rule is now
-simply "none" — no allowlist, no judgement about which comment is blessed.
-
-Where the removed rationale went: the spacing row-boundary story is the maintainers' spacing row-boundary write-up,
-and the partial-channel-group story is tests/test_transport_slot_budget.py.
+implementation rationale belongs in docs/ or in the tests, not in the deliverable. The rule
+is "none": no allowlist.
 """
 import ast
 import os
@@ -55,9 +44,8 @@ def test_reference_model_carries_no_comments(rel):
 
 @pytest.mark.parametrize("rel", _MODELS)
 def test_reference_model_keeps_its_docstrings(rel):
-    """The counterweight: docstrings are the documentation form these files DO use (v2
-    shipped them), so the no-comment rule must not be satisfied by deleting the module or
-    class docs instead."""
+    """Docstrings are the documentation form these files DO use, so the no-comment rule must
+    not be satisfied by deleting the module or class docs instead."""
     tree = ast.parse(_read(rel))
     assert ast.get_docstring(tree), f"{rel} lost its module docstring"
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
@@ -66,19 +54,7 @@ def test_reference_model_keeps_its_docstrings(rel):
     assert not undocumented, f"{rel}: classes lost their docstrings: {undocumented}"
 
 
-# Docstring CONTENT is deliberately NOT checked here, and the claim that it was has been
-# withdrawn rather than weakened.
-#
-# A guard existed for one cycle that rejected docstrings naming this codebase — test and
-# module paths, a comparison to the C++ core, a method of a module the specification does not
-# publish, "the engine". The rule was right about the artefact and wrong about who writes it.
-# These two files are authored externally and arrive as whole-file drops, so holding the line
-# means either rewriting the author's prose every drop or carrying a divergent copy, and the
-# next drop reverts both. Enforcement was tried first as an exemption list, which is worse
-# than nothing: it reads as coverage while the exemptions are where the real content is.
-#
-# So the rule now lives where it can be acted on — as review comments on the incoming drop.
-# What stays enforced above is what a whole-file drop cannot silently undo and what this repo
-# does own: no `#` comments (upstream ships none, and OUR edits are the ones that added 25),
-# and the module/class docstrings existing at all, so the comment rule is never satisfied by
-# deleting documentation instead of relocating it.
+# Docstring CONTENT is NOT checked here. The two files are authored externally and arrive as
+# whole-file drops; content rules are raised as review comments on the incoming drop. This
+# file enforces what a drop cannot silently undo: no `#` comments, and the module/class
+# docstrings existing at all.

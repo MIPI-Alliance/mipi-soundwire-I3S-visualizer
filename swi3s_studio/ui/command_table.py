@@ -22,10 +22,9 @@ from .theme import VizTheme, analyzer_stylesheet
 _ERROR_BG = QColor(VizTheme.SEM_ERROR_BG)
 
 # Row error shading + the "Errors only" filter both key off analysis.errors'
-# is_error/command_error — that predicate now also covers a decoder-flagged
+# is_error/command_error, one predicate for both. It also covers a decoder-flagged
 # EnableCh_CURR write with Interval != 1 Row (native Decoder::feed / CommandRec::
-# enablechCurrError; see analysis/errors.command_error), so this module no longer
-# keeps its own separate check — one predicate, so the two surfaces can't drift.
+# enablechCurrError; see analysis/errors.command_error).
 _row_is_error = is_error
 _row_error_tooltip = command_error
 
@@ -33,9 +32,30 @@ _row_error_tooltip = command_error
 # Columns follow the on-wire command structure: PhaseID, Device Mask, Packet
 # Length, then the Manager Packet (Opcode, Address, Register, Data, Group Mask),
 # then CRC and the response. Row/Time lead for navigation.
-_COLUMNS = ["Row", "Time (µs)", "PhaseID", "Devices", "Packet Length", "Opcode",
-            "Address", "Register", "Data", "Group Mask", "CRC", "Response"]
+_COLUMNS = ["Row", "ΔRows", "Time (µs)", "ΔTime (µs)", "PhaseID", "Devices", "Packet Length",
+            "Opcode", "Address", "Register", "Data", "Group Mask", "CRC", "Response"]
 _COL = {name: i for i, name in enumerate(_COLUMNS)}
+COLUMN_NAMES = tuple(_COLUMNS)           # a per-Link table's columns, as headers name them
+
+# The two delta columns count from the ROW ABOVE AS THE TABLE SHOWS IT, filtered and sorted,
+# so filtering to SSPA reads SSPA spacing and a filter to one device reads its traffic's
+# gaps. That makes them the proxy's to compute (CommandFilterProxy.data), not the model's: a
+# source row has no "row above" until the filter and sort say which it is. A value counted
+# from the row above as shown is not a sort key, so a click on either header leaves the sort
+# as it was (UNSORTABLE).
+_DELTA = {"ΔRows": "rows", "ΔTime (µs)": "time"}
+UNSORTABLE = frozenset(_DELTA)
+# The columns a workspace that does not record its column list ("columns") has no setting
+# for: they take the table's default.
+UNRECORDED_COLUMNS = frozenset(_DELTA)
+
+# Every capture's table starts with these columns hidden (the header's right-click menu
+# shows them) and these widths, in px, on the columns shown. A hidden column shown from
+# the menu is fitted to its contents.
+DEFAULT_HIDDEN = frozenset({"Row", "ΔRows", "ΔTime (µs)", "Devices", "Packet Length",
+                            "Group Mask", "CRC"})
+DEFAULT_WIDTHS = {"Time (µs)": 100, "PhaseID": 86, "Opcode": 98, "Address": 96,
+                  "Register": 257, "Data": 209, "Response": 313}
 
 # Two-line header labels for columns whose LABEL is wider than their (narrow) data —
 # so the column shrinks to the wider word instead of the full label. The base name is
@@ -220,15 +240,11 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
         labels, response decode, …) of every row on each keystroke.
 
         THE CACHE IS COLD AFTER EVERY MODEL RESET (set_commands / set_peripheral_maps), and
-        the first keystroke after one is what pays to fill it: QSortFilterProxyModel sweeps
-        EVERY source row on the first invalidateFilter, so the whole table is rendered on the
-        GUI thread in one go. Measured before this was factored out of data(): 0.58 s at 10k
-        commands, 2.9 s at 50k, 11.5 s at 200k — with the second keystroke at 0.14 s, because
-        by then the cache is warm. So it was a freeze once per load, not sustained lag.
+        the first keystroke after one fills it: QSortFilterProxyModel sweeps EVERY source row
+        on the first invalidateFilter, so the whole table is rendered on the GUI thread once.
 
-        Built via _display_text rather than self.data(self.index(row, c)) for that reason: the
-        index+role path cost twelve QModelIndex constructions and twelve role dispatches per
-        row on top of the formatting that is actually needed. The filter's own debounce (see
+        Built via _display_text rather than self.data(self.index(row, c)), which avoids a
+        QModelIndex construction and a role dispatch per cell. The filter's own debounce (see
         main_window's expression dialog) keeps the sweep to one per typing pause rather than
         one per character.
         """
@@ -253,6 +269,21 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
 
     def command_at(self, row: int) -> Optional[dict]:
         return self._cmds[row] if 0 <= row < len(self._cmds) else None
+
+    # ---- the delta columns' inputs (computed by CommandFilterProxy) ----
+    @staticmethod
+    def delta_kind(column: int) -> Optional[str]:
+        return _DELTA.get(_COLUMNS[column]) if 0 <= column < len(_COLUMNS) else None
+
+    def delta_value(self, row: int, kind: str) -> float:
+        cmd = self._cmds[row]
+        if kind == "rows":
+            return self._display_row(cmd)
+        return int(cmd.get("start_sample", 0)) / self._rate * 1e6
+
+    @staticmethod
+    def delta_link(row: int) -> int:
+        return 0
 
     @staticmethod
     def _cmd_device(cmd: dict) -> Optional[int]:
@@ -282,7 +313,7 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
         res = self._rmap.resolve(cmd["address"])
         if not res:
             # Not a SWI3S register: try this device's peripheral (vendor) map, then
-            # fall back to the address-region label (Table 163/164).
+            # fall back to the address-region label (`registers.region_name`).
             preg = self._peripheral_reg(cmd, cmd["address"])
             if preg is not None:
                 return preg.name
@@ -342,21 +373,19 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
     def _display_text(self, cmd: dict, name: str):
         """The DisplayRole text for one column of one command.
 
-        ONE DEFINITION, called by data() above and by search_text() below. The free-text
-        filter has to match what the user can SEE, so a second formatter here would be a
-        divergence waiting to happen — a column whose rendering changed would silently stop
-        being searchable the way it looks.
+        ONE DEFINITION, called by data() above and by search_text() below, so the free-text
+        filter matches what the user can SEE.
 
-        TAKES (cmd, name) RATHER THAN A QModelIndex, which is the point: search_text can then
-        build a row's text without constructing twelve QModelIndex objects and re-entering
-        data()'s role dispatch per cell. That was 2.4 M Qt round-trips for one keystroke on a
-        200k-command capture — see search_text for what it cost.
+        TAKES (cmd, name) RATHER THAN A QModelIndex, so search_text can build a row's text
+        without constructing a QModelIndex per cell and re-entering data()'s role dispatch.
         """
         data = _payload(cmd)
         if name == "Row":                                  # SWI3S bus row (0-based, Column-0 index)
             return f"{self._display_row(cmd):,}"
         if name == "Time (µs)":
             return f"{cmd.get('start_sample', 0) / self._rate * 1e6:,.2f}"
+        if name in _DELTA:                                 # the proxy's (see _DELTA)
+            return ""
         if name == "PhaseID":
             return cmd.get("phase", "")
         if name == "Devices":
@@ -398,11 +427,18 @@ class CommandTableView(QTableView):
         enable_copy(self, cells=True)
         self.setAlternatingRowColors(True)
         self.verticalHeader().setVisible(False)      # drop the empty row-index column (Row column carries the bus row)
+        # No sort to start with, and the header says so: the rows are in capture order.
+        # Qt's default indicator (Row ▼) would claim a sort, and code that reads the sort
+        # from the header (scope switches, saved workspaces) would apply it.
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         self.setSortingEnabled(True)                 # click a header to sort
-        # Don't stretch the last column: every column sizes to its content. Response can
-        # be long (a 12-device ping status), so it's sized to its FULL widest text (see
-        # fit_columns) and the table scrolls horizontally (per-pixel) to reveal it — no
-        # width cap, and never elided-with-no-way-to-see-the-rest.
+        # Columns are hidden BY NAME and re-applied whenever the model resets: the All Links
+        # model leads with a Link column, so an index would hide the wrong column after a
+        # scope switch, and a reset re-creates the header's sections.
+        self._hidden_names: set = set(DEFAULT_HIDDEN)
+        # Don't stretch the last column: each keeps its own width (fit_columns), and the
+        # table scrolls horizontally (per-pixel). A Response wider than its column (a
+        # 12-device ping status) is elided, with its full text in the cell's tooltip.
         self.horizontalHeader().setStretchLastSection(False)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.setTextElideMode(Qt.ElideRight)
@@ -414,6 +450,26 @@ class CommandTableView(QTableView):
         hdr.setDefaultAlignment(Qt.AlignCenter)      # centres single- and two-line labels
         hdr.setContextMenuPolicy(Qt.CustomContextMenu)
         hdr.customContextMenuRequested.connect(self._column_menu)
+        hdr.sortIndicatorChanged.connect(self._refuse_unsortable)
+
+    def _refuse_unsortable(self, section: int, _order) -> None:
+        """A header click or sortByColumn on an UNSORTABLE column: the indicator goes back
+        to the sort the proxy holds (CommandFilterProxy.sort ignores those columns), with
+        signals blocked so nothing re-sorts."""
+        model = self.model()
+        if model is None or not 0 <= section < model.columnCount() \
+                or self._column_name(model, section) not in UNSORTABLE:
+            return
+        if isinstance(model, QSortFilterProxyModel):
+            column, order = model.sortColumn(), model.sortOrder()
+        else:
+            column, order = -1, Qt.AscendingOrder
+        hdr = self.horizontalHeader()
+        blocked = hdr.blockSignals(True)
+        try:
+            hdr.setSortIndicator(column, order)
+        finally:
+            hdr.blockSignals(blocked)
 
     def retheme(self) -> None:
         """Re-apply the palette after a theme switch: refresh the error-row
@@ -425,18 +481,21 @@ class CommandTableView(QTableView):
         self.viewport().update()
 
     def fit_columns(self) -> None:
-        """Size every column to its content. Response and Row are then widened toward their
-        widest text (resizeColumnsToContents only samples ~1000 rows, so a long response —
-        or the large bus-row number deep in a big capture — would otherwise be elided) — but
-        only across a BOUNDED head+tail sample, not all rows: scanning every row of a
-        200k-command capture cost ~5.5 s on the GUI thread on every (re-)decode. The Row
-        number is ~monotonic (its max is at the tail), and resizeColumnsToContents already
-        measured the head, so the extremes are covered; a rare very-long Response in the
-        deep middle may clip until scrolled to (acceptable — it's a column width, not data)."""
+        """Size every column to its content, then give the columns DEFAULT_WIDTHS names
+        those widths. A hidden column is fitted too (resizeColumnsToContents passes it
+        over), so it has that width when shown. Row is widened toward its widest text
+        (resizeColumnsToContents only samples ~1000 rows, so the large bus-row number deep
+        in a big capture would otherwise be elided) — but only across a BOUNDED head+tail
+        sample, not all rows, so the cost does not grow with the capture. The Row number is
+        ~monotonic (its max is at the tail), and resizeColumnsToContents already measured
+        the head, so the extremes are covered."""
         self.resizeColumnsToContents()
         model = self.model()
         if model is None:
             return
+        for c in range(model.columnCount()):
+            if self.isColumnHidden(c):
+                self.resizeColumnToContents(c)
         fm = self.fontMetrics()
         n = model.rowCount()
         _SAMPLE = 2000                                     # head + tail rows measured per column
@@ -444,7 +503,8 @@ class CommandTableView(QTableView):
                 else [*range(_SAMPLE), *range(n - _SAMPLE, n)])
 
         def widen_to_true_max(col: int) -> None:
-            widest = self.columnWidth(col)
+            widest = self.columnWidth(col) or max(          # a hidden column reads 0 wide
+                self.sizeHintForColumn(col), self.horizontalHeader().sectionSizeHint(col))
             for r in rows:
                 text = model.data(model.index(r, col), Qt.DisplayRole)
                 if text:
@@ -454,9 +514,51 @@ class CommandTableView(QTableView):
         # By header, not _COL index: the All Links view leads with a Link column.
         headers = [model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
                    for c in range(model.columnCount())]
-        for name in ("Response", "Row"):
-            if name in headers:
-                widen_to_true_max(headers.index(name))
+        if "Row" in headers:
+            widen_to_true_max(headers.index("Row"))
+        for c, name in enumerate(headers):
+            if name in DEFAULT_WIDTHS:
+                self.setColumnWidth(c, DEFAULT_WIDTHS[name])
+
+    def setModel(self, model) -> None:  # noqa: N802 (Qt override)
+        old = self.model()
+        if old is not None:
+            try:
+                old.modelReset.disconnect(self.apply_hidden_names)
+                old.layoutChanged.disconnect(self.apply_hidden_names)
+            except (RuntimeError, TypeError):
+                pass
+        super().setModel(model)
+        if model is not None:
+            model.modelReset.connect(self.apply_hidden_names)
+            model.layoutChanged.connect(self.apply_hidden_names)
+        self.apply_hidden_names()
+
+    @staticmethod
+    def _column_name(model, column: int) -> str:
+        return str(model.headerData(column, Qt.Horizontal, Qt.DisplayRole)).replace("\n", " ")
+
+    def apply_hidden_names(self, *_a) -> None:
+        model = self.model()
+        if model is None:
+            return
+        for c in range(model.columnCount()):
+            hide = self._column_name(model, c) in self._hidden_names
+            was_hidden = self.isColumnHidden(c)
+            self.setColumnHidden(c, hide)
+            if was_hidden and not hide and self.columnWidth(c) <= 0:
+                self.resizeColumnToContents(c)      # shown with no width: fit it
+
+    def hidden_names(self) -> set:
+        return set(self._hidden_names)
+
+    def set_hidden_names(self, names) -> None:
+        self._hidden_names = set(names)
+        self.apply_hidden_names()
+
+    def set_column_shown(self, name: str, on: bool) -> None:
+        (self._hidden_names.discard if on else self._hidden_names.add)(name)
+        self.apply_hidden_names()
 
     def _column_menu(self, pos) -> None:
         if self.model() is None:
@@ -466,12 +568,11 @@ class CommandTableView(QTableView):
         menu.addSeparator()
         hdr = self.horizontalHeader()
         for c in range(self.model().columnCount()):
-            name = self.model().headerData(c, Qt.Horizontal, Qt.DisplayRole)
-            act = menu.addAction(str(name).replace("\n", " "))    # flatten wrapped labels
+            name = self._column_name(self.model(), c)            # wrapped labels flattened
+            act = menu.addAction(name)
             act.setCheckable(True)
             act.setChecked(not self.isColumnHidden(c))
-            # Keep at least one column visible.
-            act.toggled.connect(lambda on, col=c: self.setColumnHidden(col, not on))
+            act.toggled.connect(lambda on, n=name: self.set_column_shown(n, on))
         menu.exec(hdr.mapToGlobal(pos))
 
 
@@ -556,6 +657,39 @@ class CommandFilterProxy(QSortFilterProxyModel):
         if self._text_ast is not None:
             bits.append("expr")
         return bits
+
+    def sort(self, column: int, order=Qt.AscendingOrder) -> None:
+        """Sort by `column`, except an UNSORTABLE one, which leaves the sort unchanged."""
+        src = self.sourceModel()
+        if column >= 0 and hasattr(src, "delta_kind") and src.delta_kind(column) is not None:
+            return
+        super().sort(column, order)
+
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
+        """The delta columns, from the row above as shown; every other cell is the model's.
+        A delta cell's tooltip is the model's for the row when it has one (an error row's
+        reason), else the column's help."""
+        src = self.sourceModel()
+        kind = src.delta_kind(index.column()) if hasattr(src, "delta_kind") else None
+        if kind is None or role not in (Qt.DisplayRole, Qt.ToolTipRole):
+            return super().data(index, role)
+        if role == Qt.ToolTipRole:
+            tip = super().data(index, role)
+            if tip:
+                return tip
+        r = index.row()
+        if r <= 0:
+            return "" if role == Qt.DisplayRole else None
+        if role == Qt.ToolTipRole:
+            return ("Rows since the row above, as the table shows it (filtered and sorted)"
+                    if kind == "rows" else
+                    "µs since the row above, as the table shows it (filtered and sorted)")
+        a = self.mapToSource(self.index(r - 1, 0)).row()
+        b = self.mapToSource(self.index(r, 0)).row()
+        if kind == "rows" and src.delta_link(a) != src.delta_link(b):
+            return ""                       # rows of two Links are not on one count
+        d = src.delta_value(b, kind) - src.delta_value(a, kind)
+        return f"{int(d):,}" if kind == "rows" else f"{d:,.2f}"
 
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
         model = self.sourceModel()
@@ -646,6 +780,18 @@ class AllLinksCommandModel(QAbstractTableModel):
             s = f"{self._names[li].lower()} {self._models[li].search_text(r)}"
             self._search_cache[row] = s
         return s
+
+    def delta_kind(self, column: int) -> Optional[str]:
+        return CommandTableModel.delta_kind(column - 1) if column > 0 else None
+
+    def delta_value(self, row: int, kind: str) -> float:
+        li, r = int(self._link[row]), int(self._row[row])
+        if kind == "rows":
+            return self._models[li].delta_value(r, "rows")
+        return self._global_us(li, self._models[li].command_at(r))   # one shared time
+
+    def delta_link(self, row: int) -> int:
+        return int(self._link[row])
 
     def _global_us(self, li: int, cmd: dict) -> float:
         model = self._models[li]

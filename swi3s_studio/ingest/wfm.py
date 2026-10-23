@@ -1,12 +1,12 @@
 """Reader for a Tektronix ``.wfm`` waveform file (one analog channel per file).
 
-Tek scopes (this project uses an MSO58) export each analog channel as a self-
+Tek scopes (e.g. the MSO5 series) export each analog channel as a self-
 describing binary waveform: a fixed-layout header (endianness + version tag,
 then a "static" description block and a "frame" curve-object block whose *field
 offsets* depend on the file version) followed by the raw sample codes. Voltages
 are ``code * v_scale + v_offset``; the time axis is ``t0 + arange(n) * dt``. Only
 version 3 (the format Tek scopes currently write) is implemented — see
-`_assert_v3` for the guard.
+`read_wfm` for the guard.
 
 Layout reference (little-endian byte offsets, version 3)::
 
@@ -30,9 +30,12 @@ Layout reference (little-endian byte offsets, version 3)::
 from __future__ import annotations
 
 import struct
-from typing import Dict
+import weakref
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+from . import analog
 
 _BOM_LE = 0x0F0F
 _BOM_BE = 0xF0F0
@@ -87,12 +90,52 @@ def _version(data: bytes, endian: str) -> int:
         raise ValueError(f".wfm: unrecognised version tag {tag!r} at offset 0x{_VERSION_OFF:03x}") from exc
 
 
+# Bytes the header fields read_wfm parses span: every one sits below 0x340.
+_HEADER_BYTES = 1024
+
+# Bytes per point held while reading a .wfm pair (read_wfm twice): one shared float64
+# time axis and two float64 volts arrays (24), and one file's raw codes while they are
+# converted (at most 8). The analog front end comes on top (analog.front_end_bytes).
+_PAIR_READ_BYTES_PER_POINT = 32
+
+# The last time axis built, by (record length, interval, start): the two files of one
+# acquisition share one read-only array. Held weakly, so it lives as long as a caller
+# keeps it.
+_LAST_TIME: Dict[Tuple[int, float, float], "weakref.ref[np.ndarray]"] = {}
+
+
+def predict_pair_peak_bytes(n_points: int) -> int:
+    """Predicted peak of reading a pair of `n_points`-point .wfm files and thresholding
+    them with analog.capture_from_analog. Measured with tracemalloc at about 33 bytes
+    per point on a 10M-point pair, against 44 here."""
+    n = int(n_points)
+    return n * _PAIR_READ_BYTES_PER_POINT + analog.front_end_bytes(n)
+
+
+def _time_axis(n: int, dt: float, t0: float) -> np.ndarray:
+    """``t0 + arange(n) * dt`` as a read-only float64 array, shared with the last call
+    that asked for the same axis while that array is still alive."""
+    key = (int(n), float(dt), float(t0))
+    ref = _LAST_TIME.get(key)
+    time = ref() if ref is not None else None
+    if time is None:
+        time = np.arange(n, dtype=np.float64)
+        time *= dt
+        time += t0
+        time.flags.writeable = False
+        _LAST_TIME.clear()
+        _LAST_TIME[key] = weakref.ref(time)
+    return time
+
+
 def read_header(path: str) -> Dict[str, float]:
     """What a .wfm is, from its first kilobyte: ``{"sample_rate_hz", "n_points", "t0",
     "duration_s"}``. Every field read_wfm takes before the curve sits below 0x340, so the
     Open Capture dialog learns a pair's length without reading either record."""
     with open(path, "rb") as f:
-        data = f.read(1024)
+        data = f.read(_HEADER_BYTES)
+    if len(data) < 0x340:
+        raise ValueError(f"{path}: too short for a .wfm header ({len(data)} bytes)")
     endian = _endianness(data)
     version = _version(data, endian)
     if version != 3:
@@ -107,22 +150,48 @@ def read_header(path: str) -> Dict[str, float]:
             "t0": float(t0), "duration_s": float(n * dt)}
 
 
-def read_wfm(path: str) -> Dict[str, object]:
+def read_wfm_pair(clock_path: str, data_path: str, max_bytes: Optional[int] = None
+                  ) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """``(read_wfm(clock_path), read_wfm(data_path))`` with the pair priced ONCE, from
+    both headers, before either curve is read: `predict_pair_peak_bytes` of the longer
+    record against `memory_budget(max_bytes)` (the .sal convention: None uses the
+    computed budget, a positive value overrides it, 0 opts out), raising
+    :class:`analog.AnalogTooLargeError` over budget. The two reads then run unchecked,
+    so the second is not priced against memory the first already holds."""
+    if max_bytes != 0:
+        n = max(int(read_header(p)["n_points"]) for p in (clock_path, data_path))
+        analog.check_budget(f"{clock_path} + {data_path}", n, predict_pair_peak_bytes(n),
+                            max_bytes)
+    return read_wfm(clock_path, max_bytes=0), read_wfm(data_path, max_bytes=0)
+
+
+def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     """Parse a Tektronix .wfm file into ``{"time", "volts", "sample_rate_hz",
-    "label", "version"}``. `time` is seconds (may start negative, pre-trigger);
-    `volts` is the decoded channel in volts; `label` is the file's base name
-    (scope .wfm files carry no channel name field we rely on, so callers should
-    prefer their own filename-derived label)."""
+    "label", "version"}``. `time` is seconds (may start negative, pre-trigger),
+    READ-ONLY, and the same array for two files with the same record length,
+    interval and start (the two channels of one acquisition); `volts` is the decoded
+    channel in volts; `label` is the file's base name (scope .wfm files carry no
+    channel name field we rely on, so callers should prefer their own
+    filename-derived label).
+
+    Only the header and the curve are read; the codes are converted in place. A .wfm
+    is one channel of a pair, so the memory guard prices the pair
+    (`predict_pair_peak_bytes`) before the curve is read: `max_bytes` follows the
+    .sal convention (None uses the shared `memory_budget()`, a positive value
+    overrides it, 0 opts out) and :class:`analog.AnalogTooLargeError` is raised over
+    budget. To read both files of a pair, use :func:`read_wfm_pair`, which checks the
+    pair once before either is read."""
     with open(path, "rb") as f:
-        data = f.read()
+        data = f.read(_HEADER_BYTES)
+    if len(data) < 0x340:
+        raise ValueError(f"{path}: too short for a .wfm header ({len(data)} bytes)")
 
     endian = _endianness(data)
     version = _version(data, endian)
     if version != 3:
-        # Only version 3 (current Tek scope firmware, e.g. this project's MSO58)
-        # has been reverse-engineered/validated here. Earlier/later versions move
+        # Only version 3 field offsets are implemented. Earlier/later versions move
         # the static/horizontal/curve-object field offsets used below, so bail
-        # loudly rather than silently misreading a differently-laid-out header.
+        # loudly rather than misread the header.
         raise NotImplementedError(
             f"{path}: .wfm version {version} is not supported (only version 3 "
             f"field offsets are implemented); add offsets for this version "
@@ -157,14 +226,26 @@ def read_wfm(path: str) -> Dict[str, object]:
         raise ValueError(f"{path}: empty or malformed curve (data_start={data_start}, "
                          f"postcharge_start={postcharge_start})")
 
+    analog.check_budget(path, n, predict_pair_peak_bytes(n), max_bytes)
+
     curve_off = curve_buffer_start + data_start
     dtype = np.dtype(f"{endian}{fmt_char}")
     if dtype.itemsize != struct.calcsize(f"{endian}{fmt_char}"):
         raise AssertionError(f"{path}: dtype/struct size mismatch for format '{fmt_char}'")
-    codes = np.frombuffer(data, dtype=dtype, count=n, offset=curve_off)
+    with open(path, "rb") as f:
+        f.seek(curve_off)
+        raw = f.read(n * dtype.itemsize)
+    if len(raw) < n * dtype.itemsize:
+        raise ValueError(f"{path}: truncated curve ({len(raw)} of {n * dtype.itemsize} "
+                         f"bytes at offset {curve_off})")
+    codes = np.frombuffer(raw, dtype=dtype, count=n)
 
-    volts = codes.astype(np.float64) * v_scale + v_offset
-    time = np.arange(n, dtype=np.float64) * dt + t0
+    # Converted in place: the same per-element arithmetic as codes * v_scale + v_offset.
+    volts = codes.astype(np.float64)
+    del codes, raw
+    volts *= v_scale
+    volts += v_offset
+    time = _time_axis(n, dt, t0)
     sample_rate_hz = 1.0 / dt if dt else 0.0
 
     return {

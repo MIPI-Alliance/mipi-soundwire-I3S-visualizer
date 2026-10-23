@@ -1,7 +1,7 @@
 """Default register values for DataPort and Flow Control Port configs.
 
-The hardware-model classes in `src/models/dataport.py` and
-`src/models/flow_control_port.py` declare their `_REG` fields as
+The hardware-model classes in `models/dataport.py` and
+`models/flow_control_port.py` declare their `_REG` fields as
 class-level annotations without instance defaults, so an unpopulated
 config raises `AttributeError` on any register read. These helpers
 populate every register with a zero/False default when a caller wants

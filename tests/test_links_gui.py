@@ -213,8 +213,7 @@ def _saved_two_link_workspace(tmp_path, monkeypatch, offset_ps=0):
 def test_a_reopened_workspace_draws_each_band_at_its_saved_offset(tmp_path, monkeypatch):
     """Each band's domain is the union of the Links' spans in global time, so it depends on
     the offsets. Reopened, it must be the one the saved offsets give, not the one computed
-    as each Link was added at offset 0: otherwise Link 2's band draws unshifted, "whole
-    capture" uses the wrong bounds, and the first zoom makes the bands jump."""
+    as each Link was added at offset 0."""
     from swi3s_studio.ui.main_window import MainWindow
     _saved_two_link_workspace(tmp_path, monkeypatch, offset_ps=5_000_000_000)   # +5 ms
     win = MainWindow()
@@ -229,8 +228,8 @@ def test_a_reopened_workspace_draws_each_band_at_its_saved_offset(tmp_path, monk
 
 def test_an_offset_change_is_not_undone_by_the_next_link_activation():
     """The cursor's instant is remembered across Link activations (so a clamp does not lose
-    it), keyed by Link and sample. Moving the active Link keeps both, so the memo has to be
-    dropped: reused, activating the other Link put the cursor back at the old instant."""
+    it), keyed by Link and sample. Moving the active Link keeps both, so an offset change
+    drops the memo."""
     win, _first, _second = _with_added_link()
     a, b = win.links[0], win.links[1]
     s = min(int(a.session.last_sample()), int(b.session.last_sample())) // 2
@@ -243,6 +242,41 @@ def test_an_offset_change_is_not_undone_by_the_next_link_activation():
     win._activate_link(0)
     assert win.cursor.sample == a.to_sample(moved), (
         "activating Link 1 put the cursor back at the instant before the offset change")
+
+
+def test_a_link_added_while_a_workspace_loads_keeps_its_own_state(tmp_path, monkeypatch):
+    """A Link added from Open Capture while a workspace's first Link decodes loads between
+    the workspace's Links. Each saved Link's name, offset and bookmarks land on the capture
+    it was saved for, found by its Session, and the added Link keeps its defaults."""
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui.main_window import MainWindow
+    win0, _first, second = _with_added_link()
+    win0.links.rename(0, "Main")
+    win0.links.rename(1, "Amp bus")
+    win0.links[1].offset_ps = 2_500
+    win0._bookmarks.add(10, link=0)
+    win0._bookmarks.add(20, link=1)
+    win0.switch_link(0)
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    win0.save_workspace()
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win = MainWindow()
+    win.open_workspace()
+    assert getattr(win, "_load_thread", None) is not None, "the first Link loads async"
+    extra = Session.from_demo(300, register_map=win._rmap)
+    win._load_async(lambda **_kw: extra, kind="add")         # queued behind Link 1
+    pump_loads(win)
+    assert len(win.links) == 3
+    added = win.links.index_of(extra)
+    amp = next(i for i, e in enumerate(win.links) if e.session.source == second.source)
+    assert added >= 0 and amp != added
+    assert win.links[amp].name == "Amp bus" and win.links[amp].offset_ps == 2_500
+    assert win.links[added].name != "Amp bus" and win.links[added].offset_ps == 0
+    assert win.links[0].name == "Main"
+    assert sorted((b.sample, b.link) for b in win._bookmarks) == [(10, 0), (20, amp)]
 
 
 @pytest.mark.parametrize("became_a_link", [False, True])
@@ -279,7 +313,7 @@ def test_a_link_whose_views_fail_to_build_still_lets_the_workspace_apply(
         assert len(win.links) == 1
 
 
-# ---- phase 3: a second Link, switching, background re-decodes, the load queue ----
+# ---- a second Link, switching, background re-decodes, the load queue ----
 
 def _flow_control(win):
     """A genuinely different second Link: the PHY2 flow-control demo."""
@@ -478,15 +512,17 @@ def test_a_switch_re_measures_and_refits_nothing(monkeypatch):
 
 
 def test_each_link_keeps_the_column_widths_the_user_set():
+    from swi3s_studio.ui.command_table import COLUMN_NAMES
     win, first, second = _with_added_link()
     win.switch_link(0)
-    win._cmd_view.setColumnWidth(0, 321)
+    time_col = COLUMN_NAMES.index("Time (µs)")
+    win._cmd_view.setColumnWidth(time_col, 321)
     win.switch_link(1)
     win.switch_link(0)
-    assert win._cmd_view.columnWidth(0) == 321
+    assert win._cmd_view.columnWidth(time_col) == 321
 
 
-# ---- phase 4: the stacked timeline and the All Links Commands scope ----
+# ---- the stacked timeline and the All Links Commands scope ----
 
 def test_the_timeline_stacks_a_band_per_link_on_one_time_scale():
     win, first, second = _with_added_link()
@@ -708,9 +744,8 @@ def test_bottom_panes_draw_their_own_links_bookmarks_and_take_seeks_in_it():
 
 
 def test_a_drag_in_a_bottom_pane_counts_in_that_panes_link():
-    """Audio and Capture count in the bottom group's Link. A drag there used to be read as
-    the ACTIVE Link's samples, so with the bottom group on another Link the bookmark
-    landed somewhere else."""
+    """Audio and Capture count in the bottom group's Link: a drag there moves the bookmark
+    in that Link's samples, not the ACTIVE Link's."""
     win, first, second = _with_added_link()
     win.links[1].offset_ps = 2_000_000
     win.set_group_link("bottom", 0)
@@ -745,7 +780,7 @@ def test_the_pane_touch_filter_exists_only_while_some_window_has_two_links():
     assert id(win) not in _PaneTouchFilter._users
 
 
-# ---- phase 4: offsets, Align on bookmark pair, other-Link marks, saved layout ----
+# ---- offsets, Align on bookmark pair, other-Link marks, saved layout ----
 
 def test_setting_an_offset_moves_the_links_bookmarks_and_all_links_times():
     win, first, second = _with_added_link()
@@ -886,9 +921,7 @@ def test_a_single_link_workspace_saves_no_multi_link_layout(tmp_path, monkeypatc
 def test_links_at_different_row_rates_work_end_to_end():
     """Equal row rates are the expected case, not a requirement: with a PHY3 Link (3072 kHz
     rows) beside a PHY2 one (1536 kHz), everything works, and only row/UI deltas across the
-    two are withheld. (PHY1 was used here once, but PHY1 and PHY2 run the SAME row rate —
-    the test only believed otherwise because it compared measured rates for exact float
-    equality, the very bug the tolerance fixes.)"""
+    two are withheld. (PHY1 and PHY2 run the SAME row rate, so PHY3 is the other Link.)"""
     from swi3s_studio.session import Session
     win = _win()
     phy3 = Session.from_demo(300, cold_start=True, phy=3, register_map=win._rmap)
@@ -928,7 +961,7 @@ def test_measured_rates_that_agree_to_a_few_ppm_count_as_the_same_rate():
     assert drows != "—" and dui == "—" and dt != "—"
 
 
-# ---- phase 5: Remove Link, per-Link export names ----
+# ---- Remove Link, per-Link export names ----
 
 def _three_links():
     from swi3s_studio.session import Session
@@ -986,7 +1019,7 @@ def test_remove_link_asks_first_and_names_the_bookmarks_it_takes(monkeypatch):
     monkeypatch.setattr(QMessageBox, "question",
                         lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
     win.remove_link(1)
-    assert asked and "Link 2" in asked[0] and "2 bookmark(s)" in asked[0]
+    assert asked and "Link 2" in asked[0] and "2 cursor(s)" in asked[0]
     assert len(win.links) == 2                          # declined: nothing removed
 
 
@@ -1057,15 +1090,17 @@ def test_a_workspace_whose_first_link_fails_adds_nothing_to_the_open_analysis(
     from swi3s_studio.workspace import LinkSpec, Workspace
     win = _win()
     before = win._session
-    bad = {"type": "sal", "path": str(tmp_path / "missing.sal"),
-           "clock_channel": 0, "data_channel": 1}
+    broken = tmp_path / "broken.sal"
+    broken.write_bytes(b"not a capture")               # found, but fails to load
+    bad = {"type": "sal", "path": str(broken), "clock_channel": 0, "data_channel": 1}
     path = str(tmp_path / "ws.json")
     Workspace(links=[LinkSpec(source=bad), LinkSpec(source=before.source)]).save(path)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
-    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: None)
-    monkeypatch.setattr(win, "_ask_missing_capture", lambda *a: "skip")   # its file is gone
+    failed = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: failed.append(a[1:3]))
     win.open_workspace()
     pump_loads(win)
+    assert failed                                        # the load failed, not a skip
     assert len(win.links) == 1 and win._session is before
 
 
@@ -1172,10 +1207,65 @@ def test_sub_capture_matches_are_bookmarked_on_the_link_searched(monkeypatch):
     from PySide6.QtWidgets import QMessageBox
     monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)    # the "found N" announcement
     win, first, second = _with_added_link()
-    win._locate_link = 0                                # the search started on Link 1
+    win._locate_session = first                         # the search started on Link 1
     win._activate_link(1)                               # ... Link 2 is active when it lands
     win._finish_locate_subcapture("sub.sal", [{"start_sample": 77, "score": 1.0}], {})
     assert [(b.sample, b.link) for b in win._bookmarks] == [(77, 0)]
+
+
+def test_sub_capture_matches_follow_the_searched_capture_to_its_link(monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+    win, first, second = _with_added_link()
+    win._locate_session = second                        # the search started on Link 2
+    win.remove_link(0, confirm=False)                   # ... which is Link 1 when it lands
+    win._finish_locate_subcapture("sub.sal", [{"start_sample": 77, "score": 1.0}], {})
+    assert [(b.sample, b.link) for b in win._bookmarks] == [(77, 0)]
+    assert win.links[0].session is second
+
+
+@pytest.mark.parametrize("matches, diag", [
+    ([{"start_sample": 123456, "score": 1.0}], {}),
+    ([], {"best_score": 0.4, "best_start_sample": 123456}),
+])
+def test_sub_capture_results_are_dropped_when_the_searched_capture_is_gone(
+        monkeypatch, matches, diag):
+    from PySide6.QtWidgets import QMessageBox
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(self.text()) or 0)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    win = _win()
+    win._locate_session = win._session                  # the search started on this capture
+    win.load_session(_flow_control(win))                # an open replaced it meanwhile
+    win._finish_locate_subcapture("sub.sal", matches, diag)
+    assert list(win._bookmarks) == [] and shown == []
+    assert "discarded" in win._status.text()
+
+
+def test_a_background_persistence_result_keeps_the_grid_links_cds_column(monkeypatch):
+    import numpy as np
+
+    import swi3s_studio.ui.main_window as mw
+    win, first, second = _with_added_link()
+    first._cds_horizontal_start, second._cds_horizontal_start = 0, 2   # FBCSE, DLV
+    for s in (first, second):
+        monkeypatch.setattr(s, "tx_persist_cached", lambda sample: None)
+    monkeypatch.setattr(mw, "_TX_PERSIST_SYNC_MAX_UIS", -1)            # every scan in the background
+    asked = []
+    monkeypatch.setattr(win, "_start_tx_persist_worker", lambda *a: asked.append(a))
+    drawn = []
+    monkeypatch.setattr(win._grid_view, "set_tx_raster", lambda r: drawn.append(r["cds_col"]))
+    win.cursor.set_sample(int(second.commands[-5]["start_sample"]))     # Link 2, in audio
+    win.set_group_link("right", 0)                      # active: Link 1; the grid shows Link 2
+    assert win._pane_link["grid"] == 1 and win.links.active_index == 0
+    win._toggle_tx_map(True)
+    drawn.clear()
+    win._toggle_tx_persist(True)
+    assert asked and asked[-1][0] is second and drawn == [2]           # the placeholder
+    session, _sample, token = asked[-1]
+    cols = session.column_count_at(_sample) or 1
+    win._on_tx_persist_done(np.zeros(cols, dtype=bool), cols, token)
+    assert drawn == [2, 2]
 
 
 def test_all_links_keeps_its_column_widths_across_a_rebuild():
@@ -1227,3 +1317,37 @@ def test_leaving_all_links_for_a_replace_does_no_cursor_work_on_unbound_panes(mo
     monkeypatch.setattr(win, "_restore_cursor", lambda s: (calls.append(win._bottom_all), real(s)))
     win.load_session(Session.from_demo(300, cold_start=True, register_map=win._rmap))
     assert calls == []                  # leaving All Links left the cursor to the bind
+
+
+# ---- the Commands sort: what the header says is what the rows are ------------------------
+
+def _rows(win):
+    proxy = win._cmd_proxy
+    return [int(str(proxy.index(r, 0).data()).replace(",", ""))
+            for r in range(min(proxy.rowCount(), 40))]
+
+
+def test_commands_open_in_capture_order_and_the_header_claims_no_sort():
+    """Commands open in capture order with no sort indicator (Qt's default indicator
+    reads Row ▼, i.e. "descending", over unsorted rows)."""
+    from swi3s_studio.ui.view_state import commands_header_state
+    win, _ = _two_links(offset_ps=0)
+    rows = _rows(win)
+    assert rows == sorted(rows), rows
+    assert win._cmd_view.horizontalHeader().sortIndicatorSection() == -1
+    assert commands_header_state(win._cmd_view)["sort"] is None
+
+
+def test_leaving_all_links_restores_the_order_the_link_had():
+    win, _ = _two_links(offset_ps=0)
+    before = _rows(win)
+    win.set_commands_scope_all(True)
+    win.set_commands_scope_all(False)
+    assert _rows(win) == before, "All Links off reversed the Link's commands"
+    # A sort the user chose is the one that comes back.
+    win._cmd_view.sortByColumn(0, Qt.DescendingOrder)
+    chosen = _rows(win)
+    assert chosen == sorted(chosen, reverse=True)
+    win.set_commands_scope_all(True)
+    win.set_commands_scope_all(False)
+    assert _rows(win) == chosen

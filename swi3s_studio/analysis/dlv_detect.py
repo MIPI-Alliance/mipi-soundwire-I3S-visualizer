@@ -25,6 +25,7 @@ import csv
 import numpy as np
 import swi3score
 
+from .. import import_notes
 from ..ingest.capture import Capture
 
 # Logic's digital sample-rate menu (Hz). The GCD-derived rate is snapped to the
@@ -82,7 +83,13 @@ def true_sample_rate_csv(path: str, max_rows: int = 500_000) -> int:
     quantum = int(np.gcd.reduce(ps))
     if quantum <= 0:
         return 0
-    return snap_to_standard_rate(1e12 / quantum)
+    raw = 1e12 / quantum
+    rate = snap_to_standard_rate(raw)
+    if abs(rate - raw) > 1e-3 * rate:
+        import_notes.warn(import_notes.source_name(path),
+                          f"the timestamps' spacing gives a sample rate of {raw:,.0f} Hz; "
+                          f"it is snapped to the standard rate of {rate:,} Hz")
+    return rate
 
 
 def is_complementary(capture: Capture, tol: float = 0.005) -> bool:
@@ -91,10 +98,8 @@ def is_complementary(capture: Capture, tol: float = 0.005) -> bool:
     throughout. `tol` allows a small fraction of edges to differ (sampling skew)."""
     ce = capture.clock_edges                         # already contiguous uint64 (Capture.__init__)
     de = capture.data_edges
-    # Cheap rejections FIRST — a non-pair (opposite initial levels, or very different
-    # edge counts) is the common FBCSE case, and these tests need only sizes/flags. Do
-    # them before touching the (100s-of-millions-of-element) edge arrays: converting
-    # both to int64 up front copied gigabytes just to reject on size a line later.
+    # Cheap rejections first (initial levels, edge counts): they need only sizes/flags,
+    # so a non-pair, the common FBCSE case, is rejected before the edge arrays are read.
     if ce.size == 0 or de.size == 0 or bool(capture.initial_clock) == bool(capture.initial_data):
         return False
     if abs(ce.size - de.size) > tol * max(ce.size, de.size):

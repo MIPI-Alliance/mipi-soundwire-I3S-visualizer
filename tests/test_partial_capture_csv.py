@@ -1,15 +1,12 @@
 """Join-late partial captures: no config on the wire, geometry supplied by a CSV.
 
-This is the workflow a user hits with a real capture started after the bus was already
-running: the setup `WriteA32`s and the commit happened before recording began, so the
-decoder has nothing to snoop. Port geometry comes from an imported Visualizer config
-CSV instead, and (since 3.0.11) the SSP is recovered from an SSPA.
+A capture started after the bus was already running has no setup `WriteA32`s or commit
+on the wire, so the decoder has nothing to snoop. Port geometry comes from an imported
+Visualizer config CSV instead, and the SSP is recovered from an SSPA.
 
-Existing `test_config_csv.py` coverage applies a CSV to a FULL demo — where the config
-commands are still on the wire, so the decoder would have found them anyway. That
-exercises the CSV plumbing but never the join-late case: nothing failed if the CSV was
-quietly ignored. These tests build the real thing with `Capture.subcapture`, starting
-inside the 16-column audio region, and assert the capture is genuinely configless first.
+`test_config_csv.py` applies a CSV to a FULL demo, where the config commands are still on
+the wire. These tests build the join-late case with `Capture.subcapture`, starting inside
+the 16-column audio region, and assert the capture is genuinely configless first.
 """
 import os
 import tempfile

@@ -47,14 +47,13 @@ def _fftconvolve_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
 
 
 # Output samples computed per block. Peak memory is ~one block's zero-stuffed input
-# window + its FFT, NOT the whole N*L upsampled signal / convolution (which OOM'd on a
-# minutes-long PDM stream at 3.6-5.8 GB).
+# window + its FFT, not the whole N*L upsampled signal / convolution.
 _OUT_BLOCK = 1 << 15
 
 
 def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
     """Compute out[k] = (linconv(upsample(x, L), h) 'same')[k*M] for k in [0, ceil(NL/M)),
-    i.e. exactly what ``_fftconvolve_same(up, h)[::M]`` produced — but only for the KEPT
+    i.e. exactly what ``_fftconvolve_same(up, h)[::M]`` produces — but only for the KEPT
     (every-M-th) samples, in bounded output blocks, so it never materializes the full
     upsampled signal or convolution. This is a low-pass FIR followed by dropping samples
     (polyphase decimation); for L=1 the input window is just a slice of x."""

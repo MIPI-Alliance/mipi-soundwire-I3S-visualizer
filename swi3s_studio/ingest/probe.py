@@ -1,8 +1,8 @@
 """What a capture file is, before anything is decoded: the Open Capture dialog's Source.
 
 `probe(paths)` reads only what is cheap and bounded: a .sal's zip directory, a header, the
-tail of a text file for its last timestamp, and a capped prefix for edge counts (as the
-channel pickers did). Whatever a format cannot report that way is None, and the dialog
+tail of a text file for its last timestamp, and a capped prefix for edge counts.
+Whatever a format cannot report that way is None, and the dialog
 shows "—" rather than a guess.
 
 A probe also says whether a time window is READ on its own (`windowed`: a .sal seeks its
@@ -17,8 +17,6 @@ from typing import Any, List, Optional
 
 # Edge arrays are uint64: one transition is 8 bytes once loaded.
 _EDGE_BYTES = 8
-_CSV_BYTES_PER_ROW = 10      # retained by digital_csv.load_capture per row (its docstring)
-_ANALOG_BYTES_PER_POINT = 8 * 3   # time + one float64 per channel kept, per point, roughly
 
 
 @dataclass
@@ -41,35 +39,63 @@ class CaptureProbe:
     analog: bool = False         # volts, thresholded on load (per-channel hi/lo)
     two_file: bool = False       # the two channels are two files (.bin / .wfm pair)
     cost_all_bytes: Optional[int] = None   # rough peak to load ONE Link, all of it
+    # A windowed read's model (saleae_sal.SalWindowModel) over one Link's two channels:
+    # the figure the loader's guard prices a window by.
+    window_model: Any = None
 
     @property
     def name(self) -> str:
         return " + ".join(os.path.basename(p) for p in self.paths)
 
     def cost_bytes(self, t0: Optional[float] = None, t1: Optional[float] = None) -> Optional[int]:
-        """Rough peak to load one Link's [t0, t1) s (None: all). A windowed read costs its
-        share of the whole; any other format reads the whole file whatever the window. Each
-        further Link from the file is loaded, and kept, as well: the dialog multiplies."""
+        """Rough peak to load one Link's [t0, t1) s (None: all). A windowed read is priced
+        by the loader's own window model (saleae_sal.SalWindowModel.peak_bytes, the
+        blocks the window decodes), so a window this calls fitting is one the loader's
+        guard admits; any other format reads the whole file whatever the window. Each
+        further Link from the file is loaded, and kept, as well: the dialog
+        multiplies."""
         if self.cost_all_bytes is None:
             return None
         if t0 is None or t1 is None or not self.windowed or not self.duration_s:
             return self.cost_all_bytes
-        frac = max(0.0, min(1.0, (t1 - t0) / self.duration_s))
-        return int(self.cost_all_bytes * frac)
+        rate = float(self.sample_rate_hz or 0.0)
+        if self.window_model is not None and rate > 0:
+            # The samples the loader will be asked for (Session.window_samples: the
+            # nearest samples, the end one past).
+            s0, s1 = int(round(t0 * rate)), int(round(t1 * rate)) + 1
+            return self.window_model.peak_bytes(s0, s1)
+        return int(self.cost_all_bytes * max(0.0, min(1.0, (t1 - t0) / self.duration_s)))
+
+    def largest_window_s(self, budget_bytes: int) -> Optional[float]:
+        """Length in seconds of the longest window from the capture start whose
+        `cost_bytes` is within `budget_bytes` (one Link); None when the cost or the
+        length is unknown, or a window is not read on its own; 0.0 when no window fits."""
+        span = float(self.duration_s or 0.0)
+        if self.cost_all_bytes is None or not self.windowed or span <= 0:
+            return None
+        if (self.cost_bytes(0.0, span) or 0) <= budget_bytes:
+            return span
+        lo, hi = 0.0, span
+        if (self.cost_bytes(0.0, 0.0) or 0) > budget_bytes:
+            return 0.0
+        for _ in range(60):                  # cost_bytes is non-decreasing in the length
+            mid = (lo + hi) / 2.0
+            if (self.cost_bytes(0.0, mid) or 0) <= budget_bytes:
+                lo = mid
+            else:
+                hi = mid
+        return lo
 
     def busiest_pair(self, among=None):
         """(clock, data) indices to offer for a Link among channel indices `among` (default
         all), the busier as the clock (a forwarded clock toggles every UI).
 
-        Edge counts alone cannot pair channels: in a file holding two Links whose clocks
-        run at different rates, no ratio separates the slower clock from the faster Link's
-        data. So the wiring is read first: a Link is usually on two adjacent channels, and
-        when the channels pair up (an even number of them) and the adjacent pairs, in file
-        order, look like Links, every pair's busier line busier than every pair's quieter
-        one, the first pair is offered. An odd channel out (a trigger beside a clock and
-        data, say) means the file is not wired in pairs. Otherwise (clocks
-        wired side by side, say) the busiest is the clock and data the busiest with under
-        half its edges. File order when the counts are unknown."""
+        The wiring is read first, since edge counts alone cannot pair Links whose clocks
+        run at different rates: when the channels pair up (an even number of them) and
+        the adjacent pairs, in file order, look like Links, every pair's busier line
+        busier than every pair's quieter one, the first pair is offered. Otherwise the
+        busiest is the clock and data the busiest with under half its edges. File order
+        when the counts are unknown."""
         idx = sorted(range(len(self.channels)) if among is None else among)
         if len(idx) < 2:
             raise ValueError("a capture needs at least two channels")
@@ -115,18 +141,24 @@ def _probe_sal(path: str) -> CaptureProbe:
         cost, per = None, {}
     pr.channels = [ProbedChannel(c, f"Channel {c}", per.get(c), approx=True)
                    for c in info.channels]
+    # Two channels are loaded per Link: price, and measure, the busiest two, as a first
+    # Link would.
+    two = sorted(info.channels, key=lambda c: per.get(c, 0), reverse=True)[:2]
+    model = None
     try:
-        span = saleae_sal.capture_span_samples(path, channels=list(info.channels[:2]))
-        if span and info.sample_rate_hz:
-            pr.duration_s = span / float(info.sample_rate_hz)
+        model = saleae_sal.window_model(path, channels=two)
+        if model.span_samples and info.sample_rate_hz:
+            pr.duration_s = model.span_samples / float(info.sample_rate_hz)
     except Exception:  # noqa: BLE001
         pass
     if cost is not None:
-        # Two channels are loaded per Link: price the busiest two, as a first Link would.
-        two = sorted(per.values(), reverse=True)[:2]
-        edge_bytes = sum(two) * _EDGE_BYTES
+        edge_bytes = sum(per.get(c, 0) for c in two) * _EDGE_BYTES
         frac = (edge_bytes / cost.est_edge_bytes) if cost.est_edge_bytes else 1.0
         pr.cost_all_bytes = int(cost.est_peak_bytes * min(1.0, max(frac, 0.0)))
+        # A v0 blob has no block chain: a window is read whole, like the other formats.
+        pr.windowed = cost.streamable
+        if cost.streamable and model is not None and model.span_samples:
+            pr.window_model = model
     return pr
 
 
@@ -136,11 +168,9 @@ def _probe_bin(paths: List[str]) -> CaptureProbe:
                       two_file=True)
     pr.sample_rate_hz = float(saleae_binary.infer_sample_rate(paths)) or None
     ends = []
-    total = 0
     for p in paths:
         n = saleae_binary.transition_count(p)
         pr.channels.append(ProbedChannel(p, os.path.basename(p), n if n >= 0 else None))
-        total += max(0, n)
         try:
             with open(p, "rb") as f:
                 head = f.read(saleae_binary._HEADER.size)
@@ -149,7 +179,11 @@ def _probe_bin(paths: List[str]) -> CaptureProbe:
         except Exception:  # noqa: BLE001
             pass
     pr.duration_s = max(ends) if ends else None
-    pr.cost_all_bytes = total * (8 + _EDGE_BYTES)        # f64 times read, uint64 edges kept
+    # The loader's own pre-flight figure, so "fits" here is what its guard admits.
+    try:
+        pr.cost_all_bytes = saleae_binary.predict_peak_bytes(paths[0], paths[1])
+    except OSError:
+        pr.cost_all_bytes = None
     return pr
 
 
@@ -163,7 +197,7 @@ def _probe_digital_csv(path: str) -> CaptureProbe:
         counts, rate = [], 0
     with open(path, "rb") as fb:
         sample = fb.read(64 << 10)
-    rows = digital_csv._predict_rows(path, 1, sample)
+    rows = digital_csv._predict_rows(path, len(header), sample)
     pr = CaptureProbe("digital_csv", [path], "Digital CSV (.csv)")
     # The counts read the first 2,000,000 rows: exact for a file that short, else a prefix.
     approx = rows > 2_000_000
@@ -178,7 +212,9 @@ def _probe_digital_csv(path: str) -> CaptureProbe:
         pr.duration_s = max(0.0, float(last) - float(first))
     except Exception:  # noqa: BLE001
         pass
-    pr.cost_all_bytes = rows * _CSV_BYTES_PER_ROW if rows else None
+    # The loader's own pre-flight figure, so "fits" here is what its guard admits.
+    pr.cost_all_bytes = (digital_csv.predict_peak_bytes(rows, len(header), sample)
+                         if rows else None)
     return pr
 
 
@@ -188,16 +224,16 @@ def _probe_vcd(path: str) -> CaptureProbe:
     sigs = info.scalar_signals
     idents = [s.ident for s in sigs]
     try:
-        per, truncated = vcd.transition_counts_bounded(path, idents, 2_000_000)
+        per, truncated, t_read = vcd.transition_counts_until(path, idents, 2_000_000)
     except Exception:  # noqa: BLE001
-        per, truncated = {}, False
+        per, truncated, t_read = {}, False, 0
     pr = CaptureProbe("vcd", [path], "Value change dump (.vcd)")
     pr.channels = [ProbedChannel(s.ident, s.name, per.get(s.ident), approx=truncated)
                    for s in sigs]
     tick = float(info.timescale_s or 0.0)
     pr.sample_rate_hz = float(info.sample_rate_hz) or None
+    last = 0
     try:
-        last = 0
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
@@ -210,7 +246,11 @@ def _probe_vcd(path: str) -> CaptureProbe:
     except Exception:  # noqa: BLE001
         pass
     two = sorted((v for v in per.values() if v), reverse=True)[:2]   # one Link's lines
-    pr.cost_all_bytes = sum(two) * _EDGE_BYTES if two and not truncated else None
+    edges = sum(two)
+    if truncated:
+        # The counts cover #0 to #t_read: scale them to the dump's last time stamp.
+        edges = int(edges * last / t_read) if (edges and last and t_read > 0) else 0
+    pr.cost_all_bytes = edges * vcd.BYTES_PER_EDGE if edges else None
     return pr
 
 
@@ -229,24 +269,23 @@ def _probe_wfm(paths: List[str]) -> CaptureProbe:
     if good:
         pr.sample_rate_hz = good[0]["sample_rate_hz"] or None
         pr.duration_s = max(h["duration_s"] for h in good)
-        pr.cost_all_bytes = int(max(h["n_points"] for h in good) * _ANALOG_BYTES_PER_POINT)
+        # The loader's own pre-flight figure (read_wfm prices the pair).
+        pr.cost_all_bytes = wfm.predict_pair_peak_bytes(int(max(h["n_points"] for h in good)))
     return pr
 
 
 def _probe_analog_csv(path: str) -> CaptureProbe:
     from . import analog_csv
-    names = analog_csv.channel_names(path)
+    _pre, header, offset, _sample = analog_csv._scan_header(path)
+    names = header[1:]
     pr = CaptureProbe("analog_csv", [path], "Analog CSV (.csv, scope export)", analog=True)
     pr.channels = [ProbedChannel(n, n) for n in names]
     try:
         import csv as _csv
         times = []
         with open(path, newline="", encoding="utf-8") as f:
-            seen_header = False
+            f.seek(offset)                   # the first data row, past the TIME header
             for row in _csv.reader(f):
-                if not seen_header:
-                    seen_header = bool(row) and row[0].strip().upper() == "TIME"
-                    continue
                 if row and row[0].strip():
                     times.append(float(row[0]))
                 if len(times) >= 2000:
@@ -259,9 +298,11 @@ def _probe_analog_csv(path: str) -> CaptureProbe:
                 pr.sample_rate_hz = 1.0 / float(np.median(dt))
         last = float(_last_line(path).split(",")[0])
         pr.duration_s = max(0.0, last - times[0]) if times else None
-        if pr.sample_rate_hz and pr.duration_s:
-            pr.cost_all_bytes = int(pr.duration_s * pr.sample_rate_hz
-                                    * (8 + 8 * len(names)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # The loader's own pre-flight figure, so "fits" here is what its guard admits.
+        pr.cost_all_bytes = analog_csv.predict_peak_bytes(path)
     except Exception:  # noqa: BLE001
         pass
     return pr

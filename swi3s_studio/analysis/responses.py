@@ -57,7 +57,7 @@ def manager_response_name(phase: str, token: int) -> str:
 
 
 def ping_name(token: int) -> str:
-    """Per-device PingInfo token (Table 67)."""
+    """Per-device PingInfo token ("Assignment of Robust Token Numbers (Peripheral)" table)."""
     return {0: "ATTACHED", 6: "ATTACHED_BUSY", 8: "ALERT", 10: "ALERT_BUSY"}.get(token, "")
 
 

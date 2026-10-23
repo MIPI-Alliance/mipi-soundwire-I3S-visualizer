@@ -2,11 +2,9 @@
 
 A caller sequencing several loads waits on those callbacks. A reopened workspace counts its
 Links down through them and applies its saved state when the count reaches zero, so a load
-that settled neither way left the count stuck, and the Links that did load kept default
-names, offsets 0 and no bookmarks. That happened when building the views raised: the path
-was not one any test made fail. These make each stage fail in turn, for each kind of load,
-alone and queued behind another, and require the request to settle once, the queue to
-drain, and the user to be told.
+that settles neither way leaves the count stuck. These make each stage fail in turn, for
+each kind of load, alone and queued behind another, and require the request to settle once,
+the queue to drain, and the user to be told.
 """
 import os
 

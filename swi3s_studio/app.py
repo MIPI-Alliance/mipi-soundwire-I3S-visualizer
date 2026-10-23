@@ -9,16 +9,14 @@
 Argument handling lives in `cli.py`, which is Qt-free, and `-o` is dispatched there BEFORE
 anything Qt is constructed — see `main`. Run with `--help` for the full list.
 
-NOTHING QT IS IMPORTED AT MODULE LEVEL, and that is what makes "-o implies headless" true rather
-than nearly true: a batch model dump neither imports PySide6 nor touches the UI package, so it
-cannot be broken by a display problem, a Qt version, or anything in the window's construction.
-`tests/test_cli.py` pins it by checking sys.modules in a subprocess. The cost is the two
-deferred-import helpers below; the alternative was a module-level QProxyStyle subclass, which
-pulls in QtWidgets just to be defined.
+NOTHING QT IS IMPORTED AT MODULE LEVEL: a batch model dump (`-o`) neither imports PySide6 nor
+touches the UI package. `tests/test_cli.py` pins it by checking sys.modules in a subprocess; Qt
+use goes through the deferred-import helpers below.
 """
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 from . import cli
 
@@ -78,6 +76,7 @@ def main(argv=None) -> int:
     from PySide6.QtWidgets import QApplication
 
     from .ui.main_window import MainWindow
+    from .ui.teardown import release_python_owned_qobjects
     from .ui.theme import apply_palette, resolve_mode, saved_preference
 
     # Name the app before QApplication so the macOS application menu reads
@@ -88,7 +87,10 @@ def main(argv=None) -> int:
     _name_macos_app_menu()
     _set_regular_activation_policy()   # become a normal GUI app BEFORE QApplication
     app = QApplication(qt_argv)
+    from .ui.singleton_pin import pin_singletons
+    pin_singletons()                   # again, now Qt is up: it pins only what is not pinned
     app.setApplicationName(_APP_NAME)
+    interrupt = _QuitOnInterrupt(app)
     # Center tabbed-dock tab bars off macOS (Windows/Fusion left-align them; macOS's
     # native style already centers and is left untouched).
     if sys.platform != "darwin":
@@ -97,6 +99,11 @@ def main(argv=None) -> int:
     # widget is constructed with the right palette ('system' follows the OS).
     apply_palette(resolve_mode(saved_preference()))
     win = MainWindow()
+    # The app ends with its window. Qt's own rule, quit when the last window closes,
+    # counts every visible top-level window, so a parentless one still open would keep the
+    # event loop running.
+    app.setQuitOnLastWindowClosed(False)
+    win.closed.connect(app.quit)
     if args.demo_bringup:
         win.load_demo_bringup()
     elif args.demo:
@@ -104,11 +111,9 @@ def main(argv=None) -> int:
     elif args.config:
         win.open_visualizer_csv_path(args.config)
     win.show()
-    # Qt-level focus is safe before the event loop; the macOS Cocoa activation is NOT —
-    # calling NSApplication.activate() before app.exec() spins AppKit's activation while
-    # no run loop is live, which prints "modalSession has been exited prematurely" on macOS
-    # (and is a no-op for an unbundled process anyway, per _activate). Defer the Cocoa part
-    # to the singleShot calls below, which fire once the loop is running.
+    # Qt-level focus is safe before the event loop; the macOS Cocoa activation is NOT
+    # (with no run loop live it prints "modalSession has been exited prematurely"). The
+    # Cocoa part runs from the singleShot calls below, once the loop is running.
     _activate(win, cocoa=False)
     # Once the event loop is live, demo loads may use the async worker+progress path (before
     # this, the __init__ preload ran synchronously). Flag it on the first loop iteration.
@@ -120,7 +125,86 @@ def main(argv=None) -> int:
     # in the background with its menu bar hidden until clicked).
     QTimer.singleShot(0, lambda: _activate(win))
     QTimer.singleShot(200, lambda: _activate(win))
-    return app.exec()
+    interrupt.watch(win)
+    code = app.exec()
+    interrupt.release()                   # the quit is under way: Ctrl+C now ends it
+    win.join_worker_threads()
+    release_python_owned_qobjects()       # before PySide's exit sweep (see ui/teardown.py)
+    return code
+
+
+class _QuitOnInterrupt:
+    """Ctrl+C in the terminal that launched the app closes the window as File ▸ Quit does,
+    from the event loop and never inside the Python code it interrupted, and once that quit
+    is under way a second Ctrl+C ends the process at once.
+
+    No Python runs while Qt's loop waits, so the signal's wake-up byte (set_wakeup_fd) goes
+    down a socket pair that a QSocketNotifier watches: the loop wakes at once with no idle
+    cost (a socket, as Windows requires). A Ctrl+C before the loop runs is served when it
+    starts."""
+
+    def __init__(self, app) -> None:
+        import signal
+        import socket
+
+        from PySide6.QtCore import QSocketNotifier
+
+        self._win: Any = None                       # the MainWindow, once watch() has it
+        self._asked = False
+        self._recv, self._send = socket.socketpair()
+        for sock in (self._recv, self._send):
+            sock.setblocking(False)                  # set_wakeup_fd requires it
+        self._prior_fd = signal.set_wakeup_fd(self._send.fileno(), warn_on_full_buffer=False)
+        signal.signal(signal.SIGINT, self._on_signal)
+        self._notifier = QSocketNotifier(self._recv.fileno(), QSocketNotifier.Type.Read, app)
+        self._notifier.activated.connect(self._on_wake)
+
+    @staticmethod
+    def _on_signal(*_args) -> None:
+        """Replaces KeyboardInterrupt; the wake-up byte is what the loop acts on."""
+
+    def watch(self, win) -> None:
+        """Close `win` on Ctrl+C, and on one pressed before now as soon as the loop runs."""
+        from PySide6.QtCore import QTimer
+
+        self._win = win
+        if self._asked:
+            QTimer.singleShot(0, self._quit)
+
+    def _on_wake(self, *_args) -> None:
+        import signal
+
+        got = b""
+        try:
+            while chunk := self._recv.recv(512):
+                got += chunk
+        except (BlockingIOError, InterruptedError):
+            pass
+        if signal.SIGINT not in got:
+            return
+        if self._win is None:
+            self._asked = True                       # served by watch()
+        else:
+            self._quit()
+
+    def _quit(self) -> None:
+        import signal
+
+        # The default first: the close joins the workers in C++, where no Python handler
+        # can run, so only the default can end a close that hangs.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if not self._win.close():
+            signal.signal(signal.SIGINT, self._on_signal)
+
+    def release(self) -> None:
+        """Stop watching once the loop has returned: Ctrl+C ends the process from here on."""
+        import signal
+
+        self._notifier.setEnabled(False)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.set_wakeup_fd(self._prior_fd)
+        self._recv.close()
+        self._send.close()
 
 
 def _set_regular_activation_policy() -> None:
@@ -148,8 +232,8 @@ def _activate(win, cocoa: bool = True) -> None:
 
     `cocoa=False` does ONLY the cross-platform Qt focus and skips the Cocoa activation —
     used for the pre-exec() call, since activating via AppKit before the event loop is
-    running triggers a spurious "modalSession has been exited prematurely" warning (and is
-    ineffective for an unbundled process regardless; the post-loop calls do the real work)."""
+    running prints a "modalSession has been exited prematurely" warning; the post-loop
+    calls do the activation."""
     win.raise_()
     win.activateWindow()
     if sys.platform != "darwin" or not cocoa:

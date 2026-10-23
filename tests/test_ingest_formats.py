@@ -58,9 +58,8 @@ def _make_sal(path, cap, clk_blob_fn, dat_blob_fn=None):
 
 def test_v0_chunked_edge_conversion_matches_whole_array():
     """The v0 seconds->uint64 conversion runs in chunks to avoid multi-GiB float64
-    temporaries that OOM on a big capture (300M+ edges). It must be bit-identical to
-    the naive whole-array expression at every chunk boundary. Regression for the
-    'Unable to allocate 2.75 GiB float64' failure on a large .sal."""
+    temporaries on a big capture (300M+ edges). It must be bit-identical to the naive
+    whole-array expression at every chunk boundary."""
     rng = np.random.default_rng(1)
     times = np.sort(rng.uniform(0.0, 5.0, 10_000)).astype(np.float64)
     origin = float(times[0])
@@ -147,7 +146,7 @@ def test_sal_mixed_version_pretrigger_alignment():
     # (absolute seconds) MUST stay aligned when the capture has a negative pre-trigger
     # begin_time. The v0 channel is rebased on begin_time (capture start == v3 sample 0),
     # NOT on its own first-transition floor — else the two lines skew by the pre-trigger
-    # amount and every decoded value garbles. Regression for the mixed-version bug.
+    # amount.
     cap = transitions.demo_capture(16)
     ref = decode_capture(cap)
     begin = -0.001                        # 1 ms pre-trigger, as Logic 2 records
@@ -193,8 +192,7 @@ def test_sal_unknown_version_error():
 def test_digital_csv_unsorted_rows_yield_ascending_edges():
     # A CSV whose rows aren't in time order must still yield ASCENDING edge arrays
     # (the C++ TransitionSampleSource requires it). Clock toggles every sample, so
-    # every row is a transition; scrambling the row order used to produce
-    # non-ascending edges (e.g. [3,2]).
+    # every row is a transition.
     rate = 1_000_000
     clk = {0: 0, 1: 1, 2: 0, 3: 1}          # toggles every sample
     order = [0, 3, 1, 2]                     # deliberately out of time order
@@ -283,15 +281,13 @@ def test_real_sal_if_present():
 
     A big capture is expected to be REFUSED rather than loaded whole — est_peak_bytes
     carries the decode transient and the budget is capped absolutely, so a multi-GB file
-    raises SalTooLargeError on any machine. That is the guard working, not a failure, so
-    the assertion moves to a windowed load of the same file: it still proves the file
-    decodes, and it covers the streaming window path on real Logic 2 data at the same time.
+    raises SalTooLargeError on any machine. The test then loads a window of the same file,
+    which proves it decodes and covers the streaming window path on real Logic 2 data.
     """
     import glob
     paths = sorted(glob.glob(os.path.expanduser("~/Downloads/*.sal")))
     if not paths:
-        print("   (skipped real .sal: none present in ~/Downloads)")
-        return
+        pytest.skip("no real .sal in ~/Downloads")
     for p in paths:
         info = saleae_sal.read_info(p)
         assert info.sample_rate_hz > 0 and len(info.channels) >= 1
@@ -317,6 +313,8 @@ def test_real_sal_if_present():
             print(f"   {name}: decoded ({cap.clock_edges.size} clk / "
                   f"{cap.data_edges.size} dat edges, {cap.sample_rate_hz/1e6:g} MHz, {how})")
         except saleae_binary.UnsupportedSaleaeVersion as exc:
+            if isinstance(exc, saleae_binary.MalformedSaleaeV3):
+                raise
             print(f"   {name}: clean error — {type(exc).__name__}")
 
 
@@ -360,17 +358,13 @@ def test_digital_csv_auto_clock_and_rate():
 def test_a_v3_delta_code_too_long_for_int64_is_refused():
     """The v3 fast paths do int64 arithmetic, and 128**9 is exactly 2**63.
 
-    So a code with 10 base-128 digits overflows and 11 wraps right around to 1 — at which
-    point the block chain's own `sum == B_end - A_start` check is satisfied by a crafted
-    B_end of 1, and `parse_channel_v3` returns a channel with NO transitions and no error.
-    A silently empty channel is the worst possible outcome for an analyzer: the capture looks
-    decoded.
+    So a code with 10 base-128 digits overflows and 11 wraps right around to 1, where the
+    block chain's own `sum == B_end - A_start` check is satisfied by a crafted B_end of 1.
+    `parse_channel_v3` must raise MalformedSaleaeV3 rather than return an empty channel.
 
-    Not reachable from a real capture — the smallest delta needing ten digits is 2**63
-    samples, 585 years at 500 MS/s — so this is about a corrupt or crafted file failing
-    loudly. Both fast paths are covered: the check counts interior bytes on the raw block, so
-    it guards the native decoder too, which shares the same overflow and cannot be checked
-    from Python any other way.
+    The smallest delta needing ten digits is 2**63 samples (585 years at 500 MS/s), so only
+    a corrupt or crafted file reaches this. The check counts interior bytes on the raw
+    block, so it covers both fast paths, the native decoder included.
     """
     import struct
 
@@ -391,7 +385,7 @@ def test_a_v3_delta_code_too_long_for_int64_is_refused():
         wire = np.frombuffer(code([1] + [0] * (digits - 1)), dtype=np.uint8)
         assert sb._v3_has_overlong_code(wire) is overlong, f"{digits} digits"
 
-    # The crafted file that used to decode to an empty channel with no error.
+    # A crafted file whose 11-digit code wraps to 1.
     crafted = blob(0, 1, code([1] + [0] * 10))          # 11 digits -> wraps to 1
     try:
         channel = sb.parse_channel_v3(crafted, "crafted")
@@ -415,12 +409,8 @@ def test_a_v3_delta_code_too_long_for_int64_is_refused():
 
 
 # --- Logic 2 version 4 -------------------------------------------------------
-# v4 is v3 with the version field bumped and NOTHING else changed. Established by
-# exporting one capture both ways and decoding the v4 blob with the v3 reader: the block
-# chain tiles identically (306 blocks from offset 59 in both), and the transitions matched
-# the v0 Binary export EXACTLY on both channels — 19,170,748 clock and 6,633,392 data
-# transitions, delta arrays equal, absolute samples equal after the constant frame offset
-# the metadata header carries at byte 42. See saleae_binary._V3_LIKE_VERSIONS.
+# v4 is v3 with the version field bumped and NOTHING else changed; the v3 reader decodes
+# both. See saleae_binary._V3_LIKE_VERSIONS.
 
 
 @pytest.mark.parametrize("version", [3, 4])
@@ -429,8 +419,7 @@ def test_v3_and_v4_blobs_decode_identically(version, chunk):
     """The reader must treat 3 and 4 as one format, whole-blob and windowed.
 
     Parametrised over the version so the two are asserted to produce the SAME transitions
-    from the same input rather than merely each being self-consistent — a reader that
-    special-cased v4 into a subtly different path would pass a v4-only test.
+    from the same input rather than merely each being self-consistent.
     """
     e = np.cumsum(np.random.default_rng(5).integers(1, 300, size=800)).astype(np.uint64)
     blob = saleae_binary.build_channel_v3(False, e, chunk_size=chunk, version=version)
@@ -452,13 +441,11 @@ def test_a_v4_sal_loads_and_streams_a_window(tmp_path, version):
     """End to end through load_capture, including the streaming window path.
 
     The window path has its own version gate (_v3_span_streaming refuses anything outside
-    V3_LIKE_VERSIONS before it even looks for the chain) — which is what made a v4 .sal
-    unopenable, since that function is also what capture_span_samples uses to answer "how
-    long is this?". A Logic-2-shaped blob is used so the header-level fast path applies:
-    v4 stamps per-block `level` correctly (306/306 blocks agreed with the decoded parity on
-    the real capture, 208 nonzero), so the fast path is sound on it.
+    V3_LIKE_VERSIONS before it looks for the chain), and capture_span_samples uses it to
+    measure the capture. A Logic-2-shaped blob is used so the header-level fast path
+    applies: v4 stamps per-block `level` correctly.
     """
-    rate = 500_000_000                       # the rate the reported v4 capture was taken at
+    rate = 500_000_000                       # a Logic 2 sample rate
     e = np.cumsum(np.random.default_rng(6).integers(1, 300, size=2000)).astype(np.uint64)
     end = int(e[-1]) + 1000
     kw = dict(sample_rate_hz=rate, unix_ms=1787088006852, frac_ms=0.767,
@@ -486,14 +473,10 @@ def test_a_v4_sal_loads_and_streams_a_window(tmp_path, version):
 
 
 def test_the_supported_version_set_is_exactly_three_and_four():
-    """Adding a version must be a deliberate act backed by evidence, not a drive-by.
+    """The supported v3-like version set is pinned to {3, 4}; v5 is refused.
 
-    v4 was accepted only after decoding a real v4 blob and matching a v0 export of the same
-    capture transition-for-transition on both channels. A future v5 might reuse the block
-    chain or might not, and the cost of guessing is asymmetric: refusing a readable file is
-    an inconvenience, while decoding a changed format produces a plausible WRONG bus, which
-    is the failure this project can least afford. So the set is pinned, and widening it means
-    coming back here and saying what was verified.
+    Widening the set requires verifying the new version against a v0 export of the same
+    capture, and updating this test.
     """
     assert saleae_binary.V3_LIKE_VERSIONS == frozenset({3, 4})
     blob = _HEADER.pack(b"<SALEAE>", 5, 100, 1, 0.0, 1.0, 0) + b"\x00" * 32

@@ -222,10 +222,9 @@ def test_a_reported_rate_is_kept():
 
 # ---------------------------------------------------------------- the DC blocker
 def test_the_dc_blocker_is_a_1_hz_zero_phase_filter_ahead_of_filter_and_gain():
-    """It was Decode ▸ Block PDM DC Bias, which subtracted the mean of every PDM port in the
-    window; now it is one stream's, for PCM as well, and a filter, so a bias that drifts
-    goes too. Zero phase, so the tone is neither shifted nor, a thousand times above the
-    corner, attenuated."""
+    """The DC blocker is one stream's setting, for PCM as well as PDM, and a filter, so a
+    bias that drifts goes too. Zero phase, so the tone is neither shifted nor, a thousand
+    times above the corner, attenuated."""
     t = np.arange(48_001)
     tone = 1000.0 * np.sin(2 * np.pi * 1000.0 * t / RATE)
     drift = 4000.0 + 1500.0 * t / t.size                   # a bias that moves

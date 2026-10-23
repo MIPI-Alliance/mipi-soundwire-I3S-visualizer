@@ -1,11 +1,10 @@
 // Abstract source of decoded UIs for the SWI3S decode core.
 //
-// The Saleae plugin pulls UIs from AnalyzerChannelData via CBitstreamDecoder;
-// for SWI3S Studio the same pipeline is driven from an ISampleSource backed by
-// a .sal/CSV reader. Each NextUi() advances to the next forwarded-clock edge
-// (one edge per UI) and reports the data-line level for the UI it ends, plus the
-// absolute sample number, exactly as the plugin's bit decoder did. Returns false
-// at end of capture.
+// The decode pipeline is driven from an ISampleSource backed by a .sal/CSV
+// reader. Each NextUi() advances to the next forwarded-clock edge (one edge per
+// UI) and reports the data-line level for the UI it ends, plus the absolute
+// sample number, matching the plugin's CBitstreamDecoder. Returns false at end
+// of capture.
 
 #ifndef SWI3SCORE_ISAMPLESOURCE_H
 #define SWI3SCORE_ISAMPLESOURCE_H
@@ -39,13 +38,21 @@ public:
     // recovered-clock source (DLV) needs it to subdivide each row into the right UI count.
     virtual void SetColumns(int /*columnCount*/) {}
 
+    // A later link bring-up (DecoderSettings::restartPoints): a recovered-clock source
+    // (DLV) re-acquires its clock at the first row edge at or after `sample`, framing
+    // `columns` UIs a row, and reads nothing before it; the next NextUi() is that row's
+    // alignment UI. A forwarded-clock source ignores it: every UI is a clock edge, which
+    // the decoder reads through itself.
+    virtual void Reacquire(std::uint64_t /*sample*/, int /*columns*/) {}
+
     // Absolute index of the UI that the NEXT NextUi() will return (i.e. the count
     // of UIs already consumed). Lets the decoder stamp segment boundaries with an
     // absolute UI so windowed re-decodes (the symbol viewer) align row numbering.
     virtual std::uint64_t UiIndex() const { return 0; }
 
-    // Total UI count for the whole source, if known up front (a seekable capture
-    // knows its size), or 0 if unknown (pure streaming). Used only to report decode
+    // Total UI count for the whole source: exact for a forwarded-clock capture (it knows
+    // its size), an estimate for a recovered-clock source (the decoder re-reads it as the
+    // decode runs), or 0 if unknown (pure streaming). Used only to report decode
     // PROGRESS (Decoder::totalUis/progress) to a polling UI thread — never for decode
     // correctness, so an under/overestimate here has no effect beyond a wrong percentage.
     virtual std::uint64_t TotalUiCount() const { return 0; }

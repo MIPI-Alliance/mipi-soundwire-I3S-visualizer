@@ -78,7 +78,7 @@ def test_ssp_redecode_keeps_audio_view():
         the GUI thread via a queued signal, so it needs a spinning loop here). Wait on
         wall-clock time, not a fixed iteration count — processEvents() returns instantly
         on an empty queue, so a fixed count can elapse before a slow runner's worker
-        finishes (flaked on the Windows VM)."""
+        finishes."""
         import time
         deadline = time.time() + 60.0
         while getattr(win, "_load_thread", None) is not None:

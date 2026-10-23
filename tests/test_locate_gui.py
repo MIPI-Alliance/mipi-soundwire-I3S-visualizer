@@ -1,4 +1,4 @@
-"""Sub-capture locate progress/teardown GUI regressions.
+"""Sub-capture locate progress/teardown GUI tests.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_locate_gui.py
 """
@@ -12,9 +12,8 @@ from PySide6.QtWidgets import QApplication
 def test_locate_progress_survives_reentrant_teardown():
     """A modal QProgressDialog.setValue() re-enters the event loop, which can dispatch the
     queued 'done' signal and tear _locate_dlg down MID-CALL. _on_locate_progress must work
-    off a local ref (and do setValue last), and _teardown_locate_thread must be idempotent —
-    otherwise the progress tick dereferences a None dialog (the AttributeError crash seen
-    during a real sub-capture locate)."""
+    off a local ref (and do setValue last), and _teardown_locate_thread must be idempotent,
+    so the progress tick never dereferences a None dialog."""
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
     win = MainWindow()

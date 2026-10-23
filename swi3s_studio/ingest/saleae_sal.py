@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .. import import_notes
 from . import saleae_binary
 from .capture import Capture
 
@@ -33,17 +34,17 @@ class SalInfo:
     digital_files: Dict[int, str] = field(default_factory=dict)
     # device-channel numbers of enabled digital channels, in order
     channels: List[int] = field(default_factory=list)
+    # what reading meta.json passed over or assumed, as import warning texts
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass
 class SalCost:
     """Predicted memory cost of opening a .sal, WITHOUT decoding it.
 
-    A .sal is a zip of delta-coded blobs: a 278 MB file can hold 2.25 GB of
-    uncompressed payload and decode to 18 GB of uint64 edge arrays, so a naive
-    open can exhaust RAM and wedge the machine before any error surfaces. Every
-    figure here comes from the zip central directory plus a few KB of header, so
-    the estimate itself costs nothing.
+    A .sal is a zip of delta-coded blobs, so its decoded edge arrays can be many
+    times the file size. Every figure here comes from the zip central directory
+    plus a few KB of header, so the estimate itself costs nothing.
     """
     file_bytes: int                    # the .sal on disk
     uncompressed_bytes: int            # blobs once inflated (what z.read() materialises)
@@ -51,6 +52,9 @@ class SalCost:
     est_edge_bytes: int                # uint64 edge arrays built from them
     sample_rate_hz: int
     per_channel: Dict[int, int] = field(default_factory=dict)   # channel -> est transitions
+    # Every priced channel is a v3/v4 block chain, so a window streams instead of
+    # inflating the blob (see window_peak_bytes).
+    streamable: bool = True
 
     @property
     def est_peak_bytes(self) -> int:
@@ -58,27 +62,24 @@ class SalCost:
         arrays are both live at once (the blob is only released after the last
         channel is decoded), plus the decoder's own working set.
 
-        THE EDGE TERM CARRIES THE DECODE TRANSIENT and the blob term does not. Building
-        the edge arrays holds the per-block int64 delta run, its cumsum, the boolean mask
-        and the final concatenate simultaneously (`_STREAM_TRANSIENT`), while the inflated
-        blob is one flat allocation. This used to return the bare sum, so it under-predicted
-        the real peak by 1.9x-3.6x on measured captures — and because the transient was
-        applied ONLY on the windowed branch of `load_capture`, the path that allocates LEAST
-        was the only one estimated honestly. On a 103 GB machine that let a capture predicted
-        at 20.29 GB load to a measured ~60 GB and put macOS into continuous memory
-        compression, which is a minute-long stall that no amount of per-move Python tuning
-        reaches. Measured against this model: 2.134 vs 2.125 GB actual, 0.948 vs 0.921, and
-        0.733 vs 0.598 (over-predicting, which is the safe direction for a guard).
-
-        THE WHOLE-FILE TRANSIENT IS NOW 2, NOT THE STREAMING 4. A whole-channel decode used
-        to hold every block's deltas, their concatenation and the cumsum at once; it now
-        validates the chain a block at a time and decodes each block again straight into
+        THE EDGE TERM CARRIES THE DECODE TRANSIENT (`_WHOLE_FILE_TRANSIENT`) and the
+        blob term does not: the inflated blob is one flat allocation. A whole-channel
+        decode validates the chain a block at a time and decodes each block straight into
         the one uint64 output (saleae_binary.parse_channel_v3), so what is live is the
-        output plus ONE block's int64 run. A block can be the whole channel, which is what
-        bounds that at 2. A 54 MB capture with 302M transitions peaked at 8.6 GB before and
-        3.7 GB after; at 4 it was predicted at 14.0 GB and refused on a 64 GB machine.
+        output plus ONE block's int64 run, and a block can be the whole channel. A
+        windowed open is priced by :meth:`window_peak_bytes` instead.
         """
         return int(self.uncompressed_bytes + self.est_edge_bytes * _WHOLE_FILE_TRANSIENT)
+
+    def window_peak_bytes(self, model: "SalWindowModel", window: tuple) -> int:
+        """Rough peak for the window ``(start, end)`` samples: the streaming model of
+        `model` (:meth:`SalWindowModel.peak_bytes`, priced by the blocks the window
+        decodes, plus the whole read of any channel whose chain did not walk) when
+        every channel is a v3/v4 blob, else the whole-file peak (a v0 blob is read
+        whole whatever the window)."""
+        if not self.streamable:
+            return self.est_peak_bytes
+        return model.peak_bytes(int(window[0]), int(window[1]))
 
     def fits_in(self, budget_bytes: int) -> bool:
         return self.est_peak_bytes <= int(budget_bytes)
@@ -97,8 +98,6 @@ _EDGE_BYTES = 8
 # A v3 transition is one base-128 varint: >= 1 byte, and on a fast bus the great
 # majority are exactly 1 (small deltas). Counting payload bytes therefore gives an
 # UPPER bound on the transition count, which is the safe direction for a guard.
-# Sampling the real terminator density would mean inflating the blob — the very
-# thing this estimate exists to avoid.
 _V3_BYTES_PER_TRANSITION = 1.0
 # A v0 blob is a fixed-width table of f64 transition times.
 _V0_BYTES_PER_TRANSITION = 8.0
@@ -116,6 +115,7 @@ def estimate_cost(path: str, channels: Optional[List[int]] = None) -> SalCost:
     want = set(info.channels if channels is None else channels)
     uncompressed = 0
     per_channel: Dict[int, int] = {}
+    streamable = True
     with zipfile.ZipFile(path) as z:
         sizes = {i.filename: i.file_size for i in z.infolist()}
         for ch, name in info.digital_files.items():
@@ -127,9 +127,12 @@ def estimate_cost(path: str, channels: Optional[List[int]] = None) -> SalCost:
             with z.open(name) as fh:
                 head = fh.read(16)
             per_tr = _V3_BYTES_PER_TRANSITION
-            if len(head) >= 12 and head[:8] == saleae_binary.SALEAE_MAGIC:
-                if int.from_bytes(head[8:12], "little") == 0:
-                    per_tr = _V0_BYTES_PER_TRANSITION
+            version = (int.from_bytes(head[8:12], "little")
+                       if len(head) >= 12 and head[:8] == saleae_binary.SALEAE_MAGIC else -1)
+            if version == 0:
+                per_tr = _V0_BYTES_PER_TRANSITION
+            if version not in saleae_binary.V3_LIKE_VERSIONS:
+                streamable = False
             per_channel[ch] = int(blob / per_tr) if per_tr else 0
     est_tr = sum(per_channel.values())
     return SalCost(file_bytes=int(os.path.getsize(path)),
@@ -137,13 +140,13 @@ def estimate_cost(path: str, channels: Optional[List[int]] = None) -> SalCost:
                    est_transitions=est_tr,
                    est_edge_bytes=est_tr * _EDGE_BYTES,
                    sample_rate_hz=info.sample_rate_hz,
-                   per_channel=per_channel)
+                   per_channel=per_channel,
+                   streamable=streamable)
 
 
 def _avail_from_proc_meminfo() -> int:
     """`MemAvailable` from /proc/meminfo (Linux), or 0. The kernel's own estimate of what a
-    new allocation can have without swapping — which is the question here, and a better
-    answer than free+cached arithmetic."""
+    new allocation can have without swapping."""
     try:
         with open("/proc/meminfo", encoding="ascii") as fh:
             for line in fh:
@@ -157,8 +160,8 @@ def _avail_from_proc_meminfo() -> int:
 def _avail_from_global_memory_status() -> int:
     """`ullAvailPhys` from GlobalMemoryStatusEx (Windows), or 0.
 
-    Windows has no `sysconf`, so without this the POSIX branch below cannot run at all and
-    an install without psutil has NO way to read free memory — see available_memory_bytes.
+    Windows has no `sysconf`; this is the stdlib route there when psutil is absent (see
+    available_memory_bytes).
     """
     if sys.platform != "win32":                     # mypy narrows on this, and so must we:
         return 0                                    # ctypes.windll does not exist elsewhere
@@ -190,9 +193,8 @@ def _avail_from_vm_stat() -> int:
     """Free + inactive + speculative pages from `vm_stat` (macOS), or 0.
 
     macOS publishes no `SC_AVPHYS_PAGES`, so this is the stdlib route. INACTIVE pages are
-    counted because Darwin will hand them to a new allocation rather than swap; free alone
-    reads as a few hundred MB on a healthy machine and would refuse ordinary captures.
-    Deliberately excludes purgeable/compressed accounting — this is a floor, not a model.
+    counted because Darwin will hand them to a new allocation rather than swap.
+    Excludes purgeable/compressed accounting — this is a floor, not a model.
     """
     try:
         import re
@@ -215,19 +217,12 @@ def available_memory_bytes() -> int:
     """Best-effort physical memory available for a load, or 0 if unknown.
 
     Prefers genuinely free memory over total RAM: a 24 GB box with 20 GB in use
-    cannot absorb an 18 GB load, and the point of the guard is to refuse before
-    the machine starts swapping itself to death.
+    cannot absorb an 18 GB load.
 
-    EVERY PLATFORM NEEDS A STDLIB ROUTE, not just psutil. psutil is a declared dependency
-    and is the accurate path, but it is also the ONLY path that used to work on the two
-    platforms users actually run: Windows has no `sysconf` at all, and macOS does not publish
-    `SC_AVPHYS_PAGES`, so the POSIX branch below only ever fired on Linux. An install without
-    psutil therefore fell through to "unknown" — silently, since the import is swallowed —
-    and `memory_budget` took its fallback, which above ~14 GB free is indistinguishable from
-    the correct answer and BELOW it is far too permissive (8.59 GB against 2.40 GB on a 4 GB
-    machine, i.e. failing OPEN on exactly the machines that can least afford it). It needs an
-    environment built without requirements.txt: `run.ps1` and `run.sh` install it, so a user
-    following the README would not hit it.
+    EVERY PLATFORM HAS A STDLIB ROUTE, not just psutil (a declared dependency and the
+    accurate path): sysconf `SC_AVPHYS_PAGES` or /proc/meminfo on Linux,
+    GlobalMemoryStatusEx on Windows (no `sysconf`), and vm_stat on macOS (no
+    `SC_AVPHYS_PAGES`).
     """
     try:                                        # psutil is the accurate path
         import psutil
@@ -257,10 +252,8 @@ def total_memory_bytes() -> int:
     """Total physical RAM, or 0 if unknown.
 
     A weaker figure than `available_memory_bytes` and used only when that one fails: it says
-    nothing about what is already in use. But it is readable from the stdlib on every
-    platform, which makes it a far better basis for a fallback than a flat constant — 8 GiB
-    is generous on a workstation and reckless on a 4 GB laptop, and a constant cannot tell
-    them apart. See memory_budget.
+    nothing about what is already in use. It is readable from the stdlib on every
+    platform. See memory_budget.
     """
     try:
         import os
@@ -304,19 +297,12 @@ _UNKNOWN_TOTAL_FRACTION = 0.25
 # The total this ASSUMES when even total RAM is unreadable — a deliberately small machine.
 # Budget when NOTHING about memory can be read is then the same rule applied to that
 # assumption, which is what keeps the tiers consistent: a weaker reading can never buy a
-# BIGGER load. Stating it as a constant instead (it was a flat 8 GiB) got that backwards
-# twice over — 8 GiB was both larger than the free-memory budget on any machine under ~14 GB
-# AND larger than the total-derived budget on any machine under 32 GB, so the less the guard
-# knew the more it allowed. An explicit max_bytes (or max_bytes=0 to opt out) overrides it.
+# BIGGER load. An explicit max_bytes (or max_bytes=0 to opt out) overrides it.
 _ASSUMED_TOTAL_WHEN_UNKNOWN = 4 << 30
 _UNKNOWN_BUDGET = int(_ASSUMED_TOTAL_WHEN_UNKNOWN * _UNKNOWN_TOTAL_FRACTION)
 # Predicted peak past which the Open Capture dialog calls a load LARGE (large_load_bytes).
-# It used to cap memory_budget, which made it a refusal: a 64 GB or 96 GB machine could not
-# open a capture predicted at 14 GB, though the cap's own reason was that past it the call
-# is a person's. It was also standing in for an estimate that under-predicted 3x, which is
-# how a 103 GB machine reached ~60 GB resident; that estimate is now measured
-# (test_the_peak_estimate_matches_a_measured_load), and the decode it cannot predict is
-# watched while it runs (decode_memory_floor). So it informs, and the person decides.
+# It informs and does not refuse; memory_budget refuses, and a running decode is watched
+# (decode_memory_floor).
 _LARGE_LOAD = 8 << 30
 
 
@@ -325,26 +311,22 @@ def large_load_bytes() -> int:
     than refused; memory_budget() is what refuses."""
     return _LARGE_LOAD
 
-# How the last budget was derived, for callers that want to SAY so — a guard running in a
-# degraded mode is exactly the kind of thing this project refuses to keep quiet about (see
-# "NOT RUN HERE is not a pass" in docs/DEVELOPMENT.md). Set by memory_budget.
+# How the last budget was derived, for callers that report a guard running in a degraded
+# mode. Set by memory_budget.
 _BUDGET_SOURCE = "not computed yet"
 
 
 def budget_source() -> str:
     """A short phrase describing how the last `memory_budget()` figure was obtained.
 
-    Exists so the UI can tell the user when the memory guard is working from a weaker
-    reading than free RAM. Silence was the actual defect: an install missing psutil got the
-    flat fallback with no error, no warning and no log line, and above ~14 GB free that was
-    indistinguishable from the correct answer while below it was several times too permissive.
+    The UI uses it to tell the user when the memory guard is working from a weaker
+    reading than free RAM.
     """
     return _BUDGET_SOURCE
 
 
-# Warn ONCE per process, not per open. The guard is consulted on every capture open and on
-# every window prompt, and a line per open would be noise a reader learns to skip — which is
-# how a real warning stops being read.
+# Warn ONCE per process, not per open: the guard is consulted on every capture open and on
+# every window prompt.
 _WARNED_DEGRADED = False
 
 
@@ -363,12 +345,7 @@ def _warn_degraded_budget(source: str) -> None:
 def memory_budget(max_bytes: Optional[int] = None) -> int:
     """The peak-memory budget a capture open is allowed, in bytes.
 
-    ONE definition, shared by the loader's guard and the UI's window prompt. They had
-    separate copies and only the loader's was fixed to fail closed, so on a machine
-    with no readable free-memory figure the prompt still concluded "it fits" and the
-    user hit a raw SalTooLargeError from inside the async worker instead of being
-    offered a window. Same class of bug as the spacing fix landing in one of two
-    placement engines — see the maintainers' spacing row-boundary write-up §6.
+    ONE definition, shared by the loader's guard and the UI's window prompt.
 
     A positive `max_bytes` overrides the computed budget. `0`/`None` mean "no explicit
     cap", and this returns the computed budget for them — opting OUT of the guard
@@ -376,18 +353,14 @@ def memory_budget(max_bytes: Optional[int] = None) -> int:
     before asking), because a budget function has no way to express "unlimited"
     without handing back a number that silently disables the check.
 
-    IT IS A QUESTION OF CAPACITY ONLY. It was capped at 8 GiB as well, so a machine with
-    lots of free memory still refused anything predicted past it; that cap is now
-    large_load_bytes(), a label the dialog shows, not a refusal (see _LARGE_LOAD).
+    IT IS A QUESTION OF CAPACITY ONLY. large_load_bytes() is a label the dialog shows,
+    not a refusal (see _LARGE_LOAD).
 
     WHEN FREE MEMORY CANNOT BE READ IT DEGRADES IN STEPS, and says which one it took
     (`budget_source`). Free RAM, then a quarter of TOTAL RAM, then a small constant, each a
     weaker reading than the last, and each used only when the one before it cannot be read.
     They are not ordered by size: a quarter of total RAM can exceed 60% of what is free, and
-    the constant exceeds a quarter of a 2 GB machine. It used to fall straight to a flat
-    8 GiB, the same number as the cap it then had, and so invisible on a large machine while
-    being ~3.6x too permissive on a 4 GB one: failing OPEN on precisely the machines that can
-    least afford it, in the branch whose own comment promised to fail closed.
+    the constant exceeds a quarter of a 2 GB machine.
     """
     global _BUDGET_SOURCE
     if max_bytes:
@@ -413,7 +386,7 @@ def memory_budget(max_bytes: Optional[int] = None) -> int:
 # The free memory a running decode must leave: past this the watchdog stops it (Session).
 # A decode's own growth (the audio it produces) cannot be predicted before it runs, so it is
 # watched instead: 10% of total RAM and at least 1 GiB, the point where macOS starts
-# compressing memory well before it swaps, which is the stall the old 8 GiB cap was for.
+# compressing memory well before it swaps.
 _DECODE_FLOOR_FRACTION = 0.10
 _DECODE_FLOOR_MIN = 1 << 30
 
@@ -431,34 +404,181 @@ def decode_memory_floor() -> int:
 # Never plan to consume ALL free memory: the decode, the audio store and Qt itself
 # still need room, and an allocation that exactly fills RAM thrashes rather than fails.
 _MEM_HEADROOM = 0.6
-# Peak/final ratio for a streaming windowed decode: the per-block int64 delta run,
-# its cumsum, the boolean mask and the final concatenate are all live at once.
-# Calibrated against the reported capture — a 2 s window whose final edge arrays are
-# 0.31 GB peaked at ~1.29 GB above baseline, i.e. ~4x.
-_STREAM_TRANSIENT = 4.0
+# Peak/final ratio for a streaming windowed decode: a channel's in-window int64 edges
+# and their concatenation are live at once, while the channel decoded first is kept.
+# The rebase to the window start is done in place. Measured with tracemalloc.
+_STREAM_TRANSIENT = 2.0
 # Peak/final ratio for a whole-file decode: the output plus one block's int64 deltas, and
 # one block can be the whole channel. See SalCost.est_peak_bytes.
 _WHOLE_FILE_TRANSIENT = 2.0
+# Delta-run bytes a streaming decode inflates and decodes at a time, whatever the
+# block's size: a block can be the whole channel.
+_STREAM_CHUNK = 1 << 18
+# Peak working set of decoding one chunk, per byte of delta run in it: the int64 deltas,
+# their positions and masks, and the over-long-code scan. Measured with tracemalloc at
+# up to 21 with the native decoder, and up to 98 with the vectorised NumPy one (its int64
+# and boolean temporaries). A constant whatever the window.
+_STREAM_DECODE_BYTES_PER_BYTE_NATIVE = 24
+_STREAM_DECODE_BYTES_PER_BYTE_NUMPY = 100
+# Fixed working set of a streaming decode whatever the window: the zip member's reader
+# and inflater, one block header at a time and the small per-call arrays. Measured with
+# tracemalloc at under 0.3 MB on a DEFLATE member.
+_STREAM_FIXED_BYTES = 1 << 20
 
 
-def _v3_span_streaming(fh, size: int, want_start: bool = False):
+def _stream_decode_bytes_per_byte() -> int:
+    return (_STREAM_DECODE_BYTES_PER_BYTE_NATIVE if saleae_binary._native_v3 is not None
+            else _STREAM_DECODE_BYTES_PER_BYTE_NUMPY)
+
+
+def window_peak_bytes(edge_bytes: int, max_block_bytes: int = _STREAM_CHUNK) -> int:
+    """Rough peak of a streaming windowed decode whose in-window edge arrays are at most
+    `edge_bytes`: those edges times `_STREAM_TRANSIENT`, plus the decode of one chunk,
+    the smaller of `_STREAM_CHUNK` and the largest block (`max_block_bytes`, its
+    delta-run bytes), plus `_STREAM_FIXED_BYTES`. `edge_bytes` comes from
+    :meth:`SalWindowModel.edge_bytes`."""
+    chunk = min(max(0, int(max_block_bytes)), _STREAM_CHUNK)
+    return (int(max(0, int(edge_bytes)) * _STREAM_TRANSIENT)
+            + chunk * _stream_decode_bytes_per_byte() + _STREAM_FIXED_BYTES)
+
+
+def whole_channel_peak_bytes(blob_bytes: int) -> int:
+    """Rough peak of reading one v3 channel's blob whole: the inflated blob plus its
+    edges, at most one per byte, times `_WHOLE_FILE_TRANSIENT`. The per-channel term
+    of :attr:`SalCost.est_peak_bytes`."""
+    blob = max(0, int(blob_bytes))
+    return int(blob + int(blob / _V3_BYTES_PER_TRANSITION) * _EDGE_BYTES
+               * _WHOLE_FILE_TRANSIENT)
+
+
+# Buckets a channel's block index keeps: on reaching twice this, adjacent buckets are
+# merged in pairs, so an index is under 2 x 4096 buckets of 16 bytes whatever the chain's
+# length. Measured with tracemalloc on a 250,000-block chain: 7,813 buckets, 125 KB
+# held, a header-walk peak of 0.66 MB.
+_INDEX_BUCKETS = 1 << 12
+
+
+class _BlockIndex:
+    """A channel's v3 block chain as consecutive buckets of whole blocks: bucket `i`
+    covers samples ``[ends[i-1], ends[i]]``, bucket 0 from sample 0, and holds
+    ``cum[i] - cum[i-1]`` delta-run bytes. Built one block header at a time
+    (:meth:`add`); a bucket merges blocks, so the bytes it charges a window are never
+    fewer than the blocks it covers."""
+
+    __slots__ = ("ends", "cum", "_e", "_b", "_per", "_n", "_acc", "_end")
+
+    def __init__(self) -> None:
+        self._e: List[int] = []
+        self._b: List[int] = []
+        self._per = 1                     # blocks per bucket
+        self._n = 0                       # blocks in the open bucket
+        self._acc = 0
+        self._end = 0
+        self.ends = np.zeros(0, dtype=np.uint64)
+        self.cum = np.zeros(0, dtype=np.int64)
+
+    def add(self, b_end: int, nbytes: int) -> None:
+        self._acc += int(nbytes)
+        self._end = int(b_end)
+        self._n += 1
+        if self._n == self._per:
+            self._close()
+
+    def _close(self) -> None:
+        self._e.append(self._end)
+        self._b.append(self._acc)
+        self._n = self._acc = 0
+        if len(self._e) >= 2 * _INDEX_BUCKETS:
+            self._e = self._e[1::2]
+            self._b = [x + y for x, y in zip(self._b[0::2], self._b[1::2])]
+            self._per *= 2
+
+    def finish(self) -> "_BlockIndex":
+        if self._n:
+            self._close()
+        self.ends = np.asarray(self._e, dtype=np.uint64)
+        self.cum = np.cumsum(np.asarray(self._b, dtype=np.int64))
+        self._e, self._b = [], []
+        return self
+
+    def bytes_overlapping(self, s0: int, s1: int) -> int:
+        """Delta-run bytes of the buckets a window decode reads for ``[s0, s1)``: every
+        one ending after `s0` and starting before `s1`, as
+        :func:`_decode_v3_window_streaming` skips and stops."""
+        if self.ends.size == 0 or s1 <= s0:
+            return 0
+        first = int(np.searchsorted(self.ends, np.uint64(max(0, s0)), side="right"))
+        # Bucket j starts at ends[j-1] (bucket 0 at 0), so buckets [0, stop) start
+        # before s1.
+        stop = 1 + int(np.searchsorted(self.ends[:-1], np.uint64(s1), side="left"))
+        if stop <= first:
+            return 0
+        return int(self.cum[stop - 1]) - (int(self.cum[first - 1]) if first else 0)
+
+
+@dataclass
+class SalWindowModel:
+    """What a windowed open of a .sal costs, from one header walk of each channel:
+    the capture's length in samples, the largest block's delta-run bytes, and each
+    channel's :class:`_BlockIndex`.
+
+    A window is priced by the blocks it decodes, not by its share of the capture: a
+    v3 transition is at least one byte of delta run and at least one sample, so a
+    channel holds at most ``min(bytes of the blocks overlapping the window, samples in
+    the window)`` transitions in it. Shared by the loader's guard and the Open Capture
+    probe.
+
+    A channel whose blob does not walk as a block chain (damaged, not v3, or empty) is
+    read whole by a windowed load: `whole_channels` maps it to its blob's bytes, and
+    :meth:`peak_bytes` charges it :func:`whole_channel_peak_bytes` whatever the window."""
+    span_samples: int = 0
+    max_block_bytes: int = 0
+    channels: Dict[int, _BlockIndex] = field(default_factory=dict)
+    whole_channels: Dict[int, int] = field(default_factory=dict)
+
+    def edge_bytes(self, s0: int, s1: int) -> int:
+        """Upper bound on the in-window edge arrays of ``[s0, s1)``, summed over the
+        channels."""
+        s0, s1 = int(s0), int(s1)
+        total = 0
+        for idx in self.channels.values():
+            end = int(idx.ends[-1]) if idx.ends.size else 0
+            samples = max(0, min(s1, end) - s0)
+            total += min(idx.bytes_overlapping(s0, s1), samples)
+        return total * _EDGE_BYTES
+
+    def peak_bytes(self, s0: int, s1: int) -> int:
+        """Rough peak of a windowed decode of ``[s0, s1)``: the streamed channels'
+        :func:`window_peak_bytes` plus :func:`whole_channel_peak_bytes` of each channel
+        in `whole_channels`."""
+        return (window_peak_bytes(self.edge_bytes(s0, s1), self.max_block_bytes)
+                + sum(whole_channel_peak_bytes(b) for b in self.whole_channels.values()))
+
+
+def _v3_span_streaming(fh, size: int, want_start: bool = False,
+                       want_max_block: bool = False, want_index: bool = False):
     """Last ``B_end`` of a v3 block chain, read by streaming the headers only.
 
     Walks the chain from the start of the stream, seeking past each block's delta
     payload instead of decoding (or even holding) it, so peak memory is one block
-    header regardless of blob size. This is what makes it safe to ask "how long is
-    this capture?" about a file too big to open — `z.read()` on the same blob would
-    inflate the gigabytes we are trying to avoid.
+    header regardless of blob size, so it can measure a file too big to open.
 
-    Returns 0 if no self-consistent chain tiles the stream exactly (same
-    acceptance rule as the in-memory walk, so the two never disagree). With
+    Returns 0 if no self-consistent chain tiles the stream exactly. The candidate
+    first-block offsets are those inside the first
+    `saleae_binary.V3_CHAIN_START_SCAN` bytes and a candidate is accepted by the same
+    header checks as :func:`saleae_binary._find_v3_chain_start`, so the two accept
+    the same chains. With
     ``want_start`` returns ``(chain_end, start_offset)`` instead — a caller that
     then decodes needs the VALIDATED offset, because a real Logic 2 metadata header
     contains several zero qwords that each look like a candidate first block and
-    only the full walk tells them apart.
+    only the full walk tells them apart. With ``want_max_block`` as well, returns
+    ``(chain_end, start_offset, largest block's delta-run bytes)``; with
+    ``want_index``, ``(chain_end, start_offset, largest block's delta-run bytes,
+    _BlockIndex)``.
     """
-    fail = (0, -1) if want_start else 0
-    head = fh.read(65536)
+    fail = ((0, -1, 0, _BlockIndex().finish()) if want_index
+            else (0, -1, 0) if want_max_block else ((0, -1) if want_start else 0))
+    head = fh.read(saleae_binary.V3_CHAIN_START_SCAN)
     if len(head) < 16 or head[:8] != saleae_binary.SALEAE_MAGIC:
         return fail
     if int.from_bytes(head[8:12], "little") not in saleae_binary.V3_LIKE_VERSIONS:
@@ -468,7 +588,8 @@ def _v3_span_streaming(fh, size: int, want_start: bool = False):
     for o0 in range(16, len(head) - hdr_len + 1):
         if int.from_bytes(head[o0:o0 + 8], "little") != 0:      # first block A_start == 0
             continue
-        pos, prev_b, ok = o0, None, True
+        pos, prev_b, ok, big = o0, None, True, 0
+        index = _BlockIndex() if want_index else None
         buf = head
         while pos + hdr_len <= size:
             if pos + hdr_len > len(buf):                        # need more bytes
@@ -492,11 +613,17 @@ def _v3_span_streaming(fh, size: int, want_start: bool = False):
             if prev_b is None and b == a and body + cnt != size:
                 ok = False
                 break
-            prev_b, pos = b, body + cnt
+            prev_b, pos, big = b, body + cnt, max(big, cnt)
+            if index is not None:
+                index.add(b, cnt)
         if ok and pos == size and prev_b is not None:
+            if index is not None:
+                return int(prev_b), o0, int(big), index.finish()
+            if want_max_block:
+                return int(prev_b), o0, int(big)
             return (int(prev_b), o0) if want_start else int(prev_b)
-        fh.seek(0)
-        head = fh.read(65536)
+        # The next candidate walks from `head`, which is unchanged; the stream is only
+        # sought (absolutely) once a walk passes it.
     return fail
 
 
@@ -510,10 +637,9 @@ def capture_span_samples(path: str, channels: Optional[Sequence[int]] = None) ->
     ``channels`` restricts the walk to those device channels. **Pass it whenever the caller
     knows which channels it will load.** Without it every digital channel in the archive is
     walked, and on a compressed archive that is not cheap: the walk seeks with
-    ``ZipExtFile.seek()``, which for a DEFLATE member is implemented as read-and-discard (and
-    re-reads from zero for each candidate start offset), so an 8-channel capture pays that
-    cost six times over for channels nobody asked for. That is what made a pre-flight span
-    read block the GUI for ~2 s on a multi-hundred-MB `.sal`.
+    ``ZipExtFile.seek()``, which for a DEFLATE member is implemented as read-and-discard
+    (and a backward seek re-reads from zero, as when a candidate start offset that walked
+    past the first 64 KiB fails).
 
     Only STORED members get a true seek, which is why a test fixture written with
     ``ZIP_STORED`` shows none of this — see `tests/test_sal_large_capture.py`.
@@ -534,15 +660,49 @@ def capture_span_samples(path: str, channels: Optional[Sequence[int]] = None) ->
     return best
 
 
-def _capture_span_samples(info: "SalInfo", path: str,
-                          channels: Optional[Sequence[int]] = None) -> int:
-    """Span helper used by the load guard; tolerates any read failure (the guard
-    then just falls back to the whole-capture estimate, which is conservative)."""
-    try:
-        return capture_span_samples(path, channels=channels)
-    except Exception:
-        return 0
+def _v3_chains(path: str, info: "SalInfo", channels: Sequence[int]) -> Dict[int, tuple]:
+    """``{channel: (chain_end, start_offset, largest block's run bytes, _BlockIndex,
+    blob bytes)}`` from one header walk of each channel's blob
+    (:func:`_v3_span_streaming`); ``(0, -1, 0, empty index, blob bytes)`` for a blob
+    that is not a v3 chain or cannot be read, with blob bytes 0 when its size cannot be
+    read either. A windowed load walks each channel once and hands the result to both
+    the guard and the decode."""
+    out: Dict[int, tuple] = {}
+    with zipfile.ZipFile(path) as z:
+        for ch in channels:
+            size = 0
+            try:
+                name = info.digital_files[ch]
+                size = int(z.getinfo(name).file_size)
+                with z.open(name) as fh:
+                    out[ch] = tuple(_v3_span_streaming(fh, size, want_start=True,
+                                                       want_index=True)) + (size,)
+            except Exception:
+                out[ch] = (0, -1, 0, _BlockIndex().finish(), size)
+    return out
 
+
+def _streams(chain: tuple) -> bool:
+    """True when :func:`_decode_v3_window_streaming` decodes the channel from its
+    walked `chain`; otherwise a windowed load reads its blob whole."""
+    return chain[0] > 0 and chain[1] >= 0
+
+
+def _model_from_chains(chains: Dict[int, tuple]) -> SalWindowModel:
+    walked = {ch: c for ch, c in chains.items() if _streams(c)}
+    return SalWindowModel(span_samples=max((c[0] for c in chains.values()), default=0),
+                          max_block_bytes=max((c[2] for c in walked.values()), default=0),
+                          channels={ch: c[3] for ch, c in walked.items()},
+                          whole_channels={ch: int(c[4]) for ch, c in chains.items()
+                                          if not _streams(c)})
+
+
+def window_model(path: str, channels: Optional[Sequence[int]] = None) -> SalWindowModel:
+    """The :class:`SalWindowModel` of `channels` (default: all digital channels), from
+    one header walk of each. Its `span_samples` is 0 when no channel is a v3 chain."""
+    info = read_info(path)
+    return _model_from_chains(
+        _v3_chains(path, info, list(info.channels if channels is None else channels)))
 
 
 def _dig(meta: dict, *path, default=None):
@@ -565,28 +725,41 @@ def read_info(path: str) -> SalInfo:
     # Digital and Analog entries (and the file name isn't positional), so key off
     # entry["type"]=="Digital" and entry["file"].
     digital_files: Dict[int, str] = {}
+    notes: List[str] = []
     bin_data = _dig(meta, "binData", default=[]) or []
+    unusable: List[str] = []
     for entry in bin_data:
         if not isinstance(entry, dict) or entry.get("type") != "Digital":
             continue
         name = str(entry.get("file", "")).lstrip("./")
         if name in names and "deviceChannel" in entry:
             digital_files[int(entry["deviceChannel"])] = name
+        else:
+            unusable.append(name or "(no file)")
+    if unusable:
+        n = len(unusable)
+        notes.append(f"{n} digital channel entr{'ies' if n != 1 else 'y'} in meta.json "
+                     f"name{'' if n != 1 else 's'} no file in the archive or no device "
+                     f"channel and {'are' if n != 1 else 'is'} skipped: "
+                     f"{', '.join(unusable[:4])}{' …' if n > 4 else ''}")
     # Fall back to positional digital-N.bin if binData is absent/uninformative.
     if not digital_files:
         i = 0
         while f"digital-{i}.bin" in names:
             digital_files[i] = f"digital-{i}.bin"
             i += 1
+        if digital_files and unusable:
+            notes.append("the channel numbers are taken from the digital-N.bin file names")
     channels = sorted(digital_files)
-    return SalInfo(sample_rate_hz=sample_rate, digital_files=digital_files, channels=channels)
+    return SalInfo(sample_rate_hz=sample_rate, digital_files=digital_files, channels=channels,
+                   notes=notes)
 
 
 # Offset of the first transition block in a MINIMAL v3 blob: `<SALEAE>` + version + type
 # and nothing else (saleae_binary.build_channel_v3). Every Logic-shaped writer puts a
 # metadata header before the chain, so a first-block offset past this one is the signal
 # that the blob's per-block `level` fields were actually filled in — 51 bytes for
-# build_logic2_channel_v3, 67 on the reported capture. See _decode_v3_window_streaming.
+# build_logic2_channel_v3. See _decode_v3_window_streaming.
 _V3_MINIMAL_FIRST_BLOCK = len(saleae_binary.SALEAE_MAGIC) + 8
 
 
@@ -596,50 +769,45 @@ class _UnstampedBlockLevels(Exception):
 
     Raised by :func:`_decode_v3_window_streaming` under ``trust_levels=True`` when the
     skipped blocks show no evidence of being stamped. The caller retries the same window
-    with ``trust_levels=False``. See that function for why the fast path exists."""
+    with ``trust_levels=False``. See that function for the fast path."""
 
 
 def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
-                                trust_levels: bool = True):
+                                trust_levels: bool = True, chain=None):
     """Decode a v3 window straight from the zip stream, never holding the blob.
 
-    :func:`saleae_binary.parse_channel_v3_window` already skips non-overlapping
-    blocks, but it needs the whole inflated blob in memory first — 2.25 GB on the
-    reported capture, which dominates the cost of a 2 s window and is most of what
-    makes a large .sal unopenable. Here the entry is inflated sequentially and each
-    block is either **skipped** as it streams past or buffered and decoded when it
-    overlaps the window. Peak memory is therefore one block plus the window's own edges.
+    Unlike :func:`saleae_binary.parse_channel_v3_window`, which needs the whole
+    inflated blob in memory, the entry is inflated sequentially and each block is either
+    **skipped** as it streams past or decoded when it overlaps the window, a
+    `_STREAM_CHUNK` of its delta run at a time. Peak memory is therefore one chunk's
+    decode plus the window's own edges, whatever the block size. Inflating is
+    sequential, so the time taken grows with the window's END, not its length.
 
-    WHAT A SKIPPED BLOCK COSTS IS THE WHOLE POINT. All a skipped block contributes is
-    the LINE LEVEL at the window's start, one bit. Deriving that bit by counting
-    transitions means decoding every delta before the window, which is O(START OFFSET)
-    and made a windowed open of a long capture unusable: on a 176 s / 2.25 G-transition
-    capture, a 0.5 s window cost 3.7 s at the start, 15.3 s at 88 s and 43.3 s at
-    175.5 s — the same half-second of data, and the beach ball users reported. Terminator
-    counting can't replace the decode either: a multi-byte code whose MSB digit is < 0x40
-    encodes as [digit+0x40, ..., terminal] (``encode_v3_delta(65) == b"\\x40\\x40"``), so
-    both bytes are < 0x80 and an odd over-count opens the window with the level INVERTED —
-    samples right, polarity wrong, silently.
+    A skipped block contributes only the LINE LEVEL at the window's start. With
+    ``trust_levels`` that bit comes from the block headers: each header carries `level`,
+    the line state at that block's START, and the block containing s0 is decoded anyway
+    because it overlaps the window, so its own transitions give the level at s0 and no
+    earlier block is decoded. Cost then scales with the window, not its start offset.
+    Terminator counting cannot replace the decode (see :func:`_count_and_discard`).
 
-    So take the bit from the block header instead. Each header carries `level`, the line
-    state at that block's START, and the block containing s0 is decoded ANYWAY because it
-    overlaps the window — so its own transitions give the level at s0 exactly, and no
-    earlier block needs decoding at all. Verified against the reported capture: the header
-    level agreed with the decoded parity on 400/400 blocks of both channels, with about
-    half the fields nonzero (so they carry real data, not a constant).
-
-    ``trust_levels=False`` restores the parity walk. It exists because
-    :func:`saleae_binary.build_channel_v3` — the minimal internal test writer — stamps 0
-    for every non-first block, and trusting that would invert the level. The two are told
-    apart by whether a METADATA HEADER precedes the chain, which is a property of the
-    writer rather than of the data: a minimal blob puts its first block at offset
+    ``trust_levels=False`` derives the level from the decoded parity of every preceding
+    block, O(start offset). Levels are trusted only when a METADATA HEADER precedes the
+    chain: :func:`saleae_binary.build_channel_v3` — the minimal internal test writer —
+    stamps 0 for every non-first block and puts its first block at offset
     ``_V3_MINIMAL_FIRST_BLOCK`` (magic + version + type, nothing else), while every
     Logic-shaped blob carries the header Logic needs first — 51 bytes for
-    :func:`saleae_binary.build_logic2_channel_v3`, 67 on the reported capture. The level
-    VALUES cannot be used as the signal: with an even block size and a low initial state
-    every block legitimately starts at 0, which is indistinguishable from unstamped.
-    An unrecognised blob therefore raises :class:`_UnstampedBlockLevels` and the caller
-    retries by parity — correct, just O(start offset), which is the safe direction.
+    :func:`saleae_binary.build_logic2_channel_v3`. The level VALUES cannot be the
+    signal: with an even block size and a low initial state every block legitimately
+    starts at 0. An unrecognised blob raises :class:`_UnstampedBlockLevels` and the
+    caller retries by parity.
+
+    Every block that is decoded is checked as the whole-file reader checks it (no delta
+    code too long for int64, deltas summing to the header's span) and raises
+    :class:`saleae_binary.MalformedSaleaeV3` if it fails. A block skipped on the
+    strength of its header is not decoded, so it is not checked.
+
+    `chain` is ``(chain_end, start_offset)`` from :func:`_v3_span_streaming` when the
+    caller has walked the chain already; otherwise this walks it, then seeks back to 0.
 
     Returns ``(initial_state_at_s0, transition_samples)`` on the ORIGINAL timeline,
     matching parse_channel_v3_window; ``None`` if the blob isn't a v3 chain (the
@@ -648,24 +816,22 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
     hdr_len = saleae_binary._V3_BLOCK_HEADER
     bc_off = saleae_binary._V3_BYTECOUNT_OFF
     lvl_off = saleae_binary._V3_LEVEL_OFF
-    # Take the VALIDATED chain start from the header walk. Picking the first zero
-    # qword instead silently lands mid-metadata on a real Logic 2 blob (several
-    # candidates there look plausible) and decodes an empty window.
-    chain_end, start = _v3_span_streaming(fh, size, want_start=True)
+    # Take the VALIDATED chain start from the header walk: a real Logic 2 metadata
+    # header holds several zero qwords that look like a first block.
+    if chain is None:
+        chain = _v3_span_streaming(fh, size, want_start=True)
+        fh.seek(0)
+    chain_end, start = chain[0], chain[1]
     if chain_end <= 0 or start < 0:
         return None
     # A metadata header before the chain means a Logic-shaped writer, which stamps every
     # block's level. Nothing else here may assume the levels are real.
     stamped = start > _V3_MINIMAL_FIRST_BLOCK
-    fh.seek(0)
-    head = fh.read(start + hdr_len)
-    if len(head) < start + hdr_len:
-        return None
-    initial = int.from_bytes(head[start + lvl_off:start + lvl_off + 2], "little") & 1
     limit = min(int(s1), chain_end)
-    fh.seek(0)
     _skip(fh, start)                                  # discard the metadata header
-    pos, parity, kept = start, 0, []
+    pos, parity = start, 0
+    kept: List[np.ndarray] = []           # in-window positions, int64, per decoded chunk
+    initial = None          # line level at capture start, from the first block's header
     level = None            # line level AT s0, from the header of the block containing it
     skipped = 0             # blocks that ended at or before s0
     while pos + hdr_len <= size:
@@ -676,6 +842,8 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
         b = int.from_bytes(h[8:16], "little")
         lvl = int.from_bytes(h[lvl_off:lvl_off + 2], "little") & 1
         cnt = int.from_bytes(h[bc_off:bc_off + 8], "little")
+        if initial is None:
+            initial = lvl
         body = pos + hdr_len
         if b < a or body + cnt > size:
             break
@@ -684,23 +852,19 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
             if trust_levels and stamped:
                 _skip(fh, cnt)                        # no decode: the level is in a header
             else:
-                parity ^= _count_and_discard(fh, cnt, drop_last=(b >= chain_end)) & 1
+                parity ^= _count_and_discard(fh, cnt, drop_last=(b >= chain_end),
+                                             span=(a, b), label=label) & 1
         elif a >= limit:
             break                                     # past the window; stop inflating
         else:
-            run = saleae_binary._v3_decode_deltas_np(fh.read(cnt), 0, cnt)
-            abs_s = np.cumsum(run, dtype=np.int64) + int(a)
-            if b >= chain_end and abs_s.size:
-                abs_s = abs_s[:-1]                    # drop the phantom end gap
-            crossed = int(np.count_nonzero(abs_s <= s0)) & 1
+            crossed, done = _decode_overlap(fh, cnt, a, b, s0, limit, label, kept)
             parity ^= crossed
             if level is None and trust_levels and stamped:
                 # This block spans s0, so its own header level plus the transitions it
                 # holds before s0 give the level at s0 -- no earlier block involved.
                 level = lvl ^ crossed
-            sel = abs_s[(abs_s > s0) & (abs_s < limit)]
-            if sel.size:
-                kept.append(sel)
+            if done:
+                break                                 # the rest is past the window
         pos = body + cnt
     if trust_levels and not stamped and skipped:
         # No metadata header, so the per-block levels may be zeros the writer never filled
@@ -712,10 +876,13 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
         # case the fast path has no bit to offer, so ask for the walk.
         if trust_levels and stamped and skipped:
             raise _UnstampedBlockLevels(label)
-        level = initial ^ parity
+        level = (initial or 0) ^ parity
     samples = (np.concatenate(kept) if len(kept) > 1
                else (kept[0] if kept else np.zeros(0, dtype=np.int64)))
-    return bool(level), np.ascontiguousarray(samples, dtype=np.uint64)
+    kept.clear()
+    # Every kept position is > s0 >= 0, so the int64 bits ARE the uint64 value: a view,
+    # not a copy.
+    return bool(level), np.ascontiguousarray(samples).view(np.uint64)
 
 
 def _skip(fh, n: int, chunk: int = 1 << 20) -> None:
@@ -727,23 +894,106 @@ def _skip(fh, n: int, chunk: int = 1 << 20) -> None:
         n -= len(got)
 
 
-def _count_and_discard(fh, nbytes: int, drop_last: bool) -> int:
+def _stream_deltas(fh, nbytes: int, label: str):
+    """Yield the next `nbytes` of delta run as ``(int64 deltas, last)`` pairs, one per
+    `_STREAM_CHUNK` read, so the working set is one chunk whatever the block's size;
+    `last` is True on the pair that ends the run.
+
+    Each chunk is cut at a code boundary and the rest carried into the next. With the
+    native decoder the cut follows the chunk's last byte below 0x40, which always ends
+    a code (a single-byte code or a terminal digit); a chunk with no such byte, and
+    every chunk without the native decoder, goes through
+    :func:`saleae_binary._v3_decode_block_np`, which finds the last complete code
+    itself. A chunk holding a code too long for int64 raises
+    :class:`saleae_binary.MalformedSaleaeV3`, as does a stream that ends before
+    `nbytes`. The carry holds the start of an unfinished code, so a run of interior
+    bytes that crosses a chunk boundary is seen whole.
+    """
+    native = saleae_binary._native_v3
+    left = int(nbytes)
+    carry = b""
+    while left > 0 or carry:
+        take = min(left, _STREAM_CHUNK)
+        got = fh.read(take) if take else b""
+        if len(got) < take:
+            raise saleae_binary.MalformedSaleaeV3(label, "the delta run ends early")
+        left -= take
+        chunk = carry + got if carry else got
+        bb = np.frombuffer(chunk, np.uint8)
+        if saleae_binary._v3_has_overlong_code(bb):
+            raise saleae_binary.MalformedSaleaeV3(
+                label, "a delta code too long for int64")
+        used = bb.size
+        if native is not None and left:
+            ends = bb < 0x40
+            used = bb.size - int(np.argmax(ends[::-1])) if ends.any() else 0
+            del ends
+        if native is not None and used:
+            deltas = native(bb, 0, used)
+        else:
+            deltas, used = saleae_binary._v3_decode_block_np(bb, left == 0)
+        carry = chunk[used:]
+        if deltas.size:
+            yield deltas, (left == 0 and not carry)
+
+
+def _decode_overlap(fh, cnt: int, a: int, b: int, s0: int, limit: int, label: str,
+                    kept: list):
+    """Decode a block that overlaps the window, appending its in-window positions
+    (int64, strictly between s0 and `limit`) to `kept`.
+
+    Returns ``(parity of its transitions at or before s0, done)``. `done` is True when
+    the block's positions reached `limit` before its run ended; the rest of the block
+    is then left unread, as is every later block. A block decoded to its end must sum
+    to its header's span, and positions never pass `b`; either failure raises
+    :class:`saleae_binary.MalformedSaleaeV3`. The block's last delta may be the gap to
+    capture end (the chain's phantom edge at `b`), which `limit` excludes."""
+    base = int(a)
+    crossed = 0
+    for deltas, last in _stream_deltas(fh, cnt, label):
+        p = np.cumsum(deltas)
+        del deltas
+        p += base
+        base = int(p[-1])
+        if base > b:
+            raise saleae_binary.MalformedSaleaeV3(
+                label, f"a block decodes past its header's end sample {b}")
+        crossed ^= int(np.count_nonzero(p <= s0)) & 1
+        sel = p[(p > s0) & (p < limit)]
+        del p
+        if sel.size:
+            kept.append(sel)
+        if base >= limit and not last:
+            return crossed, True
+    if base != b:
+        raise saleae_binary.MalformedSaleaeV3(
+            label, f"a block decodes to {base - a} samples, its header says {b - a}")
+    return crossed, False
+
+
+def _count_and_discard(fh, nbytes: int, drop_last: bool, span=None, label: str = "") -> int:
     """Number of transitions in the next `nbytes` of delta run, discarding the bytes.
 
     A skipped block contributes only its level PARITY, so all we need is the delta
     count — but it has to be the real one. Counting bytes < 0x80 as terminators
     over-reports: a multi-byte code whose MSB digit is < 0x40 encodes as
     [digit+0x40, ..., terminal] (e.g. encode_v3_delta(65) == b"\\x40\\x40"), so both
-    bytes are < 0x80. An odd over-count flips the parity and the window opens with the
-    line level INVERTED — samples right, polarity wrong, silently. So decode the run.
+    bytes are < 0x80, and an odd over-count inverts the window's opening level. So
+    decode the run, a `_STREAM_CHUNK` at a time (`_stream_deltas`).
 
-    Read whole (a block body, not the blob) and released immediately; blocks are the
-    codec's own chunking, which is what keeps this bounded. `drop_last` excludes the
-    chain's trailing gap-to-capture-end delta, which is not a real transition."""
-    buf = fh.read(nbytes)
-    if not buf:
-        return 0
-    n = int(saleae_binary._v3_decode_deltas_np(buf, 0, len(buf)).size)
+    `drop_last` excludes the chain's trailing gap-to-capture-end delta, which is not a
+    real transition. `span` is the block header's ``(A_start, B_end)``: when given, the
+    deltas must sum to ``B_end - A_start`` or :class:`saleae_binary.MalformedSaleaeV3`
+    is raised."""
+    n = 0
+    total = 0
+    for deltas, _last in _stream_deltas(fh, nbytes, label):
+        n += int(deltas.size)
+        total += int(deltas.sum())
+    if span is not None and total != int(span[1]) - int(span[0]):
+        raise saleae_binary.MalformedSaleaeV3(
+            label, f"a block decodes to {total} samples, its header says "
+                   f"{int(span[1]) - int(span[0])}")
     return n - 1 if (drop_last and n) else n
 
 
@@ -761,9 +1011,8 @@ def _decode_channel(data: bytes, label: str, window=None):
 
     `window` is an optional (start_sample, end_sample) pair. On v3 it is pushed down
     into the block-chain walk so only overlapping blocks are decoded (see
-    saleae_binary.parse_channel_v3_window) — the whole point being NOT to
-    materialise a multi-GB edge array for a capture you only want 10 s of. v0 is a
-    flat table with no block index, so it decodes fully and slices after; that path
+    saleae_binary.parse_channel_v3_window). v0 is a flat table with no block
+    index, so it decodes fully and slices after; that path
     is bounded by the f64 table itself, which is already in memory."""
     version = saleae_binary.peek_version(data)
     if version == 0:
@@ -786,12 +1035,10 @@ def _times_to_edges(times: np.ndarray, origin: float, rate: float,
                     step: int = _EDGE_CHUNK) -> np.ndarray:
     """Convert v0 transition times (seconds) to uint64 edge samples in chunks.
 
-    The naive ``np.rint((times - origin) * rate).astype(uint64)`` allocates three
-    FULL float64 temporaries (8 bytes/edge each) on top of the raw blob — on a 300M+
-    edge capture that's ~8 GiB of transients and OOMs a RAM-limited box (e.g. a VM).
-    Converting a block at a time keeps the transient to one small chunk while the
-    result is written straight into the uint64 output. Bit-identical to the
-    whole-array expression: the per-element arithmetic is unchanged, and origin is a
+    Converting a block at a time keeps the float64 transient to one chunk while the
+    result is written straight into the uint64 output. Bit-identical to
+    ``np.rint((times - origin) * rate).astype(uint64)``: the per-element arithmetic
+    is unchanged, and origin is a
     lower bound on every time (min of begin-times + first edges), so no value is
     negative before the uint64 cast."""
     out = np.empty(times.size, dtype=np.uint64)
@@ -804,24 +1051,76 @@ def _times_to_edges(times: np.ndarray, origin: float, rate: float,
     return out
 
 
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
 class SalTooLargeError(MemoryError):
     """Opening this .sal is predicted to exhaust memory.
 
     Raised BEFORE anything is inflated or decoded, so the app can offer a windowed
-    load instead of letting the machine swap itself unresponsive. Carries the
-    estimate so a caller can show the numbers and suggest a window size.
+    load. Carries the estimate so a caller can show the numbers and suggest a window
+    size: `peak` is the figure that was compared with `available`, the whole-file
+    peak or, when `window` (start, end samples) was asked for, the window's.
+    `streamed` is False when a window was asked for but the channels are read whole
+    whatever the window (a v0 blob, or no block chain that could be walked).
+    `whole_channels` lists the channels of a streamed window whose blob does not walk
+    as a block chain, so they are read whole and `peak` includes them.
     """
 
-    def __init__(self, path: str, cost: "SalCost", available: int):
+    def __init__(self, path: str, cost: "SalCost", available: int,
+                 peak: Optional[int] = None, window: Optional[tuple] = None,
+                 streamed: bool = True, whole_channels: Sequence[int] = ()):
         self.path = path
         self.cost = cost
         self.available = int(available)
-        MemoryError.__init__(
-            self,
-            f"{path}: {cost.summary()}, but only "
-            f"{available / 1e9:.1f} GB is available for one load. Open it again and choose "
-            f"a window (Decode: From … to …) in the Open Capture dialog, or free memory / use "
-            f"a machine with more RAM.")
+        self.peak = int(cost.est_peak_bytes if peak is None else peak)
+        self.window = None if window is None else (int(window[0]), int(window[1]))
+        self.streamed = bool(streamed)
+        self.whole_channels = tuple(int(c) for c in whole_channels)
+        if self.window is None:
+            text = (f"{path}: {cost.summary()}, but only "
+                    f"{available / 1e9:.1f} GB is available for one load. Open it again "
+                    f"and choose a window (Decode: From … to …) in the Open Capture "
+                    f"dialog, or free memory / use a machine with more RAM.")
+        elif not self.streamed:
+            text = (f"{path}: {cost.summary()}, but only "
+                    f"{available / 1e9:.1f} GB is available for one load, and these "
+                    f"channels are read whole whatever the window. Free memory / use a "
+                    f"machine with more RAM, or export a shorter capture.")
+        elif self.whole_channels:
+            s0, s1 = self.window
+            names = ", ".join(str(c) for c in self.whole_channels)
+            text = (f"{path}: the window from sample {s0:,} to {s1:,} is estimated to "
+                    f"peak at ~{_gb(self.peak)}, but only {available / 1e9:.1f} GB is "
+                    f"available for one load. Channel {names} is read whole whatever "
+                    f"the window: its data does not walk as a block chain (the file "
+                    f"may be damaged). Export the capture again, or free memory / use "
+                    f"a machine with more RAM.")
+        else:
+            s0, s1 = self.window
+            text = (f"{path}: the window from sample {s0:,} to {s1:,} is estimated to "
+                    f"peak at ~{_gb(self.peak)}, but only {available / 1e9:.1f} GB is "
+                    f"available for one load (whole capture: {cost.summary()}). Choose "
+                    f"a shorter window, or free memory / use a machine with more RAM.")
+        MemoryError.__init__(self, text)
+
+
+def _check_window(src: str, window: tuple, span: int, rate: int) -> None:
+    """Warn when `window` (start, end) samples runs past a capture `span` samples long
+    (0: not known). The end is one past the window's last sample, and a window whose
+    end is within 0.1 % of the span is taken as one to the end."""
+    if span <= 0 or rate <= 0:
+        return
+    s0, s1 = int(window[0]), int(window[1])
+    end_s = span / float(rate)
+    if s0 >= span:
+        import_notes.warn(src, f"the window starts at {s0 / rate:.9g} s, at or after the "
+                               f"capture's end at {end_s:.9g} s; nothing of it is read")
+    elif s1 - 1 > span + max(1, span // 1000):
+        import_notes.warn(src, f"the window ends at {(s1 - 1) / rate:.9g} s, past the "
+                               f"capture's end at {end_s:.9g} s; it is read to the end of "
+                               f"the capture")
 
 
 def load_capture(path: str, clock_channel: int, data_channel: int,
@@ -838,18 +1137,25 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     UI), so the caller needn't know the probe order.
 
     ``window`` is an optional ``(start_sample, end_sample)`` range. Only transitions
-    inside it are decoded — on v3 the block chain is seeked, so cost scales with the
-    window rather than the capture — and the returned Capture is REBASED so the
-    window starts at sample 0 (matching Capture.subcapture, so every downstream
-    sample number is window-relative).
+    inside it are decoded — on v3 the block chain is streamed, so memory scales with
+    the window rather than the capture (time with the window's end) — and the returned
+    Capture is REBASED so the window starts at sample 0 (matching Capture.subcapture,
+    so every downstream sample number is window-relative).
 
     ``max_bytes`` caps the predicted peak memory. When the estimate exceeds it,
     :class:`SalTooLargeError` is raised before any blob is inflated. Pass 0 to
     disable the check; the default consults available system memory. A ``window``
     small enough to fit is always allowed — the guard tests what will actually be
-    decoded, not the file size.
+    decoded (:meth:`SalCost.window_peak_bytes`: the blocks the window overlaps), not
+    the file size.
+
+    Import warnings (import_notes) report meta.json channel entries that were skipped,
+    and a window that runs past the capture's end.
     """
     info = read_info(path)
+    src = import_notes.source_name(path)
+    for note in info.notes:
+        import_notes.warn(src, note)
     rate = int(sample_rate_hz or info.sample_rate_hz)
     if rate <= 0:
         raise ValueError(f"{path}: no digital sample rate in meta.json")
@@ -857,26 +1163,32 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         if ch not in info.digital_files:
             raise ValueError(f"{path}: {role} channel {ch} not in capture "
                              f"(available: {info.channels})")
+    # One header walk per channel, shared by the guard (the capture's length) and the
+    # streaming decode (the validated chain start).
+    chains = (_v3_chains(path, info, [clock_channel, data_channel])
+              if window is not None else {})
+    if window is not None:
+        _check_window(src, window, max((c[0] for c in chains.values()), default=0), rate)
     # --- pre-flight memory guard -------------------------------------------------
-    # Estimate from the zip directory (no inflation) and refuse rather than let the
-    # allocator take the machine down. A windowed v3 load streams the blob past
-    # instead of holding it, so its cost is the window's own edges — which is what
-    # makes a 2 s slice of an otherwise unopenable capture viable.
+    # Estimate from the zip directory (no inflation) and refuse when over budget. A
+    # windowed v3 load streams the blob past instead of holding it, so its cost is
+    # the window's own edges, bounded by the blocks it overlaps, plus the whole read
+    # of any channel whose chain did not walk.
     if max_bytes != 0:
         cost = estimate_cost(path, channels=[clock_channel, data_channel])
         budget = memory_budget(max_bytes)
         peak = cost.est_peak_bytes
+        streamed = False
+        unwalked: List[int] = []
         if window is not None:
-            span = max(0, int(window[1]) - int(window[0]))
-            total = _capture_span_samples(info, path,
-                                         channels=[clock_channel, data_channel])
-            if total > 0:
-                frac = min(1.0, span / float(total))
-                # Streaming: no inflated-blob term, just the window's own edges plus
-                # the decode transient (see _STREAM_TRANSIENT).
-                peak = int(cost.est_edge_bytes * frac * _STREAM_TRANSIENT)
+            model = _model_from_chains(chains)
+            streamed = cost.streamable and model.span_samples > 0
+            if streamed:
+                peak = cost.window_peak_bytes(model, window)
+                unwalked = sorted(ch for ch, c in chains.items() if c[1] < 0)
         if budget > 0 and peak > budget:
-            raise SalTooLargeError(path, cost, budget)
+            raise SalTooLargeError(path, cost, budget, peak=peak, window=window,
+                                   streamed=streamed, whole_channels=unwalked)
     with zipfile.ZipFile(path) as z:
         def read_channel(ch: int):
             """Decode one channel, streaming when a window makes it possible.
@@ -900,12 +1212,14 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
                         with z.open(name) as fh:
                             got = _decode_v3_window_streaming(
                                 fh, size, int(window[0]), int(window[1]), label,
-                                trust_levels=trust)
+                                trust_levels=trust, chain=chains.get(ch))
                         if got is not None:
                             return got[0], None, got[1], 0.0
                         break                      # not a v3 chain: the retry won't help
                     except _UnstampedBlockLevels:
                         continue                   # re-stream, deriving the level by parity
+                    except saleae_binary.MalformedSaleaeV3:
+                        raise                      # a corrupt block: refused, not retried
                     except Exception:
                         break                      # fall through to the in-memory path
             return _decode_channel(z.read(name), label, window=window)
@@ -945,11 +1259,13 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         s0, s1 = int(window[0]), int(window[1])
 
         def clip(edges, initial):
+            # Rebased IN PLACE: every edge array here was built by this call, and a
+            # streamed v3 channel is already inside the window, so it is not copied.
             lo = int(np.searchsorted(edges, s0, side="right"))
             hi = int(np.searchsorted(edges, s1, side="left"))
-            return (np.ascontiguousarray(edges[lo:hi].astype(np.int64) - s0,
-                                         dtype=np.uint64),
-                    bool(initial) ^ (lo % 2 == 1))
+            kept = edges if (lo == 0 and hi == edges.size) else edges[lo:hi].copy()
+            kept -= np.uint64(s0)                # every kept edge is > s0
+            return kept, bool(initial) ^ (lo % 2 == 1)
 
         clk_edges, clk_init = clip(clk_edges, clk_init)
         dat_edges, dat_init = clip(dat_edges, dat_init)

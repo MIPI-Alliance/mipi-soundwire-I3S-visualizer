@@ -3,6 +3,7 @@
 #include "CPayloadEngine.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 
 void CPayloadEngine::Configure(const SwI3sConfig& cfg)
@@ -10,14 +11,10 @@ void CPayloadEngine::Configure(const SwI3sConfig& cfg)
     mCfg = cfg;
     mDps.clear();
     mFcStats = FlowControlStats{};   // fresh handshake accounting per (re)configure
-    // Peripheral-SOURCED data arrives ~1 UI late on the manager's column grid:
-    // the peripheral receives the forwarded clock, then drives its data back with a
-    // clock-to-data + round-trip propagation delay. As a sniffer we therefore sample
-    // a source port's data ONE COLUMN LATER than its register HorizontalStart.
-    // Measured = 1 UI (recovers clean tones on a verified IV/PDM capture; 0 leaves
-    // sources as noise, 2 over-reads). Sinks (manager-driven) are aligned -> shift 0.
-    // SWI3S_SRC_SHIFT overrides the measured default for re-tuning on a very
-    // different bus rate / trace length.
+    // Source-port sample shift (UIs): a peripheral-SOURCED bit is read with the level
+    // this many UIs later, for the peripheral's clock-to-data + round-trip propagation
+    // delay on the manager's column grid. Sinks (manager-driven) are never shifted.
+    // Default kDefaultSourceShift; SWI3S_SRC_SHIFT overrides it.
     const char* sh = std::getenv("SWI3S_SRC_SHIFT");
     mSourceShift = sh ? std::atoi(sh) : kDefaultSourceShift;
 
@@ -47,15 +44,15 @@ CPayloadEngine::DpRuntime CPayloadEngine::buildRuntime(const SwI3sDpConfig& dc, 
     rt.dpIndex = (dc.dpNumber >= 0) ? dc.dpNumber : idx;
     rt.deviceNum = dc.deviceNum;
     rt.scramblerEn = dc.ScramblerEn;
-    rt.sampleSize = dc.SampleSize;
     rt.cfg = dc;
     rt.isSource = dc.isSource();
     rt.port.Configure(dc, mCfg.columnCount(), mCfg.SkippingDenominator);
     rt.port.Initialize(mStartColumn);
     rt.hasFcp = dc.drqEnabled();
     if (rt.hasFcp) {
+        // The FCP shares the data port's bus column and interval phase.
         rt.fcp.Configure(dc, mCfg.columnCount());
-        rt.fcp.Initialize();
+        rt.fcp.Initialize(rt.port.Column(), rt.port.RowInInterval());
     }
     // ChannelRuntime[16] is default-constructed (each descrambler seeded); only
     // enabled channels are ever ticked, so disabled entries stay unused.
@@ -87,17 +84,53 @@ void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
             // only fields that can change without a commit/SSP are SampleSize/SampleGrouping
             // (0x09), ScramblerEn/PortMode (0x0B), FlowMode (0x0E), SkippingNumerator (0x0C).
             // Re-apply the new config but RESTORE the transport phase (do NOT re-anchor):
-            // this is spec-correct, NOT a bug — per SWI3S v1.1 §14.2.5.3/.4 the working
-            // counters (current_bit_in_sample, samples_remaining_in_sample_group) are reloaded
-            // from the registers only at sample/group/interval boundaries, and §9.1.6.2.1 says
-            // only an SSP (SSPA/SSCR) or channel enable/prepare re-anchors the interval. So the
-            // preserved counters correctly FINISH the in-flight sample under the OLD geometry,
-            // and the NEW SampleSize/SampleGrouping (now in dc/mCfg) is picked up at the next
-            // boundary reload. Resetting the counters here would WRONGLY truncate that sample.
-            CDataPort::State phase = it->port.SaveState();
-            DpRuntime rebuilt = buildRuntime(dc, static_cast<int>(i));
-            rebuilt.port.RestoreState(phase);
-            next.push_back(std::move(rebuilt));
+            // per SWI3S v1.1 §14.2.5.3/.4 the working counters (current_bit_in_sample,
+            // samples_remaining_in_sample_group) are reloaded from the registers only at
+            // sample/group/interval boundaries, and per §9.1.6.2.1 only an SSP (SSPA/SSCR) or
+            // channel enable/prepare re-anchors the interval. The preserved counters FINISH
+            // the in-flight sample under the OLD geometry, and the NEW
+            // SampleSize/SampleGrouping (now in dc/mCfg) is picked up at the next boundary
+            // reload. The data port reports the SampleSize each sample was loaded with
+            // (DpEmit::sampleSize), so the in-flight sample keeps its old MSB and width.
+            //
+            // The runtime is updated in place, so the per-channel assembly (descrambler
+            // LFSR, part-assembled value, start sample, running index, TX_PRESENT latch),
+            // the source-shift queue and the DRQ history carry across the write. A channel
+            // that the new config enables and the old one did not gets a freshly seeded
+            // descrambler and an empty accumulator; its index continues.
+            DpRuntime& rt = *it;
+            const std::uint32_t newlyEnabled = dc.EnableCh & ~rt.cfg.EnableCh;
+            for (int ch = 0; ch < 16; ++ch) {
+                if (newlyEnabled & (1u << ch)) {
+                    const U64 index = rt.channels[ch].index;
+                    rt.channels[ch] = ChannelRuntime{};
+                    rt.channels[ch].index = index;
+                }
+            }
+            const bool hadFcp = rt.hasFcp;
+            rt.scramblerEn = dc.ScramblerEn;
+            rt.cfg = dc;
+            rt.isSource = dc.isSource();
+            CDataPort::State phase = rt.port.SaveState();
+            rt.port.Configure(dc, mCfg.columnCount(), mCfg.SkippingDenominator);
+            rt.port.Initialize(mStartColumn);
+            rt.port.RestoreState(phase);
+            rt.hasFcp = dc.drqEnabled();
+            if (rt.hasFcp) {
+                // CFlowControlPort::Configure binds the config without touching the row /
+                // column phase, so a port that already had an FCP keeps its DRQ placement.
+                // A new FCP starts at the restored data port's column and interval row.
+                rt.fcp.Configure(dc, mCfg.columnCount());
+                if (!hadFcp) rt.fcp.Initialize(rt.port.Column(), rt.port.RowInInterval());
+            }
+            if (!rt.hasFcp || !hadFcp) {
+                rt.drqHistory.clear();
+                rt.drqBase = 0;
+                rt.drqCount = 0;
+                rt.txpInterval = 0;
+            }
+            if (!rt.hasFcp) rt.lastDrqSample = 0;
+            next.push_back(std::move(rt));
         }
     }
     mDps = std::move(next);
@@ -115,12 +148,10 @@ bool CPayloadEngine::SyncToSSP()
         // Is this port ALREADY at its sync point? An SSPA re-asserts the phase the ports
         // are running at (it must land on a row where row_in_interval == 0, or it would
         // shift the transport and garble the audio), so for a correctly-placed one the
-        // interval numbering does NOT change — and the in-flight DRQ pipeline is still
-        // valid. Clearing it there invents a handshake violation: the DRQ was genuinely
-        // sent d intervals ago and its sample legitimately transports after the SSP, but
-        // a cleared history has nothing to pair the TxPresent with. A re-anchor that DOES
-        // move the phase (SSCR to a new phase, a manual SSP row, a misplaced SSPA) really
-        // does invalidate the pipeline, so keep clearing in that case.
+        // interval numbering does NOT change and the in-flight DRQ pipeline stays: a DRQ
+        // sent d intervals ago still pairs with the TxPresent that transports after the
+        // SSP. A re-anchor that DOES move the phase (SSCR to a new phase, a manual SSP
+        // row, a misplaced SSPA) invalidates the pipeline, so clear it in that case.
         const bool alreadyAtSsp = (rt.port.SaveState().rowInInterval == 0);
         // A skipping port has a SECOND alignment to satisfy: its pattern repeats every
         // Interval x SkippingDenominator Rows, so a row that is interval-aligned can still
@@ -130,7 +161,8 @@ bool CPayloadEngine::SyncToSSP()
         rt.port.SyncToSSP();
         rt.pending.clear();        // re-anchoring drops in-flight (shifted) bits
         if (rt.hasFcp) {
-            rt.fcp.Initialize();   // re-anchor the FCP row/interval to the SSP
+            // Re-anchor the FCP row/interval to the SSP, at the data port's column.
+            rt.fcp.Initialize(rt.port.Column(), rt.port.RowInInterval());
             if (!alreadyAtSsp) {
                 rt.drqHistory.clear(); // phase moved; startup DRQ=1 again
                 rt.drqBase = 0;
@@ -171,7 +203,8 @@ void CPayloadEngine::TickScheduleOnly()
         if (mSourceShift > 0 && rt.isSource) {
             bool isBit = e.sampleHere &&
                          (e.slot == SwI3sSlot::Data || e.slot == SwI3sSlot::TxPresent);
-            rt.pending.push_back({isBit, e.channel, e.bitInChannel, e.slot == SwI3sSlot::Data});
+            rt.pending.push_back({isBit, e.channel, e.bitInChannel, e.sampleSize,
+                                  e.slot == SwI3sSlot::Data});
             if (static_cast<int>(rt.pending.size()) > mSourceShift) rt.pending.pop_front();
         }
     }
@@ -181,8 +214,9 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
 {
     // Assemble one decoded data/tx-present bit into its channel's running sample.
     // `lvl` is the physical level sampled for this bit; `sn` the capture sample.
-    auto applyBit = [&](DpRuntime& rt, int channel, int bitInChannel, bool isData,
-                        bool lvl, U64 sn) {
+    // `sampleSize` is the SampleSize field (bits - 1) the bit's sample was loaded with.
+    auto applyBit = [&](DpRuntime& rt, int channel, int bitInChannel, int sampleSize,
+                        bool isData, bool lvl, U64 sn) {
         if (channel < 0 || channel >= 16) {
             return;
         }
@@ -197,8 +231,7 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
             // valid); == 0 means the opportunity was skipped (no sample this
             // interval — the jitter we must remove at the receiver). Latch it for
             // the LSB below. NORMAL ports emit no TX_PRESENT bit, so txpValid stays
-            // true and every sample is emitted (unchanged behaviour). The LFSR was
-            // already advanced above.
+            // true and every sample is emitted. The LFSR was already advanced above.
             if (rt.cfg.txpEnabled()) {
                 cs.txpValid = recovered;
             }
@@ -208,18 +241,19 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
             // Record where this data bit was sampled; the MSB (bitInChannel ==
             // sampleSize) begins a new sample interval.
             mBitSamples.push_back({sn, rt.deviceNum, rt.dpIndex, channel,
-                                   bitInChannel == rt.sampleSize});
+                                   bitInChannel == sampleSize});
         }
         if (mDumpFile && (mDumpDp < 0 || rt.dpIndex == mDumpDp) && mDumpCount < mDumpMax) {
             std::fprintf(mDumpFile, "%llu %d %d %d %d\n",
                          (unsigned long long)sn, rt.dpIndex, channel, bitInChannel, recovered ? 1 : 0);
             ++mDumpCount;
         }
-        if (bitInChannel == rt.sampleSize) {  // MSB: start a new sample
+        if (bitInChannel == sampleSize) {  // MSB: start a new sample
             cs.acc = 0;
             cs.startSample = sn;
         }
-        cs.acc |= (static_cast<U64>(recovered ? 1 : 0) << bitInChannel);
+        if (bitInChannel >= 0 && bitInChannel < 64)   // a shift past the accumulator is UB
+            cs.acc |= (static_cast<U64>(recovered ? 1 : 0) << bitInChannel);
         if (bitInChannel == 0) {  // LSB: sample complete
             // Flow control: only EMIT the sample if its TX_PRESENT gated it valid.
             // An unused transport opportunity (TX_PRESENT == 0) is fully assembled
@@ -236,7 +270,7 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
                 s.deviceNum = rt.deviceNum;
                 s.channel = channel;
                 s.value = cs.acc;
-                s.sampleSize = rt.sampleSize + 1;
+                s.sampleSize = sampleSize + 1;
                 s.index = cs.index++;
                 s.startSample = cs.startSample;
                 s.endSample = sn;
@@ -307,7 +341,8 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
             // Fast path (the default: no diagnostic source shift): sample this bit
             // with this UI's level.
             if (isBit) {
-                applyBit(rt, e.channel, e.bitInChannel, isData, level, sampleNumber);
+                applyBit(rt, e.channel, e.bitInChannel, e.sampleSize, isData, level,
+                         sampleNumber);
             }
             continue;
         }
@@ -316,12 +351,13 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
         // with the level N UIs later (probing the peripheral's clock-to-data
         // round-trip skew). Push every UI so the delay is measured in UIs, not in
         // sample events.
-        rt.pending.push_back({isBit, e.channel, e.bitInChannel, isData});
+        rt.pending.push_back({isBit, e.channel, e.bitInChannel, e.sampleSize, isData});
         if (static_cast<int>(rt.pending.size()) > mSourceShift) {
             DpRuntime::PendingBit p = rt.pending.front();
             rt.pending.pop_front();
             if (p.has) {
-                applyBit(rt, p.channel, p.bitInChannel, p.isData, level, sampleNumber);
+                applyBit(rt, p.channel, p.bitInChannel, p.sampleSize, p.isData, level,
+                         sampleNumber);
             }
         }
     }

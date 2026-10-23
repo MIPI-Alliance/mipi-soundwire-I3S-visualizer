@@ -1,7 +1,7 @@
 # Directed tests
 
-Targeted configurations for the Bus Visualizer, one feature or edge case each, from the
-SWI3S Visualizer's own test suite. The test suite builds every one of them and compares the
+Targeted configurations for the Bus Visualizer, one feature or edge case each. The test
+suite builds every one of them and compares the
 result against a golden (`tests/test_visualizer_engine.py`, `tests/test_visualizer_placement.py`,
 `tests/test_authoring_render_golden.py`).
 

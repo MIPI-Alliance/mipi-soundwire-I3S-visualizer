@@ -25,8 +25,8 @@ TIMING = "Timing"
 ANALYSIS = "Analysis"
 MODES = (VISUALIZATION, TIMING, ANALYSIS)
 
-# Display labels for the mode switcher (the internal mode keys above stay stable
-# so workspace files and dock maps keyed by mode don't churn).
+# Display labels for the mode switcher. The internal mode keys above are what workspace
+# files and dock maps are keyed by; change a label here, never a key.
 MODE_LABELS = {
     VISUALIZATION: "Bus Visualizer",
     TIMING: "Timing Calculator",
@@ -43,16 +43,21 @@ class ModeManager:
             (0=Visualization, 1=Timing, 2=Analysis).
         mode_docks: mode name → the docks that belong to that mode.
         on_change: optional callback invoked with the new mode name after a switch.
+        before_change: optional callback invoked before leaving the current mode, ahead of
+            the snapshot of its arrangement (a maximized pane is put back first, so the
+            snapshot is the user's layout rather than the maximized one).
     """
 
     def __init__(self, window: QMainWindow,
                  set_central_index: Callable[[int], None],
                  mode_docks: Dict[str, List[QDockWidget]],
-                 on_change: Optional[Callable[[str], None]] = None) -> None:
+                 on_change: Optional[Callable[[str], None]] = None,
+                 before_change: Optional[Callable[[], object]] = None) -> None:
         self._window = window
         self._set_central = set_central_index
         self._mode_docks = mode_docks
         self._on_change = on_change
+        self._before_change = before_change
         self._states: Dict[str, bytes] = {}     # mode → saved QMainWindow state
         self._current: Optional[str] = None
         self._actions: Dict[str, QAction] = {}
@@ -60,10 +65,8 @@ class ModeManager:
         self._build_mode_menu()
 
     def _build_mode_menu(self) -> None:
-        """Mode switching lives in a 'Mode' menu rather than a toolbar. On macOS the
-        menu bar is the system bar (zero in-window height), so this reclaims the
-        vertical space the toolbar used. The current mode is checkmarked; Ctrl+1/2/3
-        switch directly."""
+        """Build the 'Mode' menu: one checkable action per mode, the current mode
+        checkmarked; Ctrl+1/2/3 switch directly."""
         mb = self._window.menuBar()
         menu = QMenu("&Mode", self._window)
         group = QActionGroup(self._window)
@@ -76,8 +79,7 @@ class ModeManager:
             menu.addAction(act)
             act.triggered.connect(lambda _checked=False, mm=m: self.switch_to(mm))
             self._actions[m] = act
-        # First in the bar (after macOS's own application menu): the mode decides what
-        # every other menu holds, since each shows only what applies to it.
+        # First in the bar (after macOS's own application menu).
         actions = mb.actions()
         if actions:
             mb.insertMenu(actions[0], menu)
@@ -94,6 +96,8 @@ class ModeManager:
         if mode == self._current:
             self._actions[mode].setChecked(True)
             return
+        if self._current is not None and self._before_change is not None:
+            self._before_change()
         # Snapshot the arrangement of the mode we're leaving so we can restore it.
         if self._current is not None:
             self._states[self._current] = bytes(self._window.saveState())

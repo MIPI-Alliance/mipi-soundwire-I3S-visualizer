@@ -1,17 +1,10 @@
 """Digital-CSV ingest is BOUNDED and BATCH-INVARIANT.
 
-Two properties, both of which the loader lacked:
+1. **Bounded.** The loader reads in batches and refuses a file predicted over the memory
+   budget before reading it, fail-closed like the `.sal` path's guard.
 
-1. **Bounded.** It used to build a Python list of every row plus three more full-length
-   Python lists, peaking at ~12x the file size (415 MB for a 34 MB / 2M-row export) with no
-   guard at all — while the `.sal` path has had a fail-closed memory guard and tests for
-   several releases. A format the architecture doc calls multi-GB cannot cost 12x.
-
-2. **Batch-invariant.** The fix reads in batches, which introduces exactly the failure mode
-   the ingest review warned about for every other chunked reader here: a boundary bug that
-   only shows when a batch edge lands mid-capture. So the interesting test is not "does it
-   load" but "does a batch size that forces many boundaries produce byte-identical output to
-   one that forces none".
+2. **Batch-invariant.** A batch size that forces many boundaries produces byte-identical
+   output to one that forces none, so a batch edge landing mid-capture changes nothing.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_digital_csv_bounded.py
 """
@@ -64,9 +57,8 @@ def test_batching_does_not_change_the_capture(monkeypatch):
 
 
 def test_a_bad_time_cell_is_dropped_whichever_batch_it_lands_in(monkeypatch):
-    """The non-numeric-time fallback moved inside the per-batch conversion, so it now runs
-    per batch instead of once over the whole file. A stray cell must still be dropped, and
-    dropping it must not depend on where the batch boundaries fall."""
+    """The non-numeric-time fallback runs inside the per-batch conversion. A stray cell is
+    dropped, and dropping it does not depend on where the batch boundaries fall."""
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(os.path.join(d, "bad.csv"), 400, bad_time_at=201)
         monkeypatch.setattr(digital_csv, "_ROW_CHUNK", 10_000)

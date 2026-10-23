@@ -1,19 +1,15 @@
 """PHY-agnostic invariants that must hold for EVERY audio-mode PHY.
 
-Most of the PHY3 (DLV) bugs we hit were the same shape: shared Session/decoder code
-that was correct for FBCSE (PHY2) but silently wrong for DLV — the sparse-clock_edges
-UI↔sample mapping threw off row/column/cursor math, the recovered-clock RSP marks were
-non-periodic, and the windowed bit-sample overlay drew nothing because the DLV source
-wasn't seekable. None of it was caught because tests exercised one PHY, used tiny demos
-that never reached the deep/reconfigured regions, and asserted outputs in isolation
-rather than cross-view CONSISTENCY.
+Shared Session/decoder code can be correct for FBCSE (PHY2) and wrong for DLV (e.g. the
+UI↔sample mapping, the recovered-clock RSP marks, a seekable sample source). These checks
+assert cross-view CONSISTENCY rather than outputs in isolation.
 
 This module runs one set of structural invariants against every synthesizable PHY, on a
 demo long enough to span the Safe-Lock→audio reconfigure and reach a deep region. Any
-future PHY (PHY1 when synthesized, or a real-capture path) gets the same coverage by
-adding it to `PHYS`. The invariants are deliberately PHY-independent — they assert the
-relationships the UI relies on, not PHY-specific values — so they catch "works for one
-PHY, broken for another" regressions.
+future PHY (or a real-capture path) gets the same coverage by adding it to `PHYS`. The
+invariants are deliberately PHY-independent — they assert the relationships the UI relies
+on, not PHY-specific values — so they catch "works for one PHY, broken for another"
+regressions.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_phy_invariants.py
 """
@@ -23,15 +19,12 @@ import pytest
 from swi3s_studio.session import Session
 
 # Audio-mode PHYs that Session.from_demo can synthesize. All three inherit every invariant
-# below. PHY1 (FBCSE-slow) was excluded on the premise that it "isn't built yet"; it has been
-# since 3.0.11, and adding it here passed 26 of 27 immediately — the one failure was an
-# assertion pinning the 4-port demo shape, not a PHY invariant (see test_audio_streams_present).
+# below.
 PHYS = [1, 2, 3]
 _DEMO_SAMPLES = 1500          # spans the 4-col Safe-Lock → 16-col audio reconfigure and
 #                               leaves a deep region for drift/seek coverage.
 
-# The port set each demo synthesizes. NOT an invariant — demo shape, which is precisely why
-# hardcoding one set here excluded a whole PHY from the 26 checks that ARE invariant.
+# The port set each demo synthesizes. NOT an invariant — demo shape, kept per PHY.
 _DEMO_STREAMS = {
     1: [(0, 0), (0, 1), (0, 2)],                    # PHY1: 4-col bus, three ports
     2: [(0, 0), (0, 1), (0, 2), (0, 3)],
@@ -56,8 +49,7 @@ def _row_samples(s: Session) -> float:
 
 def test_ui_and_row_mapping_monotonic(sess):
     """`_ui_for_sample` and `bus_row_for_sample` are monotonic non-decreasing in the
-    sample number — the property the DLV sparse-clock_edges mapping violated (it
-    under-counted UIs, so a later sample mapped to an earlier row)."""
+    sample number (an under-counted UI index maps a later sample to an earlier row)."""
     pts = _audio_points(sess)
     uis = np.array([sess._ui_for_sample(int(x)) for x in pts])
     rows = np.array([sess.bus_row_for_sample(int(x)) for x in pts])
@@ -79,8 +71,7 @@ def test_batch_and_scalar_row_numbering_agree(sess):
 
 def test_row_sample_round_trip_stays_in_row(sess):
     """sample → row → sample lands at/before the sample and inside the SAME row — so a
-    clicked command/commit anchors on its own row's Row Sync Point. (The DLV inverse
-    `_sample_at_bus_row` used to round-trip to a totally different time.)"""
+    clicked command/commit anchors on its own row's Row Sync Point."""
     for x in _audio_points(sess):
         row = sess.bus_row_for_sample(int(x))
         back = sess._sample_at_bus_row(row)
@@ -92,9 +83,8 @@ def test_cursor_geometry_consistent_across_views(sess):
     """The column count a cursor sees must agree across the three ways the UI derives it:
     the Bus Grid's sample-based `column_count_at`, the segment `_segment_for_sample` falls
     in, AND the segment its BUS ROW falls in (row_base ranges — the Timeline/commands
-    path). This is the exact disagreement behind "Timeline shows 4col, Capture shows
-    16col" for one cursor: a wrong bus row put the cursor in the 4-col segment by row
-    while the grid read 16-col by sample."""
+    path). A wrong bus row would put the cursor in the 4-col segment by row while the grid
+    reads 16-col by sample."""
     segs = sess.segments
 
     def cols_for_row(row: int) -> int:
@@ -115,10 +105,9 @@ def test_cursor_geometry_consistent_across_views(sess):
 
 def test_rsp_marks_are_periodic_one_per_row(sess):
     """The Raw-view Row Sync Point marks recur once per row at a near-uniform row period
-    within a constant-width region — not the ragged/vanishing marks the DLV sparse-edge
-    indexing produced. The analyzer samples off-multiple of the UI, so a constant row
-    period quantises to two adjacent sample counts (e.g. 325/326) — the ±1 jitter a real
-    capture shows — hence a spread of at most one sample, not exactly zero."""
+    within a constant-width region. The analyzer samples off-multiple of the UI, so a
+    constant row period quantises to two adjacent sample counts (e.g. 325/326) — the ±1
+    jitter a real capture shows — hence a spread of at most one sample, not exactly zero."""
     row = _row_samples(sess)
     mid = int(sess.audio_start_sample) + int(0.5 * (sess.audio_end_sample - sess.audio_start_sample))
     lo, hi = mid, mid + int(30 * row)
@@ -132,8 +121,8 @@ def test_rsp_marks_are_periodic_one_per_row(sess):
 def test_windowed_bit_samples_resolve_and_are_consistent(sess):
     """The on-demand windowed bit-sample overlay (Show Samples) resolves in the audio
     region for EVERY PHY, everywhere in the capture, and a sub-window is exactly the
-    super-window's bits clipped to it. DLV drew nothing because its sample source wasn't
-    seekable; a mid-capture-only test would also have missed a deep-region seek failure.
+    super-window's bits clipped to it. It needs a seekable sample source, and checks a deep
+    region as well as mid-capture.
     """
     row = _row_samples(sess)
     a, end = int(sess.audio_start_sample), int(sess.audio_end_sample)
@@ -161,10 +150,9 @@ def test_row_math_matches_rsp_ground_truth(sess):
     (`cds_column_samples`, derived from the recovered clock / edges, not from the row
     formulas). Each RSP is a true Column-0 row opener, so: it round-trips exactly
     (row → sample → same RSP), consecutive RSPs advance the row by exactly 1, and a
-    sample just after an RSP shares that RSP's row. Regression: the row math anchored on
-    the segment's CDS-column UI without adding the CDS offset, so every DLV row came out
-    one low and the cursor landed 2 UIs off — self-consistent (so round-trip/consistency
-    tests passed) but wrong against this external ground truth."""
+    sample just after an RSP shares that RSP's row. The row math must add the CDS offset to
+    the segment's CDS-column UI; an error there is self-consistent (round-trip and
+    consistency tests pass) but wrong against this external ground truth."""
     row = _row_samples(sess)
     a = int(sess.audio_start_sample) + int(5 * row)
     marks = np.asarray(sess.cds_column_samples(a, a + int(12 * row))).astype(np.int64)
@@ -182,11 +170,10 @@ def test_audio_streams_present(phy):
     guard that a shared decode path didn't regress audio for one PHY while another worked.
 
     Parametrized rather than taking the shared `sess`, because the expected set is per-PHY
-    and a Session does not record which PHY built it. The previous version hardcoded the
-    4-port PHY2/PHY3 shape, which is what kept PHY1 out of this file entirely.
+    and a Session does not record which PHY built it.
 
-    Also asserts each stream is NON-EMPTY, which the set comparison alone never did: a port
-    that decoded zero samples still appeared in `audio_streams()` and passed."""
+    Also asserts each stream is NON-EMPTY: a port that decodes zero samples still appears in
+    `audio_streams()`."""
     sess = Session.from_demo(_DEMO_SAMPLES, cold_start=True, phy=phy)
     assert sess.audio_streams() == _DEMO_STREAMS[phy]
     counts = {}
@@ -199,10 +186,9 @@ def test_audio_streams_present(phy):
 @pytest.mark.parametrize("phy", PHYS, ids=[f"phy{p}" for p in PHYS])
 def test_redecode_preserves_phy_and_audio(phy):
     """An in-place re-decode (scrambler / hub / register what-if) must keep the SAME PHY
-    framing and audio. Regression: `_redecode` rebuilt the source as forwarded-clock
-    FBCSE, so a scrambler override on a DLV session silently reverted it — wrong segments
-    and corrupt audio — while `is_dlv` still reported True. (Own session, not the shared
-    fixture, since it re-decodes in place.)"""
+    framing and audio: `_redecode` must rebuild a DLV session's source as DLV, not as
+    forwarded-clock FBCSE. (Own session, not the shared fixture, since it re-decodes in
+    place.)"""
     s = Session.from_demo(_DEMO_SAMPLES, cold_start=True, phy=phy)
     is_dlv, segs, n_audio = s.is_dlv, [x["column_count"] for x in s.segments], s.audio_count
     n_rows = s.recovered_clock()[0].size if is_dlv else -1

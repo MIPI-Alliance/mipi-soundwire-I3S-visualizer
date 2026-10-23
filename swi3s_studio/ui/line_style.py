@@ -16,8 +16,8 @@ What can be set, per theme:
 and, for both themes, a line weight in pixels for the Audio and Capture traces.
 
 Colours are stored per theme because a colour picked for one can vanish on the other's
-plot background, which is the bug the per-theme line palette fixed. Bus Grid cells are
-not lines and keep their fills (`grid_view.dp_stream_color`).
+plot background. Bus Grid cells are not lines and keep their fills
+(`grid_view.dp_stream_color`).
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ WEIGHT_KEY = "waveforms/weights"    # QSettings: JSON {kind: px}
 
 KINDS = ("dp", "bookmark", "capture", "timing")
 WEIGHT_KINDS = ("audio", "capture")
-DEFAULT_WEIGHTS = {"audio": 1, "capture": 2}
+DEFAULT_WEIGHTS = {"audio": 2, "capture": 2}
 MIN_WEIGHT, MAX_WEIGHT = 1, 4
 
 # (device, dp, mode) -> "#rrggbb": one Link's per-stream overrides.

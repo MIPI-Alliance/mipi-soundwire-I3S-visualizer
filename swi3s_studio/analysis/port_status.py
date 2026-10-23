@@ -1,12 +1,9 @@
 """Peripheral-reported status and error registers, decoded from the read replies.
 
-The analyzer forms its own opinion of the bus by decoding the wire. A peripheral also
-reports on ITSELF — through the ``IntStat_*`` interrupt-status bits it latches, the
-``DevStat_*`` device-status bits, and the saturating ``EC_*`` error counters. That is the
-device's own account of what went wrong, and it is on the wire whenever the Manager polls
-it. The register map already resolved those replies to field names; nothing read their
-VALUES, so a capture in which a peripheral raised ``IntStat_PortImpDef_1`` decoded
-perfectly clean and said so.
+A peripheral reports on ITSELF through the ``IntStat_*`` interrupt-status bits it latches,
+the ``DevStat_*`` device-status bits, and the saturating ``EC_*`` error counters; they are
+on the wire whenever the Manager polls it. This module decodes their VALUES from the read
+replies.
 
 Classification is by FIELD NAME, not by a table of addresses here, so the coverage grows
 with ``data/registers.json`` instead of with this module:
@@ -104,14 +101,11 @@ class Report:
     def label(self) -> str:
         """One-line summary, faults first — what a command row should show.
 
-        A counter's whole point is its value, so ``EC_*`` / ``COUNT_*`` always carry the
-        number; a flag set to 1 reads better bare. With no fault to report, fall back to
-        the live state — naming only the non-zero fields once a register holds more than a
-        handful, so an 8-bit array doesn't spell out seven zeros to report one bit.
+        ``EC_*`` / ``COUNT_*`` fields always carry their value; a flag set to 1 is shown
+        bare. With no fault to report, fall back to the live state, naming only the
+        non-zero fields once a register holds more than four.
 
-        An ImpDef/SDCA field is listed as-is, with nothing appended to classify it: the
-        NAME already says ImpDef or SDCA, which is the spec's own term for it, and
-        "(vendor-defined)" after it neither named the spec term nor added information."""
+        An ImpDef/SDCA field is listed by name alone."""
         counter = self.register.startswith(("EC_", "COUNT_"))
 
         def show(name: str, value: int) -> str:
@@ -173,8 +167,7 @@ def reports_for(cmd: dict) -> List[Report]:
 def fault_label(cmd: dict) -> Optional[str]:
     """Label for a command whose reply reported a fault or an ImpDef/SDCA event, else None.
 
-    Plain state (PortSyncOK=0, ReadyCh=3, a zero counter) is NOT an error — it is normal
-    polling, and flagging it would bury the real reports under thousands of rows."""
+    Plain state (PortSyncOK=0, ReadyCh=3, a zero counter) is NOT an error."""
     for r in reports_for(cmd):
         if r.faults or r.vendor:
             return r.label()

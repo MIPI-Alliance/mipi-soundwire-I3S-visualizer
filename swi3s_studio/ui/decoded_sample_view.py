@@ -170,8 +170,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setAlternatingRowColors(True)
-        # Decimal is sized to its contents like the rest, not stretched: stretched, its width
-        # was whatever the other columns left, so stacked Links' tables differed.
+        # Decimal is sized to its contents like the rest, not stretched, so stacked Links'
+        # tables have matching columns.
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.itemSelectionChanged.connect(self._on_select)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -294,10 +294,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         prev_sel = self._suppress_select      # setRowCount also churns selection → don't echo it
         self._suppress_select = True
         t.setUpdatesEnabled(False)            # bulk-fill a VISIBLE table without a per-item
-        #                                       relayout/repaint (offscreen elides these, but on a
-        #                                       real display filling ~8k rows x 6 cols one setItem
-        #                                       at a time otherwise triggers thousands of paints —
-        #                                       the "selecting Samples takes tens of seconds" hang).
+        #                                       relayout/repaint (on a real display each setItem
+        #                                       would otherwise paint).
         t.blockSignals(True)
         try:
             t.setRowCount(len(self._samples))
@@ -392,15 +390,11 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             self._suppress_scroll = prev
             self._suppress_select = prev_sel
         self._rebuild_starts()
-        # Re-anchor under the scroll guard. This setValue is programmatic, but the scrollbar
-        # is a separate object from the table, so the blockSignals() above never covered it —
-        # and once n rows have been inserted above, the new value can land within _EDGE_PAD of
-        # either end, which _on_scroll reads as the USER scrolling there and answers with
-        # another edgeReached. A scroll-to-top extend therefore also appended a chunk at the
-        # BOTTOM, doubling the work and, at _MAX_LOADED, evicting the rows the user had just
-        # scrolled up to reach. The old 4000-row window hid this: 12000 + 4000 was exactly
-        # _MAX_LOADED, so the stray append's own eviction put the row count back on the
-        # expected number and test_window_is_bounded_and_lazily_extends stayed green.
+        # Re-anchor under the scroll guard. The scrollbar is a separate object from the
+        # table, so the blockSignals() above does not cover it, and once n rows have been
+        # inserted above, the new value can land within _EDGE_PAD of either end, which
+        # _on_scroll would read as the USER scrolling there and answer with another
+        # edgeReached.
         self._suppress_scroll = True
         try:
             sb.setValue(top_before + n)           # keep the previously-visible rows in place

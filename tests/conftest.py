@@ -14,19 +14,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # QSettings needs a non-empty organisation/application name to persist reliably on
 # Windows (its registry scope is keyed on them). The real app sets these in app.py, but
-# tests build a bare QApplication — so per-mode dir-memory (capture/last_dir_*) tests
-# didn't round-trip on Windows and fell back to the default examples dir. Set a
-# TEST-scoped identity here (distinct from the app's, so it never touches a developer's
-# real saved settings), before any test constructs a QApplication.
+# tests build a bare QApplication, so a TEST-scoped identity is set here (distinct from
+# the app's, so it never touches a developer's real saved settings), before any test
+# constructs a QApplication.
 from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+# Tests use PySide directly, not only through the app's ui package, which pins them too.
+from swi3s_studio.ui.singleton_pin import pin_singletons  # noqa: E402
+
+pin_singletons()
 
 QCoreApplication.setOrganizationName("MIPI SWI3S Test")
 QCoreApplication.setApplicationName("SWI3S Studio Test")
 
-# And keep them in a throwaway ini, not a file of the developer's: the test identity alone
-# still wrote ~/Library/Preferences (or the registry) and kept what one run saved for the
-# next. Every QSettings() of the run, the app's included, reads and writes this one, and
-# each test starts with it empty (_fresh_settings).
+# And keep them in a throwaway ini, not a file of the developer's. Every QSettings() of
+# the run, the app's included, reads and writes this one, and each test starts with it
+# empty (_fresh_settings).
 import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
@@ -39,11 +42,11 @@ QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _SETTINGS_DIR)
 
 # ---------------------------------------------------------------- no test may block on a modal
 # Offscreen, a modal dialog has nobody to dismiss it: an un-patched QMessageBox or file
-# picker is a hang until the CI job's timeout, not a failure (the Locate Sub-Capture test
-# did exactly that on its "found N" box). Every modal entry point the app uses is replaced
-# for every test with one that answers "cancel" and records the call, and a test that
-# opened one it did not patch FAILS at teardown, naming the dialog. A test that means to
-# drive a dialog patches the entry point itself; its monkeypatch lands after this one.
+# picker is a hang until the CI job's timeout, not a failure. Every modal entry point the
+# app uses is replaced for every test with one that answers "cancel" and records the call,
+# and a test that opened one it did not patch FAILS at teardown, naming the dialog. A test
+# that means to drive a dialog patches the entry point itself; its monkeypatch lands after
+# this one.
 # The static helpers run in C++, so patching exec() alone would not catch them.
 _MODAL_CANCEL = {
     ("QMessageBox", "question"): None, ("QMessageBox", "information"): None,
@@ -89,9 +92,9 @@ def _no_unexpected_modal(monkeypatch):
         monkeypatch.setattr(getattr(QtWidgets, cls_name), meth, stub)
     # QMenu.exec also has a STATIC overload, exec(actions, pos), and PySide 6.11 resolves
     # `menu.exec(...)` on an instance to the built-in method whatever the class attribute
-    # holds: the stub above caught only `QMenu.exec(menu, pos)`, and a right-click menu
-    # opened for real and hung. Route the instance
-    # lookup through the class attribute, so this stub, or a test's own patch, answers.
+    # holds, so the stub above alone catches only `QMenu.exec(menu, pos)`. Route the
+    # instance lookup through the class attribute, so this stub, or a test's own patch,
+    # answers.
     menu_getattr = QtWidgets.QMenu.__getattribute__
 
     def _menu_getattr(self, name):
@@ -121,9 +124,8 @@ def _fresh_settings():
 
 @pytest.fixture(autouse=True)
 def _no_swallowed_slot_exception(monkeypatch):
-    """An exception raised in a Qt slot fails the test that raised it. PySide prints it
-    and carries on, so the app was broken while the test passed: Open Capture's dialog
-    raised an AttributeError as it was built, and every test of it was green."""
+    """An exception raised in a Qt slot fails the test that raised it. PySide only
+    prints it and carries on."""
     import sys
     import traceback
     raised = []
@@ -138,22 +140,19 @@ def _no_swallowed_slot_exception(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _close_the_tests_windows(monkeypatch):
-    """Close, after each test, the MainWindows it built, joining their workers. Left open
-    they pile up, and every later test that runs the event loop paid for all of them. A
-    window from a wider-scoped fixture was built before the test, so it is left to its
-    fixture.
+    """Close, after each test, the MainWindows it built, joining their workers, so they
+    do not pile up under every later test that runs the event loop. A window from a
+    wider-scoped fixture was built before the test, so it is left to its fixture.
 
     The windows are recorded as they are built, not found afterwards: listing the
     application's top-level widgets wraps every one of them, a half-destroyed one
-    included, and that segfaulted the pooled run. And they are DELETED, not just closed:
-    a closed window is kept alive by its own Qt connections to its methods, with every
-    Link it decoded, and the pooled run reached 17 GB, enough to exhaust a 4 GB machine.
-    Deleting them used to crash later tests through a QTimer.singleShot of the old window
-    firing on it; the window's timers now have it as their context, so they die with it.
+    included, which can segfault. And they are DELETED, not just closed: a closed window
+    is kept alive by its own Qt connections to its methods, with every Link it decoded.
+    The window's timers have it as their context, so they die with it.
 
-    A TimingView a test built on its own, with no parent, is deleted here too. Left to the
-    collector below, one the test had clicked segfaulted it on Python 3.13 (PySide 6.11);
-    deleted the way Qt deletes a child, it does not."""
+    A TimingView a test built on its own, with no parent, is deleted here too, the way Qt
+    deletes a child; left to the collector below, one the test had clicked can segfault
+    (Python 3.13, PySide 6.11)."""
     from shiboken6 import isValid
 
     from swi3s_studio.ui.main_window import MainWindow
@@ -197,8 +196,8 @@ def _close_the_tests_windows(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_modifier_left_held():
     """A test that pressed a modifier through QTest lets go of it. QTest keeps Ctrl held
-    after a key sequence, beyond the test and its windows, and a later test's row click
-    in another file read as a Ctrl-click (an order-dependent failure far from its cause)."""
+    after a key sequence, beyond the test and its windows, so a later test's row click
+    would read as a Ctrl-click."""
     yield
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
@@ -224,6 +223,35 @@ def pump_loads(win, seconds: float = 120.0) -> None:
         time.sleep(0.005)
 
 
+# ---------------------------------------------------------------- perf margins, pass or fail
+# A wall-clock ceiling reports its measurement only when it fails. The ceilings that
+# record here are printed at the end of the session, each as a fraction of its ceiling,
+# whatever the outcome.
+_PERF_MARGINS: list = []
+
+
+def record_perf(name: str, median: float, ceiling: float,
+                worst: float, worst_ceiling: float) -> None:
+    """Note a perf test's measured median and worst against their ceilings (seconds), for the
+    session summary. Call it BEFORE the asserts, so a failing run reports it too."""
+    _PERF_MARGINS.append((name, median, ceiling, worst, worst_ceiling))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG001
+    if not _PERF_MARGINS:
+        return
+    import platform
+    import sys
+    tr = terminalreporter
+    tr.section("perf margins")
+    tr.write_line(f"{sys.platform} {platform.machine()}, Python {platform.python_version()}, "
+                  f"GITHUB_ACTIONS={os.environ.get('GITHUB_ACTIONS', '-')}")
+    for name, median, ceiling, worst, worst_ceiling in _PERF_MARGINS:
+        tr.write_line(f"{name}: median {median * 1000:.0f} / {ceiling * 1000:.0f} ms "
+                      f"({median / ceiling:.0%}), worst {worst * 1000:.0f} / "
+                      f"{worst_ceiling * 1000:.0f} ms ({worst / worst_ceiling:.0%})")
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """Join every MainWindow's worker threads before the interpreter tears down.
 
@@ -234,8 +262,16 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     tests/run_all.sh, which judges each suite by its exit code.
 
     Fixing it here rather than per-test covers every suite, including ones added later.
+
+    Then every object tree Python still owns is deleted, as the app does on quit, so
+    PySide's own sweep at exit has nothing left to destroy (see
+    swi3s_studio/ui/teardown.py).
     """
     _join_all_main_windows()
+    from PySide6.QtWidgets import QApplication
+    if QApplication.instance() is not None:
+        from swi3s_studio.ui.teardown import release_python_owned_qobjects
+        release_python_owned_qobjects()
     shutil.rmtree(_SETTINGS_DIR, ignore_errors=True)
 
 
@@ -257,9 +293,8 @@ def _join_all_main_windows() -> None:
 # ---------------------------------------------------------------- payload skipping in the demos
 # The PHY1/PHY2/PHY3 demos carry DP0 at 44.1 kHz on 48 kHz transport opportunities: 13 of every
 # 160 intervals are skipped (Section 14.1.10). 44100/48000 == 147/160 exactly, and 160 is the
-# smallest denominator that can express it. Named here rather than repeated as 44_100 in each
-# test, so a test states the RULE — a rate derived from the skipping fraction — instead of a
-# constant that says nothing about where it comes from.
+# smallest denominator that can express it. Named here so a test states the RULE — a rate
+# derived from the skipping fraction — instead of a bare 44_100.
 DEMO_SKIP_NUMERATOR = 13
 DEMO_SKIP_DENOMINATOR = 160
 DEMO_PCM_OPPORTUNITY_HZ = 48_000.0
@@ -274,17 +309,15 @@ def demo_skipped_rate_hz(opportunity_hz: float = DEMO_PCM_OPPORTUNITY_HZ) -> flo
 def demo_transported_samples(opportunities: int) -> tuple[int, int]:
     """(low, high) bound on how many of `opportunities` intervals actually transport.
 
-    NOT an exact number, deliberately. The skip decision is a Bresenham accumulator
+    A bound, not an exact number. The skip decision is a Bresenham accumulator
     (CDataPort::advanceSkippingAccumulator) that RESTARTS at every SSP — Section 9.1.6.2.1 — so
     the exact count depends on how many SSPs the capture contains and which interval each lands
     on. The three demos differ there: at 1500 samples/channel PHY1 transports 1380 and PHY2/PHY3
     transport 1379, because PHY1's mid-capture reconfigure and their SSPA cadences reset the
     accumulator at different points.
 
-    A bound that is honest about what the phase depends on beats a constant that happens to
-    match two demos out of three (a single-run count is wrong for PHY1 by one). The strong assertion is not the count anyway: it is
-    that every transported VALUE equals the generated sine (see test_demo_skipping), which a
-    mis-phased skip breaks immediately.
+    The value check is in test_demo_skipping: every transported VALUE equals the generated
+    sine.
     """
     exact = opportunities * (DEMO_SKIP_DENOMINATOR - DEMO_SKIP_NUMERATOR) / DEMO_SKIP_DENOMINATOR
     # One extra sample per SSP at most; no demo has more than a handful.
@@ -292,11 +325,11 @@ def demo_transported_samples(opportunities: int) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------- two Links on one timeline
-# No capture in or around the repository has more than one Link, and every native demo
-# generator produces one bus, so the multi-Link tests use the app's own two-Link demo
-# (File ▸ Open Demo Capture ▸ PHY2 (Two Links)): the PHY2 demo, and the flow-control demo
-# delayed by a known number of samples at the shared 500 MHz analyzer rate. The demo
-# generators themselves are untouched: exact-value demo tests depend on them.
+# Every native demo generator produces one bus, so the multi-Link tests use the app's own
+# two-Link demo (File ▸ Open Demo Capture ▸ PHY2): the PHY2 demo, and the
+# flow-control demo delayed by a known number of samples at the shared 500 MHz analyzer
+# rate. The demo generators themselves are untouched: exact-value demo tests depend on
+# them.
 from swi3s_studio.ingest.transitions import DEMO_LINK2_DELAY_SAMPLES  # noqa: E402
 
 TWO_LINK_SHIFT_SAMPLES = DEMO_LINK2_DELAY_SAMPLES       # ~2.47 ms at 500 MHz

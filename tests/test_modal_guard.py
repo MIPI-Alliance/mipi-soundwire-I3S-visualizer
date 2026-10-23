@@ -44,8 +44,8 @@ def test_an_unpatched_modal_is_cancelled_and_recorded(_no_unexpected_modal):
 
 def test_a_menu_opened_on_an_instance_is_cancelled(monkeypatch, _no_unexpected_modal):
     """QMenu.exec has a static overload, so PySide answers `menu.exec(pos)` with the
-    built-in method even when the class attribute is patched: without the guard's
-    __getattribute__ route this opened a real menu and hung."""
+    built-in method even when the class attribute is patched; the guard routes it through
+    __getattribute__."""
     from PySide6.QtCore import QPoint
     from PySide6.QtWidgets import QMenu
     QApplication.instance() or QApplication([])

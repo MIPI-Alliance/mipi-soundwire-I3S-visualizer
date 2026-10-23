@@ -3,8 +3,7 @@
 A long capture is ~98% Pings; with millions of samples per timeline pixel, many
 commands collide on one x. The ribbon paints ticks in ASCENDING importance so a
 significant mark (Write/Read, commit, CRC error) WINS the pixel over a colliding
-Ping — fixing the bug where a Write tick was overpainted by a later Ping and
-vanished. This checks the paint-order rank (tick_rank) that drives that sort,
+Ping. This checks the paint-order rank (tick_rank) that drives that sort,
 without relying on fragile offscreen pixel rendering.
 
 Run: python3 -m pytest tests/test_timeline.py
@@ -53,12 +52,8 @@ def test_colors_distinct():
 
 def test_legend_tick_heights_match_what_the_painter_draws():
     """The legend describes ticks by HEIGHT ("tall red", "short blue"), but the painter
-    gates height on COLOUR: `tall = color in (_C_ERROR, _C_SSP)`. Nothing tied the two, and
-    they drifted — "SSP Announce" (SEM_SSP, therefore drawn tall) was described as a plain
-    "(gold tick)" among neighbours that all say "short", implying a distinction from
-    "Commit + SSP" that the painter cannot draw: same colour, same rank, same height.
-
-    Found by the 3.0.11 release review, by measuring gold pixel spans in a render.
+    gates height on COLOUR: `tall = color in (_C_ERROR, _C_SSP)`. This ties the two: a
+    tall-colour tick's legend says "tall", and no other tick's does.
     """
     tall_tokens = {"SEM_ERROR", "SEM_SSP"}          # mirrors the `tall = ...` gate
     for label, token, desc in tl._MARK_LEGEND_SPEC:
@@ -76,7 +71,7 @@ def test_legend_tick_heights_match_what_the_painter_draws():
 def test_sspa_and_commit_ssp_are_admittedly_indistinguishable():
     """They share colour AND rank, so the ribbon cannot separate them; the legend must not
     pretend otherwise. If SSPA is ever given its own colour/shape, update the legend text
-    (and delete this test) rather than letting the description drift again."""
+    (and delete this test)."""
     sspa = {"command": "SSPA", "has_manager_packet": True, "crc_valid": True,
             "has_sync_point": True}
     assert tl._kind_label(sspa) == "SSP Announce"
@@ -86,3 +81,24 @@ def test_sspa_and_commit_ssp_are_admittedly_indistinguishable():
     assert "Commit + SSP" in desc and "hover" in desc, (
         "the SSP Announce legend must say it looks like Commit + SSP and point at hover "
         f"as the way to tell them apart; got {desc!r}")
+
+
+def test_a_legend_entry_names_no_shade_its_colour_does_not_keep_in_both_palettes():
+    """The legend text is the same in every palette, and only the swatch follows it. An
+    entry whose colour flips between near-white and near-black (the cursor) must not name
+    a shade, or one palette shows a swatch that contradicts its text."""
+    from PySide6.QtGui import QColor
+
+    from swi3s_studio.ui import theme
+    shades = ("white", "black", "grey", "gray")
+    flipped = 0
+    for label, token, desc in tl._MARK_LEGEND_SPEC:
+        dark = QColor(theme._PALETTES["dark"][token]).lightnessF()
+        light = QColor(theme._PALETTES["light"][token]).lightnessF()
+        if abs(dark - light) < 0.5:
+            continue
+        flipped += 1
+        assert not any(w in desc.lower() for w in shades), (
+            f"{label!r} is {theme._PALETTES['dark'][token]} in dark and "
+            f"{theme._PALETTES['light'][token]} in light, but its legend says {desc!r}")
+    assert flipped, "the cursor's colour flips between the palettes"

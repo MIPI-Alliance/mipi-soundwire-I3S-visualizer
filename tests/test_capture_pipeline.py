@@ -181,9 +181,8 @@ def test_scrambler_override():
 
 
 def test_command_store_roundtrip(tmp_path):
-    # tmp_path, not a TemporaryDirectory: on Windows something (a scanner) can hold a
-    # just-written file for a moment, and TemporaryDirectory's cleanup then raised
-    # PermissionError in a test about the round trip, intermittently (1 run in 6).
+    # tmp_path, not a TemporaryDirectory: on Windows a scanner can hold a just-written
+    # file for a moment, and TemporaryDirectory's cleanup then raises PermissionError.
     res = decode_capture(transitions.demo_capture(32))
     table = command_store.commands_to_table(res.commands)
     assert table.num_rows == len(res.commands)

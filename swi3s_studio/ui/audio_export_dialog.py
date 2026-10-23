@@ -44,7 +44,11 @@ class AudioExportDialog(QDialog):
     each with its own optional resample rate.
 
     Range: whole capture, or the visible window the audio view is currently
-    showing, supplied as a sample-index range (i0, i1).
+    showing. `visible_sample_range` supplies that window as a capture-sample span
+    (s0, s1); index_range(dev, dp) maps it to each stream's own [i0, i1) slice, as
+    streams differ in rate and start position. `visible_index_range` supplies a
+    window already as one stream's indices (i0, i1), used as given; a capture-sample
+    span takes precedence when both are passed.
 
     `default_rates` ({(dev, dp): Hz}) seeds each stream's rate combo — typically
     the per-dataport decimation chosen for playback, so export matches playback.
@@ -52,7 +56,8 @@ class AudioExportDialog(QDialog):
 
     def __init__(self, store, visible_index_range: Optional[Tuple[int, int]] = None,
                  parent=None, default_rates: Optional[Dict[Tuple[int, int], int]] = None,
-                 names=None) -> None:
+                 names=None,
+                 visible_sample_range: Optional[Tuple[int, int]] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export audio as WAV")
         self._store = store
@@ -85,7 +90,12 @@ class AudioExportDialog(QDialog):
 
         self._range = QComboBox()
         self._range.addItem("Whole capture", None)
-        if visible_index_range is not None:
+        self._visible_samples: Optional[Tuple[int, int]] = None
+        if visible_sample_range is not None:
+            self._visible_samples = (int(visible_sample_range[0]),
+                                     int(visible_sample_range[1]))
+            self._range.addItem("Visible range (audio view)", self._visible_samples)
+        elif visible_index_range is not None:
             self._range.addItem("Visible range (audio view)", visible_index_range)
         rbox = QGroupBox("Range")
         rform = QFormLayout(rbox)
@@ -110,8 +120,26 @@ class AudioExportDialog(QDialog):
     def selected_streams(self) -> List[Tuple[int, int]]:
         return [k for k, cb in self._checks.items() if cb.isChecked()]
 
-    def index_range(self) -> Optional[Tuple[int, int]]:
+    def sample_range(self) -> Optional[Tuple[int, int]]:
+        """The chosen capture-sample span (s0, s1), or None for the whole capture or
+        for a window supplied as indices."""
+        if self._visible_samples is None:
+            return None
         return self._range.currentData()
+
+    def index_range(self, dev: Optional[int] = None,
+                    dp: Optional[int] = None) -> Optional[Tuple[int, int]]:
+        """The chosen [i0, i1) slice of stream (dev, dp), or None for the whole
+        capture. A capture-sample window maps through that stream's own sample
+        positions, so it needs `dev` and `dp`; without them it raises ValueError
+        rather than return indices that belong to no particular stream."""
+        rng = self._range.currentData()
+        if rng is None or self._visible_samples is None:
+            return rng
+        if dev is None or dp is None:
+            raise ValueError("a capture-sample window maps to indices per stream: "
+                             "pass the stream's device and data port")
+        return self._store.stream_index_range(int(dev), int(dp), *rng)
 
     def target_rate(self, dev: int, dp: int) -> Optional[int]:
         """Chosen resample rate in Hz for one stream, or None for native."""

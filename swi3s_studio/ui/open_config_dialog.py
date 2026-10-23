@@ -9,8 +9,7 @@ authoring (in-memory), and the action is one of:
   * Compare against decoded — overlay the config's expected registers in the
     Register Map (blue) beside the snooped values (green) and report the diff.
 
-This folds together the old File ▸ Apply Config CSV, Compare ▸ CSV Config, and
-Compare ▸ Visualizer into one place (see MainWindow.open_visualizer_config).
+The caller is MainWindow.open_visualizer_config.
 """
 from __future__ import annotations
 
@@ -87,8 +86,8 @@ class OpenVisualizerConfigDialog(QDialog):
         # Typing/browsing a path selects the file source; picking authoring is explicit.
         self._path_edit.textEdited.connect(lambda _t: self._from_file.setChecked(True))
         # "Update" writes a persistent config path into the session/workspace, so it's
-        # only offered for a real file. In-memory authoring is transient → Compare only
-        # (this is the old "Compare with Visualizer"). Toggling the source enforces that.
+        # only offered for a real file. In-memory authoring is transient → Compare only.
+        # Toggling the source enforces that.
         self._from_auth.toggled.connect(self._sync_action_enabled)
         self._sync_action_enabled()
         self._start_dir = start_dir

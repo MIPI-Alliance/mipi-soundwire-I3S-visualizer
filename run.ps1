@@ -14,7 +14,6 @@
 #>
 # $Rebuild is THIS script's flag; everything else is forwarded to the app verbatim
 # (ValueFromRemainingArguments), so `.\run.ps1 -c cfg.csv -o m.json` reaches the CLI.
-# Until 3.0.19 both launchers swallowed every argument.
 param(
     [switch]$Rebuild,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -23,9 +22,9 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
-# Pick a Python the wheels support: PySide6 / pyarrow / numpy publish wheels for
-# 3.11-3.13, not 3.14+ (pip would fall back to building from source and fail). Prefer
-# the newest supported via the py launcher, then fall back to `python` if it's in range.
+# Pick a Python the launcher supports: 3.11-3.13. 3.14 on Windows x64 works through the
+# manual setup in README.md. Prefer the newest supported via the py launcher, then fall
+# back to `python` if it's in range.
 $pyCmd = $null
 if (Get-Command py -ErrorAction SilentlyContinue) {
     foreach ($v in "3.13", "3.12", "3.11") {
@@ -38,22 +37,19 @@ if (-not $pyCmd) {
     if ($LASTEXITCODE -eq 0) { $pyCmd = "python" }
 }
 if (-not $pyCmd) {
-    Write-Error ("Need Python 3.11-3.13 (PySide6/pyarrow/numpy have no 3.14+ wheels yet). " +
+    Write-Error ("Need Python 3.11-3.13 (the versions this launcher supports). " +
                  "Install one, e.g.:  winget install --id Python.Python.3.12 -e")
     exit 1
 }
 
 # Does an interpreter have the C API headers (Python.h)? The decode core is C++, so a
-# build needs them. The python.org and Store builds ship them, but an embeddable
-# distribution or a stripped/managed install may not — and without this the failure lands
-# ~20 lines into compiling bindings.cpp as "fatal error: Python.h: No such file or
-# directory". sysconfig reports the BASE prefix, so a venv answers for its parent, which
-# is correct: a venv doesn't supply headers.
+# build needs them. The python.org and Store builds ship them; an embeddable distribution
+# or a stripped/managed install may not. sysconfig reports the BASE prefix, so a venv
+# answers for its parent, which is correct: a venv doesn't supply headers.
 function Test-PythonHeaders([string]$exe) {
     # Single quotes for the Python string literals and doubled "" for the cmd-level
-    # quoting — the same idiom as the version probes above. (Using \" here instead broke
-    # the argument and reported FALSE on a machine whose Python.h was present, which
-    # would have refused to build on every healthy Windows install.)
+    # quoting — the same idiom as the version probes above; \" does not escape a quote
+    # through cmd /c.
     $probe = "import os,sysconfig,sys; sys.exit(0 if os.path.isfile(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"
     # Callers pass the interpreter UNQUOTED — either a path ("...\python.exe", which may
     # contain spaces and so needs quoting) or a launcher invocation ("py -3.12", which
@@ -93,10 +89,9 @@ $venvDir = if ($env:SWI3S_VENV) { $env:SWI3S_VENV } else { Join-Path $env:LOCALA
 New-Item -ItemType Directory -Force -Path (Split-Path $venvDir) | Out-Null
 
 if (-not (Test-Path $venvDir)) {
-    # No venv yet => the native core will certainly have to be built. Check the headers
-    # NOW rather than after creating the venv and downloading ~200 MB of wheels: on a
-    # headerless install that work is wasted and the real error arrives minutes later.
-    # Skipped when SKBUILD_CMAKE_DEFINE already points the build at headers elsewhere.
+    # No venv yet => the native core will have to be built. Check the headers before
+    # creating the venv and downloading the wheels. Skipped when SKBUILD_CMAKE_DEFINE
+    # already points the build at headers elsewhere.
     if ((-not $env:SKBUILD_CMAKE_DEFINE) -and (-not (Test-PythonHeaders $pyCmd))) {
         Show-HeaderHelp $pyCmd
         Write-Error "Cannot build the decode core with $pyCmd - Python.h is missing."
@@ -125,11 +120,10 @@ if (-not (Test-Path $stamp) -or (Get-Item "requirements.txt").LastWriteTime -gt 
 $nativeStamp = Join-Path $venvDir ".native-stamp"
 $needNative = [bool]$Rebuild
 if (-not $needNative) {
-    # Probe whether the native core imports. This is EXPECTED to fail when the .pyd is
-    # stale/missing (e.g. right after a source sync) — that's the signal to rebuild. Run
-    # it via `cmd /c ... 2>nul` (like the Python-version probes above) so the traceback on
-    # stderr can't trip $ErrorActionPreference='Stop' and abort the launcher before the
-    # build step; we only care about the exit code.
+    # Probe whether the native core imports; a failure (stale or missing .pyd) means
+    # rebuild. Run via `cmd /c ... 2>nul` (like the Python-version probes above) so the
+    # traceback on stderr cannot trip $ErrorActionPreference='Stop'; only the exit code
+    # is read.
     & cmd /c """$python"" -c ""import swi3score"" 2>nul"
     if ($LASTEXITCODE -ne 0) { $needNative = $true }
 }
@@ -153,14 +147,11 @@ if ($needNative) {
         exit 1
     }
     Write-Host "Building the swi3score decode core (needs a C++ compiler - see the README)..."
-    # --force-reinstall because the native version is a fixed 0.1.0: a plain install
-    # no-ops ("Requirement already satisfied") and silently keeps a stale .pyd after a
-    # source change or a git-archive sync, which then trips the ABI check at import.
-    # --no-deps keeps it from re-resolving/reinstalling the app deps on every rebuild.
+    # --force-reinstall because the native version is a fixed 0.1.0, so a plain install
+    # no-ops and keeps a stale .pyd. --no-deps skips re-resolving the app deps.
     & $python -m pip install --force-reinstall --no-deps .\native
     if ($LASTEXITCODE -ne 0) {
-        # Don't guess at the cause (this used to assert a missing C++ compiler; the
-        # most common real failure is a working compiler but no Python headers).
+        # List the usual causes; do not assert one.
         Write-Error @"
 swi3score build failed. Not stamping - will retry next run.
   The build output above names the cause. The usual ones are:
@@ -175,11 +166,8 @@ swi3score build failed. Not stamping - will retry next run.
     New-Item -ItemType File -Path $nativeStamp -Force | Out-Null
 }
 
-# Say that the launch has started. Everything above prints as it works, so without this
-# the last thing on screen is a pip line and the window is the next event - which reads as
-# a stall, especially right after an install: the OS scans the several hundred MB of newly
-# written Qt libraries the first time they load. A warm start is ~1s.
-# -o implies headless, so neither message would be true of it.
+# Announce the launch; the first launch after an install is slow while the OS scans the
+# newly written Qt libraries. -o implies headless, so no window message is printed.
 $headless = @($AppArgs | Where-Object { $_ -eq "-o" -or $_ -eq "--output" -or
                                         $_ -like "-o=*" -or $_ -like "--output=*" -or
                                         $_ -eq "-h" -or $_ -eq "--help" }).Count -gt 0
@@ -193,8 +181,7 @@ if ($headless) {
 }
 
 $env:PYTHONPATH = "."
-# See run.sh: the app names the LAUNCHER in its usage line, not an installed console
-# script that a fresh checkout does not have.
+# The app names the launcher in its usage line — see cli.program_name().
 $env:SWI3S_LAUNCHER = ".\run.ps1"
 & $python -m swi3s_studio.app @AppArgs
 exit $LASTEXITCODE        # -o returns 0/1/2; swallowing it would make it useless

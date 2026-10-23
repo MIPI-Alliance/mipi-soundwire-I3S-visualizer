@@ -2,24 +2,20 @@
 
 Three things are pinned here:
 
-1. **Non-regression.** With both sides SWI3S the calculator is bit-identical to
-   the single-spec behaviour it had before the spec selector existed. The
-   cross-spec work must not perturb the validated SWI3S path.
+1. **Non-regression.** With both sides SWI3S the calculator gives the pinned
+   single-spec SWI3S margins.
 
 2. **Agreement with the `swtiming.interop` oracle** on all four setup legs, to
    within the two models' tPD-convention difference.
 
-3. **The anchor conversion that got them there.** Porting the mapping surfaced a
-   defect in the oracle: it converted the SWI3S clock-to-output to a pure delay
-   but fed SoundWire's t_OV in raw, double-counting 7.20 ns of output slew on
-   every leg where the SoundWire device transmits. That moved two published
-   margins (A/PM setup −14.28 → −7.08; B/MP setup −3.04 → +4.16, a sign flip)
-   and the binding setup leg in Scenario B. Fixed upstream; ORACLE below carries
-   the corrected values, and ``test_the_conversion_is_worth_the_whole_anchor_offset``
-   pins the mechanism so a partial application cannot pass.
+3. **The anchor conversion.** Both the SWI3S clock-to-output and SoundWire's
+   t_OV are reduced to a pure delay; ORACLE below carries the oracle's values, and
+   ``test_the_conversion_is_worth_the_whole_anchor_offset`` pins the mechanism so
+   a partial application cannot pass.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_timing_cross_spec.py
 """
+import itertools
 import math
 from dataclasses import replace as dc_replace
 
@@ -82,10 +78,8 @@ def _mixed(man_spec, per_spec, **kw):
 def test_swi3s_defaults_unchanged_by_the_spec_selector():
     """The default CalcInputs is SWI3S on both sides and must be untouched.
 
-    These margins are the pre-change values, transcribed. The selector defaults
-    to SWI3S/SWI3S precisely so the validated single-spec path is the default
-    path; if this moves, the cross-spec work has leaked into it.
-
+    The selector defaults to SWI3S/SWI3S, so the validated single-spec path is
+    the default path; these are its pinned margins.
     """
     r = compute(CalcInputs())
     expect = {
@@ -104,43 +98,133 @@ def test_every_leg_displays_the_margin_it_reports():
     """The equation on screen must SUM to the margin beside it, on every leg and every spec.
 
     A setup leg computes its margin from a `*_required` expression and builds its term list
-    SEPARATELY — two spellings of one inequality, with nothing tying them together. Change one
-    and the page shows an equation whose terms do not add up to the number it prints, which is
-    the worst kind of wrong for a tool whose whole output is "here is the arithmetic".
+    SEPARATELY — two spellings of one inequality, with nothing tying them together.
 
-    Found while sabotage-testing the reference cross-check: a 0.5 ns error injected into a
-    displayed Term left every margin untouched, so no test noticed. The cross-check compares
-    margins, and could not see it either. This closes that side.
+    Hold legs sum their terms to get the margin, so for them this is a tautology, asserted
+    anyway.
 
-    Hold legs sum their terms to get the margin, so for them this is a tautology — asserted
-    anyway, because which family a leg belongs to is not a property anyone should have to
-    remember before trusting the display.
+    THE LANES ARE ALSO RUN APART. With Man CLK, Man DATA and Per DATA at one t_RF, a leg that
+    computes its margin from the wrong data lane still sums correctly, so each configuration
+    is repeated with the three lanes at three different values, in every order.
     """
-    for spec in ("SWI3S_PHY2", "SWI3S_PHY2_PROP", "SW13_1V8"):
-        for extra in ({}, {"handover_UIs": 0.0}, {"Man_ede": True, "Per_ede": True}):
-            r = compute(_same(spec, **extra))
-            for name, b in r.breakdowns.items():
-                assert sum(t.value_ns for t in b.terms) == pytest.approx(b.margin_ns, abs=5e-9), \
-                    (f"{spec} {name}{extra}: terms sum to "
-                     f"{sum(t.value_ns for t in b.terms):+.4f} but the margin reads "
-                     f"{b.margin_ns:+.4f} — the equation and the number disagree")
+    lane_splits = [{}] + [
+        dict(zip(("tRF_Man_CLK_ns", "tRF_Man_DATA_ns", "tRF_Per_DATA_ns"), order))
+        for order in itertools.permutations((3.0, 5.0, 8.3))
+    ]
+    for spec, extra, lanes in itertools.product(
+            ("SWI3S_PHY2", "SWI3S_PHY2_PROP", "SW13_1V8"),
+            ({}, {"handover_UIs": 0.0}, {"Man_ede": True, "Per_ede": True}),
+            lane_splits):
+        cfg = {**extra, **lanes}
+        r = compute(_same(spec, **cfg))
+        for name, b in r.breakdowns.items():
+            assert sum(t.value_ns for t in b.terms) == pytest.approx(b.margin_ns, abs=5e-9), \
+                (f"{spec} {name}{cfg}: terms sum to "
+                 f"{sum(t.value_ns for t in b.terms):+.4f} but the margin reads "
+                 f"{b.margin_ns:+.4f} — the equation and the number disagree")
+
+
+def _displayed_sum(terms) -> float:
+    """The number the substitution row reads, evaluated as a reader would: the row's text
+    with its markup removed, `−` as minus and `·` as times."""
+    import re
+
+    from swi3s_studio.ui.timing_view import TimingView
+    text = re.sub(r"<[^>]+>", "", TimingView._numeric_only(terms))
+    expr = text.replace("−", "-").replace("·", "*")
+    assert re.fullmatch(r"[0-9.+\-*() ]+", expr), text
+    return float(eval(expr))                            # digits, operators and parentheses only
+
+
+@pytest.mark.parametrize("spec", SPEC_SOURCES)
+def test_every_leg_s_substitution_row_reads_its_margin(spec):
+    """The substitution row's numbers, as printed, add up to the margin beside them: a term
+    whose own value is negative keeps its sign (`− (−2.00)`), on every spec including the
+    EDE source on both sides. Each number is printed to two places, so the row is within a
+    rounding of the margin."""
+    for extra in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0}):
+        r = compute(_same(spec, **extra))
+        for name, b in r.breakdowns.items():
+            got = _displayed_sum(b.terms)
+            assert got == pytest.approx(b.margin_ns, abs=0.1), \
+                f"{spec} {name}{extra}: the row reads {got:+.2f}, the margin {b.margin_ns:+.2f}"
+
+
+def test_the_pp_setup_legs_follow_the_peripheral_data_lane():
+    """PP_setup and PP_setup_ho read the Per DATA lane and never the Man DATA lane.
+
+    A Peripheral drives the data on a P->P leg, so its late data crossing is on `Per DATA`.
+    Asserted three ways: moving Man DATA alone leaves both margins unchanged, moving Per DATA
+    alone moves them by the late-crossing coefficient times the change, and the worst-corner
+    search drives the Per DATA row to its slow end.
+    """
+    base = CalcInputs()
+    env = base.envelope()
+    for leg in ("PP_setup", "PP_setup_ho"):
+        m0 = compute(base).breakdowns[leg].margin_ns
+        m_man = compute(dc_replace(base, tRF_Man_DATA_ns=8.3)).breakdowns[leg].margin_ns
+        m_per = compute(dc_replace(base, tRF_Per_DATA_ns=8.3)).breakdowns[leg].margin_ns
+        assert m_man == pytest.approx(m0, abs=1e-12), (leg, m0, m_man)
+        assert m0 - m_per == pytest.approx(env.mp_late_rise * (8.3 - 5.0), abs=1e-9), \
+            (leg, m0, m_per)
+        picks = find_worst_corner_rows(leg, default_swi3s_rows(), base)
+        assert picks["t_RF Per DATA"] == "max", (leg, picks["t_RF Per DATA"])
+
+
+@pytest.mark.parametrize("man_shape,per_shape", [("linear", "exp"), ("exp", "linear")])
+def test_the_pp_data_crossing_takes_the_peripheral_ramp_shape(man_shape, per_shape):
+    """On every P->P leg peripheral A drives the data, so B's data crossing on
+    `Per_t_RF,DATA` takes Per_shape; the clock lane is the Manager's and takes Man_shape.
+
+    Pinned with the two shapes different, the only case where the choice shows: each
+    coefficient equals the single-shape envelope's for the device driving that lane.
+    """
+    from swi3s_studio.timing.delta_tpd import compute_delta_tpd_envelope
+
+    inp = CalcInputs(Man_shape=man_shape, Per_shape=per_shape)
+    man = compute_delta_tpd_envelope(ramp_shape=man_shape)
+    per = compute_delta_tpd_envelope(ramp_shape=per_shape)
+    coeffs = _crossing_coefficients(compute(inp).breakdowns)
+    want = {
+        ("X_PP,B,late", "Per_t_RF,DATA"): (per.mp_late_rise,
+                                           {"PP_setup", "PP_setup_ho"}),
+        ("X_PP,B,early", "Man_t_RF,CLK"): (man.mp_early_fall,
+                                           {"PP_setup", "PP_setup_ho"}),
+        ("X_PP,B,early", "Per_t_RF,DATA"): (per.mp_early_fall,
+                                            {"PP_hold", "PP_hold_ho"}),
+        ("X_PP,B,late", "Man_t_RF,CLK"): (man.mp_late_rise,
+                                          {"PP_hold", "PP_hold_ho"}),
+    }
+    for key, (value, legs) in want.items():
+        assert set(coeffs[key]) == legs, (key, coeffs[key])
+        for leg, got in coeffs[key].items():
+            assert got == pytest.approx(value, rel=1e-12), (key, leg, got, value)
+    # The margin moves with the Peripheral's shape through that lane. Against the same bus
+    # with the Manager's shape on both devices, PP_hold_ho differs by the data coefficient's
+    # change times the lane's t_RF, plus the change in A's pure turn-on (also Per_shape).
+    mixed = compute(inp).breakdowns["PP_hold_ho"]
+    same = compute(CalcInputs(Man_shape=man_shape, Per_shape=man_shape)).breakdowns["PP_hold_ho"]
+
+    def launch(b):
+        return next(t.value_ns for t in b.terms if t.symbol == "Per_t_ZD,pure")
+
+    shift = (per.mp_early_fall - man.mp_early_fall) * inp.tRF_Per_DATA_ns
+    assert (mixed.margin_ns - same.margin_ns) - (launch(mixed) - launch(same)) == \
+        pytest.approx(shift, abs=1e-9)
 
 
 def test_the_keeper_leg_charges_the_launch_and_the_swing_without_overlapping_them():
     """A keeper leg must not charge the 0→20 % portion of the ramp twice.
 
-    Figure 174 measures Per_t_DD from the clock crossing to 20 % OF THE RAMP, so a tabulated
-    value already contains the first fifth of the transition. The leg then adds the FULL
-    rail-to-rail swing to ask when the level is settled — so it must subtract the PURE launch,
-    or that fifth is paid for twice. It was: the leg used the raw 20.00 ns with an 8.33 ns
-    full swing, over-charging keeper_Per by exactly offset·t_RF,nom = 1.667 ns.
+    The Peripheral Output Timing figure measures Per_t_DD from the clock crossing to 20 % OF THE
+    RAMP, so a tabulated value already contains the first fifth of the transition. The leg then adds
+    the FULL rail-to-rail swing to ask when the level is settled — so it must subtract the PURE
+    launch, or that fifth is paid for twice.
 
-    No test caught it, because the conventional keeper_Per margin was never pinned to a
-    number — only asserted positive, which it was either way. This pins the identity instead
-    of the value: the two spellings of the same physical interval must agree.
+    This pins the identity: the two spellings of the same physical interval must agree.
 
-    The Manager side is unaffected by construction — Fig. 176's anchors are symmetric, so its
-    pure value IS its tabulated one — which is why the bug could only ever show on Per.
+    The Manager side is unaffected by construction — the Manager Output Timing figure's anchors are
+    symmetric, so its pure value IS its tabulated one.
     """
     from swi3s_studio.timing.calculator import _per_tdd_pure_max, _swing_ns
 
@@ -163,21 +247,52 @@ def test_the_keeper_leg_charges_the_launch_and_the_swing_without_overlapping_the
         "t_DZ marks an abrupt event and must be used raw"
 
 
+def test_the_peripheral_ede_release_charges_the_launch_and_the_swing_without_overlapping_them():
+    """A peripheral's EDE release is its PURE launch plus the full swing plus the hold.
+
+    Same pairing as the keeper legs: the tabulated Per_t_DD contains the ramp's first 20 %
+    (Peripheral Output Timing figure), so the full 0 %-to-rail swing goes with the pure launch.
+    Checked on the helper, on the `Per_t_DZ,EDE` term both peripheral-releasing contention legs
+    show, and on that term's note, which spells out the four parts.
+    """
+    from swi3s_studio.timing.calculator import (
+        _per_ede_release_vs_edge_ns,
+        _per_tdd_pure_max,
+        _per_tdd_pure_min,
+        _swing_ns,
+    )
+
+    for trf in (3.0, 5.0, 8.3):
+        inp = CalcInputs(Per_ede=True, handover_UIs=0.0, tRF_Per_DATA_ns=trf)
+        swing = _swing_ns(inp, trf)
+        late = _per_tdd_pure_max(inp) + swing + inp.Per_ede_hold_max_ns - inp.UI_ns()
+        early = _per_tdd_pure_min(inp) + swing + inp.Per_ede_hold_min_ns - inp.UI_ns()
+        assert _per_ede_release_vs_edge_ns(inp, corner="max") == pytest.approx(late)
+        assert _per_ede_release_vs_edge_ns(inp, corner="min") == pytest.approx(early)
+        r = compute(inp)
+        for leg in ("PM_contention", "PP_contention"):
+            term = next(t for t in r.breakdowns[leg].terms
+                        if t.symbol == "Per_t_DZ,EDE")
+            assert -term.value_ns == pytest.approx(late), (leg, trf)
+            assert "Per_t_DD,pure + swing + Per_t_hold,max − UI" in term.note, term.note
+            assert f"= {late:.2f} ns" in term.note, term.note
+
+    # At the default corner the release sits offset·t_RF,ref = 1.667 ns before the raw form.
+    inp = CalcInputs(Per_ede=True, handover_UIs=0.0)
+    raw = (inp.Per_t_DD_max_ns + _swing_ns(inp, inp.tRF_Per_DATA_ns)
+           + inp.Per_ede_hold_max_ns - inp.UI_ns())
+    assert raw - _per_ede_release_vs_edge_ns(inp) == pytest.approx(5.0 / 3.0, abs=1e-9)
+    assert compute(inp).breakdowns["PM_contention"].margin_ns == pytest.approx(1.217, abs=1e-3)
+
+
 def test_the_pure_back_out_is_a_fixed_offset_not_a_function_of_the_operating_slew():
-    """Per_t_DD,pure is 18.333 ns at EVERY slew, and the reason is what the number IS.
+    """Per_t_DD,pure is 18.333 ns at EVERY slew.
 
     The tabulated 20.00 ns was MEASURED at the spec's reference test condition, so the
     V=0→V_OL portion embedded in it is the one realised at THAT slew: offset·5.0 = 1.667 ns.
     Running the bus at a slower edge does not retroactively change what the measurement
-    contained.
-
-    It used to multiply by the OPERATING t_RF, and that moved margins in BOTH directions, so
-    no single sign of pessimism made it obvious. At the 8.3 ns slow corner it reported
-    Per_t_DD,max,pure as 17.233 — handing back 1.10 ns of delay the device never saves, on
-    exactly the corner where PM setup is thinnest (−8.48 where the truth is −9.58) — while
-    the min corner flowed the other way and flattered PM hold. The operating slew is
-    charged, heavily and correctly, by the crossing envelopes; it must not also be credited
-    here.
+    contained. The operating slew is charged by the crossing envelopes; it must not also be
+    credited here.
     """
     from swi3s_studio.timing.calculator import _per_tdd_pure_max, _per_tdd_pure_min
 
@@ -190,20 +305,17 @@ def test_the_pure_back_out_is_a_fixed_offset_not_a_function_of_the_operating_sle
 
 
 def test_swi3s_manager_output_is_already_pure():
-    """Man_t_DD is measured between symmetric anchors (Fig. 176), so a SWI3S
+    """Man_t_DD is measured between symmetric anchors (Manager Output Timing figure), so a SWI3S
     Manager's tabulated value needs no conversion — while a SoundWire one does.
 
-    The expected numbers did not move when `pure_output_delay` stopped taking an operating
-    t_RF: every call here already passed the spec's OWN reference slew (5.0 SWI3S, 5.4
-    SW-1V8), which is the value the function now reads for itself.
+    `pure_output_delay` reads the spec's OWN reference slew (5.0 SWI3S, 5.4 SW-1V8).
     """
     assert pure_output_delay(18.0, spec="SWI3S_PHY2", side="Man",
                              shape="linear") == 18.0
-    # Per is asymmetric (Fig. 174) and does get the offset.
+    # Per is asymmetric (Peripheral Output Timing figure) and does get the offset.
     assert pure_output_delay(20.0, spec="SWI3S_PHY2", side="Per",
                              shape="linear") == pytest.approx(18.3333, abs=1e-4)
-    # A SoundWire Manager is NOT exempt — this is the case the old Per-only
-    # hardcode silently got wrong. Both ends are re-anchored: −(1+1/3)·t_RF on the
+    # A SoundWire Manager is NOT exempt. Both ends are re-anchored: −(1+1/3)·t_RF on the
     # data side (t_OV ends at V_OH) and +1.083·t_RF on the clock side (t_OV starts
     # at the clock's V_TP threshold, not its V=0). Net −0.25·t_RF = −1.35 ns.
     assert pure_output_delay(27.6, spec="SW13_1V8", side="Man",
@@ -240,11 +352,10 @@ def test_anchor_gap_is_exactly_one_trf_under_both_ramp_shapes():
 # swtiming.interop at small/1.8 V, 30 cm, 13.2 MHz, with the SWI3S side on its
 # CURRENT numbers. Scenario A = SWI3S Mgr + SW Per; B = the reverse.
 #
-# NOTE the revision: `interop.run_scenario` now defaults to swi3s_revision=
-# "proposed", because the memo's Part II assumes the proposed timings throughout.
-# So docs/numerics.tex's \interop* macros are PROPOSED values and no longer match
-# this dict — reproduce these by passing swi3s_revision="current". The
-# proposed-side equivalents are pinned in section 9 below.
+# `interop.run_scenario` defaults to swi3s_revision="proposed", so
+# docs/numerics.tex's \interop* macros are PROPOSED values and do not match this
+# dict — reproduce these by passing swi3s_revision="current". The proposed-side
+# equivalents are pinned in section 9 below.
 ORACLE = {
     ("A", "MP", "setup"): +10.41, ("A", "MP", "hold"): -2.68,
     ("A", "PM", "setup"): -12.93, ("A", "PM", "hold"): +22.94,
@@ -264,10 +375,7 @@ SCENARIOS = {"A": ("SWI3S_PHY2", "SW13_1V8"), "B": ("SW13_1V8", "SWI3S_PHY2")}
 def _oracle_gap_ns(scenario: str, leg: str) -> float:
     """How far Studio should sit from the oracle on this leg.
 
-    Now ZERO everywhere. It was (1 + offset) * t_RF = 7.20 ns on the legs where
-    the SoundWire device transmits, because `interop._sw13_tx` fed the raw t_OV
-    into a slot that must hold a pure delay. That defect was found by this port
-    and has since been fixed upstream, so the two models converged.
+    ZERO everywhere: the two models agree on every leg.
 
     Kept as a function rather than inlined as 0.0: it is the hook that makes a
     future divergence explicit instead of silently loosening a tolerance.
@@ -298,26 +406,14 @@ def test_matches_oracle_where_soundwire_receives(scenario):
 
 @pytest.mark.parametrize("scenario", ["A", "B"])
 def test_matches_oracle_where_soundwire_transmits(scenario):
-    """The legs that found the bug, and now agree.
+    """The legs where SoundWire transmits.
 
     SoundWire v1.3 Table 15 defines t_OV_Data as ending when the data reaches
     V_OH_Data_Min / V_OL_Data_Max -- 80 % / 20 % of Vdd (Table 8), i.e. the END
     of the slew. SWI3S t_DD ends at V_OL, the START of the valid swing. The
     inequalities need a *pure* delay ending at the start of physical slew,
-    because the slew is already carried by Delta_cross / Sigma_cross.
-
-    `swtiming.interop` converted the SWI3S side but fed `_sw13_tx`'s t_OV in
-    raw, counting the full V=0 -> V_OH portion twice on any leg where SoundWire
-    transmits -- (1 + 1/3) * 5.4 = 7.20 ns at this corner. Two independent
-    derivations of the true clock-edge -> V_IH time agreed to 0.36 ns (the
-    per-edge slew tolerance) while the oracle sat 7.2 ns above both:
-
-        pure-delay form:   20.40 + 7.78 = 28.18 ns
-        t_OV + 80%->V_IH:  27.60 + 0.22 = 27.82 ns
-        oracle (was):      27.60 + 7.78 = 35.38 ns
-
-    Fixed upstream, so ORACLE now carries the corrected values (A/PM -14.28 ->
-    -7.08; B/MP -3.04 -> +4.16, a sign flip) and the two models agree here.
+    because the slew is already carried by Delta_cross / Sigma_cross. Both
+    models reduce t_OV to a pure delay, so they agree here.
     """
     man, per = SCENARIOS[scenario]
     r = compute(_mixed(man, per))
@@ -341,8 +437,7 @@ def test_the_conversion_is_worth_the_whole_anchor_offset():
         clock side +1.083·t_RF       (t_OV starts at the clock's V_TP, not V=0)
         net        −0.25·t_RF        = −1.35 ns at t_RF = 5.4
 
-    Asserted as the net rather than as one term, because for a day the model had
-    only the data-side half and −7.20 ns looked like a complete answer.
+    Asserted as the net, and each half individually.
     """
     inp = _mixed("SW13_1V8", "SWI3S_PHY2")           # Scenario B: SW is Mgr (TX on MP)
     converted = compute(inp).breakdowns["MP_setup"].margin_ns
@@ -362,11 +457,7 @@ def test_the_conversion_is_worth_the_whole_anchor_offset():
 # ---------------------------------------------------------------------------
 
 def test_soundwire_caps_the_clock_below_the_swi3s_mandatory_rate():
-    """No SoundWire configuration may legally clock at SWI3S PHY2's 13.2 MHz.
-
-    The interop model had no ceiling at all until 2026-08-03 and happily
-    reported margins at a rate the bus may not run at.
-    """
+    """No SoundWire configuration may legally clock at SWI3S PHY2's 13.2 MHz."""
     assert fclk_ceiling_MHz("SWI3S_PHY2", "SWI3S_PHY2") == 13.2
     for size, expect in (("small", 12.7), ("large", 10.1)):
         assert fclk_ceiling_MHz("SWI3S_PHY2", "SW13_1V8", size) == expect
@@ -393,10 +484,9 @@ def test_schmitt_cost_is_reported_for_a_soundwire_receiver():
 
 
 def test_schmitt_simplification_stays_small_at_the_realistic_corner():
-    """Guard the §4.5 decision to treat Schmitt globally rather than per-receiver.
-
-    The decision rests on the cost being sub-nanosecond. That is true at the
-    realistic corner — the nominal hysteresis band — and this pins it.
+    """§4.5 treats Schmitt globally rather than per-receiver, on the cost being
+    sub-nanosecond. This pins that cost at the realistic corner — the nominal
+    hysteresis band.
     """
     for tRF, want in ((2.0, 0.350), (5.0, 0.875), (5.4, 0.945)):
         assert schmitt_delta_ns(shape="linear", tRF_ns=tRF) == pytest.approx(want, abs=5e-3)
@@ -416,12 +506,8 @@ def test_schmitt_simplification_is_NOT_small_at_the_widest_legal_corner():
     legal edge (t_RF = 8.3 ns) the cost reaches ~4.4 ns, which is no longer
     negligible against the margins being reported.
 
-    This does not overturn the decision at the documented baseline, and it
-    changes no published verdict there. It does mean the simplification is
-    justified *by the corner*, not by the structure -- so it must not be
-    silently inherited if the operating point moves. Pinned here so that a
-    future change to the threshold window or edge rate surfaces it rather than
-    quietly invalidating the reasoning.
+    The simplification holds *by the corner*, not by the structure: a change to
+    the threshold window or edge rate fails here.
     """
     worst = max(
         schmitt_delta_ns(shape=shape, tRF_ns=tRF, V_IH_max_frac=vih,
@@ -465,6 +551,45 @@ def test_converted_terms_carry_provenance():
 # 5. UI
 # ---------------------------------------------------------------------------
 
+def test_a_conversion_note_reproduces_the_pure_value_it_shows():
+    """Every anchor-conversion note recomputes to the pure delay it prints.
+
+    The note states the tabulated value, the coefficients and the slew they multiply, and that
+    slew is the side's reference t_RF (`preset(spec, side).tRF_ns`), the one
+    `pure_output_delay` uses. Run at a slow operating slew on every lane, so a note that
+    printed the operating t_RF would recompute to a different number. The SoundWire max branch
+    shows the clock re-anchor and the data-side term; the min branch shows the re-anchor only.
+    """
+    import re
+
+    num = r"([0-9]+\.[0-9]+)"
+    pat = re.compile(rf"tabulated {num} ns.*→ pure {num} ns \("
+                     rf"(?:\+{num}·t_RF,ref)?(?: clock re-anchor)?(?: ?− ?{num}·t_RF,ref)?; "
+                     rf"t_RF,ref = {num} ns")
+    slow = dict(tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3, tRF_Per_DATA_ns=8.3)
+    seen = {"SWI3S": 0, "SW max": 0, "SW min": 0}
+    for man, per in (("SWI3S_PHY2", "SWI3S_PHY2"), ("SW13_1V8", "SWI3S_PHY2"),
+                     ("SWI3S_PHY2", "SW13_1V8"), ("SW13_1V8", "SW13_1V8")):
+        r = compute(dc_replace(_mixed(man, per), **slow))
+        for name, b in r.breakdowns.items():
+            for t in b.terms:
+                if "t_RF,ref" not in t.note:
+                    continue
+                m = pat.search(t.note)
+                assert m, (name, t.symbol, t.note)
+                tab, pure, clk, out, trf = (float(g) if g else 0.0 for g in m.groups())
+                assert tab + clk * trf - out * trf == pytest.approx(pure, abs=0.02), \
+                    (name, t.symbol, t.note)
+                assert abs(t.value_ns) == pytest.approx(pure, abs=5e-3), (name, t.symbol)
+                assert trf != 8.3, (name, t.symbol, "the note shows the operating slew")
+                spec = man if t.symbol.startswith("Man") else per
+                assert trf == pytest.approx(preset(spec, t.symbol[:3]).tRF_ns), t.note
+                kind = ("SWI3S" if not is_soundwire(spec)
+                        else "SW min" if "re-anchor" in t.note else "SW max")
+                seen[kind] += 1
+    assert all(seen.values()), seen
+
+
 def _view():
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -483,8 +608,7 @@ def test_spec_selector_reseeds_only_its_own_side():
     assert tv._title.text() == "SWI3S & SoundWire Timing Calculator"
     assert tv._subtitle.text() == "SWI3S PHY2 Manager and Peripheral"
     # The size envelope is SoundWire-only, and HIDDEN rather than greyed when
-    # neither side is SoundWire — on the default all-SWI3S page a disabled row
-    # is a permanent question with no answer on screen.
+    # neither side is SoundWire.
     assert not tv._size_row.isVisibleTo(tv), "size envelope is SoundWire-only"
 
     tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V8"))
@@ -515,7 +639,7 @@ def test_fclk_seeds_to_the_legal_ceiling_not_the_swi3s_rate():
     """A mixed bus may not clock at 13.2 MHz, so reset must not seed it there."""
     tv = _view()
     # All-SWI3S opens on the 12.288 MHz audio design point (256 x 48 kHz), not
-    # PHY2's 13.2 MHz mandatory maximum — a worst-case corner no design targets.
+    # PHY2's 13.2 MHz mandatory maximum.
     assert tv._fclk.value() == pytest.approx(12.288)
     tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V8"))
     assert tv._fclk.value() == pytest.approx(12.288)     # below the 12.7 ceiling
@@ -560,16 +684,14 @@ def test_spec_selection_round_trips_and_legacy_dicts_default_to_swi3s():
 
 
 def test_legacy_phy1_workspace_restores_as_a_phy1_bus():
-    """The PHY picker is gone; PHY1 is a spec source on each side.
+    """PHY1 is a spec source on each side.
 
-    A workspace written while PHY was one global switch carries `phy: 1` and no
-    spec keys. That switch meant "both sides are PHY1", so it must restore that
-    way — silently landing on PHY2 would change the answer without saying so.
+    A legacy workspace carries `phy: 1` and no spec keys, meaning "both sides are
+    PHY1", and restores that way.
     """
     # A realistic legacy dict: every row value present (to_dict always writes
     # them), spec keys absent, `phy` present. Row values come from the dict, so
-    # this checks the SELECTOR mapping, which is the part that has no other
-    # source once the picker is gone.
+    # this checks the SELECTOR mapping.
     src = _view()
     for combo in (src._man_spec_combo, src._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY1"))
@@ -621,16 +743,15 @@ def test_phy1_example_column_follows_the_table_structure_not_the_numbers():
     """Which half of the proposal reaches a PHY1 side is decided by how the SPEC
     IS STRUCTURED, not by which numbers happen to coincide (v1.1r06).
 
-    Table 128 (INPUT) is genuinely shared — one row per parameter, no PHY1/PHY2
-    distinction — so revising Per_tIH 0-4.5 -> 0-1.5 revises it for both PHYs.
+    The "PHY1 & PHY2 Input Timing" table is genuinely shared — one row per parameter, no
+    PHY1/PHY2 distinction — so revising Per_tIH 0-4.5 -> 0-1.5 revises it for both PHYs.
 
-    Table 129 (OUTPUT) prints EVERY parameter as a separate PHY1 and PHY2 row and
-    never collapses them, so a revision to PHY2's row implies nothing about
-    PHY1's. Man_tDD's two rows agree today, and revising them together is a
-    decision the proposal makes. Per_tDD and Per_tZD DIFFER per PHY, so they
-    carry PHY1's own revised maximum (50 -> 44) rather than PHY2's 9 — the
-    distinction being that 44 is a number stated for this PHY, where 9 would be
-    a value invented by pasting. Man_tZD has no PHY1 revision and stays put.
+    The "PHY1 & PHY2 Output Timing" table prints EVERY parameter as a separate PHY1 and
+    PHY2 row and never collapses them, so a revision to PHY2's row implies nothing about
+    PHY1's. Man_tDD's, Man_tDZ's and Per_tDZ's two rows agree today, and revising them
+    together is a decision the proposal makes. Per_tDD, Per_tZD and Man_tZD DIFFER per PHY,
+    so they carry PHY1's own revision (Per_tDD 14-42, Per_tZD 17-42, Man_tZD 22-56) rather
+    than PHY2's.
     """
     tv = _view()
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
@@ -643,35 +764,34 @@ def test_phy1_example_column_follows_the_table_structure_not_the_numbers():
             tv._max[("proposed", "Man_t_DD")].value()) == (9.0, 23.0)
     assert tv._max[("spec", "Per_t_IH")].value() == pytest.approx(4.5)
     assert tv._max[("proposed", "Per_t_IH")].value() == pytest.approx(1.5)
-
-    # PHY1's OWN revision on the two rows that differ per PHY: 14-50 -> 14-44.
-    # NOT PHY2's proposed 2-9, which would be a value invented for this PHY.
-    for name in ("Per_t_DD", "Per_t_ZD"):
+    for name in ("Man_t_DZ", "Per_t_DZ"):
         assert (tv._min[("spec", name)].value(),
-                tv._max[("spec", name)].value()) == (14.0, 50.0), name
+                tv._max[("spec", name)].value()) == (0.0, 10.0), name
         assert (tv._min[("proposed", name)].value(),
-                tv._max[("proposed", name)].value()) == (14.0, 44.0), name
-        # The min is untouched — only the maximum is revised.
-        assert tv._min[("proposed", name)].value() == tv._min[("spec", name)].value()
+                tv._max[("proposed", name)].value()) == (0.0, 9.0), name
 
-    # Man_tZD has no PHY1 revision, so both columns hold its Table-129 value.
-    for col in ("spec", "proposed"):
-        assert tv._min[(col, "Man_t_ZD")].value() == 14.0, col
-        assert tv._max[(col, "Man_t_ZD")].value() == 30.0, col
+    # PHY1's OWN revision on the rows that differ per PHY, NOT PHY2's proposed values.
+    for name, spec_rng, prop_rng in (("Per_t_DD", (14.0, 50.0), (14.0, 42.0)),
+                                     ("Per_t_ZD", (14.0, 50.0), (17.0, 42.0)),
+                                     ("Man_t_ZD", (14.0, 30.0), (22.0, 56.0))):
+        assert (tv._min[("spec", name)].value(),
+                tv._max[("spec", name)].value()) == spec_rng, name
+        assert (tv._min[("proposed", name)].value(),
+                tv._max[("proposed", name)].value()) == prop_rng, name
 
-    # The revisions have to actually move margins, or seeding them means nothing.
+    # The revisions move margins.
     spec = tv._per_inequality_worst("spec")
     prop = tv._per_inequality_worst("proposed")
     assert prop["MP_hold"].margin_ns > spec["MP_hold"].margin_ns, \
         "Man_tDD,min 7->9 and Per_tIH,max 4.5->1.5 fund MP hold"
-    # Per_tDD,max 50->44 is worth exactly 6 ns of PM setup, and closes it.
-    assert prop["PM_setup"].margin_ns - spec["PM_setup"].margin_ns == pytest.approx(6.0)
-    assert spec["PM_setup"].margin_ns < 0 < prop["PM_setup"].margin_ns, \
-        "the PHY1 revision should close PM setup, which is the point of it"
+    # Per_tDD,max 50->42 is worth exactly 8 ns of PM setup, and raises its F_max.
+    assert prop["PM_setup"].margin_ns - spec["PM_setup"].margin_ns == pytest.approx(8.0)
+    assert prop["PM_setup"].F_max_MHz > spec["PM_setup"].F_max_MHz
 
 
 def test_the_shared_input_table_is_shared_on_both_phys():
-    """Table 128 has no PHY1/PHY2 split, so both PHYs must carry identical input
+    """The "PHY1 & PHY2 Input Timing" table has no PHY1/PHY2 split, so both PHYs must carry
+    identical input
     timing — the invariant that makes carrying Per_tIH to PHY1 correct.
 
     Asserted against the PRESETS, not against two readings of the same view: the
@@ -693,8 +813,7 @@ def test_the_shared_input_table_is_shared_on_both_phys():
 
 
 def test_the_two_swi3s_phys_are_independently_selectable_per_side():
-    """A PHY1 Manager with a PHY2 Peripheral — inexpressible with a global PHY
-    switch, which is the reason the switch was folded into the spec selector.
+    """A PHY1 Manager with a PHY2 Peripheral.
 
     Each side must take its OWN Table-129 rows: PHY1 splits only the Peripheral
     output/high-Z and Manager high-Z values, so a mixed pair mixes those three
@@ -708,8 +827,8 @@ def test_the_two_swi3s_phys_are_independently_selectable_per_side():
     # Shared PHY1&2 values are unaffected by either side's choice.
     assert tv._max[("spec", "Man_t_DD")].value() == pytest.approx(18.0)
     assert tv._max[("spec", "Per_t_IH")].value() == pytest.approx(4.5)
-    # PHY1's 6.6 MHz mandatory max binds the pair, so the target clamps to 6.4.
-    assert tv._fclk.value() == pytest.approx(6.4)
+    # The pair opens on the slower side's target: PHY1's, its 6.6 MHz mandatory maximum.
+    assert tv._fclk.value() == pytest.approx(6.6)
 
 
 # ---------------------------------------------------------------------------
@@ -717,12 +836,7 @@ def test_the_two_swi3s_phys_are_independently_selectable_per_side():
 # ---------------------------------------------------------------------------
 
 def test_soundwire_on_both_sides_matches_the_oracle():
-    """SW <-> SW is the control that says the MP-hold failure is not about mixing.
-
-    Both same-spec configurations fail MP hold in these inequalities -- SW/SW at
-    -2.83 and SWI3S/SWI3S at -2.64 -- so a mixed bus's failure is not caused by
-    the specs being different. For SoundWire it is arithmetic: t_OH_Data 6.7 minus
-    t_IHold 4.0 leaves 2.7 ns against a 5.33 ns crossing penalty at its own t_Slew.
+    """SW <-> SW, the same-spec SoundWire control, pinned to its margins.
 
     (SoundWire's own method does not form this inequality at all; it spends the
     edge uncertainty on clock-high time instead. See the memo's interop finding 4.)
@@ -740,7 +854,7 @@ def test_soundwire_hold_bound_is_t_ZD_not_t_OH():
     data first becoming valid ... to Data output becoming high impedance" — a
     data-referenced drive-before-handover permission ({1209}), after which the
     BUS-KEEPER holds the level to the sampling edge (§5.1.11, Fig. 16). It is not
-    a hold guarantee, and using it penalised SoundWire by 1.2 ns.
+    a hold guarantee.
 
     The right parameter is t_ZD_Data,Min — "Time to enable Data output signal
     after positive or negative edge on Clock input signal", limit is a Min — the
@@ -769,13 +883,10 @@ def test_soundwire_hold_bound_is_t_ZD_not_t_OH():
 
 # The P->P DATA legs the spec does not promise: peripheral B READING a level peripheral A drove
 # in order to be read. A claim of the form "the proposal closes every inequality" is a claim
-# about the GUARANTEED directions, so filtering these keeps it exact; what they actually read is
+# about the GUARANTEED directions, so these are filtered out; what they actually read is
 # recorded by the tests named for them.
 #
-# IMPORTED FROM THE MODEL, NOT RESTATED. This was a local tuple, and it drifted the moment the
-# model's set changed -- it still listed `PP_hold_ho` after that leg became bounding, so the
-# equality assertion below went on subtracting a leg the model no longer excludes and could not
-# see the change. One definition, read by both.
+# IMPORTED FROM THE MODEL, NOT RESTATED: one definition, read by both.
 _PP_DATA_LEGS = tuple(sorted(CalcResults._PP_DATA_LEGS))
 
 
@@ -798,10 +909,10 @@ def _same(spec, **kw):
 
 
 def test_proposal_closes_every_failing_inequality_at_the_reference_corner():
-    """The revision's purpose: MP hold and PM setup both fail today and both close.
+    """MP hold and PM setup both fail under the current spec and both close.
 
-    Deltas are exact and attributable, which is why they are asserted rather
-    than bounded -- each comes from one parameter change:
+    Deltas are exact and attributable, so they are asserted rather than
+    bounded -- each comes from one parameter change:
       MP hold  +5.00 = Man_t_DD,min +2.0 and Per_t_IH,max -3.0
       PM setup +11.00 = Per_t_DD,max 20 -> 9
       MP setup -5.00 = Man_t_DD,max 18 -> 23, the cost of funding the above
@@ -823,19 +934,16 @@ def test_proposal_closes_every_failing_inequality_at_the_reference_corner():
 
 
 def test_proposal_at_the_design_target_leaves_a_sub_ns_worst_corner_deficit():
-    """What the proposal is actually asked to do, judged at the real design point.
+    """The proposal at the design point.
 
     Targets are 12.288 MHz (256 x 48 kHz) over a 30 cm bus -- not the 13.2 MHz
     mandatory ceiling the earlier corners used. At that point the proposal closes
     everything except MP hold at the simultaneous worst case, and that residual
     is **0.89 ns**.
 
-    That residual should NOT be read as a failure. The corner stacks every
-    parameter at its individual extreme at once -- slowest legal slew AND full
-    120 mV noise AND independent supplies at opposite tolerance ends -- which is
-    not a configuration a real deployment lands in. Any ONE of those relaxing is
-    enough (see the companion test). The honest claim is "closes at the design
-    point with a sub-nanosecond all-extremes residual", not "closes every corner".
+    That corner stacks every parameter at its individual extreme at once --
+    slowest legal slew AND full 120 mV noise AND independent supplies at opposite
+    tolerance ends. Any ONE of those relaxing is enough (see the companion test).
     """
     prop = compute(_same("SWI3S_PHY2_PROP", F_CLK_target_MHz=12.288))
     assert all(b.margin_ns >= 0 for b in _guaranteed(prop.breakdowns).values()), \
@@ -848,8 +956,8 @@ def test_proposal_at_the_design_target_leaves_a_sub_ns_worst_corner_deficit():
                           tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3,
                           tRF_Per_DATA_ns=8.3))
     assert worst.breakdowns["MP_hold"].margin_ns == pytest.approx(-0.89, abs=0.02)
-    # MP setup stays positive at the design rate -- the 13.2 MHz corner is what
-    # pushed it negative, and 13.2 is above the target.
+    # MP setup stays positive at the design rate; it goes negative only at the
+    # 13.2 MHz corner, which is above the target.
     assert worst.breakdowns["MP_setup"].margin_ns > 0
     assert worst.breakdowns["PM_setup"].margin_ns > 0
 
@@ -857,13 +965,8 @@ def test_proposal_at_the_design_target_leaves_a_sub_ns_worst_corner_deficit():
 def test_which_relaxations_close_the_all_extremes_corner():
     """The residual is covered by ANY one of three realistic assumptions.
 
-    Pinned because the three are alternatives, not a cumulative requirement, and
-    quoting them as a list of things that must ALL hold would overstate the ask
-    substantially. Slew is held at its 8.3 ns worst throughout except where varied.
-
-    (This briefly asserted that a SECOND leg failed here, PM_setup_ho at -0.25 ns.
-    That was an artefact of removing Per_t_ZD's V_OL back-out, which was itself a
-    misreading -- see `_per_tzd_pure_max`. MP hold is again the only short leg.)
+    The three are alternatives, not a cumulative requirement. Slew is held at its
+    8.3 ns worst throughout except where varied. MP hold is the only short leg.
     """
     W = dict(F_CLK_target_MHz=12.288, tRF_Man_CLK_ns=8.3,
              tRF_Man_DATA_ns=8.3, tRF_Per_DATA_ns=8.3)
@@ -900,20 +1003,20 @@ def test_which_relaxations_close_the_all_extremes_corner():
     assert failing(Man_t_DZ_max_ns=0.0) == {"MP_hold", "keeper_Man"}
     assert failing(Man_t_DZ_max_ns=0.0, V_SEOS_tol_frac=0.0) == {"keeper_Man"}
     assert failing(Man_t_DZ_max_ns=0.0, V_noise_pp_frac=0.065) == {"keeper_Man"}
-    # AND THE SLEW RELAXATION NO LONGER COVERS IT EITHER, since Table 125's 3 ns became
-    # unconditional (PHY2 has no forced keeper, so the observing case is the only case).
-    # The 7 ns edge used to leave +2.79 and now leaves -1.05: the keeper wants 3 ns of
-    # settled level at the Manager pin and this corner has 1.05 ns less than the whole
-    # transition. What the leg now needs at 12.288 MHz, any ONE of:
+    # AND THE SLEW RELAXATION DOES NOT COVER IT EITHER, since the 3 ns of the "PHY1 & PHY2
+    # Bus Keeper Behavior" table is unconditional (PHY2 has no forced keeper, so the
+    # observing case is the only case).
+    # The 7 ns edge leaves -1.05: the keeper wants 3 ns of settled level at the Manager
+    # pin and this corner has 1.05 ns less than the whole transition. What the leg needs
+    # at 12.288 MHz, any ONE of:
     #
     #     an edge of 6.4 ns or better        (6.5 -> -0.21, 6.0 -> +0.62)
     #     Man_t_DD,max of 21.95 ns, not 23   (the leg is affine: margin = 21.95 - t_DD)
     #     a STATED Man_t_DZ minimum of 1.05 ns -- which the spec does not have, since
     #       t_DZ is a maximum, so "release the instant the UI closes" stays legal
     #
-    # That is a finding about the proposed revision at its own worst corner, not a
-    # modelling artefact: 23 ns of launch plus a slow-corner transition plus the keeper's
-    # 3 ns does not fit in a 36.62 ns UI.
+    # At the proposed revision's own worst corner, 23 ns of launch plus a slow-corner
+    # transition plus the keeper's 3 ns does not fit in a 36.62 ns UI.
     assert failing(Man_t_DZ_max_ns=0.0, tRF_Man_CLK_ns=7.0, tRF_Man_DATA_ns=7.0,
                    tRF_Per_DATA_ns=7.0) == {"keeper_Man"}
     assert failing(Man_t_DZ_max_ns=0.0, tRF_Man_CLK_ns=6.0, tRF_Man_DATA_ns=6.0,
@@ -969,7 +1072,7 @@ def test_clock_launch_beats_analog_on_both_mp_legs_at_the_design_rate():
     # The launch mode sets the clock's RESOLUTION; the placement is a design
     # choice on that grid, so a comparison has to state it. These are the
     # placements the proposal names for each multiplier -- 0.25 UI at 4x, 0.50 UI
-    # at 2x -- but they are now inputs rather than something the mode imposes.
+    # at 2x -- but they are inputs rather than something the mode imposes.
     UI = 1000 * 0.45 / 12.288
     base = dict(F_CLK_target_MHz=12.288)
     analog = compute(_same("SWI3S_PHY2_PROP", **base))
@@ -994,7 +1097,7 @@ def test_clock_launch_beats_analog_on_both_mp_legs_at_the_design_rate():
 
 
 def test_the_two_clock_modes_are_bounded_from_opposite_ends():
-    """Why the spec needs both, and why the choice is rate-dependent.
+    """The two clock modes' rate bounds, and which mode governs at which rate.
 
     4x is bounded by HOLD: its launch delay is 0.25*UI, which shrinks as the
     clock speeds up until it no longer covers the receiver's hold requirement.
@@ -1043,9 +1146,8 @@ def test_launch_mode_governs_man_t_ZD_on_an_analog_column():
     placeable by the selected clock". Not as a direction: the proposal's 23 ns
     tabulated max is nowhere near a 1/4 UI point, so at 4× it snaps UP to 0.75 UI
     and the handover setup leg gets worse, while at 2× it snaps down to 0.50 UI and
-    the leg improves. That is what snapping an arbitrary analog number means, and
-    it is why the page SEEDS these rows to the data-launch point on a mode change
-    instead of leaving a tabulated value to be snapped.
+    the leg improves. The page SEEDS these rows to the data-launch point on a mode
+    change instead of leaving a tabulated value to be snapped.
     """
     UI = 1000 * 0.45 / 12.288
 
@@ -1072,18 +1174,11 @@ def test_the_launch_mode_governs_every_manager_output_including_ede_t_DZ():
     """EDE redefines what t_DZ MEANS, not whether the clock can place it -- so the
     selector governs all three Manager outputs, on every column.
 
-    This test previously asserted the opposite, and the reasoning was wrong in a
-    way worth recording. It read EDE as stating all three Manager outputs itself,
-    with t_ZD on the 0.00 UI grid point plus a 3--9 ns analog turn-on, and treated
-    that 0.00 UI point as load-bearing.
-
-    Two things kill it. The PHY2 revision proposes Man_t_ZD as "9--23 ns or
-    (0.5 UI 2x CLK, 0.25 UI 4x CLK)" -- the SAME options as Man_t_DD, tracking it,
-    so 0.00 UI is not on offer for this parameter. And the revision raised its
-    analog minimum from 2 ns to 9 ns precisely BECAUSE 2 ns violated hold at the
-    peripheral, which `MP_hold_ho` now carries -- so a 3 ns minimum sits below the
-    floor the revision exists to establish. EDE says nothing about t_ZD; it moves
-    t_DZ to mid-UI (Table 130). Only t_DZ is exempt.
+    The PHY2 revision proposes Man_t_ZD as "9--23 ns or (0.5 UI 2x CLK, 0.25 UI
+    4x CLK)" -- the SAME options as Man_t_DD, tracking it, so 0.00 UI is not on
+    offer for this parameter, and its 9 ns analog minimum is the hold floor
+    `MP_hold_ho` carries. EDE says nothing about t_ZD; it moves t_DZ to mid-UI
+    (the EndDriveEarly ceiling, `ede_release_ceiling_ns`). Only t_DZ is exempt.
     """
     tv = _view()
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
@@ -1122,9 +1217,7 @@ def test_the_launch_mode_governs_every_manager_output_including_ede_t_DZ():
 
 
 def test_the_hold_on_acquire_leg_is_what_the_handover_UI_was_paying_for():
-    """`MP_hold_ho` / `PM_hold_ho` were missing until 2026-08-06, and the omission
-    was invisible for the same reason the keeper leg's was: an allocated handover
-    UI covered it.
+    """`MP_hold_ho` / `PM_hold_ho`: an allocated handover UI covers them.
 
     What they bound: the bit sampled at the UI-opening edge is still inside its
     hold window when the ACQUIRING device turns on. Nothing else covers it ---
@@ -1134,9 +1227,7 @@ def test_the_hold_on_acquire_leg_is_what_the_handover_UI_was_paying_for():
 
     Pinned three ways: the leg must be rate-scaled by N_HO (so an allocated UI
     pays for it), it must FAIL on the pre-revision Man_t_ZD,min of 2 ns, and it
-    must PASS on the revision's 9 ns. That last pair is the revision's own stated
-    reason for the change, so if this test ever stops distinguishing them the leg
-    has lost the constraint it was added for.
+    must PASS on the revision's 9 ns.
     """
     UI = 1000 * 0.45 / 12.288
     base = dict(F_CLK_target_MHz=12.288, bus_length_cm=30.0,
@@ -1151,7 +1242,7 @@ def test_the_hold_on_acquire_leg_is_what_the_handover_UI_was_paying_for():
     assert leg(2.0, 0.0) < 0, \
         "2 ns must fail -- that is why the revision raised Man_t_ZD,min to 9"
     assert leg(9.0, 0.0) > 0, "9 ns must pass, or the revision does not fix it"
-    # One allocated UI pays for it either way, which is why it never surfaced.
+    # One allocated UI pays for it either way.
     assert leg(2.0, 1.0) > UI - 10, "an allocated handover UI must cover the leg"
     # And it is a hold leg, so it takes t_ZD's MIN corner: more is better.
     assert leg(9.0, 0.0) > leg(2.0, 0.0)
@@ -1161,9 +1252,7 @@ def test_launch_selector_preserves_the_users_clock_rate():
     """Switching launch mode must not reseed or reset F_CLK.
 
     It routes through its own handler rather than `_on_spec_changed`, because
-    that one calls `_reset_to_defaults` and would silently discard a target rate
-    the moment the user compared two launch options. Regressed once during
-    wiring: 12.288 jumped back to the 13.2 PHY default.
+    that one calls `_reset_to_defaults` and would discard the target rate.
     """
     tv = _view()
     tv._fclk.setValue(12.288)
@@ -1229,10 +1318,6 @@ def test_revision_reaches_only_one_of_two_hold_terms_on_a_mixed_bus():
     Per_t_IH,max 4.5->1.5 (+3.0) needs a SWI3S Peripheral receiving. A same-spec
     SWI3S bus collects both (+5.0, closes); a mixed bus collects exactly one,
     because the other term belongs to a SoundWire device that does not change.
-
-    So MP hold improves but does not close in either scenario -- not a defect in
-    the revision, just the arithmetic of a link whose ends answer to different
-    specs.
     """
     F = dict(F_CLK_target_MHz=12.288)
     a_cur = compute(_mixed("SWI3S_PHY2", "SW13_1V8", **F))
@@ -1253,10 +1338,10 @@ def test_revision_reaches_only_one_of_two_hold_terms_on_a_mixed_bus():
     assert gain_s == pytest.approx(+5.0, abs=0.02)
     assert gain_s == pytest.approx(gain_a + gain_b, abs=0.02)
 
-    # Both residuals are sub-nanosecond, which is the point of quoting them.
+    # A's residual is sub-nanosecond.
     assert a_prop.breakdowns["MP_hold"].margin_ns == pytest.approx(-0.14, abs=0.02)
-    # B closes: the corrected hold bound (t_ZD_Data,Min plus its clock-side
-    # re-anchor) rather than t_OH_Data is worth +6.4 ns on a SoundWire-TX leg.
+    # B closes: the hold bound t_ZD_Data,Min plus its clock-side re-anchor,
+    # rather than t_OH_Data, is worth +6.4 ns on a SoundWire-TX leg.
     assert b_prop.breakdowns["MP_hold"].margin_ns == pytest.approx(+6.72, abs=0.02)
     assert b_prop.breakdowns["MP_hold"].margin_ns >= 0
 
@@ -1270,11 +1355,8 @@ def test_scenario_A_pm_setup_is_not_swi3s_to_fix():
     revision is worth +11 ns. That asymmetry is Part II's conclusion: of the two
     topologies, a SoundWire Manager driving SWI3S Peripherals is the viable one.
 
-    All four values re-baselined by +0.074 ns (2026-08-06) when Σ_cross,PM,setup
-    stopped assuming the ground shift cancels across the two legs: cancellation
-    needs equal per-leg t_RF, and a mixed bus carries 5.00 vs 5.40 ns. The shift
-    is a common offset, so both conclusions survive unchanged — A is still
-    revision-invariant, and B's gain is still exactly +11.00 ns.
+    Σ_cross,PM,setup does not assume the ground shift cancels across the two legs:
+    cancellation needs equal per-leg t_RF, and a mixed bus carries 5.00 vs 5.40 ns.
     """
     F = dict(F_CLK_target_MHz=12.288)
     a_cur = compute(_mixed("SWI3S_PHY2", "SW13_1V8", **F))
@@ -1289,8 +1371,7 @@ def test_scenario_A_pm_setup_is_not_swi3s_to_fix():
     b_prop = compute(_mixed("SW13_1V8", "SWI3S_PHY2_PROP", **F))
     assert b_cur.breakdowns["PM_setup"].margin_ns == pytest.approx(+1.14, abs=0.02)
     assert b_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(+12.14, abs=0.02)
-    # The revision's worth on B is a clean +11 ns, unchanged by the re-baseline —
-    # so the ground-shift correction shifted the level, not the conclusion.
+    # The revision's worth on B is a clean +11 ns.
     assert (b_prop.breakdowns["PM_setup"].margin_ns
             - b_cur.breakdowns["PM_setup"].margin_ns) == pytest.approx(11.0, abs=5e-3)
     # Scenario B ends up with NO deficit at all under the revision.
@@ -1303,12 +1384,10 @@ def test_preset_trf_means_different_things_on_the_two_sides():
     SWI3S tabulates 3.0-8.3 ns with 5 ns as its reference test condition.
     SoundWire tabulates t_Slew_Clock 2.0-5.4 ns (small/1.8 V) and publishes no
     nominal at all. So a table built from the presets alone compares a SWI3S
-    nominal against a SoundWire worst case — which is what the memo's interop
-    table did until it was corrected to put each side at its own maximum.
+    nominal against a SoundWire worst case; put each side at its own maximum.
 
-    Pinned so the asymmetry cannot be forgotten again: it is invisible in the
-    numbers (5.0 vs 5.4 looks like a rounding difference) and changes every
-    cross-spec margin that scales with slew.
+    The asymmetry is invisible in the numbers (5.0 vs 5.4 looks like a rounding
+    difference) and changes every cross-spec margin that scales with slew.
     """
     assert preset("SWI3S_PHY2", "Man").tRF_ns == 5.0      # reference condition
     assert preset("SW13_1V8", "Per").tRF_ns == 5.4        # tabulated MAXIMUM
@@ -1317,7 +1396,7 @@ def test_preset_trf_means_different_things_on_the_two_sides():
 
 
 def test_mp_hold_at_each_sides_own_slew_maximum():
-    """The worst corner the memo's interop table now uses.
+    """The worst corner the memo's interop table uses.
 
     Quoted at the each-side-own-maximum corner (SWI3S 8.3, SoundWire 5.4),
     because that is the only worst case defined for both specs. The same-spec
@@ -1365,8 +1444,7 @@ def test_example_column_seeds_from_the_proposed_revision():
 
     The ranges are asserted rather than taken from SpecPreset because the preset
     holds a SINGLE value for t_ZD and t_IH -- fine for SoundWire where they are
-    single-valued, but the SWI3S proposal revises them as ranges, and reading
-    them from the preset collapsed min onto max (Per_t_IH became 1.5-1.5).
+    single-valued, but the SWI3S proposal revises them as ranges.
     """
     tv = _view()
     expect = {
@@ -1387,7 +1465,7 @@ def test_example_column_seeds_from_the_proposed_revision():
     txt = tv.summary_text()
     assert "MP hold" in txt and "PM setup" in txt
 
-    # Nothing is labelled "proposed" — that is socialised separately.
+    # Nothing is labelled "proposed".
     assert "PROPOSED" not in tv._title.text()
     assert "PROPOSED" not in tv._ceiling_label.text()
     # ...and the selector offers ratified specs only.
@@ -1399,9 +1477,7 @@ def test_proposal_delta_is_visible_in_the_two_columns():
     """The Spec-vs-Example delta must BE the revision's effect.
 
     +5.00 on MP hold, +11.00 on PM setup, -5.00 on MP setup -- the same
-    decomposition the memo quotes. Pinned here because this is now the only
-    place in Studio where the proposal is visible, so a reseed regression would
-    silently turn the page back into a spec-vs-spec comparison of nothing.
+    decomposition the memo quotes.
     """
     tv = _view()
     tv._fclk.setValue(12.288)
@@ -1432,7 +1508,7 @@ def test_proposal_delta_is_visible_in_the_two_columns():
 
 def test_phy1_hands_over_in_zero_uis_because_its_own_numbers_allow_it():
     """The §11.1.5 note, reproduced by the model rather than hard-coded --- and the
-    model now says the note is a PEER-TO-PEER statement.
+    model reads the note as a PEER-TO-PEER statement.
 
     "EndDriveEarly is typically not used with PHY1 because this FBCSE operating
     mode already allows for handover between outputs without needing extra UIs
@@ -1444,12 +1520,13 @@ def test_phy1_hands_over_in_zero_uis_because_its_own_numbers_allow_it():
     clock-detection lead cancels. That is the check below, and it is
     rate-independent, which is the note's actual content.
 
-    THE MIXED LEGS DO NOT GIVE 4 ns, and that is a finding rather than a defect.
+    THE MIXED LEGS DO NOT GIVE 4 ns.
     A peripheral's output parameters are measured from ITS DETECTION of the clock
-    edge (Table 129, "after edge on clock input"; Figure 174 marks it at
-    V_IH / V_IL of the input), while a Manager's are measured from its own internal
-    reference (Figure 176) and carry no such offset. So on a mixed handover the two
-    ends do not share a zero, and the lead enters with a sign that depends on which
+    edge (the "PHY1 & PHY2 Output Timing" table, "after edge on clock input"; the Peripheral
+    Output Timing figure marks it at V_IH / V_IL of the input), while a Manager's are
+    measured from its own internal reference (Manager Output Timing figure) and carry no such
+    offset. So on a mixed handover the
+    two ends do not share a zero, and the lead enters with a sign that depends on which
     class is releasing:
 
         MP  the peripheral ACQUIRES, so its lateness keeps it clear   -> +detect
@@ -1465,9 +1542,8 @@ def test_phy1_hands_over_in_zero_uis_because_its_own_numbers_allow_it():
     late = _e.sigma_pm_setup_clk_dgnd_pos * 5.0
     early = _e.sigma_pm_hold_rf_clk * 5.0
     # P->P has TWO peripherals, and they read the SAME clock edge: the Manager drives it from
-    # one pin, so one slew serves both detections and both crossings scale by the same t_RF.
-    # A previous revision cornered them at opposite ends of a tolerance band; withdrawn, see
-    # `_gather_lane_terms`. So P->P's pair is the same two numbers as every other leg's.
+    # one pin, so one slew serves both detections and both crossings scale by the same t_RF
+    # (see `_gather_lane_terms`). So P->P's pair is the same two numbers as every other leg's.
     early_i, late_i = early, late
     for fclk in (0.032, 6.4, 6.6):
         r = compute(CalcInputs(
@@ -1476,19 +1552,14 @@ def test_phy1_hands_over_in_zero_uis_because_its_own_numbers_allow_it():
             Man_t_DZ_max_ns=10.0, Per_t_DZ_max_ns=10.0,
             Man_t_ZD_ns=14.0, Per_t_ZD_ns=14.0,
         ))
-        # NO LEG EQUALS THE NOTE'S BARE DIFFERENCE, and that is the finding. Every
-        # one of the three has at least one peripheral on it, and a peripheral's
-        # t_DZ / t_ZD are referenced to ITS OWN detection of the clock -- so each
-        # leg carries the crossing at whichever corner its roles demand:
+        # NO LEG EQUALS THE NOTE'S BARE DIFFERENCE. Every one of the three has at
+        # least one peripheral on it, and a peripheral's t_DZ / t_ZD are referenced to
+        # ITS OWN detection of the clock -- so each leg carries the crossing at
+        # whichever corner its roles demand:
         #
         #   M->P  the peripheral only ACQUIRES        -> + early
         #   P->M  the peripheral only RELEASES        -> - late
         #   P->P  one of each, both on the same edge   -> + early - late
-        #
-        #   M->P  the peripheral only ACQUIRES        -> + early
-        #   P->M  the peripheral only RELEASES        -> - late
-        #   P->P  one of each, two independent parts  -> + early_i - late_i, each at
-        #         its own end of the t_RF tolerance band
         #
         # The 4 ns is still in there, as the DEVICE half; what the note omits is
         # where those parameters' own zero sits on the Manager's timeline.
@@ -1497,24 +1568,21 @@ def test_phy1_hands_over_in_zero_uis_because_its_own_numbers_allow_it():
         assert r.breakdowns["PP_contention"].margin_ns == pytest.approx(
             4.0 + early_i - late_i), fclk
         # Rate-independence is the note's content: no UI appears in any of these
-        # legs, so no clock rate changes them. A PASSING leg reports inf; a failing
-        # zero-UI leg reports 0.0 rather than inf, which says "no legal rate"
-        # instead of "any rate" -- both are statements that the rate is irrelevant.
-        # A PASSING zero-UI leg reports inf; a FAILING one reports 0.0 rather than
-        # inf, which says "no legal rate" instead of "any rate". Both are statements
-        # that no clock rate reaches the leg, which is the note's real content.
+        # legs, so no clock rate changes them. A PASSING zero-UI leg reports inf; a
+        # FAILING one reports 0.0 rather than inf, which says "no legal rate" instead
+        # of "any rate". Both are statements that no clock rate reaches the leg.
         assert r.breakdowns["MP_contention"].F_max_MHz == math.inf, fclk
         for leg in ("PM_contention", "PP_contention"):
             assert r.breakdowns[leg].F_max_MHz == 0.0, (leg, fclk)
 
-    # THE FINDING, pinned so it cannot be lost: two of the three are NEGATIVE at
-    # zero bus length, so it is not a propagation effect -- it is the crossing
-    # alone. PHY1's zero-UI handover does not close on either leg with a releasing
-    # peripheral once the two reference classes are put on one timeline.
+    # Two of the three are NEGATIVE at zero bus length, so it is not a propagation
+    # effect -- it is the crossing alone. PHY1's zero-UI handover does not close on
+    # either leg with a releasing peripheral once the two reference classes are put
+    # on one timeline.
     #
-    # Raised in docs/MODEL_AUDIT.md and NOT resolved by this model: it is a claim
-    # about ratified behaviour, and whether the Sec. 11.1.5 note is a device-parameter
-    # statement or a bus one is the working group's to settle.
+    # Open, and NOT resolved by this model: whether the Sec. 11.1.5 note is a
+    # device-parameter statement or a bus one (the timing-analysis project's
+    # docs/MODEL_AUDIT.md).
     assert r.breakdowns["PM_contention"].margin_ns < 0
     assert r.breakdowns["PP_contention"].margin_ns < 0
     assert r.breakdowns["MP_contention"].margin_ns > 0, \
@@ -1529,12 +1597,8 @@ def test_the_launch_mode_never_governs_the_specification_column():
     Manager no multiplied clock, so the Specification column is analog whatever the
     selector says.
 
-    THIS IS A REGRESSION TEST FOR A SILENT, DESTRUCTIVE BUG. The mode was applied to
-    both columns, and `snap_to_launch_grid(2.0, 2x)` is 0.00 -- so selecting a 2x clock
-    turned the spec column's Man_t_DD (7-18), Man_t_ZD (2-18) and Man_t_DZ (0-10) all
-    into 0.00, and every leg reading them reported margins for a Manager that launches
-    data with no delay. Nothing failed; the numbers were just wrong. The full gate was
-    green over it, which is why this asserts the ROWS and not only the margins.
+    `snap_to_launch_grid(2.0, 2x)` is 0.00, so a mode applied to the spec column zeroes
+    its Manager rows. This asserts the ROWS and not only the margins.
     """
     tv = _view()
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
@@ -1558,9 +1622,7 @@ def test_a_clocked_launch_never_snaps_below_the_tabulated_minimum():
     grid it rounds down to zero.
 
     The revision's Man_t_DD,min of 9.0 ns is 0.246 UI at 12.288 MHz, so a 2x clock's
-    nearest point is 0.00 UI. Knife-edge as well as wrong: EDE's 0.25 UI seed is
-    9.155 ns, which rounds the other way to 0.50 UI, so 0.155 ns of seed decided
-    between 0.00 and 18.31. The floor makes it the lowest placeable point that still
+    nearest point is 0.00 UI. The floor makes it the lowest placeable point that still
     honours the minimum.
     """
     UI = 1000 * 0.45 / 12.288
@@ -1586,7 +1648,7 @@ def test_a_clocked_launch_never_snaps_below_the_tabulated_minimum():
 
 
 def test_the_level_is_owned_by_the_hold_ho_legs_not_by_contention():
-    """Why the contention legs may permit an overlap at all.
+    """The `*_hold_ho` legs own the level during a contention-leg overlap.
 
     The overlap allowance bounds driver CURRENT. It says nothing about the voltage on
     the line while both drivers are on, so permitting an overlap is only defensible if
@@ -1600,13 +1662,6 @@ def test_the_level_is_owned_by_the_hold_ho_legs_not_by_contention():
     is that the level leg exists on both guaranteed directions, and that it is funded
     by the acquirer's t_ZD -- if it ever stopped reading t_ZD, contention would be
     allowing an overlap that nothing else bounds.
-
-    And the deliberate gap: there is no PP setup or hold leg, because
-    peripheral-to-peripheral communication is not guaranteed. Two peripherals can
-    damage each other's DRIVERS -- bounded by PP_contention -- without either being
-    obliged to read the other's DATA. That asymmetry is the reason the set of
-    inequalities is not symmetric in the three legs, and it reads as an omission
-    unless it is written down.
     """
     r = compute(CalcInputs(
         Man_spec="SWI3S_PHY2_EDE", Per_spec="SWI3S_PHY2_EDE", handover_UIs=0.0,
@@ -1619,12 +1674,9 @@ def test_the_level_is_owned_by_the_hold_ho_legs_not_by_contention():
         syms = [t.symbol for t in r.breakdowns[leg].terms]
         assert any(s.startswith(f"{acquirer}_t_ZD") for s in syms), \
             f"{leg} must be funded by {acquirer}_t_ZD, got {syms}"
-    # P2P now has BOTH: a contention leg (two drivers can damage each other whether or
-    # not either reads the other) and, as of this revision, its own data legs. This
-    # assertion used to be the opposite -- "P2P communication is not guaranteed, so it gets
-    # no setup/hold leg" -- and it was a correct reading of the scope at the time. The scope
-    # widened; the leg that funds the level here is still the acquirer's own turn-on, which
-    # is what this test is about.
+    # P2P has BOTH: a contention leg (two drivers can damage each other whether or not
+    # either reads the other) and its own data legs. The leg that funds the level here is
+    # the acquirer's own turn-on.
     assert "PP_contention" in r.breakdowns
     for leg in ("PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho"):
         assert leg in r.breakdowns, f"{leg} is a data leg now, not an omission"
@@ -1635,9 +1687,8 @@ def test_the_level_is_owned_by_the_hold_ho_legs_not_by_contention():
 def test_the_out_of_scope_split_matches_the_legs_own_terms():
     """Which P->P legs bound the bus, checked against WHOSE LEVEL each one protects.
 
-    An out-of-scope declaration is a claim about an inequality's TERMS, and nothing
-    checked it against them -- so `PP_hold_ho` sat excluded on the strength of its name
-    for as long as it existed, in this model and in the reference analysis both.
+    An out-of-scope declaration is a claim about an inequality's TERMS; this checks it
+    against them.
 
     THE RULE. A leg is out of scope iff satisfying it would require peripheral B to READ
     a level peripheral A drove in order to be read. On the three setup/hold legs the
@@ -1657,9 +1708,8 @@ def test_the_out_of_scope_split_matches_the_legs_own_terms():
          "protects belongs to the releaser, who may be the Manager -- and the other "
          "three must be, because on each of those the aggressor drove the level itself")
 
-    # AT THE WORST CORNER, not at the typicals. The leg reads +3.37 at nominal values and
-    # -7.67 once the search has it, so a test written at the midpoint would assert the
-    # opposite conclusion and pass.
+    # AT THE WORST CORNER, not at the typicals: the leg reads +3.37 at nominal values and
+    # -7.67 once the search has it.
     rows = default_swi3s_rows()
 
     def worst(base, leg, rs=None):
@@ -1676,10 +1726,9 @@ def test_the_out_of_scope_split_matches_the_legs_own_terms():
 
     # THE BEHAVIOURAL HALF, and it needs a configuration where PP_hold_ho is the ONLY
     # failing bounding leg. Otherwise MP_hold's own -0.74 ns pins the rate to zero and
-    # F_max says nothing about this leg at all -- which is how the first version of this
-    # assertion passed while naming MP_hold. A launch at 20 ns clears both MP hold legs
+    # F_max says nothing about this leg at all. A launch at 20 ns clears both MP hold legs
     # (the floor is 9.89) and leaves PP_hold_ho untouched, since no Manager parameter
-    # appears in it -- which is itself the reason the leg cannot be fixed from that side.
+    # appears in it.
     lift = [CalcRow(r.name, r.binds,
                     ParamRange(20.0, 20.0, 20.0) if r.name in ("Man_t_DD", "Man_t_ZD")
                     else r.range, r.linked_to, r.is_window)
@@ -1714,13 +1763,8 @@ def test_contention_is_overlap_bounded_by_one_flight_not_a_gap():
 
         overlap = T_off(releaser) - T_on(acquirer) <= t_PD
 
-    THIS TEST USED TO ASSERT THE OPPOSITE SIGN. It pinned an acquirer's-pin frame,
-    which charged the releaser's data one traversal to reach the acquirer and then
-    required margin >= 0 -- a GAP of one flight where one flight of overlap is free.
-    Wrong side of the physics by 2*t_PD, and it read as rigour because the frame was
-    argued at length. What it did get right, and what is kept, is that a bare
-    difference of two parameter values is a MIXED frame; the fix is to put both events
-    in absolute time, not to move them both to one pin.
+    A bare difference of two parameter values is a MIXED frame; both events are put in
+    absolute time, not moved to one pin.
 
     The bus then costs each leg only what the clock skew costs, net of the allowance:
 
@@ -1749,16 +1793,15 @@ def test_contention_is_overlap_bounded_by_one_flight_not_a_gap():
         pytest.approx(+4.0)
     # The bus is ONE netted term on every leg, as a signed count of traversals in
     # the same idiom as the 2*t_PD the PM legs already carry. A zero count states the
-    # cancellation instead of showing a +t_PD/-t_PD pair at the bus row's typ value --
-    # a value that is not a corner, and read as though 15 cm meant something.
+    # cancellation instead of showing a +t_PD/-t_PD pair at the bus row's typ value,
+    # which is not a corner.
     for leg, n in (("MP_contention", +2), ("PM_contention", 0), ("PP_contention", 0)):
         pd = [t for t in far[leg].terms if t.symbol.endswith("·t_PD")]
         if not n:
             # DROPPED, not shown as zero: the count is zero for every input, so the
-            # term could never be anything else. `0·UI` is dropped too now, for the
-            # weaker but sufficient reason that nothing is allocated -- see
-            # test_no_handover_ui_means_no_ui_term. The zero that STAYS is `Man_t_IH`,
-            # a parameter whose value happens to be 0 on this spec.
+            # term could never be anything else. `0·UI` is dropped too, because nothing
+            # is allocated -- see test_no_handover_ui_means_no_ui_term. The zero that
+            # STAYS is `Man_t_IH`, a parameter whose value happens to be 0 on this spec.
             assert pd == [], f"{leg}: a structurally-zero bus term must be dropped: {pd}"
             continue
         assert len(pd) == 1, f"{leg}: the bus must be one term, got {len(pd)}"
@@ -1780,7 +1823,7 @@ def test_pp_data_legs_carry_the_three_crossings_and_only_two_are_correlated():
     reuse it rather than coining an envelope. clk@A is an unrelated part and is charged in
     full, at the band end that hurts.
 
-    Asserted as the identity, not as a number: the construction is ported from the
+    Asserted as the identity, not as a number: the construction matches the
     standalone tool's `sigma_pp_setup`/`sigma_pp_hold`, while the magnitudes follow this
     model's own envelope inputs (V_IH/V_IL, supply, noise), which are not the paper's.
     """
@@ -1814,8 +1857,7 @@ def test_pp_data_legs_carry_the_three_crossings_and_only_two_are_correlated():
         assert syms == sorted([f"{gathered} · Man_t_RF,CLK",
                                f"X_PP,B,{role} · Per_t_RF,DATA"]), syms
         # B's DATA lane is the peripheral's: the data reaching B was driven by A, not by the
-        # Manager. Reusing the MP tuples verbatim charged Man DATA on a link the Manager does
-        # not drive, which only showed once the two lanes were given different values.
+        # Manager.
         assert not any("Man_t_RF,DATA" in s for s in syms), syms
 
 
@@ -1830,11 +1872,9 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
     driver-far/sampler-near pays, and it pays twice the flight. The bracket is a COST for
     setup and a CREDIT for hold, so `unknown` hands each leg its own end.
 
-    A SELECTOR, because as a corner ROW its value multiplied the bus-length row and the
-    margin stopped being affine in each parameter -- which is the one thing
-    `find_worst_corner_rows` requires. It duly missed the worst corner: on PP_setup it left
-    the bus at 15 cm where 30 cm is 2 ns worse, because with the placement at its typical of
-    zero the leg looked bus-insensitive. The brute-force check below is the guard.
+    A SELECTOR, not a corner ROW: as a row its value would multiply the bus-length row and
+    the margin would stop being affine in each parameter, which `find_worst_corner_rows`
+    requires. The brute-force check below is the guard.
     """
     import itertools
 
@@ -1845,12 +1885,11 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
         b = compute(dc_replace(base, pp_placement=placement)).breakdowns[leg]
         return [(t.symbol, round(t.value_ns, 6)) for t in b.terms if t.symbol == "t_PD"]
 
-    # TWO TERMS, NOT ONE `2·t_PD`, since the legs went into time order: the count is two
+    # TWO TERMS, NOT ONE `2·t_PD`: the legs read in time order and the count is two
     # different FLIGHTS -- the clock reaching A at the far end, then A's data running back to
     # B -- so they bracket A's launch instead of sitting together, and each carries a note
-    # saying which it is. The contention legs' bus term stays NETTED for the opposite reason
-    # (see the test above): there the pair cancels, and printing it apart invited a reader to
-    # look for a bus effect that is not there.
+    # saying which it is. The contention legs' bus term stays NETTED (see the test above):
+    # there the pair cancels.
     # Unknown: setup takes the cost, hold takes none -- each its own worst.
     assert pd_terms("unknown", "PP_setup") == [("t_PD", -t_pd), ("t_PD", -t_pd)]
     assert pd_terms("unknown", "PP_hold") == []
@@ -1864,9 +1903,7 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
     assert "data" in notes[1] and "back" in notes[1], notes
     # EVERY OTHER PLACEMENT COSTS NOTHING EITHER WAY, enumerated from the source rather than
     # listed here: two ends and two devices is four placements, and a fifth added to
-    # `PP_PLACEMENT_LABELS` without a cost decided would otherwise go untested. `both_far`
-    # arrived exactly that way -- it was missing from the enumeration and read as a case not
-    # modelled, when t_PD + 0 − t_PD is simply zero.
+    # `PP_PLACEMENT_LABELS` without a cost decided would otherwise go untested.
     from swi3s_studio.timing.calculator import PP_PLACEMENT_LABELS
 
     free = set(PP_PLACEMENT_LABELS) - {"unknown", "driver_far"}
@@ -1877,7 +1914,7 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
         assert pd_terms(placement, "PP_setup") == [], placement
         assert pd_terms(placement, "PP_hold") == [], placement
 
-    # And the search is exact again: no combination of the geometric/peripheral rows beats
+    # And the search is exact: no combination of the geometric/peripheral rows beats
     # what it finds. (A subset, brute-forced -- the full product is 3**17.)
     rows = default_swi3s_rows()
     sub = [r for r in rows if r.name in ("bus length (cm)", "t_PD,mis fraction", "Per_t_DD",
@@ -1895,7 +1932,7 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
 def test_pp_completes_the_launch_method_2x2():
     """Setup and hold, each on both launch methods -- the same structural grid MP and PM
     carry. A receiver cannot tell whether an edge came from t_DD or out of high-Z, so both
-    must satisfy both; carrying three quarters of that grid is what hid `MP_hold_ho`.
+    must satisfy both.
 
     The handover UI credits HOLD only: it puts the acquirer's turn-on a UI further from the
     sampling edge, while setup's sampling edge moves with the launch and nets out.
@@ -1920,8 +1957,8 @@ def test_pp_hold_is_the_tightest_data_leg_and_says_what_it_would_cost():
 
     PM hold banks +2·t_PD because the data returns along the clock's own path; P->P hold's
     worst placement gives nothing back. Per_t_IH,max is 4.5 ns where Man_t_IH,max is 0. So
-    the two differences compound, and this records the consequence rather than asserting a
-    conclusion: the leg is short, and the shortfall IS the price of guaranteeing P->P.
+    the two differences compound: the leg is short, and the shortfall IS the price of
+    guaranteeing P->P.
     """
     rows = default_swi3s_rows()
     base = CalcInputs()
@@ -1942,11 +1979,6 @@ def test_pp_hold_is_the_tightest_data_leg_and_says_what_it_would_cost():
 
 def test_no_handover_ui_means_no_ui_term():
     """With no handover UI scheduled, no inequality shows one.
-
-    `0·UI` used to print on all five legs that carry the allocation, on the argument that a
-    term becoming `1·UI` when a UI IS allocated is worth stating at zero. It is worth
-    stating -- but not as a row of arithmetic contributing nothing, least of all on the legs
-    whose entire point is that NOTHING separates the release from the acquirer's turn-on.
 
     Display only: the dropped term was worth 0.0 ns and every margin is the sum of its
     terms, so this asserts the margins are bit-identical either way by reconstructing each
@@ -2007,28 +2039,24 @@ def test_peripheral_to_peripheral_handover_is_its_own_leg():
     syms = [t.symbol for t in pp.terms]
     assert any("Per_t_ZD" in s for s in syms) and any("Per_t_DZ" in s for s in syms)
     # NO MANAGER *DRIVER*, which is not the same as no Manager symbol at all: the
-    # Manager drives the CLOCK on a P2P data handover, so `Man_t_RF` belongs here, and
-    # an earlier "no Man_ anywhere" check started failing on it the moment the crossing
-    # terms named their slew lane. What must be absent is a Manager output-timing or
-    # input-timing parameter -- a Manager DRIVER or RECEIVER, not the clock it sources.
+    # Manager drives the CLOCK on a P2P data handover, so `Man_t_RF` belongs here. What
+    # must be absent is a Manager output-timing or input-timing parameter -- a Manager
+    # DRIVER or RECEIVER, not the clock it sources.
     assert not any(s.startswith(("Man_t_DD", "Man_t_ZD", "Man_t_DZ",
                                  "Man_t_IS", "Man_t_IH")) for s in syms), \
         f"a P2P handover involves no Manager driver or receiver: {syms}"
-    # PP no longer equals PM, and the difference is the acquiring peripheral's own
-    # crossing credit -- taken at the FAST end of the t_RF tolerance band, since the
-    # two devices share the setting but not the tolerance, while PM's single
-    # peripheral is read at the row the corner search picked. That is what makes PP a
-    # separate leg rather than a relabelling of PM.
+    # PP does not equal PM: the difference is the acquiring peripheral's own crossing
+    # credit. That is what makes PP a separate leg rather than a relabelling of PM.
     _e = CalcInputs().envelope()
     delta = _e.sigma_pm_hold_rf_clk * 5.0
     assert pp.margin_ns - r["PM_contention"].margin_ns == pytest.approx(delta)
     # ...and PP carries BOTH crossing corners — but GATHERED into one product, because both
     # ends read the SAME clock edge. The Manager sources the clock from one pin, so one slew
-    # serves both detections; two separate products of one row invited, and previously got,
-    # two independently cornered values for one physical edge. The netted term keeps both
-    # contributions visible in its note rather than in two symbols.
+    # serves both detections. The netted term keeps both contributions visible in its
+    # note rather than in two symbols. The releaser's late detection is `X_MP,late`, the
+    # name whose coefficient it carries; the acquirer's early one is `X_PM,early`.
     xs = {t.symbol: t.value_ns for t in pp.terms if "X_PM," in t.symbol}
-    assert {s.split(" · ")[0] for s in xs} == {"(X_PM,late - X_PM,early)"}, xs
+    assert {s.split(" · ")[0] for s in xs} == {"(X_MP,late - X_PM,early)"}, xs
     assert all(s.endswith("Man_t_RF,CLK") for s in xs), xs
     net = next(t for t in pp.terms if "X_PM," in t.symbol)
     # The note decomposes it, and the inner signs are relative to the operator hoisted out:
@@ -2038,7 +2066,7 @@ def test_peripheral_to_peripheral_handover_is_its_own_leg():
     assert abs(net.value_ns) > 0.1, net.value_ns
     # The gathered value IS the difference of the two crossings at one t_RF.
     assert net.value_ns == pytest.approx(
-        _e.sigma_pm_hold_rf_clk * 5.0 - _e.sigma_pm_setup_clk_dgnd_pos * 5.0)
+        _e.sigma_pm_hold_rf_clk * 5.0 - _e.mp_late_rise * 5.0)
     faster_per = compute(CalcInputs(
         Man_spec="SWI3S_PHY2", Per_spec="SWI3S_PHY2", handover_UIs=1.0,
         F_CLK_target_MHz=12.288, bus_length_cm=30.0,
@@ -2070,8 +2098,7 @@ def test_phy2_needs_its_handover_ui_and_the_model_says_why():
     # The DEVICE half of the deficit is the 8 ns the note is about: t_DZ,max 10 against
     # t_ZD,min 2. On top of it sits the crossing spread — the acquirer's early detection
     # against the releaser's late one, BOTH AT ONE SLEW, because the clock comes from one
-    # Manager pin. (A previous revision took them at opposite ends of a tolerance band, which
-    # made this ~2.6 ns worse; withdrawn, see `_gather_lane_terms`.)
+    # Manager pin (see `_gather_lane_terms`).
     _e = CalcInputs(**kw).envelope()
     _trf = CalcInputs(**kw).tRF_Man_CLK_ns
     spread = (_e.sigma_pm_hold_rf_clk - _e.sigma_pm_setup_clk_dgnd_pos) * _trf
@@ -2141,7 +2168,7 @@ def test_handover_ui_checkbox_selects_whether_the_ui_term_applies():
 
     # Clearing it must FAIL the handover legs at PHY2's current numbers: t_ZD,min
     # 2.0 cannot cover t_DZ,max 10.0 without a UI. That is the deficit EDE has to
-    # close, so the model showing it is the point of the control.
+    # close.
     tv._ho_ui_check.setChecked(False)
     assert tv.inputs("spec").handover_UIs == 0.0
     w = tv._per_inequality_worst("spec")
@@ -2166,9 +2193,8 @@ def test_handover_ui_checkbox_selects_whether_the_ui_term_applies():
 def test_handover_ui_does_not_reseed_and_round_trips():
     """Toggling it must not reset the rate or the edited Example column.
 
-    Same trap as the launch selector: routing through `_on_spec_changed` would
-    call `_reset_to_defaults` and silently discard a user's target rate just
-    because they compared the two handover cases.
+    Like the launch selector, it does not route through `_on_spec_changed`,
+    which calls `_reset_to_defaults` and would discard the target rate.
     """
     tv = _view()
     tv._fclk.setValue(9.0)
@@ -2186,7 +2212,7 @@ def test_handover_ui_does_not_reseed_and_round_trips():
     assert tv2.inputs("spec").handover_UIs == 0.0
 
     # A workspace written before the checkbox existed falls back to what the
-    # selected PHYs imply, which is what that version computed.
+    # selected PHYs imply.
     d.pop("handover_ui")
     tv3 = _view()
     tv3.set_from_dict(d)
@@ -2202,9 +2228,9 @@ def test_ede_is_a_negative_effective_t_dz():
 
     It moves the releasing device's t_DZ reference from the END of its last driven
     UI to the START -- one UI earlier -- so the tabulated value stays positive
-    (Table 130's convention) and the model shifts it. In an end-of-UI-referenced
-    inequality that is a NEGATIVE effective t_DZ, which is why no new inequality
-    was needed to evaluate the feature.
+    (the calculator's EndDriveEarly convention) and the model shifts it. In an end-of-UI-referenced
+    inequality that is a NEGATIVE effective t_DZ, so no new inequality is needed
+    to evaluate the feature.
     """
     UI = 1000 * 0.45 / 12.288
     kw = dict(F_CLK_target_MHz=12.288, handover_UIs=0.0, bus_length_cm=0.0,
@@ -2257,15 +2283,15 @@ def test_the_ede_column_pair_is_proposal_versus_ede():
     assert (tv._min[("proposed", "Man_t_DD")].value(),
             tv._max[("proposed", "Man_t_DD")].value()) == (9.0, 23.0)
     # What DOES change is the release: a timed move to high-Z at the UI boundary, i.e. the
-    # bottom of Table 129's own 0-10 ns range, against the ordinary end-of-UI reference.
+    # bottom of the revision's 0-9 ns range, against the ordinary end-of-UI reference.
     assert tv._max[("proposed", "Man_t_DZ")].value() == pytest.approx(0.0)
-    assert tv._max[("spec", "Man_t_DZ")].value() == pytest.approx(10.0)
+    assert tv._max[("spec", "Man_t_DZ")].value() == pytest.approx(9.0)
 
     # ONLY THE PERIPHERAL HAS A MECHANISM, so only its flag is set. `Man_ede` means
-    # `Man_t_DZ` is referenced to the START of the last driven UI (Table 130's mid-UI
-    # convention); the Manager here releases at the boundary under the ORDINARY reference,
-    # so the shift must not apply -- with `Man_ede` true and a row of 0.0 the release would
-    # land a whole UI early. See `_man_ede_for`.
+    # `Man_t_DZ` is referenced to the START of the last driven UI (the calculator's mid-UI
+    # EndDriveEarly convention); the Manager here releases at the boundary under the ORDINARY
+    # reference, so the shift must not apply -- with `Man_ede` true and a row of 0.0 the release
+    # would land a whole UI early. See `_man_ede_for`.
     assert tv.inputs("proposed").Per_ede and not tv.inputs("proposed").Man_ede
     assert not tv.inputs("spec").Man_ede and not tv.inputs("spec").Per_ede
     # And no handover UI is allocated, which is the point of the feature.
@@ -2275,23 +2301,11 @@ def test_the_ede_column_pair_is_proposal_versus_ede():
 def test_ede_helps_every_leg_it_owns():
     """What EDE buys. The MECHANISM is asserted; where the margins land is recorded.
 
-    THE NAME OF THIS TEST HAS NOW BEEN WRONG TWICE, in opposite directions -- first
-    "closes all three handover legs", then "closes only the manager-releasing one" --
-    because each time it named the current result rather than the invariant. It is
-    named for the mechanism now, and the result lives in the body where it can move.
-
     * EDE MUST IMPROVE EVERY LEG WHOSE RELEASER HAS IT. That is a statement about the
       mechanism, it holds regardless of where the margins land, and it is what catches
-      a sign error or a swapped reference -- the failure mode that once made M->P read
-      BETTER without EDE than with it.
+      a sign error or a swapped reference.
     * Which legs reach positive is a RESULT, and is recorded as one rather than
-      demanded. Pinning it the other way round is what let an earlier version of this
-      file protect an artefact (see the keeper split test).
-
-    As of the overlap criterion all three reach positive, M->P with room and the two
-    peripheral-releasing legs with about 1-2 ns. Before it, only M->P did. The two
-    verdicts differ by 2*t_PD on every leg and by nothing else, which is why the
-    mechanism assertions below are identical across both and only the tail moved.
+      demanded.
     """
     tv = _view()
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
@@ -2305,65 +2319,54 @@ def test_ede_helps_every_leg_it_owns():
         assert ede[leg].margin_ns > base[leg].margin_ns, \
             f"{leg}: the releasing device's change must improve the leg it owns"
     # The two PERIPHERAL-releasing legs fail at the baseline, so the peripheral's mechanism
-    # is doing real work on each. M->P is NOT in that list any more: at Table 129's own
-    # Man_t_DZ,max the leg is already marginal rather than broken, so what closes it is the
-    # release tightened inside a ratified range and not a feature. Asserting a failing
-    # baseline there is what a 23 ns release maximum -- a LAUNCH range -- used to buy.
+    # is doing real work on each. M->P is NOT in that list: at the "PHY1 & PHY2 Output
+    # Timing" table's own Man_t_DZ,max the leg is already marginal rather than broken, so
+    # what closes it is the release tightened inside a ratified range and not a feature.
     for leg in ("PM_contention", "PP_contention"):
         assert base[leg].margin_ns < 0, f"{leg}: the baseline should fail at zero UIs"
 
-    # The result, recorded: the two MIXED legs close and P->P does not. Both halves of that
-    # have been the other way round at some point, so both are worth stating.
+    # The result, recorded: all three contention legs close at zero UIs, and P->P is the
+    # thinnest of them.
     #
-    # P->P's sign has now been decided by two separate readings of "two peripherals corner
-    # independently", pulling opposite ways:
+    # P->P's margin depends on which quantities two peripherals realise separately:
     #
     #   t_RF   the clock's slew is NOT independent. It comes from one Manager pin, so one
     #          edge with one slew serves both detections, and the two crossings gather into
-    #          a single product (`_gather_lane_terms`). Withdrawing that split was worth
-    #          +2.6 ns and made the leg close.
+    #          a single product (`_gather_lane_terms`).
     #   V_IH   the receiver threshold IS independent. Each part's own switching threshold
     #          sits somewhere in the compliance window, so two receivers can be at opposite
-    #          ends at once. The row picker used to collapse that window to one value for
-    #          the whole bus, which credited the acquirer 2.38 ns it is not owed
-    #          (`CalcRow.is_window`). Keeping the window open costs the leg its sign back.
+    #          ends at once (`CalcRow.is_window`).
     #
-    # Both are about which quantities two devices realise separately, and getting the
-    # ANSWER right per quantity is the point -- not applying one rule to both. What has
-    # survived every revision either way is the ORDERING, so that is what is pinned
-    # hardest.
-    for leg in ("MP_contention", "PM_contention"):
+    # The peripheral's EDE release is `Per_t_DD,pure + swing + hold - UI`
+    # (`_per_ede_release_vs_edge_ns`). P->P closing at zero UIs is a statement about driver
+    # current only: `PP_hold_ho` still fails wherever a peripheral acquires (see the column
+    # test below), so the P->P handover still owes its UI.
+    for leg in ("MP_contention", "PM_contention", "PP_contention"):
         assert ede[leg].margin_ns > 0, (leg, ede[leg].margin_ns)
-    assert ede["PP_contention"].margin_ns < 0, \
-        ("P->P contention does not close once the threshold window stays open",
-         ede["PP_contention"].margin_ns)
     assert ede["PP_contention"].margin_ns < min(ede["MP_contention"].margin_ns,
                                                 ede["PM_contention"].margin_ns)
-    assert ede["MP_contention"].margin_ns > ede["PM_contention"].margin_ns
+    assert ede["MP_contention"].margin_ns == pytest.approx(3.48, abs=0.02)
+    assert ede["PM_contention"].margin_ns == pytest.approx(3.49, abs=0.02)
+    assert ede["PP_contention"].margin_ns == pytest.approx(0.59, abs=0.02)
 
-    # Whatever else moves, the keeper must hold on both releasing devices -- a
-    # starved keeper loses the bit outright rather than eroding a margin. The Manager's
-    # leg has room; the peripheral's is EXACTLY zero, because its EDE hold minimum and
+    # The peripheral's keeper leg is EXACTLY zero, because its EDE hold minimum and
     # Man_tKeeper_Response are both 3 ns (see the keeper-split test). Asserted as the
     # equality it is rather than folded into a `>= 0`, so if either number moves this
-    # says so instead of quietly reading as slack.
-    # THE MANAGER'S KEEPER LEG DOES NOT CLOSE, and that is the proposal's one residual ask
-    # rather than a defect in the release placement. The leg is
-    # `t_DZ - Man_t_DD,max - t_swing - t_keeper`, so with the release at the boundary it is
-    # a ceiling on the LAUNCH: 19.79 ns with the keeper observing, which is what this model
+    # says so.
+    # THE MANAGER'S KEEPER LEG DOES NOT CLOSE: that is the proposal's one residual ask. The
+    # leg is `t_DZ - Man_t_DD,max - t_swing - t_keeper`, so with the release at the boundary
+    # it is a ceiling on the LAUNCH: 19.79 ns with the keeper observing, which is what this model
     # charges, against the revision's own 23. Recorded with a bound on the magnitude, so a
     # drift into a large failure is caught while the sign stays where the EDE paper says.
-    # Settling Table 125 as a FORCED keeper is worth the 3 ns and is the paper's ask.
+    # Settling the "PHY1 & PHY2 Bus Keeper Behavior" table as a FORCED keeper is worth the
+    # 3 ns and is the paper's ask.
     assert -4.0 < ede["keeper_Man"].margin_ns < 0, ede["keeper_Man"].margin_ns
     assert ede["keeper_Per"].margin_ns == pytest.approx(0.0), ede["keeper_Per"].margin_ns
-    # ...and moving the release OFF the boundary makes it worse, not better, which is the
-    # claim that retired the 4x grid. Checked here rather than asserted in a docstring.
+    # ...and moving the release OFF the boundary makes it worse, not better.
     #
     # BOTH SIDES AT THE SAME CORNER. `ede[...]` is each leg's own auto-worst corner and
     # `tv.inputs()` is the typ baseline, so comparing one against the other measures the
-    # corner as well as the release -- which is how the first version of this assertion
-    # came to compare +35.67 against -3.21 and fail for a reason that had nothing to do
-    # with the claim. Isolate the release: one input set, one field changed.
+    # corner as well as the release. Isolate the release: one input set, one field changed.
     #
     # NOTE THE `Man_ede=True` too: a 0.75 UI release is a MID-UI-referenced value, so
     # reaching it means flipping the reference as well as the number. Leaving the ordinary
@@ -2389,20 +2392,17 @@ def test_the_threshold_window_is_never_collapsed_by_a_corner_pick():
 
     A DEVICE'S THRESHOLD IS A DEVICE CORNER -- a given part's rising threshold is
     somewhere in [V_IH,min, V_IH,max] -- and that is exactly why one bus-wide value
-    cannot express two of them. The row picker used to bind one picked value to BOTH
-    ends, so the moment auto-worst ran, every receiver on the bus was given the same
-    threshold and a leg that CHARGES one receiver's crossing while CREDITING another's
-    saw them partially cancel.
+    cannot express two of them. Binding one picked value to BOTH ends would give every
+    receiver on the bus the same threshold, and a leg that CHARGES one receiver's crossing
+    while CREDITING another's would see them partially cancel.
 
     Worth 2.38 ns on the three legs that net two peripherals, and nothing anywhere else:
     within one receiver what matters is the V_IH-to-V_IL separation, which a collapse
     preserves; ACROSS two receivers it is the window's WIDTH, which a collapse destroys.
-    And it could only ever read at or above the spec window's own answer, so the search
-    was choosing its worst corner out of a subspace that excluded the worst corner.
 
-    Not the same question as the clock's slew, which went the OTHER way in the same
-    revision: one Manager pin drives one edge, so both peripherals detect the same slew
-    and collapsing THAT is correct. Independence has to be decided per quantity.
+    Not the same question as the clock's slew: one Manager pin drives one edge, so both
+    peripherals detect the same slew and collapsing THAT is correct. Independence has to
+    be decided per quantity.
     """
     rows = default_swi3s_rows()
     windows = {r.name for r in rows if r.is_window}
@@ -2433,11 +2433,11 @@ def test_the_threshold_window_is_never_collapsed_by_a_corner_pick():
 def test_ede_ui_relative_rows_follow_the_rate():
     """The rate-relative refresh, asserted as an INVARIANT rather than as a row list.
 
-    `_EDE_UI_RELATIVE_ROWS` is EMPTY now: the settled proposal has no rate-relative Manager
+    `_EDE_UI_RELATIVE_ROWS` is EMPTY: the settled proposal has no rate-relative Manager
     value.  The launch is the revision's analog 9-23 ns and the release is
     `Man_t_DZ,max` = 0 against the end-of-UI reference -- both absolute, so both survive a
-    rate change unchanged, and `Per_t_DZ` stopped being a row at all when the peripheral's
-    release became an interval from its own ramp.
+    rate change unchanged, and `Per_t_DZ` is not a row: the peripheral's release is an
+    interval from its own ramp.
 
     So this test asserts two things that stay true whatever the list contains:
 
@@ -2445,10 +2445,6 @@ def test_ede_ui_relative_rows_follow_the_rate():
          UI -- vacuous today, live the moment a fraction is seeded again, and the check that
          stops the list and the seeding drifting apart;
       2. every row NOT in it holds its value across a rate change, edits included.
-
-    The retired version asserted (2)'s opposite for three named rows, which was right while
-    they were grid points -- "0.75 UI" carried across a rate change is not
-    stale-but-usable, it is wrong at both rates -- and it is what caught this reseed.
     """
     from swi3s_studio.ui.timing_view import _EDE_UI_RELATIVE_ROWS
 
@@ -2477,9 +2473,9 @@ def test_ede_ui_relative_rows_follow_the_rate():
         "a rate change must not discard an edit to an absolute row"
 
 
-def test_table_130_caps_the_ede_release_and_no_inequality_does():
-    """The boundary is excluded by Table 130, not by any leg -- so the model must carry
-    the table.
+def test_the_ede_ceiling_caps_the_release_and_no_inequality_does():
+    """The boundary is excluded by the EndDriveEarly ceiling, not by any leg -- so the
+    model must carry the ceiling.
 
     THIS IS THE ONE THING THAT FORBIDS A RELEASE ON THE UI EDGE. Nothing else does, and
     both of the Manager's own legs are content there:
@@ -2493,14 +2489,12 @@ def test_table_130_caps_the_ede_release_and_no_inequality_does():
         are 1:1 traded, so every 0.25 UI step later is 9.155 ns off contention and onto
         the keeper.
 
-    So a release at 1.00 UI read as a comfortable pass on both, while being outside
+    So a release at 1.00 UI reads as a comfortable pass on both, while being outside
     0.60 UI + 10 ns and not an early release at all -- and on a 1/2 UI grid that is
-    where the nearest-point snap PUT it, which is how the tool came to report a 2x EDE
-    column with every leg green.
+    where the nearest-point snap puts it.
 
-    The cap is asserted on the MODEL, not on the seeded row: the row assertion in
-    `test_ede_needs_a_quarter_UI_grid_and_is_seeded_for_it` cannot catch a user edit or
-    a corner search moving the value.
+    The cap is asserted on the MODEL, not on the seeded row: a row assertion cannot
+    catch a user edit or a corner search moving the value.
     """
     from swi3s_studio.timing.spec_source import ede_release_ceiling_ns
 
@@ -2525,12 +2519,13 @@ def test_table_130_caps_the_ede_release_and_no_inequality_does():
     # The 0.75 UI placement is inside the cap and is left exactly where it is.
     used, note = dz_in_force(0.75 * UI)
     assert used == pytest.approx(0.75 * UI, abs=5e-4)
-    assert "Table 130" not in note, "an admissible release must not be annotated as capped"
+    assert "EndDriveEarly ceiling" not in note, \
+        "an admissible release must not be annotated as capped"
 
     # The boundary is pulled back to the latest legal point the 1/4 UI grid can place.
     used, note = dz_in_force(UI)
     assert used == pytest.approx(0.75 * UI, abs=5e-4), used
-    assert "Table 130" in note and "0.60·UI + 10 ns" in note, note
+    assert "EndDriveEarly ceiling" in note and "0.60·UI + 10 ns" in note, note
 
     # On a 1/2 UI grid the latest legal point is 0.50 UI -- the launch's own point --
     # which is why 2x cannot express EDE. The cap, not the keeper, is what excludes it.
@@ -2541,23 +2536,21 @@ def test_table_130_caps_the_ede_release_and_no_inequality_does():
     # it is clamped at the cap itself rather than at a grid point.
     used, note = dz_in_force(UI, mode=LaunchMode.ANALOG)
     assert used == pytest.approx(cap, abs=5e-4), used
-    assert "Table 130" in note, note
+    assert "EndDriveEarly ceiling" in note, note
 
-    # And a CONVENTIONAL release is NOT capped: Table 130 bounds EndDriveEarly, while a
+    # And a CONVENTIONAL release is NOT capped: the ceiling bounds EndDriveEarly, while a
     # conventional t_DZ is referenced to the closing edge and bounded by its own max.
     used, note = dz_in_force(UI, ede=False)
     assert used == pytest.approx(UI, abs=0.02), used
-    assert "Table 130" not in note, note
+    assert "EndDriveEarly ceiling" not in note, note
 
 
 def test_one_man_t_dz_is_read_by_both_the_keeper_and_the_contention_legs():
     """Two legs, one release time, and it has to be the same number in both.
 
-    THE KEEPER LEG USED TO READ `inp.Man_t_DZ_max_ns` RAW while the contention legs read
-    it snapped to the launch mode's grid -- so under a clocked mode one output stage had
-    two release times, and each family kept the end that suited it. That is the same
-    hybrid `_man_tdz_parts` was written to stop, and the same failure `_man_tzd_ns`
-    already documents for t_ZD.
+    Under a clocked mode both families read `inp.Man_t_DZ_max_ns` snapped to the launch
+    mode's grid (`_man_tdz_parts`; `_man_tzd_ns` does the same for t_ZD), so one output
+    stage has one release time.
 
     Checked where it would show: a value deliberately OFF the grid, on a non-EDE column
     (so the keeper takes its `1·UI + Man_t_DZ` form) under a clocked launch.
@@ -2580,10 +2573,9 @@ def test_one_man_t_dz_is_read_by_both_the_keeper_and_the_contention_legs():
 def test_the_keeper_leg_catches_ede_on_an_analog_launch():
     """The leg that stops the model reporting a false PASS.
 
-    Before it existed, selecting EDE with the analog Manager launch showed all
-    three handover legs green while the bus keeper was starved by 7.7 ns -- the
-    releasing driver let go before the level had been valid long enough for the
-    keeper to hold it, so the bit is lost and nothing said so.
+    With EDE and the analog Manager launch the bus keeper is starved: the
+    releasing driver lets go before the level has been valid long enough for the
+    keeper to hold it, so the bit is lost.
 
     Contention does NOT catch this: it depends on t_DZ and t_ZD, not on t_DD, so
     it is indifferent to how the Manager launched its data. The keeper is the only
@@ -2604,31 +2596,79 @@ def test_the_keeper_leg_catches_ede_on_an_analog_launch():
         "contention passes either way — which is exactly why the keeper leg is needed"
 
 
-def test_the_contention_clock_crossing_is_the_same_X_as_the_pm_legs():
-    """The contention legs and the PM legs share a symbol, so they must share a value.
+def _crossing_coefficients(breakdowns) -> dict:
+    """{(crossing symbol, lane symbol): {leg: coefficient}} over every crossing term.
 
-    `X_PM,setup,clk` and `X_PM,hold,clk` appear in BOTH families -- in PM setup/hold as
-    one addend of Sigma_cross,PM, and in the contention legs as a releasing or acquiring
-    peripheral's clock detection. They were separate names (`Sigma_cross,clk,*`) until
-    the crossings went per-lane, and giving them one name asserts they are one quantity.
+    A lone term's coefficient is `factors[0]`. A GATHERED term,
+    `(X_PP,A,late - X_PP,B,early) · Man_t_RF,CLK`, lists its crossings in the order its
+    `factors` carry their signed coefficients, the row value last (`Term.factors`).
+    """
+    import re
+    out: dict = {}
+    for leg, b in breakdowns.items():
+        for t in b.terms:
+            if "X_" not in t.symbol or " · " not in t.symbol or t.factors is None:
+                continue
+            head, _, lane = t.symbol.partition(" · ")
+            if head.startswith("("):
+                heads = [h.strip() for h in re.split(r" [-+] ", head[1:-1])]
+                coeffs = [abs(c) for c in t.factors[:-1]]
+            else:
+                heads, coeffs = [head], [abs(t.factors[0])]
+            assert len(heads) == len(coeffs), (leg, t.symbol, t.factors)
+            for h, c in zip(heads, coeffs):
+                out.setdefault((h, lane), {}).setdefault(leg, c)
+    return out
 
-    That assertion is checkable, so it is checked: the contention path reads
-    `sigma_pm_setup_clk_dgnd_pos` / `sigma_pm_hold_rf_clk` directly while the PM path
-    takes whichever polarity or case its max/min selects, and those could in principle
-    disagree. Swept over noise, supply tolerance, slew tolerance and both ramp shapes.
-    If it ever fails, the shared name has become a lie and the symbols must split again.
+
+def test_a_crossing_symbol_carries_one_coefficient_wherever_it_appears():
+    """One name on two legs asserts one quantity, so it must be one number.
+
+    `X_PM,late · Man_t_RF,CLK` on PM_setup is the clock addend of Sigma_cross,PM,setup, whose
+    ground-shift polarity is chosen jointly with the data lane and flips once the Per DATA
+    lane is the slower one or the two devices' ramp shapes differ. A releasing peripheral's
+    lone clock detection on a contention leg is always cornered at the raised threshold, so it
+    carries a different coefficient there and a different name, `X_MP,late`, whose value it
+    equals.
+
+    Swept where the selections flip: unequal per-lane t_RF in both directions, both ramp
+    shapes on each device independently, noise, supply and slew tolerance, and the EDE and
+    zero-UI configurations that change which terms appear.
     """
     import itertools
-    for a, d, t, shape in itertools.product((0.0, 0.05, 0.10), (0.0, 0.05),
-                                            (0.0, 0.05), ("linear", "exp")):
-        inp = CalcInputs(V_noise_pp_frac=a, V_SEOS_tol_frac=d, tRF_tolerance_frac=t,
-                         Man_shape=shape, Per_shape=shape)
-        e = inp.envelope()
-        clk_setup, _ = e.sigma_pm_setup_lanes(inp.tRF_Man_CLK_ns, inp.tRF_Per_DATA_ns)
-        clk_hold, _ = e.sigma_pm_hold_lanes(inp.tRF_Man_CLK_ns, inp.tRF_Per_DATA_ns)
-        why = (a, d, t, shape)
-        assert clk_setup == pytest.approx(e.sigma_pm_setup_clk_dgnd_pos), why
-        assert clk_hold == pytest.approx(e.sigma_pm_hold_rf_clk), why
+    lanes = ((5.0, 5.0, 5.0), (3.0, 5.0, 8.3), (8.3, 6.0, 3.0))
+    shapes = ("linear", "exp")
+    extras = ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
+              {"pp_placement": "driver_far"})
+    for (clk, mdata, pdata), ms, ps, a, d, t, kw in itertools.product(
+            lanes, shapes, shapes, (0.0, 0.10), (0.0, 0.05), (0.0, 0.05), extras):
+        inp = CalcInputs(tRF_Man_CLK_ns=clk, tRF_Man_DATA_ns=mdata, tRF_Per_DATA_ns=pdata,
+                         Man_shape=ms, Per_shape=ps, V_noise_pp_frac=a, V_SEOS_tol_frac=d,
+                         tRF_tolerance_frac=t, **kw)
+        for (sym, lane), by_leg in _crossing_coefficients(compute(inp).breakdowns).items():
+            vals = list(by_leg.values())
+            assert all(v == pytest.approx(vals[0], rel=1e-9) for v in vals), (
+                f"{sym} · {lane} carries {by_leg} at t_RF {clk}/{mdata}/{pdata}, "
+                f"shapes {ms}/{ps}, alpha {a}, delta {d}, tau {t}, {kw}: one symbol, "
+                f"several values — the symbols must split")
+
+
+def test_the_lone_clock_detections_are_named_for_the_coefficient_they_carry():
+    """The contention legs' clock detections, against the legs whose names they borrow.
+
+    `X_MP,late · Man_t_RF,CLK` is MP_hold's late clock crossing; `X_PM,early · Man_t_RF,CLK`
+    is PM_hold's early clock crossing. Checked where PM_setup's own clock addend has flipped
+    polarity, so the old shared name would have shown two values.
+    """
+    for kw in ({"tRF_Man_CLK_ns": 3.0, "tRF_Per_DATA_ns": 8.3},
+               {"Per_shape": "exp"}, {"Man_shape": "exp"}):
+        coeffs = _crossing_coefficients(compute(CalcInputs(**kw)).breakdowns)
+        late = coeffs[("X_MP,late", "Man_t_RF,CLK")]
+        assert {"MP_hold", "PM_contention", "PP_contention"} <= set(late), (kw, late)
+        early = coeffs[("X_PM,early", "Man_t_RF,CLK")]
+        assert {"PM_hold", "MP_contention", "PP_contention"} <= set(early), (kw, early)
+        pm_setup = coeffs[("X_PM,late", "Man_t_RF,CLK")]
+        assert set(pm_setup) == {"PM_setup", "PM_setup_ho"}, (kw, pm_setup)
 
 
 def test_crossing_terms_are_dimensionless_coefficients_times_a_named_lane_trf():
@@ -2640,10 +2680,10 @@ def test_crossing_terms_are_dimensionless_coefficients_times_a_named_lane_trf():
     Sigma_cross,PM,setup = X_PM,setup,clk + X_PM,setup,data.
 
     Each is a sum over legs of (dimensionless coefficient) × (that leg's t_RF), and the
-    three lanes -- Man CLK, Man DATA, Per DATA -- are independent rows. A single
-    pre-multiplied `Δ_cross,MP = 8.19 ns` hid all of that: that the quantity scales with
-    slew, that it scales with a DIFFERENT slew per lane, and that on Δ_cross,MP which
-    lane carries the late crossing SWAPS between setup and hold.
+    three lanes -- Man CLK, Man DATA, Per DATA -- are independent rows. The per-lane
+    terms show that the quantity scales with slew, that it scales with a DIFFERENT slew
+    per lane, and that on Δ_cross,MP which lane carries the late crossing SWAPS between
+    setup and hold.
 
     IT CANNOT BE ONE PRODUCT. `Σ_cross,PM,hold × t_RF` is only equal to the envelope
     when the two lanes happen to share a t_RF, and both envelopes select their
@@ -2657,13 +2697,7 @@ def test_crossing_terms_are_dimensionless_coefficients_times_a_named_lane_trf():
     """
     LANES = {"Man CLK": "tRF_Man_CLK_ns", "Man DATA": "tRF_Man_DATA_ns",
              "Per DATA": "tRF_Per_DATA_ns"}
-    # CLK/DATA is implied by the term's own role, so the t_RF symbol carries it only
-    # where it must: Δ_cross,MP has BOTH Manager lanes on one leg-pair and swaps which
-    # carries the late crossing, so there it is explicit.
-    # Every lane is qualified now, and a P->P clock crossing names the tolerance BAND
-    # (An earlier revision excluded a peripheral clock crossing here because it was cornered
-    # at a tolerance-band end rather than read off the Man CLK row. That band is gone -- one
-    # pin, one slew -- so every crossing now reads its row and none is excluded.)
+    # Every lane is qualified, and every crossing reads its own row.
     _LANE_OF = {"Man_t_RF,CLK": "Man CLK", "Man_t_RF,DATA": "Man DATA",
                 "Per_t_RF,DATA": "Per DATA"}
     for shape in ("linear", "exp"):
@@ -2720,11 +2754,10 @@ def test_no_term_symbol_names_a_corner_the_picker_owns():
     end for the keeper and its high end for contention. So a baked-in suffix can
     contradict the number printed beside it.
 
-    It was worse than redundant. `apply_row_picks` sets every field a row binds to the
-    same picked value, so `Man_t_DD,min` and `Man_t_DD,max` displayed the identical
-    number while claiming to be two different quantities. And `Man_t_DZ,min` named a
-    corner the spec does not define at all -- t_DZ is given only as a maximum -- so the
-    label asserted a guaranteed-earliest release no vendor has promised.
+    `apply_row_picks` sets every field a row binds to the same picked value, so
+    `Man_t_DD,min` and `Man_t_DD,max` would display the identical number. And
+    `Man_t_DZ,min` would name a corner the spec does not define at all -- t_DZ is given
+    only as a maximum.
 
     Suffixes that are not corners are fine and are not caught here: `,pure` is an
     anchor conversion, `,EDE` is a different definition of the parameter, and a corner
@@ -2764,12 +2797,11 @@ def test_the_keeper_leg_is_meaningful_without_ede_too():
     If this ever went negative on a plain PHY2 bus it would mean the release had
     overtaken data-valid, which is a real defect worth seeing.
 
-    THE TERM STRUCTURE IS WHAT THIS PINS, because the value has been wrong in both
-    directions. `1*UI + t_DZ` is the release point: the UI carries the reference change
-    (t_DD is measured from the edge that opens the UI, t_DZ from the one that closes
-    it), and t_DZ carries the driving that continues past that edge. One version folded
-    the UI into the t_DZ term's value and labelled the sum `Man_t_DZ,min`; the next
-    dropped t_DZ altogether. Both are visible here as a wrong term count.
+    THE TERM STRUCTURE IS WHAT THIS PINS. `1*UI + t_DZ` is the release point: the UI
+    carries the reference change (t_DD is measured from the edge that opens the UI, t_DZ
+    from the one that closes it), and t_DZ carries the driving that continues past that
+    edge. Folding the UI into the t_DZ term, or dropping t_DZ, shows here as a wrong term
+    count.
     """
     r = compute(CalcInputs(F_CLK_target_MHz=12.288, handover_UIs=1.0))
     assert r.breakdowns["keeper_Man"].margin_ns > 0
@@ -2794,22 +2826,18 @@ def test_the_keeper_needs_the_release_two_grid_steps_after_the_launch():
     """What satisfies the keeper is the PLACEMENT of the release, not the choice of
     multiplier -- and the placement it likes best is the one no grid contains.
 
-    RETAINED AS A PROPERTY OF THE CLOCKED OPTION, which the EDE paper still reports and
-    which a designer can still select.  It is no longer the seeded position: the settled
-    proposal has the Manager stopping AT the UI boundary under the ordinary end-of-UI
-    reference (`_ede_ranges`), so this test drives `CalcInputs` directly rather than
-    through the view's rows -- `Man_ede` is what makes a release value mid-UI-referenced,
-    and the view no longer asserts it.
+    A PROPERTY OF THE CLOCKED OPTION, which the EDE paper reports and which a designer
+    can select.  It is not the seeded position: the settled proposal has the Manager
+    stopping AT the UI boundary under the ordinary end-of-UI reference (`_ede_ranges`), so
+    this test drives `CalcInputs` directly rather than through the view's rows --
+    `Man_ede` is what makes a release value mid-UI-referenced, and the view does not set it.
 
     The claim: `t_DZ` must clear `t_DD` by the whole rail-to-rail swing PLUS the keeper's
     response time, 13.83 + 3.00 = 16.83 ns at the slow corner (0.46 UI), which on a
-    1/4 UI grid is TWO steps.  The docstring once said "at least t_keeper after t_DD,
-    which on a grid means a LATER POINT" -- the retired swing-for-t_keeper reading, and it
-    admits ONE step, which the body below has always asserted fails.
+    1/4 UI grid is TWO steps.
 
-    AND THE LAST BLOCK IS WHY THE GRID IS RETIRED.  The leg is monotone in the release, so
-    the boundary beats every point the grid offers -- which the grid sweep could not show,
-    because it excluded the boundary by construction.
+    THE LAST BLOCK: the leg is monotone in the release, so the boundary beats every point
+    the grid offers.
     """
     base = _same("SWI3S_PHY2_EDE", F_CLK_target_MHz=12.288, handover_UIs=0.0, Per_ede=True,
                  tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3, tRF_Per_DATA_ns=8.3)
@@ -2823,10 +2851,8 @@ def test_the_keeper_needs_the_release_two_grid_steps_after_the_launch():
         NO ROW PICKER HERE, deliberately.  `apply_row_picks` writes each row's own range
         into the inputs, so a pinned `Man_t_DD` is overwritten by the RATIFIED row's typ
         the moment the picker runs -- filtering the pick out does not protect it, it just
-        picks typ instead.  The first version of this helper did that and read -24.33 ns
-        where the placement gives +1.48, because it was measuring the ratified 7-18 ns
-        launch at its midpoint.  The corner that matters to this leg is `t_RF,max`, and
-        that is pinned in `base`.
+        picks typ instead.  The corner that matters to this leg is `t_RF,max`, and that is
+        pinned in `base`.
         """
         inp = dc_replace(base, Man_ede=ede, Man_t_DD_min_ns=dd, Man_t_DD_max_ns=dd,
                          Man_t_ZD_ns=dd, Man_t_DZ_max_ns=dz)
@@ -2834,25 +2860,25 @@ def test_the_keeper_needs_the_release_two_grid_steps_after_the_launch():
 
     assert keeper_with(0.50 * UI, 0.50 * UI) < 0, \
         "release on the launch's own point must fail -- no driven valid level"
-    # ONE grid step is NOT enough, and that is what set the multiplier. The addend
-    # is the full rail-to-rail swing (t_RF / 0.60 = 13.83 ns at the slow corner,
-    # 0.3777 UI), not t_keeper -- the keeper is a weak holder and cannot finish a
+    # ONE grid step is NOT enough. The addend is the full rail-to-rail swing
+    # (t_RF / 0.60 = 13.83 ns at the slow corner, 0.3777 UI), not t_keeper -- the keeper is a weak holder and cannot finish a
     # transition. A 0.25 UI step cannot cover 0.3777 UI.
     assert keeper_with(0.50 * UI, 0.75 * UI) < 0, \
         "one grid step is short of the swing, so it must NOT satisfy the keeper"
     assert keeper_with(0.25 * UI, 0.50 * UI) < 0, "...at either pairing"
-    # TWO steps do, which is why a clocked EDE release needed a 4x clock.
+    # TWO steps do, so a clocked EDE release needs a 4x clock.
     assert keeper_with(0.25 * UI, 0.75 * UI) > 0, \
         "two grid steps must satisfy it -- 0.50 UI covers the 0.3777 UI swing"
-    # A MID-UI RELEASE IS STILL CAPPED BY TABLE 130, so the boundary is not reachable as
-    # an EDE value: the model pulls 1.00 UI back to the latest legal grid point, 0.75 UI,
-    # which from a 0.50 UI launch is one step and fails.
+    # A MID-UI RELEASE IS STILL CAPPED BY THE EndDriveEarly CEILING, so the boundary is not
+    # reachable as an EDE value: the model pulls 1.00 UI back to the latest legal grid point, 0.75
+    # UI, which from a 0.50 UI launch is one step and fails.
     assert keeper_with(0.50 * UI, UI) < 0, \
         "an EDE release at the boundary must be capped to 0.75 UI, one step from 0.50"
 
     # AND THE BOUNDARY, REACHED THE OTHER WAY, BEATS ALL OF THEM. `ede=False` makes the
-    # value end-of-UI-referenced, so 0.0 IS the boundary -- Table 129's own parameter at
-    # the bottom of its range, no mid-UI reference and nothing for Table 130 to bound.
+    # value end-of-UI-referenced, so 0.0 IS the boundary -- the "PHY1 & PHY2 Output Timing"
+    # table's own parameter at the bottom of its range, no mid-UI reference and nothing for
+    # the EndDriveEarly ceiling to bound.
     # Same launch on both sides, so this isolates the release.
     at_edge = keeper_with(0.25 * UI, 0.0, ede=False)
     assert at_edge > keeper_with(0.25 * UI, 0.75 * UI), (
@@ -2862,24 +2888,20 @@ def test_the_keeper_needs_the_release_two_grid_steps_after_the_launch():
 
 
 def test_the_ede_column_seeds_a_boundary_release_and_the_revision_s_own_launch():
-    """What the EDE column IS, now that only the peripheral has a mechanism.
-
-    THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-08-18 -- that the column seeds a 1/4 UI
-    clocked grid, launch 0.25 UI and release 0.75 UI, and that a 4x clock is therefore
-    required.  Both halves are withdrawn, and the reasoning is worth keeping because the
-    arithmetic behind the retired position was never wrong:
+    """What the EDE column IS: only the peripheral has a mechanism.
 
       * `Man_t_DZ` is its own tabulated parameter at 0-10 ns, referenced to the edge that
-        ENDS the last driven UI (Table 129 Note 1) and measured from the Manager's internal
+        ENDS the last driven UI (Note 1 of the "PHY1 & PHY2 Output Timing" table) and
+        measured from the Manager's internal
         timing reference for that edge (Note 3).  So stopping AT the boundary is
         `Man_t_DZ,max` = 0 -- the bottom of a ratified range, gated from a clock edge the
         Manager already owns.  Not an EDE release at all, hence `Man_ede` False and no
-        Table 130 ceiling.
+        EndDriveEarly ceiling.
       * The keeper is `t_DZ - t_DD,max - t_swing`, monotone in the release, so the boundary
-        is the best release the UI holds and 0.75 UI is 9.16 ns worse -- on the very leg the
-        grid was chosen for (see the test above).  What the keeper constrains is the LAUNCH.
-      * The launch therefore stays the revision's analog 9-23 ns.  It is NOT deterministic
-        any more, and the 3:1 test below is what governs it instead.
+        is the best release the UI holds and 0.75 UI is 9.16 ns worse (see the test
+        above).  What the keeper constrains is the LAUNCH.
+      * The launch therefore stays the revision's analog 9-23 ns.  It is NOT deterministic,
+        and the 3:1 test below governs it.
 
     A clocked launch remains selectable and is an f_max option: it lifts the keeper's
     ceiling from 12.22 to 24.40 MHz and buys 0.16 ns on MP hold, against MP setup giving
@@ -2906,58 +2928,48 @@ def test_the_ede_column_seeds_a_boundary_release_and_the_revision_s_own_launch()
 
     w = tv._per_inequality_worst("proposed")
     short = [k for k, b in w.items() if b.margin_ns < -0.005]
-    # EDE closes every CONTENTION leg it owns, and both keeper legs. Three legs stay short
-    # and none of the three is EDE's to close:
+    # EDE closes every CONTENTION leg, and the peripheral's keeper leg. The legs that stay
+    # short are not EDE's to close:
     #
     #   MP_hold / MP_hold_ho   the ordinary legs. MP_hold carries no t_ZD at all, so EDE
-    #                          cannot be what moves them. Both sit at about -0.7 ns on the
+    #                          cannot be what moves them. Both sit at about -0.89 ns on the
     #                          revision's own Man_t_DD,min / Man_t_ZD,min of 9 ns against a
     #                          floor of 9.89 at the slow corner.
-    #   PP_contention          the expected PHY2 answer at N_HO = 0 (see below).
-    #   keeper_Man             NEW, and it is the proposal's one residual ask rather than a
-    #                          consequence of the boundary release -- which is the BEST
-    #                          release for this leg. Rearranged, eq:keeper is a ceiling on
+    #   keeper_Man             the proposal's one residual ask rather than a consequence
+    #                          of the boundary release -- which is the BEST release for
+    #                          this leg. Rearranged, eq:keeper is a ceiling on
     #                          the LAUNCH: Man_t_DD,max <= 19.79 ns with the keeper
     #                          observing, against the revision's 23. The EDE paper asks the
-    #                          working group to settle Table 125 as a FORCED keeper, which
+    #                          working group to settle the "PHY1 & PHY2 Bus Keeper Behavior"
+    #                          table as a FORCED keeper, which
     #                          is worth the 3 ns; this model charges it, so the column shows
     #                          the pessimistic reading.
-    #   PP_hold_ho             NEW TO THIS SET, and it did not move -- the SCOPE did. The
-    #                          leg was excluded as P->P data until its terms were read: the
-    #                          level it protects belongs to whoever RELEASED, so when the
-    #                          Manager released it is Manager-to-peripheral data and the leg
-    #                          binds. It is now in the bounding set, hence in this
+    #   PP_hold_ho             the level it protects belongs to whoever RELEASED, so when
+    #                          the Manager released it is Manager-to-peripheral data and
+    #                          the leg binds. It is in the bounding set, hence in this
     #                          subtraction's result. See `test_the_out_of_scope_split_...`.
     #
-    # ASSERTED BY EQUALITY, not as a subset, and that is the point of this line. It
-    # WAS a subset -- `set(short) - _PP_DATA_LEGS <= {...}` -- which cannot see a leg
-    # LEAVING the set. PP_contention duly left it (the clock's slew band was withdrawn,
-    # +2.6 ns, leg closed) and came back (the threshold window stopped being collapsed,
-    # -2.38 ns), and neither move cost a red test while the bound was one-sided.
+    # ASSERTED BY EQUALITY, not as a subset: a subset cannot see a leg LEAVING the set.
     #
-    # `_PP_DATA_LEGS` is now IMPORTED from the model rather than restated here, which is what
-    # made this line fail on the scope change instead of quietly subtracting a leg the model
-    # no longer excludes.
-    assert set(short) - set(_PP_DATA_LEGS) == {"MP_hold", "MP_hold_ho", "PP_contention",
+    # `_PP_DATA_LEGS` is IMPORTED from the model rather than restated here.
+    assert set(short) - set(_PP_DATA_LEGS) == {"MP_hold", "MP_hold_ho",
                                               "PP_hold_ho", "keeper_Man"}, \
         f"the set of short legs moved: {short}"
     assert w["PP_hold_ho"].margin_ns == pytest.approx(-7.67, abs=0.02), \
         ("the level a releasing MANAGER drove, against an acquiring peripheral's turn-on: "
          "in scope, unclosed, and what still owes a handover UI wherever a peripheral "
          "acquires")
-    assert w["PP_contention"].margin_ns == pytest.approx(-1.08, abs=0.02), \
+    # P->P contention closes at zero UIs: the peripheral's EDE release is its pure launch plus
+    # the full swing plus the hold interval, so the two drivers do not overlap past the
+    # allowance. The P->P handover still owes a UI, because `PP_hold_ho` above does not close.
+    assert w["PP_contention"].margin_ns == pytest.approx(0.59, abs=0.02), \
         "P->P contention: two receivers at opposite ends of one threshold window"
-    # AND THAT SIGN IS THE EXPECTED PHY2 ANSWER, which is why it is asserted as a value
-    # rather than guarded as a failure. PHY2 allocates a UI to every handover by default
-    # and that UI is how it separates two peripherals' drivers -- P->P is not expected to
-    # close without one. Evaluated at N_HO = 0 this leg prices REMOVING that UI, which is
-    # a key motivation for EDE rather than a defect in the bus.
     assert tv._handover_UIs() == 0.0, "this whole column is the zero-UI hypothetical"
     # WHAT THE BOUNDARY RELEASE BUYS AND WHAT IT DOES NOT. M->P contention closes and the
     # peripheral's keeper leg sits at exactly zero (its EDE hold minimum IS
     # Man_tKeeper_Response), so that one is asserted as the equality it is rather than
     # folded into a `>= 0`. The MANAGER's keeper leg does NOT close, and it is the residual
-    # ask rather than a cost of the placement -- see the narrative above the short-leg set.
+    # ask rather than a cost of the placement -- see the table above the short-leg set.
     assert w["MP_contention"].margin_ns > 0, w["MP_contention"].margin_ns
     assert w["keeper_Per"].margin_ns == pytest.approx(0.0), w["keeper_Per"].margin_ns
     assert -4.0 < w["keeper_Man"].margin_ns < 0, w["keeper_Man"].margin_ns
@@ -2965,10 +2977,7 @@ def test_the_ede_column_seeds_a_boundary_release_and_the_revision_s_own_launch()
     assert len([k for k, b in base_w.items() if b.margin_ns < 0]) >= 3, \
         "the baseline should fail the handover legs, or the comparison shows nothing"
 
-    # THE LAUNCH MODE NO LONGER TOUCHES THE RELEASE, and that is worth pinning because it
-    # used to. While the release was a grid point, selecting 2x snapped it -- Table 130
-    # capping it at 0.50 UI, the launch's own point, so the keeper failed and the tool
-    # correctly reported that 2x cannot express EDE. The release is not on a grid now: it is
+    # THE LAUNCH MODE DOES NOT TOUCH THE RELEASE. The release is not on a grid: it is
     # Man_t_DZ,max = 0 against the end-of-UI reference, which every clock can produce
     # because the UI boundary is the one instant the bus clock marks by itself.
     for mode in (LaunchMode.CLK2, LaunchMode.CLK4, LaunchMode.ANALOG):
@@ -2983,52 +2992,34 @@ def test_the_ede_column_seeds_a_boundary_release_and_the_revision_s_own_launch()
         "a clocked launch must close the keeper -- that is the whole of what it buys here"
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData(LaunchMode.ANALOG.value))
 
-    # Which legs are thin, named individually -- and the ORDERING has been wrong in
-    # this file twice already, so it is pinned as an ordering and not as three numbers.
+    # Which legs are thin, named individually -- pinned as an ordering and not as three
+    # numbers.
     #
-    #   M->P  comfortable, and by the widest margin of the three. Its peripheral only
-    #         ACQUIRES, so the crossing is a credit -- and it is the one leg that
-    #         BANKS the overlap allowance rather than spending it against the skew.
-    #   P->M  thin. Its peripheral RELEASES, so it pays the late crossing; the skew
+    #   P->M  the widest. Its peripheral RELEASES, so it pays the late crossing; the skew
     #         and the allowance cancel, leaving the leg bus-independent. Its acquirer
     #         is the Manager, launching from a 0.25 UI grid point, which is a far
-    #         larger turn-on delay than a peripheral's t_ZD,min -- so it still has
-    #         more room than P->P.
-    #   P->P  thinnest. Same late crossing and the same cancellation, but its acquirer
-    #         is a peripheral turning on at Per_t_ZD,min, and the early crossing it
-    #         gains does not make up the difference.
+    #         larger turn-on delay than a peripheral's t_ZD,min.
+    #   M->P  comfortable. Its peripheral only ACQUIRES, so the crossing is a credit --
+    #         and it is the one leg that BANKS the overlap allowance rather than spending
+    #         it against the skew.
+    #   P->P  thinnest, and positive. Same late crossing and the same cancellation as
+    #         P->M, but its acquirer is a peripheral turning on at Per_t_ZD,min, and the
+    #         early crossing it gains does not make up the difference.
     #
-    # FOUR earlier versions of this block, and the ORDERING is the only thing that has
-    # survived all of them. One had P->P with the MOST room ("the detection lead cancels on
-    # it" -- it does not). The next had P->M and P->P NEGATIVE, which was the acquirer's-pin
-    # frame demanding a gap where one flight of overlap is free. The third had P->P negative
-    # because its two peripherals were cornered at opposite ends of the CLOCK's slew band --
-    # withdrawn, because the clock comes from one Manager pin and one pin has one slew, so
-    # both detections scale by the same t_RF (`_gather_lane_terms`), and the leg closed. The
-    # fourth is this one: the same "two peripherals corner independently" argument is CORRECT
-    # for the receiver THRESHOLD, which is a per-device property and not a shared edge, so the
-    # window stays open (`CalcRow.is_window`) and the leg is negative again.
-    #
-    # The signs have moved four times and the ordering never has, so the ordering is what is
-    # pinned and each sign is stated as its own movable fact. Note what the two slew/threshold
-    # rulings have in common: the question is always which quantities two devices realise
-    # SEPARATELY, and the answer is per quantity -- a shared signal is one value, a per-part
-    # property is two.
+    # The ordering is pinned and each sign is stated as its own movable fact. Which
+    # quantities two devices realise SEPARATELY is decided per quantity -- a shared signal
+    # (the clock's slew, `_gather_lane_terms`) is one value, a per-part property (the
+    # receiver threshold, `CalcRow.is_window`) is two.
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData(LaunchMode.CLK4.value))
     w = tv._per_inequality_worst("proposed")
     mp, pm, pp = (w[f"{k}_contention"].margin_ns for k in ("MP", "PM", "PP"))
-    assert mp > pm > pp, f"expected MP > PM > PP, got {mp:+.2f} {pm:+.2f} {pp:+.2f}"
-    assert pp < 0, (
-        f"P->P contention does not close: its two peripherals sit at opposite ends of the "
-        f"receiver threshold window, which is a per-device corner: {pp:+.2f}")
-    # No claim about the SIZE of the gaps: they were ~0.7 ns apart when this was written and
-    # the four rewrites above are what a pinned magnitude here would have cost. The ordering
-    # is the load-bearing statement.
+    assert pm > mp > pp, f"expected PM > MP > PP, got {mp:+.2f} {pm:+.2f} {pp:+.2f}"
+    assert pp > 0, (
+        f"P->P contention closes on the clocked launch, with its two peripherals at "
+        f"opposite ends of the receiver threshold window: {pp:+.2f}")
+    # No claim about the SIZE of the gaps: the ordering is the load-bearing statement.
     #
-    # THIS LINE USED TO READ `mp > 10.0`, and it went with the retired 0.75 UI release: the
-    # Manager let go a quarter UI early, so the acquirer had that much more room. At the
-    # boundary M->P is about +3.5 ns instead, which is the release being LATER and not the leg
-    # getting worse in any sense that matters -- the margin it needs is the acquirer's own
+    # At the boundary M->P is about +3.5 ns: the margin it needs is the acquirer's own
     # lateness, and the Manager cannot spend that by holding on longer.
     assert mp > 0.0, "M->P is the comfortable one: the crossing is a credit there"
 
@@ -3036,11 +3027,8 @@ def test_the_ede_column_seeds_a_boundary_release_and_the_revision_s_own_launch()
 def test_setup_and_contention_agree_about_man_t_zd():
     """One definition of Man_t_ZD, read by both families.
 
-    They used to disagree: the setup handover variants applied the launch mode
-    while the contention legs took `inp.Man_t_ZD_ns` raw, so on a clock-launched
-    bus the two modelled different turn-on times for the same device. It was
-    pessimistic in contention rather than optimistic, so it hid rather than broke
-    -- which is exactly why one definition beats two that happen to be safe.
+    The setup handover variants and the contention legs both read `_man_tzd_ns`,
+    so on a clock-launched bus they model one turn-on time for the device.
 
     Asserted by construction rather than on values: whatever the mode, the t_ZD
     the setup leg used must be the one the contention leg used.
@@ -3072,13 +3060,8 @@ def test_ede_peripheral_values_are_not_tighter_than_3_to_1():
     3:1 asks for better than PVT delivers -- an unbuildable part, not a tight one.
 
     A peripheral has no clock, so every peripheral value is analog end to end and
-    the 3:1 spans the whole of it. A MANAGER value may be narrower in total
-    without violating anything, because a clocked grid point carries no PVT and
-    only the analog turn-on/turn-off portion does -- so the Manager is checked on
-    that portion instead.
-
-    This caught Per_t_DZ seeded as (UI - turn_max .. UI) = 1.33:1, from applying
-    the Manager's grid-plus-analog shape to a device with no grid.
+    the 3:1 spans the whole of it. A MANAGER value is either clocked (deterministic)
+    or analog (3:1 over the whole of it).
     """
     tv = _view()
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
@@ -3097,15 +3080,13 @@ def test_ede_peripheral_values_are_not_tighter_than_3_to_1():
     # is the safe direction, so it passes; noted so it is not read as an omission.
     assert ratio("Per_t_DD") >= 3.0
 
-    # THE MANAGER'S ROWS SPLIT, and the rule is the same one applied honestly to each: a
-    # CLOCKED value is deterministic (1:1) and 3:1 does not apply to it; an UNCLOCKED value
-    # carries 3:1 over the WHOLE of itself. Nothing in between, and no subtraction.
+    # THE MANAGER'S ROWS SPLIT: a CLOCKED value is deterministic (1:1) and 3:1 does not
+    # apply to it; an UNCLOCKED value carries 3:1 over the WHOLE of itself. Nothing in
+    # between, and no subtraction.
     #
     # The launch is unclocked on this column -- the revision's own analog 9-23 ns, which the
     # proposal asks nothing of -- so it is governed like a peripheral value: 2.56:1, wider
-    # than 3:1, which is the SAFE direction. An earlier version of this test asserted 1:1 on
-    # all three Manager rows, which was correct while every one of them was a grid point and
-    # is what caught this reseed.
+    # than 3:1, which is the SAFE direction.
     assert 1.0 < ratio("Man_t_DD") <= 3.0 + 0.02, \
         f"an ANALOG Man_t_DD must carry a spread, and no tighter than 3:1: {ratio('Man_t_DD'):.2f}"
     assert ratio("Man_t_ZD") == pytest.approx(ratio("Man_t_DD")), \
@@ -3116,24 +3097,11 @@ def test_ede_peripheral_values_are_not_tighter_than_3_to_1():
     # which `ratio` would report as inf -- so it is asserted directly.
     assert (tv._min[("proposed", "Man_t_DZ")].value(),
             tv._max[("proposed", "Man_t_DZ")].value()) == pytest.approx((0.0, 0.0))
-    #
-    # WHAT THE RETIRED VERSION OF THIS TEST CAUGHT is worth keeping, because the failure mode
-    # is general. It used to subtract an assumed 0.50 UI grid point from Man_t_DZ and check
-    # only the remainder, which came to 9/3 = 3:1 and passed. That made the check
-    # UNFALSIFIABLE -- the test chose which part of the value to excuse, so any range could be
-    # made to pass by nominating a suitable grid point. Man_t_DZ was 21.31-27.31, i.e. 1.28:1
-    # as a whole value, and the test waved it through. Rod caught it by inspection.
 
 
 # ---------------------------------------------------------------------------
-# Three "the value on screen is not the value in force" defects, found together
+# The value on screen is the value in force
 # ---------------------------------------------------------------------------
-#
-# All three are the same shape as the false-PASS classes already guarded above
-# (the stale native core, the missing clock-skew term, the missing keeper leg):
-# a check existed and could not see the failure mode. Two were reported by
-# inspection -- a parameter row that did not move with the picker driving it --
-# and the third came out of chasing the first.
 
 
 def test_the_manager_output_timings_are_all_clocked_or_all_analog():
@@ -3144,11 +3112,9 @@ def test_the_manager_output_timings_are_all_clocked_or_all_analog():
     launched from it too. A t_DD on a clock grid point beside an analog t_ZD and
     t_DZ is not a conservative model of anything; it is two different devices.
 
-    That was the state PHY2 was left in: at 2× t_DD collapsed to 18.31 ns while
-    t_ZD kept 9–23 and t_DZ kept 0–10. And it was not neutral, it took the
-    FAVOURABLE HALF OF EACH — the clocked data launch (which helps setup) together
-    with the analog 10 ns release (which helps MP contention). Fixing it costs
-    8.3 ns of MP contention at 2×, and that cost is the correct answer.
+    A mix is not neutral: it takes the FAVOURABLE HALF OF EACH — the clocked data
+    launch (which helps setup) together with the analog 10 ns release (which helps
+    MP contention). Coherence costs 8.3 ns of MP contention at 2×.
 
     What the mode does NOT dictate is which grid point each one sits on — see
     `test_a_four_x_clock_places_the_three_timings_independently`. This asserts only
@@ -3189,12 +3155,10 @@ def test_a_four_x_clock_places_the_three_timings_independently():
     """A 4× clock offers 0.00, 0.25, 0.50 and 0.75 UI, and the three timings do
     NOT have to pick the same one. A 2× clock offers only 0.00 and 0.50.
 
-    The coherence rule above is about clocked-vs-analog, not about sharing an edge,
-    and the first version of that fix conflated the two: it forced every clocked
-    Manager output onto the data edge's own point. That is a real restriction on the
-    design space rather than a conservative simplification, and the EDE proposal is
-    the proof — t_DD 0.50 UI, t_ZD 0.00 UI, t_DZ 0.50 UI — so a model that cannot
-    express different points cannot express the design it exists to evaluate.
+    The coherence rule above is about clocked-vs-analog, not about sharing an edge.
+    Forcing every clocked Manager output onto the data edge's own point would restrict
+    the design space rather than simplify it conservatively — e.g. t_DD 0.50 UI,
+    t_ZD 0.00 UI, t_DZ 0.50 UI is a valid design.
 
     Off-grid values are SNAPPED rather than accepted, because a t_ZD the selected
     clock cannot place reads as a perfectly good number instead of the
@@ -3232,16 +3196,13 @@ def test_a_four_x_clock_places_the_three_timings_independently():
 
 
 def test_clocking_the_manager_release_costs_mp_contention():
-    """The direction that shows the old hybrid was not merely untidy.
+    """Clocking the Manager's release costs MP contention.
 
     A clocked t_DZ of ~18.3 ns at 2× is LATER than the tabulated 10 ns max, so the
-    Manager holds the bus longer and MP contention gets WORSE. The hybrid kept the
-    10 ns analog release alongside the clocked 18.31 ns launch — helping setup with
-    the clock and helping contention with the analog number, from one device.
+    Manager holds the bus longer and MP contention gets WORSE.
 
-    Pinned as a direction rather than a value, because the value is the model's and
-    the direction is the argument: if clocking the Manager ever stops costing MP
-    contention, the coupling has been quietly dropped again.
+    Pinned as a direction rather than a value: if clocking the Manager ever stops
+    costing MP contention, the coupling has been dropped.
     """
     kw = dict(F_CLK_target_MHz=12.288, handover_UIs=1.0,
               Man_spec="SWI3S_PHY2_PROP", Per_spec="SWI3S_PHY2_PROP",
@@ -3259,15 +3220,13 @@ def test_clocking_the_manager_release_costs_mp_contention():
 
 
 def test_every_governed_row_agrees_with_the_term_it_feeds():
-    """The reported symptom that started this: the picker moved the margins while
-    the parameters they are computed from sat unchanged on screen, so the value in
-    force was nowhere on the page.
+    """When the picker moves the margins, the parameters they are computed from
+    move with them on screen, so the value in force is on the page.
 
     Asserted as an IDENTITY between each row and the term it feeds, for all three
     Manager outputs, in both clocked modes. That is the invariant regardless of
-    which placement a design picks -- and it is what an earlier pair of tests got
-    wrong by pinning the placement the selector used to impose instead. The
-    selector supplies the GRID; the rows supply the placements.
+    which placement a design picks. The selector supplies the GRID; the rows supply
+    the placements.
     """
     tv = _view()
     for mode in (LaunchMode.CLK2, LaunchMode.CLK4):
@@ -3287,7 +3246,7 @@ def test_every_governed_row_agrees_with_the_term_it_feeds():
             if name == "Man_t_DZ" and "EDE" in term.symbol:
                 used += 1000 * 0.45 / tv._fclk.value()
             assert row == pytest.approx(used, abs=0.06), (mode, name, row, used)
-        # And every one is editable: none is the mode's output any more.
+        # And every one is editable: none is the mode's output.
         for name in ("Man_t_DD", "Man_t_ZD", "Man_t_DZ"):
             assert not tv._min[("proposed", name)].isReadOnly(), \
                 f"{mode}: {name} is a placement the design chooses, not a fixed value"
@@ -3297,17 +3256,13 @@ def test_the_keeper_legs_are_split_so_the_corner_search_stays_exact():
     """`find_worst_corner_rows` moves ONE row at a time, which is exact only for a
     margin affine in each parameter. A min over two legs is not affine.
 
-    The keeper used to be reported as the worse of its two legs, and that
-    saturated: on the EDE column the Manager's leg sits at exactly 0.00 ns, so no
-    single move of a peripheral row could lower min(0.00, per) -- each one alone
-    left the reported margin at 0.00 -- and the search stopped with the peripheral
-    rows at their typicals. Reaching the peripheral's worst needs Per_t_DZ,min and
-    Per_t_DD,max TOGETHER, a two-coordinate move no amount of iterating one
-    coordinate at a time will make.
+    Reported as the worse of its two legs, the keeper saturates: when one leg sits at
+    a fixed value, no single move of the other leg's rows lowers the min, and reaching
+    the peripheral's worst needs Per_t_DZ,min and Per_t_DD,max TOGETHER, a
+    two-coordinate move. So each keeper leg is reported on its own.
 
     Checked against brute force over the four rows the keeper reads, at 13.2 MHz
-    (PHY2's mandatory maximum) where the peripheral leg genuinely fails. The
-    single-leg model reported +0.00 there.
+    (PHY2's mandatory maximum).
     """
     import itertools
     from dataclasses import replace
@@ -3333,28 +3288,14 @@ def test_the_keeper_legs_are_split_so_the_corner_search_stays_exact():
             for c in itertools.product(("min", "typ", "max"), repeat=len(names)))
         assert got == pytest.approx(brute, abs=5e-3), \
             f"{leg}: search found {got:+.2f}, true worst {brute:+.2f}"
-    # THIS TEST USED TO PIN A CONCLUSION, AND THAT WAS THE BUG.
-    #
-    # It asserted that the peripheral's keeper leg FAILS at PHY2's mandatory
-    # maximum, and read that as the EDE proposal's rate ceiling. The failure was an
-    # artefact of the input: Per_t_DZ,min was seeded UI/3, a 3:1 turn-off ratio
-    # applied to a POSITION in the UI rather than to a delay, which nothing derived.
-    # The assertion then protected the artefact exactly as well as it would have
-    # protected a real finding -- a test that asserts a conclusion shields it from
-    # correction as well as from regression.
-    #
-    # So this pins the INPUT instead: the peripheral's release is referenced to its
-    # own ramp completion, which makes the keeper leg satisfied BY CONSTRUCTION --
-    # what is left over is the hold interval, whose minimum is Man_tKeeper_Response.
-    # If that stops being true the leg is wrong, and this says so without asserting
-    # which way it comes out.
+    # This pins the INPUT: the peripheral's release is referenced to its own ramp
+    # completion, which makes the keeper leg satisfied BY CONSTRUCTION -- what is left
+    # over is the hold interval, whose minimum is Man_tKeeper_Response.
     # The margin is the hold interval MINUS the keeper's demand, and PHY2 sets the two to
-    # the same 3 ns -- so "satisfied by construction" is exact and there is NOTHING SPARE.
-    # It read +3.00 while Man_tKeeper_Response was gated off by the old keeper_forced flag;
-    # with the demand charged (PHY2 has no forced keeper) it is identically zero. A pass by
-    # the model's criterion, and a knife-edge one: anything unmodelled that eats into the
-    # settled window at the far pin -- ringing, settling, a hold interval at its minimum
-    # rather than above it -- takes it negative, and a starved keeper loses the bit.
+    # the same 3 ns (PHY2 has no forced keeper) -- so the margin is identically zero and
+    # there is NOTHING SPARE: anything unmodelled that eats into the settled window at the
+    # far pin -- ringing, settling, a hold interval at its minimum rather than above it --
+    # takes it negative, and a starved keeper loses the bit.
     per = find_worst_corner_rows("keeper_Per", rows, base)
     leg = compute(apply_row_picks(base, rows, per)).breakdowns["keeper_Per"]
     assert leg.margin_ns == pytest.approx(0.0), \
@@ -3363,3 +3304,40 @@ def test_the_keeper_legs_are_split_so_the_corner_search_stays_exact():
     assert syms == {"Per_t_hold,min", "Man_t_Keeper_Response"}, syms
     assert not any("UI" in t.symbol for t in leg.terms), \
         "the peripheral's release must not be UI-scaled -- that was the artefact"
+
+
+def test_the_launch_hint_names_only_the_column_the_selector_drives():
+    from swi3s_studio.timing.spec_source import is_ede
+    from swi3s_studio.ui.timing_view import LaunchMode
+    tv = _view()
+    ede = next(i for i in range(tv._man_spec_combo.count())
+               if is_ede(tv._man_spec_combo.itemData(i)))
+    tv._man_spec_combo.setCurrentIndex(ede)
+    tv._update_launch_hint()
+    text = tv._launch_hint.text()
+    assert "EDE column only" in text and "BOTH" not in text
+    assert tv._launch_mode_for("spec") is LaunchMode.ANALOG
+
+
+@pytest.mark.parametrize("spec", SPEC_SOURCES)
+def test_every_unratified_source_carries_the_proposal_note(spec):
+    """A result computed from unratified values says so, whichever proposal it is.
+
+    The EDE source is the proposed revision plus a clocked Manager release, so it is as
+    unratified as `SWI3S_PHY2_PROP`, though the selector offers it and hides the other.
+    """
+    from swi3s_studio.timing.spec_source import (
+        PROPOSAL_NOTE,
+        is_ede,
+        is_proposed,
+        is_unratified,
+    )
+    unratified = spec in ("SWI3S_PHY2_PROP", "SWI3S_PHY2_EDE")
+    assert is_unratified(spec) == unratified
+    assert is_proposed(spec) == (spec == "SWI3S_PHY2_PROP")   # the selector's predicate
+    assert is_unratified(spec) == (is_proposed(spec) or is_ede(spec))
+    for side in ({"Man_spec": spec}, {"Per_spec": spec}):
+        caveats = compute(CalcInputs(**side)).caveats
+        assert (PROPOSAL_NOTE in caveats) == unratified, (spec, side, caveats)
+        if unratified:
+            assert caveats[0] == PROPOSAL_NOTE, caveats

@@ -11,16 +11,25 @@ void CRegisterModel::Reset()
     mDev.clear();
 }
 
-// Normalise a written address to its _NEXT-base form: a write to a _CURR
-// register (offset >= 0x40 within the dual-ranked window) maps onto the same
-// base so reads are uniform. We treat 0x40-sized dual-rank windows at SLC
-// 0x1080+ and DP _NEXT 0x80+.
+// The per-device blocks with a dual-ranked window: SLC, CDS and the three PHY Control
+// blocks. Within each, _NEXT is at 0x80..0xBF and its _CURR alias at 0xC0..0xFF, as in a
+// data port block (data/registers.json).
+static const U32 kDualRankedBlocks[] = {reg::kSlcBase, reg::kCdsBase, reg::kPhy1Base,
+                                        reg::kPhy2Base, reg::kPhy3Base};
+
+// Offset of `addr` within the dual-ranked block holding it, or -1 when no such block does.
+static int systemBlockOffset(U32 addr)
+{
+    for (U32 base : kDualRankedBlocks)
+        if (addr >= base && addr < base + 0x100) return static_cast<int>(addr - base);
+    return -1;
+}
+
+// Normalise a written address to its _NEXT-base form: a write to a _CURR alias maps onto
+// its _NEXT base so reads are uniform.
 static U32 toBase(U32 addr)
 {
-    // SLC dual-ranked: 0x1080.._0x10BF (_NEXT), 0x10C0..0x10FF (_CURR).
-    if (addr >= reg::kSlcBase + 0xC0 && addr < reg::kSlcBase + 0x100) {
-        return addr - reg::kCurrRankOffset;
-    }
+    if (systemBlockOffset(addr) >= 0xC0) return addr - reg::kCurrRankOffset;
     // DP dual-ranked: within each 256-byte block, _NEXT 0x80..0xBF, _CURR 0xC0..0xFF.
     if (reg::InDpBlock(addr)) {
         U32 off = reg::DpOffsetOf(addr);
@@ -31,7 +40,8 @@ static U32 toBase(U32 addr)
 
 static bool isDualRanked(U32 baseAddr)
 {
-    if (baseAddr >= reg::kSlcBase + 0x80 && baseAddr < reg::kSlcBase + 0xC0) return true;
+    const int off = systemBlockOffset(baseAddr);
+    if (off >= 0x80 && off < 0xC0) return true;
     if (reg::InDpBlock(baseAddr)) {
         U32 off = reg::DpOffsetOf(baseAddr);
         return off >= 0x80 && off < 0xC0;
@@ -39,8 +49,16 @@ static bool isDualRanked(U32 baseAddr)
     return false;
 }
 
+// A CDS register's _CURR alias is read-only (Dual-CURR-is-RO, data/registers.json), unlike a
+// data port's (Dual-Curr-is-RW): a write to it has no effect.
+static bool isReadOnlyCurr(U32 addr)
+{
+    return addr >= reg::kCdsBase && addr < reg::kCdsBase + 0x100 && addr - reg::kCdsBase >= 0xC0;
+}
+
 void CRegisterModel::applyWrite(int dev, U32 addr, U8 value)
 {
+    if (isReadOnlyCurr(addr)) return;
     DeviceRegs& d = mDev[dev];
     U32 base = toBase(addr);
     bool currAlias = (base != addr);        // toBase mapped a _CURR alias down to its base
@@ -48,7 +66,7 @@ void CRegisterModel::applyWrite(int dev, U32 addr, U8 value)
         d.next[base] = value;           // _NEXT write: stage; needs Commit
         d.nextSrc[base] = SrcWritten;
     } else if (isDualRanked(base)) {
-        // Direct write to a dual-ranked _CURR alias (the Current Value Register):
+        // Direct write to a dual-ranked, writable _CURR alias (the Current Value Register):
         // takes effect IMMEDIATELY with no Commit, and per spec (SWI3S v1.1 Table
         // 165 / {ASW5612}, Dual-Curr-is-RW) the same value is mirrored into the
         // _NEXT register (NVR == CVR). BuildConfig reads _CURR, so this changes the
@@ -131,7 +149,7 @@ void CRegisterModel::commitDevice(int dev, U8 groupMask)
                                          : resetOf(reg::DpAddr(n, reg::kDpCommitGroupMemb));
             return (memb & groupMask) != 0;
         }
-        // SLC dual-ranked (geometry, row rate, spacer) = CG0.
+        // SLC, CDS and PHY Control registers are fixed members of CG0 (Section 9.1.10.4.1).
         return (groupMask & 0x1) != 0;
     };
 
@@ -168,20 +186,22 @@ void CRegisterModel::OnCommand(const SwI3sCommand& cmd)
         }
     }
     // NOTE: Commit promotion is deferred to Commit() at the SSP row, called by
-    // the WorkerThread only for a CONFIRM_COMMIT'd SSCR.
+    // the Decoder only for a CONFIRM_COMMIT'd SSCR.
 }
 
-void CRegisterModel::Commit(U8 groupMask)
+void CRegisterModel::Commit(U8 groupMask, U16 deviceMask)
 {
     for (auto& kv : mDev) {
-        commitDevice(kv.first, groupMask);
+        if (kv.first >= 0 && kv.first < 16 && (deviceMask & (1u << kv.first)))
+            commitDevice(kv.first, groupMask);
     }
 }
 
 U8 CRegisterModel::resetOf(U32 baseAddr)
 {
     // Per-register spec reset for the decode path. The DP-block registers with a
-    // non-zero reset (mirrors data/registers.json; verified by test_register_resets):
+    // non-zero reset (mirrors data/registers.json; verified by
+    // test_register_model.py::test_decode_reset_table_matches_spec):
     if (reg::InDpBlock(baseAddr)) {
         switch (reg::DpOffsetOf(baseAddr)) {
             case reg::kDpCommitGroupMemb: return 0x01;  // CommitGroupMemb -> CG0
@@ -371,8 +391,7 @@ bool CRegisterModel::BuildConfig(SwI3sConfig& out) const
     //
     // THE MANAGER'S SLOT (0) STAYS AT ITS DEFAULT and cannot be recovered: only
     // peripherals have an addressable register block, so nothing on the wire says how the
-    // Manager drives the CDS. Leaving it at the default is the honest answer — inferring
-    // it from a peripheral's value would invent a fact the capture does not contain.
+    // Manager drives the CDS. It is not inferred from a peripheral's value.
     //
     // CDS_BitWidth is bus-wide in the config but per-device on the wire; taken from `rep`
     // like the geometry above, for the same reason (identical across the link).
@@ -397,9 +416,8 @@ bool CRegisterModel::BuildConfig(SwI3sConfig& out) const
     }
 
     // Every enabled dataport across every device. Start empty and append only the
-    // enabled ports — do NOT pre-fill kMaxPeripherals disabled placeholders, which
-    // padded config_dataports() with phantom entries and skewed the positional
-    // fallback index by kMaxPeripherals.
+    // enabled ports — no disabled placeholders, which would pad config_dataports()
+    // with phantom entries and skew the positional fallback index.
     out.dps.clear();
     bool any = false;
     for (const auto& kv : mDev) {

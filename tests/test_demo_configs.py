@@ -1,13 +1,11 @@
 """Demo bus-config expectations: the handover-friendly PHY2 layout, the PHY3 operational
 row rate, and cursor-aware config export.
 
-These lock in three fixes:
-- The Bus Grid and "Export Visualizer CSV" disagreed for a reconfiguring capture
-  (grid showed the cursor's 8-col segment, export always wrote the final 16-col config).
-  Export is now as-of the cursor (`config_dataports_at`).
-- The PHY2 demo now keeps the column right after the CDS (col 1) and the last column
-  (col 7 at 8-col) FREE for the CDS / S1 handovers, matching real configs — the two PCM
-  ports time-interleave in col 2 at 8-col to fit.
+- "Export Visualizer CSV" writes the config as-of the cursor (`config_dataports_at`), so for
+  a reconfiguring capture it matches the segment the Bus Grid shows.
+- The PHY2 demo keeps the column right after the CDS (col 1) and the last column
+  (col 7 at 8-col) FREE for the CDS / S1 handovers — the two PCM ports time-interleave in
+  col 2 at 8-col to fit.
 - The PHY3 demo holds its 16-col operational row rate at 3.072 MRows/s (the recovered-
   clock PLL's stable reference), using one capture sample rate throughout.
 """

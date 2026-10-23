@@ -3,8 +3,7 @@
 One row per device (0–11). Lets the user name each device, assign/import/clear
 its peripheral register map, and set its hub depth (0–5). Hub depth feeds the
 decoder: a peripheral N hub levels deep has its response delayed 2·N frame rows.
-This is the single place these per-device settings live (the old standalone
-register-map import menu folds in here).
+This is the single place these per-device settings live.
 """
 
 from __future__ import annotations
@@ -27,11 +26,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import import_notes
 from .theme import VizTheme
 
 MAX_HUB_DEPTH = 5
 
-# The per-device aspects this dialog can edit. The Devices menu (and Decode ▸ Hub Depths) opens it
+# The per-device aspects this dialog can edit. Each Devices menu item opens it
 # focused on ONE aspect (Names / Register Maps / Hub Depth); the full set is used
 # when everything is edited together.
 ALL_SECTIONS = ("names", "maps", "depths")
@@ -44,7 +44,8 @@ class DevicesDialog(QDialog):
     `sections` selects which aspects to show (a subset of ALL_SECTIONS); the
     hidden aspects keep the values passed in. On accept, read results from
     `.names` ({dev: str}), `.hub_depths` ({dev: int}), and `.regmaps`
-    ({dev: PeripheralRegisterMap})."""
+    ({dev: PeripheralRegisterMap}); `.map_notes` holds, per device, the import warnings
+    (import_notes.ImportWarning) of the map imported for it here."""
 
     def __init__(self, parent, devices, names: Dict[int, str],
                  hub_depths: Dict[int, int], regmaps: Dict[int, object],
@@ -60,6 +61,7 @@ class DevicesDialog(QDialog):
         self.names: Dict[int, str] = dict(names)
         self.hub_depths: Dict[int, int] = dict(hub_depths)
         self.regmaps: Dict[int, object] = dict(regmaps)
+        self.map_notes: Dict[int, list] = {}
 
         self._name_edits: Dict[int, QLineEdit] = {}
         self._depth_spins: Dict[int, QSpinBox] = {}
@@ -157,12 +159,16 @@ class DevicesDialog(QDialog):
     def _set_map(self, dev: int) -> None:
         from .regmap_import_dialog import RegisterMapImportDialog
         dlg = RegisterMapImportDialog(self, device=dev, devices=[dev])
-        if dlg.exec() and dlg.pmap is not None:
+        with import_notes.collect() as notes:
+            ok = dlg.exec()
+        if ok and dlg.pmap is not None:
             self.regmaps[dev] = dlg.pmap
+            self.map_notes[dev] = list(notes)
             self._map_labels[dev].setText(self._map_text(dev))
 
     def _clear_map(self, dev: int) -> None:
         self.regmaps.pop(dev, None)
+        self.map_notes.pop(dev, None)
         self._map_labels[dev].setText(self._map_text(dev))
 
     def accept(self) -> None:

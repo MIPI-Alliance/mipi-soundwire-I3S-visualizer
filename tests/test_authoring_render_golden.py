@@ -1,15 +1,11 @@
-"""Authoring-render characterization golden — locks the Visualizer authoring output
-(issue list + clash cells + grid dimensions) across every example config, so the
-in-progress placement merge (routing the authoring grid through the C++ placer +
-a Python decoration/validation post-pass) can be proven to reproduce today's
-behaviour exactly before swviz is retired from the live path.
+"""Authoring-render characterization golden: locks the Visualizer authoring output
+(issue list + clash cells + grid dimensions) across every example config.
 
-Cells themselves are already pinned by test_visualizer_placement (C++ placement ==
-golden) and test_visualizer_engine (swviz model == golden); this snapshot covers the
-part those DON'T — render_payload's issues + clashes (the decoration/validation
-layer most at risk in the merge).
+Cells themselves are pinned by test_visualizer_placement (C++ placement == golden) and
+test_visualizer_engine (swviz model == golden); this snapshot covers render_payload's
+issues + clashes (the decoration/validation layer).
 
-Regenerate (only with a reviewed diff — see MEMORY 'golden diff review before edit'):
+Regenerate (only with a reviewed diff; see docs/DEVELOPMENT.md):
     PYTHONPATH=. python3 tests/test_authoring_render_golden.py --regen
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_authoring_render_golden.py

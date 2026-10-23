@@ -18,7 +18,7 @@ const U8 kCode3b4bMinus[8] = {
     0xB, 0x9, 0x5, 0xC, 0xD, 0xA, 0x6, 0xE  // y=7 is primary (P7); A7 added below
 };
 
-// Robust Token raw 10-bit symbols (Table 38), index = token number.
+// Robust Token raw 10-bit symbols (the "Robust Token Symbols" table), index = token number.
 const U16 kRobustToken[16] = {
     0x299, 0x196, 0x345, 0x32A, 0x2A5, 0x159, 0x2C6, 0x135,
     0x25A, 0x1A9, 0x236, 0x1CA, 0x0D5, 0x0BA, 0x269, 0x166
@@ -48,10 +48,8 @@ struct DecodeTables {
         // D.07 is the one *balanced* 5b/6b sub-block, so its complement is not
         // added by the loop above (popcount == 3). Both 111000 (RD-) and 000111
         // (RD+) are legal and decode to 7 -- mirror the 3b/4b D.x.7 handling
-        // below. Without this, any byte with low-5-bits == 7 (0x07, 0x27, ...,
-        // 0xE7) fails to decode whenever the transmitter emits the RD+ form,
-        // which (being disparity-dependent) shows up as intermittent CRC errors
-        // on Write packets / register data. See SwI3sProtocolDefs comma table.
+        // below. Without it, a byte with low-5-bits == 7 (0x07, 0x27, ..., 0xE7)
+        // in the RD+ form fails to decode.
         dec6[0x07] = 7;   // D.07 RD+ (000111)
         for (int y = 0; y < 8; ++y) {
             U8 c = kCode3b4bMinus[y];
@@ -62,8 +60,8 @@ struct DecodeTables {
         }
         // D.x.3 is the balanced 3b/4b sub-block (the 5b/6b D.07 analog): 1100
         // (RD-) and 0011 (RD+) are both legal and decode to 3, but the loop
-        // skips the complement for balanced codes (popcount == 2), so 0011 was
-        // unmapped -- the same intermittent-CRC failure mode as D.07 above.
+        // skips the complement for balanced codes (popcount == 2), so map 0011
+        // here.
         dec4[0x3] = 3;   // D.x.3 RD+ (0011)
         // D.x.A7 alternate encodings of y=7 (0111 / 1000).
         dec4[0x7] = 7;

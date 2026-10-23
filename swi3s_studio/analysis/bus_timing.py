@@ -2,9 +2,7 @@
 
 SWI3S PHY2 is a forwarded-clock DDR link: the data line is sampled once per UI (one
 clock edge per UI, alternating rising/falling); the decoder samples just before each
-clock edge (the settled end of the UI). How much margin there is depends on *where* the
-analyzer probes the bus — a sub-optimal tap pushes data transitions toward the sample
-point and erodes setup/hold, especially on one clock-edge polarity (duty is rarely 50%).
+clock edge (the settled end of the UI).
 
 Straight off `Capture.clock_edges`/`data_edges` (no decode), for EVERY data transition
 in [start_sample, end_sample) it reports: setup (transition -> the sample edge that
@@ -14,11 +12,9 @@ column — enough for the Timing pane to bin/colour the four (clock-edge polarit
 direction) categories, filter by column/driver, and find the tightest margins. Plus the
 UI period and clock high/low split (duty).
 
-Measuring every transition is data-edge-bound, so it stays cheap even on multi-GB
-captures and catches a tight edge anywhere in the range; only the duty is estimated from
-a window. The range is one audio-mode REGION (Session.timing_regions): a commit can
-change the bus clock rate mid-capture (e.g. 2 col -> 16 col) and setup/hold only makes
-sense within a single clock rate, so each region is measured on its own.
+Every transition in the range is measured; only the duty is estimated from a window.
+The range is one audio-mode region (Session.timing_regions), a span of constant clock
+rate; each region is measured on its own.
 """
 from __future__ import annotations
 
@@ -56,11 +52,10 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
     """Measure setup/hold for `capture` over the audio-mode region [start_sample,
     end_sample). Returns None if there aren't enough edges to measure.
 
-    Every data transition in the range is measured (data-edge-bound, so cheap even on
-    huge captures) — a windowed sample would miss a localized tight edge. The §5.1.2
-    link-control / cold-start region (long idle gaps, not real sampled UIs) is excluded
-    because it is before the audio start. Only the clock duty / UI period is estimated
-    from a representative window of up to `max_edges` clock gaps within the region.
+    Every data transition in the range is measured. The §5.1.2 link-control / cold-start
+    region (long idle gaps, not sampled UIs) is excluded: it precedes the audio start.
+    Only the clock duty / UI period is estimated, from a window of up to `max_edges`
+    clock gaps within the region.
 
     `segments` (a list of {start_ui, column_count}, from the decode) lets each
     transition be tagged with its frame column (`tr_column`) so the caller can filter
@@ -68,10 +63,8 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
 
     `recovered_clock` = (row_sync_samples, ui_samples) switches to the PHY3 (DLV) model:
     there is no forwarded clock, so setup/hold are measured against the RECOVERED mid-UI
-    SAMPLE POINT (where DLV latches the bit), not a clock edge. Passing capture.clock_edges
-    (the DP wire) as both clock and data — which is what a DLV capture stores — through the
-    forwarded-clock path gives setup≈0 / hold≈one-UI garbage, because DP and DN toggle at
-    the SAME samples; this branch avoids that."""
+    SAMPLE POINT (where DLV latches the bit), not a clock edge. Pass it for a DLV capture:
+    its DP and DN toggle at the same samples, so the forwarded-clock path does not apply."""
     if recovered_clock is not None:
         return _measure_dlv_timing(capture, segments, start_sample, end_sample,
                                    recovered_clock, max_edges)
@@ -91,17 +84,12 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
     c0 = int(_ss(clk, int(start_sample), side="left")) if start_sample > 0 else 0
     c1 = int(_ss(clk, int(end_sample), side="left")) if end_sample is not None else n
 
-    # Clock duty + UI period from a representative window of THIS region's gaps. Duty is a
-    # global property within a region, so a window is enough and keeps this O(window).
-    # (Windowing to the region — not the whole capture — is what keeps a short region's
-    # duty region-local instead of leaking in the excluded link-control gaps.) Edge k
-    # (0-based) leaves state = initial_clock ^ ((k+1) & 1); `rising` is that state.
+    # Clock duty + UI period from a window of up to `max_edges` of THIS region's gaps.
+    # Edge k (0-based) leaves state = initial_clock ^ ((k+1) & 1); `rising` is that state.
     w0 = c0
-    # Clamp the duty window STRICTLY to the region [c0, c1): never reach past c1, or a
-    # tiny region's UI/duty would be measured across the handover edge into the next
-    # region (the very edge the setup/hold path below excludes). A region with < 2
-    # edges then has no measurable gap and ui/high/low fall back to 0 (honest
-    # "unknown") rather than reporting the adjacent region's clock rate.
+    # The duty window stays strictly inside [c0, c1), never past the handover edge at c1.
+    # A region with < 2 edges has no measurable gap; ui/high/low then fall back to 0
+    # (unknown).
     clkw = clk[w0:min(c1, w0 + max_edges)]
     rising_w = (initial_clock ^ (((np.arange(w0, w0 + clkw.size) + 1) & 1) == 1))
     gapw = np.diff(clkw) * to_ns
@@ -110,18 +98,15 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
     clk_high = float(np.median(gapw[after_rising])) if after_rising.any() else ui_ns
     clk_low = float(np.median(gapw[~after_rising])) if (~after_rising).any() else ui_ns
 
-    # Setup/hold, measured PER DATA TRANSITION over the region so that every transition
-    # contributes exactly one setup AND one hold (a transition sits between two sample
-    # edges, so both are defined and the counts must agree), and a tight edge anywhere in
-    # the range is caught.
+    # Setup/hold, measured per data transition over the region: each transition sits
+    # between two sample edges and contributes exactly one setup and one hold.
     #
     # A transition d falls in the UI (clk[e-1], clk[e]] whose END sample edge is e (the
     # edge that samples the new value). Its SETUP is that edge's margin (clk[e] - d, how
     # long the value was stable before it was sampled). Its HOLD is the PREVIOUS edge's
     # margin (d - clk[e-1], how long the old value was held after it was last sampled).
-    # Require both bounding edges strictly inside the region (c0 < end_i < c1), so the
-    # handover UI at the boundary — whose UI already runs at the adjacent region's rate —
-    # doesn't leak in.
+    # Both bounding edges must lie strictly inside the region (c0 < end_i < c1), which
+    # excludes the handover UI at the boundary.
     end_i = np.searchsorted(clk, dat, side="left")       # first sample edge >= d (UI end)
     ok = (end_i >= c0 + 1) & (end_i <= min(c1, n) - 1)
     d, end_i = dat[ok], end_i[ok]
@@ -172,11 +157,8 @@ def _measure_dlv_timing(capture, segments, start_sample, end_sample, recovered_c
         return None
     lo = int(start_sample)
     hi = int(end_sample) if end_sample is not None else int(syncs[-1])
-    # Whole rows STRICTLY inside [lo, hi]. Exclude the partial boundary rows: a region
-    # boundary (a commit) is where the row's column count changes, and a row that straddles
-    # it would be sub-divided at the wrong (adjacent-region) column count — placing its
-    # mid-UI sample grid a few UIs off and reporting bogus multi-UI setup/hold. (This mirrors
-    # the forwarded-clock path excluding the handover UI at the boundary.)
+    # Whole rows strictly inside [lo, hi]. Partial boundary rows are excluded: a row that
+    # straddles a commit would be subdivided at the adjacent region's column count.
     i0 = int(np.searchsorted(syncs, lo, side="left"))          # first row starting at/after lo
     i1 = int(np.searchsorted(syncs, hi, side="right")) - 1     # last row starting at/before hi
     if i1 - i0 < 1:
@@ -211,14 +193,13 @@ def _measure_dlv_timing(capture, segments, start_sample, end_sample, recovered_c
     d, j = d[ok], j[ok]
     setup = (sp[j] - d) * to_ns                              # value stable before it was latched
     hold = (d - sp[j - 1]) * to_ns                           # value held after the previous latch
-    # UI period of THIS region (row period / its columns), from the region's own rows — not
-    # the global operational UI (which is wrong for a Safe-Lock region measured on its own).
+    # UI period of THIS region (row period / its columns), from the region's own rows, not
+    # the global operational UI.
     row_periods = (ends - starts)
     ui_samps = float(np.median(row_periods / cols_per_row.astype(np.float64))) if starts.size else float(ui)
     ui_ns = ui_samps * to_ns
-    # Frame column = the column of the mid-UI sample point that latches the new value. Must
-    # be a real column index (not -1), or the Timing pane's column filter — enabled whenever
-    # the region has column roles — excludes every point (np.isin(-1, {0..cols-1}) is False).
+    # Frame column = the column of the mid-UI sample point that latches the new value. It
+    # must be a real column index (not -1): the Timing pane's column filter drops -1.
     tr_column = spc[j].astype(np.int64)
     # DLV samples on the recovered clock's mid-UI (falling) edge only — there is no dual-
     # edge forwarded clock, so the clock-polarity split is not meaningful; report both

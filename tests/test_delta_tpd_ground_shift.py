@@ -2,30 +2,26 @@
 
 The PM legs send a signal out and get one back, so TX and RX roles swap between
 them. One physical ground shift δ = V_Per_gnd − V_Man_gnd therefore raises one
-leg's effective threshold and lowers the other's. The model used to treat that
-as an exact cancellation and drop α from Σ_cross,PM,setup entirely.
+leg's effective threshold and lowers the other's.
 
-The cancellation is real but narrower than that: it needs t_cross to be AFFINE
-in the threshold (true only for a linear ramp) AND the two legs to carry EQUAL
-t_RF (so the ±δ terms are equally weighted). Break either and a residue
-survives — and because Σ_setup is a PENALTY, dropping it made the PM setup
-margin optimistic. Under the exponential ramp t_cross is convex, so by Jensen
-the ±δ pair sums to strictly more than the δ=0 value: ~+0.57 ns at α = 0.10,
-t_RF = 5 ns, landing on the already-failing PM_setup leg.
+The ±δ terms cancel exactly only when t_cross is AFFINE in the threshold (a
+linear ramp) AND the two legs carry EQUAL t_RF (so the ±δ terms are equally
+weighted). Otherwise a residue survives, and because Σ_setup is a PENALTY it
+reduces the PM setup margin. Under the exponential ramp t_cross is convex, so by
+Jensen the ±δ pair sums to strictly more than the δ=0 value: ~+0.57 ns at
+α = 0.10, t_RF = 5 ns.
 
 What is pinned here:
 
-1. The narrow case still cancels exactly (linear + equal t_RF), so the default
-   configuration is untouched by the fix.
-2. The two broken cases now move with α, in the pessimistic direction.
+1. The narrow case cancels exactly (linear + equal t_RF), which is the default
+   configuration.
+2. The other two cases move with α, in the pessimistic direction.
 3. The accessor agrees with an independent two-polarity recomputation.
 4. hold-rr keeps its δ=0 simplification, and that stays inert because rr never
-   binds — asserted rather than assumed, since the docstring leans on it.
-5. The invariant a reader should actually rely on: ∂margin/∂α ≤ 0 for EVERY
-   inequality. The individual cross terms do NOT all move together — Δ_cross,MP
-   and Σ_setup are penalties that shrink as α falls, while Σ_cross,PM,hold is a
-   CREDIT that grows. Reading term magnitudes as if they shared a sign is what
-   makes the α response look inconsistent when it is not.
+   binds.
+5. ∂margin/∂α ≤ 0 for EVERY inequality. The individual cross terms do NOT all
+   move together — Δ_cross,MP and Σ_setup are penalties that shrink as α falls,
+   while Σ_cross,PM,hold is a CREDIT that grows.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_delta_tpd_ground_shift.py
 """
@@ -43,9 +39,8 @@ from swi3s_studio.timing.delta_tpd import (
 # defaults), restated here so the oracle below is independent of the model.
 _V_IH_MAX, _VDD_PLUS, _VDD_MINUS, _TRF_TOL = 0.65, 1.05, 0.95, 0.05
 # The swing is (V_OH − V_OL)/V_DD at those same defaults. Written as the subtraction, not as
-# the literal 0.60, for two reasons: it is what the swing MEANS, and 0.80 − 0.20 is not
-# exactly 0.60 in binary — so the literal would leave this oracle 1-2 ULP away from the model
-# it is checking, which an exact comparison would report as a disagreement.
+# the literal 0.60: 0.80 − 0.20 is not exactly 0.60 in binary, and the oracle must match the
+# model to the ULP.
 _SWING = 0.80 - 0.20
 
 _ALPHAS = (0.10, 0.075, 0.05, 0.025, 0.0)
@@ -73,13 +68,11 @@ def _sigma_setup_oracle(alpha, tRF_Man, tRF_Per, shape):
 
 
 def test_linear_ramp_at_equal_tRF_still_cancels_the_ground_shift():
-    """The one case where cancellation is exact — and the default config, so the
-    fix must not perturb it.
+    """The one case where cancellation is exact, and the default config.
 
-    "Exact" is analytic, not bit-exact: the two legs are now summed as separate
-    ±α terms, so the result carries a few ULPs of rounding the single-coefficient
-    form did not. 1e-9 ns is six orders of magnitude below anything the margins
-    resolve.
+    "Exact" is analytic, not bit-exact: the two legs are summed as separate ±α
+    terms, so the result carries a few ULPs of rounding. 1e-9 ns is six orders of
+    magnitude below anything the margins resolve.
     """
     values = [_env(a, "linear").sigma_pm_setup_ns(5.0, 5.0) for a in _ALPHAS]
     assert max(values) - min(values) < 1e-9, \
@@ -98,7 +91,7 @@ def test_exp_ramp_does_not_cancel_the_ground_shift():
         f"Σ_setup must fall monotonically as α falls, got {got}"
     assert got[0] - got[-1] == pytest.approx(0.5701, abs=5e-4), \
         "the α=0.10 residue on the exp ramp is what the old model dropped"
-    # The residue is a PENALTY: never let the fix understate the δ=0 baseline.
+    # The residue is a PENALTY: it never falls below the δ=0 baseline.
     flat = _env(0.0, "exp").sigma_pm_setup_ns(5.0, 5.0)
     assert all(v >= flat - 1e-12 for v in got)
 
@@ -131,9 +124,7 @@ def test_hold_rr_never_binds_so_its_dgnd_simplification_is_inert(shape):
     That is safe ONLY while rr never binds — Σ_hold takes min(rr, rf), and rr's
     per-leg coefficients dominate rf's on BOTH legs, so rf always wins.
 
-    Asserted because ``sigma_pm_hold_ns``'s docstring names this test as the
-    justification; if a corner change ever made rr bind, the simplification
-    would silently become a live error.
+    ``sigma_pm_hold_ns``'s docstring names this test as the justification.
     """
     env = _env(0.10, shape)
     assert env.sigma_pm_hold_rr_clk >= env.sigma_pm_hold_rf_clk
@@ -151,11 +142,10 @@ def test_hold_rr_never_binds_so_its_dgnd_simplification_is_inert(shape):
 
 @pytest.mark.parametrize("shape", ["linear", "exp"])
 def test_reducing_alpha_never_worsens_any_margin(shape):
-    """The invariant worth documenting: ∂margin/∂α ≤ 0 everywhere.
+    """∂margin/∂α ≤ 0 everywhere.
 
-    Term magnitudes are the wrong thing to watch — Σ_cross,PM,hold is a credit
-    and GROWS as α falls, while the two penalties shrink. Both express the same
-    thing, so the check belongs on the margins.
+    Checked on the margins, not on term magnitudes: Σ_cross,PM,hold is a credit
+    and GROWS as α falls, while the two penalties shrink.
     """
     base = CalcInputs(Man_shape=shape, Per_shape=shape)
     series = [compute(dc_replace(base, V_noise_pp_frac=a)).breakdowns
@@ -169,9 +159,8 @@ def test_reducing_alpha_never_worsens_any_margin(shape):
 
 
 def test_the_hold_credit_grows_as_the_penalties_shrink():
-    """Pins the sign asymmetry itself, since it is the part that reads as a bug:
-    less noise makes the data stay valid LONGER at the Manager, so the hold
-    credit grows while Δ_cross,MP shrinks."""
+    """Pins the sign asymmetry: less noise makes the data stay valid LONGER at the
+    Manager, so the hold credit grows while Δ_cross,MP shrinks."""
     hi, lo = _env(0.10, "linear"), _env(0.0, "linear")
     assert (lo.delta_cross_MP_ns(5.0, 5.0, direction="hold")
             < hi.delta_cross_MP_ns(5.0, 5.0, direction="hold")), \
@@ -185,8 +174,8 @@ def test_the_hold_credit_grows_as_the_penalties_shrink():
 # ---------------------------------------------------------------------------
 
 def test_delta_cross_MP_is_lane_agnostic_only_when_the_lanes_match():
-    """Equal per-lane t_RF ⇒ setup and hold coincide. That coincidence is why a
-    single coefficient served both, and why the split changes nothing by default."""
+    """Equal per-lane t_RF ⇒ setup and hold coincide, so the per-direction split
+    changes nothing at equal t_RF."""
     env = _env(0.10, "linear")
     for tRF in (2.0, 5.0, 8.3):
         assert (env.delta_cross_MP_ns(tRF, tRF, direction="setup")
@@ -200,8 +189,7 @@ def test_setup_puts_the_late_edge_on_the_data_lane_and_hold_on_the_clock(shape):
     transitions early. So the late (rising) crossing scales with t_RF_DATA for
     setup and t_RF_CLK for hold — the two t_RF swap between directions.
 
-    Using the hold assignment for setup understates a setup PENALTY, which is
-    the defect this pins.
+    Using the hold assignment for setup would understate a setup PENALTY.
     """
     env = _env(0.10, shape)
     tRF_CLK, tRF_DATA = 3.0, 8.0
@@ -209,7 +197,7 @@ def test_setup_puts_the_late_edge_on_the_data_lane_and_hold_on_the_clock(shape):
         env.mp_late_rise * tRF_DATA - env.mp_early_fall * tRF_CLK)
     assert env.delta_cross_MP_ns(tRF_CLK, tRF_DATA, direction="hold") == pytest.approx(
         env.mp_late_rise * tRF_CLK - env.mp_early_fall * tRF_DATA)
-    # Slow data against a fast clock is the case that used to be understated.
+    # Slow data against a fast clock: setup is the larger penalty.
     assert (env.delta_cross_MP_ns(tRF_CLK, tRF_DATA, direction="setup")
             > env.delta_cross_MP_ns(tRF_CLK, tRF_DATA, direction="hold") + 5.0), \
         "a 3:8 lane mismatch should separate the two directions by several ns"

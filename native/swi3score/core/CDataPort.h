@@ -1,5 +1,5 @@
 // Audio payload placement for one Data Port — a C++ port of the visualizer's
-// DataPort cascade (src/models/dataport.py), which implements the normative
+// DataPort cascade (swi3s_studio/swviz/models/dataport.py), which implements the normative
 // §14.2.5 "Payload Visualizer" algorithm.
 //
 // clock_tick() advances the port by one UI and returns what that UI carries
@@ -22,6 +22,10 @@ struct DpEmit
     int  channel = -1;         // channel number (DATA / TX_PRESENT)
     int  sampleInGroup = 0;
     int  bitInChannel = 0;     // numeric bit weight within the sample (MSB..0)
+    // SampleSize field (bits - 1) the sample being transported was loaded with: its MSB
+    // is bitInChannel == sampleSize. A SampleSize write that lands mid-sample takes effect
+    // at the next sample, so this can differ from Config().SampleSize until then.
+    int  sampleSize = 0;
     bool freshTransport = false;
     bool isSource = false;
 };
@@ -63,6 +67,7 @@ public:
              channelGroupBaseChannel, channelIndex, channelsInGroupRemaining,
              bitInChannel, wideBitRemaining;
         bool txpPending;
+        int  sampleSizeLoaded;
     };
     State SaveState() const;
     void  RestoreState(const State& s);
@@ -132,6 +137,8 @@ private:
     int  mBitInChannel = 0;
     int  mWideBitRemaining = 0;
     bool mTxpPending = false;
+    // SampleSize the bit counter was last loaded from (mBitInChannel counts down from it).
+    int  mSampleSizeLoaded = 0;
 };
 
 #endif // SWI3S_CDATAPORT_H

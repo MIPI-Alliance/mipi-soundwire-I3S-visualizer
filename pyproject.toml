@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.0.20"
+version = "3.1.0"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
 requires-python = ">=3.11"
 dependencies = [
     "swi3score>=0.1.0",   # the C++ decode core (build from ./native)
-    "PySide6>=6.6,<6.12",        # 6.12.0 crashes at interpreter exit (requirements.txt)
+    "PySide6>=6.6",
     "pyqtgraph>=0.13",
     "numpy>=1.23",
     "pyarrow>=12",
@@ -40,26 +40,31 @@ packages = [
     "swi3s_studio.swviz.utils",
     "swi3s_studio.swviz.viz",
 ]
-# The Raven-extracted register map is installed alongside the app and located at
+# The register map (data/registers.json) is installed alongside the app and located at
 # runtime via sys.prefix/share (see model/registers.py _default_registers_json).
 # Bundled peripheral register-map examples ship under share/swi3s-studio/regmaps
-# (see model/regmap_import.py library_dir).
+# (see model/regmap_import.py library_dir), and the demo workspaces under
+# share/swi3s-studio/demos (see workspace.py demo_dir).
 # (init.csv is a user-supplied local file, not packaged.)
-data-files = [
-    ["share/swi3s-studio", ["data/registers.json"]],
-    ["share/swi3s-studio/regmaps", ["data/regmaps/example_amp.json"]],
-]
+[tool.setuptools.data-files]
+"share/swi3s-studio" = ["data/registers.json"]
+"share/swi3s-studio/regmaps" = ["data/regmaps/example_amp.json"]
+"share/swi3s-studio/demos" = ["data/demos/phy1.swi3s", "data/demos/phy2.swi3s",
+                              "data/demos/phy2_flow_control.swi3s", "data/demos/phy3.swi3s"]
+
+# The theme's icons are read from beside ui/theme.py, so they ship inside the package.
+[tool.setuptools.package-data]
+"swi3s_studio.ui" = ["assets/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# A bare `pytest` is the functional suite. The perf ceilings are wall clocks and only mean
-# something in their own process (`pytest -m perf`, as the gate and CI run them): pooled
-# behind every other test they flaked. An explicit -m on the command line overrides this.
+# A bare `pytest` is the functional suite. The perf ceilings are wall clocks and are only
+# meaningful in their own process (`pytest -m perf`, as the gate and CI run them). An explicit
+# -m on the command line overrides this.
 addopts = ["-m", "not perf"]
-# Our own warnings are errors: a deprecated Qt call or an unclosed file in this code is
-# fixed when it appears, instead of joining ~2,100 lines of noise that hide the next one.
-# (Scoped by module, so a dependency's warnings stay warnings.) A ResourceWarning is raised
-# from a finalizer, so pytest reports it as an unraisable-exception warning.
+# Warnings from this project's own modules are errors (scoped by module, so a dependency's
+# warnings stay warnings). A ResourceWarning is raised from a finalizer, so pytest reports it
+# as an unraisable-exception warning.
 filterwarnings = [
     "error::DeprecationWarning:(swi3s_studio|test_|conftest)",
     "error::ResourceWarning",
@@ -72,34 +77,23 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-# `scratch` is local debris (gitignored). It is listed HERE, not left to .gitignore,
-# because ruff only honours .gitignore inside a git repository — and the Windows test VM's
-# tree is an scp'd copy with no .git. The same commit therefore linted CLEAN on macOS and
-# reported 95 findings on Windows, which makes a release gate worthless. Ruff's own defaults
-# already cover .venv / build / dist / __pycache__ / .mypy_cache, so this is the only gap.
+# `scratch` is local debris (gitignored). It is listed here as well because ruff only honours
+# .gitignore inside a git repository, and a copied tree without .git must lint the same.
+# Ruff's own defaults cover .venv / build / dist / __pycache__ / .mypy_cache.
 extend-exclude = ["native/build", "build", "dist", "scratch"]
 
 
 [tool.ruff.lint]
-# Real errors (F) + import hygiene (I) are what this ruleset is for; pure layout
-# preferences are not. E501 (long lines), E402 (guarded imports) and E741 (ambiguous
-# names) were already silenced. E701/E702 (colon / semicolon one-liners) and E731
-# (assigned lambda) now join them: the tree deliberately uses compact one-liners for Qt
-# setup and short test fixtures, ruff has no SAFE autofix for any of them, and
-# hand-splitting ~190 statements would change no behaviour while touching 30+ files.
-# With these ignored the tree is CLEAN, which is what makes the advisory lint job
-# flippable to blocking (see the maintainers' tech-debt register) — a gate that catches real defects is
-# worth more than uniform statement-per-line style.
+# The ruleset covers real errors (F) and import hygiene (I), not layout preferences.
+# Ignored: E501 (long lines), E402 (guarded imports), E741 (ambiguous names), E701/E702
+# (colon / semicolon one-liners) and E731 (assigned lambda); the tree uses compact
+# one-liners for Qt setup and short test fixtures.
 select = ["E", "F", "W", "I"]
 ignore = ["E501", "E402", "E741", "E701", "E702", "E731"]
 
 [tool.mypy]
-# 3.12, not our 3.11 floor. mypy follows imports into installed stubs, and modern ones use
-# 3.12+ syntax: on the Windows VM (Python 3.14) numpy's stubs use a `type` statement, which
-# under python_version="3.11" was a FATAL syntax error that aborted the entire check after
-# one error — the gate saw "205 -> 1" and reported a regression. Assuming 3.12 semantics
-# costs us nothing here (nothing in this tree depends on 3.11-vs-3.12 typing differences)
-# and makes the check reproducible on both platforms, which a release gate requires.
+# 3.12, not the 3.11 floor: mypy follows imports into installed stubs, and newer stubs
+# (numpy's, for one) use 3.12+ syntax such as the `type` statement.
 python_version = "3.12"
 ignore_missing_imports = true       # PySide6 / pyqtgraph / pyarrow ship partial stubs
 check_untyped_defs = false          # lenient start — the tree isn't fully annotated yet

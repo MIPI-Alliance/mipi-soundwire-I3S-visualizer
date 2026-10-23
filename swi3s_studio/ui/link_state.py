@@ -8,8 +8,8 @@ panels instead of losing the state.
 Only state DERIVED from a Link belongs here, plus the Link's stream colour overrides: those
 are the user's, but a (device, data port) means something only within one Link's capture,
 so they travel with it (and its workspace entry). Display preferences (TX map on/off,
-persist, grid rows, the TX-map scroll row) are window-wide, because opening a new capture
-keeps them today and one set of panels shows them.
+persist, grid rows, the TX-map scroll row) are window-wide: opening a new capture keeps
+them, and one set of panels shows them.
 """
 from __future__ import annotations
 
@@ -34,13 +34,16 @@ class LinkPanelState:
     col_widths: Any = None                  # Commands column widths, kept while switched away
     eye_cache: dict = field(default_factory=dict)     # Timing pane's measurement (cached)
     stream_colors: dict = field(default_factory=dict)  # (device, dp, theme) -> "#rrggbb"
+    #                                                    (line_style.Overrides)
     # Per-stream Filter & Gain (DC blocker, high-pass, gain), (device, dp) -> StreamProcessing. The Link's choice,
     # re-applied to each new audio store (a re-decode builds one) and saved per Link.
     stream_processing: dict = field(default_factory=dict)
+    # Streams drawn evenly spaced instead of at their transport times, {(device, dp)}: the
+    # Link's choice, re-applied to each new audio store and saved per Link.
+    even_timing: set = field(default_factory=set)
     # The Audio and Capture panes' view of this Link (ui/view_state.py dicts): checked
     # channels, zoom, Vertical Zoom, decimation, toggles. Saved when a pane stops showing
     # the Link and re-applied when one shows it again, so a Link switch or a re-decode keeps
     # them, and saved in the workspace. None: not seen yet, so the panes' defaults.
     audio_view: Any = None
     capture_view: Any = None
-    #                                                    (line_style.Overrides)

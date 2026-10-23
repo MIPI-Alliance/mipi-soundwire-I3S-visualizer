@@ -55,7 +55,7 @@ def _timed(label, fn, *args, **kw):
           + (f" (n={n:,})" if n else ""), file=sys.stderr, flush=True)
     return r
 
-# A match must agree on at least this FRACTION of the sub's transition symbols. We look
+# A match must agree on at least this FRACTION of the sub's symbols. We look
 # for near-exact occurrences: a genuine recurrence reproduces the logical (data, clock)
 # waveform exactly (score 1.0) even across sample rates, while a coincidental overlap of
 # unrelated traffic scores far lower. 0.98 admits only a stray flipped symbol.
@@ -104,9 +104,7 @@ def _levels_at(edges: np.ndarray, initial: bool, points: np.ndarray) -> np.ndarr
 def capture_to_symbols(capture) -> SymbolSequence:
     """Reduce `capture` to its :class:`SymbolSequence`: the data-line level (0/1) at
     each clock edge, in order — the per-UI data bit the clock samples. One searchsorted,
-    O(N), no sort (a whole-transition union of both lines would need an O(N log N) sort
-    over ~N_clock+N_data points, far too slow on a 100M-edge capture). Rate-independent —
-    see module docstring."""
+    O(N), no sort. Rate-independent — see module docstring."""
     clk = np.asarray(capture.clock_edges, dtype=np.int64)
     dat = np.asarray(capture.data_edges, dtype=np.int64)
     if clk.size == 0:
@@ -140,9 +138,7 @@ def _match_counts(main_syms: np.ndarray, sub_syms: np.ndarray) -> np.ndarray:
     counts = np.zeros(out_len, dtype=np.float64)
     rev = sub_syms[::-1]
     # Only symbol values actually in the sub can contribute a match — iterate those
-    # (the capture alphabet is binary 0/1, so this is 1-2 passes, not a fixed 4). Skips
-    # building a full-length mask for absent values (the old (0,1,2,3) loop wasted two
-    # N-sized float arrays per call).
+    # (the capture alphabet is binary 0/1, so this is 1-2 passes).
     for v in np.unique(rev):
         a = (main_syms == v).astype(np.float64)
         k = (rev == v).astype(np.float64)
@@ -282,12 +278,10 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
     """Find every place `sub`'s logical (data, clock) pattern occurs in `main`.
 
     Both are :class:`~swi3s_studio.ingest.capture.Capture` and may have different
-    ``sample_rate_hz`` — matching is on the ORDERED sequence of logical
-    ``(data<<1)|clock`` states at each transition (see module docstring), not absolute
-    sample counts, so it is rate-independent. A match needs BOTH lines to agree at every
-    transition. `tolerance` is accepted for backward compatibility and ignored (the old
-    gap-shape term is gone). `score_threshold` is the minimum fraction of matching
-    symbols (default near-exact).
+    ``sample_rate_hz`` — matching is on the ORDERED sequence of data bits sampled at
+    each clock edge (see module docstring), not absolute sample counts, so it is
+    rate-independent. `tolerance` is accepted and ignored. `score_threshold` is the
+    minimum fraction of matching symbols (default near-exact).
 
     Orientation: `sub` is searched as-loaded first; if that finds nothing it is retried
     with clock/data SWAPPED, so a sub whose lines were assigned opposite to `main`'s

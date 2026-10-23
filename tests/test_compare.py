@@ -89,8 +89,7 @@ def test_registers_from_csv_roundtrip():
 def test_grid_from_commands_next_staging():
     """grid_from_commands must honour dual-ranked _NEXT staging: a _NEXT dataport
     write changes the placed grid ONLY after a CONFIRMED commit of its group — not
-    the instant the write is seen, and never on an unconfirmed commit. This is the
-    fix for the as-of-cursor grid updating on _NEXT writes before any commit."""
+    the instant the write is seen, and never on an unconfirmed commit."""
     import tempfile
 
     from swi3s_studio.ingest import visualizer_csv as vc
@@ -105,10 +104,15 @@ def test_grid_from_commands_next_staging():
     # _NEXT writes alone: staged, grid has no data cells yet.
     assert ndata(swi3score.grid_from_commands(wcmds, 32)) == 0
     # An UNCONFIRMED commit does not promote.
-    unconf = wcmds + [{"is_commit": True, "commit_confirmed": False, "group_mask": 0xFF}]
+    devices = 0
+    for dev, _a, _v in writes:
+        devices |= 1 << dev
+    unconf = wcmds + [{"is_commit": True, "commit_confirmed": False, "group_mask": 0xFF,
+                       "device_mask": devices}]
     assert ndata(swi3score.grid_from_commands(unconf, 32)) == 0
     # A CONFIRMED commit promotes _NEXT -> _CURR; the data ports now place.
-    conf = wcmds + [{"is_commit": True, "commit_confirmed": True, "group_mask": 0xFF}]
+    conf = wcmds + [{"is_commit": True, "commit_confirmed": True, "group_mask": 0xFF,
+                     "device_mask": devices}]
     assert ndata(swi3score.grid_from_commands(conf, 32)) > 0
 
 
@@ -168,8 +172,8 @@ def test_visualizer_csv_legacy_detect_and_convert():
     # Data Port Channels (excess-one count) -> EnableCh_REG contiguous bitmask.
     assert fields["EnableCh_REG"][:2] == ["0b1", "0b11"]     # 1 ch, 2 ch
     assert fields["SampleSize_REG"][:2] == ["23", "15"]
-    # The v3.0 addition (per-DP logical number) is now present, defaulting to the
-    # column index (legacy had no DP-number concept).
+    # The per-DP logical number is present, defaulting to the column index (legacy had
+    # no DP-number concept).
     assert fields["DataPortNumber"][:2] == ["0", "1"]
     # current text passes through unchanged (idempotent).
     assert vc.to_current_text(cur) == cur

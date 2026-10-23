@@ -1,8 +1,7 @@
 """Timing-mode tests.
 
-- The ported compute core matches the source `swtiming.calculator` exactly (the
-  source app validated the math against two reference spreadsheets, 56/56 + 58/58;
-  we pin equality to it rather than re-deriving).
+- The ported compute core matches the source `swtiming.calculator` exactly (pinned
+  to equality rather than re-derived).
 - The TimingView renders the four inequalities + binding summary, recomputes on
   input change, and its inputs round-trip through the workspace dict.
 
@@ -48,10 +47,9 @@ def test_view_renders_and_roundtrips():
     # device to change instead of leaving two margins under one title.
     assert len(heads) == 11
     # TITLED FOR THE OBLIGATION, not the direction: each of these legs pairs one device's
-    # output timing against another's receiver window, and "Manager-to-Peripheral Hold" left
-    # the reader to infer which was which. The REQUIREMENT names the leg rather than the
-    # mechanism — "Setup", not "Launching", since the launch is a step on the way. The P->P
-    # pair carries the same letters its terms do (A drives, B samples — see
+    # output timing against another's receiver window. The REQUIREMENT names the leg rather
+    # than the mechanism — "Setup", not "Launching", since the launch is a step on the way.
+    # The P->P pair carries the same letters its terms do (A drives, B samples — see
     # test_A_drives_and_B_samples_on_every_pp_leg).
     assert [it.text(0) for it in heads if "Peripheral A" in it.text(0)] == \
         ["Peripheral A Setup for Peripheral B",
@@ -80,8 +78,8 @@ def test_view_renders_and_roundtrips():
     assert tv.inputs("spec").bus_length_cm == 60.0
     # workspace round-trip
     # The P→P placement is a control-bar selector (not a corner row), so it needs its own
-    # key; a workspace written before it existed must fall back to "unknown", which is what
-    # that version computed — each P→P leg at its own worst end of the flight bracket.
+    # key; a workspace without the key falls back to "unknown" — each P→P leg at its own
+    # worst end of the flight bracket.
     tv._pp_combo.setCurrentIndex(tv._pp_combo.findData("driver_far"))
     d = tv.to_dict()
     assert d["pp_placement"] == "driver_far"
@@ -97,12 +95,53 @@ def test_view_renders_and_roundtrips():
     assert tv2.inputs("spec").Man_shape == tv2.inputs("proposed").Man_shape
 
 
+def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
+    """F_max is shown for hold, contention and keeper legs too, wherever the margin has a
+    UI-scaled part; "—" only where no rate bounds the leg.
+
+    The summary and the results tree both print the worst-corner breakdown's own F_max, and
+    the default page carries non-setup legs with a finite one (the keeper's closing UI).
+    """
+    import math
+
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.timing_view import TimingView
+    tv = TimingView()
+    spec_w = tv._per_inequality_worst("spec")
+    prop_w = tv._per_inequality_worst("proposed")
+    rows = {line.split(" | ")[0].split(") ", 1)[1].replace(" ", "_"): line.split(" | ")
+            for line in tv.summary_text().splitlines()[1:]}
+    for ineq in INEQUALITIES:
+        cells = rows[ineq]
+        assert cells[4] == tv._fmt_fmax(spec_w[ineq].F_max_MHz), (ineq, cells)
+        assert cells[5] == tv._fmt_fmax(prop_w[ineq].F_max_MHz), (ineq, cells)
+    finite = [i for i in INEQUALITIES if not spec_w[i].is_setup
+              and 0.0 < spec_w[i].F_max_MHz < math.inf]
+    assert {"keeper_Man", "keeper_Per"} <= set(finite), finite
+
+    # The tree's F_max cell says the same, with its unit.
+    shown = {}
+    for i in range(tv._tree.topLevelItemCount()):
+        head = tv._tree.topLevelItem(i)
+        current = None
+        for c in range(head.childCount()):
+            kid = head.child(c)
+            if "≥ 0" in kid.text(0):
+                current = INEQUALITIES[int(kid.text(0).split(")")[0]) - 1]
+            elif current and "Specification" in kid.text(0):
+                shown[current] = kid.text(2)
+    for ineq in finite:
+        assert shown[ineq] == f"{spec_w[ineq].F_max_MHz:.3f} MHz", (ineq, shown[ineq])
+
+
 def test_phy1_selector_reseeds_spec_and_persists():
     """PHY1 is chosen per side, via the spec selector — there is no PHY picker.
 
-    PHY1 (SWI3S v1.1r06 §11.2 Table 129) has slower Peripheral output / high-Z
-    timing and a lower F_CLK target; the shared PHY1&2 values (Man_t_DD, V
-    thresholds, t_IS/t_IH) are unchanged. The selection round-trips via to_dict.
+    PHY1 (SWI3S v1.1r06 §11.2, the "PHY1 & PHY2 Output Timing" table) has slower
+    Peripheral output / high-Z timing and a lower F_CLK target; the shared PHY1&2 values
+    (Man_t_DD, V thresholds, t_IS/t_IH) are unchanged. The selection round-trips via
+    to_dict.
     """
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
@@ -123,8 +162,8 @@ def test_phy1_selector_reseeds_spec_and_persists():
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY1"))
     assert "PHY1" in tv._subtitle.text()
-    assert tv._fclk.value() == 6.4                                   # Table 126 target
-    for name, lo, hi in [("Per_t_DD", 14.0, 50.0),                   # Table 129 PHY1
+    assert tv._fclk.value() == 6.6                                   # clock target
+    for name, lo, hi in [("Per_t_DD", 14.0, 50.0),                   # output timing, PHY1
                          ("Per_t_ZD", 14.0, 50.0),
                          ("Man_t_ZD", 14.0, 30.0)]:
         assert tv._min[("spec", name)].value() == lo, name
@@ -149,13 +188,10 @@ def test_phy1_selector_reseeds_spec_and_persists():
 
 
 def test_every_displayed_symbol_follows_one_naming_scheme():
-    """The vocabulary on the page, pinned — it drifted four ways before this existed.
+    """The vocabulary on the page, pinned.
 
     THIS IS THE STYLE GATE FOR NEW INEQUALITIES. A leg added later inherits the scheme by
-    failing this test if it does not, which is the only mechanism that has actually held:
-    every drift so far (`X_PM,setup,clk`, an unsubscripted `X_PP`, `Man_tKeeper_Response`
-    spelled the spec's way, a P→P leg charging the Manager's data lane) was invented in good
-    faith by copying a neighbouring leg that happened to be the odd one out.
+    failing this test if it does not.
 
     The scheme, in one place because it is checked in one place:
 
@@ -164,23 +200,16 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
         and hold by an EARLY one — MANDATORY and LAST. Where a leg reads ONE lane twice the two
         crossings are GATHERED into a parenthesised expression,
         `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK`, because one pin has one slew; every
-        symbol inside the bracket obeys this same grammar (see `_gather_lane_terms`). P→P inserts a device letter
-        before it (A drives, B samples); the letter narrows the role, it never replaces it,
-        which is how `X_PP,A` passed an earlier version of this check that read the qualifiers
-        as an unordered bag. Never `clk`/`data`: that is the lane, and the lane is named by
+        symbol inside the bracket obeys this same grammar (see `_gather_lane_terms`). P→P
+        inserts a device letter before it (A drives, B samples); the letter narrows the role,
+        it never replaces it. Never `clk`/`data`: that is the lane, and the lane is named by
         the t_RF beside it.
       * THE LANE IS ALWAYS QUALIFIED, `,CLK` or `,DATA`, on every term including the swing
-        addend. It used to be dropped where the role was thought to imply it, which was true
-        only for a reader who already knew how the envelope was built, and was never uniform
-        anyway — X_MP had to qualify both of its Manager-driven lanes, so the page carried two
-        spellings of one thing.
+        addend.
       * Every symbol subscripts. The underscore before a token is the marker, so a symbol
-        rendering with a bare `_` left in it is misspelled — that is how
-        `Man_tKeeper_Response` was caught (the spec writes `Man_tDD`; this file writes
-        `Man_t_DD`).
-      * A term multiplied by a lane's t_RF must actually MOVE with that lane. Format alone
-        would not have caught the P→P legs charging `Man_t_RF,DATA` on a link the Manager does
-        not drive; this does.
+        rendering with a bare `_` left in it is misspelled (the spec writes `Man_tDD`; this
+        file writes `Man_t_DD`).
+      * A term multiplied by a lane's t_RF must actually MOVE with that lane.
     """
     import re
     from dataclasses import replace
@@ -205,9 +234,7 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
 
         A GATHERED term's head is a parenthesised expression — `(X_PP,A,late - X_PP,B,early)`
         — because two crossings of one pin net into one product. Every symbol inside it must
-        satisfy the same grammar as a lone one, which is stronger than the `X_PM,net` spelling
-        this replaced: that was one valid symbol saying only that some netting happened, so a
-        wrong pair could be combined and still pass.
+        satisfy the same grammar as a lone one.
         """
         head = sym.partition(" · ")[0]
         if head.startswith("(") and head.endswith(")"):
@@ -237,10 +264,9 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
                 assert qual in ("late", "early", "A", "B"), \
                     f"{sym!r}: bad qualifier {qual!r}"
             # THE ROLE IS MANDATORY AND IT COMES LAST. Checked positionally rather than
-            # as a set, because as a set `X_PP,A` passed: `A` is a legal token, so a
-            # symbol naming only the device satisfied every rule while saying nothing
-            # about WHICH crossing of A's it is. A device letter narrows the role, it
-            # does not replace it.
+            # as a set: `A` is a legal token, so as a set `X_PP,A` would pass while saying
+            # nothing about WHICH crossing of A's it is. A device letter narrows the role,
+            # it does not replace it.
             assert parts[-1] in ("late", "early"), \
                 f"{sym!r}: every crossing ends in the role — a device letter is not one"
             for qual in parts[1:-1]:
@@ -255,7 +281,7 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
     # and which pair wins depends on BOTH t_RF values, so bumping the Per DATA row legitimately
     # changes the clock leg's coefficient — a term's value moving with another lane is not
     # evidence that it names the wrong one. (That is real behaviour, documented on
-    # `sigma_pm_setup_lanes`; an earlier version of this check called it a bug.)
+    # `sigma_pm_setup_lanes`.)
     base = CalcInputs()
     for (device, which), field in _LANE_FIELD.items():
         want = f"{device}_t_RF,{which}"
@@ -263,24 +289,16 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
             for term in b.terms:
                 if not term.factors or " · " not in term.symbol:
                     continue
-                if term.value_ns == 0.0:
-                    # A structurally zero crossing, emitted on purpose so all three
-                    # contention legs keep one shape (a Manager end gets no crossing,
-                    # Fig. 176). A zero names a lane nominally and reads none.
-                    continue
                 if not term.symbol.endswith(want):
                     continue
                 # `factors[-1]` IS the row value: a gathered term carries its coefficients
                 # first and the t_RF last, so the position is what makes this read right for
                 # both shapes (see `Term.factors`).
                 allowed_values = {getattr(base, field)}
-                # ONE CLOCK, ONE PIN, ONE VALUE. A previous revision allowed the ends of a
-                # `tRF_CLK_tol_ns` band here as well, because a leg with two peripherals
-                # cornered its two clock crossings independently. Withdrawn: the Manager
-                # drives the clock from one pin, so every crossing on this lane multiplies the
-                # row's picked value and a leg reading it twice gathers the two into one
-                # product (`_gather_lane_terms`). So the allowed set is the row, full stop —
-                # which is a stronger check than it was.
+                # ONE CLOCK, ONE PIN, ONE VALUE. The Manager drives the clock from one pin,
+                # so every crossing on this lane multiplies the row's picked value and a leg
+                # reading it twice gathers the two into one product (`_gather_lane_terms`).
+                # So the allowed set is the row, full stop.
                 assert any(term.factors[-1] == pytest.approx(v) for v in allowed_values), (
                     f"{leg}: {term.symbol!r} names {want} but multiplies {term.factors[-1]}, "
                     f"and that row offers {sorted(allowed_values)}")
@@ -297,8 +315,7 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
 #
 # So an M→P leg reads the Manager's two lanes; P→M reads the Manager's clock and the
 # peripheral's data; and P→P reads the Manager's clock (both peripherals take it) and the
-# PERIPHERAL's data — never Man DATA, because no Manager drives that link. Reusing the M→P
-# crossing tuples in the P→P legs put Man DATA there and nothing objected.
+# PERIPHERAL's data — never Man DATA, because no Manager drives that link.
 _LEGAL_LANES = {
     "MP_setup": {"Man CLK", "Man DATA"}, "MP_setup_ho": {"Man CLK", "Man DATA"},
     "MP_hold": {"Man CLK", "Man DATA"},  "MP_hold_ho": {"Man CLK", "Man DATA"},
@@ -317,12 +334,10 @@ def test_no_leg_reads_a_lane_it_has_no_business_reading():
 
     A wrong-lane bug is CONSISTENT: the symbol says `Man_t_RF,DATA`, the factors carry the
     Man DATA value, and the term moves with the Man DATA row. Symbol, factors and behaviour
-    all agree, so no invariant over them objects. The P→P legs shipped like that by reusing
-    the M→P crossing tuples, and it was found by eye, not by a test.
+    all agree, so no invariant over them objects.
 
     The only thing that catches it is a statement of what each leg SHOULD read. Adding a leg
-    means adding a row to `_LEGAL_LANES` and defending it — which is the review step this
-    file exists to force, and the point at which "does this apply elsewhere?" gets asked.
+    means adding a row to `_LEGAL_LANES` and defending it — which is the review step.
     """
     from dataclasses import replace
 
@@ -345,6 +360,83 @@ def test_no_leg_reads_a_lane_it_has_no_business_reading():
                     f"{leg}: reads {lane!r} via {term.symbol!r}, but that leg may only read "
                     f"{sorted(allowed)} — either the leg is wrong or _LEGAL_LANES is")
 
+
+# Lanes a leg reads through a term that carries no `· t_RF` product, declared per leg. A
+# releasing EDE peripheral lets go after its own ramp completes, so the swing of its DATA lane
+# is inside the `Per_t_DZ,EDE` value (`_per_ede_release_vs_edge_ns`).
+_LEGAL_LANES_PER_EDE = {"PM_contention": {"Per DATA"}, "PP_contention": {"Per DATA"}}
+
+
+def test_no_leg_margin_moves_with_a_lane_it_has_no_business_reading():
+    """`_LEGAL_LANES` checked on the MARGIN, not on the symbols.
+
+    A margin computed from a separate `*_required` expression can read a lane its terms do
+    not show. So each lane outside a leg's declared set is moved on its own, and the leg's
+    margin must not change.
+    """
+    from dataclasses import replace
+
+    field = {"Man CLK": "tRF_Man_CLK_ns", "Man DATA": "tRF_Man_DATA_ns",
+             "Per DATA": "tRF_Per_DATA_ns"}
+    for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
+               {"pp_placement": "driver_far"}):
+        base = replace(CalcInputs(), **kw)
+        ref = compute(base).breakdowns
+        for lane, f in field.items():
+            for trf in (3.0, 8.3):
+                moved = compute(replace(base, **{f: trf})).breakdowns
+                for leg, b in ref.items():
+                    allowed = set(_LEGAL_LANES[leg])
+                    if base.Per_ede:
+                        allowed |= _LEGAL_LANES_PER_EDE.get(leg, set())
+                    if lane in allowed:
+                        continue
+                    assert moved[leg].margin_ns == pytest.approx(b.margin_ns, abs=1e-12), (
+                        f"{leg}{kw}: margin moves with {lane} ({b.margin_ns:+.4f} -> "
+                        f"{moved[leg].margin_ns:+.4f} at {trf} ns), which that leg may not "
+                        f"read")
+
+
+def test_no_leg_shows_a_structurally_zero_term():
+    """Checklist rule 5: a structurally zero term is dropped; a parameter at zero is shown.
+
+    Structurally zero means zero for every input: a crossing with a zero coefficient (a
+    Manager end of a contention leg has no clock crossing), or a `0·` count. A term whose
+    VALUE is zero must be one of the parameters whose row can reach zero.
+    """
+    from dataclasses import replace
+
+    from swi3s_studio.timing import (
+        INEQUALITIES,
+        apply_row_picks,
+        default_swi3s_rows,
+        find_worst_corner_rows,
+    )
+    from swi3s_studio.timing.spec_source import SPEC_SOURCES
+
+    may_read_zero = {"Man_t_IH", "t_PD,mis", "t_PD", "2·t_PD", "Man_t_DZ", "Man_t_DZ,EDE",
+                     "Per_t_DZ"}
+    rows = default_swi3s_rows()
+    for spec in SPEC_SOURCES:
+        for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
+                   {"pp_placement": "driver_far"}, {"bus_length_cm": 0.0},
+                   {"t_keeper_ns": 0.0}):
+            inp = replace(CalcInputs(Man_spec=spec, Per_spec=spec), **kw)
+            corners = [inp] + [apply_row_picks(inp, rows, find_worst_corner_rows(leg, rows, inp))
+                               for leg in INEQUALITIES]
+            for c in corners:
+                for leg, b in compute(c).breakdowns.items():
+                    for t in b.terms:
+                        assert not t.symbol.startswith("0·"), (spec, kw, leg, t.symbol)
+                        if t.factors:
+                            assert t.factors[0] != 0.0, (
+                                f"{spec}{kw} {leg}: {t.symbol!r} has a zero coefficient")
+                        if abs(t.value_ns) < 1e-12:
+                            assert t.symbol in may_read_zero, (
+                                f"{spec}{kw} {leg}: {t.symbol!r} reads zero and is not a "
+                                f"parameter that can")
+
+
 def _term_view():
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -361,18 +453,13 @@ def _term_view():
 def test_the_click_regions_line_up_with_the_painted_glyphs():
     """Where the terms are DRAWN and where they are CLICKABLE must be the same places.
 
-    THIS SHIPPED BROKEN and no other test saw it. The hit-test built its own
-    QStyleOptionViewItem and called `initFrom(view)`, which copies the palette and the font
-    METRICS but leaves `opt.font` at Qt's default 9 pt — while paint receives the view's
-    15 px font. The two documents then laid out at different widths (512.8 against 606.5 on
-    leg 1), so the error grew with x: clicking `DATA` in `Man_t_RF,DATA` selected `Per_t_IS`,
-    two terms further along. Sharing `_doc` and `_origin` was not enough, because the drift
-    entered through the option, one level above the guard.
+    The hit-test and paint must lay the document out from the same option:
+    `initFrom(view)` copies the palette and the font METRICS but leaves `opt.font` at Qt's
+    default, so a hand-built option lays out at a different width and the error grows with x.
 
-    So the invariant is checked the only way that catches it: for every sample point on every
-    row, what the PAINT path has drawn there must equal what the CLICK path resolves there.
-    No hardcoded coordinates — a fixed x would have to be updated whenever a symbol changes
-    and would test the expectation rather than the agreement.
+    So the invariant is checked directly: for every sample point on every row, what the
+    PAINT path has drawn there must equal what the CLICK path resolves there. No hardcoded
+    coordinates — a fixed x would test the expectation rather than the agreement.
     """
     from PySide6.QtCore import QPoint, QPointF
     from PySide6.QtWidgets import QStyleOptionViewItem
@@ -415,9 +502,7 @@ def test_a_click_between_terms_is_inert_and_only_empty_space_clears():
     """A 2-pixel miss must not throw away the reader's work.
 
     The operators are deliberately not click targets, so a click on a `−` lands on the row's
-    text but on no term. That is INERT; clearing needs a click in genuinely empty space. The
-    first version cleared on any non-term click, which meant aiming at a term and catching
-    the sign beside it wiped every highlight — the least forgiving possible response.
+    text but on no term. That is INERT; clearing needs a click in genuinely empty space.
     """
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
@@ -614,26 +699,17 @@ def test_a_highlight_is_a_repaint_and_not_a_recompute():
 def test_anchored_terms_keep_the_palette_ink_in_both_modes():
     """An anchor must not change the colour of the text it wraps.
 
-    THIS EXACT BUG SHIPPED FOR ABOUT TEN MINUTES and is worth a test because it looked like
-    a font problem rather than a CSS one. `a { color: inherit }` reads as obviously correct
-    and is wrong: Qt's rich-text CSS resolves `inherit` to BLACK, not to the paint context's
-    Text role -- so on the dark palette every anchored symbol went near-invisible against
-    the panel while the substitution numbers stayed bright (their table cell sets its own
-    colour), leaving a half-dimmed page.
+    Qt's rich-text CSS resolves `a { color: inherit }` to BLACK, not to the paint context's
+    Text role, so an anchor that inherits its colour goes near-invisible on the dark palette.
 
-    Checked by INK, in both palettes, because that is the only way to see it: the document's
-    charFormat reports a default black brush whether or not a colour was set, so querying
-    the format cannot distinguish the broken case from the working one.
+    Checked by INK, in both palettes: the document's charFormat reports a default black brush
+    whether or not a colour was set, so querying the format cannot distinguish the broken
+    case from the working one.
 
-    IT COMPARES THE TWO RENDERS, NOT THE PALETTE VALUE, and the first version got that wrong.
-    Asserting that some pixel equals VizTheme.TEXT is a statement about RASTERISATION rather
-    than about colour: the Ubuntu CI job draws this text entirely in antialiased mid-tones
-    (#92969c and #94999f, between the background and the ink) and never lands a pixel on the
-    full colour, where macOS does — so the assertion failed on a tree whose rendering was
-    correct. The property under test is that anchoring changes NOTHING, so the anchored render
-    is compared against the plain one, which is what catches the bug: `inherit` made one
-    near-black while the other stayed light. An absence of glyphs is a SKIP, so the comparison
-    cannot pass vacuously.
+    IT COMPARES THE TWO RENDERS, NOT THE PALETTE VALUE: antialiasing may land no pixel on the
+    full ink colour, so the property under test — anchoring changes NOTHING — is checked by
+    comparing the anchored render against the plain one. An absence of glyphs is a SKIP, so
+    the comparison cannot pass vacuously.
     """
     import collections
 
@@ -658,12 +734,9 @@ def test_anchored_terms_keep_the_palette_ink_in_both_modes():
                     + _anchored("Man_t_DZ", _subscript("Man_t_DZ")))
 
         def ink(html):
-            # THROUGH THE DELEGATE'S OWN `_doc`, not a re-typed copy of its stylesheet. The
-            # first version of this test built the document itself with the correct CSS
-            # hardcoded, so it exercised its own string and not the product: re-injecting
-            # `color: inherit` into the delegate left it green. It is the delegate's
-            # stylesheet that is under test, so the delegate has to be the one that builds
-            # the document.
+            # THROUGH THE DELEGATE'S OWN `_doc`, not a re-typed copy of its stylesheet: it
+            # is the delegate's stylesheet that is under test, so the delegate builds the
+            # document.
             opt = QStyleOptionViewItem()
             opt.text = html
             opt.font = QApplication.instance().font()
@@ -691,10 +764,9 @@ def test_anchored_terms_keep_the_palette_ink_in_both_modes():
         if not (want - {bg}):
             pytest.skip("no glyphs rasterised here — the ink is unverifiable")
 
-        # THE PROPERTY IS THAT ANCHORING CHANGES NOTHING. With `color: inherit` the anchored
-        # ink went near-black while the plain ink stayed light, so the two sets differ and
-        # this fails loudly — without depending on which pixels a platform's antialiasing
-        # happens to produce.
+        # THE PROPERTY IS THAT ANCHORING CHANGES NOTHING. An anchor that changed the ink
+        # makes the two sets differ, without depending on which pixels a platform's
+        # antialiasing happens to produce.
         assert got == want, f"{mode}: anchoring changed the ink: {sorted(want)} -> {sorted(got)}"
 
     theme.apply_palette("dark")
@@ -735,14 +807,14 @@ def test_the_wash_is_applied_by_class_to_exactly_the_active_keys():
 def test_every_leg_reads_in_physical_time_order():
     """The terms are a NARRATIVE, and the order is part of what the page says.
 
-    Four rules, each of which was violated somewhere before this test existed:
+    Four rules:
 
       1. The receiver's window is LAST. It is the requirement the whole leg is spent
          satisfying, so it belongs at the end, not two terms in.
       2. A clock-lane crossing comes before a data-lane crossing. The clock edge is what
          a device detects; the data crossing is judged against it. Delta_cross,MP SWAPS
          which lane carries the late crossing between setup and hold, so without a rule
-         the two families printed their lanes in opposite orders on one page.
+         the two families would print their lanes in opposite orders on one page.
       3. On a leg whose launcher is a PERIPHERAL, the launch sits BETWEEN the two
          crossings: the peripheral must detect the clock before it can launch, and the
          sampler sees the result after the data has crossed the bus.
@@ -750,9 +822,8 @@ def test_every_leg_reads_in_physical_time_order():
          clock reaching the launcher, one for the data coming back — not a single
          `2·t_PD` off to the side.
 
-    ORDER IS FREE TO GET WRONG, which is why it needs a test: the margin is a sum, so a
-    reordering changes no number and no other test would notice. The whole benefit is to a
-    reader, and the whole cost of losing it is silent.
+    ORDER IS FREE TO GET WRONG: the margin is a sum, so a reordering changes no number and
+    no other test would notice.
     """
     from dataclasses import replace
 
@@ -795,11 +866,8 @@ def test_every_leg_reads_in_physical_time_order():
 def test_the_inequalities_are_numbered_for_reference_in_display_order():
     """1) … 17), one numbering, shared by the tree and the summary.
 
-    The numbers exist so a leg can be named in conversation without spelling out
-    "Peripheral A Holding for Peripheral B, the t_ZD variant". That only works if the
-    number means the same row everywhere, so `_INEQ_NUMBER` is derived from the DISPLAY
-    grouping and both renderers read it — two independent numberings would drift the
-    moment either order changed, and a stale number is worse than no number.
+    A number means the same row everywhere: `_INEQ_NUMBER` is derived from the DISPLAY
+    grouping and both renderers read it.
 
     ")" AND NOT ".", deliberately: the equations carry the "·" multiplication operator and
     decimals like "1.44·8.30", so a leading "1." reads as arithmetic.
@@ -838,8 +906,7 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
     THIS NEEDS A HUMAN'S STATEMENT OF INTENT, like `_LEGAL_LANES` does. Nothing in the
     arithmetic prevents a fifth P→P leg from lettering the sampler A: the margin would come
     out identical, since both letters read the same `Per` rows, and the equation on screen
-    would be self-consistent while telling the reader the wrong device to change. The
-    convention lived in two `_pp_device_note` call sites and in nothing that fails.
+    would be self-consistent while telling the reader the wrong device to change.
 
     THE RULE. On every P→P leg:
       * A contributes the LAUNCH — `Per_t_DD` on the t_DD legs, `Per_t_ZD` on the `_ho`
@@ -852,7 +919,7 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
     hold (an early launch leaves the level valid longer past B's edge). A letter that
     followed the corner instead of the device would look just as consistent.
 
-    Note also what "A drives" does NOT settle, which the notes now say per leg: on a HOLD
+    Note also what "A drives" does NOT settle, which the notes say per leg: on a HOLD
     leg A's launch is the aggressor, and on `PP_hold_ho` the level it destroys belongs to the
     peripheral that just released, not to A.
     """
@@ -888,26 +955,14 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
 
 
 def test_no_pp_leg_reads_one_per_row_for_both_devices():
-    """The condition under which A and B's independence starts costing something.
+    """No P→P leg reads one `Per` row for both devices.
 
-    A and B are unrelated parts and each realises its own value of every `Per` parameter —
-    its own t_DD, its own t_IS — exactly as each realises its own slew inside
-    the clock's slew. The symbols do not letter the device parameters anyway, and the reason
-    is NOT that they are shared (they are not); it is that on every leg as built, each `Per`
-    row is read AT MOST ONCE.
-
-    That is what makes the independence free. It costs something only when one row appears
-    twice on a leg with opposite signs, because then a single cornered value has to serve as
-    both the charge and the credit, and the shared corner flatters the leg — which is exactly
-    the clock lane, where `X_PP,A,late` and `X_PP,B,early` both read `Man_t_RF,CLK` and are
-    pinned to opposite ends of the band, worth 2.6 ns on P→P hold. A row read once is already
-    driven to the end that hurts by the ordinary corner search, and splitting it per device
-    would change no number.
-
-    SO THE ARGUMENT EXPIRES IF A LEG EVER READS ONE `Per` ROW FOR BOTH DEVICES, and this
-    fails when it does rather than leaving it to be spotted. The fix at that point is a
-    per-device band like the clock's, plus `Per_A_*` / `Per_B_*` symbols to name the two ends
-    — not a note.
+    A and B are unrelated parts and each realises its own value of every `Per` parameter.
+    The symbols do not letter the device parameters because each `Per` row is read AT MOST
+    ONCE per leg, and the ordinary corner search already drives a row read once to the end
+    that hurts. A row read twice with opposite signs would let one cornered value serve as
+    both charge and credit; it needs a per-device band like the clock's, plus `Per_A_*` /
+    `Per_B_*` symbols to name the two ends — not a note.
     """
     import re
     from collections import Counter
@@ -934,13 +989,11 @@ def test_no_pp_leg_reads_one_per_row_for_both_devices():
 def test_a_gathered_crossing_states_arithmetic_that_actually_adds_up():
     """A gathered term's SYMBOL, factors and note must all describe the same sum.
 
-    WHY THIS NEEDS ITS OWN TEST. `_gather_lane_terms` folds two crossings of one lane into
+    `_gather_lane_terms` folds two crossings of one lane into
     `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK`, substituted as `(1.44 − 0.45)·5.00`. The
     term's VALUE is computed from the signed total and is correct however the decomposition is
-    written, so no margin assertion can catch a wrong one — and the first version WAS wrong: it
-    hoisted the operator out front without dividing the contributions by it, printing
-    `(1.44 + 0.45)` under a minus. That reads as −1.89 where the leg is −0.99. Re-injecting the
-    missing division passes every other test in this suite.
+    written, so no margin assertion can catch a wrong one: the contributions must be signed
+    relative to the operator hoisted out front.
 
     So the check is the arithmetic itself, three ways round: the coefficients in `factors` must
     sum to the value in force, the bracketed symbol must carry one crossing name per
@@ -994,3 +1047,39 @@ def test_a_gathered_crossing_states_arithmetic_that_actually_adds_up():
                     f"{abs(total):.3f} — its signs are not relative to the hoisted operator")
 
     assert seen, "no gathered crossing found — has _gather_lane_terms stopped running?"
+
+
+def test_the_calculator_docstring_counts_the_legs_it_evaluates():
+    """The module docstring states how many legs `INEQUALITIES` holds and points at it."""
+    from swi3s_studio.timing import INEQUALITIES, calculator
+
+    doc = calculator.__doc__ or ""
+    first = doc.splitlines()[0]
+    assert f"{len(INEQUALITIES)} inequalities" in first, first
+    assert "`INEQUALITIES`" in doc and "ADDING AN INEQUALITY" in doc
+    assert "docs/SWI3S_Timing_Analysis.tex" not in doc.replace(
+        "timing-analysis/docs/SWI3S_Timing_Analysis.tex", ""), \
+        "the derivation lives in the sibling project, not in this repository's docs/"
+
+
+def test_the_parameter_sections_and_where_the_ramp_models_live():
+    """Rise/Fall Times holds the t_RF rows and the per-edge slew; System Properties holds the
+    V_SEOS tolerance, the noise fraction, the bus length and the length mismatch. Each card
+    carries its title in its own top-left cell, and the two ramp-model pickers are in the top
+    bar, which does not scroll, not in a card."""
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from swi3s_studio.ui.timing_view import SECTIONS, TimingView
+    QApplication.instance() or QApplication([])
+    sections = dict(SECTIONS)
+    assert list(sections) == ["RX Thresholds", "RX Timing", "TX Timing", "Handover Timing",
+                              "Rise/Fall Times", "System Properties"]
+    assert sections["Rise/Fall Times"][-1] == "τ (per-edge slew)"
+    assert sections["System Properties"] == ["δ (V_SEOS tol)", "α (V_noise / V_SEOS)",
+                                             "bus length (cm)", "t_PD,mis fraction"]
+    tv = TimingView()
+    for card, (title, _rows) in zip(tv._section_cards, SECTIONS):
+        assert title in [lab.text() for lab in card.findChildren(QLabel)]
+    for combo in (tv._man_shape, tv._per_shape):
+        assert tv._topbar.isAncestorOf(combo)
+        assert not any(card.isAncestorOf(combo) for card in tv._section_cards)

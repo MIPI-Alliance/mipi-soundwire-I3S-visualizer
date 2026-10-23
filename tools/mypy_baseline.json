@@ -1,15 +1,14 @@
 {
   "env": {
     "mypy": "2.3.0",
-    "numpy": "2.4.4"
+    "site_packages": "not read"
   },
-  "total": 134,
+  "total": 129,
   "per_file": {
     "swi3s_studio/analysis/compare.py": 2,
     "swi3s_studio/analysis/errors.py": 1,
     "swi3s_studio/analysis/link_control.py": 1,
     "swi3s_studio/analysis/subcapture.py": 1,
-    "swi3s_studio/ingest/analog_csv.py": 2,
     "swi3s_studio/ingest/saleae_sal.py": 3,
     "swi3s_studio/ingest/transitions.py": 1,
     "swi3s_studio/model/bus_config.py": 1,
@@ -20,10 +19,75 @@
     "swi3s_studio/ui/audio_view.py": 2,
     "swi3s_studio/ui/devices_dialog.py": 2,
     "swi3s_studio/ui/grid_view.py": 10,
-    "swi3s_studio/ui/main_window.py": 49,
+    "swi3s_studio/ui/main_window.py": 48,
     "swi3s_studio/ui/raw_view.py": 1,
     "swi3s_studio/ui/register_view.py": 8,
     "swi3s_studio/ui/timeline.py": 6,
-    "swi3s_studio/ui/timing_view.py": 14
+    "swi3s_studio/ui/timing_view.py": 12
+  },
+  "per_platform": {
+    "darwin": {
+      "swi3s_studio/analysis/compare.py": 2,
+      "swi3s_studio/analysis/errors.py": 1,
+      "swi3s_studio/analysis/link_control.py": 1,
+      "swi3s_studio/analysis/subcapture.py": 1,
+      "swi3s_studio/ingest/saleae_sal.py": 3,
+      "swi3s_studio/ingest/transitions.py": 1,
+      "swi3s_studio/model/bus_config.py": 1,
+      "swi3s_studio/model/regmap_import.py": 5,
+      "swi3s_studio/session.py": 21,
+      "swi3s_studio/store/audio_store.py": 3,
+      "swi3s_studio/swviz/io/csv_handler.py": 1,
+      "swi3s_studio/ui/audio_view.py": 2,
+      "swi3s_studio/ui/devices_dialog.py": 2,
+      "swi3s_studio/ui/grid_view.py": 10,
+      "swi3s_studio/ui/main_window.py": 48,
+      "swi3s_studio/ui/raw_view.py": 1,
+      "swi3s_studio/ui/register_view.py": 8,
+      "swi3s_studio/ui/timeline.py": 6,
+      "swi3s_studio/ui/timing_view.py": 12
+    },
+    "linux": {
+      "swi3s_studio/analysis/compare.py": 2,
+      "swi3s_studio/analysis/errors.py": 1,
+      "swi3s_studio/analysis/link_control.py": 1,
+      "swi3s_studio/analysis/subcapture.py": 1,
+      "swi3s_studio/ingest/saleae_sal.py": 3,
+      "swi3s_studio/ingest/transitions.py": 1,
+      "swi3s_studio/model/bus_config.py": 1,
+      "swi3s_studio/model/regmap_import.py": 5,
+      "swi3s_studio/session.py": 21,
+      "swi3s_studio/store/audio_store.py": 3,
+      "swi3s_studio/swviz/io/csv_handler.py": 1,
+      "swi3s_studio/ui/audio_view.py": 2,
+      "swi3s_studio/ui/devices_dialog.py": 2,
+      "swi3s_studio/ui/grid_view.py": 10,
+      "swi3s_studio/ui/main_window.py": 48,
+      "swi3s_studio/ui/raw_view.py": 1,
+      "swi3s_studio/ui/register_view.py": 8,
+      "swi3s_studio/ui/timeline.py": 6,
+      "swi3s_studio/ui/timing_view.py": 12
+    },
+    "win32": {
+      "swi3s_studio/analysis/compare.py": 2,
+      "swi3s_studio/analysis/errors.py": 1,
+      "swi3s_studio/analysis/link_control.py": 1,
+      "swi3s_studio/analysis/subcapture.py": 1,
+      "swi3s_studio/ingest/saleae_sal.py": 3,
+      "swi3s_studio/ingest/transitions.py": 1,
+      "swi3s_studio/model/bus_config.py": 1,
+      "swi3s_studio/model/regmap_import.py": 5,
+      "swi3s_studio/session.py": 21,
+      "swi3s_studio/store/audio_store.py": 3,
+      "swi3s_studio/swviz/io/csv_handler.py": 1,
+      "swi3s_studio/ui/audio_view.py": 2,
+      "swi3s_studio/ui/devices_dialog.py": 2,
+      "swi3s_studio/ui/grid_view.py": 10,
+      "swi3s_studio/ui/main_window.py": 48,
+      "swi3s_studio/ui/raw_view.py": 1,
+      "swi3s_studio/ui/register_view.py": 8,
+      "swi3s_studio/ui/timeline.py": 6,
+      "swi3s_studio/ui/timing_view.py": 12
+    }
   }
 }

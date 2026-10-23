@@ -28,9 +28,7 @@ _EXPANDED = "▾ "
 # Kinds that are a CHILD of the enclosing `group`, i.e. that fold away with it. 'detail'
 # is the plain case; a child may also be a 'fail'/'pass' row, because a group's breakdown
 # reports its own error count ("errors", red) — see analysis.measurements._rw_detail_rows.
-# Membership is about position in the tree, styling is a separate axis, and conflating the
-# two is what let the fold leak: 'fail' was styled but never adopted, so the errors row
-# stayed visible under a collapsed group AND ended the group, orphaning every later device.
+# Membership is about position in the tree; styling is a separate axis.
 _GROUPED_KINDS = ("detail", "fail", "pass")
 
 

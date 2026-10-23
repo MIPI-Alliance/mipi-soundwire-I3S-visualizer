@@ -1,9 +1,9 @@
-"""Per-DP logical data-port number (v3.0.0) — model, CSV, native, converter.
+"""Per-DP logical data-port number: model, CSV, native, converter.
 
-Covers Feature A: each of the 12 authoring slots carries a logical DP number
-(0-31, default = slot index) plus a display name; (device, dp_number) must be
-unique within a device; the number drives the DP register block address; and
-the v1.74 converter emits the new DataPortNumber row.
+Each of the 12 authoring slots carries a logical DP number (0-31, default = slot
+index) plus a display name; (device, dp_number) must be unique within a device; the
+number drives the DP register block address; and the v1.74 converter emits the
+DataPortNumber row.
 
 Run: python3 -m pytest tests/test_dp_number.py
 """
@@ -51,9 +51,8 @@ def test_uniqueness_within_device():
 
 
 def test_config_dataports_exports_only_enabled():
-    # config_dataports() must not pad the export with disabled placeholder DPs
-    # (BuildConfig used to prepend kMaxPeripherals empties). Every exported dataport
-    # is an enabled one snooped from the bus.
+    # config_dataports() does not pad the export with disabled placeholder DPs. Every
+    # exported dataport is an enabled one snooped from the bus.
     from swi3s_studio.session import Session
     sess = Session.from_demo(64, cold_start=False)
     d = sess.decoder.config_dataports()

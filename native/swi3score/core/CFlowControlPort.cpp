@@ -8,10 +8,10 @@ void CFlowControlPort::Configure(const SwI3sDpConfig& dpCfg, int numColumns)
     mNumColumns = numColumns;
 }
 
-void CFlowControlPort::Initialize()
+void CFlowControlPort::Initialize(int startColumn, int rowInInterval)
 {
-    mColumn = 0;
-    mRowInInterval = 0;
+    mColumn = ((startColumn % mNumColumns) + mNumColumns) % mNumColumns;
+    mRowInInterval = (rowInInterval >= 0 && rowInInterval <= mCfg.Interval) ? rowInInterval : 0;
     mGuardPending = false;
     mTailRemaining = 0;
     startInterval();

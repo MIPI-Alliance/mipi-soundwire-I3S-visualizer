@@ -1,23 +1,17 @@
 """Command-line interface: argument parsing and the headless model dump.
 
-Qt-FREE ON PURPOSE. `-o/--output` implies headless mode, so nothing on this path may need a
-display, a QApplication, or the UI package — `app.main()` dispatches here and returns before it
-builds any of them. Keeping the parser here too means the whole surface is testable without Qt.
+Qt-FREE. `-o/--output` implies headless mode, so nothing on this path may need a display, a
+QApplication, or the UI package — `app.main()` dispatches here and returns before it builds any
+of them. The parser lives here too, so the whole surface is testable without Qt.
 
     swi3s-studio                                 # empty window
     swi3s-studio --demo                          # synthetic demo capture
     swi3s-studio -c config.csv                   # open a config CSV in Bus-Visualizer mode
     swi3s-studio -c config.csv -o model.json     # headless: write the bus model, no window
 
-The `-o` flag is restored from the v2 Visualizer CLI, where it was the batch entry point for
-regression tooling. Two things about it are deliberately NOT copied from v2:
-
-  * v2's help text called the payload a "frame model" while its code wrote the BUS model
-    (`BusModelJSONEncoder`). The behaviour is kept — that is what every consumer of those files
-    expects, and `JSONHandler.load_bus_model` round-trips it — and the help text is corrected to
-    match. `save_frame_model` still exists for the legacy shape; nothing here emits it.
-  * v2 accepted `-o` with no input and then complained. Here `-c` is required by the parser, so
-    the error arrives from argparse with usage attached rather than from application code.
+`-o` writes the BUS model (`BusModelJSONEncoder`), which `JSONHandler.load_bus_model`
+round-trips. `save_frame_model` still exists for the legacy shape; nothing here emits it.
+`-o` requires `-c`, and the parser reports a missing `-c` with usage attached.
 """
 from __future__ import annotations
 
@@ -30,20 +24,16 @@ _EXIT_ERROR = 1
 _EXIT_CRITICAL = 2      # a model was written, but it contains a bus clash / truncated DRQ
 
 # The same ceiling the UI's Export applies to RowsToDraw (main_window.export_frame_json). A CSV
-# may ask for any number of rows and the model is built row by row, so an unbounded value is a
-# way to make a batch run allocate for a very long time. Clamped rather than refused — and
-# REPORTED when it bites, because a silently smaller model looks like a complete one.
+# may ask for any number of rows and the model is built row by row. Clamped rather than
+# refused, and REPORTED when it applies.
 _MAX_ROWS = 1024
 
 
 class _Parser(argparse.ArgumentParser):
     """argparse that exits 1, not 2, on a usage error.
 
-    Each exit code has to mean exactly ONE thing, and 2 is already spoken for: "the model was
-    written and it contains a bus clash or a truncated DRQ". argparse's default is
-    SystemExit(2) for a usage error, which made a misspelled flag indistinguishable from a
-    config with a physical bus collision — the caller most likely to care is a batch script
-    branching on the code, and it would have treated a typo as a finding about the bus.
+    Each exit code means exactly ONE thing, and 2 means "the model was written and it contains
+    a bus clash or a truncated DRQ".
     """
 
     def error(self, message: str):        # noqa: A003 - argparse's own name
@@ -54,19 +44,15 @@ class _Parser(argparse.ArgumentParser):
 def program_name() -> str:
     """What to call this program in `usage:`, from the caller's point of view.
 
-    A usage line names a command the reader can retype. There are three ways in, and a single
-    hardcoded name is wrong for two of them: `./run.sh -h` printed `usage: swi3s-studio …`, which
-    is not a command that exists on a fresh checkout — the launcher is how this project is
-    documented to be run, and `swi3s-studio` only exists once the package is pip-installed.
-
-    So the launcher says who it is via $SWI3S_LAUNCHER, and the fallbacks cover the rest:
+    A usage line names a command the reader can retype. The launcher says who it is via
+    $SWI3S_LAUNCHER, and the fallbacks cover the rest:
 
       ./run.sh / .\\run.ps1     -> "run.sh" / ".\\run.ps1"   (the launcher exports it)
       swi3s-studio             -> "swi3s-studio"           (argv[0] IS the console script)
       python -m swi3s_studio.app -> "python -m swi3s_studio.app"
 
-    The last one matters: argv[0] there is the full path to app.py, so argparse's own default
-    would print `usage: app.py …`, which is not runnable as written either.
+    Under `python -m`, argv[0] is the full path to app.py, so argparse's own default would
+    print `usage: app.py …`.
     """
     launcher = os.environ.get("SWI3S_LAUNCHER", "").strip()
     if launcher:
@@ -128,24 +114,30 @@ def run_headless(config: str, output: str, out=None) -> int:
     from .swviz.viz import VizConfig
 
     # Read RowsToDraw first so the clamp can be REPORTED rather than applied behind the
-    # caller's back. Parsing the CSV twice is cheap next to building the model.
+    # caller's back. Parsing the CSV twice is cheap next to building the model. A CSV that
+    # does not load is reported by build_bus_model below, so the probe only reads rows from
+    # a successful load.
     rows: int | None = None
     try:
         probe = VizConfig()
-        CSVHandler.load_csv(config, Interface(), probe)
+        loaded = CSVHandler.load_csv(config, Interface(), probe).success
         wanted = int(probe.rows_to_draw)
-        if wanted > _MAX_ROWS:
+        if loaded and wanted > _MAX_ROWS:
             print(f"note: {config} asks for {wanted} rows; building {_MAX_ROWS} "
                   f"(the same ceiling the UI's Export applies)", file=sys.stderr)
             rows = _MAX_ROWS
     except Exception:                                     # noqa: BLE001 - the real load reports
         rows = None
 
+    from . import import_notes
     try:
-        bus_model, _iface, _viz = build_bus_model(config, rows)
+        with import_notes.collect() as notes:
+            bus_model, _iface, _viz = build_bus_model(config, rows)
     except Exception as exc:                              # noqa: BLE001 - report, don't traceback
         print(f"error: could not build a model from {config}: {exc}", file=sys.stderr)
         return _EXIT_ERROR
+    for note in notes:
+        print(f"warning: {note}", file=sys.stderr)
 
     try:
         # batch_mode creates the parent directory — a batch caller writing into a fresh
@@ -161,8 +153,7 @@ def run_headless(config: str, output: str, out=None) -> int:
     print(f"  bits    {len(bus_model.bits)}", file=out)
 
     # The SAME issue list the UI's notifications panel shows, from the same function, so a
-    # batch run and the window cannot disagree about what is wrong with a config. v2 grew a
-    # parallel hand-written report here and it drifted from the GUI panel.
+    # batch run and the window cannot disagree about what is wrong with a config.
     issues = issues_from_model(bus_model)
     for issue in issues:
         print(f"  {issue.severity.upper():7} {issue.source}: {issue.message}", file=out)

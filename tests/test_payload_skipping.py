@@ -7,13 +7,12 @@ empty follows a fractional accumulator: each interval adds N, and an interval wh
 accumulator reaches D is skipped (D subtracted). Source and sink run the identical
 accumulator, re-initialized by every SSP, so they agree without signalling.
 
-`make_skipping_levels` carries a RAMP — sample n has value n — rather than a sine, because
-the failure being guarded against is a decode that skips the WRONG interval. That reads an
-idle interval as data and discards the sample really transported next door, which a sine
-hides (it still looks like audio) and a ramp cannot (it stops counting). The generator
-Initialize()s its ports and never SyncToSSP()s them, so the wire's skip phase comes from
-the path the placement cross-check pins against the normative Python model — the decode's
-SSP re-anchor has to AGREE with that rather than share a mistake with it.
+`make_skipping_levels` carries a RAMP — sample n has value n — rather than a sine, so a
+decode that skips the WRONG interval (reading an idle interval as data and discarding the
+sample transported next door) stops the count. The generator Initialize()s its ports and
+never SyncToSSP()s them, so the wire's skip phase comes from the path the placement
+cross-check pins against the normative Python model, independent of the decode's SSP
+re-anchor.
 """
 import swi3score
 
@@ -48,12 +47,9 @@ def test_skipping_decodes_every_transported_sample_and_no_others():
     """The whole feature, end to end: with N=13/D=160 the decode must return the ramp the
     device put on the wire, unbroken.
 
-    REGRESSION: CDataPort::SyncToSSP cleared the skipping accumulator without starting the
-    interval that begins at the SSP, so that interval never spent its `A += Numerator`
-    step and every later skip decision landed ONE INTERVAL LATE. The decode read the
-    interval the device had skipped (idle bus) and skipped the next one — dropping a real
-    sample per skip. This broke at sample 12 (the first skip), returning 0x3333, the idle
-    zebra read as a sample."""
+    CDataPort::SyncToSSP clears the skipping accumulator AND starts the interval that
+    begins at the SSP (its `A += Numerator` step); otherwise every later skip decision lands
+    ONE INTERVAL LATE and the ramp breaks at the first skip (sample 12)."""
     values = _ramp(_decode())
     assert len(values) >= 200, f"only {len(values)} samples decoded"
     assert _prefix_len(values) == len(values), (
@@ -110,9 +106,9 @@ def test_an_ssp_on_the_pattern_boundary_is_not_flagged_and_does_not_disturb_the_
 
     This is also what pins the pattern period. The fixture places its SSPAs on multiples of
     the enabled ports' pattern period (SwI3sConfig::patternRows — Interval x
-    SkippingDenominator for a skipping port, 32 x 160 = 5120 Rows here). Were that period
-    still one Interval, as it was before, the SSPA would land part-way through the skip
-    pattern and this test would fail on both counts."""
+    SkippingDenominator for a skipping port, 32 x 160 = 5120 Rows here). With a period of
+    one Interval the SSPA would land part-way through the skip pattern and this test would
+    fail on both counts."""
     dec = _decode(samples=400)
     assert any(c["command"] == "SSPA" for c in dec.commands()), "fixture emitted no SSPA"
     flagged = [c["command"] for c in dec.commands() if c.get("unexpected_ssp_error")]

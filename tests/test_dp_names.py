@@ -94,9 +94,38 @@ def test_a_re_decode_keeps_the_names(win, monkeypatch):
     assert win._audio_view._checks[key].text().startswith("Probe CH")
 
 
+def test_the_audio_channel_list_is_as_wide_as_its_longest_entry(win, monkeypatch):
+    """The channel list starts at its longest entry's width (checkbox and text, plus the
+    list's margins and scroll bar), follows a rename while it is at that width, and keeps a
+    width dragged on the splitter or restored from a workspace."""
+    from swi3s_studio.ui import view_state
+    from swi3s_studio.ui.audio_view import _CHANNEL_LIST_MIN
+    av = win._audio_view
+
+    def list_width():
+        return av._splitter.sizes()[0]
+    widest = max(cb.sizeHint().width() for cb in av._checks.values())
+    assert list_width() == av.channel_list_fit_width() >= max(widest, _CHANNEL_LIST_MIN)
+    assert list_width() < widest + 60                       # no wasted space before the tracks
+    short = list_width()
+    key = sorted(av._checks)[0]
+    _rename(win, monkeypatch, key, ("A Much Longer Data Port Name", True))
+    assert list_width() == av.channel_list_fit_width() > short
+    assert list_width() >= av._checks[key].sizeHint().width()
+    total = sum(av._splitter.sizes())
+    av._splitter.setSizes([333, total - 333])               # a drag on the splitter
+    _rename(win, monkeypatch, key, ("AMP1", True))
+    assert list_width() == 333
+    view_state.restore_audio(av, {"channel_list_width": 222})
+    assert list_width() == 222
+    win.load_session(win._session)                          # a re-decode keeps it
+    QApplication.processEvents()
+    assert list_width() == 222
+
+
 def test_the_grid_key_widens_to_fit_a_name(win):
-    """A swatch is as wide as its label, and no narrower than the 46 px the numbers had,
-    and the swatches do not overlap."""
+    """A swatch is as wide as its label, and no narrower than 46 px, and the swatches do
+    not overlap."""
     from PySide6.QtGui import QFontMetricsF
     s = win._session
     win.cursor.set_sample(int(s.segments[-1]["start_sample"]) + 200_000)

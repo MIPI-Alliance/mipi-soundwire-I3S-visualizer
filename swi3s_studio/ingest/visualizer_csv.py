@@ -8,21 +8,24 @@ several formats over time:
   ``Save file using excess one`` encoding flag. v1.74 split the interval into
   ``Data Port Interval Integer`` + ``Data Port Interval Numerator`` and renamed
   the denominator; v1.73 used a single ``Data Port Interval``.
-* **v2.0 ("Soko")** — register-style field names (``NumColumns_REG``,
+* **v2.0** — register-style field names (``NumColumns_REG``,
   ``EnableCh_REG`` …). This is what the C++ ``SwI3sConfig::LoadCsv`` /
   ``swi3score.grid_from_csv`` parser reads.
 * **v3.0.0 (current)** — v2.0 plus a per-DP ``DataPortNumber`` row (logical DP
   number, distinct from the column index).
 
 This module detects the format and upgrades any older one to the CURRENT format
-so old files open silently everywhere (Compare, the decode config, the authoring
-panel). The upgrade always converges on the swviz model — parse into an
+so old files open everywhere (Compare, the decode config, the authoring panel).
+What an upgrade could not carry over (an unrecognised field, a v2.0 file the model
+could not read, a file with no config fields at all) is reported through
+``import_notes`` under the original file's name, and ``report_csv_warnings`` reports
+what the native loader did not read as written. The upgrade always converges on the swviz model — parse into an
 ``Interface`` / ``VizConfig`` then re-serialise with ``CSVHandler.save_csv`` — so
 new fields added in future versions are written automatically; the converter
 only has to learn how to READ each older layout, not how to emit the newest one.
 
 ``convert()`` (legacy dict → model) is shared with the standalone
-``tools/csv_converter/convert_174.py`` CLI, which is now a thin wrapper.
+``tools/csv_converter/convert_174.py`` CLI, which wraps it.
 """
 from __future__ import annotations
 
@@ -33,6 +36,8 @@ import os
 import re
 import tempfile
 from typing import Callable, Dict, List, Tuple
+
+from .. import import_notes
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +125,7 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
     from ..swviz.version import app_version
     from ..swviz.viz import VizConfig
 
-    # app_version(), not the APP_VERSION literal: this note is the ONE place that read
-    # the literal directly, so a legacy conversion recorded 'to v3.0.8' for three
-    # releases while the app itself displayed the right version.
+    # app_version(), not the APP_VERSION literal.
     note = f'converted from SWI3S legacy CSV to v{app_version()}'
     iface = Interface()
     viz = VizConfig()
@@ -266,11 +269,13 @@ def _model_to_text(iface, viz) -> str:
             pass
 
 
-def _upgrade_register_text(text: str) -> str:
+def _upgrade_register_text(text: str, source: str = "") -> str:
     """Upgrade a v2.0 register-style CSV to current by round-tripping through the
     swviz model (which fills in the fields v2.0 predates, e.g. DataPortNumber).
     Falls back to the original text if the model can't load it (the C++/BusConfig
-    parsers already tolerate a v2.0 file, so opening still works)."""
+    parsers already tolerate a v2.0 file, so opening still works). Fields the model
+    does not recognise, which the upgraded text leaves out, and the fallback are
+    import warnings for `source`."""
     from ..swviz.io.csv_handler import CSVHandler
     from ..swviz.models import Interface
     from ..swviz.viz import VizConfig
@@ -283,11 +288,20 @@ def _upgrade_register_text(text: str) -> str:
         if not getattr(res, "success", True):
             logger.warning("config CSV: v2.0 upgrade load reported failure; "
                            "using the file as-is")
+            import_notes.warn(source, "this v2.0 config could not be upgraded to the "
+                              f"current format ({res.error_message or 'the load failed'}); "
+                              "it is read as written, and fields v2.0 does not have take "
+                              "their defaults.")
             return text
+        for note in res.notes(missing=False):
+            import_notes.warn(source, f"upgrading this v2.0 config: {note}")
         return _model_to_text(iface, viz)
-    except Exception:  # noqa: BLE001 — never block opening a readable v2.0 file
+    except Exception as exc:  # noqa: BLE001 — never block opening a readable v2.0 file
         logger.warning("config CSV: could not upgrade v2.0 file to current; "
                        "using it as-is", exc_info=True)
+        import_notes.warn(source, f"this v2.0 config could not be upgraded to the current "
+                          f"format ({exc}); it is read as written, and fields v2.0 does not "
+                          "have take their defaults.")
         return text
     finally:
         try:
@@ -296,26 +310,51 @@ def _upgrade_register_text(text: str) -> str:
             pass
 
 
-def to_current_text(text: str) -> str:
+def _legacy_short_rows(old: Dict[str, List[str]]) -> List[str]:
+    """Per-DP legacy fields with fewer than NUM_DP values, as 'name (n of 12)'."""
+    return [f"{name} ({len(vals)} of {NUM_DP})" for name, vals in old.items()
+            if name in _DP_FIELDS and len(vals) < NUM_DP]
+
+
+def to_current_text(text: str, source: str = "") -> str:
     """Upgrade config-CSV `text` to the CURRENT register-style format.
 
     Already-current (or unrecognised) text is returned unchanged; legacy
-    (v1.73/v1.74) and v2.0 files are converted."""
+    (v1.73/v1.74) and v2.0 files are converted. `source` names the file in the import
+    warnings: unrecognised legacy fields, legacy per-port rows short of a value per data
+    port, a v2.0 file that does not upgrade, and text with no config fields at all."""
     version = detect_version(text)
-    if version in ("current", "unknown"):
+    if version == "unknown":
+        if any(f for f, _ in _rows(text)):
+            import_notes.warn(source, "no config field is recognised (no _REG row and "
+                              "no legacy field); every setting takes its default.")
+        return text
+    if version == "current":
         return text
     if version == "legacy":
+        skipped: List[str] = []
         try:
-            iface, viz = convert(legacy_dict_from_text(text),
-                                 lambda name: logger.warning(
-                                     "config CSV: skipped unrecognised legacy field %r", name))
-            return _model_to_text(iface, viz)
+            old = legacy_dict_from_text(text)
+            iface, viz = convert(old, skipped.append)
+            out = _model_to_text(iface, viz)
         except Exception as exc:  # noqa: BLE001 — turn a cryptic model error into a clear one
             # A legacy CSV can't be read as-is (the C++/BusConfig parsers only read
             # register-style), so surface a clear failure rather than a raw
             # descriptor ValueError from an out-of-range field.
             raise ValueError(f"could not convert legacy visualizer CSV: {exc}") from exc
-    return _upgrade_register_text(text)               # register_old (v2.0)
+        for name in skipped:
+            logger.warning("config CSV: skipped unrecognised legacy field %r", name)
+        if skipped:
+            n = len(skipped)
+            import_notes.warn(source, f"{n} legacy field{'s are' if n != 1 else ' is'} not "
+                              f"recognised and {'were' if n != 1 else 'was'} skipped: "
+                              f"{', '.join(skipped)}.")
+        short = _legacy_short_rows(old)
+        if short:
+            import_notes.warn(source, "legacy per-port rows with fewer values than data "
+                              f"ports, the missing ports taking defaults: {', '.join(short)}.")
+        return out
+    return _upgrade_register_text(text, source)       # register_old (v2.0)
 
 
 def normalized_path(path: str) -> str:
@@ -327,10 +366,27 @@ def normalized_path(path: str) -> str:
     dir to reclaim; callers that want eager cleanup can remove it after use."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    upgraded = to_current_text(text)
+    upgraded = to_current_text(text, import_notes.source_name(path))
     if upgraded == text:
         return path
     fd, tmp = tempfile.mkstemp(suffix=".cur.csv", prefix="swi3s_cfg_")
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(upgraded)
     return tmp
+
+
+def report_csv_warnings(cfg_path: str, source_path: str = "") -> List[str]:
+    """Report, as import warnings for `source_path` (default `cfg_path`), what the native
+    loader does not read as written in the current-format CSV at `cfg_path`
+    (`swi3score.csv_warnings`): a port disabled for its DeviceNumber_REG, a value masked
+    or clamped to its register field, an unreadable cell. Returns the messages; empty
+    when the loaded core does not provide `csv_warnings`."""
+    import swi3score
+    fn = getattr(swi3score, "csv_warnings", None)
+    if fn is None or not cfg_path:
+        return []
+    msgs = [str(m) for m in fn(str(cfg_path))]
+    src = import_notes.source_name(source_path or cfg_path)
+    for m in msgs:
+        import_notes.warn(src, m)
+    return msgs

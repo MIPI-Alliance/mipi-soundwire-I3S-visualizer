@@ -29,7 +29,7 @@ def test_crc_and_mask_and_response_errors():
 
 def test_ping_status_error_is_flagged():
     # GetStatus error tokens live in the per-device ping_status list, NOT the scalar
-    # peripheral_response — command_error must still flag them (regression).
+    # peripheral_response; command_error flags them.
     ping = [0] * 12
     ping[3] = 15                                    # device 3 reports COMMANDS_BLOCKED
     cmd = {"command": "GetStatus", "phase": "GetStatus", "device_mask": 0xFFF,
@@ -65,9 +65,8 @@ def test_count_errors():
 
 def test_enablech_curr_error_is_flagged():
     # Decoder-flagged EnableCh_CURR write with Interval != 1 Row (native Decoder::feed
-    # / CommandRec::enablechCurrError) must count as an error here too — command_table's
-    # row shading / "Errors only" filter and the status-bar "(N errors)" count both key
-    # off this predicate, so a capture with this violation must not read "0 errors".
+    # / CommandRec::enablechCurrError) counts as an error. command_table's row shading,
+    # its "Errors only" filter and the status-bar "(N errors)" count key off this predicate.
     cmd = _write(enablech_curr_error=True)
     assert command_error(cmd) == "Write to EnableCh_CURR with Interval != 1 Row"
     assert count_errors([cmd]) == 1

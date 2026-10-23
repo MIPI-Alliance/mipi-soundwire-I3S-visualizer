@@ -3,12 +3,9 @@ Session.from_wfm, Session.from_analog_csv, Session.locate_subcapture,
 Session.export_sal, and the decoder_ready progress hook.
 
 Everything here is SYNTHETIC — `.wfm` files are written by `_write_synthetic_wfm`
-and analog CSVs by `_write_csv`, so the whole module runs on any machine. The four
-tests that needed a locally-synced scope export (a WFM pair + the analog CSV of
-the same acquisition) were dropped in 3.0.11: they skipped everywhere, so they never
-actually guarded anything, and three of the four duplicated synthetic coverage above.
-The one behaviour only they exercised — auto_clock orientation — is now
-test_from_wfm_auto_clock_is_order_independent, built from a synthetic pair.
+and analog CSVs by `_write_csv`, so the whole module runs on any machine.
+auto_clock orientation is covered by test_from_wfm_auto_clock_is_order_independent,
+built from a synthetic pair.
 
 Run: PYTHONPATH="$PWD" python3 -m pytest tests/test_analog_import.py -q
 """
@@ -113,8 +110,8 @@ def test_from_wfm_rejects_mismatched_time_base():
 
 def test_from_wfm_accepts_matching_pair():
     """A genuine same-acquisition pair (matching record length + time base) must
-    still decode normally — the new from_wfm validation must not false-positive
-    on the common case."""
+    still decode normally — the from_wfm validation must not false-positive on
+    the common case."""
     n = 4000
     clk_codes = _square_wave_codes(n, period=20)       # busier -> auto-picked as clock
     dat_codes = _square_wave_codes(n, period=200)
@@ -129,10 +126,9 @@ def test_from_wfm_accepts_matching_pair():
 
 
 def test_source_label_names_wfm_pair():
-    """source_label() only checked source keys "clock"/"data"/"path"; a .wfm pair's
-    source uses "clock_path"/"data_path" instead, so its window title used to fall
-    through to the useless generic 'Capture'. Must name both files, like the
-    two-file .bin/.sal labeling."""
+    """A .wfm pair's source uses the keys "clock_path"/"data_path"; source_label()
+    names both files, like the two-file .bin/.sal labeling, not the generic
+    'Capture'."""
     n = 4000
     codes = _square_wave_codes(n, period=20)
     with tempfile.TemporaryDirectory() as d:
@@ -185,10 +181,9 @@ def test_is_analog_csv_decides_by_values_not_header():
 
 def test_read_analog_csv_truncates_ragged_trailing_comma_row():
     """A stray trailing comma (e.g. from an Excel re-save) gives one data row
-    an extra column versus the header. Before the fix this made `data_rows`
-    ragged and crashed np.asarray(..., dtype=float64) with a cryptic
-    'inhomogeneous shape' ValueError; it must instead be truncated to the
-    header's column count and parse cleanly."""
+    an extra column versus the header. It is truncated to the header's column
+    count and parses cleanly, rather than leaving `data_rows` ragged for
+    np.asarray(..., dtype=float64)."""
     from swi3s_studio.ingest import analog_csv
     path = _write_csv(
         "TIME,CH1,CH2\n"
@@ -207,9 +202,7 @@ def test_read_analog_csv_truncates_ragged_trailing_comma_row():
 def test_is_analog_csv_detects_analog_past_a_long_railed_lead_in():
     """A capture with a long railed/saturated lead-in — many rows all exactly
     0/1 — before the real analog data begins must still classify as analog.
-    The old hard cap at max_scan_rows DATA rows stopped scanning before
-    reaching the real data and misclassified it as digital; use a small
-    max_scan_rows here to keep the fixture file a reasonable size while still
+    A small max_scan_rows keeps the fixture file a reasonable size while still
     exercising the past-the-cap thinning path."""
     from swi3s_studio.ingest import analog_csv
     lines = ["TIME,CH1,CH2"]
@@ -243,9 +236,8 @@ def test_from_wfm_auto_clock_is_order_independent():
     file arguments can be given in either order and yield the same capture; the busier
     line becomes the clock. auto_clock=False honours the given order instead.
 
-    Synthetic pair (was gated on a local Box scope export — see the module docstring):
-    the property is about transition COUNTS, so a square-wave pair with a known busier
-    line exercises it exactly, and runs everywhere."""
+    Synthetic pair: the property is about transition COUNTS, so a square-wave pair with
+    a known busier line exercises it exactly, and runs everywhere."""
     n = 4000
     busy = _square_wave_codes(n, period=20)            # many transitions -> the clock
     quiet = _square_wave_codes(n, period=200)

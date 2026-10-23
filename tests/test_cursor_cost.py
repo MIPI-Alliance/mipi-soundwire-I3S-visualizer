@@ -1,20 +1,11 @@
 """What a cursor move is ALLOWED TO DO — asserted as counts, not as wall-clock times.
 
-Every user-visible stall this project has shipped was a per-cursor-move cost that grew
-with the capture, and the perf suite kept missing them because it times FUNCTIONS in
-isolation. Two things follow from that, and this file is both of them:
-
-  * A ceiling on a function cannot express "and not on the GUI thread". A 1.5 s bound is
-    right for a worker and ruinous for a cursor move; `test_tx_persist_columns_ceiling`
-    allowed 30 M UIs at 1.5 s and stayed green while a 4.7 s capture froze for ~550 ms per
-    move, because the defect was WHICH THREAD the call landed on, not how fast it was.
-  * Wall clocks have to be generous enough to survive a loaded runner, so they catch
-    cliffs and never drift. A 2-3x regression passes every ceiling in test_perf.
-
-So the assertions here are COUNTS: rows built, calls made, thread used. They are
-deterministic, they are the same on a busy CI runner as on a workstation, and they fail on
-drift rather than only on a cliff. `tests/test_perf.py` keeps the wall-clock budget for the
-whole cascade; this file pins the shape that budget depends on.
+A ceiling on a function cannot express "and not on the GUI thread", and wall clocks have
+to be generous enough to survive a loaded runner. So the assertions here are COUNTS: rows
+built, calls made, thread used. They are deterministic, they are the same on a busy CI
+runner as on a workstation, and they fail on drift rather than only on a cliff.
+`tests/test_perf.py` keeps the wall-clock budget for the whole cascade; this file pins the
+shape that budget depends on.
 
 The model is test_gui_smoke.test_cursor_cascade_coalesces_when_event_loop_live, which
 counts heavy rebuilds rather than timing them.
@@ -46,11 +37,9 @@ def test_a_cursor_move_inside_the_loaded_window_builds_no_rows():
     change and nothing more.
 
     The pane is a QTableWidget refilled wholesale, so a rebuild costs
-    2 * _SAMPLE_HALF_WINDOW * len(_COLS) fresh QTableWidgetItems -- 48,000 at the original
-    half-window of 4000, profiled at ~99 ms of a 142 ms cursor move. The whole design
-    depends on the in-window move being free (_refresh_samples_around's cheap path), and
-    nothing asserted that it was. Counting _fill_row is exact: it is the only place the
-    pane builds a row, and it builds len(_COLS) items each time.
+    2 * _SAMPLE_HALF_WINDOW * len(_COLS) fresh QTableWidgetItems; an in-window move takes
+    _refresh_samples_around's cheap path instead. Counting _fill_row is exact: it is the
+    only place the pane builds a row, and it builds len(_COLS) items each time.
     """
     w = _win()
     sv = w._sample_view
@@ -82,10 +71,9 @@ def test_a_cursor_move_inside_the_loaded_window_builds_no_rows():
 def test_a_cursor_move_outside_the_window_builds_at_most_one_window():
     """Leaving the window costs ONE re-centre, bounded by the window size.
 
-    This is the count that the pane's cost reduces to, and it is what makes the
-    _SAMPLE_HALF_WINDOW constant load-bearing: the rebuild is O(window), so the bound has
-    to be stated in terms of the window rather than the capture. A regression that rebuilt
-    per pane, or that loaded the whole capture, shows up here as a multiple.
+    The rebuild is O(window), so the bound is stated in terms of _SAMPLE_HALF_WINDOW
+    rather than the capture. Rebuilding per pane, or loading the whole capture, shows up
+    here as a multiple.
     """
     w = _win()
     sv = w._sample_view
@@ -115,8 +103,7 @@ def _big_region_session(w, ui_count):
     """A demo session re-pointed at a capture with ONE config region of `ui_count` UIs.
 
     Same swap the perf suite uses (tx_persist_columns reads only `capture` and `segments`),
-    which is what makes it possible to test the region-size routing without decoding a
-    multi-second capture.
+    so the region-size routing is tested without decoding a multi-second capture.
 
     `_link_control` is reset because it is cached from the ORIGINAL capture: left in place,
     the demo's cold-start bring-up keeps _apply_grid_for_sample on its "No PHY Selected"
@@ -154,13 +141,7 @@ def _record_tx_routing(w, s, monkeypatch):
 def test_a_big_region_persistence_scan_never_runs_on_the_gui_thread(monkeypatch):
     """A config region above _TX_PERSIST_SYNC_MAX_UIS must be routed to the worker.
 
-    This is the invariant no wall-clock ceiling can express. The scan runs at ~32 ns/UI, so
-    the constant IS the freeze a cursor move may cause -- and it was set to 32 M UIs under a
-    comment claiming "sub-~0.3s", which admitted ~1.0 s. The cruel part was that it bit
-    SHORT captures: a 4.7 s capture's single 18.9 M-UI region sat UNDER the threshold and
-    therefore ran inline, while the long captures the constant was written for were routed
-    away correctly all along. Measured 530 ms median per cursor move against 28 ms with
-    persistence off.
+    The scan runs at ~32 ns/UI, so the constant IS the freeze a cursor move may cause.
 
     Asserting on the ROUTING rather than on elapsed time makes this deterministic: no
     threads have to be scheduled and no clock has to be read.
@@ -181,12 +162,10 @@ def test_a_big_region_persistence_scan_never_runs_on_the_gui_thread(monkeypatch)
 
 
 def test_a_small_region_persistence_scan_still_runs_inline(monkeypatch):
-    """The other half of the routing rule, so the fix can't be "send everything async".
+    """The other half of the routing rule: a small region is scanned inline.
 
-    The inline path exists deliberately: for a small region the thread hand-off and the
-    async round-trip cost more than the scan, and keeping it synchronous is what makes the
-    demo and short captures respond immediately. A test that only pinned the async side
-    would be satisfied by deleting the inline branch.
+    For a small region the thread hand-off and the async round-trip cost more than the
+    scan, so keeping it synchronous makes the demo and short captures respond immediately.
     """
     w = _win()
     w._tx_map = True
@@ -208,8 +187,7 @@ def test_the_inline_threshold_is_stated_as_a_gui_budget(monkeypatch):
 
     Paired with test_perf.test_tx_persist_inline_threshold_stays_inline, which measures the
     scan at exactly this size. This half needs no clock: it fails if the constant is raised
-    past what a cursor move can absorb, which is the change that caused the freeze. 4 M UIs
-    is ~130 ms at the measured rate -- already the outer edge of tolerable.
+    past what a cursor move can absorb. 4 M UIs is ~130 ms at the measured rate.
     """
     assert _TX_PERSIST_SYNC_MAX_UIS <= 4_000_000, (
         f"_TX_PERSIST_SYNC_MAX_UIS is {_TX_PERSIST_SYNC_MAX_UIS:,}. The scan measures "
@@ -221,11 +199,8 @@ def test_the_inline_threshold_is_stated_as_a_gui_budget(monkeypatch):
 def test_the_cursor_cascade_skips_hidden_docks(monkeypatch):
     """A hidden pane must cost NOTHING on a cursor move.
 
-    _apply_cursor_heavy's per-dock guards are the reason hiding Decoded Samples took a
-    reported cursor move from 142 ms to 43 ms, which is how the pane was identified in the
-    first place. That makes the guards a performance contract, and it was untested: a pane
-    that stopped checking its own dock would reintroduce the cost invisibly for anyone who
-    had closed the tab.
+    _apply_cursor_heavy guards each pane on its dock's visibility, so a hidden Samples,
+    CDS symbol or Registers pane is not refreshed. The guards are a performance contract.
     """
     w = _win()
     s = w._session

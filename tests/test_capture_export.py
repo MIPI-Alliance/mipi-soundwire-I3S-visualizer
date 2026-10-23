@@ -125,15 +125,15 @@ def test_export_sal_tolerates_leading_zero_edge():
 
 
 def test_export_sal_with_range_on_dlv():
-    """.sal export of a sub-range whose bounds land on DLV row-sync (RSP) edges must
-    not crash (regression: 'v3 delta must be >= 1') and must round-trip."""
+    """.sal export of a sub-range whose bounds land on DLV row-sync (RSP) edges does
+    not raise 'v3 delta must be >= 1' and round-trips."""
     from swi3s_studio.ingest import saleae_sal
     cap = transitions.demo_capture(600, phy=3)
     s = Session(cap, dlv=True, forced_column_count=16)
     rng = (s.sample_at_bus_row(40), s.sample_at_bus_row(200))         # bounds are RSP edges
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "range.sal")
-        s.export_sal(p, sample_range=rng)                             # regression: used to raise
+        s.export_sal(p, sample_range=rng)                             # must not raise
         c2 = saleae_sal.load_capture(p, 0, 1)
     assert c2.clock_edges.size > 0
 

@@ -1,9 +1,9 @@
 """Out-of-core results store for decoded commands (Apache Arrow / Parquet).
 
-Milestone 1 keeps the command stream — sparse relative to the capture — in an
-Arrow table, memory-mappable and filterable, savable to Parquet. (Audio goes to
-a memmap + pyramid store in M2; the register-event log is derived from the
-WriteA32/Commit commands here.)
+Keeps the command stream — sparse relative to the capture — in an Arrow table,
+memory-mappable and filterable, savable to Parquet. Audio has its own memmap +
+pyramid store (`audio_store`); the register-event log is derived from the
+WriteA32/Commit commands here.
 """
 from __future__ import annotations
 
@@ -58,12 +58,8 @@ def save_commands(table: pa.Table, path: str) -> None:
 
 
 def load_commands(path: str) -> pa.Table:
-    # memory_map=False: read the table fully into RAM rather than keeping an mmap
-    # handle open on the file for the table's lifetime. The command table is small
-    # (commands, not the audio pyramid), so the zero-copy win is negligible, while
-    # a lingering handle LOCKS the file on Windows — blocking deletion/overwrite of
-    # a temp or to-be-rewritten store (surfaced as a PermissionError tearing down a
-    # TemporaryDirectory, and would also block a re-decode overwriting the store).
+    # memory_map=False: read the table fully into RAM. An open mmap handle locks the
+    # file on Windows, blocking deletion or overwrite of the store.
     return pq.read_table(path, memory_map=False)
 
 

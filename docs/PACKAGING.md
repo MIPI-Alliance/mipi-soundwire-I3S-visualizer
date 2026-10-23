@@ -22,6 +22,16 @@ loader (`model/registers.py`) finds it via, in order: `$SWI3S_REGISTERS`, the
 repo `data/` dir, the package dir, `sys.prefix/share/swi3s-studio/`, or a
 PyInstaller bundle's `data/`.
 
+The demo workspaces File ▸ Open Demo Capture applies (`data/demos/*.swi3s`) are found
+the same way by `workspace.demo_dir`: the repo `data/demos`, the package dir,
+`sys.prefix/share/swi3s-studio/demos/`, or a PyInstaller bundle's `data/demos`.
+
+A wheel (`pip install .`) carries only what `[tool.setuptools]` names: the packages, the
+theme's icons (`package-data`, `ui/assets/*.svg`), the register data and the demo
+workspaces (`data-files`).
+A new file read from beside a module needs a `package-data` glob;
+`tests/test_release_gate.py` fails until it has one.
+
 ## 3. Standalone desktop bundle (PyInstaller)
 
 ```bash
@@ -33,8 +43,8 @@ pyinstaller swi3s-studio.spec    # macOS -> dist/"SWI3S Studio.app";
 
 The spec is cross-platform: it wraps the build as a `.app` only on macOS (a plain
 COLLECT folder on Windows/Linux) and is a GUI app (no console window on Windows).
-It bundles the app, the `swi3score` extension (`.pyd`/`.so`/`.dylib`), and
-`data/registers.json`. Drop a `data/icon.ico` (Windows) or `data/icon.icns` (macOS)
+It bundles the app, the `swi3score` extension (`.pyd`/`.so`/`.dylib`),
+`data/registers.json` and `data/demos/`. Drop a `data/icon.ico` (Windows) or `data/icon.icns` (macOS)
 to give it an icon — the spec picks it up if present. (`briefcase` is an
 alternative if you prefer per-OS installers.)
 

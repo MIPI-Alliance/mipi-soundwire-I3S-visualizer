@@ -29,14 +29,16 @@ r06) and kept as table-driven constants — notably the PHY-number *encoding*
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 import numpy as np
 
 from ..nputil import searchsorted as _ss
 
-# ---- thresholds (µs), from Tables 17/24 + §5.1.2.1 decision boundaries ----
+# ---- thresholds (µs) ----
+# From the "UFI Timing Parameters Related to Link Control Sequences" and "DFI Timing
+# Parameters Related to Link Control Sequences" tables + §5.1.2.1 decision boundaries.
 # Decision boundaries chosen inside the guaranteed Manager/Peripheral gaps:
 ACK_VS_WARM_US = 150.0      # < this DP-high pulse = LC_Ack/Request (ignored here)
 WARM_VS_COLD_US = 500.0     # [150,500) = Warm Start; ≥ 500 = Cold Start bus reset
@@ -61,12 +63,9 @@ PHY_NUMBER_BITS = 4         # normative 4-bit PHY number, MSb first
 # A Cold/Warm Start is the FIRST thing on the bus (power-on bring-up), before audio
 # mode — a handful of slow pulses (a few Bus-Reset pulses, a ≤~8-edge PHY-number
 # clock burst, PhyStart): a few dozen edges, always at the very start of the capture.
-# Detecting it (or confirming 'none') therefore needs only a small PREFIX of the edge
-# list. Coalescing/scanning the whole capture — 100s of millions of audio edges — just
-# to read the first few ms was the dominant load-time cost (a redundant full sort of
-# the already-sorted edges alone was ~12s on a 420M-edge capture). This bound keeps it
-# near-instant; it is hugely larger than any real bring-up, and audio-mode edges (sub-µs
-# gaps) never satisfy the ≥150µs start-pulse test, so a truncated audio capture still
+# Detecting it (or confirming 'none') therefore scans only a PREFIX of the edge list.
+# This bound is far larger than any real bring-up, and audio-mode edges (sub-µs gaps)
+# never satisfy the ≥150µs start-pulse test, so a truncated audio capture still
 # resolves to 'none'.
 _LC_MAX_EDGES = 8192
 
@@ -85,7 +84,8 @@ PHY_NUMBER_MAP = {
 # columns). The bus then reconfigures to its operational geometry.
 PHY_SAFE_LOCK_COLUMNS = {"PHY1": 2, "PHY2": 2, "PHY3": 4}
 
-# Manager Link-Control timing limits — Table 24, §5.2.3 (MIPI SWI3S v1.1 r06).
+# Manager Link-Control timing limits — the "DFI Timing Parameters Related to Link Control
+# Sequences" table, §5.2.3 (MIPI SWI3S v1.1 r06).
 # (param -> (min_us, max_us, description)); None = no bound on that side. The Link
 # Control Timing pane measures each observable parameter and flags it against these.
 LC_TIMING_LIMITS = {
@@ -134,6 +134,8 @@ class LinkControlResult:
     ext_bits: Optional[int] = None           # provisional draft extension (rising edges)
     lc_on_data_line: bool = False            # True ⇒ the LC clock (DP) is the capture's
     #                                          data line (audio clock = DN on the clock line)
+    clock_stop_sample: Optional[int] = None  # a later bring-up: the last audio-mode clock
+    #                                          edge before the Link went inactive
     note: str = ""
     # Named, timed sub-phases for the timeline band (Idle / Bus Reset / Cold Start /
     # Warm Start / LC_Request / PhyStart), each {"name", "start", "end"} in samples.
@@ -189,6 +191,172 @@ def _coalesce_edges(edges: np.ndarray, min_gap: int = 0) -> np.ndarray:
     return np.ascontiguousarray(keep, dtype=np.uint64)
 
 
+# A forwarded clock that stops for this long has left audio mode, which never pauses it, so
+# the link went inactive and any later audio follows a new start sequence. Far longer than
+# the clock stutter inside a bring-up (~130 µs) and shorter than Man_tReset10 (≥ 1569 µs).
+LINK_IDLE_MIN_US = 1000.0
+# How much of the capture after a restarted clock a later bring-up is decoded from: the
+# sequence ends a few hundred µs after the restart, so this bounds the work per stop.
+RESTART_WINDOW_MS = 20.0
+# A later start sequence begins where the clock stopped: its start pulse (the Bus Reset's
+# LC:10 rise, or the Warm Start pulse) rises during the stop or after at most this many
+# clock-line edges once the clock moves again — room for a few LC_Ack / LC_Request pulses
+# (two edges each) and the LC:00 low before it. Audio mode clocks thousands of edges a
+# millisecond, so a "start pulse" found further on is an audio pulse that happens to be
+# long, not a bring-up.
+START_PULSE_MAX_EDGES = 16
+# Audio mode follows a bring-up, and its forwarded clock toggles every UI: millions of edges
+# a second at any PHY rate. A "bring-up" with fewer clock edges than this in its first
+# millisecond of audio is a line that bursts and pauses, not a Link coming back up.
+AUDIO_MIN_EDGES_PER_MS = 1000
+# An edge this long after the one before it is link control, not audio mode: audio mode's
+# clock toggles every UI, well under a µs at any PHY rate, and link control's shortest
+# pulses (LC_Ack, LC_Request) last tens of µs.
+LC_EDGE_GAP_MIN_US = 10.0
+# Clock edges differenced at a time when looking for the stops (bounded scratch memory).
+_GAP_CHUNK = 1 << 22
+
+
+def _clock_stops(edges: np.ndarray, min_gap: int) -> np.ndarray:
+    """Indices i where the clock held its level for more than `min_gap` samples after edge
+    i. Differences the edge array in place, chunk by chunk: the edges are sorted, so the
+    unsigned differences cannot wrap, and no full-size copy is made."""
+    out = [np.flatnonzero(np.diff(edges[lo:lo + _GAP_CHUNK + 1]) > min_gap) + lo
+           for lo in range(0, max(int(edges.size) - 1, 0), _GAP_CHUNK)]
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
+
+
+def _edges_in(edges: np.ndarray, lo: int, hi: int) -> int:
+    """Edges in [lo, hi)."""
+    return int(_ss(edges, hi, side="left")) - int(_ss(edges, lo, side="left"))
+
+
+def _start_pulse(r: LinkControlResult) -> Optional[int]:
+    """Where `r`'s start pulse rises: the Bus Reset's LC:10 for a Cold Start, the Warm Start
+    pulse for a warm one."""
+    if r.sequence == "cold":
+        return r.bus_reset_sample
+    return next((int(sec["start"]) for sec in r.sections if sec["name"] == "Warm Start"), None)
+
+
+def decode_link_controls(capture) -> List[LinkControlResult]:
+    """Every link bring-up in the capture, in order: the first as decode_link_control finds
+    it (sequence 'none' when the capture starts in audio mode), then one per later start
+    sequence. A Link can go inactive (its clock stops) and be brought up again.
+
+    A later one is looked for after each clock stop longer than LINK_IDLE_MIN_US past the
+    previous bring-up's audio start, decoded from the stop (whose Idle section is then the
+    inactive stretch) and shifted back to capture samples. When the clock held HIGH through
+    the stop, the stop may be the Bus Reset's LC:10 pulse itself (an idle shorter than
+    LINK_IDLE_MIN_US before it), whose rising edge a window starting at the stop folds into
+    its initial level; then the window starting at the clock edge before it is tried too.
+    A detection counts only if it is complete (it reaches audio mode), its start pulse
+    rises within START_PULSE_MAX_EDGES clock edges of the clock moving again, and the clock
+    then runs as audio mode does (AUDIO_MIN_EDGES_PER_MS). A Warm Start names no PHY, so it carries the
+    previous bring-up's; a Cold Start whose PHY number is not recognised names none."""
+    first = decode_link_control(capture)
+    found = [first]
+    ce = np.asarray(capture.clock_edges)
+    if ce.size < 2:
+        return found
+    spp = float(capture.sample_rate_hz) / 1e6
+    one_ms = int(1000.0 * spp)
+    after = int(first.audio_start_sample or 0)
+    for g in _clock_stops(ce, int(LINK_IDLE_MIN_US * spp)):
+        g = int(g)
+        stop, restart = int(ce[g]), int(ce[g + 1])
+        if stop < after:
+            continue
+        end = restart + int(RESTART_WINDOW_MS * one_ms)
+        if _edges_in(ce, restart, end) < AUDIO_MIN_EDGES_PER_MS:
+            continue                                   # no audio mode after this stop
+        held_high = bool(capture.initial_clock) ^ bool((g + 1) & 1)
+        bases = [stop] + ([int(ce[g - 1])] if held_high and g > 0 else [])
+        r, audio = None, 0
+        for base in bases:
+            got = decode_link_control(capture.subcapture(base, end))
+            if got.sequence == "none":
+                continue
+            got = _shifted(got, base)
+            rise = _start_pulse(got)
+            if got.audio_start_sample is None or rise is None or (
+                    rise > restart and _edges_in(ce, restart, rise) > START_PULSE_MAX_EDGES):
+                continue
+            last = _last_audio_edge(ce, g if base == stop else g - 1,
+                                    int(LC_EDGE_GAP_MIN_US * spp))
+            sections = list(got.sections)
+            if sections and sections[0]["name"] == "Idle" and last < int(sections[0]["start"]):
+                sections[0] = dict(sections[0], start=last)   # from where the Link stopped
+            r = replace(got, clock_stop_sample=last, sections=sections)
+            audio = int(got.audio_start_sample)
+            break
+        if r is None or _edges_in(ce, audio, audio + one_ms) < AUDIO_MIN_EDGES_PER_MS:
+            continue
+        if r.sequence == "warm":
+            prev = found[-1]
+            r = replace(r, phy_number=prev.phy_number, phy_name=prev.phy_name,
+                        phy_kind=prev.phy_kind, safe_lock_columns=prev.safe_lock_columns,
+                        note=(f"Warm Start: {prev.phy_name} reused from the bring-up before it."
+                              if prev.phy_name else
+                              "Warm Start: the PHY of the bring-up before it is reused, and "
+                              "that bring-up names none."))
+        found.append(r)
+        after = audio
+    return found
+
+
+def clock_resumes(capture, bringups: List[LinkControlResult]) -> List[int]:
+    """The first clock edge after each clock stop longer than LINK_IDLE_MIN_US that none of
+    `bringups` (decode_link_controls' list, the first included) accounts for, where audio
+    mode's clock runs again: a pause, not the Link going inactive. Audio mode never pauses
+    its clock, so the analyzer lost samples or the capture was joined there, and the decode
+    checks the bus's phase there (DecoderSettings.resume_points). Stops before the first
+    bring-up's audio start, or from a later one's clock stop to its audio start, are part of
+    a start sequence."""
+    ce = np.asarray(capture.clock_edges)
+    if ce.size < 2:
+        return []
+    spp = float(capture.sample_rate_hz) / 1e6
+    one_ms = int(1000.0 * spp)
+    first = bringups[0] if bringups else None
+    after = int(first.audio_start_sample or 0) if first is not None else 0
+    spans = [(int(r.clock_stop_sample if r.clock_stop_sample is not None
+                  else r.audio_start_sample), int(r.audio_start_sample))
+             for r in bringups[1:] if r.audio_start_sample is not None]
+    out = []
+    for g in _clock_stops(ce, int(LINK_IDLE_MIN_US * spp)):
+        stop, resume = int(ce[g]), int(ce[g + 1])
+        if stop < after or any(lo <= resume and stop <= hi for lo, hi in spans):
+            continue
+        if _edges_in(ce, resume, resume + one_ms) >= AUDIO_MIN_EDGES_PER_MS:
+            out.append(resume)
+    return out
+
+
+def _last_audio_edge(ce: np.ndarray, i: int, min_gap: int) -> int:
+    """The last audio-mode clock edge at or before `ce[i]`, where the Link went inactive:
+    back over the link-control edges before it (each more than `min_gap` after the one
+    before), at most START_PULSE_MAX_EDGES of them. After a long idle that is `ce[i]`
+    itself; after a short one the stop found is the Bus Reset's LC:10, and the LC_Ack and
+    LC:00 edges before it are link control too."""
+    k = i
+    while k > 0 and i - k < START_PULSE_MAX_EDGES and int(ce[k]) - int(ce[k - 1]) > min_gap:
+        k -= 1
+    return int(ce[k])
+
+
+def _shifted(r: LinkControlResult, base: int) -> LinkControlResult:
+    """`r`, decoded from a window starting at sample `base`, in capture samples."""
+    def at(v):
+        return None if v is None else int(v) + base
+    return replace(r, bus_reset_sample=at(r.bus_reset_sample),
+                   phy_select_sample=at(r.phy_select_sample),
+                   phystart_sample=at(r.phystart_sample),
+                   audio_start_sample=at(r.audio_start_sample),
+                   sections=[dict(sec, start=int(sec["start"]) + base,
+                                  end=int(sec["end"]) + base) for sec in r.sections])
+
+
 def decode_link_control(capture) -> LinkControlResult:
     """Recover the §5.1.2 Cold/Warm Start sequence from a :class:`Capture`.
 
@@ -204,12 +372,17 @@ def decode_link_control(capture) -> LinkControlResult:
     b = _decode_oriented(capture.data_edges, capture.initial_data,
                          capture.clock_edges, capture.initial_clock, rate)
     # Prefer the MORE DEFINITIVE sequence, not just the first orientation that matches.
-    # A Cold Start has a rich structure (long Bus Reset + PHY-number burst + PhyStart);
-    # a Warm Start is a lone [150,500) µs pulse that the WRONG line can match spuriously
-    # (e.g. an audio-data pulse) — which otherwise mis-reported a real Cold reset as a
-    # Warm-Start timing violation. Rank cold > warm > none; ties keep the clock line (a).
+    # A complete one (it reaches PhyStart and audio mode) outranks one that does not: the
+    # wrong line can show a long pulse with no PhyStart after it. Then a Cold Start (a rich
+    # structure: long Bus Reset + PHY-number burst + PhyStart) outranks a Warm Start, a
+    # lone [150,500) µs pulse that the WRONG line can match spuriously (e.g. an audio-data
+    # pulse). Ties keep the clock line (a).
     rank = {"cold": 2, "warm": 1, "none": 0}
-    if rank.get(b.sequence, 0) > rank.get(a.sequence, 0):
+
+    def strength(r: LinkControlResult):
+        return (r.audio_start_sample is not None, rank.get(r.sequence, 0))
+
+    if strength(b) > strength(a):
         b.lc_on_data_line = True                   # LC clock (DP) is the DATA line
         return b
     return a
@@ -238,12 +411,9 @@ def _decode_oriented(clock_edges, initial_clock, data_edges, initial_data,
 
     seq_idx = None
     seq_kind = None
-    # DP-high (rising) pulse durations, vectorised — a bring-up capture can hold
-    # hundreds of millions of audio-clock edges, so a Python scan over them was slow.
-    # A pulse >= WARM_VS_COLD_US is a definitive Cold Start Bus Reset: prefer the FIRST
-    # such pulse even when a shorter warm-range pulse precedes it. Otherwise a stray
-    # [150,500) µs pulse before the real >=1569 µs reset mis-reported a Cold reset as a
-    # Warm-Start timing violation. Only when NO cold-reset pulse exists anywhere is the
+    # DP-high (rising) pulse durations, vectorised. A pulse >= WARM_VS_COLD_US is a
+    # definitive Cold Start Bus Reset: prefer the FIRST such pulse even when a shorter
+    # warm-range pulse precedes it. Only when NO cold-reset pulse exists anywhere is the
     # first warm-range pulse a Warm Start; sub-ACK pulses are LC_Ack/Request (ignored).
     rise_us = gaps[first_rise_idx::2].astype(np.float64) / spp
     cold = np.flatnonzero(rise_us >= WARM_VS_COLD_US)

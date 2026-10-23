@@ -1,9 +1,8 @@
 """Timeline zoom, pan, seek and bookmark drag, driven by real Qt input events.
 
-The ribbon's wheel and mouse handlers had never run under a test (every test before this set
-the view directly), and a stack of Links made them load-bearing: zooming
-one Link's band has to show the same INSTANTS on every other band, whatever its offset.
-Events go through QApplication.sendEvent so the dispatch is the real one.
+In a stack of Links, zooming one Link's band has to show the same INSTANTS on every other
+band, whatever its offset. Events go through QApplication.sendEvent so the dispatch is the
+real one.
 """
 import os
 

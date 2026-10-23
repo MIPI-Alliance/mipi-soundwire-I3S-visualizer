@@ -1,12 +1,10 @@
 # `swi3score` â€” SWI3S decode core (pybind11)
 
 The verified C++ SWI3S PHY2 decode, **vendored in-repo** under `swi3score/core/`
-so this repository builds standalone. The sources originated in the Saleae plugin
-(`SwI3sAnalyzer`); only the SDK-coupled bits are replaced: `compat/LogicPublicTypes.h`
-is a tiny SDK-free type shim, and `ISampleSource` + `Decoder` replace
-`CBitstreamDecoder` + `WorkerThread` (same pipeline, fed from a `.sal`/CSV/in-memory
-source instead of `AnalyzerChannelData`). See `swi3score/core/README.md` for the
-vendored file list and how to keep it in sync with the plugin.
+so this repository builds standalone. `compat/LogicPublicTypes.h` is a small SDK-free
+type shim, and `ISampleSource` + `Decoder` run the pipeline from a `.sal`/CSV/in-memory
+source. See `swi3score/core/README.md` for the vendored file list and how to keep it in
+sync with the upstream analyzer plugin (`SwI3sAnalyzer`).
 
 ## Build
 
@@ -34,8 +32,8 @@ dec.audio()      # list[dict]: dp, channel, value, index, sample_size, samplesâ€
 dec.column_count, dec.row_rate_khz, dec.measured_ui_rate_hz
 ```
 
-`MemorySampleSource` is the first `ISampleSource`; the `.sal` and CSV readers
-(Milestone 1) implement the same interface so the decode core is unchanged.
+`MemorySampleSource` is one `ISampleSource`; the `.sal` and CSV readers implement the
+same interface, so the decode core does not depend on the input format.
 
 ## Test
 

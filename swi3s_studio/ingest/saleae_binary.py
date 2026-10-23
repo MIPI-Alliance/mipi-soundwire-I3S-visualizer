@@ -11,12 +11,11 @@ The writer round-trips the same format, so tests can synthesise capture files.
 The Logic 2 project ``.sal`` (a ZIP of ``meta.json`` + per-channel ``digital-N.bin``)
 is handled by ``saleae_sal``, which reuses :func:`parse_channel` for version-0
 digital blobs and :func:`parse_channel_v3` for Logic 2's **version-3 compressed
-internal** format (reverse-engineered below). Version 4 is the SAME format with the
-version field bumped -- see _V3_LIKE_VERSIONS for the evidence -- so it goes through
-the same reader. Other versions raise :class:`UnsupportedSaleaeVersion`.
+internal** format (layout below). Version 4 is the SAME format with the version
+field bumped (see _V3_LIKE_VERSIONS), so it goes through the same reader. Other
+versions raise :class:`UnsupportedSaleaeVersion`.
 
-Version-3 layout (little-endian), reverse-engineered from Logic 2 captures and
-**validated to the sample against a Logic CSV export** (see the maintainers' .sal format notes)::
+Version-3 layout (little-endian)::
 
     0   char[8]  "<SALEAE>"
     8   u32      version  (== 3, or 4: identical format, see _V3_LIKE_VERSIONS)
@@ -41,17 +40,18 @@ chain rather than assuming a fixed position.
 """
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 
 import numpy as np
 
+from .. import import_notes
 from .capture import Capture
 
-# The v3 delta codec is the hot loop on 100s-of-millions-of-edges .sal captures.
-# Prefer the native decoder (swi3score.decode_saleae_v3_deltas); fall back to the
-# vectorised-numpy _v3_decode_deltas_np when the native core is absent (it stays a
-# self-contained, bit-identical pure-Python+numpy reader). Both match decode_v3_deltas.
+# The v3 delta codec prefers the native decoder (swi3score.decode_saleae_v3_deltas)
+# and falls back to the vectorised-numpy _v3_decode_deltas_np when the native core is
+# absent. Both match decode_v3_deltas bit for bit.
 try:
     import swi3score as _score
     _native_v3 = getattr(_score, "decode_saleae_v3_deltas", None)
@@ -96,16 +96,11 @@ class DigitalChannelSamples:
 
 _V3_VERSION = 3
 _V4_VERSION = 4
-# Logic 2 bumped the digital blob's version from 3 to 4 with NO change to the format:
-# verified against a capture exported both ways, the 26-byte block header, the block chain
-# and the base-128 delta codec are all identical, and a v3 decode of a v4 blob reproduced the
-# v0 export's transition deltas EXACTLY on both channels (19,170,748 and 6,633,392
-# transitions, samples equal after the constant frame offset the metadata header carries at
-# byte 42). v4 also stamps per-block `level` correctly (306/306 blocks agreeing with the
-# decoded parity, 208 of them nonzero), so the windowed fast path in saleae_sal is sound on
-# it too. Only the version number moved, so the readers accept the SET rather than one value
-# -- and an unknown version still raises UnsupportedSaleaeVersion rather than being decoded
-# hopefully, because that is the difference between a clean refusal and a silently wrong bus.
+# Logic 2's version-4 digital blob is the version-3 format with only the version number
+# changed: the 26-byte block header, the block chain and the base-128 delta codec are
+# identical, and per-block `level` is stamped correctly, so the windowed fast path in
+# saleae_sal applies. The readers accept this SET; any other version raises
+# UnsupportedSaleaeVersion rather than being decoded.
 _V3_LIKE_VERSIONS = frozenset({_V3_VERSION, _V4_VERSION})
 _V3_TYPE_DIGITAL = 100
 # Public aliases for the v3 codec surface, so exporters (sal_export, saleae_sal)
@@ -122,13 +117,17 @@ V3_TYPE_DIGITAL = _V3_TYPE_DIGITAL
 # first/last transition; `level` is the line state at the block's start (so the
 # FIRST block's level is the channel's initial state); byte_count is the length of
 # the delta-codec run that follows. Blocks chain (A_start == previous B_end); a
-# block's decoded deltas sum to (B_end - A_start). The old fixed offsets
-# (_V3_BLOCKS_OFF etc.) were wrong for Logic 2 — the data is preceded by a
+# block's decoded deltas sum to (B_end - A_start). The data is preceded by a
 # variable-length metadata header, so the first block is located by scanning for a
 # self-consistent chain (see parse_channel_v3).
 _V3_BLOCK_HEADER = 26
 _V3_LEVEL_OFF = 16             # u16 line-level (initial state in the first block)
 _V3_BYTECOUNT_OFF = 18         # u64 byte_count offset within the block header
+# Bytes from the blob's start in which the first block header must begin. Every reader
+# of the chain (parse_channel_v3, _find_v3_chain_start, saleae_sal._v3_span_streaming)
+# tries candidate offsets only inside this prefix, so all of them accept the same blobs.
+# The Logic 2 metadata header before the chain is 51 bytes (build_logic2_channel_v3).
+V3_CHAIN_START_SCAN = 1 << 16
 
 
 def encode_v3_delta(delta: int) -> bytes:
@@ -185,15 +184,13 @@ def decode_v3_deltas(buf: bytes, off: int, nbytes: int):
 _v3_decode_deltas = decode_v3_deltas    # internal alias (pre-public name)
 
 # A v3 code is one MSB byte (>= 0x40), zero or more INTERIOR bytes (>= 0x80), then a terminal
-# byte (< 0x80) — so its digit count is (interiors + 2). 128**9 is exactly 2**63, which means
-# 10 base-128 digits overflow the int64 arithmetic BOTH fast paths use, and 11 wrap right
-# around: a crafted 11-digit code decodes to 1, which then satisfies the block chain's own
-# `sum == B_end - A_start` check against a crafted B_end of 1 and hands back a SILENTLY EMPTY
-# channel. A 10-digit code wraps NEGATIVE, which no unsigned B_end can match, so the chain
-# check alone already refused that one — but the streaming decoder in saleae_sal calls the
-# block decoder WITHOUT a chain check, and there a negative delta would flow through
-# cumsum into the uint64 sample cast as garbage. So the limit here is the arithmetic's, not
-# the chain's: nine digits (seven interiors) is the most int64 can hold.
+# byte (< 0x80), so its digit count is (interiors + 2). 128**9 is exactly 2**63: 10 base-128
+# digits overflow the int64 arithmetic both fast paths use, and 11 wrap right around, so a
+# crafted 11-digit code decodes to 1 and satisfies the chain's `sum == B_end - A_start`
+# check against a crafted B_end of 1. Every v3 decode path (parse_channel_v3,
+# parse_channel_v3_window and the zip-streaming decoder in saleae_sal) refuses a block
+# holding a longer code before decoding it. Nine digits (seven interiors) is the most int64
+# can hold.
 _V3_MAX_INTERIOR_RUN = 7
 
 
@@ -213,9 +210,7 @@ def _v3_has_overlong_code(bb: np.ndarray) -> bool:
     if not high.any():
         return False
     # AND the mask with itself shifted 1..run-1 places: what survives starts a run that long.
-    # Two bytes per payload byte. It was a running "distance since the last low byte" in
-    # int64, three of them, 24 bytes per payload byte — three times the decoded output on a
-    # multi-byte-delta block, and the peak of a whole-channel decode.
+    # Two bytes per payload byte.
     n = bb.size - run + 1
     hit = high[:n].copy()
     for k in range(1, run):
@@ -276,8 +271,7 @@ def _v3_decode_deltas_np(buf, off: int, nbytes: int, _chunk: int = 1 << 23) -> n
     """Vectorised, memory-bounded equivalent of :func:`decode_v3_deltas` returning an
     int64 array. Streams the body in code-aligned chunks (each begins at a code
     boundary, carrying any partial trailing code forward) so peak memory stays a few
-    ×`_chunk`, not the whole 100s-of-millions-of-edges body. Bit-identical to the
-    scalar decoder (verified by round-trip)."""
+    ×`_chunk`, not the whole body. Bit-identical to the scalar decoder."""
     if nbytes == 0:
         return np.zeros(0, dtype=np.int64)
     mv = memoryview(buf)[off:off + nbytes]
@@ -351,7 +345,8 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
     transition samples = cumsum(deltas)[:-1].
 
     The variable-length metadata means the first block isn't at a fixed offset, so
-    it's found by scanning for the self-consistent chain that tiles the blob exactly.
+    it's found by scanning the first `V3_CHAIN_START_SCAN` bytes for the start of a
+    self-consistent chain that tiles the blob exactly.
     Raises UnsupportedSaleaeVersion for non-v3 blobs and MalformedSaleaeV3 when no
     such chain is found."""
     if len(data) < 16 or data[:8] != _MAGIC:
@@ -392,11 +387,7 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
         channel's initial state in its `level` field.
 
         Each run is decoded to check it and then DROPPED, so validating costs one block,
-        and the fill below decodes it again straight into the output. Keeping the runs
-        instead held every delta (8 bytes per transition), then a concatenated copy, then
-        the cumsum: three full-size arrays live at once. On a 264M-transition channel that
-        was 6.3 GB for 2.1 GB of result, and it is what put a 54 MB capture past the
-        memory guard on a 64 GB machine. The second decode costs well under a second."""
+        and the fill below decodes it again straight into the output."""
         blocks = []
         o = o0
         prev_b = None
@@ -432,11 +423,11 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
             o = body + cnt
         return (initial, blocks) if o == n else None
 
-    # The variable-length metadata header has no documented bound, so scan the whole
-    # pre-block region for the first self-consistent chain start. walk() is only
-    # invoked where the u64 at o0 is 0 (a candidate first block, A_start == 0) and
-    # bails on the first block that doesn't fit/sum, so a spurious zero-qword is cheap.
-    for o0 in range(16, n - _V3_BLOCK_HEADER + 1):
+    # The first self-consistent chain start inside the first V3_CHAIN_START_SCAN bytes.
+    # walk() is only invoked where the u64 at o0 is 0 (a candidate first block,
+    # A_start == 0) and bails on the first block that doesn't fit/sum, so a spurious
+    # zero-qword is cheap.
+    for o0 in range(16, min(n, V3_CHAIN_START_SCAN) - _V3_BLOCK_HEADER + 1):
         if struct.unpack_from("<Q", data, o0)[0] != 0:   # first block A_start == 0
             continue
         r = walk(o0)
@@ -481,7 +472,8 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
     """``(byte offset of the first transition block, chain end sample)`` for a v3 blob.
 
     The metadata header is variable-length, so the chain is located by the same
-    self-consistency scan :func:`parse_channel_v3` uses — but this only VALIDATES
+    self-consistency scan :func:`parse_channel_v3` uses, over the same candidate
+    offsets (inside the first `V3_CHAIN_START_SCAN` bytes) — but this only VALIDATES
     the chain by walking block headers (checking they tile the blob exactly and
     chain A_start == prev B_end); it never decodes a delta run. That makes it
     cheap enough to call before deciding what to decode.
@@ -490,7 +482,7 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
     delta that the whole-blob reader drops (the gap to capture end), which a
     windowed read must drop too."""
     n = len(data)
-    for o0 in range(16, n - _V3_BLOCK_HEADER + 1):
+    for o0 in range(16, min(n, V3_CHAIN_START_SCAN) - _V3_BLOCK_HEADER + 1):
         if struct.unpack_from("<Q", data, o0)[0] != 0:      # first block A_start == 0
             continue
         o, prev_b, ok = o0, None, True
@@ -514,20 +506,21 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
 
 def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
                             label: str = "") -> DigitalChannelSamples:
-    """Decode only the transitions in ``[start_sample, end_sample)`` of a v3 blob.
+    """Decode only the transitions strictly inside ``(start_sample, end_sample)`` of a
+    v3 blob. An edge AT `start_sample` is folded into `initial_state`, as in
+    :meth:`Capture.subcapture`.
 
-    The whole-blob :func:`parse_channel_v3` cumsums every delta in the file — on a
-    1.5 bn-edge channel that is a 12 GB uint64 array, which is what exhausts RAM on
-    a long capture. Each v3 block header carries absolute ``A_start``/``B_end``
-    sample bounds, so a block that does not overlap the window can be SKIPPED by
-    byte arithmetic without decoding its delta run at all. Only overlapping blocks
-    are decoded, so cost scales with the window, not the capture.
+    Each v3 block header carries absolute ``A_start``/``B_end`` sample bounds, so the
+    walk stops at the first block that starts at or past the window's end, and a block
+    that ends at or before the window's start contributes only its delta count.
 
     Transition samples are returned on the ORIGINAL capture timeline (not rebased);
-    ``initial_state`` is the line level at ``start_sample``, derived from the parity
-    of the transitions preceding it — for a skipped block that is just the parity of
-    its delta COUNT, which the codec gives us without cumsum (one varint terminator
-    per delta), so the level stays exact across skipped regions.
+    ``initial_state`` is the line level at ``start_sample``, from the parity of the
+    transitions at or before it. A block before the window is fully decoded to count
+    its deltas (counting bytes below 0x80 over-counts, see the loop). Every decoded
+    block is checked as :func:`parse_channel_v3` checks it: no delta code too long for
+    int64, and deltas summing to ``B_end - A_start``; a block that fails raises
+    :class:`MalformedSaleaeV3`.
     """
     if len(data) < 16 or data[:8] != _MAGIC:
         raise ValueError(f"{label or 'data'}: not a Saleae binary capture (bad identifier)")
@@ -547,9 +540,23 @@ def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
     # whole-blob reader drops it (cumsum(...)[:-1]) and a window must agree, or a
     # window covering the capture end grows a phantom edge at chain_end.
     limit = min(int(s1), chain_end)
-    buf8 = np.frombuffer(data, np.uint8) if _native_v3 is not None else None
-    parity = 0                       # transitions strictly before the window, mod 2
+    buf8 = np.frombuffer(data, np.uint8)
+    parity = 0                       # transitions at or before the window start, mod 2
     kept: list = []
+
+    def _checked_run(a: int, b: int, body: int, cnt: int) -> np.ndarray:
+        """One block's int64 deltas, refused unless they decode within int64 and sum
+        to the block header's span."""
+        if _v3_has_overlong_code(buf8[body:body + cnt]):
+            raise MalformedSaleaeV3(label, f"block at byte {body - _V3_BLOCK_HEADER} holds "
+                                           "a delta code too long for int64")
+        run = (_native_v3(buf8, body, cnt) if _native_v3 is not None
+               else _v3_decode_deltas_np(data, body, cnt))
+        if int(run.sum()) != b - a:
+            raise MalformedSaleaeV3(label, f"block at byte {body - _V3_BLOCK_HEADER} "
+                                           f"decodes to {int(run.sum())} samples, its "
+                                           f"header says {b - a}")
+        return run
 
     while o + _V3_BLOCK_HEADER <= n:
         a, b = struct.unpack_from("<QQ", data, o)
@@ -564,14 +571,12 @@ def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
             # Do NOT count bytes < 0x80 as terminators. A multi-byte code whose MSB
             # digit is itself < 0x40 encodes as [digit+0x40, ..., terminal] — e.g.
             # encode_v3_delta(65) == b"\x40\x40" — so BOTH bytes are < 0x80 and the
-            # naive count over-reports. When the over-count is odd the parity flips and
-            # the window opens with the line level INVERTED: samples correct, polarity
-            # wrong, no error raised. Decode the run properly instead; it is the same
+            # naive count over-reports; an odd over-count inverts the window's opening
+            # level. Decode the run properly instead; it is the same
             # vectorised path the overlap branch uses, and a skipped block's deltas are
             # discarded immediately rather than cumsummed.
             if cnt:
-                run = (_native_v3(buf8, body, cnt) if _native_v3 is not None
-                       else _v3_decode_deltas_np(data, body, cnt))
+                run = _checked_run(a, b, body, cnt)
                 ntr = int(run.size)
                 if b >= chain_end:
                     ntr -= 1        # last block's final delta is the phantom end gap
@@ -580,8 +585,7 @@ def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
             break                                            # past the window: done
         else:
             # Overlaps: decode this block and keep the in-window transitions.
-            run = (_native_v3(buf8, body, cnt) if _native_v3 is not None
-                   else _v3_decode_deltas_np(data, body, cnt))
+            run = _checked_run(a, b, body, cnt)
             abs_s = np.cumsum(run, dtype=np.int64) + int(a)
             if b >= chain_end and abs_s.size:
                 abs_s = abs_s[:-1]                           # drop the phantom end gap
@@ -629,11 +633,10 @@ def build_channel_v3(initial_state: bool, transition_samples: np.ndarray,
     return bytes(out)
 
 
-# Transitions per Logic-2 version-3 block. Real Logic captures chunk the transition
-# stream into many blocks (a busy channel had 818 / 412 blocks, never one giant
-# block) — the boundaries are time-based (per capture-buffer flush), so the per-block
-# count varies. We chunk at a fixed count instead; the only invariant Logic needs is
-# that the preamble's block-count field matches the number of blocks written.
+# Transitions per Logic-2 version-3 block. Logic itself chunks the transition stream
+# by time (per capture-buffer flush); this writer chunks at a fixed count. The only
+# invariant Logic needs is that the preamble's block-count field matches the number of
+# blocks written.
 V3_LOGIC_BLOCK_DELTAS = 4096
 
 
@@ -704,9 +707,11 @@ def parse_channel(data: bytes, label: str = "") -> DigitalChannel:
         raise UnsupportedSaleaeVersion(version, label)
     if ctype != _TYPE_DIGITAL:
         raise ValueError(f"{label or 'data'}: not a digital channel (type={ctype})")
+    held = (len(data) - _HEADER.size) // 8
+    if n > held:
+        raise ValueError(f"{label or 'data'}: truncated (the header counts {n:,} "
+                         f"transitions, the file holds {held:,})")
     times = np.frombuffer(data, dtype="<f8", count=n, offset=_HEADER.size)
-    if times.size != n:
-        raise ValueError(f"{label or 'data'}: truncated (expected {n} transitions)")
     return DigitalChannel(bool(initial), np.ascontiguousarray(times), begin, end)
 
 
@@ -719,16 +724,21 @@ def transition_count(path: str) -> int:
     """Read just the version-0 <SALEAE> header and return its transition count
     (cheap: no need to load the whole edge array). Used to tell the forwarded
     clock (toggles every UI -> most transitions) from the data line. Returns -1
-    if the file isn't a readable version-0 digital blob."""
+    if the file isn't a readable version-0 digital blob.
+
+    The count is capped at the f64 times the file's size can hold, so a truncated
+    file or a damaged count field is counted, and priced, by what is there;
+    :func:`parse_channel` then refuses it as truncated."""
     try:
         with open(path, "rb") as f:
             head = f.read(_HEADER.size)
+            size = os.fstat(f.fileno()).st_size
         if len(head) < _HEADER.size or head[:8] != _MAGIC:
             return -1
         _, version, ctype, _, _, _, n = _HEADER.unpack(head)
         if version != 0 or ctype != _TYPE_DIGITAL:
             return -1
-        return int(n)
+        return min(int(n), (size - _HEADER.size) // 8)
     except OSError:
         return -1
 
@@ -743,15 +753,16 @@ def _read_times_sample(path: str, count: int) -> np.ndarray:
         if version != 0 or ctype != _TYPE_DIGITAL:
             return np.zeros(0)
         k = min(int(count), int(n))
-        return np.frombuffer(f.read(k * 8), dtype="<f8")
+        raw = f.read(k * 8)
+        return np.frombuffer(raw, dtype="<f8", count=len(raw) // 8)
 
 
-def infer_sample_rate(paths, sample: int = 2_000_000) -> int:
+def infer_sample_rate(paths, sample: int = 1 << 18) -> int:
     """Infer the capture sample rate from version-0 binaries, which store
-    transition times in seconds but no rate. Timestamps are integer multiples of
-    one sample period, so the finest spacing between transitions (across the given
-    channels) is ~one period: rate ~= 1 / min_delta. Snapped to the nearest kHz
-    (digital capture rates are kHz-aligned). Returns 0 if it can't be inferred."""
+    transition times in seconds but no rate. Every time is a whole number of sample
+    periods, so the rate is the grid the first `sample` times of each channel sit on
+    (`timebase.rate_from_times`). Returns 0 if it can't be inferred."""
+    from .timebase import rate_from_times
     merged = []
     for p in paths:
         t = _read_times_sample(p, sample)
@@ -759,15 +770,7 @@ def infer_sample_rate(paths, sample: int = 2_000_000) -> int:
             merged.append(t)
     if not merged:
         return 0
-    allt = np.unique(np.concatenate(merged))
-    if allt.size < 2:
-        return 0
-    d = np.diff(allt)
-    d = d[d > 0]
-    if d.size == 0:
-        return 0
-    rate = 1.0 / float(d.min())
-    return int(round(rate / 1000.0)) * 1000        # snap to nearest kHz
+    return rate_from_times(np.concatenate(merged))
 
 
 def write_channel(path: str, initial_state: bool, times_s: np.ndarray,
@@ -792,11 +795,10 @@ def _times_to_samples(times_s: np.ndarray, sample_rate_hz: int,
     from `origin_s`. Logic captures start at a negative (pre-trigger) time, so the
     origin must be subtracted or the cast to uint64 wraps negatives to garbage.
 
-    Converts a block at a time: the naive whole-array
-    ``np.rint((times - origin) * rate).astype(uint64)`` allocates three full float64
-    temporaries (~24 bytes/edge), a multi-GB OOM on a 100M+-edge .bin — the same
-    chunked scheme as saleae_sal._times_to_edges. Bit-identical (per-element arithmetic
-    unchanged; origin_s is <= every time, so no value is negative before the cast)."""
+    Converts `_TIMES_CHUNK` edges at a time so the float64 temporaries stay bounded
+    (the same chunked scheme as saleae_sal._times_to_edges). Per-element arithmetic
+    matches ``np.rint((times - origin) * rate).astype(uint64)``; origin_s is <= every
+    time, so no value is negative before the cast."""
     out = np.empty(times_s.size, dtype=np.uint64)
     for i in range(0, times_s.size, _TIMES_CHUNK):
         b = times_s[i:i + _TIMES_CHUNK].astype(np.float64)   # writable copy of this chunk
@@ -807,22 +809,162 @@ def _times_to_samples(times_s: np.ndarray, sample_rate_hz: int,
     return out
 
 
-def load_capture(clock_path: str, data_path: str, sample_rate_hz: int) -> Capture:
-    """Read a clock + data channel pair into a :class:`Capture`."""
+# Peak bytes per transition of `load_capture`: the file's f64 times, read whole and kept
+# until the pair is built (8), and the uint64 edge array built from them (8).
+_PAIR_BYTES_PER_EDGE = 16
+# Bytes per transition of one `_TIMES_CHUNK` step of `_times_to_samples`: the float64
+# copy of the chunk and its uint64 cast. Measured with tracemalloc within these figures:
+# 16.0 per edge plus 16 MB on a 3M + 1M transition pair, 26 per edge on 300k + 100k.
+_CHUNK_BYTES_PER_EDGE = 16
+# The two headers, the Capture, the small per-call arrays and the interpreter's own
+# allocations during a load, which differ by platform (about 130 KB on Windows).
+_PAIR_FIXED_BYTES = 1 << 20
+
+
+def predict_peak_bytes(clock_path: str, data_path: str) -> int:
+    """Predicted peak of :func:`load_capture` on the pair, from the two headers alone.
+    Each count is :func:`transition_count`'s, capped at what the file holds. `read_channel`
+    reads a file whole, so the bytes past what its count accounts for (a low or zero count)
+    are charged too, and a file whose header is not a version-0 digital one is charged its
+    size, which `read_channel` reads before refusing it."""
+    counts = []
+    cost = _PAIR_FIXED_BYTES
+    for p in (clock_path, data_path):
+        n = transition_count(p)
+        size = os.path.getsize(p)
+        if n < 0:
+            cost += size
+            n = 0
+        else:
+            cost += max(0, size - _HEADER.size - 8 * n)
+        counts.append(n)
+    return (cost + sum(counts) * _PAIR_BYTES_PER_EDGE
+            + min(max(counts), _TIMES_CHUNK) * _CHUNK_BYTES_PER_EDGE)
+
+
+class BinTooLargeError(MemoryError):
+    """Opening this .bin pair is predicted to exhaust memory.
+
+    Raised BEFORE either file is read, like the .sal guard. A .bin pair is read
+    whole, so the remedies are a shorter export or more RAM."""
+
+    def __init__(self, paths, predicted: int, budget: int):
+        self.paths = tuple(paths)
+        self.predicted = int(predicted)
+        self.budget = int(budget)
+        MemoryError.__init__(
+            self,
+            f"{' + '.join(self.paths)}: the pair would need roughly "
+            f"{predicted / 1e9:.1f} GB, but only {budget / 1e9:.1f} GB is budgeted. "
+            f"Export a shorter capture, free memory, or pass max_bytes=0 to override.")
+
+
+# Transition times checked against the sample grid (`_grid_notes`).
+_GRID_CHECK = 1 << 16
+# Farthest a transition time may sit from the sample grid, in samples, before the
+# rounding is reported.
+_GRID_OFF_SAMPLES = 0.25
+
+
+def _descending_steps(times: np.ndarray) -> int:
+    """Places where `times` steps back, checked `_TIMES_CHUNK` steps at a time."""
+    n = 0
+    for i in range(0, max(0, times.size - 1), _TIMES_CHUNK):
+        j = min(i + _TIMES_CHUNK, times.size - 1)
+        n += int(np.count_nonzero(times[i + 1:j + 1] < times[i:j]))
+    return n
+
+
+def _repeats(edges: np.ndarray) -> int:
+    """Edges on the same sample as the edge before, `_TIMES_CHUNK` at a time."""
+    n = 0
+    for i in range(0, max(0, edges.size - 1), _TIMES_CHUNK):
+        j = min(i + _TIMES_CHUNK, edges.size - 1)
+        n += int(np.count_nonzero(edges[i + 1:j + 1] == edges[i:j]))
+    return n
+
+
+def _pair_notes(clock_path: str, data_path: str, clk: DigitalChannel, dat: DigitalChannel,
+                rate: int, origin: float) -> list:
+    """The import warnings of one `load_capture` that need the times: [(source, message)],
+    the source a file's base name or the pair's. A channel whose times step back is
+    sorted in place of its `times_s`."""
+    out = []
+    for path, ch in ((clock_path, clk), (data_path, dat)):
+        src = import_notes.source_name(path)
+        extra = os.path.getsize(path) - _HEADER.size - 8 * ch.times_s.size
+        if extra > 0:
+            out.append((src, f"{extra:,} byte{'s' if extra != 1 else ''} past the "
+                             f"{ch.times_s.size:,} transitions the header counts "
+                             f"{'are' if extra != 1 else 'is'} ignored"))
+        back = _descending_steps(ch.times_s)
+        if back:
+            ch.times_s = np.sort(ch.times_s, kind="stable")
+            out.append((src, f"the transition times step back at {back:,} "
+                             f"place{'s' if back != 1 else ''}; they are sorted into "
+                             f"time order"))
+        head = ch.times_s[:_GRID_CHECK]
+        if head.size and rate > 0:
+            pos = (head.astype(np.float64) - origin) * rate
+            off = float(np.max(np.abs(pos - np.rint(pos))))
+            if off > _GRID_OFF_SAMPLES:
+                out.append((src, f"the transition times do not sit on the {rate:,} Hz "
+                                 f"sample grid (up to {off:.2f} of a sample off in the "
+                                 f"first {head.size:,}); each is rounded to the nearest "
+                                 f"sample"))
+    period = 1.0 / rate if rate > 0 else 0.0
+    if abs(clk.begin_time - dat.begin_time) > period:
+        out.append((f"{import_notes.source_name(clock_path)} + "
+                    f"{import_notes.source_name(data_path)}",
+                    f"the two files start at different times ({clk.begin_time:.9g} s and "
+                    f"{dat.begin_time:.9g} s); both are read on one timeline from the "
+                    f"earlier start"))
+    return out
+
+
+def load_capture(clock_path: str, data_path: str, sample_rate_hz: int,
+                 max_bytes: int | None = None) -> Capture:
+    """Read a clock + data channel pair into a :class:`Capture`.
+
+    `max_bytes` follows the .sal convention: None uses the shared `memory_budget()`, a
+    positive value overrides it, and 0 opts out. Before either file is read,
+    :func:`predict_peak_bytes` is compared with that budget and
+    :class:`BinTooLargeError` is raised when it is over.
+
+    Import warnings (import_notes) report bytes past the transitions a header counts,
+    times out of order (sorted), times off the sample grid, transitions that land on
+    one sample, and two files that start at different times."""
+    if max_bytes != 0:
+        from .saleae_sal import memory_budget  # ONE definition of the budget
+        predicted = predict_peak_bytes(clock_path, data_path)
+        budget = memory_budget(max_bytes)
+        if predicted > budget:
+            raise BinTooLargeError((clock_path, data_path), predicted, budget)
     clk = read_channel(clock_path)
     dat = read_channel(data_path)
     # Both channels share one timeline; pick the earliest point (capture start,
     # which Logic records as a negative pre-trigger time) as sample 0.
     origin = min(clk.begin_time, dat.begin_time,
-                 float(clk.times_s[0]) if clk.times_s.size else 0.0,
-                 float(dat.times_s[0]) if dat.times_s.size else 0.0)
-    return Capture(
+                 float(np.min(clk.times_s)) if clk.times_s.size else 0.0,
+                 float(np.min(dat.times_s)) if dat.times_s.size else 0.0)
+    notes = _pair_notes(clock_path, data_path, clk, dat, int(sample_rate_hz), origin)
+    cap = Capture(
         clock_edges=_times_to_samples(clk.times_s, sample_rate_hz, origin),
         data_edges=_times_to_samples(dat.times_s, sample_rate_hz, origin),
         initial_clock=clk.initial_state,
         initial_data=dat.initial_state,
         sample_rate_hz=sample_rate_hz,
     )
+    for path, edges in ((clock_path, cap.clock_edges), (data_path, cap.data_edges)):
+        same = _repeats(edges)
+        if same:
+            notes.append((import_notes.source_name(path),
+                          f"{same:,} transition{'s' if same != 1 else ''} land on the "
+                          f"same sample as the one before at {int(sample_rate_hz):,} "
+                          f"Hz (the rate is coarser than the transitions)"))
+    for source, message in notes:
+        import_notes.warn(source, message)
+    return cap
 
 
 def write_capture(capture: Capture, clock_path: str, data_path: str) -> None:

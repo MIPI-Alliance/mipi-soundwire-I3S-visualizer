@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Every Python suite in its own process, with a per-suite summary: a thin wrapper over the
-# gate's per-suite check, so there is ONE implementation (tools/gate.py) on every platform.
+# per-suite check in tools/gate.py.
 #
 #   ./run_all.sh                 # every suite, one process each (excludes perf, like CI)
 #   ./run_all.sh --build         # rebuild the swi3score core (and assert its ABI) first
@@ -8,9 +8,9 @@
 #   ./run_all.sh --native        # also run the native C++ suite (sibling checkout)
 #   ./run_all.sh --verbose       # list every suite with its test count
 #
-# This used to hold its own loop, which the gate then re-implemented in Python so the step
-# could run on Windows; two copies of one check is how the gate and the runner drift. Keep
-# this a wrapper; put logic in tools/gate.py (`python3 tools/gate.py --only ...`).
+# The options map onto
+#   python3 tools/gate.py --only [native,]per-suite|perf[,native-cpp] [--verbose]
+# Keep this a wrapper; put logic in tools/gate.py.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 checks=per-suite pre="" post="" verbose=""

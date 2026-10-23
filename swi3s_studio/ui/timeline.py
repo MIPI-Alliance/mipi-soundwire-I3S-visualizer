@@ -27,7 +27,7 @@ def _diamond(cx: float, cy: float, r: float) -> QPolygonF:
 
 _MARGIN = 8
 _AXIS_H = 18                 # bottom strip reserved for the time ruler
-_H = 92                      # taller so the config-band labels + a time axis both fit
+_H = 92                      # fits the config-band labels and a time axis
 _H_MIN = 64                  # smallest band in a resizable stack of Links (ticks still read)
 _CFG_BAND_H = 18             # top strip for the config-region bands (holds the "Ncol" label),
                              # kept ABOVE the command ticks so the ticks read clearly
@@ -85,8 +85,8 @@ _MARK_LEGEND_SPEC = [
     ("Ping",              "SEM_PING",     "Ping phase (short gray tick)"),
     ("Read",              "SEM_READ",     "Read phase (short violet tick)"),
     ("Write / other",     "SEM_OTHER",    "Write or other command phase (short green tick)"),
-    ("Cursor",            "CURSOR",       "Time cursor — shared across every pane (white line)"),
-    ("Bookmark",          "SEM_BOOKMARK", "Bookmarked sample (magenta diamond at the baseline)"),
+    ("Playhead",          "CURSOR",       "Playhead — shared across every pane (line with a square at the top)"),
+    ("Cursor",            "SEM_BOOKMARK", "Cursor (magenta diamond at the baseline)"),
     ("Link bring-up",     "SEM_BRINGUP",  "§5.1.2 Bus Reset → PHY-select before audio mode "
                                           "(cyan band + flag; the PHY-select edge is the tick)"),
     ("Forced geometry",   "SEM_ERROR",    "Config region whose column count you pinned — its "
@@ -110,9 +110,8 @@ def _kind_label(cmd: dict) -> str:
     if cmd.get("is_commit"):
         return "Commit + SSP" if cmd.get("commit_confirmed") else "Commit"
     # An SSPA carries a Stream Sync Point without committing anything — it re-asserts
-    # data-port synchronization. Label it as an SSP rather than lumping it in with
-    # "Other command": it re-anchors every port's transport phase, which is exactly the
-    # kind of event you want to find on the timeline.
+    # data-port synchronization. Label it as an SSP, not "Other command": it re-anchors
+    # every port's transport phase.
     if cmd.get("has_sync_point"):
         return "SSP Announce"
     name = cmd.get("command", "") or ""
@@ -173,7 +172,9 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._starts: List[int] = []         # sorted command start samples (arrow nav)
         self._nav_starts = None              # filtered subset for arrow nav (None = all)
         self._draw_set = None                # visible raw start_samples for the paint filter
-        self._decim_key = None               # cache key: (lo, hi, width, draw_order id, filter id)
+        self._tick_gen = 0                   # bumped by set_events and set_draw_filter
+        self._commit_gen = 0                 # bumped by set_commit_points
+        self._decim_key = None               # cache key: (lo, hi, width, _tick_gen)
         self._decim_ticks: List[tuple] = []  # cached [(x, cmd), …] — one per occupied pixel column
         self._commit_decim_key = None        # cache key for the decimated commit-point x's
         self._commit_decim: List[int] = []   # cached in-view commit-point pixel columns
@@ -184,7 +185,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._tick_start_i = np.empty(0, dtype=np.int64)
         self._tick_start_f = np.empty(0, dtype=np.float64)
         self._tick_pos = np.empty(0, dtype=np.int64)
-        self._tick_filter_key: Optional[int] = None
+        self._tick_filter_key: Optional[int] = None    # the _tick_gen the mask is for
         self._tick_filter_mask: Optional[np.ndarray] = None
         self._total = 1
         self._cursor = 0
@@ -193,7 +194,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._segments: List[dict] = []      # bus-config segments (start_sample, column_count, …)
         self._seg_band: dict = {}            # column_count -> band QColor
         self._bringup: dict = {}             # §5.1.2 link bring-up region (or empty)
-        self._link_sections: List[dict] = [] # named LC sub-phases within the bring-up
+        self._link_sections: List[dict] = [] # named LC sub-phases within the bring-ups
+        self._later_bringups: List[dict] = [] # later bring-ups (after the Link went inactive)
         self._rate = 0.0                 # sample rate, for the hover tooltip's time
         self._row_label = None           # fn(sample) -> 0-based display row, for the hover
         self._view_lo = 0.0              # visible sample window (zoom/pan); full = [0,_total]
@@ -211,8 +213,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._seek_timer.timeout.connect(self._emit_pending_seek)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)          # accept arrow keys
-        # No widget tooltip: the "Click to seek…" help popped up over the ribbon and hid
-        # the marks/cursor. The interactions are listed in Help ▸ Keyboard Shortcuts.
+        # No widget tooltip: it would cover the marks and cursor. The interactions are
+        # listed in Help ▸ Keyboard Shortcuts.
 
     def set_sample_rate(self, rate_hz: float) -> None:
         self._rate = float(rate_hz or 0.0)
@@ -263,7 +265,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._commands = commands
         # Pre-sort once at load, not per paint/hover: by start sample (arrow-nav +
         # nearest-tick bisect) and by paint rank (so paintEvent never re-sorts the
-        # whole list — it was O(N log N) every frame, on the GUI thread).
+        # whole list).
         self._by_start = sorted(commands, key=lambda c: int(c.get("start_sample", 0)))
         self._starts = [int(c.get("start_sample", 0)) for c in self._by_start]
         self._draw_order = sorted(commands, key=tick_rank)
@@ -277,37 +279,55 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._tick_start_i = starts[order]
         self._tick_start_f = self._tick_start_i.astype(np.float64)
         self._tick_pos = pos[order]
-        self._tick_filter_key = None             # (id(_draw_set)) the mask below is for
+        self._tick_gen += 1
+        self._tick_filter_key = None             # (_tick_gen) the mask below is for
         self._tick_filter_mask = None
         self._total = max(1, int(total_samples))
         self._reset_view()                       # new capture → show the whole thing
 
-    def set_bringup(self, result) -> None:
-        """Mark the §5.1.2 link bring-up region (Bus Reset → PHY-select → audio).
-        `result` is a LinkControlResult; cleared when there's no bring-up so the
-        ribbon shows nothing extra for mid-stream/plain captures."""
-        if result is None or getattr(result, "sequence", "none") == "none":
-            self._bringup = {}
-            self._link_sections = []
-        else:
-            self._bringup = {
-                "start": int(result.bus_reset_sample or 0),
-                "phy_select": (int(result.phy_select_sample)
-                               if result.phy_select_sample is not None else None),
-                "phystart": (int(result.phystart_sample)
-                             if result.phystart_sample is not None else None),
-                "audio_start": int(result.audio_start_sample or 0),
-                "label": result.label(),
-                # For the safe-lock band label: the selected PHY + its Safe-Lock column
-                # count, so the initial audio segment reads e.g. "Cold Start PHY2".
-                "sequence": getattr(result, "sequence", "none"),
-                "phy_name": getattr(result, "phy_name", None),
-                "safe_lock_columns": getattr(result, "safe_lock_columns", None),
-            }
-            # Named LC sub-phases (Idle / Bus Reset / Cold|Warm Start / PhyStart /
-            # LC_Request) — drawn as distinct colour bands within the bring-up region.
-            self._link_sections = list(getattr(result, "sections", []) or [])
+    def set_bringups(self, results) -> None:
+        """Mark every link bring-up (Session.link_controls): the first — absent ('none')
+        when the capture starts in audio mode — and each later one after the Link went
+        inactive, whose Idle section is the stretch the clock stopped for. The config bands
+        stop where a later one begins, and the region a later one opens (Cold or Warm) is
+        labelled by its PHY, as the first's is."""
+        results = [r for r in (results or []) if r is not None]
+        first = results[0] if results else None
+        present = [r for r in results if getattr(r, "sequence", "none") != "none"]
+        self._bringup = ({} if first is None or getattr(first, "sequence", "none") == "none"
+                         else self._bringup_marks(first))
+        self._later_bringups = [self._bringup_marks(r) for r in present if r is not first]
+        # Named LC sub-phases (Idle / Bus Reset / Cold|Warm Start / PhyStart / LC_Request)
+        # — drawn as distinct colour bands within each bring-up region.
+        self._link_sections = [sec for r in present for sec in (getattr(r, "sections", []) or [])]
         self.update()
+
+    @staticmethod
+    def _bringup_marks(result) -> dict:
+        sections = list(getattr(result, "sections", []) or [])
+        return {
+            "start": int(result.bus_reset_sample or 0),
+            # Where the bring-up's strip begins: its first section (a later one's Idle).
+            "span_start": int(sections[0]["start"]) if sections else int(
+                result.bus_reset_sample or result.phy_select_sample or 0),
+            "phy_select": (int(result.phy_select_sample)
+                           if result.phy_select_sample is not None else None),
+            "phystart": (int(result.phystart_sample)
+                         if result.phystart_sample is not None else None),
+            "audio_start": int(result.audio_start_sample or 0),
+            "label": result.label(),
+            # For the safe-lock band label: the selected PHY + its Safe-Lock column
+            # count, so the region it opens reads e.g. "PHY2 Safe-Lock-2".
+            "sequence": getattr(result, "sequence", "none"),
+            "phy_name": getattr(result, "phy_name", None),
+            "safe_lock_columns": getattr(result, "safe_lock_columns", None),
+        }
+
+    def _in_bringup(self, sample: int) -> bool:
+        """Whether `sample` is in a bring-up's strip rather than an audio region."""
+        if self._bringup and sample < int(self._bringup.get("audio_start", 0)):
+            return True
+        return any(b["span_start"] <= sample < b["audio_start"] for b in self._later_bringups)
 
     def set_cursor(self, sample: int) -> None:
         self._cursor = int(sample)
@@ -325,7 +345,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self.update()
 
     def set_flexible_height(self, on: bool) -> None:
-        """Fixed at _H for one Link (as always); in a stack of Links the ribbon takes the
+        """Fixed at _H for one Link; in a stack of Links the ribbon takes the
         height its row is given, so the Timeline dock can be resized vertically."""
         self._flexible = bool(on)
         self.setMinimumHeight(_H_MIN if on else _H)
@@ -436,6 +456,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         the raw start_sample the ticks are drawn at (so a commit tick would vanish)."""
         self._draw_set = ({int(s) for s in start_samples}
                           if start_samples is not None else None)
+        self._tick_gen += 1
         self.update()
 
     def set_commit_starts(self, starts) -> None:
@@ -449,6 +470,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         line; distinct from the commit COMMAND tick at its own start sample."""
         self._commit_points = sorted(int(p) for p in points) if points else []
         self._commit_f = np.asarray(self._commit_points, dtype=np.float64)
+        self._commit_gen += 1
         self.update()
 
     def keyPressEvent(self, event) -> None:
@@ -511,12 +533,10 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         A column's winner is the in-view (and, with a filter, visible) command LATEST in
         _draw_order: that list is sorted by ascending paint rank, stable, so the latest
         is the most significant and, among equals, the one a back-to-front walk of it
-        reaches first — which is how this used to be computed, one Python iteration per
-        command per view change (76 ms per wheel step at 100k commands). Now it is a
-        bisect to the view and a vectorised per-column maximum over what is in it; the
-        result, order included, is the same (tests/test_timeline_decimation.py)."""
-        key = (self._view_lo, self._view_hi, self.width(),
-               id(self._draw_order), id(self._draw_set))
+        reaches first. It is computed as a bisect to the view and a vectorised per-column
+        maximum over what is in it; tests/test_timeline_decimation.py checks the result,
+        order included, against that walk."""
+        key = (self._view_lo, self._view_hi, self.width(), self._tick_gen)
         if key == self._decim_key:
             return self._decim_ticks
         i0, i1, xs = self._view_slice(self._tick_start_f)
@@ -524,12 +544,12 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         if self._draw_set is not None:
             # Honor the command-table filter: no ticks for filtered-out commands (keyed by
             # raw start_sample, matching the tick position — see set_draw_filter). The
-            # mask is built once per filter, not per view.
-            if self._tick_filter_key != id(self._draw_set):
+            # mask is built once per filter (per _tick_gen), not per view.
+            if self._tick_filter_key != self._tick_gen:
                 self._tick_filter_mask = np.isin(
                     self._tick_start_i, np.fromiter(self._draw_set, dtype=np.int64,
                                                     count=len(self._draw_set)))
-                self._tick_filter_key = id(self._draw_set)
+                self._tick_filter_key = self._tick_gen
             keep = self._tick_filter_mask[i0:i1]
             xs, pos = xs[keep], pos[keep]
         ticks: List[tuple] = []
@@ -550,7 +570,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         view/width — so paintEvent (16 ms play timer) doesn't redo it each frame. The
         points are sorted, so x is non-decreasing along them and the distinct columns in
         order are the whole answer; same bisect as _decimated_ticks."""
-        key = (self._view_lo, self._view_hi, self.width(), id(self._commit_points))
+        key = (self._view_lo, self._view_hi, self.width(), self._commit_gen)
         if key == self._commit_decim_key:
             return self._commit_decim
         _i0, _i1, xs = self._view_slice(self._commit_f)
@@ -582,6 +602,10 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                               if i + 1 < len(self._segments) else tr.right())
             if band_left is not None and x0 < band_left:
                 x0 = band_left
+            for b in self._later_bringups:            # the band ends where the Link stopped
+                bx = self._clampx(self._x_for(b["span_start"]))
+                if x0 < bx < x1:
+                    x1 = bx
             if x1 <= x0:
                 continue
             cols = int(seg.get("column_count", 0))
@@ -590,8 +614,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             # A user-pinned region is outlined so "this width was forced, not snooped"
             # is visible at a glance even where the band is too narrow for its label.
             # NoBrush explicitly: drawRect FILLS with the painter's current brush, and
-            # the bring-up flag below sets a solid one — this outline only stays an
-            # outline because nothing has set a brush by the time the loop runs.
+            # the bring-up flag below sets a solid one.
             if seg.get("forced"):
                 p.setPen(QPen(QColor(VizTheme.SEM_ERROR), 1, Qt.DashLine))
                 p.setBrush(Qt.NoBrush)
@@ -605,7 +628,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         # capture this region is well under a pixel wide, so draw an ALWAYS-VISIBLE
         # marker in a distinct cyan (NOT the gold Commit+SSP tick): a min-width band,
         # a solid vertical line at the PHY-select edge, and a downward flag on top.
-        if self._bringup:
+        if self._bringup or self._later_bringups:
             # Named sub-phase bands (Idle / Bus Reset / Cold|Warm Start / PhyStart /
             # LC_Request), each its own data-port-palette colour, drawn in the SAME top
             # strip as the config "Ncol" bands (so LC regions read like the audio-mode
@@ -624,35 +647,31 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                     p.setPen(QPen(QColor(VizTheme.TEXT)))
                     p.drawText(QRectF(sx0 + 3, tr.top(), w - 5, _CFG_BAND_H),
                                Qt.AlignLeft | Qt.AlignVCenter, sec.get("name", ""))
-            if not self._link_sections:                       # fallback: single cyan band
+            if self._bringup and not self._link_sections:     # fallback: single cyan band
                 bx0 = self._clampx(self._x_for(self._bringup["start"]))
                 bx1 = self._clampx(self._x_for(self._bringup["audio_start"]))
                 band = QRectF(bx0, tr.top(), max(4.0, bx1 - bx0), _CFG_BAND_H)
                 p.fillRect(band, QColor(_C_BRINGUP.red(), _C_BRINGUP.green(), _C_BRINGUP.blue(), 120))
                 p.setPen(QPen(_C_BRINGUP, 1))
                 p.drawRect(band)
-            ps = self._bringup.get("phy_select")
-            mx = self._clampx(self._x_for(ps if ps is not None else self._bringup["start"]))
-            p.setPen(QPen(_C_BRINGUP, 2))
-            p.drawLine(int(mx), int(tr.top()), int(mx), int(tr.bottom()))
-            flag = QPolygonF([QPointF(mx - 4, tr.top() - 7), QPointF(mx + 4, tr.top() - 7),
-                              QPointF(mx, tr.top())])           # downward triangle above track
-            p.setBrush(_C_BRINGUP); p.setPen(QPen(_C_BRINGUP, 1))
-            p.drawPolygon(flag)
+            for b in ([self._bringup] if self._bringup else []) + self._later_bringups:
+                ps = b.get("phy_select")
+                mx = self._clampx(self._x_for(ps if ps is not None else b["start"]))
+                p.setPen(QPen(_C_BRINGUP, 2))
+                p.drawLine(int(mx), int(tr.top()), int(mx), int(tr.bottom()))
+                flag = QPolygonF([QPointF(mx - 4, tr.top() - 7), QPointF(mx + 4, tr.top() - 7),
+                                  QPointF(mx, tr.top())])       # downward triangle above track
+                p.setBrush(_C_BRINGUP); p.setPen(QPen(_C_BRINGUP, 1))
+                p.drawPolygon(flag)
         # baseline
         p.setPen(QPen(_C_AXIS))
         p.drawLine(int(tr.left()), int(tr.bottom()), int(tr.right()), int(tr.bottom()))
-        # event ticks. A long capture is ~98% Pings; with ~7M samples per pixel many
-        # commands collide on one x. Paint order is by ASCENDING importance so the
-        # significant marks WIN the pixel (Ping < other < commit < SSP/error), instead
-        # of last-in-time-order overpainting a Write with a later Ping. At most ONE tick
-        # per pixel column is drawn — the MOST significant — so a zoomed-out large
-        # capture (tens of thousands of commands collapsing onto ~1000 pixels) doesn't
-        # walk every command each frame (that made navigation/the play-timer sweep
-        # janky). The decimated (x, cmd) list is cached by _decimated_ticks and only
-        # recomputed when the view range / width / filter actually changes — paintEvent
-        # itself just iterates the ~width-sized result. Visually identical: colliding
-        # ticks overpaint anyway.
+        # event ticks. In a long capture many commands collide on one x. Paint order is
+        # by ASCENDING importance so the significant marks WIN the pixel (Ping < other <
+        # commit < SSP/error). At most ONE tick per pixel column is drawn — the MOST
+        # significant. The decimated (x, cmd) list is cached by _decimated_ticks and only
+        # recomputed when the view range / width / filter changes; paintEvent iterates the
+        # ~width-sized result.
         for x, cmd in self._decimated_ticks():
             color = _kind_color(cmd)
             tall = color in (_C_ERROR, _C_SSP)
@@ -727,8 +746,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             p.drawLine(int(x), int(y), int(x), int(y) + 4)
             p.setPen(QPen(QColor(180, 180, 185)))
             # Centred on its tick, except where that would cut it at the widget's edge
-            # (the "0 ms" at the start, once the Link names left the bands that close to
-            # the left): there it is pinned to the edge instead.
+            # (the "0 ms" at the start): there it is pinned to the edge instead.
             rect, align = QRectF(x - 44, y + 4, 88, _AXIS_H - 4), Qt.AlignHCenter
             text = self._fmt_axis(s, step_u)
             half = p.fontMetrics().horizontalAdvance(text) / 2 + 1
@@ -828,7 +846,9 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     def _band_label(self, index: int, seg: dict) -> str:
         """A band's label: the user's name for the region, then what it is."""
         what = self._segment_label(index, int(seg.get("column_count", 0)),
-                                   bool(seg.get("forced")), bool(seg.get("csv")))
+                                   bool(seg.get("forced")), bool(seg.get("csv")),
+                                   int(seg.get("start_sample", 0)) if seg.get("restart")
+                                   else None)
         name = str(seg.get("name") or "").strip()
         return f"{name} · {what}" if name else what
 
@@ -840,7 +860,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             return None
         # The bring-up's bands sit over the start of region 0, which is drawn only from the
         # audio start (paintEvent's band_left); a click there is the bring-up's, not region 0's.
-        if self._bringup and self._sample_for(pos.x()) < int(self._bringup.get("audio_start", 0)):
+        if self._in_bringup(self._sample_for(pos.x())):
             return None
         seg = self._segment_at(self._sample_for(pos.x()))
         if seg is None:
@@ -849,7 +869,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         return int(s.get("index", i)), s
 
     def _segment_label(self, index: int, cols: int, forced: bool = False,
-                       csv: bool = False) -> str:
+                       csv: bool = False, restart: Optional[int] = None) -> str:
         """Config-band label. The initial audio segment of a cold/warm start is the
         selected PHY's Safe-Lock geometry, so label it by the PHY (e.g. 'PHY2
         Safe-Lock-2') — the PHY is what makes that 2-column (FBCSE) / 4-column (DLV)
@@ -859,9 +879,15 @@ class TimelineRibbon(RowOriginMixin, QWidget):
 
         A `forced` region had its width pinned by the user, so say so — otherwise a
         pinned width is indistinguishable from one the decoder read off the wire. A `csv`
-        region decodes with a config CSV imposed on it, which says so for the same reason."""
+        region decodes with a config CSV imposed on it, which says so for the same reason.
+
+        `restart`, the start sample of a region a later bring-up (Cold or Warm) opened,
+        labels it by that bring-up's PHY the same way."""
         b = self._bringup
-        if (index == 0 and b and b.get("phy_name")
+        if restart is not None:
+            b = next((x for x in reversed(self._later_bringups)
+                      if x["span_start"] <= restart), {})
+        if ((index == 0 or restart is not None) and b and b.get("phy_name")
                 and b.get("safe_lock_columns") == cols and not forced and not csv):
             return f"{b['phy_name']} Safe-Lock-{cols}"
         return f"{cols}col (forced)" if forced else f"{cols}col (CSV)" if csv else f"{cols}col"
@@ -907,8 +933,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         cmd = self._nearest(x)
         if cmd is not None:
             # Concise: the command name, plus its kind only when that adds something
-            # beyond the name (e.g. "CRC error" on a WriteA32) — NOT the legend's tick-
-            # appearance blurb, which was just noise on a specific command.
+            # beyond the name (e.g. "CRC error" on a WriteA32), not the legend's
+            # tick-appearance text.
             name = str(cmd.get("command", "")) or "?"
             label = _kind_label(cmd)
             tag = f" ({label})" if label and label.lower() not in name.lower() else ""
@@ -977,8 +1003,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                 self._seek_timer.start()
             return
         # Hover (no drag): a tooltip naming what's under the pointer (command / commit
-        # point / link-control phase / config band). The WIDGET-level "Click to seek…"
-        # help tooltip was removed — it kept replacing this useful info popup.
+        # point / link-control phase / config band).
         text = self._hover_text(x)
         if text:
             QToolTip.showText(event.globalPosition().toPoint(), text, self)

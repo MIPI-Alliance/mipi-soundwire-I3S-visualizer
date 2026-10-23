@@ -1,9 +1,7 @@
 """Per-port cell-label fields in the Analyzer Bus Grid.
 
-The renderer always supported this — `GridView.set_cells` takes a `dp_display` map
-and `_dp_disp` reads `display_fields` from it — but nothing ever passed one, so the
-Analyzer was hard-wired to the Channel|Bit default. On a port carrying several
-samples per row that hides the distinguishing field: every cell drew "C0B0".
+`GridView.set_cells` takes a `dp_display` map and `_dp_disp` reads `display_fields`
+from it; the session supplies the map. Unset ports use the Channel|Bit default.
 
 These tests cover the three pieces that make the choice reachable and durable: the
 swatch is a click target, the choice reaches the rendered label, and it survives a
@@ -63,7 +61,7 @@ def test_set_label_fields_round_trips(session):
 
 
 def test_label_fields_are_per_port(session):
-    """The point of per-port: changing one must not move the others."""
+    """Changing one port's fields leaves the others unchanged."""
     session.set_label_fields(0, 2, SAMPLE)
     assert session.label_fields_for(0, 2) == SAMPLE
     assert session.label_fields_for(0, 0) == DEFAULT
@@ -71,9 +69,8 @@ def test_label_fields_are_per_port(session):
 
 
 def test_setting_back_to_default_drops_the_entry(session):
-    """A workspace should record real choices only — otherwise every port opened
-    once is pinned to today's default, and changing that default later silently
-    doesn't apply to them."""
+    """A workspace records real choices only: setting a port back to the default drops
+    its entry, so a later change of default still applies to it."""
     session.set_label_fields(0, 2, SAMPLE)
     assert session.source.get("label_fields") == {"0.2": 1}
     session.set_label_fields(0, 2, DEFAULT)
@@ -143,8 +140,8 @@ def test_chosen_fields_reach_the_rendered_label(session, qapp):
 
 
 def test_sample_field_distinguishes_multi_sample_cells(session, qapp):
-    """The actual user-visible win. A port with two samples per row draws the same
-    "C0B0" in every cell under the default; adding Sample separates them.
+    """A port with two samples per row draws the same "C0B0" in every cell under the
+    default; adding Sample separates them.
     """
     from swi3s_studio.ui.grid_view import GridView
 
@@ -204,8 +201,8 @@ def test_clicking_the_grid_body_emits_nothing(session, qapp):
 
 
 def test_hits_are_dropped_when_the_scene_is_rebuilt(session, qapp):
-    """Stale swatch rects would map a click onto the wrong port. Every scene
-    teardown must drop them — set_tx_raster replaces the grid entirely."""
+    """Every scene teardown drops the swatch rects, so a click cannot map onto a stale
+    port; set_tx_raster replaces the grid entirely."""
     gv = _grid(session, qapp)
     assert gv._key_hits
     gv.set_tx_raster({"column_count": 4, "cds_col": 0, "rows": [[0, 0, 0, 0]],
@@ -302,8 +299,7 @@ def test_choice_reaches_the_real_grid_widget(qapp, monkeypatch):
     """main_window must actually hand the map to GridView.
 
     Building a GridView directly (as the tests above do) proves the renderer honours
-    a map, not that the app ever supplies one — that wiring was missing for the whole
-    life of the dp_display parameter, which is the bug this feature fixes.
+    a map, not that the app supplies one; this reads it off the app's widget.
     """
     import swi3s_studio.ui.authoring.dialogs as dialogs
     from swi3s_studio.ui.main_window import MainWindow
@@ -366,12 +362,10 @@ def test_apply_to_all_covers_every_port(qapp, monkeypatch):
 def test_apply_to_all_covers_every_port_from_an_EARLY_cursor(qapp, monkeypatch):
     """"Apply to every data port" must mean the capture's ports, not the cursor's.
 
-    Found by the 3.0.11 release review. The port set was scanned from
-    grid_cells_at(cursor, _grid_rows) — a small window as-of the cursor. With the cursor
-    parked in the FIRST config region, before any commit has taken effect, that window
-    yields NO ports on the stock PHY2 demo, so "apply to every data port" silently applied
-    to only the port clicked. test_apply_to_all_covers_every_port cannot catch it because
-    it parks the cursor at the LAST segment, where every port is live.
+    With the cursor parked in the FIRST config region, before any commit has taken
+    effect, grid_cells_at(cursor, _grid_rows) yields NO ports on the stock PHY2 demo;
+    apply-to-all must still reach every configured port. test_apply_to_all_covers_every_port
+    parks the cursor at the LAST segment, where every port is live.
     """
     import swi3s_studio.ui.authoring.dialogs as dialogs
     from swi3s_studio.ui.main_window import MainWindow
@@ -384,8 +378,7 @@ def test_apply_to_all_covers_every_port_from_an_EARLY_cursor(qapp, monkeypatch):
         w.cursor.set_sample(early)
         qapp.processEvents()
 
-        # Precondition: this really is the blind spot — the old window-based scan sees
-        # nothing here, so the test would pass vacuously if the cursor were placed later.
+        # Precondition: a window-based scan at this cursor sees no ports.
         visible = {(int(c["device"]), int(c["dp"]))
                    for c in w._session.grid_cells_at(early, w._grid_rows)
                    if not c["is_cds"] and int(c.get("dp", -1)) >= 0}

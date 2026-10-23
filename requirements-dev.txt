@@ -1,0 +1,16 @@
+# SWI3S Studio development and test dependencies: the runtime set (requirements.txt) plus
+# the test runner, coverage, the linter and the type checker that tests/gate.sh and CI run.
+#
+#     python3 -m pip install -r requirements-dev.txt
+#     python3 -m pip install ./native      # builds the swi3score C++ module
+#
+# tools/setup_dev.sh (macOS / Linux) and tools/setup_dev.ps1 (Windows) do both in a venv.
+
+-r requirements.txt
+
+pytest>=8.0
+pytest-cov>=5.0      # the coverage floor CI enforces
+ruff>=0.16
+# Pinned to the version tools/mypy_baseline.json records under "env": another mypy makes the
+# type ratchet NOT COMPARABLE. Change the two together.
+mypy==2.3.0

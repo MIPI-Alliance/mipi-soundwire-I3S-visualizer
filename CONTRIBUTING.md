@@ -84,10 +84,14 @@ checks this on every pull request; to sign, comment on your PR exactly:
 ## SWI3S Studio: working in the code
 
 - **Setup and tests.** The [README](README.md) covers setup (`run.sh` / `run.ps1`, or the
-  manual steps) and the test commands. Before opening a PR, run
+  manual steps) and the test commands. `bash tools/setup_dev.sh` (`.\tools\setup_dev.ps1`
+  on Windows) installs what testing needs, `requirements-dev.txt`, and builds the decode
+  core. Before opening a PR, run
   `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows). It rebuilds the
   native decode core and checks its ABI, then runs the test suite, `ruff`, the `mypy`
-  check and the leak scan; it skips only the perf gate and the one-process-per-file pass.
+  check, the leak scan and the screenshots check (every mode in light and dark, checked for
+  wrong-theme panes, widgets a theme switch missed, faint text and clipped labels); it skips
+  only the perf gate and the one-process-per-file pass.
   On a pull request, CI runs the test suite on Linux, macOS and Windows, and the perf,
   coverage and lint jobs on Linux. If you run `pytest` directly after changing anything
   under `native/`, rebuild the decode core first. See

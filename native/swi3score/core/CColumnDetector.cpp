@@ -16,10 +16,9 @@ int CColumnDetector::Score(const std::vector<bool>& levels, int columnCount,
 
     // Column 0 of each row sits at indices i where (i - offset) % columnCount == 0.
     // The CDS bit there is NRZS-decoded against the immediately-preceding UI, so i must
-    // be >= 1. Stride directly across those Column-0 indices instead of testing every
-    // index with a modulo + continue (same bit sequence, columnCount× fewer iterations):
-    // the first is `offset` itself, except offset 0 (index 0 has no preceding UI) starts
-    // at the next row's Column 0, columnCount.
+    // be >= 1. Stride directly across those Column-0 indices: the first is `offset`
+    // itself, except offset 0 (index 0 has no preceding UI) starts at the next row's
+    // Column 0, columnCount.
     size_t start = (offset >= 1) ? static_cast<size_t>(offset)
                                  : static_cast<size_t>(columnCount);
     for (size_t i = start; i < levels.size(); i += static_cast<size_t>(columnCount)) {

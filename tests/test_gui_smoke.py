@@ -4,8 +4,7 @@ navigation, filters, statistics, raw capture and register editing all behave.
 
 Split into pytest test_* functions sharing ONE module-scoped MainWindow (building it
 is ~1s; the walkthrough mutates that shared window in order, like a real session).
-Runs under CI (`pytest`) so it catches drift from the demo it asserts against — e.g.
-the 3.0.6 demo change to a single device with four data ports (DP0/DP2 PCM/PDM
+It asserts against the demo: a single device with four data ports (DP0/DP2 PCM/PDM
 unscrambled, DP1/DP3 scrambled), 4 mono channels.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_gui_smoke.py
@@ -189,10 +188,17 @@ def test_synchronized_navigation(win):
     last = model.rowCount() - 1
     win._cmd_view.selectRow(last)
     assert win.cursor.sample == win._session.command_cursor_sample(model.command_at(last))
-    # As-of t=0 (before any write) NumColumns is still at its DEFAULT.
-    early = win._session.register_files_at(0)
-    if 0 in early:
-        assert early[0].provenance(0x1081) == Provenance.DEFAULT
+    # As-of the cursor: just before device 0's first NumColumns (0x1081) write the register
+    # is at its DEFAULT (a device with no register state yet counts as all-default), and
+    # from the end of that write it is WRITTEN.
+    nc = next(c for c in win._session.commands
+              if c.get("command") == "WriteA32" and c.get("crc_valid")
+              and c.get("address") == 0x1081 and int(c.get("device_mask", 0)) & 1)
+    early = win._session.register_files_at(int(nc["start_sample"]) - 1)
+    assert (early[0].provenance(0x1081) if 0 in early else Provenance.DEFAULT) \
+        == Provenance.DEFAULT
+    assert win._session.register_files_at(int(nc["end_sample"]))[0].provenance(0x1081) \
+        == Provenance.WRITTEN
 
     # Selecting a command selects ITS beginning CDS symbol (the SPM comma).
     wcmd_row = next(r for r in range(model.rowCount())
@@ -504,9 +510,8 @@ def test_studio_ui_batch(win):
 
 def test_the_analyzer_opens_empty_and_says_how_to_open_a_capture():
     """No capture is decoded unasked: not when the window is built, not on entering the
-    Bus Analyzer. A demo is one menu item away (File ▸ Open Demo Capture), and decoding one
-    unasked cost seconds and ~2.3 GB for anyone whose next act was File ▸ Open. The empty
-    panes say so instead of showing blank tables and axes."""
+    Bus Analyzer. A demo is one menu item away (File ▸ Open Demo Capture). The empty panes
+    say how to open a capture instead of showing blank tables and axes."""
     from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
 
     w = MainWindow()
@@ -545,7 +550,7 @@ def test_load_demo_async_when_event_loop_live():
     synchronous, so a headless load_demo() returns with the session ready. Pumps events to
     completion. (conftest sets SWI3S_DEMO_SAMPLES=300, so the pumped decode is quick.)"""
     import time
-    w = MainWindow()                                    # constructor loads nothing now
+    w = MainWindow()                                    # the constructor loads nothing
     assert w._session is None and getattr(w, "_load_thread", None) is None
     w.load_demo()                                       # loop not live yet => synchronous
     assert w._session is not None and getattr(w, "_load_thread", None) is None
@@ -556,10 +561,6 @@ def test_load_demo_async_when_event_loop_live():
         assert getattr(w, "_load_dlg", None) is not None, "no progress dialog shown"
         # Wall-clock wait, not a fixed iteration count: processEvents() returns instantly
         # on an empty queue, so `for _ in range(N)` measures CPU spin, not elapsed time.
-        # The worker needs ~7k iterations here but the old range(2000) gave up after
-        # ~50 ms — it passed under pytest (warm caches, short conftest demo) and failed
-        # as a standalone script, which is what run_all.sh does. Same fix as d0873fd
-        # applied to test_ssp.py / test_workspace.py; this sibling was missed.
         deadline = time.time() + 60.0
         while getattr(w, "_load_thread", None) is not None:
             if time.time() > deadline:
@@ -580,7 +581,7 @@ def test_cursor_cascade_coalesces_when_event_loop_live():
     cursor LINE still moves on every change. Headless / tests keep it synchronous."""
     import time
     w = MainWindow()
-    w.load_demo()                                    # no longer preloaded in __init__
+    w.load_demo()                                    # __init__ does not preload one
     s = w._session
     assert s is not None
     N = int(s.capture.clock_edges[-1])
@@ -617,10 +618,8 @@ def test_teardown_is_idempotent_after_join_worker_threads():
     QThread.wait() returns when the worker's run() returns — it does NOT mean the
     worker's queued done/failed signal has been DELIVERED. So closing the window (or
     the atexit hook) mid-load nulls _load_thread, the queued signal then lands, and
-    _finish_load re-enters with everything already cleared. It used to raise
-    AttributeError inside a Qt slot: PySide6 prints and swallows that, so the visible
-    symptom was a stray traceback plus a progress dialog that never closed and a
-    worker never deleteLater'd. Both teardowns now bail cleanly.
+    _finish_load re-enters with everything already cleared. Both teardowns must return
+    cleanly in that state.
     """
     w = MainWindow()
     for attrs, fn in (
@@ -640,10 +639,9 @@ def test_no_worker_respawns_after_join_worker_threads():
     """Nothing may start a NEW worker thread once the window is closing.
 
     A worker's queued done/failed signal can still be delivered after
-    join_worker_threads() has waited on it; its handler then ran the next queued
-    request, spawning a fresh QThread AFTER everything was believed joined — the
-    exact destroyed-while-running SIGABRT the join exists to prevent. Both respawn
-    paths (_run_pending_load and _start_tx_persist_worker) now honour _closing.
+    join_worker_threads() has waited on it; a handler that ran the next queued request
+    would spawn a QThread after the join (a destroyed-while-running SIGABRT). Both respawn
+    paths (_run_pending_load and _start_tx_persist_worker) honour _closing.
     """
     w = MainWindow()
     w._load_pending = (lambda **kw: w._session, None)
@@ -662,16 +660,11 @@ def test_no_worker_respawns_after_join_worker_threads():
 def test_locate_subcapture_refuses_a_second_search_while_one_runs(monkeypatch):
     """Re-invoking Locate Sub-Capture mid-search must not start a second worker.
 
-    The search runs for seconds on a worker thread, which is ample time to pick the menu
-    item again. Without a guard the second call overwrote _locate_thread / _locate_worker /
-    _locate_dlg / _locate_path while the first worker was still running: its still-connected
-    done/failed slots then read the SECOND search's state (a result reported against the
-    wrong file), and the first QThread was never joined — the destroyed-while-running abort
-    join_worker_threads() exists to prevent, which the other two workers already guard
-    against (_load_async, _start_tx_persist_worker).
+    A second call must not overwrite _locate_thread / _locate_worker / _locate_dlg /
+    _locate_path while the first worker runs (the same guard as _load_async and
+    _start_tx_persist_worker).
 
-    The refusal must come BEFORE the file dialog, so nobody chooses a file only to be told
-    no; that is what asserting on the dialog not opening pins.
+    The refusal comes BEFORE the file dialog; the test asserts the dialog does not open.
     """
     import swi3s_studio.ui.main_window as mw
     w = MainWindow()
@@ -717,15 +710,13 @@ def test_locate_subcapture_does_not_start_while_closing(monkeypatch):
 def test_rebuilding_the_playback_menus_does_not_accumulate_action_groups():
     """QMenu.clear() destroys the actions, NOT the groups — those are children of the WINDOW.
 
-    So rebinding self._play_device_group / _play_depth_group / _play_rate_groups only dropped
-    the last PYTHON reference to a C++ object Qt still owned: 4 groups after construction, 104
-    after 50 rebuilds, 4004 after 2000. Empty shells at ~1.6 KB per rebuild, but unbounded
-    across a session — and the decimation menu is rebuilt per capture load and per re-decode,
-    one group per (device, dataport) audio stream.
+    Rebinding self._play_device_group / _play_depth_group / _play_rate_groups only drops the
+    last PYTHON reference to a C++ object Qt still owns, so each rebuild must delete the old
+    groups. The decimation menu is rebuilt per capture load and per re-decode, one group per
+    (device, dataport) audio stream.
 
     NOTE THE FLUSH: deleteLater() posts a DeferredDelete event, and QApplication.processEvents()
-    does NOT run those. Without sendPostedEvents the count still reads 104 and the fix looks
-    broken — which it did, on the first attempt at this check.
+    does NOT run those; the test calls sendPostedEvents before counting.
     """
     from PySide6.QtCore import QEvent
     from PySide6.QtGui import QActionGroup
@@ -749,15 +740,13 @@ def test_rebuilding_the_playback_menus_does_not_accumulate_action_groups():
 
 
 def test_the_rows_to_draw_field_fits_its_widest_value_at_a_wider_font():
-    """A pixel constant sized this field: setFixedWidth(64), for a validator that permits
-    five digits. That is the shape of the defects that shipped 3.0.13 and 3.0.14 red on
-    Windows — a width tuned on macOS metrics, clipped by the runner's font.
+    """The Rows-to-draw field (a validator permitting five digits) is sized from font
+    metrics, not a pixel constant, so "10240" fits under a wider platform font.
 
     THE STRESS FONT IS DERIVED FROM METRICS, not a point size, following the convention
-    test_authoring.py established for the same class of bug: grow the size until "10240"
-    reaches a width a wider platform would plausibly produce. The font must be set on the
-    APPLICATION before the window is built, since the minimum is computed from the field's
-    font at construction.
+    in test_authoring.py: grow the size until "10240" reaches a width a wider platform
+    would plausibly produce. The font must be set on the APPLICATION before the window is
+    built, since the minimum is computed from the field's font at construction.
     """
     from PySide6.QtGui import QFont, QFontMetrics
 

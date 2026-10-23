@@ -1,8 +1,7 @@
 // Synthetic SWI3S PHY2 stream for tests and demos: an absolute per-UI data-level
 // plan carrying a control sequence that configures + commits one stereo 8-bit
 // scrambled audio data port, followed by scrambled audio payload (a sine per
-// channel). The same plan the Saleae plugin's simulation produces, validated by
-// test/test_simulation_roundtrip.cpp. Feed it to a MemorySampleSource.
+// channel). Feed it to a MemorySampleSource.
 
 #ifndef SWI3SCORE_DEMO_H
 #define SWI3SCORE_DEMO_H
@@ -30,7 +29,7 @@ std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel = 32);
 
 // PHY1 (FBCSE, "slow" forwarded-clock) demo. A CONSTANT 4-column geometry (CDS at Column
 // 0, NRZS) carrying two 16-bit PCM ports interleaved in one column (DP0 Offset 0, DP1
-// Offset 16, DP1 scrambled) at 48 kHz and one PDM port (2 samples/row, 3.072 MHz). Halfway
+// Offset 16, DP1 scrambled) at 48 kHz and one PDM port (2 samples/row, 3.072 MHz).
 // DP0 carries 44.1 kHz via payload interval skipping (13/160) on its 48 kHz
 // opportunities, sharing its column with DP1 at 48 kHz. Halfway
 // through, a commit REPOSITIONS the ports WITHOUT changing the column count — the PCM pair
@@ -72,6 +71,13 @@ std::vector<bool> MakeDscrDisableLevels(int samplesPerChannel = 32, bool disable
 // reconfigure lands mid-interval (exercises the windowed-replay phase preservation).
 std::vector<bool> MakeImmediateScramblerLevels(int samplesPerChannel = 32,
                                                bool midInterval = false);
+
+// Test fixture: one scrambled PCM port carrying (fromSize+1)-bit samples; a single-ranked
+// WriteA32 to SampleSizeGrouping sets SampleSize to toSize, and the decode's reconfigure
+// lands `rowsIntoSample` rows into a sample. The in-flight sample finishes at the old width
+// on the wire; later samples use the new one.
+std::vector<bool> MakeImmediateSampleSizeLevels(int samplesPerChannel = 32, int fromSize = 23,
+                                                int toSize = 15, int rowsIntoSample = 8);
 
 // Test fixture for the EnableCh_CURR protocol-error rule (SWI3S v1.1: EnableCh is
 // dual-ranked; a direct write to its _CURR address is only safe when the port's

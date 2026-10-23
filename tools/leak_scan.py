@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Leak scan: does this tree carry anything that only makes sense where it was built?
 
-    python3 tools/leak_scan.py              # working tree (tracked files)
+    python3 tools/leak_scan.py              # working tree (tracked + untracked, not ignored)
     python3 tools/leak_scan.py <sha>        # a specific commit's tree
+    python3 tools/leak_scan.py --tree=<dir> # a directory that is not a checkout: an
+                                           # exported tree, walked whole (see _walk)
     python3 tools/leak_scan.py --text=<f>  # any text file: a release description, a commit
                                            # message — content that ships but is not a FILE
 
@@ -12,25 +14,23 @@ environment is a leak — it is unverifiable to them at best and confusing at wo
 categories are documented in docs/DEVELOPMENT.md ("Pre-flight before publishing a release").
 
 WHAT SHIPS IS NOT ONLY FILES. A release description and the commit message on a publish
-branch are usually the FIRST things an outside reader sees, and neither is in the tree — so a
-tree-only scan reports clean while the most-read text goes unchecked. That is not
-hypothetical: a published branch description carried three of the categories this exists to
-stop — an attribution, two capture filenames, and the platforms the release was gated on — and
-the scan passed on that same content both as a tree and, when tested, as a tracked file. It
-passed because the patterns here are structural and all three of those are prose. `--text=`
-closes the artifact half of the gap. The prose half is a review rule, not a pattern — see
-docs/DEVELOPMENT.md, "Write the RULE, not the story".
+branch are usually the FIRST things an outside reader sees, and neither is in the tree;
+`--text=` scans them. The patterns here are structural, so prose disclosures are a review
+rule, not a pattern — see docs/DEVELOPMENT.md, "Write the RULE, not the story".
 
-This scanner carries only STRUCTURAL patterns, which are safe to publish: private IP
-addresses, home-directory paths, key file names, private-key headers. Site-specific names —
-host names, repository names, a lab machine's address — must NOT live here, because a
-published list of the strings you are trying not to publish is itself the leak (this
-project's own release docs made exactly that mistake). Put those in a file named by
+This scanner carries only STRUCTURAL patterns, which are safe to publish: private IP addresses,
+home-directory paths, macOS volume, iCloud Drive and container paths, the absolute path of this
+checkout and of the scanned tree, key file names, private-key headers. Site-specific names —
+host names, repository names, a lab machine's address, and the names of third parties whose
+material the project was given (a vendor whose register file a dialect was written from, its
+part numbers and codenames) — must NOT live here, because a published list of the strings you
+are trying not to publish is itself the leak. Put those in a file named by
 $SWI3S_LEAK_PATTERNS, one regex per line, kept outside the repository; the scan uses it when
 present and says so when it is absent, so a missing file can never look like a clean result.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import subprocess
@@ -40,22 +40,26 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Built from parts so this file does not match its own patterns when it scans the tree.
 _HOME = "/" + "Users/"
-_WINHOME = r"C:\\" + r"Users\\"
+# A Windows home with one or more backslashes per separator: JSON and non-raw string
+# literals store `C:\\Users\\name` with each backslash doubled.
+_WINHOME = r"\b[A-Za-z]:\\+" + r"Users\\+"
+# A Linux home. `runner` is the hosted CI account, which names no person.
+_LINUXHOME = "/" + r"home/(?!runner\b)"
+# A macOS volume mount, an iCloud Drive container, and an app's sandbox container: each names
+# a disk, an account's synced storage or a sandboxed process, wherever the home directory is.
+_VOLUME = "/" + r"(?-i:Volumes)/[^/\r\n]+/"   # a volume name may hold spaces
+_ICLOUD = r"Mobile " + r"Documents[/\\]|com~apple~" + r"CloudDocs"
+_CONTAINER = "/" + r"Library/(?:Daemon )?" + r"Containers/"
 
-# A dotted spec-section citation looks exactly like a 10.0.0.0/8 address:
-# "§10.1.4.4.2" matched the private-IP pattern and failed the gate. Narrowed
-# rather than allowlisted — an allowlist entry would have to name the file, and
-# the next §10.x citation anywhere else would fail again.
-#
-# Two structural discriminators, neither of which a real address can satisfy:
+# A dotted spec-section citation (§10.1.4.4.2) looks exactly like a 10.0.0.0/8 address.
+# Narrowed rather than allowlisted, by two structural discriminators, neither of which a
+# real address can satisfy:
 #   * a section citation is introduced by §, so reject that prefix;
 #   * an IPv4 address has exactly FOUR octets, so reject a fifth (§10.1.4.4.2).
 # A genuine 10.x address in prose is still caught: it has four octets and no §.
 #
-# The fifth-octet guard is `(?!\.\d)`, NOT `(?![.\d])`. The stricter form also
-# rejected a trailing sentence period — "the host is 10.1.4.4." stopped being a
-# finding, which is a real address in ordinary prose. Only a dot FOLLOWED BY A
-# DIGIT means "this is not an address".
+# The fifth-octet guard is `(?!\.\d)`: only a dot FOLLOWED BY A DIGIT means "this is not
+# an address", so a sentence-final period after an address still matches.
 _IPV4_TAIL = r"(?!\.?\d)(?!\.\d)"   # no 5th octet; a sentence-final '.' is fine
 
 _STRUCTURAL: list[tuple[str, str]] = [
@@ -67,12 +71,14 @@ _STRUCTURAL: list[tuple[str, str]] = [
      "private IP address (172.16.0.0/12)"),
     (_HOME + r"[A-Za-z0-9._-]+", "absolute home path (reveals a user name)"),
     (_WINHOME + r"[A-Za-z0-9._-]+", "absolute Windows home path (reveals a user name)"),
+    (_LINUXHOME + r"[A-Za-z0-9._-]+", "absolute Linux home path (reveals a user name)"),
+    (_VOLUME, "absolute macOS volume path (names a disk)"),
+    (_ICLOUD, "iCloud Drive path (names synced storage)"),
+    (_CONTAINER, "macOS container path (names a sandboxed process's storage)"),
     (r"\bid_(?:rsa|ed25519|ecdsa|dsa)\b", "SSH key file name"),
     (r"BEGIN (?:OPENSSH|RSA|DSA|EC|PGP) PRIVATE KEY", "PRIVATE KEY MATERIAL"),
-    # A VARIABLE is not a key name. The point of this pattern is a literal path escaping
-    # into the tree (`ssh -i ~/.ssh/<name>`); `ssh -i "$KEY"` names nothing and is how a
-    # script SHOULD be written, so matching it taught the opposite lesson — and the project's
-    # own rule is to narrow a pattern rather than allowlist the string it fires on.
+    # A VARIABLE is not a key name. The pattern targets a literal path escaping into the
+    # tree (`ssh -i ~/.ssh/<name>`); `ssh -i "$KEY"` names nothing and is not matched.
     (r"ssh\s+-i\s+(?![\"']?\$)\S+", "ssh invocation naming a key file"),
 ]
 
@@ -80,89 +86,208 @@ _STRUCTURAL: list[tuple[str, str]] = [
 # The exemption is per-pattern-KIND, not per-file: these two are skipped for structural
 # patterns only, and are scanned normally for site-specific ones.
 #
-# A whole-file exemption is what it used to be, and it hid a real leak in a shipping file for a
-# release. This module's own docstring is published prose, and it was describing what v3.0.17's
-# branch description had disclosed by REPEATING the vocabulary — so the one file guaranteed to
-# escape the scan was the one arguing for it. Site patterns cannot self-match by construction:
-# they live outside the repository (see _site_patterns), so nothing here defines them.
+# Site patterns cannot self-match by construction: they live outside the repository (see
+# _site_patterns), so nothing here defines them.
 _SELF = {"tools/leak_scan.py", "tests/test_leak_scan.py"}
 
 
-def _files(rev: str | None) -> list[str]:
-    """Paths to scan.
+def _own_path_patterns(root: str, why: str = "absolute path of the tree being scanned"
+                       ) -> list[tuple[str, str]]:
+    """Patterns for the absolute path of the tree being scanned, as `root` spells it and, on
+    Windows, with forward or doubled separators. Matched only as a whole path (not preceded
+    by a path character, ending at a separator or the end of a component). No pattern for a
+    path of fewer than two components, which would match ordinary relative paths."""
+    root = os.path.abspath(root)
+    parts = [p for p in re.split(r"[\\/]", os.path.splitdrive(root)[1]) if p]
+    if len(parts) < 2:
+        return []
+    spellings = {root}
+    if os.sep == "\\":
+        spellings |= {root.replace("\\", "/"), root.replace("\\", "\\\\")}
+    return [(r"(?<![\w./\\-])" + re.escape(sp) + r"(?![\w.-])", why)
+            for sp in sorted(spellings)]
 
-    Falls back to walking the filesystem when this is not a git repository, because the most
-    important thing to scan is an EXPORTED tree — `tools/publish_tree.py` builds one with
-    `git archive` and it has no .git, so a git-only implementation could not scan the exact
-    artefact that gets published. (It couldn't: this returned a CalledProcessError there.)
+
+def _files(rev: str | None, tree: str | None = None) -> list[str]:
+    """Paths to scan, relative to `tree` when one is given and to _ROOT otherwise.
+
+    A `tree` is walked (see _walk for what the walk skips). So is _ROOT when it is not a git
+    repository: the most important thing to scan is an EXPORTED tree, and
+    `tools/publish_tree.py` builds one with `git archive`, which has no .git.
     """
+    if tree is not None:
+        found, _SKIPPED[:] = _walk(tree)
+        return found
     if rev:
         out = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev],
                              cwd=_ROOT, capture_output=True, text=True, check=True)
         return [f for f in out.stdout.splitlines() if f]
 
-    out = subprocess.run(["git", "ls-files"], cwd=_ROOT, capture_output=True, text=True)
+    # Tracked files plus untracked ones that are not ignored: what the next commit can carry.
+    out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                         cwd=_ROOT, capture_output=True, text=True)
     if out.returncode == 0 and out.stdout.strip():
-        return [f for f in out.stdout.splitlines() if f]
+        return sorted({f for f in out.stdout.splitlines() if f})
 
-    skip = {".git", "__pycache__", ".venv", "venv", "env", "build", "dist", ".mypy_cache",
-            ".ruff_cache", ".pytest_cache", "scratch", "node_modules", "dev_docs", ".eggs"}
+    found, _SKIPPED[:] = _walk(_ROOT)
+    return found
+
+
+# Paths the last filesystem walk left out because the tree's .gitignore excludes them.
+_SKIPPED: list[str] = []
+# The native core a gate builds beside the tree (gitignored as /swi3score*.so etc.) is a
+# build artefact, never part of a published tree, and its name carries the platform, which
+# a published-tier pattern can rightly forbid in the files that are published.
+_CORE = re.compile(r"swi3score[^/]*\.(so|pyd|dylib)$")
+
+
+def _gitignore_rules(root: str) -> list[tuple[list[str], bool, bool]]:
+    """(pattern components, directory only, anchored) for each rule of `root`/.gitignore.
+
+    Git's rules for one top-level file: `#` starts a comment only in column 0, trailing
+    spaces are dropped, a trailing `/` matches directories only, and a pattern holding a `/`
+    elsewhere is anchored to the root and matched component by component. A file using
+    `!` (re-include) or `**` yields no rules, so nothing is skipped rather than too much."""
+    try:
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    rules = []
+    for line in lines:
+        line = line.rstrip(" ")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!") or "**" in line:
+            return []
+        dir_only = line.endswith("/")
+        pat = line.rstrip("/")
+        anchored = "/" in pat
+        rules.append(([c for c in pat.split("/") if c], dir_only, anchored))
+    return rules
+
+
+def _ignored(rel: str, is_dir: bool, rules: list[tuple[list[str], bool, bool]]) -> bool:
+    parts = rel.split("/")
+    for pat, dir_only, anchored in rules:
+        if dir_only and not is_dir:
+            continue
+        if anchored:
+            if len(pat) == len(parts) and all(
+                    fnmatch.fnmatchcase(p, q) for p, q in zip(parts, pat)):
+                return True
+        elif pat and fnmatch.fnmatchcase(parts[-1], pat[0]):
+            return True
+    return False
+
+
+def _walk(root: str) -> tuple[list[str], list[str]]:
+    """(files to scan, paths skipped) for a tree that is not a git checkout.
+
+    Skipped: `.git`, whatever the tree's own .gitignore excludes (what a git listing would
+    leave out), the top-level native core, and an AppleDouble `._name` beside its `name`.
+    A symlink is a file, as git stores it, whatever it points at: a link to a directory is
+    listed and not descended into, and _content reads its target path.
+    POSIX separators always: _SELF and every caller compare against "a/b.py"."""
+    rules = _gitignore_rules(root)
     found: list[str] = []
-    for base, dirs, names in os.walk(_ROOT):
-        dirs[:] = [d for d in dirs if d not in skip]
-        # macOS AppleDouble sidecars are filesystem metadata git never tracks;
-        # one undeletable leftover on the Windows VM failed this otherwise.
-        names = [n for n in names if not n.startswith('._')]
+    skipped: list[str] = []
+    for base, dirs, names in os.walk(root):
+        rel_base = os.path.relpath(base, root).replace(os.sep, "/")
+        rel_base = "" if rel_base == "." else rel_base + "/"
+        keep = []
+        for d in sorted(dirs):
+            if os.path.islink(os.path.join(base, d)):
+                (skipped if _ignored(rel_base + d, False, rules) else found).append(
+                    rel_base + d)
+            elif d == ".git" or _ignored(rel_base + d, True, rules):
+                skipped.append(rel_base + d + "/")
+            else:
+                keep.append(d)
+        dirs[:] = keep
         for n in names:
-            # POSIX separators ALWAYS: _SELF and every caller compare against "a/b.py", so on
-            # Windows a backslash path silently matches nothing — which made this file scan
-            # ITSELF there and report its own pattern descriptions ("10.0.0.0/8") as leaks.
-            rel = os.path.relpath(os.path.join(base, n), _ROOT).replace(os.sep, "/")
-            found.append(rel)
-    return sorted(found)
+            rel = rel_base + n
+            if (_CORE.fullmatch(rel)                    # top level only, as .gitignore has it
+                    or (n.startswith("._") and n[2:] in names)
+                    or _ignored(rel, False, rules)):
+                skipped.append(rel)
+            else:
+                found.append(rel)
+    return sorted(found), sorted(skipped)
 
 
-def _content(path: str, rev: str | None) -> tuple[str, bool]:
+def _content(path: str, rev: str | None, tree: str | None = None) -> tuple[str, bool]:
     """(text to scan, is_binary).
 
-    Three cases the 3.0.12 release review proved were being missed:
-
-    * SYMLINKS. The gate invokes this with no revision, and `open(..., "rb")` FOLLOWS a
-      symlink — so the link's own target path, which is where a leak lives (a fixture
-      pointing at /Users/<name>/… or an internal share), was never read. `git show` returns
-      the target string for a symlink blob, so the commit-mode path caught what the mode the
-      gate actually uses did not. Read the link text explicitly.
-    * UTF-16. `b"\\0" in raw` classified it as binary, and UTF-16 puts a NUL between every
-      ASCII character, so no printable run of 4+ bytes exists and the "printable runs inside
-      binaries" net recovered NOTHING — a leak in a UTF-16 file scanned as zero text while
-      being counted as covered. Decode it as text instead.
+    * SYMLINKS. `open(..., "rb")` FOLLOWS a symlink, but the link's own target path is
+      where a leak lives, so the link text is read explicitly (`git show` already returns
+      the target string for a symlink blob).
+    * UTF-16. UTF-16 puts a NUL between every ASCII character, so it is decoded as text
+      rather than classified as binary (it has no printable run of 4+ bytes).
     * Binary files still get their printable ASCII runs, for names in capture headers.
     """
     if rev:
         p = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=_ROOT, capture_output=True)
         raw = p.stdout if p.returncode == 0 else b""
     else:
-        full = os.path.join(_ROOT, path)
+        full = os.path.join(_ROOT if tree is None else tree, path)
         if os.path.islink(full):
-            return os.readlink(full), False      # the TARGET PATH is the thing to scan
+            # The TARGET PATH is the thing to scan. Windows reports an absolute target with
+            # the `\\?\` long-path prefix, which is not part of the path a reader sees.
+            target = os.readlink(full)
+            return (target[4:] if target.startswith("\\\\?\\") else target), False
         try:
             with open(full, "rb") as f:
                 raw = f.read()
         except (OSError, IsADirectoryError):
             return "", False
 
-    if b"\0" not in raw[:8192]:
+    return decode_bytes(raw)
+
+
+def _utf16_codec(sample: bytes) -> str | None:
+    """The UTF-16 codec `sample` is written in, or None when it is not UTF-16.
+
+    A byte-order mark decides it. Without one, UTF-16 is accepted only when its NULs fall the
+    way ASCII-range UTF-16 puts them: in at least 40% of the pairs, all on the same side of
+    the pair. A stray NUL in an 8-bit text file does not make it UTF-16."""
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    pairs = len(sample) // 2
+    if not pairs:
+        return None
+    even, odd = sample[0:2 * pairs:2].count(0), sample[1:2 * pairs:2].count(0)
+    if odd >= 0.4 * pairs and even <= 0.05 * pairs:
+        return "utf-16-le"
+    if even >= 0.4 * pairs and odd <= 0.05 * pairs:
+        return "utf-16-be"
+    return None
+
+
+def decode_bytes(raw: bytes) -> tuple[str, bool]:
+    """(text, is_binary) for a file's bytes: UTF-8 text, UTF-16 text, or the printable ASCII
+    runs (4+ bytes) of a binary file. tools/name_review.py reads files the same way.
+
+    * No NUL in the first 8 KB: UTF-8 (undecodable bytes replaced).
+    * UTF-16 by _utf16_codec, kept when over 90% of the decoded characters are printable.
+    * NULs in under 1% of the first 8 KB, and the whole file strict UTF-8: text, NULs kept.
+    * Otherwise binary: the printable ASCII runs.
+    """
+    sample = raw[:8192]
+    if b"\0" not in sample:
         return raw.decode("utf-8", "replace"), False
 
-    # NULs present: UTF-16 text, or genuinely binary?
-    for enc in ("utf-16", "utf-16-le", "utf-16-be"):
-        try:
-            text = raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
+    codec = _utf16_codec(sample)
+    if codec:
+        text = raw.decode(codec, "replace")
         printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in text)
         if text and printable / len(text) > 0.9:
             return text, False                   # UTF-16 TEXT, not binary
+    if sample.count(0) < 0.01 * len(sample):
+        try:
+            return raw.decode("utf-8"), False    # text with a stray NUL
+        except UnicodeDecodeError:
+            pass
     runs = re.findall(rb"[\x20-\x7e]{4,}", raw)
     return b"\n".join(runs).decode("ascii", "replace"), True
 
@@ -175,8 +300,8 @@ def _content(path: str, rev: str | None) -> tuple[str, bool]:
 #     but naming it in docs/internal/ is the whole point of an internal record, and the
 #     format notes legitimately cite the captures a decode was verified against.
 #
-# Without this distinction, a capture name could only be added to the scan by failing the gate
-# on the internal format notes that are pruned before publishing, so it would be left out.
+# With this prefix, a capture name can be scanned for without failing on the internal
+# format notes that are pruned before publishing.
 _PUBLISHED_ONLY_PREFIX = "published-only:"
 # The tier tools/publish_tree.py prunes. Kept in sync with its _INTERNAL by the release-gate
 # test, so the two cannot drift into disagreeing about what "published" means.
@@ -232,20 +357,34 @@ def _scan_text(path: str, patterns) -> int:
 
 def main() -> int:
     # REFUSE AN ARGUMENT THIS DOES NOT UNDERSTAND, rather than falling through to the default
-    # scan. `--text=<file>` mistyped as `--tex=` used to scan the WORKING TREE instead and print
-    # "no leaks found" — a pass, about input the caller never named. That is the NOT-RUN-HERE
-    # failure in the one tool whose whole job is to be believed: the release description it was
-    # pointed at would have gone out unscanned, and the transcript would show a green run.
+    # scan: a mistyped `--text=` must not report a pass about input the caller never named.
     known = [a for a in sys.argv[1:] if a.startswith("-")]
-    if any(not a.startswith("--text=") for a in known):
-        bad = [a for a in known if not a.startswith("--text=")]
+    bad = [a for a in known if not a.startswith(("--text=", "--tree="))]
+    if bad:
         print(f"unknown option(s): {' '.join(bad)}\n{__doc__}", file=sys.stderr)
         return 2
     text_arg = next((a.split("=", 1)[1] for a in sys.argv[1:]
                      if a.startswith("--text=")), None)
+    tree = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--tree=")), None)
     rev = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+    if tree is not None:
+        if rev or text_arg is not None:
+            print("--tree= scans a directory; it takes no <sha> and no --text=",
+                  file=sys.stderr)
+            return 2
+        if not os.path.isdir(tree):
+            print(f"--tree={tree}: no such directory", file=sys.stderr)
+            return 2
     site, site_path = _site_patterns()
-    patterns = [(re.compile(p, re.I), why, False, True) for p, why in _STRUCTURAL]
+    # This checkout's path, and the scanned tree's when that is another directory.
+    if tree is None:
+        own = _own_path_patterns(_ROOT)
+    else:
+        own = _own_path_patterns(tree)
+        own += [p for p in _own_path_patterns(_ROOT, "absolute path of the scanner's checkout")
+                if p[0] not in {rx for rx, _ in own}]
+    struct_pats = _STRUCTURAL + own
+    patterns = [(re.compile(p, re.I), why, False, True) for p, why in struct_pats]
     patterns += [(re.compile(p, re.I), why, only, False) for p, why, only in site]
     if text_arg is not None:
         if not os.path.isfile(text_arg):
@@ -256,7 +395,7 @@ def main() -> int:
         return _scan_text(text_arg, patterns)
 
     hits: list[tuple[str, int, str, str]] = []
-    files = _files(rev)
+    files = _files(rev, tree)
     n_binary = 0
     for path in files:
         # The PATH itself can leak — a fixture named after a device discloses it without the
@@ -271,7 +410,7 @@ def main() -> int:
             m = rx.search(path)
             if m:
                 hits.append((path, 0, m.group(0), why + " — IN THE FILE NAME"))
-        text, is_binary = _content(path, rev)
+        text, is_binary = _content(path, rev, tree)
         n_binary += is_binary
         if not text:
             continue
@@ -286,12 +425,19 @@ def main() -> int:
                     hits.append((path, i, m.group(0),
                                  why + (" (printable run in a binary)" if is_binary else "")))
 
-    where = f"commit {rev}" if rev else "the working tree"
+    where = (f"commit {rev}" if rev else f"the tree at {tree}" if tree is not None
+             else "the working tree (tracked + untracked, not ignored)")
     print(f"leak scan — {where}: {len(files)} files "
           f"({len(files) - n_binary} text, {n_binary} binary), {len(patterns)} patterns "
-          f"({len(_STRUCTURAL)} structural, {len(site)} site-specific)")
+          f"({len(struct_pats)} structural, {len(site)} site-specific)")
+    if _SKIPPED and not rev:
+        print(f"  {len(_SKIPPED)} path(s) not scanned: .git, or excluded by the tree's "
+              f".gitignore")
     if site_path:
         print(f"  site patterns from {site_path}")
+        if not site:
+            print(f"  {site_path} holds NO patterns — host names, repository names and lab"
+                  "\n  addresses are NOT covered by this run.")
     else:
         # Loud, because a missing site list means the scan covered LESS than it looks like.
         print("  no $SWI3S_LEAK_PATTERNS set — structural checks only. Host names, repository"

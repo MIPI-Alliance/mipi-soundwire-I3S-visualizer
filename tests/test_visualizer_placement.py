@@ -1,19 +1,15 @@
-"""SWI3S Visualizer placement regression — ported from the visualizer's own test
-suite (`mipi-soundwire-I3S-visualizer/test/testsuite.py`).
+"""SWI3S Visualizer placement regression.
 
-The visualizer's tests run each example CSV through its placement model and check
-the result against a golden output. Studio reuses that placement as the verified
-C++ core, so the equivalent Studio test asserts that **Studio's per-data-port
-placement matches the visualizer's** for every example config.
+Asserts that **Studio's per-data-port placement (the C++ core) matches the
+visualizer's** for every example config.
 
 Fixtures:
 - `visualizer_examples/<category>/<name>.csv` (repo root) — the visualizer's
   example configs (directed tests, spec figures, use cases), the source of inputs.
 - `tests/visualizer/golden/<category>/<name>.txt` — the per-data-port placement for
   that config: one `dp row col SLOT` line per owned slot, with a `# rows N` header.
-  Authored for Studio (not part of the upstream visualizer suite, which uses the JSON
-  goldens); the placements were dumped from the vendored swviz engine, so this test is
-  a change-detector for the C++ core against that engine, NOT an independent oracle —
+  The placements are dumped from the vendored swviz engine, so this test is a
+  change-detector for the C++ core against that engine, NOT an independent oracle —
   the spec + reviewed CSVs are the authority when a golden changes.
 
 Comparison: for each config we solo-place every enabled data port through the C++
@@ -35,9 +31,8 @@ from swi3s_studio.model.bus_config import BusConfig
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VIZ = os.path.join(_HERE, "visualizer")
-# Example configs are the repo-root visualizer_examples/ folder (copied verbatim
-# from the original visualizer); the golden placements stay vendored under
-# tests/visualizer/golden.
+# Example configs are the repo-root visualizer_examples/ folder; the golden
+# placements stay vendored under tests/visualizer/golden.
 _EXAMPLES = os.path.join(os.path.dirname(_HERE), "visualizer_examples")
 
 # Studio SLOT_NAMES -> the visualizer's slot strings.

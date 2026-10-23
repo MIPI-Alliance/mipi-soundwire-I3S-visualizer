@@ -1,11 +1,10 @@
 """Visualizer visual style — single source of truth for the SWI3S Studio
-"Bus Visualizer" look, ported from the standalone SoundWire I3S Visualizer's
-customtkinter dark theme.
+"Bus Visualizer" look.
 
-Centralising the colours, backgrounds and corner radii here (rather than
-scattering hex literals through the widgets) lets the authoring panel, its
-sub-panes (Description / Notifications), the data-port key and the bus grid all
-share one consistent palette — matching the original Visualizer.
+The colours, backgrounds, corner radii and Qt stylesheets live here, not as hex
+literals in the widgets: the authoring panel, its sub-panes (Description /
+Notifications), the data-port key, the bus grid and the Analyzer views all read
+their palette from this module.
 """
 from __future__ import annotations
 
@@ -13,6 +12,13 @@ import os
 
 _ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 _CHECK_SVG = os.path.join(_ASSETS, "check.svg").replace("\\", "/")
+
+
+def _branch_svg(state: str, mode: "str | None" = None) -> str:
+    """A tree section's open / closed arrow, TEXT-coloured like its heading in the active
+    theme (or in `mode`'s): "down" when open, "right" when closed."""
+    mode = mode or VizTheme.MODE
+    return os.path.join(_ASSETS, f"chevron-{state}-{mode}.svg").replace("\\", "/")
 
 
 def _chevron_svg() -> str:
@@ -23,7 +29,7 @@ def _chevron_svg() -> str:
 
 class VizTheme:
     """Active palette. Colour attributes are (re)assigned by :func:`apply_palette`
-    (default dark, set at import); consumers read ``VizTheme.X`` as before, so a
+    (default dark, set at import); consumers read ``VizTheme.X``, so a
     theme switch + re-render picks up the new values. Sizes/typography below are
     theme-independent."""
     BORDER_WIDTH = 1
@@ -34,11 +40,8 @@ class VizTheme:
 
     # Declared, not assigned: apply_palette() setattr()s every palette key onto this
     # class at import. Bare annotations give a type checker the names and types without
-    # creating class attributes, so runtime behaviour is unchanged. Before this, mypy
-    # saw NONE of them and reported 243 'type[VizTheme] has no attribute' errors across
-    # 15 files — 54% of the whole tree's type debt, from one dynamic-assignment pattern.
-    # tests/test_theme.py pins this list against the palettes so a new colour cannot be
-    # added without declaring it.
+    # creating class attributes, so runtime behaviour is unchanged. tests/test_theme.py
+    # pins this list against the palettes: declare every new colour here.
     WINDOW_BG: str
     FRAME_BG: str
     ENTRY_BG: str
@@ -90,7 +93,7 @@ class VizTheme:
 
 
 # Each palette defines every colour key. apply_palette() copies one onto VizTheme.
-# Dark is the original Visualizer palette; light is its readable counterpart
+# Dark is the Visualizer palette; light is its readable counterpart
 # (flipped backgrounds/text + slightly darkened data colours for white canvases).
 _DARK = {
     "WINDOW_BG": "#242424", "FRAME_BG": "#2b2b2b", "ENTRY_BG": "#2b2b2b",
@@ -101,7 +104,6 @@ _DARK = {
     "GRID_CDS_FILL": "#34373c",
     "PLOT_BG": "#1e2023", "CURSOR": "#f5f5f5", "AXIS": "#787878",
     # Plot gridlines are pyqtgraph's axis grey (150,150,150) at this opacity over PLOT_BG.
-    # 0.2 (1.38:1) is too faint behind the Audio waveforms.
     "PLOT_GRID_ALPHA": 0.35,                                 # 1.82:1 on #1e2023
     "TRACE_PALETTE": ["#3c96c8", "#46be82", "#c85a6e", "#beaa46", "#9670c8", "#5ac8c8"],
     # Data-port colours drawn as LINES (Audio waveforms, Capture lane overlays, bookmark
@@ -114,7 +116,7 @@ _DARK = {
     "SEM_COMMIT": "#5aaae6", "SEM_READ": "#b48ceb", "SEM_OTHER": "#5ac88c",
     "SEM_PING": "#6e7882", "SEM_BOOKMARK": "#e15ad2", "SEM_BRINGUP": "#3cc8dc",
     "SEM_SYNC": "#ee8b3d",
-    "PROV_DEFAULT": "#8c8c8c", "PROV_WRITTEN": "#3caa4b", "PROV_CSV": "#4682d2",
+    "PROV_DEFAULT": "#3bb8c3", "PROV_WRITTEN": "#3caa4b", "PROV_CSV": "#4682d2",
     "PROV_UI": "#e1962b",
     "SYM_INVALID": "#c8505a", "SYM_ROBUST": "#50a0dc", "SYM_DCODE": "#5abe82",
     "SYM_KCODE": "#aa78d2", "SYM_UNKNOWN": "#c8c8c8",
@@ -129,8 +131,6 @@ _LIGHT = {
     "GRID_LINE": "#9098a0", "GRID_TEXT": "#2a2e33", "GRID_INK": "#0f0f12",
     "GRID_CDS_FILL": "#e2e5e9",
     "PLOT_BG": "#ffffff", "CURSOR": "#1a1a1a", "AXIS": "#909090",
-    # 0.2 here blends to #eaeaea, 1.2:1 on white, and the grid all but vanished; 0.45
-    # (1.55:1) is still too faint behind the Audio waveforms.
     "PLOT_GRID_ALPHA": 0.65,                                 # 1.93:1 on white
     "TRACE_PALETTE": ["#2f7db4", "#2fa86e", "#c04a5e", "#9c8520", "#8050c0", "#1f9b9b"],
     # The pastels on white fall to 1.03:1, so each hue is darkened in HSL (hue and
@@ -145,7 +145,7 @@ _LIGHT = {
     "SEM_COMMIT": "#1f6aa5", "SEM_READ": "#7d3c98", "SEM_OTHER": "#2e8b57",
     "SEM_PING": "#737a82", "SEM_BOOKMARK": "#c026b8", "SEM_BRINGUP": "#1597ad",
     "SEM_SYNC": "#d1691c",
-    "PROV_DEFAULT": "#808080", "PROV_WRITTEN": "#2e8b3c", "PROV_CSV": "#2f6fc0",
+    "PROV_DEFAULT": "#16808a", "PROV_WRITTEN": "#2e8b3c", "PROV_CSV": "#2f6fc0",
     "PROV_UI": "#c47a16",
     "SYM_INVALID": "#c0303a", "SYM_ROBUST": "#2f7fc0", "SYM_DCODE": "#2ea05e",
     "SYM_KCODE": "#7d52b8", "SYM_UNKNOWN": "#888888",
@@ -313,6 +313,18 @@ def analyzer_stylesheet() -> str:
         outline: none;
     }}
     QTableView::item, QTreeView::item {{ padding: 1px 4px; }}
+    QTreeView::branch:has-children:closed {{ image: url({_branch_svg("right")}); }}
+    QTreeView::branch:has-children:open {{ image: url({_branch_svg("down")}); }}
+    /* A styled branch is painted without the selected row's fill (like ::item above), so
+       the arrow sat on a strip of panel colour: it takes the row's fill, and the arrow the
+       light shade of the row's white text. */
+    QTreeView::branch:selected, QTreeView::branch:selected:!active {{
+        background: {t.ACCENT};
+    }}
+    QTreeView::branch:has-children:closed:selected {{
+        image: url({_branch_svg("right", "dark")});
+    }}
+    QTreeView::branch:has-children:open:selected {{ image: url({_branch_svg("down", "dark")}); }}
     /* Styling ::item above disables Qt's built-in selection fill, so the parent
        selection-background-color no longer paints — the row would select (and copy)
        but show NO highlight. Restore it explicitly, and keep it visible when the view
@@ -403,11 +415,9 @@ def analyzer_stylesheet() -> str:
 
 
 def combo_qss() -> str:
-    """Every drop-down's look: the entry recipe and an explicit chevron. Without its own
-    arrow image a combo showed one or not depending on its parent's stylesheet (the
-    Commands picker did, the Link pickers in the dock title bars, under a blanket
-    background rule, did not); an arrow says "click to change", so all have it. The
-    drop-down button is merged into the field: no separate box beside the arrow."""
+    """Every drop-down's look: the entry recipe and an explicit chevron, so every combo
+    shows its arrow whatever its parent's stylesheet. The drop-down button is merged
+    into the field: no separate box beside the arrow."""
     t = VizTheme
     return f"""
     QComboBox {{
@@ -454,11 +464,9 @@ def chrome_stylesheet() -> str:
        paints a pale button frame behind the X that a QSS `::close-button` background
        can't suppress (QStyleSheetStyle re-renders the sub-control), so the close
        button is owned + themed directly there instead. */
-    /* Dock tabs sit at the BOTTOM of each pane (South) and are flush against the
-       window edge, so a tab rounded only on one side gets its other corners clipped by
-       that edge. Draw each tab as a fully-rounded chip lifted a few px off both edges
-       (top/bottom margin) so none of its corners are cut; deselected reads via dimmer
-       text, selected via full text + an accent outline. */
+    /* Each tab is a fully-rounded chip lifted a few px off both edges (top/bottom
+       margin) so none of its corners are cut; deselected reads via dimmer text, selected
+       via full text + an accent outline. */
     QTabBar {{ background: {t.FRAME_BG}; border: none; }}
     QTabBar::tab {{
         background: {t.FRAME_BG}; color: {t.TEXT_DIM};
@@ -468,6 +476,12 @@ def chrome_stylesheet() -> str:
     }}
     QTabBar::tab:selected {{ color: {t.TEXT}; border-color: {t.ACCENT}; }}
     QTabBar::tab:!selected:hover {{ color: {t.TEXT}; }}
+    /* A tabbed pane's tabs are in its title bar (QTabBar#paneTabs, main_window's
+       _DockTitleBar). The dock area's own tab bar, a direct child of the window, keeps
+       the group's order and the pane in front, and is collapsed to no height. */
+    QTabBar#paneTabs::tab {{ padding: 1px 10px; margin: 0 3px 0 0; }}
+    QMainWindow > QTabBar {{ max-height: 0px; }}
+    QMainWindow > QTabBar::tab {{ height: 0px; padding: 0; margin: 0; border: none; }}
     QProgressDialog {{ background: {t.FRAME_BG}; color: {t.TEXT}; }}
     QProgressDialog QLabel {{ color: {t.TEXT}; background: transparent; }}
     QProgressBar {{

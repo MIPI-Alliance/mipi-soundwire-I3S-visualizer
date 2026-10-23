@@ -4,8 +4,8 @@
 # Build with:  pyinstaller swi3s-studio.spec
 #
 # Bundles the app, the swi3score extension module (must be importable in the
-# build env — `pip install ./native` first), and data/registers.json under data/
-# where the runtime loader checks sys._MEIPASS/data. (init.csv is a user-supplied
+# build env — `pip install ./native` first), and data/registers.json and data/demos/
+# under data/, where the runtime loaders check sys._MEIPASS/data. (init.csv is a user-supplied
 # local file, not bundled; Load Init falls back to the built-in demo config.)
 import os
 import sys
@@ -17,6 +17,8 @@ IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 
 datas = [(os.path.join(HERE, "data", "registers.json"), "data"),
+         # File ▸ Open Demo Capture's workspaces (workspace.demo_dir reads _MEIPASS/data/demos).
+         (os.path.join(HERE, "data", "demos"), os.path.join("data", "demos")),
          # The stylesheet's SVGs (checkbox tick, combo chevrons), found beside theme.py
          # (os.path.dirname(__file__)), so they go where the frozen module lives.
          (os.path.join(HERE, "swi3s_studio", "ui", "assets"), os.path.join("swi3s_studio", "ui", "assets")),

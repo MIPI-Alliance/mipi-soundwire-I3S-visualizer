@@ -10,25 +10,42 @@
 
 ## 1. Where the style lives
 
-There is **one source of truth**: `swi3s_studio/ui/theme.py` (`VizTheme` +
-`authoring_stylesheet()` + `SCROLLBAR_QSS`). The rule that keeps the app coherent:
+There is **one source of truth**: `swi3s_studio/ui/theme.py` (`VizTheme` + the
+stylesheet builders `authoring_stylesheet()`, `analyzer_stylesheet()`, `chrome_stylesheet()`,
+`combo_qss()` and `scrollbar_qss()`). The rule that keeps the app coherent:
 
 > **Never scatter hex literals or radii through widgets.** Pull every colour,
 > border, radius, and font size from `VizTheme`. If a value isn't there yet, add it
 > there and reference it — don't inline it.
 
-The look is a port of the standalone SoundWire I3S Visualizer's customtkinter dark
-theme, so the vocabulary (frame / entry / accent / border) mirrors customtkinter.
+**The palette changes at run time.** `theme.py` holds two palettes, `_DARK` and `_LIGHT`,
+and `apply_palette(mode)` copies one onto `VizTheme`'s colour attributes (dark at import,
+then the saved View ▸ Appearance choice). A theme switch calls `apply_palette`, then
+`MainWindow._restyle()`, which re-applies the chrome and calls `retheme()` on every view
+that caches colours. So:
+
+- Read `VizTheme.X` when you build a stylesheet, pen or brush, and call the builder
+  functions at that point. Never capture a colour or a built stylesheet in a module-level
+  constant: it keeps the palette of import time.
+- A widget that caches colours gives itself a `retheme()` that rebuilds them, and is in
+  the list `_restyle()` walks.
+- Define a new colour key in BOTH palettes and declare it on `VizTheme`
+  (`tests/test_theme.py` checks the declarations against the palettes).
+
+The token vocabulary (frame / entry / accent / border) mirrors customtkinter's dark
+theme.
 
 ## 2. Palette
 
-All values are defined in `VizTheme`. Use the **name**, not the hex.
+All values are defined in `VizTheme`. Use the **name**, not the hex. The hex values below
+are the dark palette (`_DARK`); the light palette (`_LIGHT`) assigns every token its own
+value.
 
-| Token | Hex | Role |
+| Token | Hex (dark) | Role |
 |---|---|---|
 | `WINDOW_BG` | `#242424` (gray13) | Outermost window only |
 | `FRAME_BG` | `#2b2b2b` (gray17) | **Everything**: panels, sections, fields, grid background |
-| `ENTRY_BG` | `#2b2b2b` | Text entries / checkboxes / description — *same as the frame* |
+| `ENTRY_BG` | `#2b2b2b` | Text entries / checkboxes / description — the frame's colour in dark; white on the light palette's near-white frame |
 | `BORDER` | `#565b5e` | Light-grey border for entries, DP chips, sub-panels |
 | `TEXT` | `#dce4ee` | Primary light text |
 | `TEXT_DIM` | `#7a848d` | Disabled / secondary text |
@@ -109,8 +126,7 @@ selection-background-color: ACCENT;
 The indicator is the whole control (no trailing label). Centre it with
 `spacing:0` + `subcontrol-position:center`, 16×16, 4px radius, `ENTRY_BG` fill with
 a `CHECK_BORDER` outline. Checked → `CHECK_ON` fill + the bundled `assets/check.svg`
-as `image:`. (See the comment block in `authoring_stylesheet()` — getting a Qt
-checkbox truly centred is fiddly and that comment explains why.)
+as `image:`.
 
 ### Sub-panel frame (Description / Notifications)
 Give the frame an `objectName` and scope the style to it so children don't inherit
@@ -119,10 +135,11 @@ the border:
 #notifFrame { border: 1px solid BORDER; border-radius: 6px; background: FRAME_BG; }
 ```
 
-### Scrollbars (`SCROLLBAR_QSS`)
-Transparent track (no groove), rounded `#5a6068` handle (radius 5, min 32px),
-hover `#6f7680`, **no arrow buttons** (`add-line`/`sub-line` sized to 0). Append
-`SCROLLBAR_QSS` to any scrollable widget's stylesheet.
+### Scrollbars (`scrollbar_qss()`)
+Transparent track (no groove), rounded `SCROLL_HANDLE` handle (radius 5, min 32px),
+hover `SCROLL_HANDLE_HOVER`, **no arrow buttons** (`add-line`/`sub-line` sized to 0).
+Append `scrollbar_qss()` to any scrollable widget's stylesheet when the stylesheet is
+built, so the handle follows the active palette.
 
 ### Header label (`HEADER_CSS`)
 `font-size:15px; font-weight:600;` — used for panel names, centred where it titles
@@ -137,7 +154,7 @@ same way `authoring_stylesheet()` is applied to the AuthoringPanel) for:
   rounded frame, `ACCENT` selection (white text), 12px text.
 - `QHeaderView::section` on `WINDOW_BG` with `BORDER` separators — a flat dark header.
 - `QPushButton` (the ACCENT recipe), themed `QComboBox`, centred `QCheckBox`, and the
-  shared `SCROLLBAR_QSS` — so a whole view themes from one call.
+  shared `scrollbar_qss()` — so a whole view themes from one call.
 
 Per-cell colour (error rows, provenance, symbol kinds) is set via the model/items
 on top of this — see §8.
@@ -147,7 +164,7 @@ on top of this — see §8.
 The grid is a `QGraphicsScene`, not styled widgets, but it follows the same palette
 via `VizTheme.GRID_*`:
 
-| Token | Hex | Role |
+| Token | Hex (dark) | Role |
 |---|---|---|
 | `GRID_BG` | = `FRAME_BG` | Canvas / empty cells — same as the panels |
 | `GRID_LINE` | `#8c9196` | Grid lines (a touch lighter than pure dark) |
@@ -164,9 +181,8 @@ Conventions worth carrying elsewhere:
   masking the square corner nubs with `FRAME_BG` rectangles (z=50) then stroking a
   rounded-rect path on top (z=51). **The masks extend ~2px *outward* past the frame
   edge** so they swallow the outer half of the 1px cell-border pen — otherwise a
-  square nub pokes out beyond the arc. (This was a real bug; see the comment at
-  `grid_view._draw_frame`.)
-- **Pastel data colours ("Eddie's colours").** The 12-entry `_DP_PALETTE` (also in
+  square nub pokes out beyond the arc.
+- **Pastel data colours (the Visualizer palette).** The 12-entry `_DP_PALETTE` (also in
   `authoring_panel._DP_COLORS`) colours data streams; dark `GRID_INK` text sits on
   top. Keep these two lists in sync.
 - **State via colour, loudly.** Diffs and clashes use 2px outlines in saturated
@@ -179,8 +195,7 @@ Conventions worth carrying elsewhere:
 The Analyzer needs colours the base palette doesn't cover — waveform traces, symbol
 classes, timeline marks, register provenance. These are *meaning-bearing*, so they're
 legitimate; the rule is they live in `VizTheme` (one source of truth), **not** re-typed
-as local literals per view. They were the main audit finding: the same value (plot
-`#1e2023`, cursor `#f5f5f5`, axis grey) was retyped in three+ files.
+as local literals per view.
 
 | Group | Tokens | Used by |
 |---|---|---|
@@ -207,8 +222,7 @@ Rules:
   (`setFixedWidth(320)` / `300` / button `180` / value cells `64`). The aim is a
   dense instrument panel, not an airy web page.
 - **Reclaim vertical space.** Prefer a menu over a toolbar, drop the status bar where
-  a transient label suffices, and size panes to content on first load. (Several recent
-  Visualizer commits exist purely to claw back vertical room.)
+  a transient label suffices, and size panes to content on first load.
 - **Centre status/feedback text**, dim it (`TEXT` or `TEXT_DIM`), and word-wrap it —
   e.g. the "Loaded: init.csv" file-status label under the Notifications panel.
 
@@ -221,7 +235,8 @@ When styling a new tab or widget so it matches the Visualizer:
 3. Pull every colour/size from `VizTheme`; add new tokens there if needed.
 4. Buttons → the ACCENT/hover recipe. Don't invent button colours.
 5. Body text 12px; headers `HEADER_CSS` (15/600); page titles `TITLE_CSS` (18/600).
-6. Tables/trees → `analyzer_stylesheet()`. Any other scroll area → append `SCROLLBAR_QSS`.
+6. Tables/trees → `analyzer_stylesheet()`. Any other scroll area → append `scrollbar_qss()`.
+   Build stylesheets when the widget is styled, and rebuild them in its `retheme()`.
 7. Meaning-bearing colours (traces, marks, provenance, kinds) → the §7 tokens, not literals.
 8. Reserve 2px borders and saturated colours for **state signals** only.
 9. Keep spacing tight and panels content-sized; reclaim vertical space.

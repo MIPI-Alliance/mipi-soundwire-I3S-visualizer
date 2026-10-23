@@ -1,10 +1,7 @@
 """Full-corpus CSV round-trip — every example config survives save -> reload intact.
 
-The upstream visualizer suite round-tripped every config (load CSV -> save CSV ->
-reload -> compare JSON) to prove no authoring data is lost across a save/load cycle.
-Studio previously had only a couple of targeted BusConfig round-trip cases
-(test_config_csv); this restores whole-corpus coverage using the same CSVHandler
-save/load path the app uses.
+Each config is loaded, saved and reloaded through the CSVHandler save/load path the app
+uses, and the built bus model JSON is compared with the original's.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_visualizer_roundtrip.py
 """
@@ -35,7 +32,7 @@ def _resave(src_csv: str, dst_csv: str) -> None:
 def test_all_configs_csv_roundtrip():
     """load -> save -> reload leaves the built bus model byte-for-byte identical, for
     every example config. Catches any authoring field dropped/reordered by the CSV
-    writer across the whole corpus, not just the hand-picked cases in test_config_csv."""
+    writer."""
     csvs = _all_example_csvs()
     assert len(csvs) >= 89, f"expected the vendored example corpus, found {len(csvs)}"
     fails = []

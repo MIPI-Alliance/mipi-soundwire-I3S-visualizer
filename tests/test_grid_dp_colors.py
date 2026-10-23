@@ -5,12 +5,8 @@ number across different devices is fine (BusConfig.duplicate_dp_numbers). A smar
 config exercises that: four devices each own a DP0 and a DP1, so eight distinct ports
 carry only two distinct DataPortNumbers.
 
-The grid used to colour by that number. Every one of those eight ports collapsed onto
-two colours and the top key drew two swatches ("DP0", "DP1"), so the rendered colours
-did not identify what the key named. Colouring by slot restores the reference
-Visualizer's behaviour — there a cell's `dp` *was* the slot index, which is why
-`palette[dp % 12]` was right in frame_renderer and wrong once Studio's cells started
-carrying the logical number (see model/viz_engine.py).
+The grid colours by slot (`dp_index`), so each of those eight ports gets its own colour
+and key swatch. A cell's `dp` carries the logical number (see model/viz_engine.py).
 
 Run: python3 -m pytest tests/test_grid_dp_colors.py
 """
@@ -30,7 +26,7 @@ def qapp():
 
 
 # (device, dp_number, name) per slot — two numbers shared across four devices, the
-# manager included (device -1), which is exactly the shape that used to collapse.
+# manager included (device -1).
 _PORTS = [(-1, 0, "IV"), (0, 0, "SB0"), (1, 0, "SB1"), (2, 0, "TWT"),
           (-1, 1, "DL"), (0, 1, "SB1"), (1, 1, "SB2"), (2, 1, "TWT")]
 
@@ -92,9 +88,8 @@ def test_every_port_gets_its_own_colour_and_swatch(qapp):
 
 
 def test_colouring_by_dp_number_would_collapse_these_ports(qapp):
-    """The mutation this file exists to catch: drop `dp_index` and the fallback keys on
-    the logical number again, reproducing the old two-colour render. If this stops
-    collapsing, the fixture no longer reproduces the bug and the guard above is inert."""
+    """Without `dp_index` the fallback keys on the logical number and these ports collapse
+    to two colours. Pins that the fixture distinguishes slot from number colouring."""
     from swi3s_studio.ui.grid_view import GridView
 
     cfg = _smart_amp_cfg()
@@ -140,9 +135,9 @@ def test_key_labels_identify_the_port_not_the_slot(qapp):
 
 
 def test_engine_key_swatches_stay_non_clickable(qapp):
-    """Colouring by slot means a swatch *could* now name a (device, dp) port, but the
-    authoring panel owns label-field editing in this mode — the click target belongs to
-    the Analyzer grid alone (see test_grid_label_fields)."""
+    """Engine-mode key swatches are not clickable: the authoring panel owns label-field
+    editing in this mode; the click target belongs to the Analyzer grid alone (see
+    test_grid_label_fields)."""
     from swi3s_studio.ui.grid_view import GridView
 
     cfg = _smart_amp_cfg()

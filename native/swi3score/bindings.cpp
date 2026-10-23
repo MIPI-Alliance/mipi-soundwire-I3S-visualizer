@@ -5,6 +5,7 @@
 #include <pybind11/numpy.h>
 
 #include <algorithm>          // std::copy
+#include <memory>             // pyOwner()
 #include <stdexcept>          // requireAudio() throws
 
 #include "ISampleSource.h"
@@ -170,45 +171,28 @@ static void requireAudio(const Decoder& d)
             "out. Read the copy — Session.audio_columns() / Session.audio — not the decoder.");
 }
 
+// An opaque owner handle for a C++ object that views a Python object's buffer: holds a
+// reference to `obj` and drops it, under the GIL, when the last copy of the handle goes.
+static std::shared_ptr<const void> pyOwner(py::object obj)
+{
+    auto* held = new py::object(std::move(obj));
+    return std::shared_ptr<const void>(held, [](const void* p) {
+        py::gil_scoped_acquire gil;
+        delete static_cast<const py::object*>(p);
+    });
+}
+
 PYBIND11_MODULE(swi3score, m)
 {
     m.doc() = "SWI3S PHY2 decode core (reused from the Saleae plugin).";
 
     // ABI version of the Python<->native interface. Bump whenever a binding's
-    // signature / return shape changes in a way the Python side depends on (e.g.
-    // registers_from_commands going from 6- to 8-tuples). swi3s_studio checks this at
-    // decode time and asks the user to rebuild if the loaded .so is stale — so a stale
-    // module gives a clear "rebuild" message instead of a cryptic unpack error.
-    // 7: audio() / audio_columns() gained flow_mode + drq_sample (flow-control decode:
-    //    TX_PRESENT gating + DRQ handshake surfacing).
-    // 8: DecoderSettings gained forced_column_sections (region-scoped forced column
-    //    count). Setting it on an ABI-7 module silently does nothing — the Python side
-    //    would show an "overridden" region badge over an unchanged decode — so it's a
-    //    bump even though no return shape changed.
-    // 9: commands() gained unexpected_ssp_error (an SSP that landed mid-skip-pattern,
-    //    Section 9.1.6.2.1), plus make_skipping_levels. errors.py reads the new key, so an
-    //    ABI-8 module would silently under-report.
-    // (NOT a bump: release_audio() / audio_released(). Purely additive, and the Python side
-    //  asks for it with getattr — an ABI-9 module just keeps holding the audio vector, which
-    //  is what it did before. Nothing's return shape moved.)
-    // 10: the Control Data Stream crossed the CSV <-> register boundary in BOTH directions.
-    //    registers_from_csv / config_registers now EMIT the per-source CDS registers (0x1186
-    //    drive type, 0x1187 bit width / end-drive-early / guard / tail), BuildConfig recovers
-    //    them from snooped writes, and configToDict exports them as cds_* lists.
-    //    A BUMP EVEN THOUGH NO RETURN SHAPE CHANGED, on the same reasoning as ABI 8: an
-    //    ABI-9 module silently omits the CDS registers from registers_from_csv, so Analysis
-    //    > Compare would report the whole CDS block as missing from the expected config —
-    //    a difference a user would chase as a real defect rather than a stale binary. The
-    //    configToDict keys alone would not have justified it (the Python side reads them
-    //    with `in`, so they degrade to defaults).
-    // 11: sosfilt(sos, x, zi) -> (y, zf), the second-order-section IIR cascade the audio
-    //    high-pass runs on. Additive, but a feature depends on it, so an ABI-10 module asks
-    //    for a rebuild instead of failing with an AttributeError mid-dialog.
-    // 12: DecoderSettings gained imported_config_sections (a config CSV imported into one
-    //    region builds that region's port config from the CSV alone). Setting it on an
-    //    ABI-11 module raises AttributeError, and the region would keep the wire's ports.
-    //    Also Decoder.request_stop() / stopped, the memory watchdog's way to end a decode.
-    m.attr("score_abi") = 12;
+    // signature / return shape changes in a way the Python side depends on, or when an
+    // older module would silently ignore a new setting or behaviour the Python side
+    // relies on. swi3s_studio checks this at decode time and asks the user to rebuild if
+    // the loaded .so is stale. A purely additive binding the Python side reaches with
+    // getattr is not a bump.
+    m.attr("score_abi") = 16;
 
     py::class_<ISampleSource>(m, "ISampleSource");
 
@@ -221,18 +205,23 @@ PYBIND11_MODULE(swi3score, m)
         .def(py::init([](py::array_t<std::uint64_t, py::array::c_style> clockEdges,
                          py::array_t<std::uint64_t, py::array::c_style> dataEdges,
                          bool initialClock, bool initialData, std::uint64_t sampleRateHz) {
-                 // Zero-copy: reference the NumPy buffers directly; the arrays are
-                 // kept alive by keep_alive below (no copy of the edge data).
+                 // The source views the buffers of the arrays the casters produced: the
+                 // caller's own arrays when they are already C-contiguous uint64 (zero
+                 // copy), otherwise converted copies that exist only in these parameters.
+                 // Both are handed to the source as its owner, so whichever buffers it
+                 // views live exactly as long as it does.
+                 const std::uint64_t* clock = clockEdges.data();
+                 const std::uint64_t* data = dataEdges.data();
+                 const auto clockN = static_cast<std::size_t>(clockEdges.size());
+                 const auto dataN = static_cast<std::size_t>(dataEdges.size());
                  return new TransitionSampleSource(
-                     clockEdges.data(), static_cast<std::size_t>(clockEdges.size()),
-                     dataEdges.data(), static_cast<std::size_t>(dataEdges.size()),
-                     initialClock, initialData, sampleRateHz);
+                     clock, clockN, data, dataN, initialClock, initialData, sampleRateHz,
+                     pyOwner(py::make_tuple(std::move(clockEdges), std::move(dataEdges))));
              }),
              py::arg("clock_edges"), py::arg("data_edges"),
              py::arg("initial_clock"), py::arg("initial_data"), py::arg("sample_rate_hz"),
-             py::keep_alive<1, 2>(),    // keep clock_edges alive while the source lives
-             py::keep_alive<1, 3>(),    // keep data_edges alive while the source lives
-             "Capture-backed source: clock/data transition arrays (uint64, zero-copy).");
+             "Capture-backed source: clock/data transition arrays (uint64; viewed without a "
+             "copy when C-contiguous uint64, converted once otherwise).");
 
     py::class_<DlvSampleSource, ISampleSource>(m, "DlvSampleSource")
         .def(py::init([](py::array_t<std::uint64_t, py::array::c_style> dpEdges,
@@ -250,7 +239,9 @@ PYBIND11_MODULE(swi3score, m)
              "DLL locked to the Sync1 row edges, sampling mid-UI. initial_columns = Safe-Lock "
              "count; the decoder pushes NumColumns changes. nominal_ui_samples seeds the loop's "
              "free-running UI estimate for the initial geometry (>0 = robust acquisition; the "
-             "aperture tracks the once-per-row reference instead of the first two edges).")
+             "aperture tracks the once-per-row reference instead of the first two edges). "
+             "Each later bring-up (DecoderSettings.restart_points) locks the loop again at its "
+             "first Row Sync, at the seeded row period over its Safe-Lock count.")
         .def("recovered_row_syncs", [](const DlvSampleSource& s) {
                  const auto& v = s.RecoveredRowSyncs();
                  return py::array_t<std::uint64_t>(
@@ -301,6 +292,35 @@ PYBIND11_MODULE(swi3score, m)
                        "mis-locked detector. Per-region because forcing one width over a "
                        "capture that genuinely reconfigures misframes the other regions. "
                        "Out-of-range counts (outside 2..32) are ignored.")
+        .def_readwrite("restart_points", &DecoderSettings::restartPoints,
+                       "Later link bring-ups: list of (sample, column_count, cold, "
+                       "inactive_from) per start sequence after a stopped clock, the first "
+                       "bring-up excluded; any order, points at one sample merged. From "
+                       "inactive_from (the first sample after the clock stopped; 0 = none) "
+                       "to sample (the bring-up's first audio-mode clock edge) nothing is "
+                       "decoded and every data port stops. At sample the decode restarts "
+                       "as at the start of the capture: it re-aligns to the next rising "
+                       "clock edge, frames at column_count (the Safe-Lock count, 2..32; "
+                       "otherwise a Cold Start frames at the cold-start count and a Warm "
+                       "Start keeps the current one), reconfigures the payload engine on "
+                       "the new Column-0 phase and opens a new segment. cold (a Cold "
+                       "Start) also resets the registers, stopping every data port until "
+                       "configured again. A config CSV keeps its ports, and on FBCSE its "
+                       "column count. With dlv the recovered clock locks again at the first "
+                       "Row Sync at or after sample, at the nominal UI of column_count, and "
+                       "is not run through the inactive stretch. Assign a whole list: like "
+                       "every list field here, reading it returns a copy, so appending to "
+                       "settings.restart_points changes nothing.")
+        .def_readwrite("resume_points", &DecoderSettings::resumePoints,
+                       "Clock pauses with no bring-up after them: list of the first clock "
+                       "edge after each stop. Audio mode never pauses its clock, so samples "
+                       "were lost or the capture was joined there. At each the decode checks "
+                       "a fresh window's Column-0 phase at the current column count: in "
+                       "phase it decodes on as if nothing happened; out of phase it re-frames "
+                       "there, its payload engine on the new phase, in a new segment that is "
+                       "no restart (geometry and registers kept). A restart point at the same "
+                       "sample wins. FBCSE only: ignored when dlv, where a pause leaves no "
+                       "row edge to find the row phase from. Assign a whole list.")
         .def_readwrite("imported_config_sections", &DecoderSettings::importedConfigSections,
                        "Section indices (keying segments()) whose payload config is "
                        "built from their register_overrides alone, not from the snooped "
@@ -319,20 +339,10 @@ PYBIND11_MODULE(swi3score, m)
              py::arg("source"), py::arg("settings"),
              py::keep_alive<1, 2>())   // keep the source alive while the decoder lives
         .def("run", &Decoder::run, py::call_guard<py::gil_scoped_release>())
-        // WHY THIS ONE DOES NOT RELEASE THE GIL, unlike audio_columns() / bit_samples() /
-        // bit_samples_window() below. Those release around a fill loop that is pure C++ over
-        // raw buffers; this loop CREATES PYTHON OBJECTS (a dict per command), which requires
-        // the GIL by definition — a gil_scoped_release around it would be undefined
-        // behaviour, not an optimisation. A code review flagged the asymmetry as an
-        // oversight, so it is written down here rather than re-litigated.
-        //
-        // Periodic yield points (release/retake every N dicts) WERE tried, since Session
-        // builds this on the decode worker while the progress dialog wants the GIL. Reverted:
-        // no observable effect. Measured on a 400k-UI demo (7,560 commands) the whole call is
-        // ~10 ms, and a second Python thread got zero extra time slices at yield intervals of
-        // both 4096 and 256 — the windows are microseconds. At a command count where this
-        // would matter (~1M, so ~1.4 s) the binding is not the problem: the same commands
-        // retain ~841 B each on the Python side, which is the finding worth acting on.
+        // commands() does NOT release the GIL, unlike audio_columns() / bit_samples() /
+        // bit_samples_window() below: those release around a fill loop that is pure C++
+        // over raw buffers, while this loop CREATES PYTHON OBJECTS (a dict per command),
+        // which requires the GIL.
         .def("commands", [](const Decoder& d) {
             py::list out;
             for (const auto& c : d.commands()) out.append(commandToDict(c));
@@ -352,6 +362,9 @@ PYBIND11_MODULE(swi3score, m)
         .def_property_readonly("audio_count", [](const Decoder& d) { return d.audio().size(); },
              "Decoded audio samples held, without copying them out (the memory watchdog "
              "sizes the column copy with it before making it).")
+        .def_property_readonly("audio_capacity",
+             [](const Decoder& d) { return d.audio().capacity(); },
+             "Audio sample records allocated (held plus reserved), ~72 B each.")
         .def("audio_released", [](const Decoder& d) { return d.audioReleased(); },
              "True once release_audio() has dropped the samples.")
         .def("audio_columns", [](const Decoder& d) {
@@ -359,8 +372,8 @@ PYBIND11_MODULE(swi3score, m)
             // Columnar (struct-of-arrays) audio: the same data as audio() but as
             // NumPy arrays instead of N per-sample dicts. For dense captures (mic
             // arrays decode tens of millions of samples) building N Python dicts
-            // dominates load time; handing over typed arrays is ~two orders of
-            // magnitude cheaper and lets the Python store group with NumPy.
+            // dominates load time; typed arrays avoid that and let the Python store
+            // group with NumPy.
             const auto& a = d.audio();
             const py::ssize_t n = static_cast<py::ssize_t>(a.size());
             py::array_t<std::int32_t> device(n), dp(n), channel(n), sample_size(n), flow_mode(n);
@@ -378,10 +391,9 @@ PYBIND11_MODULE(swi3score, m)
             auto* pdrq = drq_sample.mutable_data();
             {
                 // The fill loop is pure C++ over raw buffers (no Python objects), and
-                // for dense mic-array captures it copies tens of millions of samples
-                // -> ~1-2 s. Release the GIL across it so the loader's worker thread
-                // doesn't freeze the GUI (the busy spinner) during this late phase of
-                // building the audio store. (run() already releases; this didn't.)
+                // for dense mic-array captures it copies tens of millions of samples.
+                // Release the GIL across it so the loader's worker thread doesn't freeze
+                // the GUI (the busy spinner) while building the audio store.
                 py::gil_scoped_release rel;
                 for (py::ssize_t i = 0; i < n; ++i) {
                     const auto& r = a[static_cast<std::size_t>(i)];
@@ -430,8 +442,11 @@ PYBIND11_MODULE(swi3score, m)
             "UIs consumed so far by run() (n of N) — poll from another thread while "
             "run() is in flight (it releases the GIL) to drive a load-progress dialog.")
         .def_property_readonly("total_uis", &Decoder::totalUis,
-            "Total UI count for this run, fixed once run() starts; 0 if the source "
-            "can't report one up front (pure streaming) — treat 0 as unknown, not done.")
+            "Total UI count for this run: read from the source when run() starts, then "
+            "refreshed every 64k UIs and at the end of run(), never below progress_uis. "
+            "Exact for a forwarded-clock source; an estimate that follows the current UI "
+            "period for a recovered-clock source. 0 if the source can't report one (pure "
+            "streaming) — treat 0 as unknown, not done.")
         .def("request_stop", &Decoder::requestStop,
             "Ask an in-flight run() to stop (call from another thread; run() releases the "
             "GIL). It returns within ~64k UIs with what it decoded so far.")
@@ -447,12 +462,16 @@ PYBIND11_MODULE(swi3score, m)
                 e["start_sample"] = s.startSample;
                 e["column_count"] = s.columnCount;
                 e["row_base"] = s.rowBase;
+                e["restart"] = s.restart;
+                e["cold_start"] = s.coldStart;
                 out.append(e);
             }
             return out;
-        }, "Decode segments (one per column count): each has start_ui, "
-           "start_sample, column_count and row_base (cumulative bus row at the "
-           "segment start). Bus rows are continuous across segments.")
+        }, "Decode segments (one per column count or link restart): each has "
+           "start_ui, start_sample, column_count, row_base (cumulative bus row at "
+           "the segment start), restart (opened by a later link bring-up, see "
+           "restart_points) and cold_start (that bring-up was a Cold Start). Bus "
+           "rows are continuous across segments.")
         .def("bit_samples", [](const Decoder& d) {
             // Per-data-bit sample points (columnar), populated only when
             // settings.collect_bit_samples was set. Keys: sample, device, dp,
@@ -783,6 +802,19 @@ PYBIND11_MODULE(swi3score, m)
        "Per-device register writes (device, address, value) encoding a visualizer "
        "CSV config — the EXPECTED registers, for the register-view comparison.");
 
+    m.def("csv_warnings", [](const std::string& csvPath) {
+        SwI3sConfig cfg;
+        std::string err;
+        py::list out;
+        if (!cfg.LoadCsv(csvPath, err)) return out;
+        for (const auto& w : cfg.warnings) out.append(w);
+        return out;
+    }, py::arg("csv_path"),
+       "What reading a visualizer CSV config did not take as written: one line per field "
+       "(a port disabled for its DeviceNumber_REG, a value masked or clamped to its "
+       "register field, an unreadable cell, values past the last column). Empty for a "
+       "clean file or one that cannot be opened.");
+
     m.def("make_demo_levels", &MakeDemoLevels, py::arg("audio_samples_per_channel") = 32,
           "Synthetic PHY2 stream: config + commit + scrambled stereo audio.");
 
@@ -830,6 +862,12 @@ PYBIND11_MODULE(swi3score, m)
           "Test fixture: one scrambled PCM port; a single-ranked write clears ScramblerEn "
           "mid-stream (immediate). mid_interval=True lands the reconfigure mid-interval.");
 
+    m.def("make_immediate_sample_size_levels", &MakeImmediateSampleSizeLevels,
+          py::arg("samples_per_channel") = 32, py::arg("from_size") = 23,
+          py::arg("to_size") = 15, py::arg("rows_into_sample") = 8,
+          "Test fixture: one scrambled PCM port; a single-ranked write changes SampleSize "
+          "from from_size to to_size (register values, bits - 1) with the reconfigure "
+          "rows_into_sample rows into a sample, so that sample is in flight across it.");
     m.def("make_enablech_curr_write_levels", &MakeEnableChCurrWriteLevels,
           py::arg("samples_per_channel") = 32, py::arg("interval") = 0,
           "Test fixture: one PCM port committed with Interval=`interval`; a WriteA32 then "
@@ -909,7 +947,7 @@ PYBIND11_MODULE(swi3score, m)
         // (byte - 0x40), interior bytes >= 0x80 are digits (byte - 0x80), and the first
         // byte < 0x80 terminates (raw low digit). Bit-identical to the Python
         // decode_v3_deltas — this is the hot loop when reading 100s-of-millions-of-edges
-        // .sal captures, so it lives in C++ (the Python byte loop took ~a minute).
+        // .sal captures, so it lives in C++.
         py::buffer_info info = buf.request();
         const std::uint8_t* base = static_cast<const std::uint8_t*>(info.ptr);
         const std::size_t total = static_cast<std::size_t>(info.size);

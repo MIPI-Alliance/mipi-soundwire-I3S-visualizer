@@ -22,17 +22,16 @@ def test_is_complementary_pair():
 
 
 def test_true_sample_rate_from_edge_csv():
-    """A Logic edge (per-transition) CSV: the finest spacing is one UI, so
-    infer_sample_rate under-reports; true_sample_rate_csv recovers the real rate
-    from the timestamp quantum."""
+    """A Logic edge (per-transition) CSV: the finest spacing is one UI, not one sample.
+    true_sample_rate_csv and digital_csv.infer_sample_rate (the grid the timestamps sit on)
+    both recover the real rate."""
     cap = transitions.demo_capture(200, phy=3)             # 500 MHz demo
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "dlv.csv")
         raw_export.export_csv(cap, p, clock_name="SW_CLK", data_name="SW_DATA")
         assert dlv_detect.true_sample_rate_csv(p) == cap.sample_rate_hz
         assert digital_csv.looks_complementary(p, 1, 2)
-        # the edge-spacing heuristic is a UI (< the true rate) on an edge export
-        assert 0 < digital_csv.infer_sample_rate(p) < cap.sample_rate_hz
+        assert digital_csv.infer_sample_rate(p) == cap.sample_rate_hz   # the timestamp grid
 
 
 def test_fbcse_csv_not_complementary():
@@ -108,7 +107,7 @@ def test_session_autodetects_partial_dlv():
 
 
 def test_sal_roundtrip_redetects_dlv():
-    """Regression: exporting a partial DLV capture to .sal and re-importing must decode
+    """Exporting a partial DLV capture to .sal and re-importing must decode
     (the DLV auto-detection runs in the Session ctor, so it covers .sal / .bin, not just
     the CSV importer)."""
     s = Session(transitions.demo_capture(600, phy=3))
@@ -130,9 +129,8 @@ def test_tx_raster_dlv_cds_at_column_2():
 
 
 def test_partial_dlv_visualizer_config_has_geometry():
-    """Regression: opening a partial DLV capture in the Visualizer showed no bus config
-    because config_dataports_at reported 1 column (no config commit on the wire). It now
-    forces the operational width and flags PHY3, so the visualizer shows the DLV frame."""
+    """A partial DLV capture has no config commit on the wire; config_dataports_at forces
+    the operational width and flags PHY3, so the Visualizer shows the DLV frame."""
     from swi3s_studio.model.bus_config import BusConfig
     s = Session(transitions.demo_capture(600, phy=3))
     d = s.config_dataports_at(s.sample_at_bus_row(200))
@@ -155,14 +153,15 @@ def test_single_region_dlv_config_roundtrips_clean():
     assert s.is_dlv and len({seg["column_count"] for seg in s.segments}) == 1  # one region
     before = sum(c["crc_valid"] for c in s.commands)
     if before:                                            # only meaningful if it decoded
-        import os
-        import tempfile
         cfg, _ = BusConfig.from_decoder_config(s.config_dataports_at(None))
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "c.csv")
             cfg.to_csv_file(p)
             s.apply_config_csv(p)
         assert sum(c["crc_valid"] for c in s.commands) == before   # unchanged (clean)
+
+
+def test_from_digital_csv_fbcse_stays_fbcse():
     """A forwarded-clock CSV must NOT be misrouted as DLV (auto_dlv is a no-op when
     the pair isn't complementary)."""
     cap = transitions.demo_capture(200, phy=2)

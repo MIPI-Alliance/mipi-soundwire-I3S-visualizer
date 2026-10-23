@@ -4,15 +4,12 @@ The PHY1/PHY2/PHY3 demos carry DP0 at 44.1 kHz on 48 kHz transport opportunities
 160 intervals are skipped. 44100/48000 == 147/160 exactly, and 160 is the smallest denominator
 that expresses it, so the rate is exact rather than approximated.
 
-WHY DP0 AND NOT DP1. DP0 runs unscrambled. A mis-phased skip then surfaces as a wrong sample
-VALUE, directly readable against the generator's own sine; on the scrambled port it would surface
-as descrambler noise, which looks like a broken decode without saying where. That is the same
-reasoning MakeSkippingLevels documents for its own fixture.
+DP0 runs unscrambled, so a mis-phased skip surfaces as a wrong sample VALUE against the
+generator's own sine.
 
-The value check below is the load-bearing one. A count can be right while the phase is wrong —
-skip interval k instead of k+1 and you still transport 147 of 160, but you read an idle interval
-as a sample and drop a real one. The sine is indexed in SAMPLES, so the decoded stream must equal
-the generated sequence element for element, with no gap, across every SSP and geometry change.
+The value check pins the skip phase, which a sample count cannot: the sine is indexed in
+SAMPLES, so the decoded stream must equal the generated sequence element for element, with no
+gap, across every SSP and geometry change.
 """
 from __future__ import annotations
 
@@ -47,8 +44,8 @@ def _generated_sine(n: int, tone_index: int, sample_size: int = 15) -> np.ndarra
 
 
 def test_the_fraction_is_exact():
-    """Not an approximation, and not a choice with slack in it: 147/160 is in lowest terms, so
-    any other denominator is either a multiple of 160 or cannot express 44.1/48 at all."""
+    """147/160 is in lowest terms, so any other denominator is either a multiple of 160 or
+    cannot express 44.1/48 at all."""
     kept = DEMO_SKIP_DENOMINATOR - DEMO_SKIP_NUMERATOR
     assert 48_000 * kept / DEMO_SKIP_DENOMINATOR == 44_100.0
     assert np.gcd(kept, DEMO_SKIP_DENOMINATOR) == 1, "147/160 must be in lowest terms"
@@ -77,13 +74,11 @@ def test_dp0_transports_fewer_samples_than_dp1(sessions, phy):
 
 @pytest.mark.parametrize("phy", _PHYS)
 def test_every_transported_value_matches_the_generated_sine(sessions, phy):
-    """THE assertion. A skipped interval must advance nothing: the decoded stream equals the
-    generated sequence element for element. Skip the wrong interval and the very first
-    misplacement reads an idle interval (value 0, or the previous sample held) where a real
-    sample was, and every element after it is offset.
+    """A skipped interval advances nothing: the decoded stream equals the generated sequence
+    element for element. A wrong skip interval reads an idle interval (value 0, or the
+    previous sample held) where a real sample was, and offsets every element after it.
 
-    Exact equality, not an SNR floor — these are integers off a deterministic generator, and a
-    tolerance would hide precisely the one-sample slip this exists to catch."""
+    Exact equality, not an SNR floor: these are integers off a deterministic generator."""
     store = sessions[phy].audio_store()
     ch = next(iter(store.channels(0, 0)))
     got = np.asarray(store.samples(0, 0, ch), dtype=np.int64)
@@ -100,8 +95,8 @@ def test_every_transported_value_matches_the_generated_sine(sessions, phy):
 @pytest.mark.parametrize("phy", _PHYS)
 def test_the_demo_decodes_without_an_unexpected_ssp(sessions, phy):
     """A skipping port's legal SSP rows are Interval x SkippingDenominator apart, not Interval
-    (Section 9.1.6.2.1). The demo's SSPA scheduler already multiplies by the denominator; if it
-    did not, an SSPA would land part-way through the pattern and the decoder would flag it."""
+    (Section 9.1.6.2.1). The demo's SSPA scheduler multiplies by the denominator; an SSPA
+    part-way through the pattern is flagged by the decoder."""
     s = sessions[phy]
     flagged = [c for c in s.commands if c.get("unexpected_ssp") or c.get("unexpectedSsp")]
     assert not flagged, f"phy{phy}: {len(flagged)} command(s) flagged an unexpected SSP"
@@ -110,8 +105,7 @@ def test_the_demo_decodes_without_an_unexpected_ssp(sessions, phy):
 
 
 def test_the_flow_control_demo_does_not_skip():
-    """Left alone deliberately: its ports gate transport on DRQ/SourceReady, so skipping would
-    confound two independent reasons for an interval to carry nothing."""
+    """The flow-control demo does not skip: its ports gate transport on DRQ/SourceReady."""
     s = Session.from_demo(400, phy=2, variant="flow_control")
     rates = s.decoder.audio_sample_rates()
     assert rates, "flow-control demo reported no audio streams"

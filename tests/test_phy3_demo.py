@@ -88,9 +88,9 @@ def test_phy3_audio_bit_exact_with_phy2():
 def test_phy3_windowed_bit_samples_resolve():
     """The Capture 'Show Samples' overlay works for DLV: the on-demand windowed bit-
     sample decode resolves port sample points in the audio region (it needs the DLV
-    sample source to be seekable — it wasn't, so nothing drew). Marks cover every
-    active dataport, are all inside the queried window, and a deep window resolves too
-    (seek is O(1), not a replay from the start)."""
+    sample source to be seekable). Marks cover every active dataport, are all inside the
+    queried window, and a deep window resolves too (seek is O(1), not a replay from the
+    start)."""
     s = Session.from_demo(600, cold_start=True, phy=3)
     ui = s.recovered_clock()[1]
     seg16 = s.segments[1]
@@ -130,7 +130,7 @@ def test_phy3_grid_layout_s1_cds_s0():
     column) — not the FBCSE CDS-at-Column-0 layout. Checked on both grid paths (the
     decoder's own grid and the as-of-cursor command replay the UI actually draws),
     and confirmed the audio geometry is the full 16 columns (not the 4-col Safe-Lock
-    segment the sparse DLV clock_edges used to mis-select)."""
+    segment, which the sparse DLV clock_edges would select)."""
     s = Session.from_demo(400, cold_start=True, phy=3)
     smp = int(s.audio_end_sample) - 1
 
@@ -158,7 +158,7 @@ def test_phy3_rsp_marks_are_periodic():
     """The Raw-view RSP (Row Sync Point) marks for a DLV capture are the virtual PLL's
     recovered row-opening edges — periodic (one per row) AND landing on the actual DP
     0→1 (S0→S1) edge that opens each row, all through the audio region (not just at the
-    start, where the old sample-source row counter tracked before drifting)."""
+    start)."""
     s = Session.from_demo(3000, cold_start=True, phy=3)
     clk = np.asarray(s.capture.clock_edges, dtype=np.int64)
     first_rise = 1 if bool(s.capture.initial_clock) else 0
@@ -207,9 +207,8 @@ def test_phy3_pll_unlock_threshold():
 def test_phy3_cursor_row_column_consistent_across_views():
     """A cursor sample in the 16-col audio region must map to the SAME geometry
     everywhere: the column count (Bus Grid), the bus row (Timeline / commands), and the
-    inverse row→sample all agree. Regression: DLV `_ui_for_sample` used to index the
-    sparse clock_edges, so bus_row_for_sample landed below segment 1's row_base and the
-    Timeline read 4-col while the grid read 16-col for the same cursor."""
+    inverse row→sample all agree. DLV `_ui_for_sample` must not index the sparse
+    clock_edges, or bus_row_for_sample lands below segment 1's row_base."""
     s = Session.from_demo(3000, cold_start=True, phy=3)
     assert [seg["column_count"] for seg in s.segments] == [4, 16]
     seg16 = s.segments[1]
@@ -235,8 +234,8 @@ def test_phy3_demo_source_label():
 def test_phy3_top_trace_is_dp_polarity_so_rsp_is_a_rising_edge():
     """The Raw view's top 'V(DP−DN)' trace must show DP polarity (high = Sync1 / logical
     1), so a Row Sync Point (the Sync0→Sync1 0→1 edge the RSP marks) lands on a RISING
-    edge of the shown signal — not a falling one (the bug: the top band was fed the
-    complementary DN wire, inverting it)."""
+    edge of the shown signal — not a falling one (the top band carries the DP wire, not
+    the complementary DN)."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -300,7 +299,7 @@ def test_phy3_cds_symbols_populate():
     real = sum(1 for x in syms if x["kind"] in (1, 2, 3))
     assert real > 150, f"CDS symbols not decoding (only {real} real of {len(syms)})"
     assert any(x["kind"] == 1 for x in syms), "no comma decoded on the DLV CDS"
-    # Clicking any command resolves its symbols (was empty — start_ui landed off Column 0).
+    # Clicking any command resolves its symbols (start_ui must land on Column 0).
     for c in [c for c in s3.commands if c["command"] == "WriteA32"][:3]:
         around = s3.symbols_around(int(c["start_sample"]), 30)
         assert around and any(x["kind"] in (1, 2, 3) for x in around), "symbols_around empty for DLV"
@@ -310,7 +309,7 @@ def test_phy3_recovered_clock_speeds_up_at_commit():
     """The recovered bit clock the Raw view draws changes rate at the commit: it packs one
     cycle per column per row, and the row RATE is constant, so the Safe-Lock-4 region draws
     4 cycles/row and the 16-column operational region 16 — a 4x-faster clock after the commit
-    (not the single fixed period the old constant-UI drawing showed everywhere)."""
+    (not a single fixed period everywhere)."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -351,9 +350,8 @@ def test_phy3_commit_marker_coincides_with_geometry_change():
     """The confirmed-commit marker (Raw view / Timeline) must land on the SAME row where the
     clock and data change to 16 columns — the commit IS the geometry change. The commit's
     effect sample (from effective_row) must resolve to the operational segment's first row's
-    Row Sync, i.e. the row that opens the 16-col region, not one row later. Regression: the
-    DLV bus-row<->RSP map was off by one (rsp[R+1]), so _sample_at_bus_row(effective_row)
-    landed a row past the geometry change and the marker desynced from the clock/data."""
+    Row Sync, i.e. the row that opens the 16-col region, not one row later (the DLV
+    bus-row<->RSP map is rsp[R], not rsp[R+1])."""
     s = Session.from_demo(600, cold_start=True, phy=3)
     seg16 = next(x for x in s.segments if int(x["column_count"]) == 16)
     rsp = np.asarray(s._recovered_row_syncs(), dtype=np.int64)
@@ -370,11 +368,11 @@ def test_phy3_commit_marker_coincides_with_geometry_change():
 
 
 def test_phy3_dlv_timing_polarity_and_per_region_ui():
-    """DLV timing details (release review follow-ups): (a) tr_data_rising is the DP wire's
-    level AFTER each transition — the ((k+1) odd) parity, not (k odd) which is inverted and
-    swapped the eye's rising/falling colours; (b) ui_ns is the MEASURED region's UI (row
-    period / its columns), not the global operational UI — so a Safe-Lock region reports its
-    own ~4x-wider UI, keeping the 'setup/hold ≈ half a UI' invariant per region."""
+    """DLV timing details: (a) tr_data_rising is the DP wire's level AFTER each
+    transition — the ((k+1) odd) parity, not (k odd), which is inverted; (b) ui_ns is the
+    MEASURED region's UI (row period / its columns), not the global operational UI — so a
+    Safe-Lock region reports its own ~4x-wider UI, keeping the 'setup/hold ≈ half a UI'
+    invariant per region."""
     from swi3s_studio.analysis.bus_timing import measure_bus_timing
     s = Session.from_demo(600, cold_start=True, phy=3)
     seg4 = next(x for x in s.segments if int(x["column_count"]) == 4)
@@ -395,9 +393,9 @@ def test_phy3_dlv_timing_polarity_and_per_region_ui():
 
 def test_phy3_recovered_clock_draw_is_bounded():
     """The Raw-view recovered-clock draw must be BOUNDED regardless of how many rows the
-    window spans (its per-row work was O(rows) and stalled the GUI thread on a wide zoom-out
-    of a long capture; re-run on every pan/zoom). A full-window draw returns at most
-    ~5 * _MAX_EDGES points (5 per drawn cycle), decimating whole rows when zoomed out."""
+    window spans (it re-runs on every pan/zoom, on the GUI thread). A full-window draw
+    returns at most ~5 * _MAX_EDGES points (5 per drawn cycle), decimating whole rows when
+    zoomed out."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -415,9 +413,9 @@ def test_phy3_recovered_clock_draw_is_bounded():
 
 def test_phy3_timing_eye_is_balanced_not_zero_setup():
     """DLV setup/hold is measured against the recovered MID-UI sample point, giving a
-    balanced ~half-UI eye — not the setup≈0 / hold≈full-UI garbage the forwarded-clock model
-    produced (DP and DN of the differential pair toggle at the SAME samples, so treating DP
-    as a forwarded clock made every data edge coincide with a 'clock' edge)."""
+    balanced ~half-UI eye — not the setup≈0 / hold≈full-UI of the forwarded-clock model
+    (DP and DN of the differential pair toggle at the SAME samples, so treating DP as a
+    forwarded clock makes every data edge coincide with a 'clock' edge)."""
     from swi3s_studio.analysis.bus_timing import measure_bus_timing
     s = Session.from_demo(600, cold_start=True, phy=3)
     seg16 = next(x for x in s.segments if int(x["column_count"]) == 16)
@@ -437,11 +435,10 @@ def test_phy3_timing_eye_is_balanced_not_zero_setup():
 
 def test_phy3_timing_pane_has_points_in_every_region():
     """The Timing pane resolves setup/hold points in BOTH DLV regions (4-col and 16-col),
-    and they SURVIVE the column filter. Two DLV-only bugs made it empty: timing_regions used
-    the sparse DP `clock_edges` per-UI (ce[start_ui]) for the region bounds — meaningless for
-    DLV, giving a zero-width range and no timing; and the per-transition column was -1, so the
-    (enabled) column filter's np.isin excluded every point. Exercised through the EyeView the
-    UI uses, per region, with the default 'All' filter."""
+    and they SURVIVE the column filter: DLV region bounds must not come from the sparse DP
+    `clock_edges` per-UI (ce[start_ui]), and each transition must carry a real column (not
+    -1) for the filter's np.isin. Exercised through the EyeView the UI uses, per region, with
+    the default 'All' filter."""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication

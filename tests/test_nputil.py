@@ -1,6 +1,5 @@
 """nputil.searchsorted — dtype-safe bisect that avoids numpy's uint64+int/float →
-float64 promotion (which casts the whole array; the cause of ~1s-per-cursor-move
-navigation stalls on large captures).
+float64 promotion (which casts the whole array).
 
 Run: python3 -m pytest tests/test_nputil.py
 """
@@ -39,3 +38,22 @@ def test_array_value_ok():
     a = np.array([0, 10, 20, 30], dtype=np.uint64)
     got = searchsorted(a, np.array([5, 15, 35], dtype=np.int64))
     assert list(map(int, got)) == [1, 2, 4]
+
+
+def test_many_keys_match_numpy():
+    from swi3s_studio.nputil import searchsorted_many
+    rng = np.random.default_rng(7)
+    for dtype in (np.uint64, np.int64):
+        for n in (0, 1, 2, 3, 17, 1000):
+            a = np.sort(rng.integers(0, 500, n)).astype(dtype)     # duplicates included
+            keys = rng.integers(-20, 520, 300)
+            want = np.searchsorted(a, np.maximum(keys, 0) if dtype == np.uint64 else keys)
+            assert (searchsorted_many(a, keys) == want).all(), (dtype, n)
+
+
+def test_many_keys_stay_exact_above_float64_precision():
+    from swi3s_studio.nputil import searchsorted_many
+    base = (1 << 53)
+    a = np.array([base - 1, base + 1, base + 3], dtype=np.uint64)
+    keys = np.array([base, base + 2, base + 4], dtype=np.uint64)
+    assert list(map(int, searchsorted_many(a, keys))) == [1, 2, 3]

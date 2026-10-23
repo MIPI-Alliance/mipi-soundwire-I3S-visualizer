@@ -1,6 +1,6 @@
 """DataPort validator regressions (swviz.utils.validators).
 
-Targets two false-rejection fixes:
+Pins two acceptance rules:
 - the FCP guard/tail is only placed by a SINK DP's (source) FCP, so a source DP's
   FCP row-fit check must not reserve guard/tail columns;
 - the C07 wide-bit straddle check must size the trailing channel group by its actual
@@ -54,10 +54,9 @@ def test_wide_bit_straddle_uses_partial_trailing_group():
 
 
 def test_engine_builds_partial_and_oversized_channel_groups():
-    # The engine intentionally ignores the validator ("real hardware has no
-    # validators"), so a channel-group config that is valid-passing OR merely
-    # plausible must not crash BusModelBuilder.build() with an IndexError from
-    # walking channel_index past the enabled channels.
+    # The engine does not run the validator, so a channel-group config that is
+    # valid-passing OR merely plausible must not crash BusModelBuilder.build() with
+    # an IndexError from walking channel_index past the enabled channels.
     from swi3s_studio.swviz.core.engine import BusModelBuilder
     from swi3s_studio.swviz.models.interface import Interface
     from swi3s_studio.swviz.viz import VizConfig

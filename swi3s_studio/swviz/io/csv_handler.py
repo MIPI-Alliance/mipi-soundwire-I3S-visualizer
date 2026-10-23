@@ -84,21 +84,20 @@ CDS_EDE_PER_SOURCE = 'CDS_EndDriveEarlyPerSource'
 _CDS_DRIVE_TYPE_SCALAR = 'CDS_DriveType'
 
 # The plain 13-wide integer rows: csv_key -> (Interface attribute, default per source).
-# ONE TABLE so a new per-source CDS field is an entry rather than a fourth near-identical
-# branch in the load loop and another writerow in the save loop. Mirrors
-# bus_config._CDS_PER_SOURCE_INT_ROWS, which is the same list for the other engine.
+# Add a new per-source CDS field as an entry here; the load and save loops read this
+# table. Mirrors bus_config._CDS_PER_SOURCE_INT_ROWS, which is the same list for the
+# other engine.
 #
-# The defaults differ in kind and both are deliberate: CDS_DriveType defaults to 1 AGAINST
-# its register reset (a file with no row must keep reading as it always did), while
-# CDS_EndDriveEarly defaults to 0 WITH its reset (full-UI drive is the ordinary case).
+# CDS_DriveType defaults to 1, against its register reset, so a file with no row reads
+# as Normal; CDS_EndDriveEarly defaults to 0, its register reset.
 _CDS_INT_PER_SOURCE = {
     CDS_TAIL_PER_SOURCE: ('CDS_Tail_PerSource', 0),
     CDS_DRIVE_TYPE_PER_SOURCE: ('CDS_DriveType_PerSource', 1),
     CDS_EDE_PER_SOURCE: ('CDS_EndDriveEarly_PerSource', 0),
 }
-# Scalar CDS guard/tail registers: still READ from legacy v2 files (to derive the
-# per-source rows), and derived FROM the per-source rows on every load for the engine
-# layout — but no longer WRITTEN (the per-source rows are authoritative).
+# Scalar CDS guard/tail registers: READ from v2 files (to derive the per-source rows)
+# and derived FROM the per-source rows on every load for the engine layout, but never
+# WRITTEN (the per-source rows are authoritative).
 _CDS_SCALAR_FIELDS = {'CDS_GuardEnabled_REG', 'CDS_GuardPolarity_REG', 'CDS_TailWidth_REG'}
 CDS_NUM_SOURCES = 13  # Manager + Device 0..11
 
@@ -116,10 +115,30 @@ class CSVLoadResult:
     missing_fields: List[str] = field(default_factory=list)
     error_message: Optional[str] = None
     # AppVersion string as written into the file, or None if the field wasn't present.
-    # Advisory only today — nothing compares it against MIN_COMPATIBLE_CSV_VERSION
-    # (the CSV format has had no breaking change). Wire in a parse/compare here if a
-    # future format break needs to reject or convert older files.
+    # Advisory only: nothing compares it against MIN_COMPATIBLE_CSV_VERSION. Wire in a
+    # parse/compare here if a format break needs to reject or convert older files.
     file_app_version: Optional[str] = None
+
+    # Fields a writer may leave out, whose absence is not reported by `notes`.
+    OPTIONAL_FIELDS = frozenset({'Interface: Description'})
+
+    def notes(self, *, missing: bool = True) -> List[str]:
+        """The load's import warnings as messages: the fields that were not recognised
+        and ignored, and (with `missing`) the fields absent from the file that took their
+        defaults, OPTIONAL_FIELDS excepted. One message per kind."""
+        out: List[str] = []
+        if self.unrecognized_fields:
+            n = len(self.unrecognized_fields)
+            names = ", ".join(f"{name} (line {line})" for line, name in self.unrecognized_fields)
+            out.append(f"{n} field{'s are' if n != 1 else ' is'} not recognised and "
+                       f"{'were' if n != 1 else 'was'} ignored: {names}.")
+        gone = [f for f in self.missing_fields if f not in self.OPTIONAL_FIELDS]
+        if missing and gone:
+            n = len(gone)
+            out.append(f"{n} field{'s are' if n != 1 else ' is'} missing and "
+                       f"{'take their defaults' if n != 1 else 'takes its default'}: "
+                       f"{', '.join(gone)}.")
+        return out
 
 
 # =============================================================================
@@ -420,7 +439,7 @@ class CSVHandler:
         found_cds_int_rows: set = set()      # which of _CDS_INT_PER_SOURCE were present
         cds_guard_enable_ps = None      # split guard rows, recombined after the loop
         cds_guard_polarity_ps = None
-        legacy_cds_drive = None         # the brief scalar spelling; broadcast if seen
+        legacy_cds_drive = None         # the scalar spelling; broadcast if seen
 
         try:
             with open(filename, encoding='utf8') as data_file:
@@ -488,10 +507,9 @@ class CSVHandler:
                                                      for v in values]
                         continue
 
-                    # A SCALAR CDS_DriveType row broadcasts to every source. That spelling
-                    # existed only briefly, before the register was understood to live in
-                    # each device's own CDS block; caught here so such a file loads with a
-                    # sensible value instead of landing in unrecognized_fields.
+                    # A SCALAR CDS_DriveType row broadcasts to every source, so such a
+                    # file loads with a sensible value instead of landing in
+                    # unrecognized_fields.
                     if field_name == _CDS_DRIVE_TYPE_SCALAR:
                         legacy_cds_drive = CSVHandler.parse_value(
                             row[1] if len(row) > 1 else "1", FieldType.INT)
@@ -614,26 +632,31 @@ class CSVHandler:
                     interface.CDS_Tail_PerSource = [interface.CDS_TailWidth_REG] * 13
                 # No per-source drive row: broadcast the scalar if the file carried one,
                 # else leave reset_to_defaults' all-Normal in place. End-drive-early has no
-                # legacy spelling to migrate — it was per-source from the start.
+                # scalar spelling.
                 if (CDS_DRIVE_TYPE_PER_SOURCE not in found_cds_int_rows
                         and legacy_cds_drive is not None):
                     interface.CDS_DriveType_PerSource = [int(legacy_cds_drive)] * 13
 
                 # The per-source rows are authoritative; derive the scalar CDS
                 # registers FROM them for the engine layout (guard column presence /
-                # tail-column count), since current files no longer carry the scalars.
+                # tail-column count), since current files do not carry the scalars.
                 interface.CDS_GuardEnabled_REG = any(v != 0 for v in interface.CDS_Guard_PerSource)
                 interface.CDS_GuardPolarity_REG = (interface.CDS_Guard_PerSource[0] == 2)
                 interface.CDS_TailWidth_REG = max(interface.CDS_Tail_PerSource)
-                # The Manager's, like CDS_GuardPolarity_REG above — not an any()/max(),
-                # because "some source drives specially" is not a value a single register
-                # can hold and the renderer reads the whole list anyway.
+                # The Manager's, like CDS_GuardPolarity_REG above, not an any()/max();
+                # the renderer reads the whole list.
                 interface.CDS_DriveType_REG = int(interface.CDS_DriveType_PerSource[0])
                 interface.CDS_EndDriveEarly_REG = int(
                     interface.CDS_EndDriveEarly_PerSource[0])
 
                 # Check for missing expected fields
                 expected_interface = set(CSVHandler._interface_field_dict.keys())
+                # A scalar CDS register is derived above from the per-source rows when
+                # the file carries them, so its absence defaults nothing.
+                if found_cds_guard_per_source:
+                    expected_interface -= {'CDS_GuardEnabled_REG', 'CDS_GuardPolarity_REG'}
+                if CDS_TAIL_PER_SOURCE in found_cds_int_rows:
+                    expected_interface.discard('CDS_TailWidth_REG')
                 expected_interface_viz = set(CSVHandler._interface_viz_field_dict.keys())
                 expected_dataport = set(CSVHandler._dataport_field_dict.keys())
                 expected_dataport_viz = set(CSVHandler._dataport_viz_field_dict.keys())
@@ -731,9 +754,9 @@ class CSVHandler:
                 writer.writerow(['AppVersion', app_version()])
 
                 # Write interface parameters using field map. The scalar CDS guard/
-                # tail registers are now DERIVED from the per-source rows on load, so
-                # they're no longer written — the CDS_*PerSource rows below are the
-                # single source of truth.
+                # tail registers are DERIVED from the per-source rows on load and are
+                # not written; the CDS_*PerSource rows below are the single source of
+                # truth.
                 for csv_field, attr_name, field_type in CSVHandler.INTERFACE_FIELD_MAP:
                     if csv_field in _CDS_SCALAR_FIELDS:
                         continue
@@ -745,10 +768,8 @@ class CSVHandler:
                     value = getattr(viz_config, attr_name)
                     writer.writerow([csv_field, str(value)])
 
-                # Per-source CDS guard/tail (Manager + 12 devices). The scalar
-                # CDS_GuardEnabled/Polarity/TailWidth fields above are the derived
-                # (Manager) summary kept for older readers; these 13-wide rows carry
-                # the authoritative per-source values so a converted v2 file shows
+                # Per-source CDS rows (Manager + 12 devices): these 13-wide rows carry
+                # the authoritative per-source values, so a converted v2 file shows
                 # every source's CDS setting explicitly. Guard is split into enable +
                 # polarity rows mirroring the scalar registers (CDS_Guard_PerSource
                 # packs both: 0=off, 1=G0, 2=G1).

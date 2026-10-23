@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Convert SWI3S Visualizer legacy (v1.73 / v1.74) CSV configs to the current format.
 
-The conversion itself now lives in the app package
-(:func:`swi3s_studio.ingest.visualizer_csv.convert`) so the GUI can open legacy
-files silently without this tool; this remains as a batch CLI wrapper for
-converting files on disk. Target format version tracks
+The conversion itself lives in the app package
+(:func:`swi3s_studio.ingest.visualizer_csv.convert`), which the GUI uses to open
+legacy files directly; this is a batch CLI wrapper for converting files on disk.
+Target format version tracks
 ``swi3s_studio.swviz.version.APP_VERSION``.
 
 Usage:

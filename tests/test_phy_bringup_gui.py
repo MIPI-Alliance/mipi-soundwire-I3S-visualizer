@@ -77,10 +77,10 @@ def test_real_capture_lands_in_analysis_and_gates():
 def test_demo_cold_start_is_spec_valid():
     _app = QApplication.instance() or QApplication([])
     win = MainWindow()
-    # The demo the app loads synthesises a valid §5.1.2 Cold Start selecting PHY2 (the
-    # app preloads with cold_start=True; see MainWindow._init_ui / load_demo). It starts
-    # in safe-lock-2 and commits up, so the bring-up is a real Cold Start — not the
-    # coalesced-audio false positive a bare audio capture would trip.
+    # The demo the app loads synthesises a valid §5.1.2 Cold Start selecting PHY2
+    # (MainWindow.load_demo uses cold_start=True). It starts in safe-lock-2 and commits
+    # up, so the bring-up is a real Cold Start — not the coalesced-audio false positive a
+    # bare audio capture would trip.
     win.load_session(Session.from_demo(256, cold_start=True, register_map=win._rmap))
     s = win._session
     assert s.has_bringup and s.link_control.sequence == "cold"
@@ -156,8 +156,7 @@ def test_grid_scroll_resets_so_new_content_is_visible():
     """Navigating from a wide/tall scrolled grid to a smaller scene (a narrower region,
     or the bring-up 'No PHY Selected' message drawn at the scene origin) must re-anchor
     the viewport at the top-left. Qt otherwise clamps the shrinking scene's scrollbars
-    to the NEW maximum (not zero), leaving the fresh content scrolled off-screen — the
-    'click twice to sync' bug."""
+    to the NEW maximum (not zero), leaving the fresh content scrolled off-screen."""
     app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.load_session(Session.from_demo(4000, cold_start=True))
