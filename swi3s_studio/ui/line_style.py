@@ -63,7 +63,9 @@ def _clean(raw) -> dict:
     fall back to the default, not break every pane)."""
     colors: dict = {}
     raw = raw if isinstance(raw, dict) else {}
-    for mode, kinds in (raw.get("colors") or {}).items():
+    stored_colors = raw.get("colors") if isinstance(raw.get("colors"), dict) else {}
+    stored_weights = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
+    for mode, kinds in stored_colors.items():
         if mode not in _PALETTES or not isinstance(kinds, dict):
             continue
         for kind, vals in kinds.items():
@@ -74,7 +76,7 @@ def _clean(raw) -> dict:
             if any(vals):
                 colors.setdefault(mode, {})[kind] = vals + [None] * (n - len(vals))
     weights = {}
-    for kind, px in (raw.get("weights") or {}).items():
+    for kind, px in stored_weights.items():
         if kind in WEIGHT_KINDS and isinstance(px, int) and MIN_WEIGHT <= px <= MAX_WEIGHT:
             weights[kind] = px
     return {"colors": colors, "weights": weights}

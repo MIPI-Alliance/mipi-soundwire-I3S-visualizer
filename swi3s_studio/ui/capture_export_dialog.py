@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .save_path import suffixed_save_path
+
 # (label, format key, extension, save-dialog filter)
 _FORMATS = [
     ("Logic 2 project (.sal)", "sal", ".sal", "Logic 2 project (*.sal)"),
@@ -32,7 +34,7 @@ _FORMATS = [
     ("Digital CSV (.csv)", "csv", ".csv", "Digital CSV (*.csv)"),
 ]
 
-# (label, range key). Sample = whole capture; the rest take a start/end pair.
+# (label, range key). 'all' = whole capture; the rest take a start/end pair.
 _RANGES = [("Whole capture", "all"), ("Time (s)", "time"),
            ("Bus rows", "rows"), ("UI", "ui")]
 
@@ -42,7 +44,12 @@ class CaptureExportDialog(QDialog):
 
     `session` supplies the range bounds and unit→sample conversions (last_sample,
     total_bus_rows, total_uis, sample_at_bus_row, sample_at_ui). `default_dir` seeds
-    the file field; `clock_name`/`data_name` seed the two signal names."""
+    the file field; `clock_name`/`data_name` seed the two signal names and are what a
+    blanked name field falls back to.
+
+    A Bus rows / UI range is inclusive at both ends (From 5, To 5 is one row); a Time
+    range runs from its start up to its end, and an end at the last edge keeps that
+    edge."""
 
     def __init__(self, session, *, default_dir: str = "",
                  clock_name: str = "SW_CLK", data_name: str = "SW_DATA",
@@ -50,6 +57,8 @@ class CaptureExportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Export Capture")
         self._session = session
+        self._clock_name = clock_name or "SW_CLK"
+        self._data_name = data_name or "SW_DATA"
         self._default_dir = default_dir or ""
         self._default_name = default_name or "capture"   # e.g. "capture_Amp_bus" per Link
 
@@ -92,8 +101,9 @@ class CaptureExportDialog(QDialog):
         for sp in (self._start, self._end):
             sp.setKeyboardTracking(False)
             sp.setGroupSeparatorShown(True)
+        self._end_label = QLabel("To:")
         rform.addRow("From:", self._start)
-        rform.addRow("To:", self._end)
+        rform.addRow(self._end_label, self._end)
         lay.addWidget(rbox)
 
         # --- File ---
@@ -136,6 +146,7 @@ class CaptureExportDialog(QDialog):
     def _on_range_changed(self) -> None:
         key = self._range.currentData()
         s = self._session
+        self._end_label.setText("To:" if key == "time" else "To (inclusive):")
         if key == "all":
             for sp in (self._start, self._end):
                 sp.setEnabled(False)
@@ -163,6 +174,9 @@ class CaptureExportDialog(QDialog):
         start = self._path.text().strip() or self._default_dir
         path, _ = QFileDialog.getSaveFileName(self, "Export Capture", start, filt)
         if path:
+            ext = self._format.currentData()[1]
+            path = suffixed_save_path(self, path, ext, "Export Capture")
+        if path:
             self._path.setText(path)
 
     # ---- results ----
@@ -170,7 +184,8 @@ class CaptureExportDialog(QDialog):
         return self._format.currentData()[0]
 
     def signal_names(self) -> Tuple[str, str]:
-        return self._clk_name.text().strip() or "SW_CLK", self._dat_name.text().strip() or "SW_DATA"
+        return (self._clk_name.text().strip() or self._clock_name,
+                self._dat_name.text().strip() or self._data_name)
 
     def include(self) -> Tuple[bool, bool]:
         return self._clk_on.isChecked(), self._dat_on.isChecked()
@@ -186,12 +201,17 @@ class CaptureExportDialog(QDialog):
             return None
         s = self._session
         a, b = self._start.value(), self._end.value()
+        last = s.last_sample()
         if key == "time":
             rate = s.sample_rate_hz
-            return int(round(a * rate)), int(round(b * rate))
+            s1 = int(round(b * rate))
+            at_end = b >= self._end.maximum() or s1 >= last   # the spin box rounds its top
+            return int(round(a * rate)), (last + 1 if at_end else s1)
         if key == "rows":
-            return s.sample_at_bus_row(int(a)), s.sample_at_bus_row(int(b))
-        return s.sample_at_ui(int(a)), s.sample_at_ui(int(b))     # ui
+            return (s.sample_at_bus_row(int(a)),
+                    last + 1 if int(b) + 1 >= s.total_bus_rows() else s.sample_at_bus_row(int(b) + 1))
+        return (s.sample_at_ui(int(a)),                         # ui
+                last + 1 if int(b) + 1 >= s.total_uis() else s.sample_at_ui(int(b) + 1))
 
     # ---- validation ----
     def accept(self) -> None:
@@ -201,6 +221,11 @@ class CaptureExportDialog(QDialog):
         clk_on, dat_on = self.include()
         if not (clk_on or dat_on):
             QMessageBox.information(self, "Export Capture", "Select at least one signal.")
+            return
+        key = self._range.currentData()
+        if key in ("rows", "ui") and self._end.value() < self._start.value():
+            QMessageBox.information(self, "Export Capture",
+                                    "The range's end must not be before its start.")
             return
         rng = self.sample_range()
         if rng is not None and rng[1] <= rng[0]:

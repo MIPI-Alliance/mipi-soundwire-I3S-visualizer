@@ -43,8 +43,8 @@ static bool isDualRanked(U32 baseAddr)
     const int off = systemBlockOffset(baseAddr);
     if (off >= 0x80 && off < 0xC0) return true;
     if (reg::InDpBlock(baseAddr)) {
-        U32 off = reg::DpOffsetOf(baseAddr);
-        return off >= 0x80 && off < 0xC0;
+        const U32 dpOff = reg::DpOffsetOf(baseAddr);
+        return dpOff >= 0x80 && dpOff < 0xC0;
     }
     return false;
 }
@@ -56,9 +56,51 @@ static bool isReadOnlyCurr(U32 addr)
     return addr >= reg::kCdsBase && addr < reg::kCdsBase + 0x100 && addr - reg::kCdsBase >= 0xC0;
 }
 
+bool CRegisterModel::IsReadOnly(U32 addr)
+{
+    if (isReadOnlyCurr(addr)) return true;
+    if (addr >= reg::kSlcBase && addr < reg::kSlcBase + 0x100) {
+        const U32 off = addr - reg::kSlcBase;
+        // ID0..Class, Reserved 0x23, IntCascade_DFI/Misc/DP, the EC_* error counters.
+        return off <= 0x05 || off == 0x23 || (off >= 0x26 && off <= 0x2B) ||
+               (off >= 0x60 && off <= 0x69 && off != 0x64);
+    }
+    if (reg::InDpBlock(addr)) {
+        const U32 off = reg::DpOffsetOf(addr);
+        // PortStatus, ReadyCh_L/H, EC_TestFailCh<c>, EC_UnexpectedSSP, EC_FlowControlFail,
+        // COUNT_ReceivedSSP.
+        return (off >= 0x05 && off <= 0x07) || (off >= 0x20 && off <= 0x31) || off == 0x3F;
+    }
+    return false;
+}
+
+U8 CRegisterModel::Rw1cMask(U32 addr)
+{
+    if (addr >= reg::kSlcBase && addr < reg::kSlcBase + 0x100) {
+        const U32 off = addr - reg::kSlcBase;
+        if (off == 0x21) return 0x03;                       // DevStat
+        if (off == 0x22) return 0xFF;                       // IntStat_Link
+        if (off == 0x24) return 0x01;                       // IntStat_PhyCal
+        if ((off >= 0x40 && off <= 0x47) || (off >= 0x4C && off <= 0x4F))
+            return 0xFF;                                    // IntStat_SDCA, IntStat_ImpDef
+        return 0x00;
+    }
+    if (reg::InDpBlock(addr)) {
+        const U32 off = reg::DpOffsetOf(addr);
+        if (off == 0x00) return 0xDF;                       // IntStat (bit 5 reserved)
+        if (off == 0x04) return 0x01;                       // DevStat
+    }
+    return 0x00;
+}
+
 void CRegisterModel::applyWrite(int dev, U32 addr, U8 value)
 {
-    if (isReadOnlyCurr(addr)) return;
+    // A read-only byte takes no write. An RW1C bit written 1 clears, written 0 keeps its
+    // value; the register's other bits take the written value. RW1C registers are
+    // single-ranked, so `addr` is their base.
+    if (IsReadOnly(addr)) return;
+    if (const U8 rw1c = Rw1cMask(addr))
+        value = static_cast<U8>((get(dev, addr) & rw1c & ~value) | (value & ~rw1c));
     DeviceRegs& d = mDev[dev];
     U32 base = toBase(addr);
     bool currAlias = (base != addr);        // toBase mapped a _CURR alias down to its base
@@ -86,9 +128,12 @@ void CRegisterModel::applyWrite(int dev, U32 addr, U8 value)
 
 bool CRegisterModel::WriteIsImmediate(U32 addr) const
 {
-    // Mirrors applyWrite: a write to a dual-ranked base stages in _NEXT (needs Commit);
-    // anything else lands in _CURR the moment it's written (immediate committed effect).
-    return !isDualRanked(toBase(addr));
+    // Mirrors applyWrite: a write to a dual-ranked _NEXT base stages (needs Commit); a
+    // write to a writable _CURR alias, or to a single-ranked register, lands in _CURR the
+    // moment it is written. A write to a read-only byte changes nothing.
+    if (IsReadOnly(addr)) return false;
+    if (toBase(addr) != addr) return true;
+    return !isDualRanked(addr);
 }
 
 void CRegisterModel::ForceOverride(int dev, U32 addr, U8 value)
@@ -116,7 +161,9 @@ void CRegisterModel::ApplyRead(int dev, U32 addr, U8 value)
     // bank the register-map display reads from. Rank-aware and mirroring the Python
     // display overlay: a _CURR-alias read updates the committed bank; a _NEXT-base
     // (dual) or single-ranked read updates the live display bank. Reads apply now —
-    // they don't wait for a commit — and never feed BuildConfig/get (config = writes).
+    // they don't wait for a commit. A _CURR-alias or single-ranked read lands in the bank
+    // that get() and BuildConfig read, so a model that decodes the bus applies writes
+    // only, and reads go to a separate model.
     DeviceRegs& d = mDev[dev];
     U32 base = toBase(addr);
     bool currAlias = (base != addr);    // toBase mapped a _CURR alias down to its base
@@ -186,7 +233,7 @@ void CRegisterModel::OnCommand(const SwI3sCommand& cmd)
         }
     }
     // NOTE: Commit promotion is deferred to Commit() at the SSP row, called by
-    // the Decoder only for a CONFIRM_COMMIT'd SSCR.
+    // the Decoder only for a CONFIRM_COMMIT'd SSCR or DSCR.
 }
 
 void CRegisterModel::Commit(U8 groupMask, U16 deviceMask)
@@ -281,6 +328,23 @@ int CRegisterModel::ColumnCount() const
     return (get(rep, reg::kNumColumns_Next) & 0x1F) + 1;
 }
 
+int CRegisterModel::CdsHorizontalStart() const
+{
+    // Bus-wide in effect (every source reads the CDS at one column), per device on the wire;
+    // taken from `rep` like CDS_BitWidth. -1 until a committed value exists.
+    int rep = representativeDevice();
+    if (rep < 0 || !has(rep, reg::kCdsHorizontalStart_N)) return -1;
+    return get(rep, reg::kCdsHorizontalStart_N) & 0x1F;
+}
+
+bool CRegisterModel::PortRunning(int dev, int dp) const
+{
+    // Any channel enabled in the committed rank (EnableCh0 in 0x81 bit7, ch1-7, ch8-15).
+    return (get(dev, reg::DpAddr(dp, reg::kDpEnableCh0HCount_N)) & 0x80) != 0 ||
+           (get(dev, reg::DpAddr(dp, reg::kDpEnableCh1_7_N)) & 0xFE) != 0 ||
+           get(dev, reg::DpAddr(dp, reg::kDpEnableCh8_15_N)) != 0;
+}
+
 int CRegisterModel::CurrentInterval(int dev, int dp) const
 {
     U8 oilo = get(dev, reg::DpAddr(dp, reg::kDpOffIntLo_N));
@@ -315,6 +379,7 @@ SwI3sDpConfig CRegisterModel::decodeDp(int dev, int n) const
                           ((get(dev, reg::DpAddr(n, reg::kDpSkipNumHi)) & 0xF) << 8);
     c.FlowMode = get(dev, reg::DpAddr(n, reg::kDpFlowMode)) & 0x3;
     c.FlowControlDelay = (get(dev, reg::DpAddr(n, reg::kDpFlowMode)) >> 7) & 0x1;  // 0x0E bit7
+    c.FCP_ScramblerEn = (get(dev, reg::DpAddr(n, reg::kDpFlowMode)) >> 3) & 0x1;   // 0x0E bit3
 
     U8 bw_hs = get(dev, reg::DpAddr(n, reg::kDpBitWidthHStart_N));
     c.BitWidth = (bw_hs >> 6) & 0x3;
@@ -398,6 +463,7 @@ bool CRegisterModel::BuildConfig(SwI3sConfig& out) const
     if (has(rep, reg::kCdsBitWidthGuardTail_N)) {
         out.CdsBitWidth = (get(rep, reg::kCdsBitWidthGuardTail_N) >> 5) & 0x7;
     }
+    out.CdsHorizontalStart = CdsHorizontalStart();
     for (const auto& kv : mDev) {
         const int dev = kv.first;
         if (dev < 0 || dev + 1 >= SwI3sConfig::kCdsSources) continue;

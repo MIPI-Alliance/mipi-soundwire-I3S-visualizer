@@ -80,12 +80,44 @@ def test_two_sampled_drqs_in_one_column_are_a_read_overlap():
         f"bus_clashes={bm.bus_clashes}")
 
 
+def _driven_drq_and_a_data_port_in_its_column(drq_enabled: bool):
+    """A Sink DP (device 3) drives its DRQ at `_FCP_COLUMN`; a Source DP on device 5 puts its
+    data in that same column. `drq_enabled` draws the first port or leaves it out."""
+    iface, viz = Interface(), VizConfig()
+    iface.NumColumns_REG = _NUM_COLUMNS - 1
+    sink = iface.data_ports[0].config
+    sink.PortDirection_REG = True
+    sink.FlowMode_REG = FlowMode.RX_CONTROLLED
+    sink.EnableCh_REG = 0b1
+    sink.SampleSize_REG = 7
+    sink.HorizontalStart_REG = 2
+    sink.HorizontalCount_REG = 3
+    sink.Interval_REG = 3
+    fcp = iface.flow_control_ports[0].config
+    fcp.FCP_HorizontalStart_REG = _FCP_COLUMN
+    fcp.FCP_BitWidth_REG = 0
+    fcp.FCP_TailWidth_REG = 0
+    fcp.FCP_Offset_REG = 0
+    source = iface.data_ports[1].config
+    source.PortDirection_REG = False
+    source.EnableCh_REG = 0b1
+    source.SampleSize_REG = 0
+    source.HorizontalStart_REG = _FCP_COLUMN
+    source.HorizontalCount_REG = 1
+    source.Interval_REG = 0
+    viz.data_ports[0].enabled = drq_enabled
+    viz.data_ports[1].enabled = True
+    iface.set_dp_device(0, 3)
+    iface.set_dp_device(1, 5)
+    return BusModelBuilder(iface, _ROWS, viz).build()
+
+
 def test_a_driven_drq_is_registered_as_a_write():
     """A driven DRQ reaches the clash detector through `add_write`, so the column reads as
-    occupied to whatever is placed next."""
-    bm = _two_ports_sharing_a_drq_column(port_direction=True)
-    drq_bits = [b for b in bm.bits if bm.bit_index(b.row, b.column) == _FCP_COLUMN]
-    assert drq_bits, f"expected a bit placed at column {_FCP_COLUMN}"
-    # Two devices drove it, so the detector saw two writes at one index: that is the clash
-    # asserted above. Its presence in bus_clashes is the observable proof add_write ran.
-    assert _FCP_COLUMN in bm.bus_clashes
+    occupied to whatever is placed next: a data port placed in that column clashes with it,
+    and the same data port alone does not."""
+    alone = _driven_drq_and_a_data_port_in_its_column(drq_enabled=False)
+    assert _FCP_COLUMN not in alone.bus_clashes, alone.bus_clashes
+    both = _driven_drq_and_a_data_port_in_its_column(drq_enabled=True)
+    assert _FCP_COLUMN in both.bus_clashes, (
+        f"a data port in a driven DRQ's column must clash with it; got {both.bus_clashes}")

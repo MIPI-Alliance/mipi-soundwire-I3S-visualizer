@@ -1,7 +1,8 @@
 # SWI3S Studio — User Guide
 
-A pane-by-pane reference. For setup and build see the [README](../README.md);
-for design, [architecture.md](architecture.md).
+A pane-by-pane reference. For setup and build see `README.md` in the source tree;
+for design, `docs/architecture.md` there. Neither ships with an installed or packaged
+application.
 
 ## Modes
 
@@ -20,34 +21,117 @@ Linux, ⌘ is Ctrl and ⌥ is Alt.)
   they diverge. Where a source departs from the ordinary case the CDS cell annotates it on a
   second line (`SP` for a Special drive type, `EDE` for an early release; a trailing `x`
   means the sources disagree).
-  Load/Save the config as CSV; export the placed frame as JSON; push it into Analysis as
+  The **⤢** at the grid's top right, **Maximize Frame** or **View ▸ Maximize Pane** (⌘⇧M)
+  gives the grid the whole page, with the data ports' colour key; again to restore. Dragging
+  the divider above the grid to the top does the same, and the grid stays maximized across a
+  switch to another mode and back.
+  The Bus Grid and Save Output (JSON) build at most 1024 rows. A larger **Rows To Draw**
+  is drawn to that limit and a Rows To Draw warning appears in the notifications.
+  Load/Save the config as CSV; export the placed bus model as JSON (**File ▸ Export Bus Model (JSON)…**, or **Save Output (JSON)**); push it into Analysis as
   the *expected* config (in the Bus Analyzer, **Decode ▸ Import Visualizer CSV**, choosing the
   current authoring, to compare it with the decode).
+  **Load Init (CSV)** opens a config CSV named `init.csv`. It looks for the file named by the
+  environment variable `SWI3S_INIT_CSV`, then for `init.csv` next to the application (the
+  repository root in a source checkout), then for `init.csv` in the working directory, and
+  opens the first of these that exists. If none exists, or the file cannot be read, it opens
+  the built-in demo config, and the status bar says why.
 - **Timing** — dial in the PHY. Pick a spec source **per side** (Manager and Peripheral
-  independently): SWI3S **PHY1** or **PHY2**, the two **proposed** PHY2 revisions, or
-  **SoundWire 1.3** at 1.8 V / 1.2 V — so a mixed SWI3S ↔ SoundWire bus is expressible, and
-  the cross-spec divergences it cannot reconcile are surfaced as caveats rather than hidden.
+  independently): **SWI3S PHY1**, **SWI3S PHY2**, **SWI3S PHY2 (EDE proposed)** (the proposed
+  PHY2 revision with EndDriveEarly), or **SoundWire 1.3 (1.2 V)** — so a mixed SWI3S ↔
+  SoundWire bus is expressible. The plain proposed PHY2 revision is not a selector choice:
+  it seeds the editable **Example** column. A SoundWire
+  side is seeded with its SWI3S equivalents (each value re-measured between the SWI3S anchors
+  for the side it is on), and the
+  cross-spec divergences that are not converted are surfaced as caveats rather than hidden.
   The **Specification** column is read-only; only the **Example** column is editable. Enter
   bus length, per-lane slew, supply/noise, and output/input/Z-handover timing, and choose
   the Manager's **data launch** (analog delay, or a 2× / 4× clock grid), whether a
-  **handover UI** is allocated, and where the two peripherals sit for the **P→P** legs.
+  **handover UI** is allocated, whether the **Manager forces keeper** (it loads the keeper
+  with the level it drives, so the Manager-releasing keeper inequality does not apply and reads
+  "does not apply" with "—" for its margin and F_max; Reset clears it), and where the two
+  peripherals sit for the **P→P** legs. A side
+  on the **EDE** source releases its **EDE Delay** (Handover Timing, per side) after its ramp
+  reaches 80 %, in place of its t_DZ. A contention inequality shows that release as its parts,
+  from the edge that opens the driven UI: the releaser's t_DD, its ramp to 80 %, the EDE
+  Delay, and the UI back to the closing edge.
+  **Save Example** writes JSON (`example.json`). **Load Example** reads JSON, and also YAML
+  where PyYAML is installed; it reads files up to 1 MiB and refuses YAML aliases. For a clocked launch the hint beneath the selector gives the rate
+  up to which the Example column's Manager-to-Peripheral setup and hold legs pass, and marks
+  a rate above it with a warning. Where the two columns launch differently, the hint names the
+  column the selector drives and the column that keeps its analog delays by their headings. A saved value that is not a number is ignored and the box
+  keeps its value; a range saved with its minimum above its maximum is restored with the two
+  exchanged; both are reported in the import warnings. A range typed with its minimum above its
+  maximum is checked once focus leaves both boxes of its row, so typing a range upward, minimum
+  first, does not exchange the boxes while you type.
   Read **17 numbered inequalities** term by term with margins, F_max and the binding
-  constraint, each evaluated at its own worst PVT corner: setup and hold for
+  constraint, each evaluated at its own worst PVT corner, with each device at one V_SEOS
+  for its outputs and inputs alike: setup and hold for
   Manager→Peripheral, Peripheral→Manager and Peripheral A→Peripheral B (each in both launch
   forms, `t_DD` and the handover's `t_ZD`), the three **Handover Contention** inequalities
-  (Manager to Peripheral, Peripheral to Manager, Peripheral to Peripheral), and the bus
-  keeper per releasing device. Titles name who owes what to whom — *Manager Holding for
+  (Manager to Peripheral, Peripheral to Manager, Peripheral to Peripheral), and the bus keeper per releasing device, its response counted from the releasing data's crossing of the Manager's V_IH / V_IL at the Manager as the Bus Keeper table measures it, a Peripheral's release counted from its own detections of the two clock edges that bound its UI. Titles name who owes what to whom — *Manager Holding for
   Peripheral*, *Peripheral A Setup for Peripheral B* — and the terms read in physical time
   order, so a row can be followed from the clock edge to the receiver's window. F_max is
   shown for every leg whose margin scales with the UI: setup legs, and hold, handover-hold,
   contention and keeper legs through a clocked Manager timing, the allocated handover UIs or
-  a conventional release's closing UI. It reads — where no rate bounds the leg and FAIL where
-  no rate closes it. Under a 2× or 4× Manager launch, F_max holds each clocked Manager timing
-  at its fraction of the UI. The binding constraint is the lowest F_max over the legs that
+  a conventional release's closing UI. F_max is the first failure: the lowest rate at which the
+  leg fails as F_CLK rises from zero. It reads — where the leg never fails and FAIL where it
+  fails at the lowest rates. A leg whose margin scales with the UI never reads above the toggle ceiling, 1000 × 0.45 / t_RF,max (54.2
+  MHz on SWI3S, from its 8.3 ns slowest edge), 0.45 being the shortest half period as a fraction of the period: there that half period holds just one
+  complete edge, and above it no edge reaches V_OH / V_OL. A leg that passes up to the ceiling
+  reads the ceiling, and its tooltip says so. Under a 2× or 4× Manager launch, F_max places each clocked Manager
+  timing where the rows go when that rate is typed in: at its fraction of the UI, raised to a
+  further grid point where that falls below the row's tabulated minimum. A leg can then fail,
+  pass again and fail again as the rate rises; its F_max is still the first failure, and the
+  F_max cell's tooltip names the higher rates at which it passes again. On the Example column,
+  PHY2/PHY2 at 12.288 MHz with 4x CLK, MP_hold fails from 12.167 MHz, its F_max and the binding
+  rate, and passes again from 12.50 MHz, where its Man_t_DD,min moves from 0.25 to 0.50 UI.
+  Inputs the model cannot evaluate, such as a threshold at or beyond the transmitter's rail,
+  show no margins: the advisory line under the inputs names the column and the reason, and
+  with the page or the diagram maximized, where the top bar is hidden, the same 'No margins.
+  <column>: ...' reason is shown above the results. The term diagram closes when no margins can
+  be computed. The binding constraint is the lowest F_max over the legs that
   bound the bus.
+  Where the two columns price different terms, as when one releases by t_DZ and the other by
+  an EDE Delay, the inequality shows an equation row per column, headed by the column's name
+  and followed by that column's numbers; where they price the same terms the columns share one
+  equation row. Every term of every row is clickable. The copied summary lists the same rows
+  after its margin table, which ends at the first blank line. The summary names the
+  specification column 'Spec' throughout, and its last column is the right column's F_max less
+  the left's ('—' where either is not a rate).
   **Click any term** — a symbol or a substituted number — to highlight that parameter
   everywhere it acts: every inequality that reads it, both substitution rows, and its input
-  row above. Click it again, or any blank space, to clear; several can be traced at once.
+  row above. Click it again in the inequality drawn, or any blank space among the inequalities, to clear;
+  a click on a Margin or Max Frequency value does nothing, so the traced term and its diagram
+  stay. Several terms can be traced at once. A click on an input row's name highlights its parameter, or
+  clears it, the same way. Clicking an EDE Delay row highlights the EDE release terms it sets,
+  and an EDE release term highlights the EDE Delay row.
+  A click on a term in an inequality also opens the **term diagram** on the right, which
+  draws that one term to scale at each column's worst corner for its inequality: the
+  signals it connects at the pin it is measured at, each row named for its signal and pin (*Clk @ Peripheral*) in the
+  edge's colour (a launch shows the launcher's clock and data, a flight one signal at both
+  pins), each edge as its ramp model's curve, the level each end is measured at, and the
+  term as a dimension in ns. A SoundWire launch and its anchor correction share one drawing,
+  each on its own dimension line, headed by their total; a correction that shortens the
+  launch is subtracted (−). A flight mismatch, t_PD,mis, is drawn as the clock's and the
+  data's propagation from the launch, and the difference between their ends. A 20 % point is
+  labelled as a percentage of the driver's V_DD. A threshold is drawn from the receiver's own
+  ground, with an arrow giving it as a percentage of the receiver's V_DD; its percentage of
+  the driver's is on the left. The driver's V_DD runs across the left half and the
+  receiver's across the right, each labelled on its line as a percentage of nominal (to a
+  tenth where it is not whole), as is a receiver's offset ground; the
+  Corner line names the rows off typical, a slew row inside its range by its value (*t_RF Man CLK at 5.70 ns*) and a V_SEOS tolerance, noise or per-edge slew row inside its range by its value in % (*V_SEOS tol (δ) at 3.58 %*), and each device's V_SEOS. The diagram follows the
+  inputs: an edit redraws it at the new worst corner. The
+  **⤢** at the diagram's top right, or a double-click on the diagram, gives it the whole
+  page with the two columns side by side; again to restore. While it has the page, the
+  buttons beside the ⤢ draw the Specification column alone, the Example column alone, or Both;
+  the choice is kept the next time the diagram is maximized, and restoring stacks both columns
+  again. The diagram draws in heavy strokes and demi-bold labels, the labels a little smaller in a
+  narrow pane. The rows grow with the pane.
+  No label overlaps another or a line: each sits on its line where there is room, and
+  further along it, off it, or joined to it by a thin leader line where there is not.
+  A click on a highlighted term in another inequality draws it there; a click on the term
+  drawn, in the inequality it is drawn for, clears its highlight, and clearing the term's
+  highlight clears the diagram. The diagram draws every term of every inequality. A driver's trace is solid while it drives and dotted while it is high-Z: after a release, and before a turn-on (t_ZD), which leaves high-Z. An EDE Delay runs from its ramp's 80 % point, drawn as a level line. A keeper's response runs from the data's crossing of the keeper's threshold at the Manager, drawn as a threshold line: the Manager's V_IH,max / V_IL,min, or a SoundWire Manager's V_TH_Keeper,max / V_TL_Keeper,min. A Peripheral's data is drawn at both pins, the flight between them a guide. A contention inequality is drawn at the releaser's pin. P→M and P→P contention are drawn with both devices at the Manager, because their bus terms net to zero, and the Corner line says so. Contention carries no data crossing, so the releaser's last bit is held at the level opposite the acquirer's first edge (low with the acquirer rising, the usual case; high where that edge falls); an EndDriveEarly releaser is drawn on the edge its ramp is priced on, which on an exponential ramp with V_OH + V_OL other than 1 is the slower of the two. The margin is green where it is a gap and red where it is short, named overlap on a contention inequality and short on a keeper one.
   The bar at the top, which does not scroll, holds the spec sources, the Manager and
   Peripheral **ramp models**, the data launch, the handover and P→P choices and F_CLK. Below
   it scroll the **Timing Inequalities** and the parameter sections, each titled inside its
@@ -56,6 +140,7 @@ Linux, ⌘ is Ctrl and ⌥ is Alt.)
   length and length mismatch). The **⤢** beside *Timing Inequalities*, a double-click on that
   title or **View ▸ Maximize Pane** (⌘⇧M) hides the top bar, so the inequalities, and the
   parameter sections below them, scroll in the whole page; the same again brings it back.
+  While the term diagram has the page, **View ▸ Maximize Pane** puts the diagram back.
 - **Analysis** — confirm it works. Decode a captured PHY1/PHY2 (forwarded-clock) or
   PHY3/DLV (recovered-clock) bus and explore it in the linked panes below. With nothing
   open the panes are empty, and the Commands and signal panes say so; **File ▸ Open Capture…** opens a capture, and
@@ -91,7 +176,8 @@ panes, with the pane you maximized in front of its tab group and still holding t
 focus, so the key toggles that same pane. Showing, hiding or closing a pane, adding or
 removing a Link, leaving the Bus Analyzer or opening a workspace puts them back first, and a
 workspace saved meanwhile keeps the arrangement they return to. A double-click on a title bar
-never floats a pane; a pane is floated out of the window by dragging its title bar.
+never floats a pane; a pane is floated out of the window by dragging its title bar. The
+maximized pane cannot be dragged out of the window; made floating, it puts the panes back.
 
 ### Commands
 One row per decoded Command Transport command. Columns: **Row** (the bus row of the
@@ -108,7 +194,9 @@ CRC errors, empty masks, error responses, and an **EnableCh _CURR write while th
 port's Interval ≠ 1 Row** (a protocol violation — a direct write to the committed
 channel-enable rank is only safe when every row transports) are highlighted, and the
 **Errors Only** filter agrees with the shading.
-Filtering is in **Commands ▸ Filter** (expression search with `and`/`or`/parens;
+Filtering is in **Commands ▸ Filter** (expression search with `and`/`or`/parens; an operator
+with nothing after it (`write or`) is ignored, and a `)` with no matching `(` is ignored; in
+All Links the filter matches the global time shown in the Time column;
 multi-select Commands / Devices / Groups; Errors Only). The Commands list has quick picks
 with keys: **All** (⌘4), **None** (⌘5: nothing, to tick kinds one by one), **All excl.
 Ping** (⌘6) and **Commit** (⌘7: the SSCR / DSCR sync-point commits and the Commit Point
@@ -127,7 +215,8 @@ jump the playhead between the sync-point commits where the config takes effect.
 Per-device register state as-of the playhead: SLC, CDS, each active data-port block, the
 active PHY, and any imported peripheral (vendor) registers. Values are coloured by
 **provenance** (inline key): Cold Reset / Bus Write / Bus Read / CSV Import / Manual
-Edit. Dual-ranked registers show a staged **(NEXT)** row and a committed **(CURR)**
+Edit. A field list wider than the Fields column is cut with an ellipsis; hover the cell to
+read it in full. Dual-ranked registers show a staged **(NEXT)** row and a committed **(CURR)**
 peer. **The key is also a filter:** click an entry (or Tab to it and press Space or
 Enter) to hide or show the registers whose value came from it; hidden entries grey out,
 and the tooltip says which state an entry is in. Turn **Cold Reset** off to see only the
@@ -140,6 +229,9 @@ changes you made while filtering. The filter stays across playhead moves and is 
 workspace, as are the column widths (by column name; a workspace without them opens at the
 default widths). **What-if editing:** right-click (or double-click) a register → *Edit fields…*
 (dropdowns for enums, bounded number boxes otherwise) or *Force value…* (raw byte).
+*Force value…* takes a whole number 0..255 in decimal, or with a 0x, 0o or 0b prefix in hex, octal or binary (0xFF); hex without the prefix (FF), `_` and non-ASCII digits are refused. Anything else is
+refused with a message and the prompt opens again with what you typed; nothing is changed
+until a value reads or you cancel.
 The edit re-decodes so grid, registers, and audio all reflect it; *Clear all manual
 edits* reverts. A dual-ranked write takes effect at its **commit**, not where it was seen.
 **History:** right-click a register → *History…* lists every write and read of it on the
@@ -156,7 +248,7 @@ listed under the address of the device's deferred ReadA32. On a dual-ranked regi
 row, History also lists the writes and reads of its (NEXT) register, marked NEXT, and each
 Commit to the device that covers the register's commit group, with the staged value it
 promotes: a value reaches the CURR register that way or by a write to the CURR address
-itself. A data
+itself. A write to a read-only register is listed, not applied, with the status "read-only register: no effect", and the command table flags it as a programming error. A write to a register with write-1-to-clear bits clears each bit it writes 1 and keeps each it writes 0; its access reads "Write (cleared by write)". A data
 port's commit group is its CommitGroupMemb as the bus left it before that Commit. A Commit
 promotes the devices its device mask selects, none when the mask is 0 (Section 8.1.1.5.1,
 the "Commit Phase for SSCR and DSCR Commands" table), in History and in the Registers pane
@@ -214,7 +306,8 @@ saved in the workspace), or **Reset Color** to go back to the palette (**View �
 palettes and how thick the lines are drawn); the Y axis reads -1, 0, +1 at full scale, and
 the extremes of what is shown under **Vertical Zoom In**; a playhead line tracks the shared
 playhead. **Click a waveform to seek**; **▶ Play** streams the first selected port to the
-system output; **Jog < / >** page one screen. Output device, bit depth, and per-port
+system output (selected data ports that start after the playhead start playing at their own
+start time); **Jog < / >** page one screen. Output device, bit depth, and per-port
 decimation are in the **Audio menu**.
 
 **Right-click a checkbox ▸ Rename…** names that data port, for example `Mic L`. The name
@@ -230,9 +323,8 @@ colour from −120 to 0 dBFS); **Waveform** goes back. It shares the waveform's 
 cursors and click-to-seek, and the tooltip adds the frequency under the pointer. The
 **frame** sizes under Spectrogram (256, 512, 1024, 2048 points; 1024 by default) trade time
 for frequency: each column is a Blackman-Harris-windowed FFT of one frame centred on it, so a
-full-scale tone's leakage is under −90 dB beyond 5 bins and under −100 dB beyond 10, and a
-click shows from
-half a frame before it, ±2.7 ms at 256 points and 48 kHz, with 188 Hz bins; ±10.7 ms at
+full-scale tone's leakage is under −90 dB beyond 5 bins and under −98 dB beyond 10 at any
+frequency, and a click shows from half a frame before it, ±2.7 ms at 256 points and 48 kHz, with 188 Hz bins; ±10.7 ms at
 1024 with 47 Hz bins. Each menu item says what its size gives at that channel's rate. Zoomed
 far out a frame is taken per column, so a click between two frames shows once you zoom in.
 The choice and the frame are part of the Link's Audio view.
@@ -268,7 +360,12 @@ low-frequency signal or too quiet to see. The dialog has:
   returns the decoded samples exactly.
 
 A processed stream's checkboxes carry an asterisk (the setting is in their tooltip) and its
-tracks' titles name it. Playback and **Audio ▸ Export…** use the processed samples; the
+tracks' titles name it. Exported files are WAVE_FORMAT_EXTENSIBLE integer PCM in a 16-, 24- or 32-bit container; the stream's sample size is the valid-bits field and each sample is left-justified in the container, so a stream narrower than its container (a 20-bit stream in a 24-bit file) still reads at full scale in a WAV editor. **Export Audio** asks before replacing WAV files that already exist in the
+chosen folder. A typed resample rate must be 1 kHz or more and no
+higher than the larger of 768 kHz and the stream's own rate. A unit always wins ("32000 Hz",
+"22.05 kHz", "48k"). A number with no unit is in kHz below 1000 ("48" is 48 kHz, "44.1" is
+44.1 kHz) and in Hz from 1000 up ("32000"). The dialog names the stream whose rate it cannot
+use and exports nothing. Playback and **Audio ▸ Export…** use the processed samples; the
 **Samples** table keeps the decoded bus values. The setting belongs to the Link, survives a re-decode,
 and is saved in the workspace. A filter cannot know the signal beyond the capture, so a
 stream that starts or ends far from its own level shows the filter's edge response over the
@@ -276,18 +373,25 @@ first and last few periods of the corner frequency; a transport gap, where the s
 joined across missing samples, shows the same.
 
 ### CDS
-The Control Data Stream as classified 8b/10b symbols: **Row**, Time, codeword, **RD**
-(running disparity; `!` = violation), Kind (comma / robust-token / D-code / K-code /
+The Control Data Stream as classified 8b/10b symbols: **Row**, **Time (µs)**, codeword,
+**Disp** (the codeword's own disparity: −2, 0 or +2), **RD**
+(running disparity; `!` = violation; `?` = not yet known in this window, or not a legal codeword), Kind (comma / robust-token / D-code / K-code /
 NO_RESPONSE, colour-coded), decoded value, and **Meaning** (the symbol's role in its
 Command Transport phase — `PhaseID: WRITE`, `Address[31:24]`, `Manager_CRC16_H`).
 Follows the playhead via windowed re-decode; selecting a command scrolls its comma to the
 top. **Scroll up** to decode-and-prepend earlier history across config sections.
+The pane frames the CDS with **Devices ▸ Hub Depths…**, as the Commands table does. A
+device N hubs deep has its response token read 2·N CDS bits later, so its Ping status, Write
+or Commit response slot shows the token the Commands table reports.
 
 ### Samples
 Each reconstructed audio sample as a row: its **MSB** bus row, Time, the port that
 carried it, and the value in binary / hex / signed decimal. Windowed around the playhead;
 click a row to seek. Filter by **data port** and **channel** (multi-select) and by a
-**value predicate** (e.g. `Decimal ≤ 0`).
+**value predicate** (e.g. `Decimal ≤ 0`). Binary is grouped in fours from the least
+significant bit, matching the Hex digits; the value filter takes decimal (leading zeros
+allowed) or a `0x`/`0o`/`0b` prefix, and a value that does not parse is outlined in red and
+not applied.
 
 ### Capture
 The two physical link lines (DP, DN) as digital waveforms, straight from the capture's
@@ -304,7 +408,7 @@ Two log-scaled histograms meet at the sample point — **setup** on the left, **
 the right — with every data transition split into the four **clock-edge polarity × data
 direction** flavours (DDR samples both edges); click a colour-key entry to hide/show a
 flavour. A **filter** narrows the transitions to any mix of drivers (Manager /
-peripheral), data ports, or columns (CDS / Column 0 is off by default). When a commit
+peripheral), data ports, or columns (CDS / Column 0 is included by default; **All excl. CDS** removes it). When a commit
 changes the bus clock rate mid-capture (e.g. `2col → 16col`) a **region** selector scopes
 the measurement to one rate. **View Worst UI** moves the playhead to the tightest
 transitions so you can inspect them in Capture. Aggregate over the capture — no
@@ -314,8 +418,11 @@ playhead of its own.
 Derived metrics: clock / row rate, per-dataport SSP intervals and bandwidth, the
 bus-config segment summary, and link `PM_Action` events.
 
-Rows are grouped into collapsible sections (Link Control / Regions / Commands / Data
-Ports) — click a section title to fold it. In **Commands**, each command kind is itself
+Rows are grouped into collapsible sections (Link Control / Regions / Commands / Peripheral
+Reports / Data Ports; Peripheral Reports holds what each device reports about itself) — click a section title to fold it. A capture whose Link is brought up again lists
+each later bring-up below the first as a `Bring-up N` row (its sequence and the time its
+strip begins), followed by that bring-up's Sequence, Selected PHY, Safe-Lock and section
+5.2.3 timing rows, indented. In **Commands**, each command kind is itself
 expandable: click it for the breakdown.
 
 - **Ping** — per peripheral, how many of each response state: `PING_ATTACHED`,
@@ -337,8 +444,12 @@ pairs form as you add the second mark of a letter. **Locate Sub-Capture** (below
 places cursors, one per match.
 
 ### Sub-capture search
+Locate Sub-Capture compares PHY1 and PHY2 captures; a PHY3 (DLV) capture, as main or sub,
+is refused with a message, because its data line is the complement of its clock. It is
+refused while a capture is still being decoded.
+
 **File ▸ Locate Sub-Capture…** finds every place a smaller reference capture
-recurs in the open one and places a cursor at each, labelled `Sub i/N` with its score. Pick the reference file(s) — any
+recurs in the open one and places a cursor at each, labelled `Sub i/N` with its score. It reads the reference file behind the progress dialog ("Reading the reference capture…"), then searches; a file that cannot be read is reported as Locate failed. Pick the reference file(s) — any
 format Open Capture accepts, selecting **both** files together for a `.bin` or `.wfm`
 pair. A short form of the Open Capture page follows (*Locate Sub-Capture: the reference*):
 pick the reference's clock and data, and optionally a window of it, then **Search**.
@@ -520,7 +631,9 @@ Two things are then missing:
 1. **Port geometry** — the decoder can't snoop it. Supply it with **Decode ▸ Import
    Visualizer CSV…** — pick a config CSV and choose **Update** to impose its data-port
    config on the open capture, or **Compare** to overlay it in the Register Map (the current
-   Visualizer authoring can be compared, not imposed). The config drives the decode from row 0,
+   Visualizer authoring can be compared, not imposed). Compare shows each register the CSV
+   names with its expected value, in the CSV Import colour, in place of the staged value;
+   hover the row to see what the register held without the overlay: the value the bus wrote or read back, its reset value when the bus never wrote it, or the value a CSV import or a manual edit set. The config drives the decode from row 0,
    so audio reconstructs. DeviceNumber_REG must be 0-11 for a peripheral port; a port with
    any other device number is ignored. A capture with **several config regions** (a cold start's
    Safe-Lock-2 → 8 → 16 columns) takes the CSV into the region under the playhead **only**:
@@ -563,16 +676,15 @@ The applied CSV and the chosen SSP row are saved in the workspace and restored o
 
 ## Large captures
 
-A `.sal` is a ZIP of delta-coded transitions, so it expands enormously on open: a 291 MB
-file can hold 2.25 GB of payload and decode to ~18 GB of edge arrays. Before opening
-anything, Studio predicts the peak memory from the ZIP directory alone — no inflating, no
+A `.sal` is a ZIP of delta-coded transitions, so it expands enormously on open: the inflated
+payload is several times the file, and the edge arrays it decodes to several times that.
+Before opening anything, Studio predicts the peak memory from the ZIP directory alone — no inflating, no
 decoding — and the Open Capture dialog shows it against the budget; when all of it would
 not fit, the dialog opens on a **time window** that does.
 
 - **The prediction is for a whole-file decode as it is now**: the inflated payload plus
-  twice the edge arrays (the result, and one block's worth of deltas while it is built). A
-  54 MB capture with 302M transitions peaks at 3.7 GB and is predicted at 7.2 GB, which
-  opens without asking.
+  twice the edge arrays (the result, and one block's worth of deltas while it is built). A load
+  predicted to fit the budget below is attempted.
 - **The budget is 60% of free memory.** A load predicted past it is not attempted, and the
   dialog opens on a window that fits. A load that fits but is predicted past 8.6 GB (8 GiB)
   is labelled *large, so opening may be slow* and is yours to open whole or not.
@@ -618,7 +730,9 @@ showing Links is **View ▸ Links**. **⌘O / ⌘S** (Ctrl on Windows and
 Linux) open and save the current mode's file. Items that act on a capture are greyed out
 until one is open, submenus included (Commands ▸ Filter, Decode ▸ Manual SSP Move, the
 playback device and bit depth, and Audio's per-stream submenus, which also need audio);
-opening files, preferences, the View menu and Help are always available. The Capture, CDS, Audio, Samples and Timing panes are the **signal
+opening files, the View menu and Help are always available; **Waveform Colors and Line
+Weight…** and **Preferences…** are offered in the Bus Analyzer only, with or without a
+capture. The Capture, CDS, Audio, Samples and Timing panes are the **signal
 panes**: one pane group, with its own Link picker.
 
 - **Mode** — *Bus Visualizer* (⌘1), *Timing Calculator* (⌘2), *Bus Analyzer* (⌘3).
@@ -628,8 +742,18 @@ panes**: one pane group, with its own Link picker.
   Control) or PHY3 (DLV)* (see **Demo captures** below); *Open / Save Workspace…*
   (⌘S, a `.swi3s` file; older `.json` workspaces still open; see **What a workspace keeps**
   below); *Export Capture…* (one dialog — pick the format `.sal` / `.bin` / CSV, which signals + their names, the range (whole capture or a
-  time / bus-row / UI window), and the output file); *Locate Sub-Capture…*; *Export
-  Visualizer CSV…*, *Export Bus Grid Image…* (SVG/PNG) and *View Bus Grid in Visualizer*.
+  time / bus-row / UI window), and the output file; in the Bus rows and UI ranges, To is the
+  last row (or UI) included, and From and To may be equal to export one row; a Time range runs
+  from From up to To, and a To at the end of the capture keeps the last edge); *Locate Sub-Capture…*; *Export
+  Visualizer CSV…*, *Export Bus Grid Image…* (SVG/PNG; a name typed without an extension takes
+  the chosen format's; a grid whose PNG raster would exceed 1 GiB (about 268 million pixels) is
+  refused, so export a very large grid as SVG or draw fewer rows) and *View Bus Grid in Visualizer*.
+  Every Save and Export dialog (workspace, bus config CSV, bus model JSON, timing settings JSON,
+  commands CSV, Visualizer settings CSV, Export Capture Browse) adds the format's suffix to a
+  name typed without it; an extension that is not the format's (a dot inside a name such as
+  `run 1.5`) does not count as one. The grid image keeps `.svg` or `.png` as typed, and a
+  workspace keeps `.json`. A suffix the app adds to a name that names an existing file asks
+  'Replace it?'.
 - **File**, Bus Visualizer — *Open / Save Visualizer CSV…* (⌘O / ⌘S, the authoring CSV);
   *Export Grid Image…*; *Export Bus Model (JSON)…* (the placed bus model).
 - **File**, Timing Calculator — *Open / Save Timing Settings…* (⌘O / ⌘S, the calculator's
@@ -656,7 +780,8 @@ panes**: one pane group, with its own Link picker.
 - **View** — in the Bus Analyzer, show/raise any pane (Timeline, Registers, Statistics,
   Cursors, Bus Grid, Capture, CDS, Audio, Samples, Timing); *Maximize Pane* / *Restore
   Panes* (⌘⇧M: the selected pane alone in the window, and back; see **Analysis panes**; in
-  the Timing Calculator, the Timing Inequalities given the whole page);
+  the Timing Calculator, the Timing Inequalities given the whole page; in the Bus Visualizer,
+  the grid);
   **Links** (two or more Links:
   *Commands: All Links* ⌘⌥0, *Signal Panes: All Links* ⌘⌥⇧0, and one
   entry per Link, ⌘⌥1…9, to show it in every pane); **Appearance** (Follow System /
@@ -689,9 +814,9 @@ analog scope sources (`.wfm`, analog `.csv`) all open through *Open Capture*. An
 volts are thresholded to logic with an automatic mid-rail + 10% hysteresis (or the
 dialog's thresholds), and — with exactly two channels, left as offered — the forwarded
 clock is assigned by transition count. Channels are paired into Links in the Open Capture
-page (see **Opening a capture**). Digital-vs-analog `.csv` is decided by the data values (channels that are strictly 0/1 read as digital). The open
+page (see **Opening a capture**). Digital-vs-analog `.csv` is decided by the data values (channels that are strictly 0/1 read as digital). A digital `.csv` starts with a header row (a file whose first row starts with a number is refused), and a bracketed unit in its Time header (`Time [ms]`, `[us]`, `[ns]`, `[ps]`) is honoured; seconds are the default. The open
 dialog reopens in the last-used folder, tracked separately per mode (the Visualizer
-defaults to `./visualizer_examples`); a large capture shows an n/N decode-progress bar.
+defaults to `./visualizer_examples`); a large capture shows an n/N decode-progress bar. Closing the window while a capture is decoding, or opening a different capture, cancels the decode in progress; the status bar and the decode dialog read "Closing: cancelling the decode…" until it has stopped (within a fraction of a second). A re-decode of the open capture is not cancelled by opening another capture; it finishes first.
 
 ### Import warnings
 
@@ -732,7 +857,8 @@ skipped, nothing opens.
 The playback output device and bit depth are not in it: they belong to the computer, not
 the capture. A window larger than the screen it reopens on is fitted to that screen. Each
 Link also keeps its own Audio and Capture view while another Link is shown, and through a
-re-decode.
+re-decode. A workspace file that is not writable is not overwritten: the save fails with a
+message and the file is left as it was.
 
 ## Row / Time reference points
 

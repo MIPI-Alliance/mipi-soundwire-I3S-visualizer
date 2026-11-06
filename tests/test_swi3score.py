@@ -3,12 +3,13 @@
 Decodes the synthetic demo stream (config + commit + scrambled stereo audio)
 through the SAME C++ decode the Saleae plugin uses, and asserts the control
 phases, snooped geometry, and reconstructed audio all come back correctly.
-Mirrors native/.../test_simulation_roundtrip.cpp, but exercised from Python.
+Exercised from Python through the pybind11 module.
 
 Run:  pytest -q   (after `pip install ./native`)
 """
 import math
 
+import pytest
 import swi3score
 
 
@@ -119,6 +120,48 @@ def test_dscr_disabling_last_port_stops_audio():
         assert n == N, f"dp{dp} kept emitting after being disabled: {n} (want {N})"
 
 
+def test_dscr_enabling_a_port_decodes_it_from_its_first_sample():
+    """A DSCR that enables a port adds it to the running decode without re-anchoring the
+    others: dp0 runs both phases bit-exact, and dp1 decodes from the commit's row, its first
+    sample index 0, with freshly seeded descramblers. The windowed re-decode replays the
+    same reconfigure."""
+    N = 64
+    levels = swi3score.make_dscr_enable_levels(N)
+    d = swi3score.Decoder(swi3score.MemorySampleSource(levels, 98_304_000, 4),
+                          swi3score.DecoderSettings())
+    d.run()
+    commits = [(c["command"], c.get("has_sync_point")) for c in d.commands()
+               if c.get("is_commit") and c.get("commit_confirmed")]
+    assert commits == [("SSCR", True), ("DSCR", False)], commits
+
+    def stream(dp):
+        return sorted((a for a in d.audio() if a["dp"] == dp), key=lambda a: a["start_sample"])
+    dp0, dp1 = stream(0), stream(1)
+    assert [a["value"] for a in dp0] == [_expected_sine(0, i, 15) for i in range(2 * N)]
+    assert [a["index"] for a in dp1] == list(range(N))
+    assert [a["value"] for a in dp1] == [_expected_sine(2, i, 15) for i in range(N)]
+    assert dp1[0]["start_sample"] > dp0[N - 1]["end_sample"]
+
+    import numpy as np
+
+    from swi3s_studio.ingest import transitions
+    from swi3s_studio.session import Session
+    cap = transitions.build_capture_from_levels(levels)   # seekable — same numbering both paths
+    st = swi3score.DecoderSettings(); st.collect_bit_samples = True
+    full = swi3score.Decoder(cap.sample_source(), st); full.run()
+    sample = np.asarray(full.bit_samples()["sample"], np.int64)
+    dp = np.asarray(full.bit_samples()["dp"], np.int32)
+    first_dp1 = int(sample[dp == 1].min())
+    lo, hi = first_dp1 - (first_dp1 - int(sample.min())) // 4, first_dp1 + 200_000
+    win = Session(cap).port_bit_marks(lo, hi, max_marks=1_000_000)
+    w_sample = np.asarray(win["sample"], np.int64)
+    w_dp = np.asarray(win["dp"], np.int32)
+    for port in (0, 1):
+        expect = np.sort(sample[(dp == port) & (sample >= lo) & (sample <= hi)])
+        assert expect.size > 100, port
+        assert np.array_equal(np.sort(w_sample[w_dp == port]), expect), port
+
+
 def test_immediate_single_ranked_write_reconfigures_decode():
     """The register state drives the decode however it was set — not only at commits. A
     single-ranked WriteA32 (PortControl.ScramblerEn, 0x0B) takes committed effect
@@ -178,6 +221,32 @@ def test_windowed_bit_samples_match_full_across_mid_interval_reconfigure():
         f"reconfigure (windowed {w_dp0.size} vs full {expect.size} in-window)")
 
 
+def test_dscr_enabling_a_channel_keeps_the_port_phase():
+    """A DSCR that enables a channel on a running port keeps the port's interval phase: a
+    DSCR generates no SSP, so nothing re-anchors and no unexpected SSP is flagged. Channel 0
+    runs both phases bit-exact. The commit point is an interval boundary, so channel 1,
+    freshly descrambled, sends its first sample (index 0) in that interval, after channel
+    0's."""
+    N = 64
+    levels = swi3score.make_dscr_enable_levels(N, enable_channel=True)
+    d = swi3score.Decoder(swi3score.MemorySampleSource(levels, 98_304_000, 4),
+                          swi3score.DecoderSettings())
+    d.run()
+    commits = [c for c in d.commands() if c.get("is_commit") and c.get("commit_confirmed")]
+    assert [c["command"] for c in commits] == ["SSCR", "DSCR"]
+    assert not any(c.get("unexpected_ssp_error") or c.get("enablech_curr_error")
+                   for c in d.commands())
+
+    audio = sorted((a for a in d.audio() if a["dp"] == 0), key=lambda a: a["start_sample"])
+    ch0 = [a for a in audio if a["channel"] == 0]
+    ch1 = [a for a in audio if a["channel"] == 1]
+    assert [a["value"] for a in ch0] == [_expected_sine(0, i, 15) for i in range(2 * N)]
+    assert [a["index"] for a in ch1] == list(range(N))
+    assert [a["value"] for a in ch1] == [_expected_sine(1, i, 15) for i in range(N)]
+    interval = ch0[N + 1]["start_sample"] - ch0[N]["start_sample"]
+    assert ch0[N]["start_sample"] < ch1[0]["start_sample"] < ch0[N]["start_sample"] + interval
+
+
 def test_decode_progress_reaches_total_at_end():
     """Decoder.run() must leave progress_uis/total_uis reporting (essentially) complete: a
     seekable MemorySampleSource knows its UI count up front (total_uis > 0), and after
@@ -197,7 +266,7 @@ def test_decode_progress_unknown_before_run():
     """Before run() (or for a pure-streaming source whose TotalUiCount() defaults to 0),
     both counters start at 0 and progress() must report 0.0 (unknown), never a bogus
     ratio / NaN / divide-by-zero — Decoder::progress() explicitly guards total_uis == 0."""
-    levels = swi3score.make_dscr_disable_levels(8)
+    levels = swi3score.make_dscr_disable_levels(16)
     src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
     d = swi3score.Decoder(src, swi3score.DecoderSettings())
     assert d.total_uis == 0 and d.progress_uis == 0
@@ -325,7 +394,7 @@ def test_register_override_drives_audio():
     the committed peer of the _NEXT 0x2081) to 0 clears ch0 and drops that port's audio."""
     base = _audio_counts([])
     assert base.get((0, 0)), base
-    ovr = _audio_counts([(1, 0, 0x20C1, 0x00)])   # (section 0, device 0, _CURR alias, value)
+    ovr = _audio_counts([(1, 0, 0x20C1, 0x00)])   # (section 1, device 0, _CURR alias, value)
     assert ovr != base, "override did not change audio"
     assert ovr.get((0, 0), 0) < base[(0, 0)], (base, ovr)
 
@@ -409,8 +478,11 @@ def test_samples_by_position_tiles_the_full_ordering():
     assert [d["index"] for d in tiled] == [d["index"] for d in full]
     # sample_position_of lands a cursor on the first sample at/after it.
     mid_sample = full[total // 2]["start_sample"]
-    pos = s.sample_position_of(mid_sample)
-    assert full[pos]["start_sample"] == mid_sample or full_starts[pos] >= mid_sample
+    assert s.sample_position_of(mid_sample) == full_starts.index(mid_sample)
+    # A sample between two starts lands on the next one.
+    gap = next((i for i in range(1, total) if full_starts[i] - full_starts[i - 1] > 1), None)
+    assert gap is not None, "test premise: the demo's sample starts have a gap"
+    assert s.sample_position_of(full_starts[gap] - 1) == gap
     # A permissive value filter keeps the full count.
     assert s.sample_marks_total(value_pred=(">=", -(1 << 40))) == total
 
@@ -442,22 +514,24 @@ def test_samples_around_window_and_filter_agree():
 
 
 def test_native_abi_guard():
-    """A stale swi3score .so (built before a binding's return shape changed) must fail
-    with a clear 'rebuild' message, not a cryptic unpack error. The native module
-    exposes score_abi; the Session checks it. Simulate an old module by lowering it."""
+    """A swi3score .so built from other sources (before a binding's return shape changed,
+    or after) must fail with a clear 'rebuild' message, not a cryptic unpack error. The
+    native module exposes score_abi; the Session requires it to equal its own. Simulate
+    an older and a newer module by changing it."""
     import swi3score
 
     from swi3s_studio import session as S
-    assert int(getattr(swi3score, "score_abi", 0)) >= S._REQUIRED_SCORE_ABI, \
-        "the loaded swi3score is itself stale — rebuild the native core"
+    assert int(getattr(swi3score, "score_abi", 0)) == S._REQUIRED_SCORE_ABI, \
+        "the loaded swi3score is built from other sources — rebuild the native core"
+    S._require_score_abi()
     saved = swi3score.score_abi
     try:
-        swi3score.score_abi = S._REQUIRED_SCORE_ABI - 1     # pretend it's old
-        try:
-            S._require_score_abi()
-            raise AssertionError("expected a stale-module error")
-        except RuntimeError as e:
-            msg = str(e).lower()
-            assert "out of date" in msg and "rebuild" in msg, e
+        for abi, state in ((S._REQUIRED_SCORE_ABI - 1, "out of date"),
+                           (S._REQUIRED_SCORE_ABI + 1, "newer than this app")):
+            swi3score.score_abi = abi
+            with pytest.raises(RuntimeError) as e:
+                S._require_score_abi()
+            msg = str(e.value).lower()
+            assert state in msg and "rebuild" in msg, e.value
     finally:
         swi3score.score_abi = saved

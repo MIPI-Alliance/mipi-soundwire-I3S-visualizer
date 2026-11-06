@@ -2,7 +2,8 @@
 
 Synthesises a v0 .sal, a v3 (compressed-internal) .sal, and a digital CSV from
 the demo capture and checks each decodes to the same commands/columns. Also
-confirms a real Logic 2 .sal (if present) decodes to a clean, strictly-monotonic
+confirms a real Logic 2 .sal in the directory named by SWI3S_REAL_SAL_DIR (skipped when
+it is unset) decodes to a clean, strictly-monotonic
 transition stream, and that a broken v3 blob raises a clear MalformedSaleaeV3.
 
 Run: python3 -m pytest tests/test_ingest_formats.py
@@ -275,7 +276,8 @@ def test_digital_csv_negative_pretrigger():
 
 
 def test_real_sal_if_present():
-    """Exercise any real Logic 2 .sal files in ~/Downloads (best effort). The
+    """Exercise the .sal files in the directory named by SWI3S_REAL_SAL_DIR (skipped when
+    the variable is unset; real captures are never read implicitly). The
     clock channel is typically multi-chunk; assert it decodes to a clean,
     strictly-monotonic transition stream.
 
@@ -285,9 +287,12 @@ def test_real_sal_if_present():
     which proves it decodes and covers the streaming window path on real Logic 2 data.
     """
     import glob
-    paths = sorted(glob.glob(os.path.expanduser("~/Downloads/*.sal")))
+    root = os.environ.get("SWI3S_REAL_SAL_DIR")
+    if not root:
+        pytest.skip("SWI3S_REAL_SAL_DIR is not set")
+    paths = sorted(glob.glob(os.path.join(os.path.expanduser(root), "*.sal")))
     if not paths:
-        pytest.skip("no real .sal in ~/Downloads")
+        pytest.skip("no .sal files in SWI3S_REAL_SAL_DIR")
     for p in paths:
         info = saleae_sal.read_info(p)
         assert info.sample_rate_hz > 0 and len(info.channels) >= 1
@@ -303,7 +308,7 @@ def test_real_sal_if_present():
             except saleae_sal.SalTooLargeError as exc:
                 # Too big to open whole: the guard refused before allocating, which is the
                 # documented behaviour. Prove it decodes through a window instead.
-                span = saleae_sal.capture_span_samples(p, channels=[clk_ch, dat_ch])
+                span = saleae_sal.window_model(p, channels=[clk_ch, dat_ch]).span_samples
                 assert span > 0, f"{name}: refused ({exc}) and no block index to window by"
                 hi = min(span, int(0.2 * info.sample_rate_hz) or span)
                 cap = saleae_sal.load_capture(p, clk_ch, dat_ch, window=(0, hi))
@@ -320,7 +325,7 @@ def test_real_sal_if_present():
 
 def test_digital_csv_auto_clock_and_rate():
     """The forwarded clock toggles every UI, so it has far more transitions than
-    the data line — channel_transition_counts must rank it first (this drives the
+    the data line — scan must rank it first (this drives the
     auto clock/data pick on CSV load). infer_sample_rate must recover the rate
     from the finest timestamp spacing."""
     cap = transitions.demo_capture(16)
@@ -347,7 +352,7 @@ def test_digital_csv_auto_clock_and_rate():
             # timestamps; %.12g rounding alone would drift infer_sample_rate a few ppm.
             for s in range(last):
                 f.write(f"{s/rate:.15g},{dat[s]},{clk[s]}\n")
-        counts = digital_csv.channel_transition_counts(p)
+        counts = digital_csv.scan(p)[0]
         assert len(counts) == 2, counts
         # Clock (column index 1 here) has the most edges.
         assert counts[1] > counts[0], counts
@@ -441,7 +446,7 @@ def test_a_v4_sal_loads_and_streams_a_window(tmp_path, version):
     """End to end through load_capture, including the streaming window path.
 
     The window path has its own version gate (_v3_span_streaming refuses anything outside
-    V3_LIKE_VERSIONS before it looks for the chain), and capture_span_samples uses it to
+    V3_LIKE_VERSIONS before it looks for the chain), and window_model uses it to
     measure the capture. A Logic-2-shaped blob is used so the header-level fast path
     applies: v4 stamps per-block `level` correctly.
     """
@@ -459,7 +464,7 @@ def test_a_v4_sal_loads_and_streams_a_window(tmp_path, version):
         z.writestr("digital-0.bin", saleae_binary.build_logic2_channel_v3(False, e, **kw))
         z.writestr("digital-1.bin", saleae_binary.build_logic2_channel_v3(False, e + 1, **kw))
 
-    assert saleae_sal.capture_span_samples(path, channels=[0, 1]) == end, \
+    assert saleae_sal.window_model(path, channels=[0, 1]).span_samples == end, \
         f"v{version}: the span walk did not accept the chain"
 
     cap = saleae_sal.load_capture(path, 0, 1)

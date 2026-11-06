@@ -30,6 +30,8 @@ from swi3s_studio.ui.grid_view import (
 )
 from swi3s_studio.ui.theme import apply_palette
 
+pytestmark = pytest.mark.gui
+
 # Palette keys drawn as lines or marks on PLOT_BG. A list key's entries are all checked, so
 # a colour added to one is covered without editing this.
 _LINE_KEYS = ("DP_LINE_PALETTE", "TRACE_PALETTE", "RAW_DP", "RAW_DN", "CURSOR", "SEM_SYNC")

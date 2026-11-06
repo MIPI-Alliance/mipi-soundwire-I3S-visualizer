@@ -10,6 +10,7 @@ own window.
 """
 from __future__ import annotations
 
+import html
 from typing import Any, Callable, List, Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -84,7 +85,7 @@ class RegisterHistoryDialog(QDialog):
         if sample_rate_hz is not None:
             self._rate = float(sample_rate_hz) or 1.0
         n_failed = sum(1 for e in self._events if e.failed)
-        title = self._title
+        title = html.escape(self._title)        # a Link's name is text, never markup
         self._summary.setText(
             f"<b>{title}</b> · {len(self._events)} access(es)"
             + (f" · {n_failed} did not land as asked" if n_failed else "")

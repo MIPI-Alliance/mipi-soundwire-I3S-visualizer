@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.audio_view import _STEM_MIN_PX
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture
 def win():
@@ -94,11 +96,16 @@ def test_the_switch_follows_the_pane_width_at_one_zoom(win):
     _zoom_to_samples(av, 60)
     assert len(curve.sample_dots.getData()[0]), "no stems at the start: nothing to test"
     rng = tuple(plot.getViewBox().viewRange()[0])
-    win.resize(400, 900)                       # 60 samples in far fewer pixels
-    _settle()
-    assert tuple(plot.getViewBox().viewRange()[0]) == pytest.approx(rng)
-    if 60 * _STEM_MIN_PX > plot.getViewBox().width():
+    limits = (av.minimumWidth(), av.maximumWidth())
+    av.setFixedWidth(300)                      # 60 samples in far fewer pixels
+    try:
+        _settle()
+        assert tuple(plot.getViewBox().viewRange()[0]) == pytest.approx(rng)
+        assert 60 * _STEM_MIN_PX > plot.getViewBox().width()
         assert len(curve.sample_dots.getData()[0]) == 0
+    finally:
+        av.setMinimumWidth(limits[0])
+        av.setMaximumWidth(limits[1])
     win.resize(1400, 900)
     _settle()
     assert len(curve.sample_dots.getData()[0])

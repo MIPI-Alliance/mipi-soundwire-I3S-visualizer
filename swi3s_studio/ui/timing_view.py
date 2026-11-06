@@ -1,9 +1,8 @@
-"""Timing mode — the SWI3S Spec Calculator (the Qt counterpart of
-`timing-analysis/app/spec_calculator.py`), covering both forwarded-clock
+"""Timing mode — the SWI3S Spec Calculator, covering both forwarded-clock
 single-ended PHYs.
 
 A per-side **spec selector** picks what each end of the bus is built to: SWI3S
-PHY1, SWI3S PHY2, or SoundWire 1.3 at either supply. The Manager and Peripheral
+PHY1, SWI3S PHY2, or SoundWire 1.3 at 1.2 V. The Manager and Peripheral
 choose independently, so the page covers a single-spec bus and a mixed
 SWI3S ↔ SoundWire one with the same controls, each side contributing the timing
 its own spec promises.
@@ -16,13 +15,12 @@ times are slower; its mandatory F_CLK is half). They are two spec sources, chose
 per side, so a PHY1 Manager talking to a PHY2 Peripheral is expressible.
 
 The inequalities themselves are unchanged across all of this — every spec here
-describes the same physical event graph — but a tabulated clock-to-output number
-means different things on the two sides (SoundWire t_OV is anchored at the END
-of the slew, a full t_RF later than SWI3S t_DD), so it is normalised per side.
-See `swi3s_studio.timing.spec_source`. Selecting a SoundWire side also surfaces
-two advisories that qualify the margins without changing them: the f_Clock
-ceiling (no SoundWire envelope reaches SWI3S PHY2's mandatory 13.2 MHz) and the
-cost of the hysteresis SoundWire does not guarantee on its Data receiver.
+describes the same physical event graph — and a SoundWire side is carried as its SWI3S
+equivalents (`spec_source.sw13_equivalents`):
+each value re-measured between the SWI3S anchors for the same event, on the side it is on.
+A SoundWire Data input's crossings use its own 35-65 % threshold window. Selecting a
+SoundWire side also surfaces the f_Clock ceiling (no SoundWire envelope reaches SWI3S PHY2's
+mandatory 13.2 MHz) as an advisory that qualifies the margins without changing them.
 
 The Specification column is read-only; only the Example column is editable.
 Where a spec has a proposed revision, the Example column seeds from it, so the
@@ -33,9 +31,10 @@ selected automatically — each inequality is evaluated at its own worst corner 
 so there is no manual corner picker. The page:
 
 - A fixed title with the selected bus named beneath it, then a top control bar:
-  per-side spec selector, SoundWire system-size envelope, Manager data-launch
-  mode, F_CLK target, Reset, and Save / Load of the Example column (YAML, or
-  JSON if PyYAML is absent).
+  per-side spec selector, per-side ramp model, SoundWire system-size envelope,
+  Manager data launch, the Handover UI box, the Manager forces keeper switch, the
+  P→P placement, F_CLK target, Reset, and Save / Load of the Example column (saved
+  as JSON; loaded as JSON, or as YAML where PyYAML is installed).
 
   The default F_CLK target is **12.288 MHz** (256 × 48 kHz, the audio design
   point) clamped to whatever the selected pair may legally clock — not PHY2's
@@ -58,27 +57,35 @@ so there is no manual corner picker. The page:
 
   The two clock options are bounded from opposite ends (4x by hold, 2x by setup),
   so which is viable depends on F_CLK — the hint beneath the selector reports that
-  bound at the current rate.
-- A "Timing Inequalities" tree: one always-expanded row per inequality
-  (MP/PM × setup/hold), each evaluated at *its own* worst corner, with the
-  symbolic equation in the header and Specification / Example child rows showing
-  the numeric substitution, Margin, and Max Frequency (every leg whose margin
-  scales with UI; "—" where no rate bounds it) — failing margins / F_max coloured
-  red.
+  bound at the current rate, read from the Example column's own Manager-to-Peripheral legs.
+- A "Timing Inequalities" tree: one always-expanded heading per inequality family
+  (M→P, P→M and P→P setup and hold with their handover variants, the three contention legs
+  and the two keeper legs), 17 numbered inequalities in all. Each is evaluated at *its own*
+  worst corner, with the symbolic equation in the header and a child row per column (named
+  by `_column_labels`) showing the numeric substitution, Margin, and Max Frequency (every
+  leg whose margin scales with UI: the lowest rate at which it fails as F_CLK rises, "—"
+  where it never fails, and a tooltip naming any higher rates at which it passes again) —
+  failing margins / F_max coloured red.
 - One Specification-vs-Example parameter grid per section (shared name column,
-  Spec and Example min/max side by side, then the unit).
+  Spec and Example min/max side by side, then the unit). A row's name toggles its
+  parameter's highlight, as a click on one of its terms does.
+- The term diagram (`timing_diagram.TimingDiagram`), on the right behind a horizontal
+  splitter and hidden until a term in an inequality is clicked: it draws that term of that
+  inequality at each column's worst corner (`_on_term_clicked`). Its ⤢, or a double-click
+  on it, gives it the whole page with the columns side by side (`set_diagram_maximized`).
 
-All compute lives in `swi3s_studio.timing` (validated against the timing-analysis
-reference spreadsheets); this view only edits CalcRow ranges and formats the
-CalcResults.
+All compute lives in `swi3s_studio.timing` (cross-checked against the vendored
+reference fixture, `tests/test_timing_vs_reference.py`); this view only edits CalcRow ranges
+and formats the CalcResults.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, cast
 
-from PySide6.QtCore import QPointF, QSize, Qt, Signal
+from PySide6.QtCore import QPointF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QBrush,
@@ -91,6 +98,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -102,9 +110,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -112,6 +122,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import import_notes
+from ..fsutil import write_whole
 from ..timing import (
     INEQUALITIES,
     PP_PLACEMENT_LABELS,
@@ -121,7 +132,14 @@ from ..timing import (
     apply_row_picks,
     compute,
     default_swi3s_rows,
-    find_worst_corner_rows,
+    find_worst_corner_rows_all,
+)
+from ..timing.calculator import (
+    CalcResults,
+    Inequality,
+    InequalityBreakdown,
+    Pick,
+    toggle_ceiling_MHz,
 )
 from ..timing.spec_source import (
     LAUNCH_LABELS,
@@ -131,17 +149,18 @@ from ..timing.spec_source import (
     SpecSource,
     SystemSize,
     default_handover_UIs,
-    ede_release_ceiling_ns,
     is_ede,
     is_proposed,
     is_soundwire,
     launch_grid_UI,
-    launch_mode_max_fclk_MHz,
     launch_mode_tDD_ns,
     preset,
     snap_to_launch_grid,
 )
+from ..timing.timeline import leg_timeline
+from .save_path import suffixed_save_path
 from .theme import VizTheme, analyzer_stylesheet
+from .timing_diagram import DiagramSection, TimingDiagram, pct_text
 
 try:
     import yaml
@@ -149,15 +168,26 @@ try:
 except Exception:                                  # pragma: no cover - env dependent
     _HAVE_YAML = False
 
+# The largest Example file Load Example reads, and the YAML it reads: a mapping of rows, with
+# no anchors or aliases (an alias is how a few lines expand to an unbounded document).
+_MAX_EXAMPLE_BYTES = 1 << 20
+
+if _HAVE_YAML:
+    class _ExampleLoader(yaml.SafeLoader):
+        def compose_node(self, parent, index):
+            if self.check_event(yaml.events.AliasEvent):
+                raise yaml.YAMLError("YAML aliases are not read in an Example file")
+            return super().compose_node(parent, index)
+
 SIDES = ("spec", "proposed")
 
-# Section layout — group default_swi3s_rows() into named boxes (mirrors the
-# Streamlit app's SECTIONS).
+# Section layout — group default_swi3s_rows() into named boxes.
 SECTIONS: List[Tuple[str, List[str]]] = [
     ("RX Thresholds", ["V_IH", "V_IL"]),
     ("RX Timing", ["Man_t_IS", "Man_t_IH", "Per_t_IS", "Per_t_IH"]),
     ("TX Timing", ["Man_t_DD", "Per_t_DD"]),
-    ("Handover Timing", ["Man_t_DZ", "Per_t_DZ", "Man_t_ZD", "Per_t_ZD"]),
+    ("Handover Timing", ["Man_t_DZ", "Per_t_DZ", "Man_t_ZD", "Per_t_ZD",
+                         "Man_t_EDE", "Per_t_EDE"]),
     ("Rise/Fall Times", ["t_RF Man CLK", "t_RF Man DATA", "t_RF Per DATA",
                          "τ (per-edge slew)"]),
     ("System Properties", ["δ (V_SEOS tol)", "α (V_noise / V_SEOS)", "bus length (cm)",
@@ -188,9 +218,8 @@ _ROW_BY_NAME: Dict[str, CalcRow] = {r.name: r for r in _ALL_ROWS}
 #       differ:  Per_tDD 14-50/2-20 · Per_tZD 14-50/2-18 · Man_tZD 14-30/2-18
 #       agree:   Man_tDD 7-18 · Man_tDZ 0-10 · Per_tDZ 0-10
 #   Only the differing rows need an override, so only they appear below — but
-#   the agreeing ones are two coincident rows, NOT one shared value. Do not
-#   reason from "the output timing table doesn't split it": it splits everything. If a
-#   future revision diverges Man_tDD, this dict is where PHY1's row belongs.
+#   the agreeing ones are two coincident rows, NOT one shared value. A parameter whose
+#   PHY1 row diverges from PHY2's belongs in this dict.
 #
 # Everything else (V thresholds §11.2.2, t_RF in the single "PHY1 & PHY2 Output Ramp Time"
 # table, noise, bus geometry) is shared or is not a device-spec value at all.
@@ -250,70 +279,14 @@ _PHY1_PROPOSED: Dict[str, ParamRange] = {
     "Man_t_ZD": ParamRange(22.0, 39.0, 56.0),    # PHY1 14-30 -> 22-56
 }
 
-# The EDE candidate's analog turn-on / turn-off range, ns. The column's values are in
-# `_ede_ranges`. The PERIPHERAL's release is not a row: it is an interval from its own
-# ramp completion, carried by `CalcInputs.Per_ede_hold_*`.
-_EDE_TURN_MIN, _EDE_TURN_MAX = 3.0, 9.0     # 3:1 analog turn-on / turn-off
+def _ede_ranges() -> Dict[str, ParamRange]:
+    """The EDE column's values, all absolute nanoseconds: the proposed revision's.
 
-# The EDE rows that are UI FRACTIONS rather than absolute nanoseconds. They follow
-# F_CLK: `_refresh_ede_rate_rows` rewrites them at the new rate.
-#
-# EMPTY: every EDE value is absolute (`_ede_ranges`). A placement stated as a fraction of
-# the UI must be listed here, or it carries across a rate change unscaled.
-# `test_ede_ui_relative_rows_follow_the_rate` checks the behaviour, not the membership.
-_EDE_UI_RELATIVE_ROWS: tuple[str, ...] = ()
-
-
-def _UI_ns(f_clk_MHz: float, duty_min: float = 0.45) -> float:
-    """UI at the duty floor, matching CalcInputs.UI_ns."""
-    return 1000.0 * duty_min / f_clk_MHz if f_clk_MHz > 0 else 0.0
-
-
-def _ede_ranges(UI_ns: float) -> Dict[str, ParamRange]:
-    """The EDE column's proposed values, all absolute nanoseconds.
-
-    `UI_ns` is unused: no value here is a UI fraction (so `_EDE_UI_RELATIVE_ROWS` is
-    empty). The parameter stays so a rate-relative seed needs no new argument through
-    `_seed_range`.
-
-        Manager     launches (t_DD, t_ZD) at the revision's analog 9-23 ns and stops
-                    driving AT the UI boundary: `Man_t_DZ,max` = 0 against Note 1's own
-                    reference in the "PHY1 & PHY2 Output Timing" table, the bottom of the
-                    ratified 0-10 ns range.
-                    `Man_t_DZ` is a pure delay from the Manager's internal timing
-                    reference for its own clock edge (Note 3), so the move to high-Z
-                    can be gated from that edge. This is not an EndDriveEarly release:
-                    `_man_ede_for` returns False and the EndDriveEarly ceiling does not bound it.
-                    `CalcInputs.Man_ede` keeps a mid-UI Manager release expressible
-                    from code.
-
-        Peripheral  has no mid-UI reference (Sec. 11.1.5). It holds its own COMPLETED
-                    level for 3-9 ns and then releases. That interval is
-                    `CalcInputs.Per_ede_hold_*`, NOT a row here. Its t_DD, t_ZD and
-                    t_IH are the revision's values.
-
-    No clocked launch is seeded; select 4x in the launch mode combo to see one.
+    A side on the EDE source releases by its EDE Delay row (seeded from
+    `default_swi3s_rows`) instead of its t_DZ row (`CalcInputs.Man_ede` / `Per_ede`).
+    No value is a fraction of the UI, so none moves with F_CLK.
     """
-    return {
-        # The launch, and the OTHER launch method: the revision's own analog range,
-        # unchanged. t_DD and t_ZD both launch a data edge -- from an already-driving
-        # output, or out of high-Z -- and both must satisfy the same setup and hold
-        # requirements at the receiver, so the revision states them identically.
-        "Man_t_DD": ParamRange(9.0, 16.0, 23.0),
-        "Man_t_ZD": ParamRange(9.0, 16.0, 23.0),
-        # The release: AT the boundary, under the end-of-UI reference of Note 1 of the
-        # "PHY1 & PHY2 Output Timing" table.
-        # Collapsed to a point because it is gated from a clock edge the Manager owns.
-        "Man_t_DZ": ParamRange(0.0, 0.0, 0.0),
-        # Peripheral: the revision's own values, unchanged.
-        "Per_t_DD": ParamRange(2.0, 5.5, 9.0),
-        # Also the revision's own value. A peripheral's t_ZD is analog (about 3:1 over
-        # PVT); `test_ede_peripheral_values_are_not_tighter_than_3_to_1` rejects a
-        # tighter range. See ../timing-analysis/docs/MODEL_AUDIT.md.
-        "Per_t_ZD": ParamRange(2.0, 5.5, 9.0),
-        "Per_t_IH": ParamRange(0.0, 0.75, 1.5),
-    }
-
+    return dict(_PHY2_PROPOSED)
 
 
 _PROPOSED_BY_SPEC: Dict[str, Dict[str, ParamRange]] = {
@@ -329,6 +302,10 @@ _PROPOSED_BY_SPEC: Dict[str, Dict[str, ParamRange]] = {
 # 13.2 MHz mandatory maximum. PHY1 opens on its mandatory maximum, 6.6 MHz.
 _SPEC_FCLK_TARGET: Dict[str, float] = {"SWI3S_PHY1": 6.6, "SWI3S_PHY2": 12.288}
 _FCLK_TARGET_DEFAULT = 12.288
+
+# Quiet time after the last typed edit before the results are recomputed (ms): a burst of
+# keystrokes costs one recompute (`TimingView._schedule_recompute`).
+_RECOMPUTE_DEBOUNCE_MS = 200
 
 
 def _phy_of(spec: SpecSource) -> int:
@@ -350,6 +327,10 @@ def _spec_range(name: str, phy: int) -> ParamRange:
     return _ROW_BY_NAME[name].range
 
 
+# Rows whose value may be negative: a setup demand below zero lets the data cross after the
+# clock reference (a SoundWire Manager's t_IS equivalent is −1.0 ns).
+_SIGNED_ROWS = ("Man_t_IS", "Per_t_IS")
+
 # Rows that belong to one side of the bus, and which SpecPreset field seeds them.
 # When a side is switched to SoundWire these are reseeded from that spec's tables;
 # everything else (thresholds, noise, bus geometry) is a property of the bus or of
@@ -358,18 +339,18 @@ _MAN_ROW_FIELDS: Dict[str, Tuple[str, str]] = {
     "Man_t_DD": ("t_DD_min_ns", "t_DD_max_ns"),
     "Man_t_IS": ("t_IS_max_ns", "t_IS_max_ns"),
     "Man_t_IH": ("t_IH_max_ns", "t_IH_max_ns"),
-    "Man_t_DZ": ("t_DZ_max_ns", "t_DZ_max_ns"),
-    "Man_t_ZD": ("t_ZD_ns", "t_ZD_ns"),
+    "Man_t_DZ": ("t_DZ_min_ns", "t_DZ_max_ns"),
+    "Man_t_ZD": ("t_ZD_min_ns", "t_ZD_ns"),
 }
 _PER_ROW_FIELDS: Dict[str, Tuple[str, str]] = {
     "Per_t_DD": ("t_DD_min_ns", "t_DD_max_ns"),
     "Per_t_IS": ("t_IS_max_ns", "t_IS_max_ns"),
     "Per_t_IH": ("t_IH_max_ns", "t_IH_max_ns"),
-    "Per_t_DZ": ("t_DZ_max_ns", "t_DZ_max_ns"),
-    "Per_t_ZD": ("t_ZD_ns", "t_ZD_ns"),
+    "Per_t_DZ": ("t_DZ_min_ns", "t_DZ_max_ns"),
+    "Per_t_ZD": ("t_ZD_min_ns", "t_ZD_ns"),
 }
 # t_RF rows follow their side's spec too — SoundWire's tabulated slew differs
-# from SWI3S's 5 ns reference, and it is what the anchor conversion scales.
+# from SWI3S's, and every crossing and anchor scales with it.
 _MAN_TRF_ROWS = ("t_RF Man CLK", "t_RF Man DATA")
 _PER_TRF_ROWS = ("t_RF Per DATA",)
 
@@ -379,7 +360,7 @@ def _row_range_for_spec(name: str, spec: SpecSource, side: str,
     """Spec min/typ/max for a per-side row, or None if the row isn't side-specific.
 
     Driven by the preset rather than by which spec family it is, so any source
-    with its own tabulated numbers reseeds: a SoundWire side from Tables 16/17
+    with its own numbers reseeds: a SoundWire side from its SWI3S equivalents
     at the selected envelope, a proposed SWI3S revision from its proposal
     values. Stock SWI3S PHY1/PHY2 return None so the caller falls back to the
     PHY-table path, which is the validated single-spec behaviour — and which is
@@ -416,8 +397,18 @@ def _red() -> QColor:
     return QColor(VizTheme.SEM_ERROR)
 
 
-_FMAX_COLS = ["Inequality", "Spec margin (ns)", "Example margin (ns)", "ΔMargin (ns)",
-              "Spec F_max (MHz)", "Example F_max (MHz)", "ΔF_max (MHz)"]
+def _summary_label(label: str) -> str:
+    """A result column's name in the copyable summary: the page's `_column_labels` entry,
+    with the specification column named "Spec" wherever the summary names it."""
+    return "Spec" if label == "Specification" else label
+
+
+def _fmax_columns(left: str, right: str) -> List[str]:
+    """The summary table's header for result columns named `left` and `right` (the page's
+    `_column_labels`)."""
+    left, right = _summary_label(left), _summary_label(right)
+    return ["Inequality", f"{left} margin (ns)", f"{right} margin (ns)", "ΔMargin (ns)",
+            f"{left} F_max (MHz)", f"{right} F_max (MHz)", "ΔF_max (MHz)"]
 
 # Uniform scale for the whole Timing page (fonts AND fixed pixel dimensions scale
 # together, so proportions and alignment are preserved). Scoped to this view.
@@ -431,6 +422,7 @@ def _px(n: float) -> int:
 _FONT_BODY = _px(12)     # matches the theme body size, scaled
 _FONT_HEADER = _px(15)   # section headers (theme HEADER_CSS, scaled)
 _FONT_TITLE = _px(18)    # page title (theme TITLE_CSS, scaled)
+_FONT_DIAGRAM = _px(14)  # the term diagram's body font, its labels' size
 _HEADER_CSS = f"font-size:{_FONT_HEADER}px; font-weight:600;"
 _TITLE_CSS = f"font-size:{_FONT_TITLE}px; font-weight:600;"
 
@@ -441,7 +433,7 @@ _BOX_W = _px(54)        # min/max spin width — fixed so columns align across s
 _UNIT_COL_W = _px(52)   # unit column width — fits the widest unit ("·V_DD")
 _GAP_W = _px(40)        # gap between the Spec and Example groups
 _HEAD_INDENT = _px(4)   # ~½ char: nudge titles/top-bar in to sit under the card borders
-_LABEL_CELL_W = _px(96)  # Spec/Example label cell — numbers align under each other
+_LABEL_CELL_W = _px(96)  # minimum label cell; widened to the longest column heading
 _COMBO_W = _px(140)     # ramp-model combo width (fits "exponential")
 _SECTION_GAP = _px(6)   # vertical gap between sections
 
@@ -538,24 +530,26 @@ _INEQ_NUMBER = {ineq: n for n, ineq in enumerate(
 # leg it acts on and the `t_RF Man CLK` row above. The symbols follow the same rule
 # (`_trf_sym`: name the lane so the term points at the row).
 #
-# So `Man_t_DD,pure` and `Man_t_DD` are ONE key: the `,pure` suffix is an anchor conversion
-# of one row's value, not a second parameter. A crossing keys on its t_RF LANE, because that
-# is the row in the grid -- the dimensionless coefficient has no row of its own, and a
-# gathered `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK` is still one lane however many
-# crossings it nets.
+# So `Per_t_DD,anchor,rise` and `Per_t_DD` are ONE key: the `,anchor` suffix is a SoundWire
+# anchor correction of one row's value, not a second parameter. A crossing keys on its t_RF
+# LANE, because that is the row in the grid -- the dimensionless coefficient has no row of its
+# own, and a gathered `(X_MP,A,rise,late − X_MP,B,fall,early) · Man_t_RF,CLK` is still one lane
+# however many crossings it nets.
 #
 # TERMS WITH NO ROW key on themselves, so they stay clickable: `UI` (derived from the
-# F_CLK spin box), `Man_t_Keeper_Response` and `Per_t_hold` (CalcInputs fields the grid
-# does not expose). Listed rather than detected, so
-# a NEW row-less term fails `test_every_printed_term_resolves_to_a_key` instead of silently
-# becoming unclickable.
-_ROWLESS_TERM_KEYS = ("UI", "Man_t_Keeper_Response", "Per_t_hold")
+# F_CLK spin box) and `Man_t_Keeper_Response` (a CalcInputs field the grid does not
+# expose). Listed rather than detected, so a NEW row-less term fails
+# `test_every_printed_term_resolves_to_a_key` instead of silently becoming unclickable.
+_ROWLESS_TERM_KEYS = ("UI", "Man_t_Keeper_Response")
 
 # Suffixes that qualify a value without naming a different parameter, so they do not change
-# which row the term came from. `,min`/`,max` are not here: no symbol carries them (see
-# `Term.symbol`'s rule that a picker-owned corner never appears in a symbol) except
-# `Per_t_hold,min`, whose base is row-less anyway.
-_TERM_SUFFIXES = (",pure", ",EDE", ",min")
+# which row the term came from: a SoundWire anchor correction, with the edges it is placed on
+# (`calculator.anchor_symbol`). `,min`/`,max` are not here: no symbol carries them (see
+# `Term.symbol`'s rule that a picker-owned corner never appears in a symbol). An anchor priced
+# on the fast data edge ends in `,fast` after those suffixes (`Man_t_DD,anchor,rr,fast`,
+# `Per_t_DD,anchor,rise,fast`); `_term_key` drops it first.
+_FAST_SUFFIX = ",fast"
+_TERM_SUFFIXES = tuple(f",anchor,{q}" for q in ("rise", "fall", "rr", "rf", "fr", "ff"))
 
 
 def _term_key(symbol: str) -> str:
@@ -567,15 +561,18 @@ def _term_key(symbol: str) -> str:
     rather than a quiet one.
     """
     head = symbol.strip()
-    # A product's LAST factor is the row: `X_MP,late · Man_t_RF,DATA`, `1.67·Per_t_RF,DATA`,
-    # and the gathered `(…) · Man_t_RF,CLK` all identify a t_RF lane that way.
+    # A product's LAST factor is the row: `X_MP,rise,late · Man_t_RF,DATA`, the ramp
+    # `Per_t_RF,DATA,rise`, and the gathered `(…) · Man_t_RF,CLK` all identify a t_RF lane that
+    # way; a ramp keys on its lane whichever edge it names.
     last = head.split("·")[-1].strip()
     if "_t_RF," in last:
         device, lane = last.split("_t_RF,")
-        return f"t_RF {device} {lane}"
+        return f"t_RF {device} {lane.split(',')[0]}"
     # A leading integer coefficient is presentation (`1·UI`, `2·t_PD`), not identity.
     if "·" in head and head.split("·")[0].strip().replace(".", "").isdigit():
         head = last
+    if ",anchor" in head and head.endswith(_FAST_SUFFIX):
+        head = head[: -len(_FAST_SUFFIX)]
     for suffix in _TERM_SUFFIXES:
         if head.endswith(suffix):
             head = head[: -len(suffix)]
@@ -685,14 +682,26 @@ class _RichTextDelegate(QStyledItemDelegate):
         return QSize(int(doc.idealWidth()) + 8, int(doc.size().height()))
 
 
+def _supply_text(leg: str, supplies: Tuple[float, float, float]) -> str:
+    """Each device's V_SEOS in a leg's supply corner, as rich text, e.g.
+    "V<sub>SEOS</sub> Manager −5 %, Peripheral +5 %"; empty when every device is nominal."""
+    names = (("Manager", 0), ("Peripheral A", 1), ("Peripheral B", 2)) if leg.startswith(
+        "PP") else (("Manager", 0), ("Peripheral", 1))
+    if all(abs(supplies[i] - 1.0) < 1e-12 for _, i in names):
+        return ""
+    parts = [f"{name} {pct_text(supplies[i] - 1.0)}" for name, i in names]
+    return "V<sub>SEOS</sub> " + ", ".join(parts)
+
+
 class _TermTree(QTreeWidget):
     """The results tree, with clickable terms.
 
-    Clicking a term toggles it; clicking in empty space clears the set (see `_hit`). The
-    pointer turns to a pointing hand over a term.
+    A click on a term emits `term_clicked` with the term's key and the inequality whose row
+    it is on ("" for a row of none); a click in empty space emits `cleared` (see `_hit`).
+    The pointer turns to a pointing hand over a term.
     """
 
-    term_clicked = Signal(str)
+    term_clicked = Signal(str, str)
     cleared = Signal()
 
     def __init__(self, delegate_keys):
@@ -705,11 +714,14 @@ class _TermTree(QTreeWidget):
         """(term key under `pos`, whether `pos` is on this row's text at all).
 
         The operators between terms are not click targets, so a click on a `−` lands on
-        the text but on no term: that is INERT, while a click in empty space clears.
+        the text but on no term: that is INERT, as is a click on a Margin or Max Frequency
+        value (a value to read), while a click in empty space clears.
         """
         index = self.indexAt(pos)
-        if not index.isValid() or index.column() != 0:
+        if not index.isValid():
             return None, False
+        if index.column() != 0:
+            return None, True
         opt = QStyleOptionViewItem()
         self.initViewItemOption(opt)
         opt.rect = self.visualRect(index)
@@ -729,7 +741,8 @@ class _TermTree(QTreeWidget):
         if event.button() == Qt.LeftButton:
             key, on_text = self._hit(event.position().toPoint())
             if key:
-                self.term_clicked.emit(key)
+                leg = self.indexAt(event.position().toPoint()).data(Qt.UserRole)
+                self.term_clicked.emit(key, leg or "")
             elif not on_text:
                 self.cleared.emit()      # empty space clears; an operator is inert
         super().mousePressEvent(event)
@@ -761,17 +774,22 @@ _DISPLAY_NAME = {
     "δ (V_SEOS tol)": "V<sub>SEOS</sub> tol (δ)",
     "α (V_noise / V_SEOS)": "V<sub>noise</sub> / V<sub>SEOS</sub> (α)",
     "τ (per-edge slew)": "per-edge slew (τ)",
+    "Man_t_EDE": "Man EDE Delay",
+    "Per_t_EDE": "Per EDE Delay",
 }
 
 
 # Timing-symbol tokens rendered as subscripts (V_IH → V<sub>IH</sub>,
-# Man_t_DD → Man_t<sub>DD</sub>, X_MP,late → X<sub>MP,late</sub>). The leading
+# Man_t_DD → Man_t<sub>DD</sub>, X_MP,rise,late → X<sub>MP,rise,late</sub>). The leading
 # Man_/Per_ underscore is kept literal; only the underscore right before one of
 # these tokens becomes the subscript, and any trailing ,qualifiers join it.
-# `PP` joins MP/PM (the P->P legs), `hold` catches Per_t_hold,min, and the qualifier
-# group takes digits and `min`/`max` so `Per_t_hold,min` subscripts like its siblings.
+# `PP` joins MP/PM (the P->P legs), `K` is the keeper's threshold crossing (X_K),
+# `TH_Keeper` / `TL_Keeper` a SoundWire keeper's thresholds (V_TH_Keeper,max), `EDE` is the
+# EDE Delay (Man_t_EDE), and the qualifier group takes digits and `min`/`max`.
+# `Keeper_Response` is tried before `K`.
 _SUB_RE = re.compile(
-    r"_(IH|IL|DD|IS|DZ|ZD|RF|PD|MP|PM|PP|hold|Keeper_Response|cross)((?:,[A-Za-z0-9]+)*)")
+    r"_(IH|IL|DD|IS|DZ|ZD|RF|PD|MP|PM|PP|EDE|TH_Keeper|TL_Keeper|Keeper_Response|cross|K)"
+    r"((?:,[A-Za-z0-9]+)*)")
 
 
 def _subscript(name: str) -> str:
@@ -848,22 +866,110 @@ def _spin_qss() -> str:
 
 
 
-# Keys an earlier version's settings carry that set_from_dict reads or ignores by design.
+# Keys of the single-PHY settings format that set_from_dict reads or ignores by design.
 _LEGACY_KEYS = frozenset({"phy", "lock_mgr_lanes", "spec::man_shape", "spec::per_shape"})
 
 
+def _find_choice(combo: QComboBox, value) -> int:
+    """The index of the choice whose data is `value`, or -1. Every selector holds strings,
+    so a value of any other type is not a choice: handing a number past the C++ int range to
+    findData raises through Qt instead of returning -1."""
+    return combo.findData(value) if isinstance(value, str) else -1
+
+
+_SHOWN_VALUE_CHARS = 60
+
+# The clock duty the launch grid is placed at: the one the model evaluates with.
+_LAUNCH_DUTY = CalcInputs().duty_min
+
+
+def _cut(text: str) -> str:
+    """`text` cut to `_SHOWN_VALUE_CHARS` characters with an ellipsis, so a name or value read
+    from a file cannot make a warning oversized."""
+    return text if len(text) <= _SHOWN_VALUE_CHARS else text[:_SHOWN_VALUE_CHARS - 1] + "…"
+
+
+def _shown(value) -> str:
+    """A saved value's repr for a warning, cut by `_cut`."""
+    return _cut(repr(value))
+
+
 def _unknown_choice(key: str, value, combo: QComboBox) -> str:
-    return (f"'{key}' {value!r} is not one of the choices offered; "
+    return (f"'{key}' {_shown(value)} is not one of the choices offered; "
             f"{combo.currentText() or combo.currentData()!r} is kept")
 
 
-def _set_spin(spin, value, label: str, clamped: List[str]) -> None:
+def _set_spin(spin, value, label: str, clamped: List[str],
+              unread: Optional[List[str]] = None) -> None:
     """Set a spin box from a saved number, adding `label` to `clamped` when the number is
-    outside the box's range (the box takes the nearest end)."""
-    v = float(value)
+    outside the box's range (the box takes the nearest end). A value that is not a finite
+    number (text, a flag, null) leaves the box as it is and adds `label` and the value to
+    `unread`."""
+    try:
+        v = math.nan if isinstance(value, (bool, str)) else float(value)
+    except (TypeError, ValueError, OverflowError):
+        v = math.nan
+    if not math.isfinite(v):
+        if unread is not None:
+            unread.append(f"{label} = {_shown(value)}")
+        return
     spin.setValue(v)
     if v < spin.minimum() or v > spin.maximum():
         clamped.append(f"{label} = {v:g} (read as {spin.value():g})")
+
+
+def _unread_note(unread: List[str]) -> str:
+    """The import warning for saved settings that are not numbers."""
+    more = f", and {len(unread) - 3} more" if len(unread) > 3 else ""
+    return (f"{len(unread)} value(s) that are not numbers, kept as they were: "
+            f"{', '.join(unread[:3])}{more}")
+
+
+def _inverted_note(swapped: List[str]) -> str:
+    """The import warning for ranges restored with their minimum above their maximum."""
+    more = f", and {len(swapped) - 3} more" if len(swapped) > 3 else ""
+    return (f"{len(swapped)} range(s) with the minimum above the maximum, exchanged: "
+            f"{', '.join(swapped[:3])}{more}")
+
+
+# What the model raises for inputs it cannot evaluate: a ValueError names the input (`compute`
+# checks every input first); a ZeroDivisionError is a divisor an input drives to zero that the
+# check did not name, shown with a generic message.
+_UNEVALUABLE = (ValueError, ZeroDivisionError)
+
+
+def _refusal_text(exc: Exception) -> str:
+    """The message shown in place of the margins for an input the model cannot evaluate."""
+    if isinstance(exc, ZeroDivisionError):
+        return "an input makes the model divide by zero"
+    return str(exc)
+
+
+def _unevaluable_note(error: str) -> str:
+    """The import warning for loaded settings the timing model cannot evaluate."""
+    return f"the timing model cannot evaluate these settings, so no margins are shown: {error}"
+
+
+def _snapped_note(mode_value: str, moved: List[Tuple[str, float, float]]) -> str:
+    """The import note for launch values moved onto a clocked mode's grid: `moved` is
+    (label, value read, value set)."""
+    grid = launch_grid_UI(LaunchMode(mode_value))
+    shown = ", ".join(f"{label} = {old:g} (set to {new:g})" for label, old, new in moved[:3])
+    more = f", and {len(moved) - 3} more" if len(moved) > 3 else ""
+    return (f"{len(moved)} Manager launch value(s) not on the {grid:g} UI grid a "
+            f"{mode_value} clock places, moved to the nearest point: {shown}{more}")
+
+
+class _ClickLabel(QLabel):
+    """A label that reports a left click."""
+    clicked = Signal()
+
+    def mousePressEvent(self, ev) -> None:  # noqa: N802 - Qt override
+        if ev.button() == Qt.LeftButton:
+            ev.accept()
+            self.clicked.emit()
+            return
+        super().mousePressEvent(ev)
 
 
 class _DoubleClickLabel(QLabel):
@@ -882,10 +988,20 @@ class TimingView(QWidget):
     # A double-click on the Timing Inequalities title: the window toggles the maximized view
     # (set_maximized), as its ⤢ button and View ▸ Maximize Pane do.
     maximizeRequested = Signal()
+    # The term diagram given the page, or put back (set_diagram_maximized).
+    diagramMaximizedChanged = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         self._loading = False
+        # The single-shot timer a typed edit restarts; its timeout is the one recompute of
+        # the burst. Parented to the view, so it dies with it. `_stale` is True from an edit
+        # until the next recompute.
+        self._recompute_timer = QTimer(self)
+        self._recompute_timer.setSingleShot(True)
+        self._recompute_timer.setInterval(_RECOMPUTE_DEBOUNCE_MS)
+        self._recompute_timer.timeout.connect(self._recompute)
+        self._stale = False
         self._maximized = False
         self._min: Dict[Tuple[str, str], QDoubleSpinBox] = {}
         self._max: Dict[Tuple[str, str], QDoubleSpinBox] = {}
@@ -893,8 +1009,23 @@ class TimingView(QWidget):
         # Every style built from the palette, as (widget, css builder), so retheme() can
         # rebuild them.
         self._themed: List[Tuple[QWidget, Callable[[], str]]] = []
-        self._man_shape: Optional[QComboBox] = None      # shared across Spec + Example
-        self._per_shape: Optional[QComboBox] = None
+        # The term diagram's leg and term key (None and "" while none is drawn), and each side's
+        # worst corner per inequality: its result and its row picks (`_worst_results`), both
+        # set together by `_recompute`.
+        self._diagram_leg: Optional[Inequality] = None
+        self._diagram_term = ""
+        self._worst: Dict[str, Dict[Inequality, CalcResults]] = {}
+        self._worst_picks: Dict[str, Dict[str, Dict[str, str]]] = {}
+        # Why the last recompute shows no margins ("" when it shows them): an input the model
+        # cannot evaluate (`_show_compute_error`).
+        self._compute_error = ""
+        # The note for the range the last edit exchanged; the advisory line shows it until
+        # the next edit of a range (`_on_range_edited`).
+        self._exchange_note = ""
+        # The last computed results the tree draws (`_render_from_last`); None while none are.
+        self._rendered: Optional[tuple] = None
+        # The width every section card matches: the results tree's (`_fit_tree_width`).
+        self._results_width = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -948,18 +1079,28 @@ class TimingView(QWidget):
         head_row.addWidget(self._results_head)
         head_row.addStretch(1)
         body.addLayout(head_row)
-        # Names the clickable terms, the page's only click targets.
-        self._trace_hint = QLabel("Click a term to trace it through every inequality and "
-                                  "its input row; click it again, or any blank space, to clear.")
+        # Says what a click on a term does. The input rows' names respond to a click too.
+        self._trace_hint = QLabel(
+            "Click a term to trace it through every inequality and its input row and to draw "
+            "it on the right; click it again in the inequality drawn, or any blank space "
+            "among the inequalities, to clear.")
         self._theme(self._trace_hint, lambda: f"color:{VizTheme.TEXT_DIM};")
         self._trace_hint.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         body.addWidget(self._trace_hint)
+        # The advisory line's text while a recompute shows no margins and the top bar that
+        # carries the line is hidden (`_sync_page_visibility`).
+        self._results_notice = QLabel("")
+        self._theme(self._results_notice, lambda: f"color:{VizTheme.SEM_ERROR};")
+        self._results_notice.setWordWrap(True)
+        self._results_notice.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
+        self._results_notice.setVisible(False)
+        body.addWidget(self._results_notice)
         # The highlight set lives on the view and is read by the delegate through a
         # callable, so a toggle is a repaint: nothing is recomputed, no row is rebuilt and
         # the tree's fitted width cannot move (the wash has no padding).
         self._hl: set = set()
         self._tree = _TermTree(lambda: self._hl)
-        self._tree.term_clicked.connect(self._toggle_term)
+        self._tree.term_clicked.connect(self._on_term_clicked)
         self._tree.cleared.connect(self._clear_terms)
         self._tree.setHeaderLabels(["", "Margin", "Max Frequency"])
         # Don't let the last column stretch to fill — with a fixed tree width it
@@ -992,7 +1133,73 @@ class TimingView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(host)
-        root.addWidget(scroll, 1)
+
+        # The term diagram, on the right behind a splitter, so it stays in view while the
+        # inequalities scroll and keeps its place when the page is maximized. Hidden until a
+        # term is clicked.
+        self._diagram = TimingDiagram(_subscript, _term_key)
+        diagram_font = _base_font()
+        diagram_font.setPixelSize(_FONT_DIAGRAM)
+        self._diagram.setFont(diagram_font)
+        self._diagram_pane = QWidget()
+        pane = QVBoxLayout(self._diagram_pane)
+        pane.setContentsMargins(_px(6), 0, 0, 0)
+        # A ⤢ at the diagram's top right (or a double-click on the diagram) gives it the
+        # whole page, its columns side by side (set_diagram_maximized).
+        self._diagram_max = False
+        self._diagram_max_btn = QToolButton()
+        self._diagram_max_btn.setText("⤢")
+        self._diagram_max_btn.setCheckable(True)
+        self._diagram_max_btn.setFocusPolicy(Qt.NoFocus)
+        self._diagram_max_btn.setToolTip("Maximize Diagram")
+        self._diagram_max_btn.clicked.connect(self.set_diagram_maximized)
+
+        def corner_css() -> str:
+            return (f"QToolButton {{ border:none; background:transparent;"
+                    f" color:{VizTheme.TEXT_DIM}; padding:0 4px; }}"
+                    f" QToolButton:hover, QToolButton:checked {{"
+                    f" background:{VizTheme.BORDER}; color:{VizTheme.TEXT};"
+                    f" border-radius:{VizTheme.CORNER_RADIUS}px; }}")
+        self._theme(self._diagram_max_btn, corner_css)
+        # While maximized, a choice of the columns drawn: either column alone, or both side
+        # by side (`_set_diagram_show`). The choice is kept across maximizing and restoring.
+        corner = QWidget()
+        corner_row = QHBoxLayout(corner)
+        corner_row.setContentsMargins(0, 0, 0, 0)
+        corner_row.setSpacing(_px(2))
+        self._diagram_show = "both"
+        self._diagram_show_btns: Dict[str, QToolButton] = {}
+        show_group = QButtonGroup(corner)
+        for key in ("spec", "proposed", "both"):
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setChecked(key == self._diagram_show)
+            btn.clicked.connect(lambda _on=False, k=key: self._set_diagram_show(k))
+            self._theme(btn, corner_css)
+            show_group.addButton(btn)
+            corner_row.addWidget(btn)
+            self._diagram_show_btns[key] = btn
+        corner_row.addWidget(self._diagram_max_btn)
+        self._diagram.set_corner_widget(corner)
+        self._diagram.doubleClicked.connect(
+            lambda: self.set_diagram_maximized(not self._diagram_max))
+        self._diagram_scroll = QScrollArea()
+        self._diagram_scroll.setWidgetResizable(True)
+        self._diagram_scroll.setWidget(self._diagram)
+        pane.addWidget(self._diagram_scroll, 1)
+        self._diagram_pane.setVisible(False)
+        # A drag cannot squeeze either side below a readable width.
+        self._diagram_pane.setMinimumWidth(self._diagram_min_width())
+        scroll.setMinimumWidth(_px(240))
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setChildrenCollapsible(False)
+        self._ineq_scroll = scroll
+        self._splitter.addWidget(scroll)
+        self._splitter.addWidget(self._diagram_pane)
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 0)
+        root.addWidget(self._splitter, 1)
 
         self._sync_spec_controls()          # size picker only applies to a SoundWire side
         self._reset_to_defaults()           # seed values + first compute
@@ -1028,7 +1235,7 @@ class TimingView(QWidget):
         buttons' right edge lands on the card/tree edge (the tree is the widest,
         being sized to its equations; cards absorb the extra via their trailing
         stretch column, the top bar via its stretch before the buttons)."""
-        w = getattr(self, "_results_width", 0)
+        w = self._results_width
         for card in getattr(self, "_section_cards", []):
             card.setFixedWidth(w)
         for bar in (getattr(self, "_topbar", None), getattr(self, "_results_head", None)):
@@ -1037,6 +1244,7 @@ class TimingView(QWidget):
 
     def showEvent(self, e) -> None:      # noqa: N802 - Qt override
         super().showEvent(e)
+        self.flush_recompute()           # an edit left pending by a close
         # Now that real font metrics apply, re-fit the tree and match the cards.
         self._fit_tree_width()
         self._fit_tree_height()
@@ -1055,8 +1263,53 @@ class TimingView(QWidget):
         page title and the top bar) is hidden, and the parameter sections still scroll below
         the inequalities. Off, the whole page."""
         self._maximized = bool(on)
+        self._sync_page_visibility()
+
+    def set_diagram_maximized(self, on: bool) -> None:
+        """Give the term diagram the whole page, its columns side by side: the inequalities
+        and the part above them are hidden. Off, the diagram beside the inequalities, its
+        columns stacked. With no term drawn there is no diagram to give the page, and the
+        request is not taken."""
+        self._diagram_max = bool(on) and bool(self._diagram_term)
+        self._diagram_max_btn.setChecked(self._diagram_max)
+        self._diagram_max_btn.setToolTip("Restore Diagram" if self._diagram_max
+                                         else "Maximize Diagram")
+        self._ineq_scroll.setVisible(not self._diagram_max)
+        self._diagram.set_side_by_side(self._diagram_max)
+        self._sync_diagram_columns()
+        self._sync_page_visibility()
+        self.diagramMaximizedChanged.emit(self._diagram_max)
+
+    def _set_diagram_show(self, key: str) -> None:
+        """Draw the maximized diagram's `key` column alone ("spec" or "proposed"), or both
+        side by side ("both")."""
+        self._diagram_show = key
+        self._sync_diagram_columns()
+
+    def _sync_diagram_columns(self) -> None:
+        """The column choice, shown and applied while the diagram is maximized; restored,
+        the diagram stacks both columns. The buttons carry the columns' headings."""
+        left, right = self._column_labels()
+        for key, text in (("spec", left), ("proposed", right), ("both", "Both")):
+            btn = self._diagram_show_btns[key]
+            btn.setText(text)
+            btn.setToolTip("Draw both columns side by side" if key == "both"
+                           else f"Draw the {text} column alone")
+            btn.setChecked(key == self._diagram_show)
+            btn.setVisible(self._diagram_max)
+        shown = {"spec": 0, "proposed": 1}.get(self._diagram_show)
+        self._diagram.set_shown_column(shown if self._diagram_max else None)
+        self._diagram.place_corner()
+
+    def is_diagram_maximized(self) -> bool:
+        return self._diagram_max
+
+    def _sync_page_visibility(self) -> None:
+        covered = self._maximized or self._diagram_max
         for w in (self._title, self._subtitle, self._topbar):
-            w.setVisible(not self._maximized)
+            w.setVisible(not covered)
+        self._results_notice.setText(self._ceiling_label.text() if self._compute_error else "")
+        self._results_notice.setVisible(bool(self._compute_error) and covered)
 
     # ---- top control bar ----
     def _build_top_bar(self) -> QVBoxLayout:
@@ -1093,8 +1346,8 @@ class TimingView(QWidget):
         ramp = QHBoxLayout()
         ramp.setContentsMargins(_HEAD_INDENT, 0, 0, 0)
         ramp.setSpacing(_px(6))
-        self._man_shape = self._make_shape_combo()
-        self._per_shape = self._make_shape_combo()
+        self._man_shape: QComboBox = self._make_shape_combo()   # shared across Spec + Example
+        self._per_shape: QComboBox = self._make_shape_combo()
         ramp.addWidget(QLabel("Manager ramp model"))
         ramp.addWidget(self._man_shape)
         ramp.addSpacing(_px(16))
@@ -1103,7 +1356,7 @@ class TimingView(QWidget):
         ramp.addStretch(1)
         outer.addLayout(ramp)
 
-        # SoundWire's small/large system envelope (C_Bus / L_Bus, Tables 4-5).
+        # SoundWire's small/large system envelope (C_Bus / L_Bus, Table 5).
         # Meaningless for an all-SWI3S bus, so the whole row is HIDDEN unless a
         # side is SoundWire — not merely disabled.
         #
@@ -1170,9 +1423,20 @@ class TimingView(QWidget):
         self._ho_ui_check = QCheckBox("Handover UI")
         self._ho_ui_check.toggled.connect(self._on_ho_ui_changed)
         ho_row.addWidget(self._ho_ui_check)
+        # A Manager that forces its keeper to the level it drives: keeper_Man then does not
+        # apply (`CalcInputs.Man_keeper_forced`). Both columns; cleared on Reset.
+        ho_row.addSpacing(_px(16))
+        self._keeper_forced_check = QCheckBox("Manager forces keeper")
+        self._keeper_forced_check.setToolTip(
+            "The Manager loads its keeper with the level it drives before it releases, so "
+            "its release waits for no keeper response and the Manager-releasing keeper "
+            "inequality does not apply. A Peripheral's release is unchanged.")
+        self._keeper_forced_check.toggled.connect(self._on_keeper_forced_changed)
+        ho_row.addWidget(self._keeper_forced_check)
         # P->P placement. A selector and not a corner row: its value multiplies the bus
-        # length, and a product of two rows is not affine, which is the one thing the
-        # per-inequality worst-corner search requires (see CalcInputs.pp_placement).
+        # length, so the bus-length row would move a margin in a direction that depends on
+        # it, which the worst-corner search forbids (calculator checklist rule 4; see
+        # CalcInputs.pp_placement).
         # "Worst Per Leg" is the default and gives each P->P leg its own worst end of the
         # bracket -- setup pays two traversals, hold banks none -- so the bounding answer
         # is what you get without choosing.
@@ -1208,6 +1472,15 @@ class TimingView(QWidget):
         self._fclk.setAlignment(Qt.AlignRight)
         self._fclk.setMaximumWidth(_BOX_W)
         self._fclk.setValue(13.2)
+        # The rate the clocked launch rows were last placed at: an F_CLK change keeps
+        # each row at its UI fraction by rescaling from this rate.
+        self._launch_fclk = self._fclk.value()
+        # A launch box holds at most 10000 ns and, on a rescale, no less than the row's
+        # tabulated minimum. Where a rescale lands past either, the box holds the limit
+        # and this holds (key -> (value the box was left with, the value it would have
+        # held)), so the next rescale starts from the placement and the UI fraction
+        # survives a transit through a very low or very high rate.
+        self._launch_unclamped: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
         self._fclk.valueChanged.connect(self._on_fclk_changed)
         clk.addWidget(self._fclk)
         clk.addWidget(QLabel("MHz"))       # unit after the box, like the rest of the page
@@ -1223,10 +1496,8 @@ class TimingView(QWidget):
         outer.addLayout(clk)
 
         # Advisory line, on its own row so it can run to full width without
-        # clipping — it carries two clauses on a mixed bus. Warns when the target
-        # exceeds what the selected pair may legally clock (every SoundWire
-        # envelope tops out below SWI3S PHY2's mandatory 13.2 MHz) and when a
-        # margin depends on hysteresis SoundWire does not guarantee.
+        # clipping. Warns when the target exceeds what the selected pair may legally
+        # clock (every SoundWire envelope tops out below SWI3S PHY2's mandatory 13.2 MHz).
         self._ceiling_label = QLabel("")
         self._theme(self._ceiling_label, lambda: f"color:{VizTheme.SEM_ERROR};")
         self._ceiling_label.setWordWrap(True)
@@ -1235,16 +1506,16 @@ class TimingView(QWidget):
         return outer
 
     def _make_spec_combo(self) -> QComboBox:
-        # Ratified specs only. The proposed revision is not a selectable spec
-        # here — it seeds the editable Example column instead, so the page is a
-        # current-vs-proposed comparison by default (see _reset_to_defaults).
+        # Every source but the proposed PHY2 revision (the EDE proposal and SoundWire
+        # are offered). That revision seeds the editable Example column instead, so the
+        # page is a current-vs-proposed comparison by default (see _reset_to_defaults).
         c = QComboBox()
         for src in SPEC_SOURCES:
             if is_proposed(src):
                 continue
             c.addItem(SPEC_LABELS[src], src)
         c.setMinimumWidth(_px(200))       # fits "SWI3S PHY2 (EDE proposed)"
-        c.setCurrentIndex(SPEC_SOURCES.index("SWI3S_PHY2"))
+        c.setCurrentIndex(c.findData("SWI3S_PHY2"))
         c.currentIndexChanged.connect(self._on_spec_changed)
         return c
 
@@ -1281,16 +1552,20 @@ class TimingView(QWidget):
         return host
 
     def _column_labels(self) -> Tuple[str, str]:
-        """(left, right) column headings, naming what each column actually holds.
+        """(left, right) column headings, naming what each column holds on every row.
 
-        The pair is not fixed, because the comparison the page makes is not fixed:
-        normally it is the spec as it stands against a proposed revision, but on
-        an EDE bus it shifts up a step to the revision against EDE.
+        A side not on the EDE source compares the spec as it stands (left) against its
+        proposed revision (right, "Example"); a side on the EDE source compares the
+        proposed revision (left) against EDE (right) (`_seed_range`). A heading therefore
+        names one thing when both sides agree, and on a bus with one EDE side names both,
+        the non-EDE side's first: "Spec / PHY2 Proposed" and "Example / EDE Proposed".
         """
-        man = self._man_spec_combo.currentData()
-        per = self._per_spec_combo.currentData()
-        if is_ede(man) or is_ede(per):
+        man_ede = is_ede(self._man_spec_combo.currentData())
+        per_ede = is_ede(self._per_spec_combo.currentData())
+        if man_ede and per_ede:
             return "PHY2 Proposed", "EDE Proposed"
+        if man_ede or per_ede:
+            return "Spec / PHY2 Proposed", "Example / EDE Proposed"
         return "Specification", "Example"
 
     def _refresh_column_labels(self) -> None:
@@ -1361,20 +1636,24 @@ class TimingView(QWidget):
     def _set_shape(combo: QComboBox, value) -> None:
         if value is None:
             return
-        i = combo.findData(value)
+        i = _find_choice(combo, value)
         if i >= 0:
             combo.setCurrentIndex(i)
 
     def _add_param_row(self, name: str, grid: QGridLayout, gridrow: int) -> None:
         row = _ROW_BY_NAME[name]
-        lab = QLabel(_display_name(name))
-        # Held so `_sync_row_highlight` can wash it: a term's key IS a row name.
+        lab = _ClickLabel(_display_name(name))
+        # Held so `_sync_row_highlight` can wash it: a term's key IS a row name. A click on
+        # it highlights the parameter, or clears it, as a click on one of its terms does.
         self._row_labels[name] = lab
+        lab.setCursor(Qt.PointingHandCursor)
+        lab.clicked.connect(lambda n=name: self._toggle_term(n))
         grid.addWidget(lab, gridrow, 0)
         dec = _decimals_for(row)
         unit = _unit_for(row)
         for side, cmin, cmax, cunit in (self._SPEC_COLS, self._EX_COLS):
-            mn = self._make_spin(dec); mx = self._make_spin(dec)
+            signed = name in _SIGNED_ROWS
+            mn = self._make_spin(dec, signed); mx = self._make_spin(dec, signed)
             if side == "spec":
                 # The Specification column shows the spec's own min/max — read-only,
                 # so only the Example column is editable. setValue still drives it
@@ -1382,32 +1661,55 @@ class TimingView(QWidget):
                 for sp in (mn, mx):
                     sp.setReadOnly(True)
                     sp.setFocusPolicy(Qt.NoFocus)
-            mn.valueChanged.connect(self._recompute)
-            mx.valueChanged.connect(self._recompute)
-            if name in self._LAUNCH_ROWS:
-                # A clocked t_ZD / t_DZ must land where the clock can place it.
-                # editingFinished, not valueChanged, so it does not fight the
-                # user mid-keystroke.
-                mn.editingFinished.connect(self._snap_launch_rows)
-                mx.editingFinished.connect(self._snap_launch_rows)
+            mn.valueChanged.connect(self._schedule_recompute)
+            mx.valueChanged.connect(self._schedule_recompute)
+            if side != "spec":
+                # A typed range with its minimum above its maximum is exchanged, and a
+                # clocked t_ZD / t_DZ moved to where the clock can place it. On
+                # editingFinished, not valueChanged, so it does not fight the user
+                # mid-keystroke; and not while focus moves between the range's two boxes,
+                # which is still one entry.
+                mn.editingFinished.connect(
+                    lambda n=name, other=mx: self._on_range_edited(n, other))
+                mx.editingFinished.connect(
+                    lambda n=name, other=mn: self._on_range_edited(n, other))
             self._min[(side, name)] = mn
             self._max[(side, name)] = mx
             grid.addWidget(mn, gridrow, cmin)
             grid.addWidget(mx, gridrow, cmax)
             grid.addWidget(QLabel(unit), gridrow, cunit)
 
+    def _on_range_edited(self, name: str, other: Optional[QDoubleSpinBox] = None) -> None:
+        """Finish an edit of an Example row: a minimum typed above the maximum (or the
+        reverse) is exchanged, as a loaded range is, and the advisory line says so. A launch
+        row is then moved onto the clock's grid. A box finishing because focus moved to the
+        row's other box (`other`) leaves the range as typed: the range is checked once
+        focus has left both."""
+        if self._loading:
+            return
+        if other is not None and QApplication.focusWidget() is other:
+            return
+        shown = bool(self._exchange_note)
+        swapped = self._exchange_inverted_ranges(("proposed",), (name,))
+        self._exchange_note = (
+            f"{_display_name(name)}: minimum above the maximum, exchanged" if swapped else "")
+        if name in self._LAUNCH_ROWS:
+            self._snap_launch_rows()         # recomputes
+        elif swapped or shown:
+            self._recompute()
+
     @staticmethod
-    def _make_spin(decimals: int = 2) -> QDoubleSpinBox:
+    def _make_spin(decimals: int = 2, signed: bool = False) -> QDoubleSpinBox:
         sp = _NoWheelSpinBox()
         sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        sp.setRange(0.0, 10000.0)
+        sp.setRange(-10000.0 if signed else 0.0, 10000.0)
         sp.setDecimals(decimals)
         sp.setSingleStep(10 ** -decimals)
         sp.setAlignment(Qt.AlignRight)
         sp.setFixedWidth(_BOX_W)            # fixed so box columns align across sections
         return sp
 
-    # ---- state readers (mirror the Streamlit helpers) ----
+    # ---- state readers ----
     def _rows(self) -> List[CalcRow]:
         # Mgr CLK and Mgr DATA slew together in practice (same driver PVT), so tie
         # Mgr DATA's worst-corner pick to Mgr CLK — the auto-worst search can't drive
@@ -1418,8 +1720,10 @@ class TimingView(QWidget):
         out: List[CalcRow] = []
         for row in self._rows():
             sc = _display_scale(row)             # % display → fraction for CalcInputs
-            mn = self._min[(side, row.name)].value() / sc
-            mx = self._max[(side, row.name)].value() / sc
+            # An inverted pair (typed, not yet exchanged by `_on_range_edited`) is read
+            # as the range it spans.
+            mn, mx = sorted((self._min[(side, row.name)].value() / sc,
+                             self._max[(side, row.name)].value() / sc))
             # `is_window` travels with the row: dropping it here would re-collapse the
             # threshold window on the way from the spin boxes to the model.
             out.append(CalcRow(row.name, row.binds,
@@ -1433,6 +1737,11 @@ class TimingView(QWidget):
         # column of it.
         man = self._man_spec_combo.currentData()
         per = self._per_spec_combo.currentData()
+        # The floor each clocked launch row is re-placed with when F_CLK changes
+        # (`_conform_launch_rows`), so F_max follows the placements the rows take.
+        floors = {name: float(self._seed_range(side, _ROW_BY_NAME[name], man, per,
+                                               self._size_combo.currentData()).min)
+                  for name in self._LAUNCH_ROWS}
         return CalcInputs(
             Man_shape=self._man_shape.currentData(),
             Per_shape=self._per_shape.currentData(),
@@ -1441,41 +1750,30 @@ class TimingView(QWidget):
             Per_spec=per,
             system_size=self._size_combo.currentData(),
             launch_mode=self._launch_mode_for(side),
+            Man_t_DD_floor_ns=floors["Man_t_DD"],
+            Man_t_ZD_floor_ns=floors["Man_t_ZD"],
+            Man_t_DZ_floor_ns=floors["Man_t_DZ"],
             # Driven by the Handover UI checkbox, which Reset/spec-change seeds
             # from the selected pair (0 for PHY1's intra-UI handover, 1 for
             # PHY2's scheduled one, §11.1.1.1) and the user may then override.
             handover_UIs=self._handover_UIs(),
             # Where the two peripherals sit, for the P->P data legs only.
             pp_placement=self._pp_combo.currentData(),
-            # EDE shifts the releasing side's t_DZ reference one UI earlier. Only
-            # the EDE column asserts it: the baseline column is the proposed
-            # revision, which has no EDE.
+            # Man_tKeeper_Response is the Manager's: a SoundWire Manager's is its
+            # t_Keeper_Delay.
+            t_keeper_ns=preset(man, "Man", self._size_combo.currentData()).t_keeper_ns,
+            # A side on the EDE source releases by its EDE Delay, on the EDE column
+            # only: the baseline column is the proposed revision, which has no EDE.
             Man_ede=self._man_ede_for(side),
             Per_ede=is_ede(per) and side == "proposed",
+            Man_keeper_forced=self._keeper_forced_check.isChecked(),
         )
 
     def _man_ede_for(self, side: str) -> bool:
-        """Whether the MANAGER releases early on `side`.  It does not, on either.
-
-        THE MANAGER'S RELEASE IS NOT AN EndDriveEarly RELEASE.  `CalcInputs.Man_ede`
-        means that `Man_t_DZ` is referenced to the START of the last driven UI, one UI
-        earlier than the reference of Note 1 of the "PHY1 & PHY2 Output Timing" table, which
-        is the calculator's convention for a mid-UI EndDriveEarly release.  The proposal has the
-        Manager stopping AT the boundary -- `Man_t_DZ,max` = 0 under the ORDINARY reference -- so
-        the shift does not apply, the EndDriveEarly ceiling does not bound it, and the launch grid
-        has nothing to place.
-        `_ede_ranges` sets the value; this predicate says which reference it is against.
-        With `Man_ede` true and a row of 0.0, `_effective_t_dz_ns` would put the release
-        a whole UI early.
-
-        `Man_ede` stays in `CalcInputs` for a mid-UI Manager release:
-        `tests/test_timing_vs_reference.py` evaluates a 0.25 / 0.75 grid placement
-        through it.
-
-        `_sync_man_tdd_rows` calls this too, to decide whether the EndDriveEarly ceiling bounds
-        the Man_t_DZ row: keep one predicate for both.
-        """
-        return False
+        """Whether the MANAGER releases by its EDE Delay on `side`: on the EDE column, when
+        the Manager is on the EDE source. The baseline column is the proposed revision,
+        which has no EndDriveEarly."""
+        return is_ede(self._man_spec_combo.currentData()) and side == "proposed"
 
     def _launch_mode_for(self, side: str) -> LaunchMode:
         """The Manager's data launch method on `side`.
@@ -1495,29 +1793,36 @@ class TimingView(QWidget):
     def _typ_baseline(self, side: str):
         base = self._base_inputs(side)
         rows = self._read_rows(side)
-        typ_picks = {r.name: "typ" for r in rows if r.linked_to is None}
+        typ_picks: Dict[str, Pick] = {r.name: "typ" for r in rows if r.linked_to is None}
         return apply_row_picks(base, rows, typ_picks), rows
 
-    def _worst_results(self, side: str) -> Dict[str, object]:
+    def _worst_results(self, side: str) -> Tuple[Dict[Inequality, CalcResults],
+                                                 Dict[str, Dict[str, str]]]:
         """Full CalcResults for `side`, each evaluated at ITS OWN inequality's worst
-        corner. Corners are auto-selected (find_worst_corner_rows) — there is no
-        manual pick — so this is the single source both the Max-Frequency table and
-        the crossing-penalty Results table read from."""
+        corner, and each inequality's row picks for that corner. Corners are selected
+        (find_worst_corner_rows_all), never picked by hand, so this is the single source the
+        inequalities tree, `summary_text` and the term diagram read from (the last two through
+        `_recompute`'s `_worst` and `_worst_picks`). It stores nothing."""
         base, rows = self._typ_baseline(side)
-        out: Dict[str, object] = {}
+        out: Dict[Inequality, CalcResults] = {}
+        picked: Dict[str, Dict[str, str]] = {}
+        all_picks = find_worst_corner_rows_all(INEQUALITIES, rows, base)
         for ineq in INEQUALITIES:
-            picks = find_worst_corner_rows(ineq, rows, base)
+            picks = all_picks[ineq]
+            picked[ineq] = dict(picks)
             out[ineq] = compute(apply_row_picks(base, rows, picks))
-        return out
+        return out, picked
 
-    def _per_inequality_worst(self, side: str) -> Dict[str, object]:
-        return {ineq: r.breakdowns[ineq]
-                for ineq, r in self._worst_results(side).items()}
+    def _per_inequality_worst(self, side: str) -> Dict[Inequality, InequalityBreakdown]:
+        """Each inequality's breakdown at its own worst corner: the last recompute's results
+        where it holds them, else a fresh search."""
+        results = self._worst.get(side) or self._worst_results(side)[0]
+        return {ineq: r.breakdowns[ineq] for ineq, r in results.items()}
 
     # ---- public interface (tests / workspace) ----
     def inputs(self, side: str = "spec") -> CalcInputs:
         """The nominal (typ) inputs for `side` — the midpoint of every range.
-        Corners are auto-selected per inequality for the tables; this is the neutral
+        Corners are selected per inequality for the tree; this is the neutral
         baseline for callers/tests that want a single representative input set."""
         return self._typ_baseline(side)[0]
 
@@ -1528,19 +1833,43 @@ class TimingView(QWidget):
         Carries the same reference numbers the tree shows (`_INEQ_NUMBER`), so a number
         quoted from a pasted summary points at the row on screen.
         """
-        lines = [" | ".join(_FMAX_COLS)]
-        spec_w = self._per_inequality_worst("spec")
-        prop_w = self._per_inequality_worst("proposed")
+        self.flush_recompute()
+        lines = [" | ".join(_fmax_columns(*self._column_labels()))]
+        try:
+            spec_w = self._per_inequality_worst("spec")
+            prop_w = self._per_inequality_worst("proposed")
+        except _UNEVALUABLE as exc:
+            # The same refusal the page shows in place of the margins.
+            return "\n".join([*lines, f"⚠ No margins. {_refusal_text(exc)}"])
         for ineq in INEQUALITIES:
             bs, bp = spec_w[ineq], prop_w[ineq]
             lines.append(" | ".join([
                 f"{_INEQ_NUMBER[ineq]}) {ineq.replace('_', ' ')}",
-                f"{bs.margin_ns:+.2f}", f"{bp.margin_ns:+.2f}",
-                f"{bp.margin_ns - bs.margin_ns:+.2f}",
+                self._fmt_margin(bs.margin_ns), self._fmt_margin(bp.margin_ns),
+                self._fmt_margin_delta(bs.margin_ns, bp.margin_ns),
                 self._fmt_fmax(bs.F_max_MHz),
                 self._fmt_fmax(bp.F_max_MHz),
-                "—",
+                self._fmt_fmax_delta(bs.F_max_MHz, bp.F_max_MHz),
             ]))
+        left_lab, right_lab = (_summary_label(lab) for lab in self._column_labels())
+        lines += ["", "Terms"]
+        for ineq in INEQUALITIES:
+            n, ls, ps = _INEQ_NUMBER[ineq], spec_w[ineq].terms, prop_w[ineq].terms
+            if spec_w[ineq].not_applicable or prop_w[ineq].not_applicable:
+                for lab, b in ((left_lab, spec_w[ineq]), (right_lab, prop_w[ineq])):
+                    lines += ([f"{n}) {lab}: does not apply: {b.not_applicable}"]
+                              if b.not_applicable else
+                              [f"{n}) {lab}: {self._equation_text(b.terms, plain=True)} ≥ 0",
+                               f"    {lab}: {self._numeric_only(b.terms, plain=True)}"])
+                continue
+            if self._same_terms(ls, ps):
+                lines.append(f"{n}) {self._equation_text(ls, plain=True)} ≥ 0")
+                lines += [f"    {lab}: {self._numeric_only(ts, plain=True)}"
+                          for lab, ts in ((left_lab, ls), (right_lab, ps))]
+                continue
+            for lab, ts in ((left_lab, ls), (right_lab, ps)):
+                lines += [f"{n}) {lab}: {self._equation_text(ts, plain=True)} ≥ 0",
+                          f"    {lab}: {self._numeric_only(ts, plain=True)}"]
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
@@ -1552,6 +1881,7 @@ class TimingView(QWidget):
              "sw_system_size": self._size_combo.currentData(),
              "launch_mode": self._launch_combo.currentData(),
              "handover_ui": self._ho_ui_check.isChecked(),
+             "man_keeper_forced": self._keeper_forced_check.isChecked(),
              "pp_placement": self._pp_combo.currentData()}
         for side in SIDES:
             for row in _ALL_ROWS:
@@ -1560,101 +1890,147 @@ class TimingView(QWidget):
         return d
 
     def set_from_dict(self, d: dict, source: Optional[str] = None) -> None:
-        """Restore the inputs `to_dict` saved. With a `source` (the file's name), a key this
-        version does not read, a choice none of the selectors offers and a number outside
-        its field's range (set to the nearest end) are reported through import_notes."""
+        """Restore the inputs `to_dict` saved. With a `source` (the file's name) these are
+        reported through import_notes: a key this version does not read, a choice none of
+        the selectors offers (`_unknown_choice`), a handover flag that is not true or false,
+        a launch mode a SoundWire Manager cannot use, a number outside its field's range (set
+        to the nearest end), a value that is not a number (`_unread_note`), a range with its
+        minimum above its maximum (`_inverted_note`), launch values moved onto a clocked grid
+        (`_snapped_note`) and settings the model cannot evaluate (`_unevaluable_note`)."""
         notes: List[str] = []
+        self._exchange_note = ""
         known = set(self.to_dict()) | _LEGACY_KEYS
         unknown = sorted(str(k) for k in d if k not in known and not str(k).endswith("::pick"))
         if unknown:
-            more = f", and {len(unknown) - 5} more" if len(unknown) > 5 else ""
             notes.append(f"{len(unknown)} setting(s) this version does not read, ignored: "
-                         f"{', '.join(unknown[:5])}{more}")
+                         f"{import_notes.names_listed(unknown)}")
         self._loading = True
         try:
-            # Legacy "lock_mgr_lanes" is ignored; a legacy per-side "spec::man_shape"
-            # falls back into the now-shared picker.
+            # "lock_mgr_lanes" is ignored; a per-side "spec::man_shape" key sets the
+            # shared shape picker when "man_shape" is absent.
             #
-            # A legacy "phy" key (one global PHY switch, before the per-side spec
-            # selector) restores as that PHY on BOTH sides. An explicit
-            # man_spec/per_spec always wins.
+            # A "phy" key (one global PHY switch) restores as that PHY on BOTH sides. An
+            # explicit man_spec/per_spec always wins.
             legacy_phy = d.get("phy")
             legacy_default = ("SWI3S_PHY1" if legacy_phy == 1 else "SWI3S_PHY2")
-            # A dict with no spec keys predates the cross-spec selector, so it can
-            # only have described an all-SWI3S bus.
+            # A dict with no spec keys describes an all-SWI3S bus.
             for combo, key in ((self._man_spec_combo, "man_spec"),
                                (self._per_spec_combo, "per_spec")):
-                j = combo.findData(d.get(key, legacy_default))
+                j = _find_choice(combo, d.get(key, legacy_default))
                 if j >= 0:
                     combo.setCurrentIndex(j)
                 else:
                     notes.append(_unknown_choice(key, d.get(key, legacy_default), combo))
-            k = self._size_combo.findData(d.get("sw_system_size", "small"))
+            k = _find_choice(self._size_combo, d.get("sw_system_size", "small"))
             if k >= 0:
                 self._size_combo.setCurrentIndex(k)
             else:
                 notes.append(_unknown_choice("sw_system_size", d.get("sw_system_size"),
                                              self._size_combo))
-            # A dict with no launch_mode predates the selector, so it can only
-            # have described the analog delay.
-            lm = self._launch_combo.findData(
-                d.get("launch_mode", LaunchMode.ANALOG.value))
+            # A missing launch_mode means the analog delay.
+            lm = _find_choice(self._launch_combo,
+                              d.get("launch_mode", LaunchMode.ANALOG.value))
             if lm >= 0:
                 self._launch_combo.setCurrentIndex(lm)
             else:
                 notes.append(_unknown_choice("launch_mode", d.get("launch_mode"),
                                              self._launch_combo))
-            # A dict with no handover_ui predates the checkbox, so fall back to
-            # what the selected PHYs imply — which is what that version computed.
-            self._ho_ui_check.setChecked(bool(d.get(
-                "handover_ui",
-                default_handover_UIs(self._man_spec_combo.currentData(),
-                                     self._per_spec_combo.currentData()) > 0)))
-            # A dict with no pp_placement predates the selector; "unknown" is what that
-            # version computed (each P->P leg at its own worst end).
-            pp = self._pp_combo.findData(d.get("pp_placement", "unknown"))
+            # A missing handover_ui follows the selected pair; so does one that is not a
+            # flag.
+            ho = d.get("handover_ui")
+            pair_ho = default_handover_UIs(self._man_spec_combo.currentData(),
+                                           self._per_spec_combo.currentData()) > 0
+            if ho is not None and not isinstance(ho, bool):
+                notes.append(f"'handover_ui' {_shown(ho)} is not true or false; the selected "
+                             f"pair's setting ({str(pair_ho).lower()}) is used")
+            self._ho_ui_check.setChecked(ho if isinstance(ho, bool) else pair_ho)
+            # A missing man_keeper_forced is a keeper that follows the line.
+            forced = d.get("man_keeper_forced", False)
+            if not isinstance(forced, bool):
+                notes.append(f"'man_keeper_forced' {_shown(forced)} is not true or false; "
+                             "the keeper follows the line (false)")
+            self._keeper_forced_check.setChecked(forced is True)
+            # A missing pp_placement means "unknown" (each P->P leg at its own worst end).
+            pp = _find_choice(self._pp_combo, d.get("pp_placement", "unknown"))
             if pp >= 0:
                 self._pp_combo.setCurrentIndex(pp)
             else:
                 notes.append(_unknown_choice("pp_placement", d.get("pp_placement"),
                                              self._pp_combo))
+            requested = self._launch_combo.currentData()
             self._sync_spec_controls()
+            if self._launch_combo.currentData() != requested:
+                notes.append(f"'launch_mode' {_shown(requested)} does not apply to a SoundWire "
+                             f"Manager; {self._launch_combo.currentText()!r} is used")
             clamped: List[str] = []
+            unread: List[str] = []
             if "fclk_target" in d:
-                _set_spin(self._fclk, d["fclk_target"], "fclk_target", clamped)
+                _set_spin(self._fclk, d["fclk_target"], "fclk_target", clamped, unread)
             for combo, key, legacy in ((self._man_shape, "man_shape", "spec::man_shape"),
                                        (self._per_shape, "per_shape", "spec::per_shape")):
                 value = d.get(key, d.get(legacy))
                 self._set_shape(combo, value)
-                if value is not None and combo is not None and combo.findData(value) < 0:
+                if value is not None and _find_choice(combo, value) < 0:
                     notes.append(_unknown_choice(key, value, combo))
             for side in SIDES:
                 for row in _ALL_ROWS:
-                    self._apply_keys(side, row.name, d, clamped)
+                    self._apply_keys(side, row.name, d, clamped, unread)
             if clamped:
                 more = f", and {len(clamped) - 3} more" if len(clamped) > 3 else ""
                 notes.append(f"{len(clamped)} value(s) outside their field's range set to the "
                              f"nearest end: {', '.join(clamped[:3])}{more}")
+            if unread:
+                notes.append(_unread_note(unread))
+            swapped = self._exchange_inverted_ranges(SIDES)
+            if swapped:
+                notes.append(_inverted_note(swapped))
         finally:
             self._loading = False
+        # The restored launch rows are kept, moved onto the restored mode's grid where
+        # it is clocked; a value that moves is reported.
+        moved = self._conform_launch_rows()
+        if moved:
+            notes.append(_snapped_note(self._launch_combo.currentData(),
+                                       [(f"{side}::{name}::{end}", old, new)
+                                        for side, name, end, old, new in moved]))
         if source is not None:
             for msg in notes:
                 import_notes.warn(source, msg)
-        # A saved Man_t_DD is only meaningful under the analog mode; if the
-        # restored launch mode is clocked, the mode wins and the row says so.
-        self._sync_man_tdd_rows()
         self._update_title()
         self._recompute()
+        if source is not None and self._compute_error:
+            import_notes.warn(source, _unevaluable_note(self._compute_error))
 
     def _apply_keys(self, side: str, name: str, d: dict,
-                    clamped: Optional[List[str]] = None) -> None:
-        # A legacy "::pick" key (pre-auto-corner) is simply ignored.
+                    clamped: Optional[List[str]] = None,
+                    unread: Optional[List[str]] = None) -> None:
+        # A "::pick" key is ignored: corners are selected per inequality.
         kmin, kmax = f"{side}::{name}::min", f"{side}::{name}::max"
         out = clamped if clamped is not None else []
         if kmin in d:
-            _set_spin(self._min[(side, name)], d[kmin], kmin, out)
+            _set_spin(self._min[(side, name)], d[kmin], kmin, out, unread)
         if kmax in d:
-            _set_spin(self._max[(side, name)], d[kmax], kmax, out)
+            _set_spin(self._max[(side, name)], d[kmax], kmax, out, unread)
+
+    def _exchange_inverted_ranges(self, sides, names=None) -> List[str]:
+        """Exchange the minimum and maximum of every row on `sides` (only `names`, when given)
+        whose minimum is above its maximum; returns their `side::row` labels. The worst-corner
+        search needs min <= max. The boxes are set without a recompute."""
+        swapped: List[str] = []
+        was, self._loading = self._loading, True
+        try:
+            for side in sides:
+                for name in (n for (sd, n) in self._min
+                             if sd == side and (names is None or n in names)):
+                    lo, hi = self._min[(side, name)], self._max[(side, name)]
+                    if lo.value() > hi.value():
+                        a, b = lo.value(), hi.value()
+                        lo.setValue(b)
+                        hi.setValue(a)
+                        swapped.append(f"{side}::{name}")
+        finally:
+            self._loading = was
+        return swapped
 
     # ---- actions ----
     def _update_title(self) -> None:
@@ -1705,7 +2081,7 @@ class TimingView(QWidget):
                 rng = _PHY2_PROPOSED.get(row.name)
             else:
                 # Candidate: EDE (`_ede_ranges`).
-                rng = _ede_ranges(_UI_ns(self._fclk.value())).get(row.name)
+                rng = _ede_ranges().get(row.name)
         elif side == "proposed" and row.name in proposal:
             rng = proposal[row.name]
         if rng is None and which is not None:
@@ -1715,6 +2091,7 @@ class TimingView(QWidget):
         return rng
 
     def _reset_to_defaults(self) -> None:
+        self._exchange_note = ""
         self._loading = True
         try:
             self._fclk.setValue(self._default_fclk())
@@ -1724,6 +2101,7 @@ class TimingView(QWidget):
                                      self._per_spec_combo.currentData()) > 0)
             self._set_shape(self._man_shape, "linear")
             self._set_shape(self._per_shape, "linear")
+            self._keeper_forced_check.setChecked(False)
             man_spec = self._man_spec_combo.currentData()
             per_spec = self._per_spec_combo.currentData()
             size = self._size_combo.currentData()
@@ -1759,10 +2137,19 @@ class TimingView(QWidget):
         return min(base, ceiling)
 
     def _on_spec_changed(self, *_a) -> None:
-        """Switching either side's spec reseeds that side's rows from its own
-        tables and re-evaluates. During a workspace load we only track the
-        selection — saved values are applied afterwards."""
-        self._sync_spec_controls()
+        """Switching either side's spec resets the whole page (`_reset_to_defaults`): every row
+        of both columns is reseeded from the selected pair's tables, F_CLK, the handover box
+        and both ramp models return to their defaults, because each seed depends on the pair,
+        and the Manager forces keeper switch is cleared. During a workspace load only the
+        selection is tracked; saved values are applied afterwards."""
+        was_loading = self._loading
+        # The launch combo a SoundWire Manager forces fires _on_launch_changed; the reset
+        # below is the one recompute.
+        self._loading = True
+        try:
+            self._sync_spec_controls()
+        finally:
+            self._loading = was_loading
         self._update_title()
         self._refresh_column_labels()
         if not self._loading:
@@ -1786,9 +2173,9 @@ class TimingView(QWidget):
     def _toggle_term(self, key: str) -> None:
         """Add or remove `key` from the highlight set.
 
-        Toggling on the KEY and not on the clicked glyph is what makes a second click
-        anywhere on the same parameter turn it off — the reader does not have to find the
-        occurrence they started from.
+        Toggling on the KEY and not on the clicked glyph makes a second click on another
+        occurrence turn it off: its row name, or the term elsewhere in the inequality it is
+        drawn for (`_on_term_clicked` draws it for any other inequality instead).
         """
         self._hl.symmetric_difference_update({key})
         self._refresh_highlight()
@@ -1812,13 +2199,101 @@ class TimingView(QWidget):
         for widget, css in self._themed:
             widget.setStyleSheet(css())
         self._sync_row_highlight()
-        self._recompute()
+        # The inputs are unchanged, so the results are redrawn in the new palette, not
+        # recomputed.
+        if self._rendered is not None:
+            self._render_from_last()
+        else:
+            self._recompute()
         self._tree.viewport().update()
+        self._diagram.update()
 
     def _refresh_highlight(self) -> None:
-        """Repaint only. No recompute, no rebuild — see `self._hl`."""
+        """Repaint only. No recompute, no rebuild — see `self._hl`. A diagram whose term is
+        no longer highlighted is cleared."""
         self._tree.viewport().update()
         self._sync_row_highlight()
+        if self._diagram_term and self._diagram_term not in self._hl:
+            self._hide_diagram()
+
+    def _hide_diagram(self) -> None:
+        """Forget the drawn term and close the diagram pane (a maximized diagram is put back
+        first, so the inequalities are on screen again)."""
+        self._diagram_leg = None
+        self._diagram_term = ""
+        self._diagram.clear()
+        if self._diagram_max:
+            self.set_diagram_maximized(False)
+        self._diagram_pane.setVisible(False)
+
+    def _diagram_min_width(self) -> int:
+        """The narrowest the diagram pane may be: 22 of the diagram's line heights."""
+        return int(22 * self._diagram.fontMetrics().height())
+
+    # ---- the term diagram ----
+    def _on_term_clicked(self, key: str, leg: str) -> None:
+        """A click on the term keyed `key` on a row of inequality `leg` ("" for none).
+
+        On the term the diagram draws, in the inequality it is drawn for, the click clears the
+        term's highlight and the diagram with it. On any other term of an inequality it
+        highlights the term, keeping a highlight it has, and draws it for that inequality.
+        Off an inequality it toggles the highlight."""
+        self.flush_recompute()
+        if leg not in INEQUALITIES or (leg, key) == (self._diagram_leg, self._diagram_term):
+            self._toggle_term(key)
+            return
+        if key not in self._hl:
+            self._hl.add(key)
+            self._refresh_highlight()
+        self._draw_term(key, leg)
+
+    def _draw_term(self, key: str, leg: str) -> None:
+        """Draw the term keyed `key` of inequality `leg` in the diagram pane, opening the pane
+        on the first call. Not a signal slot: `_on_term_clicked` calls it, with the arguments
+        in the order (key, leg). A term that is not highlighted is not drawn."""
+        self.flush_recompute()
+        if key not in self._hl or leg not in INEQUALITIES:
+            return
+        self._diagram_leg = cast(Inequality, leg)
+        self._diagram_term = key
+        if self._diagram_pane.isHidden():
+            self._diagram_pane.setVisible(True)
+            # The inequalities keep their full width where the page has room; the diagram
+            # takes the rest, and never less than a readable minimum.
+            total = max(self._splitter.width(), 1)
+            want = max(self._diagram_min_width(),
+                       total - self._results_width - _px(40))
+            self._splitter.setSizes([max(total - want, 1), want])
+        self._show_diagram()
+
+    def _show_diagram(self) -> None:
+        """Rebuild the diagram for the shown term from each column's worst corner."""
+        leg = self._diagram_leg
+        if leg is None or not self._diagram_term or not self._worst:
+            return
+        base = next(b for b, members in _INEQ_GROUPS if leg in members)
+        title = f"{_INEQ_NUMBER[leg]}) {_INEQ_LABEL[base]}"
+        if leg.endswith("_ho"):
+            title += ", handover"
+        sections = []
+        for side, label in zip(("spec", "proposed"), self._column_labels()):
+            res = self._worst[side][leg]
+            if res.breakdowns[leg].not_applicable:
+                sections.append(DiagramSection(
+                    label, None, note=f"Does not apply: {res.breakdowns[leg].not_applicable}."))
+                continue
+            picks = self._worst_picks.get(side, {}).get(leg, {})
+            corner = ", ".join(f"{_display_name(name)} {pick}" for name, pick in picks.items()
+                               if pick != "typ")
+            text = f"Corner: {corner}" if corner else "Corner: every row typical"
+            supplies = _supply_text(leg, res.breakdowns[leg].supplies)
+            tl = leg_timeline(res.inputs, leg)
+            text = f"{text}; {supplies}" if supplies else text
+            sections.append(DiagramSection(
+                label, tl, list(res.breakdowns[leg].terms),
+                corner=f"{text}. {tl.note}" if tl.note else text))
+        self._diagram.show_term(title, self._diagram_term, sections)
+        self._sync_diagram_columns()
 
     def _sync_row_highlight(self) -> None:
         """Wash the input rows whose parameter is highlighted.
@@ -1839,6 +2314,11 @@ class TimingView(QWidget):
         handover cases would silently reset the rate and every edited row.
         """
         self._update_ho_hint()
+        if not self._loading:
+            self._recompute()
+
+    def _on_keeper_forced_changed(self, *_a) -> None:
+        """Forcing the keeper changes no spec table: no reseed, as for the handover UI."""
         if not self._loading:
             self._recompute()
 
@@ -1876,66 +2356,30 @@ class TimingView(QWidget):
             txt = "no UI allocated — the handover must close on device timing alone"
             if native > 0:
                 txt += ("; PHY2 does not, at its current t_DZ/t_ZD. EndDriveEarly "
-                        "is the mechanism that would, by releasing early — its "
-                        "timing values are not modelled yet.")
+                        "releases early")
+                txt += ("; a side on the EDE source releases its EDE Delay after its ramp."
+                        if is_ede(man) or is_ede(per) else
+                        f"; select {SPEC_LABELS['SWI3S_PHY2_EDE']} on a side to evaluate it.")
         self._ho_hint.setText(txt)
 
     def _on_fclk_changed(self, *_a) -> None:
         """F_CLK moves the clock-launched t_DD and the mode's viable ceiling, so
         the hint has to follow it, not just the spec selection."""
         self._update_launch_hint()
-        self._refresh_ede_rate_rows()
-        # After the EDE reseed, which rewrites Man_t_DD: a clocked grid point
-        # scales with the rate, so it has to be re-derived here too, and last.
-        self._sync_man_tdd_rows()
-        self._recompute()
-
-    def _refresh_ede_rate_rows(self) -> None:
-        """Re-derive the EDE column's UI-fraction rows at the current rate.
-
-        Only the rows in `_EDE_UI_RELATIVE_ROWS`, which are *defined* as fractions
-        of the UI, are rewritten. Everything else in the column, edits included,
-        is left untouched: reseeding the whole column would discard the user's
-        edits.
-        """
+        # A load or reset places the launch rows itself once every value is in.
         if self._loading:
             return
-        if not (is_ede(self._man_spec_combo.currentData())
-                or is_ede(self._per_spec_combo.currentData())):
-            return
-        rng = _ede_ranges(_UI_ns(self._fclk.value()))
-        self._loading = True                      # setValue must not re-enter
-        try:
-            for name in _EDE_UI_RELATIVE_ROWS:
-                r = rng.get(name)
-                if r is None:
-                    continue
-                sc = _display_scale(_ROW_BY_NAME[name])
-                self._min[("proposed", name)].setValue(float(r.min) * sc)
-                self._max[("proposed", name)].setValue(float(r.max) * sc)
-        finally:
-            self._loading = False
+        # Each clocked launch row keeps its UI fraction; an analog one keeps its value.
+        self._conform_launch_rows(rescale_from=self._launch_fclk)
+        self._schedule_recompute()
 
     # Every Manager output timing the launch mode governs. All three, or none: one
-    # Manager has one output stage. See `calculator._man_tzd_clocked`.
+    # Manager has one output stage. See `calculator._man_clocked_grid_ns`, which places all three.
     #
     # Each is constrained to the mode's RESOLUTION: a 4× clock offers 0.00, 0.25,
     # 0.50 and 0.75 UI and the three do not have to agree; a 2× clock offers 0.00
     # and 0.50. They stay editable and are snapped to a placeable point.
     _LAUNCH_ROWS = ("Man_t_DD", "Man_t_ZD", "Man_t_DZ")
-    # Nothing is pinned. The mode says which points exist; the rows say which are
-    # used.
-    _LAUNCH_FIXED_ROWS: tuple[str, ...] = ()
-
-    def _launch_driven_rows(self) -> tuple[str, ...]:
-        """Which of `_LAUNCH_ROWS` the launch mode governs on the current column.
-
-        All three, on every column including EDE. EDE changes what t_DZ MEANS, not
-        whether the selected clock can place it. The same rule decides the margins, in
-        `calculator._man_tzd_clocked` / `_man_tdz_clocked`; keep the two in step, or
-        the row and the term disagree.
-        """
-        return self._LAUNCH_ROWS
 
     def _snap_launch_rows(self) -> None:
         """Move the editable clocked rows onto a point the selected clock places.
@@ -1947,45 +2391,15 @@ class TimingView(QWidget):
         """
         if self._loading:
             return
-        mode = LaunchMode(self._launch_combo.currentData())
-        if launch_grid_UI(mode) is None:
-            return
-        f = self._fclk.value()
-        driven = self._launch_driven_rows()
-        man_spec = self._man_spec_combo.currentData()
-        per_spec = self._per_spec_combo.currentData()
-        size = self._size_combo.currentData()
-        was, self._loading = self._loading, True
-        try:
-            for name in driven:
-                if name in self._LAUNCH_FIXED_ROWS:
-                    continue
-                row = _ROW_BY_NAME[name]
-                sc = _display_scale(row)
-                for side in SIDES:
-                    # PROPOSED ONLY. A tabulated value is not a design choice to be
-                    # placed on a grid, and snapping one rounds it to zero -- see
-                    # `_launch_mode_for`. The Specification boxes are left as tabulated.
-                    if launch_grid_UI(self._launch_mode_for(side)) is None:
-                        continue
-                    # Same floor as the reseed path: an edit must not be rounded down
-                    # through the row's tabulated minimum onto 0.00 UI.
-                    floor = float(self._seed_range(side, row, man_spec,
-                                                   per_spec, size).min)
-                    for boxes in (self._min, self._max):
-                        box = boxes[(side, name)]
-                        snapped = snap_to_launch_grid(box.value() / sc, mode, f, 0.45,
-                                                      floor_ns=floor)
-                        box.setValue(snapped * sc)
-        finally:
-            self._loading = was
+        self._conform_launch_rows()
         self._recompute()
 
     def _sync_man_tdd_rows(self) -> None:
-        """Show the Manager output timings the launch mode actually puts in force.
+        """Re-derive the Manager output timings for the selected launch mode.
 
-        A clocked launch OVERRIDES the tabulated values in `_man_tdd_range`,
-        `_man_tzd_ns` and `_man_tdz_parts`, so the rows show the values in force.
+        Called when the launch mode itself is set: on a mode change and on Reset. A
+        clocked launch OVERRIDES the tabulated values in `_man_tdd_range`,
+        `_man_tzd_ns` and `man_tdz_parts`, so the rows show the values in force.
         Each column follows its own mode (`_launch_mode_for`).
 
         A governed row is seeded from `_seed_range`, snapped to the grid (min ==
@@ -1994,17 +2408,19 @@ class TimingView(QWidget):
         mode RE-SEEDS from `_seed_range` rather than restoring what was there
         before, so a hand edit is lost across a round trip through a clocked mode;
         while the mode held, the model ignored an analog-range edit.
+
+        A path that keeps the user's values (an F_CLK change, a restore, Load
+        Example) uses `_conform_launch_rows` instead.
         """
         mode = LaunchMode(self._launch_combo.currentData())
         man_spec = self._man_spec_combo.currentData()
         per_spec = self._per_spec_combo.currentData()
         size = self._size_combo.currentData()
-        driven = self._launch_driven_rows()
+        self._launch_unclamped.clear()
         was, self._loading = self._loading, True    # setValue must not re-enter
         try:
-            # Every candidate row, not just the driven ones: leaving a clocked mode,
-            # or switching to a spec whose values the mode does not govern, has to
-            # put the tabulated value back.
+            # Every launch row: leaving a clocked mode, or switching to a spec whose
+            # values the mode does not govern, has to put the tabulated value back.
             for name in self._LAUNCH_ROWS:
                 row = _ROW_BY_NAME[name]
                 sc = _display_scale(row)
@@ -2014,41 +2430,103 @@ class TimingView(QWidget):
                     # here however the selector is set, matching the values that
                     # column computes from.
                     clk = launch_mode_tDD_ns(self._launch_mode_for(side),
-                                             self._fclk.value(), 0.45)
-                    if clk is None or name not in driven:
+                                             self._fclk.value(), _LAUNCH_DUTY)
+                    if clk is None:
                         rng = self._seed_range(side, row, man_spec, per_spec, size)
                         lo, hi = float(rng.min), float(rng.max)
                     else:
                         # RESEED FROM THE COLUMN, THEN SNAP -- statelessly, never by
                         # snapping whatever the box currently shows: snapping the
                         # displayed value accumulates rounding across mode changes.
-                        #
-                        # THE EndDriveEarly CEILING BOUNDS AN EDE RELEASE (`ceil_ns`), so the row
-                        # shows the latest legal point rather than the nearest one.
                         rng = self._seed_range(side, row, man_spec, per_spec, size)
-                        ede_dz = (name == "Man_t_DZ" and self._man_ede_for(side))
                         lo = hi = snap_to_launch_grid(
-                            float(rng.min), mode, self._fclk.value(), 0.45,
-                            floor_ns=float(rng.min),
-                            ceil_ns=(ede_release_ceiling_ns(_UI_ns(self._fclk.value()))
-                                     if ede_dz else None))
+                            float(rng.min), mode, self._fclk.value(), _LAUNCH_DUTY,
+                            floor_ns=float(rng.min))
                     self._min[(side, name)].setValue(lo * sc)
                     self._max[(side, name)].setValue(hi * sc)
         finally:
             self._loading = was
+        self._launch_fclk = self._fclk.value()
+        self._update_launch_tooltips()
+
+    def _conform_launch_rows(self, rescale_from: Optional[float] = None
+                             ) -> List[Tuple[str, str, str, float, float]]:
+        """Keep the Manager output timings the boxes hold, on the launch mode's grid.
+
+        - The Specification column is always analog and read-only: it is set to its
+          tabulated range.
+        - An analog Example column keeps its values.
+        - A clocked Example column keeps each box's placement. With `rescale_from`
+          (the rate the rows were placed at) each box keeps its UI fraction at the
+          current rate, and a box held at the row's tabulated minimum or at the end of
+          its range remembers that fraction, so a return to the earlier rate restores
+          it; without it each box moves to the nearest placeable point, not below the
+          row's tabulated minimum.
+
+        Returns (side, row, "min"/"max", old, new) for each box a snap without
+        `rescale_from` moved by more than half its displayed step, for the caller to
+        report. A rescale is a change of rate, not a correction, and is not returned.
+        """
+        mode = LaunchMode(self._launch_combo.currentData())
+        f = self._fclk.value()
+        man_spec = self._man_spec_combo.currentData()
+        per_spec = self._per_spec_combo.currentData()
+        size = self._size_combo.currentData()
+        moved: List[Tuple[str, str, str, float, float]] = []
+        if rescale_from is None:
+            self._launch_unclamped.clear()
+        was, self._loading = self._loading, True    # setValue must not re-enter
+        try:
+            for name in self._LAUNCH_ROWS:
+                row = _ROW_BY_NAME[name]
+                sc = _display_scale(row)
+                half_step = 0.5 * 10 ** -_decimals_for(row) + 1e-9
+                for side in SIDES:
+                    rng = self._seed_range(side, row, man_spec, per_spec, size)
+                    if side == "spec":
+                        self._min[(side, name)].setValue(float(rng.min) * sc)
+                        self._max[(side, name)].setValue(float(rng.max) * sc)
+                        continue
+                    if launch_grid_UI(self._launch_mode_for(side)) is None:
+                        continue
+                    for end, boxes in (("min", self._min), ("max", self._max)):
+                        box = boxes[(side, name)]
+                        key = (side, name, end)
+                        old = box.value()
+                        held = self._launch_unclamped.get(key)
+                        value = (held[1] if held and held[0] == old else old) / sc
+                        if rescale_from is not None and f > 0:
+                            value *= rescale_from / f
+                        snapped = snap_to_launch_grid(value, mode, f, _LAUNCH_DUTY,
+                                                      floor_ns=float(rng.min))
+                        if rescale_from is not None:
+                            box.setValue(snapped * sc)
+                            # The placement the rate gives before the floor and the box's
+                            # range apply is held while the box shows a different value.
+                            free = snap_to_launch_grid(value, mode, f, _LAUNCH_DUTY)
+                            if snapped * sc > box.maximum() or abs(free - snapped) > 1e-9:
+                                self._launch_unclamped[key] = (box.value(), free * sc)
+                            else:
+                                self._launch_unclamped.pop(key, None)
+                        elif abs(snapped * sc - old) > half_step:
+                            box.setValue(snapped * sc)
+                            moved.append((side, name, end, old, box.value()))
+        finally:
+            self._loading = was
+        self._launch_fclk = f
+        self._update_launch_tooltips()
+        return moved
+
+    def _update_launch_tooltips(self) -> None:
+        """Say on each Example launch box whether the mode governs it, and on what grid."""
+        mode = LaunchMode(self._launch_combo.currentData())
         # The tooltips describe the PROPOSED column's boxes, so they read that
         # column's mode -- which is the selector's, since only that side is governed.
         clk = launch_mode_tDD_ns(self._launch_mode_for("proposed"),
-                                 self._fclk.value(), 0.45)
+                                 self._fclk.value(), _LAUNCH_DUTY)
         grid = launch_grid_UI(mode)
         for name in self._LAUNCH_ROWS:
-            governed = clk is not None and name in driven
-            fixed = governed and name in self._LAUNCH_FIXED_ROWS
-            if fixed:
-                tip = (f"Fixed by the Manager data launch mode "
-                       f"({LAUNCH_LABELS[mode]}) at {self._fclk.value():.3f} MHz — "
-                       f"select the analog delay to edit it")
-            elif governed and grid is not None:
+            if clk is not None and grid is not None:
                 points = ", ".join(f"{k * grid:g} UI" for k in
                                    range(int(round(1.0 / grid))))
                 tip = (f"Clocked: a {mode.value} clock places this on {points} "
@@ -2056,38 +2534,66 @@ class TimingView(QWidget):
             else:
                 tip = ""
             for box in (self._min[("proposed", name)], self._max[("proposed", name)]):
-                box.setReadOnly(fixed)
                 box.setToolTip(tip)
+
+    def _launch_limit(self) -> Optional[Tuple[float, str]]:
+        """The highest rate at which the Example column's Manager-to-Peripheral setup and hold
+        legs (handover forms included) all pass, and what sets it: "setup" or "hold" for the
+        limiting leg, or "t_RF" where that leg's F_max is its own `toggle_ceiling_MHz`, read
+        from the inputs at its own worst corner. None until a recompute has produced results.
+        An unbounded leg counts as infinity."""
+        results = self._worst.get("proposed")
+        if not results:
+            return None
+        best: Optional[Tuple[float, str]] = None
+        for leg in ("MP_setup", "MP_setup_ho", "MP_hold", "MP_hold_ho"):
+            b = results[leg].breakdowns[leg]
+            if best is None or b.F_max_MHz < best[0]:
+                at_ceiling = math.isclose(b.F_max_MHz, toggle_ceiling_MHz(results[leg].inputs),
+                                          rel_tol=1e-12)
+                best = (b.F_max_MHz,
+                        "t_RF" if at_ceiling else ("setup" if b.is_setup else "hold"))
+        return best
 
     def _update_launch_hint(self) -> None:
         """Say what the selected launch mode costs at the current rate.
 
         The two clock modes are bounded from opposite ends — 4x by hold (its
         0.25 UI delay shrinks as the clock speeds up), 2x by setup (its 0.5 UI
-        delay consumes half the UI) — so which is viable depends on F_CLK.
+        delay consumes half the UI) — so which is viable depends on F_CLK. The bound is
+        read from the Example column's own Manager-to-Peripheral legs (`_launch_limit`),
+        so it follows every input the margins do.
         """
         mode = LaunchMode(self._launch_combo.currentData())
-        driven = self._launch_driven_rows()
         if mode is LaunchMode.ANALOG:
             txt = "ranges as tabulated — spread absorbed by both MP legs"
         else:
             f = self._fclk.value()
-            t_lo, _ = launch_mode_tDD_ns(mode, f, 0.45) or (0.0, 0.0)
-            f_max, bound = launch_mode_max_fclk_MHz(mode)
+            t_lo, _ = launch_mode_tDD_ns(mode, f, _LAUNCH_DUTY) or (0.0, 0.0)
             grid = launch_grid_UI(mode) or 0.0
-            over = "  ⚠ above this mode's limit" if f > f_max else ""
-            # Say what it FIXES and what it merely CONSTRAINS to its grid.
-            free = [n for n in driven if n not in self._LAUNCH_FIXED_ROWS]
-            txt = (f"Man_t<sub>DD</sub> = {t_lo:.2f} ns fixed · viable to "
-                   f"~{f_max:.1f} MHz (bound by {bound}){over}")
-            if free:
-                txt += (f" · also clocks {' and '.join(_display_name(n) for n in free)}"
-                        f", editable on this clock's {grid:g} UI grid")
-        # On an EDE bus, name the column the selector applies to (see _launch_mode_for).
-        if is_ede(self._man_spec_combo.currentData()):
-            txt += ("  ·  applies to the EDE column only; the Specification column "
-                    "keeps its tabulated analog delays. The EDE column is seeded with "
-                    "the analog 9–23 ns launch")
+            txt = f"{grid:g} UI = {t_lo:.2f} ns at this rate"
+            limit = self._launch_limit()
+            if limit is not None:
+                f_max, bound = limit
+                if math.isfinite(f_max):
+                    over = "  ⚠ above this mode's limit" if f > f_max else ""
+                    txt += f" · viable to ~{f_max:.1f} MHz (bound by {bound}){over}"
+                else:
+                    txt += " · no rate limit"
+            # The rows the clock places, constrained to its grid.
+            txt += (f" · clocks {', '.join(_display_name(n) for n in self._LAUNCH_ROWS)} "
+                    f"together, editable on this clock's {grid:g} UI grid")
+        # A clocked mode applies to one column only (see _launch_mode_for), named by its
+        # heading. In analog mode both columns of an EDE bus use the tabulated ranges.
+        left, right = self._column_labels()
+        man_ede = is_ede(self._man_spec_combo.currentData())
+        if mode is not LaunchMode.ANALOG:
+            txt += (f"  ·  applies to the {right} column only; the {left} column keeps "
+                    f"its analog delays")
+        elif man_ede or is_ede(self._per_spec_combo.currentData()):
+            txt += "  ·  both columns use the tabulated delay ranges"
+            if man_ede:
+                txt += f"; the {right} column is seeded with the analog 9–23 ns launch"
         self._launch_hint.setText(txt)
 
     def _sync_spec_controls(self) -> None:
@@ -2108,43 +2614,64 @@ class TimingView(QWidget):
         self._update_ho_hint()
 
     def _save_proposed(self) -> None:
-        ext = "YAML (*.yaml *.yml)" if _HAVE_YAML else "JSON (*.json)"
-        default = "example.yaml" if _HAVE_YAML else "example.json"
-        path, _ = QFileDialog.getSaveFileName(self, "Save Example", default, ext)
+        path, _ = QFileDialog.getSaveFileName(self, "Save Example", "example.json",
+                                              "JSON (*.json)")
         if not path:
             return
+        path = suffixed_save_path(self, path, ".json", "Save Example")
+        if path is None:
+            return
         payload = self._serialize_side("proposed")
+        # Written whole or not at all (fsutil.write_whole): a failed write leaves the
+        # target's earlier content as it was and no other file of the user's is touched.
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                if _HAVE_YAML and not path.lower().endswith(".json"):
-                    yaml.safe_dump(payload, f, sort_keys=True)
-                else:
-                    import json
-                    json.dump(payload, f, indent=2, sort_keys=True)
+            write_whole(path, lambda f: json.dump(payload, f, indent=2, sort_keys=True),
+                        mode="w", encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "Save Example", str(exc))
 
     def _load_proposed(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Example", "",
-            "Config (*.yaml *.yml *.json);;All files (*)")
+            ("Config (*.json *.yaml *.yml);;All files (*)" if _HAVE_YAML
+             else "JSON (*.json);;All files (*)"))
         if not path:
             return
         try:
-            with open(path, encoding="utf-8") as f:
-                if _HAVE_YAML and not path.lower().endswith(".json"):
-                    payload = yaml.safe_load(f)
-                else:
-                    import json
-                    payload = json.load(f)
+            with open(path, "rb") as f:
+                data = f.read(_MAX_EXAMPLE_BYTES + 1)
+            if len(data) > _MAX_EXAMPLE_BYTES:
+                raise ValueError(f"the file is larger than {_MAX_EXAMPLE_BYTES >> 10} KiB")
+            text = data.decode("utf-8-sig")
+            try:
+                payload = json.loads(text)
+            except ValueError as exc:
+                if not _HAVE_YAML:
+                    raise ValueError(f"the file is not valid JSON ({exc}), and reading YAML "
+                                     f"needs PyYAML, which is not installed") from None
+                payload = yaml.load(text, Loader=_ExampleLoader)
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                raise ValueError('the file must hold a mapping of row name to '
+                                 '{"min": ..., "max": ...}')
             with import_notes.collect() as notes:
-                self._deserialize_side("proposed", payload or {},
+                self._deserialize_side("proposed", payload,
                                        source=import_notes.source_name(path))
+                # Loaded launch rows are kept, moved onto a clocked mode's grid.
+                moved = self._conform_launch_rows()
+                if moved:
+                    import_notes.warn(import_notes.source_name(path), _snapped_note(
+                        self._launch_combo.currentData(),
+                        [(f"{name} {end}", old, new) for _s, name, end, old, new in moved]))
         except Exception as exc:  # noqa: BLE001
+            self._recompute()                # the boxes a part-way load set
             QMessageBox.critical(self, "Load Example", f"Load failed: {exc}")
             return
-        self._sync_man_tdd_rows()       # a loaded Man_t_DD cannot outrank the mode
         self._recompute()
+        if self._compute_error:
+            notes.append(import_notes.ImportNote(import_notes.source_name(path),
+                                                    _unevaluable_note(self._compute_error)))
         show = getattr(self.window(), "show_import_warnings", None)
         if callable(show):
             show(notes, import_notes.source_name(path))
@@ -2162,10 +2689,13 @@ class TimingView(QWidget):
 
     def _deserialize_side(self, side: str, payload: dict, source: Optional[str] = None) -> None:
         """Set one side's ranges from {row: {"min", "max"}}. With a `source`, a row this
-        version does not have, an entry that is not a mapping and a number outside its
-        field's range are reported through import_notes."""
+        version does not have, an entry that is not a mapping, a number outside its field's
+        range, a value that is not a number and a range with its minimum above its maximum
+        are reported through import_notes."""
         unknown: List[str] = []
         clamped: List[str] = []
+        unread: List[str] = []
+        self._exchange_note = ""
         self._loading = True
         try:
             for name, body in payload.items():
@@ -2173,52 +2703,113 @@ class TimingView(QWidget):
                     unknown.append(str(name))
                     continue
                 if "min" in body:
-                    _set_spin(self._min[(side, name)], body["min"], f"{name} min", clamped)
+                    _set_spin(self._min[(side, name)], body["min"], f"{name} min", clamped,
+                              unread)
                 if "max" in body:
-                    _set_spin(self._max[(side, name)], body["max"], f"{name} max", clamped)
-                # a legacy "pick" key is ignored (corners are auto-selected now)
+                    _set_spin(self._max[(side, name)], body["max"], f"{name} max", clamped,
+                              unread)
+                # a "pick" key is ignored: corners are selected per inequality
+            swapped = self._exchange_inverted_ranges((side,))
         finally:
             self._loading = False
         if source is None:
             return
+        if unread:
+            import_notes.warn(source, _unread_note(unread))
+        if swapped:
+            import_notes.warn(source, _inverted_note(swapped))
         if unknown:
-            more = f", and {len(unknown) - 5} more" if len(unknown) > 5 else ""
             import_notes.warn(source, f"{len(unknown)} row(s) this version does not have or "
-                                      f"cannot read, ignored: {', '.join(unknown[:5])}{more}")
+                                      f"cannot read, ignored: {import_notes.names_listed(unknown)}")
         if clamped:
             more = f", and {len(clamped) - 3} more" if len(clamped) > 3 else ""
             import_notes.warn(source, f"{len(clamped)} value(s) outside their field's range set "
                                       f"to the nearest end: {', '.join(clamped[:3])}{more}")
 
+    def closeEvent(self, e) -> None:     # noqa: N802 - Qt override
+        # A recompute still pending does not fire on a closed view; showing the view again
+        # runs it (`showEvent`).
+        self._recompute_timer.stop()
+        super().closeEvent(e)
+
     # ---- compute + render ----
-    def _recompute(self, *_a) -> None:
+    def _schedule_recompute(self, *_a) -> None:
+        """Recompute after a quiet `_RECOMPUTE_DEBOUNCE_MS`: every call restarts the wait, so a
+        burst of typed edits costs one recompute. For edits the user types (the Example
+        column's boxes and the clock rate); a discrete action calls `_recompute` and a read
+        of the results calls `flush_recompute`."""
         if self._loading:
             return
-        spec_res = self._worst_results("spec")
-        prop_res = self._worst_results("proposed")
+        self._stale = True
+        self._recompute_timer.start()
+
+    def flush_recompute(self) -> None:
+        """Run the recompute an edit left pending, now; nothing otherwise. Call before
+        reading the results (the tree, the diagram, `summary_text`) after an edit."""
+        if self._stale and not self._loading:
+            self._recompute()
+
+    def _recompute(self, *_a) -> None:
+        """Recompute the margins now, dropping any recompute pending."""
+        if self._loading:
+            return
+        self._recompute_timer.stop()
+        self._stale = False
+        worst: Dict[str, Tuple[Dict[Inequality, CalcResults], Dict[str, Dict[str, str]]]] = {}
+        for side, label in zip(SIDES, self._column_labels()):
+            try:
+                worst[side] = self._worst_results(side)
+            except _UNEVALUABLE as exc:
+                self._show_compute_error(f"{label} column: {_refusal_text(exc)}")
+                return
+        self._compute_error = ""
+        self._results_notice.setVisible(False)
+        (spec_res, spec_picks), (prop_res, prop_picks) = worst["spec"], worst["proposed"]
         spec_w = {i: r.breakdowns[i] for i, r in spec_res.items()}
         prop_w = {i: r.breakdowns[i] for i, r in prop_res.items()}
+        self._rendered = (spec_w, prop_w, next(iter(spec_res.values())))
+        # Each inequality's own worst corner, for the term diagram.
+        self._worst = {"spec": spec_res, "proposed": prop_res}
+        self._worst_picks = {"spec": spec_picks, "proposed": prop_picks}
+        self._update_launch_hint()
+        self._render_from_last()
+        self._show_diagram()
+
+    def _show_compute_error(self, msg: str) -> None:
+        """Show no margins and say why: an input the model cannot evaluate, such as a
+        threshold at or beyond the transmitter's rail. The tree is cleared, and the term diagram
+        is closed with the highlight of the term it drew. The message shows in the advisory
+        line, and above the results while the top bar is hidden, until a recompute succeeds."""
+        self._compute_error = msg
+        self._rendered = None
+        self._worst = {}
+        self._worst_picks = {}
+        self._update_launch_hint()
+        self._tree.clear()
+        self._hl.discard(self._diagram_term)
+        self._hide_diagram()
+        self._refresh_highlight()
+        self._ceiling_label.setText(f"⚠ No margins. {msg}")
+        self._ceiling_label.setToolTip(msg)
+        self._sync_page_visibility()
+
+    def _render_from_last(self) -> None:
+        """Draw the last computed results: the tree and the advisories."""
+        if self._rendered is None:
+            return
+        spec_w, prop_w, first = self._rendered
         self._render_tree(spec_w, prop_w)
-        self._render_advisories(next(iter(spec_res.values())))
+        self._render_advisories(first)
 
     def _render_advisories(self, res) -> None:
-        """Qualify the margins: an illegal clock rate, and the Schmitt cost.
-
-        Both are advisory — they do not change a margin, they say what a margin
-        is worth. A rate above the ceiling produces arithmetic that is fine and
-        physically meaningless, and the Schmitt margin is not spec-guaranteed on
-        a SoundWire Data receiver, so neither should be silently absorbed.
-
-        ``res`` is one inequality's worst-corner result, so the Schmitt figure is
-        quoted at that corner (t_RF driven to its max) rather than at nominal —
-        it is the exposure, not the typical case, and is labelled as such.
-        """
+        """Qualify the margins: an illegal clock rate, and the result's caveats as the
+        tooltip. A rate above the ceiling produces arithmetic that is fine and physically
+        meaningless, so it is not silently absorbed."""
         bits = []
         if not res.F_CLK_legal:
             bits.append(f"above the {res.F_CLK_ceiling_MHz:g} MHz ceiling for this bus")
-        if res.schmitt_cost_ns > 0:
-            bits.append(f"assumes no hysteresis on the SoundWire Data RX "
-                        f"(worth up to {res.schmitt_cost_ns:.2f} ns at the worst corner)")
+        if self._exchange_note:
+            bits.append(self._exchange_note)
         self._ceiling_label.setText("⚠ " + "; ".join(bits) if bits else "")
         self._ceiling_label.setToolTip("\n\n".join(res.caveats) if res.caveats else "")
 
@@ -2240,19 +2831,55 @@ class TimingView(QWidget):
                 # Equation on its own line under the title, numbered for reference. Kept in
                 # column 0 (not spanned) so column 0 sizes to fit it and the Margin column
                 # lands after the equation rather than overlapping it.
-                QTreeWidgetItem(head, [f"{_INEQ_NUMBER[ineq]}) "
-                                       f"{self._equation_text(bs.terms)} ≥ 0", "", ""])
                 left_lab, right_lab = self._column_labels()
-                self._add_side_term(head, left_lab, bs, fclk)
-                self._add_side_term(head, right_lab, bp, fclk)
+                if bs.not_applicable or bp.not_applicable:
+                    for lab, b in ((left_lab, bs), (right_lab, bp)):
+                        if b.not_applicable:
+                            self._add_not_applicable(head, ineq, lab, b)
+                        else:
+                            self._add_equation(head, ineq, b.terms, lab)
+                            self._add_side_term(head, lab, b, fclk).setData(
+                                0, Qt.UserRole, ineq)
+                elif self._same_terms(bs.terms, bp.terms):
+                    self._add_equation(head, ineq, bs.terms)
+                    self._add_side_term(head, left_lab, bs, fclk).setData(0, Qt.UserRole, ineq)
+                    self._add_side_term(head, right_lab, bp, fclk).setData(0, Qt.UserRole, ineq)
+                else:
+                    # The columns price different terms (a release by t_DZ against one by an
+                    # EDE Delay): each shows its own equation row, then its own numbers.
+                    for lab, b in ((left_lab, bs), (right_lab, bp)):
+                        self._add_equation(head, ineq, b.terms, lab)
+                        self._add_side_term(head, lab, b, fclk).setData(0, Qt.UserRole, ineq)
             head.setExpanded(True)
         self._fit_tree_width()
         self._fit_tree_height()
         self._unify_section_widths()
 
-    def _add_side_term(self, parent: QTreeWidgetItem, label: str, b, fclk: float) -> None:
-        # F_max on every leg whose margin scales with UI, setup or not; "—" where no rate
-        # bounds it, "FAIL" where no rate closes it.
+    @staticmethod
+    def _same_terms(left, right) -> bool:
+        """Whether both columns print the same symbols, in the same order: they then share
+        one equation row."""
+        return [t.symbol for t in left] == [t.symbol for t in right]
+
+    def _add_equation(self, parent: QTreeWidgetItem, ineq: str, terms,
+                      label: str = "") -> None:
+        """An inequality's equation row, numbered for reference; a column's own row carries
+        the column's label after the number."""
+        head = f"{_INEQ_NUMBER[ineq]}) " + (f"{label}: " if label else "")
+        item = QTreeWidgetItem(parent, [f"{head}{self._equation_text(terms)} ≥ 0", "", ""])
+        item.setData(0, Qt.UserRole, ineq)
+
+    def _add_not_applicable(self, parent: QTreeWidgetItem, ineq: str, label: str, b) -> None:
+        """A column's row for an inequality that places no requirement on its bus: the
+        reason, and "—" for its margin and F_max."""
+        item = QTreeWidgetItem(parent, [f"{_INEQ_NUMBER[ineq]}) {label}: does not apply: "
+                                        f"{b.not_applicable}", "—", "—"])
+        item.setData(0, Qt.UserRole, ineq)
+
+    def _add_side_term(self, parent: QTreeWidgetItem, label: str, b,
+                       fclk: float) -> QTreeWidgetItem:
+        # F_max on every leg whose margin scales with UI, setup or not; "—" where the leg
+        # never fails, "FAIL" where it fails at the lowest rates.
         # Unit trails the number ("… MHz") to match the Margin column's "… ns".
         x = b.F_max_MHz
         if not math.isfinite(x):
@@ -2263,80 +2890,124 @@ class TimingView(QWidget):
             fmax = f"{x:.3f} MHz"
         # Label in a fixed-width table cell so the Example substitution lines up
         # column-wise under the Specification one (proportional font → can't pad).
+        fm = self._tree.fontMetrics()
+        cell_w = max(_LABEL_CELL_W, *(fm.horizontalAdvance(f"{lab}:") + _px(8)
+                                      for lab in self._column_labels()))
         html = (f'<table border="0" cellspacing="0" cellpadding="0"><tr>'
-                f'<td width="{_LABEL_CELL_W}">{label}:</td>'
+                f'<td width="{cell_w}">{label}:</td>'
                 f'<td>{self._numeric_only(b.terms)}</td></tr></table>')
         child = QTreeWidgetItem(parent, [html, f"{b.margin_ns:+.2f} ns", fmax])
+        # F_max is the first failure as the rate rises; the note names any higher rates at
+        # which the leg passes again.
+        if b.F_max_note:
+            child.setToolTip(2, f"F_max is the lowest rate at which the leg fails; "
+                                f"it {b.F_max_note}.")
         if b.margin_ns < 0:
             child.setForeground(1, QBrush(_red()))
-        if (math.isfinite(x) and x < fclk) or (b.is_setup and not math.isfinite(x)):
+        if math.isfinite(x) and x < fclk:
             child.setForeground(2, QBrush(_red()))
+        return child
 
-    # ---- equation formatting (as in spec_calculator) ----
+    # ---- equation formatting ----
     @staticmethod
-    def _equation_text(terms) -> str:
+    def _op_of(t) -> str:
+        """`-` or `+`: the inequality-level sign of `t`."""
+        return getattr(t, "op", None) or ("-" if t.value_ns < 0 else "+")
+
+    @staticmethod
+    def _signed(ops, bodies) -> str:
+        """`bodies` joined by their operators; the first carries only a minus."""
         pieces: List[str] = []
-        for i, t in enumerate(terms):
-            op = getattr(t, "op", None) or ("-" if t.value_ns < 0 else "+")
+        for i, (op, body) in enumerate(zip(ops, bodies)):
             display_op = "−" if op == "-" else "+"
-            # Anchored so a click can identify it and the delegate can wash it; the
-            # operator stays outside, so `+`/`−` are not click targets and only the term
-            # itself highlights.
-            sym = _anchored(_term_key(t.symbol), _subscript(t.symbol))
-            if i == 0:
-                pieces.append(("−" if op == "-" else "") + sym)
-            else:
-                pieces.append(f" {display_op} {sym}")
+            pieces.append(("−" if op == "-" else "") + body if i == 0
+                          else f" {display_op} {body}")
         return "".join(pieces)
 
     @staticmethod
-    def _numeric_only(terms) -> str:
+    def _equation_text(terms, plain: bool = False) -> str:
+        """The equation row: one symbol per term. Anchored so a click can identify it and the
+        delegate can wash it; the operator stays outside, so `+`/`−` are not click targets
+        and only the term itself highlights. `plain` prints the bare symbols instead."""
+        return TimingView._signed(
+            [TimingView._op_of(t) for t in terms],
+            [t.symbol if plain else _anchored(_term_key(t.symbol), _subscript(t.symbol))
+             for t in terms])
+
+    @staticmethod
+    def _numeric_only(terms, plain: bool = False) -> str:
         """The substitution row: one number per term, or the PRODUCT where a term is one.
 
-        A crossing term reads `X_MP,late · Man_t_RF,DATA` in the equation row, and its
-        coefficient appears nowhere else on the row -- so the substitution shows
-        `1.4414·6.00` rather than the pre-multiplied 8.65, and the reader can check the
-        multiplication against the symbol beside it.
+        A crossing term reads `X_MP,rise,late · Man_t_RF,DATA` in the equation row, and its
+        coefficient appears nowhere else on the row -- so the substitution shows `c·t_RF`, the
+        coefficient times the lane's value, rather than their product, and the reader can
+        check the multiplication against the symbol beside it.
 
-        The swing term `1.67·Man_t_RF` expands too, for the OTHER operand's sake: the
-        multiplier is in the symbol but the slew in force is not. Which operand is missing
-        decides this, not which one is named -- see `Term.factors`.
+        A negative coefficient is written `(−c)·t_RF`, so the operator before it reads as the
+        term's own sign.
 
-        A GATHERED crossing shows all THREE numbers: `(1.44 − 0.45)·5.00`. Its symbol is
-        `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK` — two crossings of one pin netted into a
-        single product — so the reader can check the netting against the symbol beside it.
-        `Term.factors` carries the coefficients first and
-        the row value last, so the count of entries is what selects the form.
+        A GATHERED crossing shows all THREE numbers: `(c_late − c_early)·t_RF`. Its symbol is
+        `(X_MP,A,rise,late − X_MP,B,fall,early) · Man_t_RF,CLK` -- two crossings of one pin
+        netted into a single product -- so the reader can check the netting against the symbol
+        beside it. `Term.factors` carries the coefficients first and the row value last, so the
+        count of entries is what selects the form.
 
         Terms with no product to show (`Man_t_DD`, `Per_t_IS`) and terms whose printed
         number IS the operand (`1·UI`) stay single numbers. A single number is the term's own
         value, its contribution with the operator taken off, so a subtracted negative value
         reads `− (−2.00)` and the row adds up to the margin.
+
+        `plain` prints the cells without anchors.
         """
-        pieces: List[str] = []
-        for i, t in enumerate(terms):
-            f = getattr(t, "factors", None)
-            op = getattr(t, "op", None) or ("-" if t.value_ns < 0 else "+")
-            if not f:
-                own = t.value_ns if op == "+" else -t.value_ns
-                num = f"{abs(own):.2f}" if round(own, 2) >= 0 else f"(−{abs(own):.2f})"
-            elif len(f) == 2:
-                num = f"{f[0]:.2f}·{f[1]:.2f}"
-            else:
-                # Coefficients signed relative to the term's hoisted operator, row value last.
-                inner = "".join(
-                    f"{c:.2f}" if k == 0 else f" {'−' if c < 0 else '+'} {abs(c):.2f}"
-                    for k, c in enumerate(f[:-1]))
-                num = f"({inner})·{f[-1]:.2f}"
-            display_op = "−" if op == "-" else "+"
-            # THE SAME KEY AS THE SYMBOL: `_numeric_only` walks `terms` in the same order
-            # as `_equation_text`, one number per term, so the two rows agree.
-            num = _anchored(_term_key(t.symbol), num)
-            if i == 0:
-                pieces.append(("−" if op == "-" else "") + num)
-            else:
-                pieces.append(f" {display_op} {num}")
-        return "".join(pieces)
+        ops, bodies = [], []
+        for t in terms:
+            ops.append(TimingView._op_of(t))
+            num = TimingView._number(t)
+            bodies.append(num if plain else _anchored(_term_key(t.symbol), num))
+        return TimingView._signed(ops, bodies)
+
+    @staticmethod
+    def _number(t) -> str:
+        """One term's cell in the substitution row (see `_numeric_only`)."""
+        f = getattr(t, "factors", None)
+        op = TimingView._op_of(t)
+        if not f:
+            own = t.value_ns if op == "+" else -t.value_ns
+            return f"{abs(own):.2f}" if round(own, 2) >= 0 else f"(−{abs(own):.2f})"
+        if len(f) == 2:
+            coef = TimingView._coef(f[0])
+            if coef.startswith("−"):
+                coef = f"({coef})"
+            return f"{coef}·{f[1]:.2f}"
+        # Coefficients signed relative to the term's hoisted operator, row value last.
+        inner = "".join(
+            TimingView._coef(c) if k == 0
+            else f" {'−' if round(c, 2) < 0 else '+'} {abs(c):.2f}"
+            for k, c in enumerate(f[:-1]))
+        return f"({inner})·{f[-1]:.2f}"
+
+    @staticmethod
+    def _coef(c: float) -> str:
+        """A signed coefficient to two places: U+2212 for a negative one, no sign on a value
+        that rounds to zero."""
+        return f"−{abs(c):.2f}" if round(c, 2) < 0 else f"{abs(c):.2f}"
+
+    @staticmethod
+    def _fmt_fmax_delta(left: float, right: float) -> str:
+        """The right column's F_max less the left's where both are rates; "—" otherwise."""
+        if not (math.isfinite(left) and math.isfinite(right) and left > 0 and right > 0):
+            return "—"
+        return f"{right - left:+.3f}"
+
+    @staticmethod
+    def _fmt_margin(x: float) -> str:
+        """A margin to the hundredth with its sign; "—" for a leg that does not apply."""
+        return f"{x:+.2f}" if math.isfinite(x) else "—"
+
+    @staticmethod
+    def _fmt_margin_delta(left: float, right: float) -> str:
+        """The right column's margin less the left's where both are finite; "—" otherwise."""
+        return f"{right - left:+.2f}" if math.isfinite(left) and math.isfinite(right) else "—"
 
     @staticmethod
     def _fmt_fmax(x: float) -> str:

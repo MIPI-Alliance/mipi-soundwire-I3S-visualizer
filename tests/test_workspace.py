@@ -5,52 +5,21 @@ bookmarks, the cursor, and the what-if register overlay.
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_workspace.py
 """
 import os
-import struct
 import tempfile
-import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
+from conftest import pump_loads
 from PySide6.QtWidgets import QApplication, QFileDialog
+from test_analog_import import _square_wave_codes, _write_synthetic_wfm
 
 from swi3s_studio.session import Session
 from swi3s_studio.ui.main_window import MainWindow
 from swi3s_studio.workspace import Workspace, session_from_source
 
-
-def _write_synthetic_wfm(path: str, codes, dt: float = 1e-9, t0: float = 0.0,
-                         v_scale: float = 1.0, v_offset: float = 0.0) -> None:
-    """Minimal, valid Tektronix .wfm (version 3) file — just enough of the header
-    fields wfm.read_wfm actually parses (see swi3s_studio/ingest/wfm.py's layout
-    reference) to exercise Session.from_wfm without a real scope export."""
-    codes = np.asarray(codes, dtype="<i2")
-    bytes_per_point = 2
-    curve_buffer_start = 0x346          # arbitrary, past every fixed-offset field used
-    data_start = 0
-    postcharge_start = codes.size * bytes_per_point
-    buf = bytearray(curve_buffer_start + postcharge_start)
-    struct.pack_into("<H", buf, 0x000, 0x0F0F)                  # little-endian BOM
-    buf[0x002:0x002 + 8] = b":WFM#003"
-    struct.pack_into("<B", buf, 0x00F, bytes_per_point)
-    struct.pack_into("<i", buf, 0x010, curve_buffer_start)
-    struct.pack_into("<i", buf, 0x07A, 2)                       # data_type: single-valued
-    struct.pack_into("<d", buf, 0x0A8, v_scale)
-    struct.pack_into("<d", buf, 0x0B0, v_offset)
-    struct.pack_into("<i", buf, 0x0F0, 0)                       # v_format: int16
-    struct.pack_into("<d", buf, 0x1E8, dt)
-    struct.pack_into("<d", buf, 0x1F0, t0)
-    struct.pack_into("<I", buf, 0x336, data_start)
-    struct.pack_into("<I", buf, 0x33A, postcharge_start)
-    buf[curve_buffer_start + data_start:curve_buffer_start + postcharge_start] = codes.tobytes()
-    with open(path, "wb") as f:
-        f.write(buf)
-
-
-def _square_wave_codes(n: int, period: int, hi: int = 1000, lo: int = -1000):
-    codes = np.full(n, lo, dtype="<i2")
-    codes[(np.arange(n) // (period // 2)) % 2 == 1] = hi
-    return codes
+pytestmark = pytest.mark.gui
 
 
 def test_workspace_json_roundtrip():
@@ -76,7 +45,7 @@ def test_session_from_source_analog_csv_roundtrip():
     t = (np.arange(n, dtype=np.float64) - 100) * 1e-9
     clock = _square_wave_codes(n, period=20).astype(np.float64) / 1000.0   # +-1V square
     data = _square_wave_codes(n, period=200).astype(np.float64) / 1000.0
-    text = ("Model,MSO58\nSample Interval,1e-9\n\nTIME,CH1,CH2\n" +
+    text = ("Model,SCOPE1\nSample Interval,1e-9\n\nTIME,CH1,CH2\n" +
            "\n".join(f"{t[i]:.9e},{clock[i]:.6e},{data[i]:.6e}" for i in range(n)) + "\n")
     with tempfile.TemporaryDirectory() as d:
         csv_path = os.path.join(d, "capture.csv")
@@ -126,14 +95,11 @@ def test_from_json_rejects_non_workspace():
     # A JSON file that isn't a workspace (no 'source' dict) must raise a clear
     # ValueError, not a bare KeyError.
     for text in ('{"hello": 1}', '[]', '"str"', '{"source": 42}'):
-        try:
+        with pytest.raises(ValueError):
             Workspace.from_json(text)
-            assert False, f"expected ValueError for {text!r}"
-        except ValueError:
-            pass
 
 
-def test_gui_save_open_restores_state():
+def test_gui_save_open_restores_state(monkeypatch):
     _app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.load_demo()
@@ -142,32 +108,31 @@ def test_gui_save_open_restores_state():
     win._bookmarks.add(int(win._session.commands[1]["start_sample"]))
     win._bookmarks.add(int(win._session.commands[3]["start_sample"]))
     win.cursor.set_sample(win._session.commands[-1]["start_sample"])
+    cursor = win.cursor.sample
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
-        # Save directly via the Workspace model (avoids the file dialog).
-        ws = Workspace.single(source=win._session.source,
-                              bookmarks=win._bookmarks.to_json(),
-                              cursor=win.cursor.sample)
-        ws.save(path)
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (path, "")))
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (path, "")))
+        win.save_workspace()
+        saved = Workspace.load(path)
+        assert saved.cursor == cursor
+        assert saved.bookmarks == win._bookmarks.to_json()
 
-        # Fresh window, open the workspace.
         win2 = MainWindow()
-        loaded = Workspace.load(path)
-        from swi3s_studio.workspace import session_from_source as sfs
-        win2.load_session(sfs(loaded.links[0].source, register_map=win2._rmap))
-        win2.apply_workspace(loaded)
+        win2.open_workspace()
+        pump_loads(win2, seconds=60.0)
 
     assert win2._bookmarks.samples() == win._bookmarks.samples()
     assert [b.display() for b in win2._bookmarks] == ["A1", "A2"]
-    assert win2.cursor.sample == ws.cursor
+    assert win2.cursor.sample == cursor
 
 
-def test_gui_save_open_restores_register_overlay():
+def test_gui_save_open_restores_register_overlay(monkeypatch):
     """The what-if register overlay round-trips: save it in the workspace and the
     real open_workspace factory re-applies it (patched dialogs + event pump for the
     off-thread decode)."""
-    app = QApplication.instance() or QApplication([])
+    _app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.load_demo()
     # A what-if override on section 0 (device 0, DP0 EnableCh_L @ 0x2090).
@@ -175,73 +140,45 @@ def test_gui_save_open_restores_register_overlay():
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
-        save_orig, open_orig = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
-        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
-        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
-        try:
-            win.save_workspace()
-            assert [0, 0, 0x2090, 0x02] in Workspace.load(path).links[0].overlay   # saved
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (path, "")))
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (path, "")))
+        win.save_workspace()
+        assert [0, 0, 0x2090, 0x02] in Workspace.load(path).links[0].overlay   # saved
 
-            win2 = MainWindow()
-            win2.open_workspace()                        # async decode on a worker thread
-            # Wall-clock wait, not a fixed iteration count: processEvents() returns
-            # instantly when the queue is empty, so `for _ in range(N)` can elapse before
-            # a slow runner's decode worker finishes. Poll on real time with a generous
-            # ceiling instead.
-            deadline = time.time() + 60.0
-            while getattr(win2, "_load_thread", None) is not None:
-                if time.time() > deadline:
-                    raise AssertionError("workspace load did not finish")
-                app.processEvents()
-                time.sleep(0.005)
-        finally:
-            QFileDialog.getSaveFileName = save_orig
-            QFileDialog.getOpenFileName = open_orig
+        win2 = MainWindow()
+        win2.open_workspace()                        # async decode on a worker thread
+        pump_loads(win2, seconds=60.0)
 
     assert win2._session.register_overrides.get((0, 0, 0x2090)) == 0x02   # re-applied
 
 
-def test_gui_save_open_restores_scrambler_overrides():
+def test_gui_save_open_restores_scrambler_overrides(monkeypatch):
     """Per-(device, dp) scrambler overrides are a decode input (they change the
     reconstructed audio), so they must round-trip like hub depths — save in the
     workspace and re-apply via the real open_workspace factory."""
-    app = QApplication.instance() or QApplication([])
+    _app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.load_demo()
     win._session.set_scrambler_overrides({(0, 2): False, (1, 3): True})
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
-        save_orig, open_orig = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
-        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
-        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
-        try:
-            win.save_workspace()
-            saved = Workspace.load(path).links[0].device_scramblers
-            assert [0, 2, False] in saved and [1, 3, True] in saved, saved
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (path, "")))
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (path, "")))
+        win.save_workspace()
+        saved = Workspace.load(path).links[0].device_scramblers
+        assert [0, 2, False] in saved and [1, 3, True] in saved, saved
 
-            win2 = MainWindow()
-            win2.open_workspace()                        # async decode on a worker thread
-            # Wall-clock wait, not a fixed iteration count: processEvents() returns
-            # instantly when the queue is empty, so `for _ in range(N)` can elapse before
-            # a slow runner's decode worker finishes. Poll on real time with a generous
-            # ceiling instead.
-            deadline = time.time() + 60.0
-            while getattr(win2, "_load_thread", None) is not None:
-                if time.time() > deadline:
-                    raise AssertionError("workspace load did not finish")
-                app.processEvents()
-                time.sleep(0.005)
-        finally:
-            QFileDialog.getSaveFileName = save_orig
-            QFileDialog.getOpenFileName = open_orig
+        win2 = MainWindow()
+        win2.open_workspace()                        # async decode on a worker thread
+        pump_loads(win2, seconds=60.0)
 
     assert win2._session.scrambler_overrides == {(0, 2): False, (1, 3): True}   # re-applied
 
 
-def test_gui_save_open_restores_view_prefs():
-    """v2 workspace round-trips the transient TX-map + Hide-Clock pane state."""
-    app = QApplication.instance() or QApplication([])
+def test_gui_save_open_restores_view_prefs(monkeypatch):
+    """A saved workspace round-trips the TX-map, persistence, Rows-To-Draw and Show-Clock view state."""
+    _app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.load_demo()
     # Set a distinctive view state: TX map on + persistence, 32 rows, clock hidden.
@@ -252,30 +189,16 @@ def test_gui_save_open_restores_view_prefs():
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ws.json")
-        save_orig, open_orig = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
-        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
-        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
-        try:
-            win.save_workspace()
-            saved = Workspace.load(path).view
-            assert saved["tx_map"] and saved["tx_persist"] and saved["grid_rows"] == 32
-            assert saved["show_clock"] is False
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (path, "")))
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (path, "")))
+        win.save_workspace()
+        saved = Workspace.load(path).view
+        assert saved["tx_map"] and saved["tx_persist"] and saved["grid_rows"] == 32
+        assert saved["show_clock"] is False
 
-            win2 = MainWindow()
-            win2.open_workspace()
-            # Wall-clock wait, not a fixed iteration count: processEvents() returns
-            # instantly when the queue is empty, so `for _ in range(N)` can elapse before
-            # a slow runner's decode worker finishes. Poll on real time with a generous
-            # ceiling instead.
-            deadline = time.time() + 60.0
-            while getattr(win2, "_load_thread", None) is not None:
-                if time.time() > deadline:
-                    raise AssertionError("workspace load did not finish")
-                app.processEvents()
-                time.sleep(0.005)
-        finally:
-            QFileDialog.getSaveFileName = save_orig
-            QFileDialog.getOpenFileName = open_orig
+        win2 = MainWindow()
+        win2.open_workspace()
+        pump_loads(win2, seconds=60.0)
 
     assert win2._tx_map and win2._tx_persist and win2._grid_rows == 32
     assert win2._raw_view.show_clock is False
@@ -283,7 +206,7 @@ def test_gui_save_open_restores_view_prefs():
 
 def test_view_prefs_no_stale_state_in_reused_window():
     """open_workspace REUSES the current window. Applying a workspace with TX map off
-    (or a pre-v2 empty view) must clear any TX-map/persist/clock state left from a
+    (or an empty view) must clear any TX-map/persist/clock state left from a
     previously-viewed capture — not leak it onto the new one."""
     _app = QApplication.instance() or QApplication([])
     win = MainWindow()
@@ -294,7 +217,7 @@ def test_view_prefs_no_stale_state_in_reused_window():
     win._raw_view.set_show_clock(False)
     assert win._tx_map and win._tx_persist
 
-    # Apply a v2 workspace whose view is all-default (TX off), and a v1 (empty view).
+    # Apply a workspace whose view is all-default (TX off), and one with an empty view.
     from swi3s_studio.workspace import Workspace
     for view in ({"tx_map": False, "tx_persist": False, "show_clock": True}, {}):
         win.apply_workspace(Workspace.single(source=win._session.source, view=view))
@@ -303,10 +226,22 @@ def test_view_prefs_no_stale_state_in_reused_window():
         assert not win._persist_btn.isChecked()
         assert win._raw_view.show_clock is True, f"clock state leaked (view={view})"
 
-    # A corrupt grid_rows must not raise (mode switch below must still run).
-    win.apply_workspace(Workspace.single(source=win._session.source,
-                                         view={"grid_rows": "oops"}, mode="Analysis"))
-    assert 1 <= win._grid_rows <= 10240
+    # A corrupt grid_rows must not raise (the mode switch after it still runs): it is
+    # reported, and the default is used, not the value the window had.
+    from swi3s_studio import import_notes
+    from swi3s_studio.ui.main_window import DEFAULT_GRID_ROWS
+    from swi3s_studio.ui.mode_controller import ANALYSIS, TIMING
+    win.apply_workspace(Workspace.single(source=win._session.source, view={"grid_rows": 32},
+                                         mode=TIMING))
+    assert win._grid_rows == 32 != DEFAULT_GRID_ROWS and win._mode_mgr.current() == TIMING
+    with import_notes.collect() as notes:
+        win.apply_workspace(Workspace.single(source=win._session.source,
+                                             view={"grid_rows": "oops"}, mode="Analysis"),
+                            source="ws.swi3s")
+    assert [n.message for n in notes] == [
+        f"the saved 'grid_rows' 'oops' is not a number; {DEFAULT_GRID_ROWS} is used"]
+    assert win._grid_rows == DEFAULT_GRID_ROWS
+    assert win._mode_mgr.current() == ANALYSIS
 
 
 def test_toggle_off_clears_persist():
@@ -360,14 +295,11 @@ def test_from_json_rejects_a_broken_link_list():
     import json
     for bad in ({"links": []}, {"links": [{"name": "no source"}]},
                 {"links": [{"source": {"type": "demo"}}], "active_link": 1}):
-        try:
+        with pytest.raises(ValueError):
             Workspace.from_json(json.dumps(bad))
-            assert False, f"expected ValueError for {bad!r}"
-        except ValueError:
-            pass
 
 
-def test_gui_save_open_restores_every_links_device_register_maps():
+def test_gui_save_open_restores_every_links_device_register_maps(tmp_path, monkeypatch):
     """A device's vendor register map is saved in the workspace with its Link, and reopened
     every Link has it: in its session (the register files), in its Commands table (the
     vendor register names, which the table copied when the Link loaded, before the
@@ -377,28 +309,23 @@ def test_gui_save_open_restores_every_links_device_register_maps():
     from swi3s_studio.model.regmap_import import PeripheralRegisterMap
     app = QApplication.instance() or QApplication([])
     pm = PeripheralRegisterMap.from_json(
-        pathlib.Path(os.path.join("data", "regmaps", "example_amp.json")).read_text("utf-8"))
+        pathlib.Path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "data", "regmaps", "example_amp.json")).read_text("utf-8"))
     win = MainWindow()
     win.load_demo_links()
-    _wait_for_load(app, win)
+    pump_loads(win, seconds=60.0)
     for link in win._links:
         link.session.set_peripheral_map(0, pm)
 
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "ws.swi3s")
-        save_orig, open_orig = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
-        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, ""))
-        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
-        try:
-            win.save_workspace()
-            assert [sorted(spec.device_regmaps) for spec in Workspace.load(path).links] == [
-                ["0"], ["0"]]
-            win2 = MainWindow()
-            win2.open_workspace()
-            _wait_for_load(app, win2)
-        finally:
-            QFileDialog.getSaveFileName = save_orig
-            QFileDialog.getOpenFileName = open_orig
+    path = str(tmp_path / "ws.swi3s")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (path, "")))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (path, "")))
+    win.save_workspace()
+    assert [sorted(spec.device_regmaps) for spec in Workspace.load(path).links] == [
+        ["0"], ["0"]]
+    win2 = MainWindow()
+    win2.open_workspace()
+    pump_loads(win2, seconds=60.0)
 
     assert len(win2._links) == 2
     for i, link in enumerate(win2._links):
@@ -412,13 +339,64 @@ def test_gui_save_open_restores_every_links_device_register_maps():
         assert any(t.startswith("Peripheral Registers") for t in titles), (i, titles)
 
 
-def _wait_for_load(app, win):
-    """Wall-clock wait for the off-thread decode (see the register-overlay test)."""
-    deadline = time.time() + 60.0
-    while getattr(win, "_load_thread", None) is not None:
-        if time.time() > deadline:
-            raise AssertionError("load did not finish")
-        app.processEvents()
-        time.sleep(0.005)
-    for _ in range(5):
-        app.processEvents()
+def test_load_names_the_file_it_cannot_read_as_a_workspace(tmp_path):
+    """A file that is not UTF-8, not JSON or nested too deeply to parse raises ValueError
+    naming the path, as does a missing one."""
+    bad = {"not_utf8.swi3s": b"\xff\xfe", "not_json.swi3s": b"{bad",
+           "too_deep.swi3s": b"[" * 100_000}
+    for name, data in bad.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        with pytest.raises(ValueError, match="not a readable workspace") as e:
+            Workspace.load(str(path))
+        assert str(path) in str(e.value)
+    missing = tmp_path / "missing.swi3s"
+    with pytest.raises(ValueError, match="not a readable workspace") as e:
+        Workspace.load(str(missing))
+    assert str(missing) in str(e.value)
+
+
+def test_load_reads_no_more_than_the_workspace_limit(tmp_path, monkeypatch):
+    """A file over MAX_WORKSPACE_CHARS raises ValueError naming it; one at the limit loads."""
+    from swi3s_studio import workspace
+    monkeypatch.setattr(workspace, "MAX_WORKSPACE_CHARS", 64)
+    body = '{"links": [{"source": {"type": "demo"}}]}'
+    at_limit = tmp_path / "at_limit.swi3s"
+    at_limit.write_text(body + " " * (64 - len(body)), encoding="utf-8")
+    assert len(Workspace.load(str(at_limit)).links) == 1
+    over = tmp_path / "over.swi3s"
+    over.write_text(body + " " * (65 - len(body)), encoding="utf-8")
+    with pytest.raises(ValueError, match="too large for a workspace") as e:
+        Workspace.load(str(over))
+    assert str(over) in str(e.value)
+
+
+def test_load_reads_an_endless_stream_no_further_than_the_limit(monkeypatch):
+    """A stream that never ends is read once, for at most the limit plus one character."""
+    from swi3s_studio import workspace
+    monkeypatch.setattr(workspace, "MAX_WORKSPACE_CHARS", 64)
+    asked = []
+
+    class Endless:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self, n=-1):
+            assert n >= 0, "an unbounded read of an endless stream"
+            asked.append(n)
+            return "x" * n
+    monkeypatch.setattr(workspace, "open", lambda *a, **k: Endless(), raising=False)
+    with pytest.raises(ValueError, match="too large for a workspace"):
+        Workspace.load("endless")
+    assert asked == [65]
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="no /dev/zero")
+def test_load_of_a_device_that_never_ends_raises(monkeypatch):
+    from swi3s_studio import workspace
+    monkeypatch.setattr(workspace, "MAX_WORKSPACE_CHARS", 64)
+    with pytest.raises(ValueError, match="too large for a workspace"):
+        Workspace.load("/dev/zero")

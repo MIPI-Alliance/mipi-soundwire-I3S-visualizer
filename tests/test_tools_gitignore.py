@@ -8,6 +8,8 @@ import subprocess
 
 import pytest
 
+pytestmark = pytest.mark.platform
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -23,7 +25,7 @@ def test_no_rule_carries_a_trailing_comment():
     assert not bad, "a comment goes on its own line:\n  " + "\n  ".join(bad)
 
 
-@pytest.mark.parametrize("path", ["frame_model.json", "bus_config.csv", "init.csv"])
+@pytest.mark.parametrize("path", ["bus_model.json", "bus_config.csv", "init.csv"])
 def test_the_root_scratch_files_are_ignored(path):
     r = subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=_ROOT,
                        capture_output=True, text=True)

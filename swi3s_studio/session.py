@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import copy
+import math
+import operator
 import os
 import threading
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from fractions import Fraction
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 import swi3score
@@ -26,7 +30,7 @@ from .nputil import searchsorted as _searchsorted
 
 # ABI the Python side expects from the swi3score native module (see bindings.cpp
 # `score_abi`). Bump both together when a binding's return shape changes.
-_REQUIRED_SCORE_ABI = 16
+_REQUIRED_SCORE_ABI = 18
 
 
 # A config CSV imposed on ONE region (Session.apply_config_csv_at) is kept in the source
@@ -35,10 +39,18 @@ _REQUIRED_SCORE_ABI = 16
 CSV_SECTION_KEY = "config_csv@"
 
 
+class DecodeCancelled(Exception):
+    """A decode was cancelled (decoder.cancel(), called from another thread) before it
+    finished. Raised by run_watched in place of returning what the decode produced, which is
+    incomplete. A Session keeps its previous decode and the inputs that decode was made
+    with, like DecodeMemoryError."""
+
+
 class DecodeMemoryError(MemoryError):
     """A decode was stopped because free memory fell below the floor it must leave
     (saleae_sal.decode_memory_floor). Raised instead of letting the machine compress and
-    swap its way through the rest; the Session keeps its previous decode, if it had one."""
+    swap its way through the rest; the Session keeps its previous decode, if it had one,
+    and the inputs that decode was made with."""
 
     def __init__(self, available: int, floor: int, progress: float):
         self.available, self.floor, self.progress = int(available), int(floor), float(progress)
@@ -56,16 +68,24 @@ class DecodeMemoryError(MemoryError):
 _WATCH_PERIOD_S = 0.25
 
 
+def _raise_if_cancelled(decoder) -> None:
+    if decoder.cancelled:
+        raise DecodeCancelled()
+
+
 def run_watched(decoder) -> None:
     """decoder.run(), stopped if free memory falls below saleae_sal.decode_memory_floor().
 
-    Raises DecodeMemoryError after a stop, and also before the audio is copied out
-    (Session._refresh_audio) when that copy would cross the floor: it is the largest single
-    allocation after the decode, and one that cannot be stopped once begun."""
+    Raises DecodeCancelled when decoder.cancel() ended the run (decoder.cancelled), and
+    DecodeMemoryError after a stop, and also
+    before the audio is copied out (Session._refresh_audio) when that copy would cross the
+    floor: it is the largest single allocation after the decode, and one that cannot be
+    stopped once begun."""
     from .ingest import saleae_sal
     floor = saleae_sal.decode_memory_floor()
-    if floor <= 0 or not hasattr(decoder, "request_stop"):
+    if floor <= 0:
         decoder.run()
+        _raise_if_cancelled(decoder)
         return
     done = threading.Event()
     low: List[int] = []
@@ -85,6 +105,7 @@ def run_watched(decoder) -> None:
     finally:
         done.set()
         t.join()
+    _raise_if_cancelled(decoder)
     if decoder.stopped:
         raise DecodeMemoryError(low[0] if low else 0, floor, float(decoder.progress))
     need = int(decoder.audio_count) * _AUDIO_ROW_BYTES
@@ -101,16 +122,46 @@ class RegionCsv(NamedTuple):
     replay: List[dict]                       # the CSV as a write + commit replay
 
 
-def csv_sections_in(source: dict) -> Dict[int, str]:
-    """The region config CSVs a source descriptor names, {section index: path}."""
-    out: Dict[int, str] = {}
-    for key, path in (source or {}).items():
-        if str(key).startswith(CSV_SECTION_KEY) and isinstance(path, str) and path:
-            try:
-                out[int(str(key)[len(CSV_SECTION_KEY):])] = path
-            except ValueError:
-                continue
-    return out
+def _csv_section_entries(source: dict) -> Dict[str, Any]:
+    """{section index as written: value as written} for each region config CSV entry a
+    source carries; Session reads each value with _region_csv_path."""
+    return {str(key)[len(CSV_SECTION_KEY):]: path for key, path in (source or {}).items()
+            if str(key).startswith(CSV_SECTION_KEY)}
+
+
+def _region_csv_path(value) -> str:
+    """A region config CSV entry's path; a value that is not non-empty text raises
+    ValueError, so the entry is left out and reported."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(value)
+    return value
+
+
+# The bus column-count range, swi3score.min_column_count..max_column_count: a forced or
+# pinned count outside it is one the decode ignores.
+_MIN_COLUMNS, _MAX_COLUMNS = 2, 32
+
+# The deepest hub a device can sit behind (Devices ▸ Hub Depths…). The decoder clamps a depth
+# to 0..MAX_HUB_DEPTH; the saved workspace (workspace.MAX_HUB_DEPTH) reads this same limit.
+MAX_HUB_DEPTH = 5
+
+# The keys a decode-input map may carry, as the core takes them: a config section index
+# 0.._MAX_SECTION, a peripheral 0.._DEVICES - 1 (a scrambler override also takes the
+# Manager, -1), a data port 0.._MAX_PORT. A key outside its range is left out with a note.
+_DEVICES = 12
+_MAX_SECTION = 2 ** 31 - 1
+_MAX_PORT = 2 ** 31 - 1
+
+# What a source-descriptor entry that does not parse raises.
+_BAD_ENTRY = (ValueError, TypeError, OverflowError)
+
+
+def _whole_entry(value) -> int:
+    """`value` as an int; a float with a fractional part raises ValueError (`_BAD_ENTRY`)
+    instead of being truncated."""
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(value)
+    return int(value)
 
 
 def zero_based_row(bus_row, origin) -> int:
@@ -121,14 +172,16 @@ def zero_based_row(bus_row, origin) -> int:
 
 
 def _require_score_abi() -> None:
-    """Fail with a clear, actionable message if the loaded swi3score native module is
-    older than this Python code expects. The .so is built locally (not tracked in git),
-    so pulling new code without rebuilding leaves it stale."""
+    """Fail with a clear, actionable message unless the loaded swi3score native module's
+    score_abi equals the one this Python code expects, as the gate requires. The .so is
+    built locally (not tracked in git), so pulling or switching commits without rebuilding
+    leaves one built from other sources."""
     abi = int(getattr(swi3score, "score_abi", 0))
-    if abi < _REQUIRED_SCORE_ABI:
+    if abi != _REQUIRED_SCORE_ABI:
+        state = "out of date" if abi < _REQUIRED_SCORE_ABI else "newer than this app"
         raise RuntimeError(
-            f"The swi3score native decode core is out of date (ABI {abi}; this app "
-            f"needs {_REQUIRED_SCORE_ABI}). Rebuild it after pulling:\n"
+            f"The swi3score native decode core is {state} (ABI {abi}; this app "
+            f"needs {_REQUIRED_SCORE_ABI}). Rebuild it after pulling or switching commits:\n"
             f"    python3 -m pip install ./native\n"
             f"(or, offline:  bash native/build_local.sh)")
 
@@ -152,11 +205,15 @@ class Session:
         # honour it, so RSP recovery, the CDS symbol table, and the recovered clock all
         # work as they do for a cold-start DLV capture.
         self._dlv_forced = bool(dlv)
+        # (columns, inverted) the blind partial-DLV detection found, or None when it did not
+        # run or found nothing (_autodetect_partial_dlv, which reports an inverted pair as an
+        # import warning).
+        self.dlv_detected: Optional[Tuple[int, bool]] = None
         # Per-(device, dp) scrambler override: {(device, dp): bool}.
-        self.scrambler_overrides = dict(scrambler_overrides or {})
-        # Per-device hub depth {device: 0..5}: a peripheral N hubs deep has its
+        self.scrambler_overrides = self._checked_scrambler_overrides(scrambler_overrides)
+        # Per-device hub depth {device: 0..MAX_HUB_DEPTH}: a peripheral N hubs deep has its
         # response delayed 2*N frame rows; fed to the decoder so responses align.
-        self.hub_depths = {int(d): int(v) for d, v in dict(hub_depths or {}).items()}
+        self.hub_depths = self._checked_hub_depths(hub_depths)
         # Per-device display names {device: str} (UI metadata; no decode effect).
         self.device_names = {int(d): str(v) for d, v in dict(device_names or {}).items()}
         # Per-(device, dp) Bus Grid label fields: 1=Sample, 2=Channel, 4=Bit, OR-ed —
@@ -165,128 +222,158 @@ class Session:
         # renderer, never by the decode, so changing it re-renders and does NOT
         # re-decode. Persisted in the source descriptor (workspace only — a new
         # capture always starts at the default).
+        # Each loader leaves out an entry that does not parse; those are reported.
+        dropped: Dict[str, List[str]] = {"label_fields": [], "dp_names": [],
+                                         "region_names": [], "forced_column_sections": [],
+                                         "csv_sections": []}
         self.label_fields: Dict[Tuple[int, int], int] = self._load_label_fields(
             label_fields if label_fields is not None
-            else self.source.get("label_fields"))
+            else self.source.get("label_fields"), dropped["label_fields"])
         self._store_label_fields()               # normalise into the descriptor
         # Per-(device, dp) names the user gave the data ports, {(device, dp): str}. Display
         # only, like the label fields, and kept in the source descriptor the same way.
         self.dp_names: Dict[Tuple[int, int], str] = self._load_dp_names(
-            dp_names if dp_names is not None else self.source.get("dp_names"))
+            dp_names if dp_names is not None else self.source.get("dp_names"),
+            dropped["dp_names"])
         self._store_dp_names()
         # Names the user gave config regions, {section index: str} (Timeline ▸ right-click
         # a region band ▸ Rename…). Keyed like forced_column_sections, display only.
         self.region_names: Dict[int, str] = self._load_region_names(
-            region_names if region_names is not None else self.source.get("region_names"))
+            region_names if region_names is not None else self.source.get("region_names"),
+            dropped["region_names"])
         self._store_region_names()
         self._register_map_arg = register_map
         self._source = capture.sample_source()       # keep alive for the decoder
         settings = swi3score.DecoderSettings()
-        settings.forced_column_count = int(forced_column_count)
-        self._forced_column_count = int(forced_column_count)
+        forced_column_count = int(forced_column_count)
+        if forced_column_count and not _MIN_COLUMNS <= forced_column_count <= _MAX_COLUMNS:
+            from . import import_notes
+            import_notes.warn(self.source_label(),
+                              f"forced column count {forced_column_count} is outside "
+                              f"{_MIN_COLUMNS}..{_MAX_COLUMNS}; the column count is detected")
+            forced_column_count = 0
+        settings.forced_column_count = forced_column_count
+        self._forced_column_count = forced_column_count
         settings.decode_audio = bool(decode_audio)
         self._decode_audio = bool(decode_audio)
         # Per-data-bit sample points (Raw Capture "Port Samples" overlay) are decoded
         # ON DEMAND per visible window (session.port_bit_marks → decoder.bit_samples_window),
         # reconstructed from transport checkpoints the initial decode records — so there
         # is no lazy full-capture collection / re-decode. Nothing to set here.
-        # Accept the old human-readable visualizer CSV as well as v2.0 (the C++
-        # parser only reads v2.0, so convert the old format first). Persist the
-        # ORIGINAL path in the source descriptor so a workspace reopen re-applies
-        # it (the normalized path may be a temp file that won't exist next launch).
-        if config_csv:
-            from .ingest import visualizer_csv
-            self.source["config_csv"] = config_csv          # original, for persistence
-            norm = visualizer_csv.normalized_path(config_csv)
-            # normalized_path returns a fresh temp file for an upgraded (legacy/v2.0)
-            # CSV; own it so apply_config_csv can delete it when it's replaced.
-            self._config_csv_tmp = norm if norm != config_csv else None
-            visualizer_csv.report_csv_warnings(norm, config_csv)
-            config_csv = norm
-        else:
-            self._config_csv_tmp = None
-        self._config_csv = config_csv or ""
-        settings.config_csv_path = self._config_csv
-        # Manual Stream Sync Point (bus row) — for a post-commit capture whose SSPA/SSCR
-        # was never on the wire, so interval>1 ports need the phase picked by ear. -1 =
-        # off. Persisted in the source so it survives a workspace reopen.
-        self._store_ssp_row(ssp_row)
-        self._ssp_from_sspa = False          # set by lock_ssp_from_sspa when derived
-        settings.ssp_row = self._ssp_row
-        settings.scrambler_overrides = [(int(d), int(p), 1 if on else 0)
-                                        for (d, p), on in self.scrambler_overrides.items()]
-        settings.hub_depth_overrides = [(d, v) for d, v in self.hub_depths.items() if v]
-        # Region-scoped forced column count {section_index: column_count}: pins ONE
-        # config region's bus geometry over the snooped NumColumns / blind detector
-        # (see force_column_count_at). Taken from the argument, else the source
-        # descriptor. Resolved BEFORE the first decode — it changes the decode, so a
-        # reopened workspace has to carry it into run() rather than re-decode after.
-        pins = (forced_column_sections
-                if forced_column_sections is not None
-                else self.source.get("forced_column_sections") or {})
-        self.forced_column_sections: Dict[int, int] = {
-            int(k): int(v) for k, v in dict(pins).items()}
-        self._store_forced_columns()             # normalise into the descriptor
-        # Config CSVs imposed on one region each (apply_config_csv_at), {section: path}:
-        # like the pins, read before the first decode, which they change.
-        self.csv_sections: Dict[int, str] = {
-            int(k): str(v) for k, v in dict(
+        self._config_csv_tmp: Optional[str] = None
+        try:
+            # Accept the old human-readable visualizer CSV as well as v2.0 (the C++
+            # parser only reads v2.0, so convert the old format first). Persist the
+            # ORIGINAL path in the source descriptor so a workspace reopen re-applies
+            # it (the normalized path may be a temp file that won't exist next launch).
+            if config_csv:
+                from .ingest import visualizer_csv
+                self.source["config_csv"] = config_csv          # original, for persistence
+                norm = visualizer_csv.normalized_path(config_csv)
+                # normalized_path returns a fresh temp file for an upgraded (legacy/v2.0)
+                # CSV; own it so apply_config_csv can delete it when it's replaced.
+                self._config_csv_tmp = norm if norm != config_csv else None
+                visualizer_csv.report_csv_warnings(norm, config_csv)
+                config_csv = norm
+            self._config_csv = config_csv or ""
+            settings.config_csv_path = self._config_csv
+            # Manual Stream Sync Point (bus row) — for a post-commit capture whose SSPA/SSCR
+            # was never on the wire, so interval>1 ports need the phase picked by ear. -1 =
+            # off. Persisted in the source so it survives a workspace reopen.
+            self._store_ssp_row(ssp_row)
+            self._ssp_from_sspa = False          # set by lock_ssp_from_sspa when derived
+            settings.ssp_row = self._ssp_row
+            settings.scrambler_overrides = [(int(d), int(p), 1 if on else 0)
+                                            for (d, p), on in self.scrambler_overrides.items()]
+            settings.hub_depth_overrides = [(d, v) for d, v in self.hub_depths.items() if v]
+            # Region-scoped forced column count {section_index: column_count}: pins ONE
+            # config region's bus geometry over the snooped NumColumns / blind detector
+            # (see force_column_count_at). Taken from the argument, else the source
+            # descriptor. Resolved BEFORE the first decode — it changes the decode, so a
+            # reopened workspace has to carry it into run() rather than re-decode after.
+            pins = (forced_column_sections
+                    if forced_column_sections is not None
+                    else self.source.get("forced_column_sections") or {})
+            self.forced_column_sections: Dict[int, int] = self._load_int_map(
+                pins, dropped["forced_column_sections"])
+            for sect in [k for k, v in self.forced_column_sections.items()
+                         if not _MIN_COLUMNS <= v <= _MAX_COLUMNS]:   # a width the decode ignores
+                dropped["forced_column_sections"].append(repr(sect))
+                del self.forced_column_sections[sect]
+            self._store_forced_columns()             # normalise into the descriptor
+            # Config CSVs imposed on one region each (apply_config_csv_at), {section: path}:
+            # like the pins, read before the first decode, which they change.
+            self.csv_sections: Dict[int, str] = self._load_int_map(
                 csv_sections if csv_sections is not None
-                else csv_sections_in(self.source)).items()}
-        self._store_csv_sections()
-        self.register_map = register_map or RegisterMap.load()   # resolves the CSVs' ranks
-        self._csv_section_cfg = self._read_csv_sections()
-        # Debug what-if register overrides, keyed by (section_index, device, address)
-        # -> byte. Section-scoped (a capture can change config mid-stream); folded
-        # into the C++ decode for the matching section so the SAME override drives
-        # the audio decode, bus grid, and register map (Provenance.UI). Changing an
-        # override re-decodes. Empty by default; not persisted (a debug tool).
-        self.register_overrides: Dict[Tuple[int, int, int], int] = {}
-        settings.forced_column_sections = self._decode_forced_sections()
-        settings.register_overrides = self._decode_register_overrides()
-        settings.imported_config_sections = sorted(self._csv_section_cfg)
-        # PHY3 (DLV) uses a recovered-clock source instead of the forwarded-clock one:
-        # decode the §5.1.2 bring-up to learn the selected PHY. When it's PHY3, build a
-        # DlvSampleSource over the DP wire STARTING at audio_start (so the virtual PLL
-        # locks to the DLV Row-Sync edges, not the single-ended cold-start LC pulses),
-        # and tell the decoder to skip NRZS and read the CDS at Column 2. FBCSE (PHY1/2)
-        # and mid-stream captures keep the forwarded-clock source.
-        self._link_control = decode_link_control(capture)
-        self._later_link_controls: Optional[List[LinkControlResult]] = None   # link_controls
-        self._decode_checking_bringup(settings, decoder_ready)
+                else _csv_section_entries(self.source), dropped["csv_sections"],
+                value=_region_csv_path)
+            self._store_csv_sections()
+            self._warn_dropped_entries(dropped)
+            self.register_map = register_map or RegisterMap.load()   # resolves the CSVs' ranks
+            self._csv_section_cfg = self._read_csv_sections()
+            # Debug what-if register overrides, keyed by (section_index, device, address)
+            # -> byte. Section-scoped (a capture can change config mid-stream); folded
+            # into the C++ decode for the matching section so the SAME override drives
+            # the audio decode, bus grid, and register map (Provenance.UI). Changing an
+            # override re-decodes. Empty here, so the first decode has none; saved with the
+            # workspace as LinkSpec.overlay, which a reopen applies with set_register_overrides
+            # once the Session is built (one more decode).
+            self.register_overrides: Dict[Tuple[int, int, int], int] = {}
+            settings.forced_column_sections = self._decode_forced_sections()
+            settings.register_overrides = self._decode_register_overrides()
+            settings.imported_config_sections = sorted(self._csv_section_cfg)
+            # PHY3 (DLV) uses a recovered-clock source instead of the forwarded-clock one:
+            # decode the §5.1.2 bring-up to learn the selected PHY. When it's PHY3, build a
+            # DlvSampleSource over the DP wire STARTING at audio_start (so the virtual PLL
+            # locks to the DLV Row-Sync edges, not the single-ended cold-start LC pulses),
+            # and tell the decoder to skip NRZS and read the CDS at CDS_HorizontalStart.
+            # FBCSE (PHY1/2) and mid-stream captures keep the forwarded-clock source.
+            self._link_control = decode_link_control(capture)
+            self._later_link_controls: Optional[List[LinkControlResult]] = None   # link_controls
+            # Every decode __init__ runs is warned about once, at its end, for the decode kept.
+            self._framing_warning_deferred = 1
+            self._decode_checking_bringup(settings, decoder_ready)
 
-        # Per-device peripheral (vendor) register maps, keyed by device number.
-        # Imported via the register-map assistant; addresses in device-defined
-        # space resolve against the matching device's map.
-        self.peripheral_maps: Dict[int, object] = {}
-        # CSV-import baseline: the register snapshot + grid replay an applied config
-        # CSV encodes (Provenance.CSV). Empty unless a config CSV is applied — see
-        # apply_config_csv / _reload_csv_seed.
-        self._reload_csv_seed()
-        # Whole-capture register state, sourced from the C++ decode authority (same
-        # as register_files_at, whole-capture / no overrides).
-        self.register_files: Dict[int, DeviceRegisterFile] = self._build_register_files(
-            self._config_commands_since_reset(), None)
-        # _link_control was decoded up front (source selection); keep it (property caches).
-        # For DLV, capture the virtual PLL's recovered Row Sync Points NOW, from the real
-        # DlvSampleSource — a later in-place re-decode (scrambler / register what-if)
-        # rebuilds `self._source` from the forwarded-clock path, which has no recovered
-        # clock, so caching here keeps the periodic RSP marks available afterwards.
-        self._rec_syncs_cache = None
-        self._rsp_analysis_cache = None
-        self._commit_rsp_cache = None      # sorted confirmed-commit RSP samples (viewport-independent)
-        if self.is_dlv:
-            self._recovered_row_syncs()
-        # A partial capture (config imposed by CSV, no setup commit on the wire) has no
-        # SSP — but an SSPA in the capture announces one. Adopt it and apply it backwards
-        # so the rows BEFORE the first SSPA decode at the right phase too. No-op unless
-        # all of those conditions hold; costs one extra decode when it fires.
-        self.lock_ssp_from_sspa()
+            # Per-device peripheral (vendor) register maps, keyed by device number.
+            # Imported via the register-map assistant; addresses in device-defined
+            # space resolve against the matching device's map.
+            self.peripheral_maps: Dict[int, object] = {}
+            # CSV-import baseline: the register snapshot + grid replay an applied config
+            # CSV encodes (Provenance.CSV). Empty unless a config CSV is applied — see
+            # apply_config_csv / _reload_csv_seed.
+            self._reload_csv_seed()
+            # Whole-capture register state, sourced from the C++ decode authority (same
+            # as register_files_at, whole-capture / no overrides).
+            self.register_files: Dict[int, DeviceRegisterFile] = self._build_register_files(
+                self._config_commands_since_reset(), None)
+            # _link_control was decoded up front (source selection); keep it (property caches).
+            # For DLV, capture the virtual PLL's recovered Row Sync Points NOW, from the real
+            # DlvSampleSource — a later in-place re-decode (scrambler / register what-if)
+            # rebuilds `self._source` from the forwarded-clock path, which has no recovered
+            # clock, so caching here keeps the periodic RSP marks available afterwards.
+            self._rec_syncs_cache = None
+            self._rsp_analysis_cache = None
+            # Sorted confirmed-commit RSP samples (viewport-independent).
+            self._commit_rsp_cache = None
+            if self.is_dlv:
+                self._recovered_row_syncs()
+            # A partial capture (config imposed by CSV, no setup commit on the wire) has no
+            # SSP — but an SSPA in the capture announces one. Adopt it and apply it backwards
+            # so the rows BEFORE the first SSPA decode at the right phase too. No-op unless
+            # all of those conditions hold; costs one extra decode when it fires.
+            self.lock_ssp_from_sspa()
+            self._framing_warning_deferred = 0
+            self._warn_guessed_framing()
+        except BaseException:
+            # A constructor that fails, a cancelled open included, leaves no Session to
+            # own the upgrade temp copy of the config CSV: it is removed here.
+            self._discard_config_tmp(self._config_csv_tmp)
+            raise
 
     def _decode_with(self, settings, decoder_ready=None) -> None:
         """Pick the source for the PHY the bring-up named, run the decode, and take its
-        results. Run once, or twice when a detected bring-up is rejected after the first
-        decode (`_reject_contradicted_bringup`) and had steered it."""
+        results. Run once, or again when a detected bring-up is rejected after the first
+        decode and had steered it (`_check_first_bringup`, `_check_later_bringups`)."""
         # A mid-stream DLV (PHY3) capture has no cold-start to name the PHY. Detect it
         # from the differential-pair signature (any source: .sal / .bin / CSV / reopen),
         # so re-importing an exported partial-DLV .sal decodes like the original. Skips
@@ -312,6 +399,43 @@ class Session:
         self.ui_rate_hz: float = self.decoder.measured_ui_rate_hz
         self.segments: List[dict] = self.decoder.segments()
 
+    _GUESSED_FRAMING_SHOWN = 5
+    _framing_warning_deferred = 0
+
+    @contextlib.contextmanager
+    def _framing_warning_after(self):
+        """Around a step that may decode more than once: the decodes inside it raise no
+        guessed-framing warning, and on leaving the outermost one the decode kept, when it
+        is a new one, is warned about once."""
+        before = getattr(self, "decoder", None)
+        self._framing_warning_deferred += 1
+        try:
+            yield
+        finally:
+            self._framing_warning_deferred -= 1
+            kept = getattr(self, "decoder", None)
+            if not self._framing_warning_deferred and kept is not before:
+                self._warn_guessed_framing()
+
+    def _warn_guessed_framing(self) -> None:
+        """Warn (import_notes) for each place the decode framed a known column count without
+        a CRC-valid command to confirm where Column 0 is: it was taken at the window's first
+        rising edge there, a guess. A generated demo capture has no user file to warn about."""
+        if (self.source or {}).get("type") == "demo":
+            return
+        samples = [int(x) for x in self.decoder.guessed_framing_samples()]
+        if not samples:
+            return
+        from . import import_notes
+        shown = ", ".join(str(x) for x in samples[:self._GUESSED_FRAMING_SHOWN])
+        more = len(samples) - self._GUESSED_FRAMING_SHOWN
+        where = f"sample {shown}" if len(samples) == 1 else f"samples {shown}"
+        if more > 0:
+            where += f" and {more} more"
+        import_notes.warn(self.source_label(),
+                          f"Column 0 was placed without a CRC-valid command to confirm it at "
+                          f"{where}; the framing there is a guess.")
+
     def _decode_checking_bringup(self, settings, decoder_ready=None) -> None:
         """Decode, then drop any detected bring-up the decode contradicts: the first
         (`_check_first_bringup`), then each later one (`_check_later_bringups`)."""
@@ -333,11 +457,19 @@ class Session:
         so it never pays the extra decode."""
         lc = self._link_control
         before = (settings.forced_column_count, self._forced_column_count, settings.dlv,
-                  settings.cds_horizontal_start, self._dlv_forced, self.capture)
+                  settings.cds_horizontal_start, self._dlv_forced, self.capture,
+                  self.dlv_detected)
 
         def restore() -> None:
             (settings.forced_column_count, self._forced_column_count, settings.dlv,
-             settings.cds_horizontal_start, self._dlv_forced, self.capture) = before
+             settings.cds_horizontal_start, self._dlv_forced, self.capture,
+             self.dlv_detected) = before
+
+        def take_first(first: LinkControlResult) -> None:
+            # The later bring-ups are looked for after the first one's audio start, so they
+            # are searched again whenever the first changes (`link_controls`).
+            self._link_control = first
+            self._later_link_controls = None
 
         self._decode_with(settings, decoder_ready)
         if lc is None or lc.sequence == "none":
@@ -345,21 +477,23 @@ class Session:
         steered = bool(lc.phy_name or lc.safe_lock_columns)
         inside = self._valid_commands_inside(lc)
         if inside:
-            self._link_control = self._no_bringup(lc, inside)
-            if steered:
+            used = [(r.sequence, r.audio_start_sample) for r in self.link_controls[1:]]
+            take_first(self._no_bringup(lc, inside))
+            found = [(r.sequence, r.audio_start_sample) for r in self.link_controls[1:]]
+            if steered or found != used:
                 restore()
                 self._decode_with(settings, decoder_ready)
             return
         if steered and not any(c.get("crc_valid") for c in self.commands):
             restore()
-            self._link_control = LinkControlResult()       # decode as if there were none
+            take_first(LinkControlResult())                # decode as if there were none
             self._decode_with(settings, decoder_ready)
             inside = self._valid_commands_inside(lc)
             if inside:
-                self._link_control = self._no_bringup(lc, inside)
+                take_first(self._no_bringup(lc, inside))
                 return
             restore()                                      # no evidence either way: keep it
-            self._link_control = lc
+            take_first(lc)
             self._decode_with(settings, decoder_ready)
 
     def _check_later_bringups(self, settings, decoder_ready=None) -> None:
@@ -435,20 +569,8 @@ class Session:
                      "drq_sample": np.uint64}
 
     def _build_audio_columns(self) -> Dict[str, np.ndarray]:
-        """Audio as a dict of parallel NumPy arrays. Uses the core's fast
-        `audio_columns()` when present; otherwise derives the columns from the
-        per-sample `audio()` list (older core — correct, just not as fast)."""
-        cols_fn = getattr(self.decoder, "audio_columns", None)
-        if callable(cols_fn):
-            return cols_fn()
-        audio = self.decoder.audio()
-        n = len(audio)
-        # .get with a default for every field so a dict list missing the ABI-7
-        # flow_mode/drq_sample keys degrades to NORMAL (0) instead of KeyError.
-        defaults = {"device": -1, "flow_mode": 0, "drq_sample": 0}
-        return {f: np.fromiter((a.get(f, defaults.get(f, 0)) for a in audio),
-                               self._AUDIO_DTYPES[f], n)
-                for f in self._AUDIO_FIELDS}
+        """Audio as a dict of parallel NumPy arrays, from the core's `audio_columns()`."""
+        return self.decoder.audio_columns()
 
     def _refresh_audio(self) -> None:
         self._audio_cols = self._build_audio_columns()
@@ -456,11 +578,8 @@ class Session:
         # vector has no second reader: the audio store, playback, the plots, PDM decode and
         # WAV export all consume the columns, `audio` below builds its dict list from them,
         # and a re-decode constructs a new Decoder rather than re-reading this one. So hand
-        # the native memory back (72 B/sample against the columns' 56). `getattr`: an older
-        # core has no release_audio and keeps holding it.
-        release = getattr(self.decoder, "release_audio", None)
-        if callable(release):
-            release()
+        # the native memory back (72 B/sample against the columns' 56).
+        self.decoder.release_audio()
         self._audio_list: Optional[List[dict]] = None      # lazy dict-list cache
         self._mark_cache = None                            # lazy per-value read-mark index
         self._filtered_cache = None                         # invalidate _filtered_positions memo
@@ -470,8 +589,9 @@ class Session:
 
     def audio_columns(self) -> Dict[str, np.ndarray]:
         """The decoded audio as columnar NumPy arrays (the fast path the audio
-        store consumes). Keys: device, dp, channel, sample_size, value, index,
-        start_sample, end_sample."""
+        store consumes), one per name in `_AUDIO_FIELDS` with the dtype `_AUDIO_DTYPES`
+        gives it: device, dp, channel, sample_size, value, index, start_sample,
+        end_sample, flow_mode and drq_sample."""
         return self._audio_cols
 
     @property
@@ -513,7 +633,8 @@ class Session:
         replay."""
         found = getattr(self, "_later_link_controls", None)
         if found is None:
-            found = self._later_link_controls = decode_link_controls(self.capture)[1:]
+            found = self._later_link_controls = decode_link_controls(
+                self.capture, first=self.link_control)[1:]
         # The first is read live: a rejected bring-up replaces it after the first decode.
         dlv = self.is_dlv
         later = [r for r in found if r.phy_name is None or (r.phy_name == "PHY3") == dlv]
@@ -710,13 +831,11 @@ class Session:
         # The decoder already tracks a sample rate per (device, dp), i.e. it knows
         # the distinct audio streams. Use that — it's a handful of keys — instead of
         # a unique() over the tens of millions of audio rows.
-        rates_fn = getattr(self.decoder, "audio_sample_rates", None)
-        if callable(rates_fn):
-            keys = rates_fn()
-            if keys:
-                return sorted((int(d), int(p)) for d, p in keys)
-        # Fallback (older core without audio_sample_rates): collapse the (device, dp)
-        # columns to a single int64 key so unique() stays a fast 1-D C sort.
+        keys = self.decoder.audio_sample_rates()
+        if keys:
+            return sorted((int(d), int(p)) for d, p in keys)
+        # No stream has a rate: collapse the (device, dp) columns to a single int64 key so
+        # unique() stays a fast 1-D C sort.
         dev, dp = self._audio_cols["device"], self._audio_cols["dp"]
         if dev.size == 0:
             return []
@@ -726,20 +845,74 @@ class Session:
     def set_scrambler_overrides(self, overrides) -> None:
         """Re-decode in place with a new per-(device, dp) scrambler override map
         ({(device, dp): bool}); absent entries keep the snooped/CSV value."""
-        new = dict(overrides or {})
+        new = self._checked_scrambler_overrides(overrides)
         if new == self.scrambler_overrides:
             return                               # unchanged -> skip the full re-decode
-        self.scrambler_overrides = new
-        self._redecode()
+        with self._undone_on_failure():
+            self.scrambler_overrides = new
+            self._redecode()
+
+    def _checked_scrambler_overrides(self, overrides) -> Dict[Tuple[int, int], bool]:
+        """`overrides` ({(device, dp): on}) as the decode takes them. An entry whose key is
+        not a tuple or list of (device -1..11, data port 0.._MAX_PORT) whole numbers is left
+        out and reported, naming the key."""
+        out: Dict[Tuple[int, int], bool] = {}
+        bad: List[str] = []
+        for key, on in dict(overrides or {}).items():
+            try:
+                if not isinstance(key, (tuple, list)) or len(key) != 2:
+                    raise ValueError(key)
+                dev, dp = (_whole_entry(k) for k in key)
+                if not (-1 <= dev < _DEVICES and 0 <= dp <= _MAX_PORT):
+                    raise ValueError(key)
+            except _BAD_ENTRY:
+                bad.append(repr(key))
+                continue
+            out[(dev, dp)] = bool(on)
+        if bad:
+            self._warn_dropped_entries({"scrambler_overrides": bad})
+        return out
+
+    def _checked_hub_depths(self, depths) -> Dict[int, int]:
+        """`depths` ({device: depth}) with each depth held to 0..MAX_HUB_DEPTH, so the
+        session, the decode and the saved workspace carry one value. A depth outside the
+        range is clamped and reported, naming the device and the value. An entry whose
+        device is not an integer 0..11, or whose depth is not an integer, is left out and
+        reported."""
+        out: Dict[int, int] = {}
+        bad: List[str] = []
+        for dev, depth in dict(depths or {}).items():
+            try:
+                key, depth = _whole_entry(dev), _whole_entry(depth)
+            except _BAD_ENTRY:
+                bad.append(repr(dev))
+                continue
+            if not 0 <= key < _DEVICES:
+                bad.append(repr(dev))
+                continue
+            dev = key
+            if not 0 <= depth <= MAX_HUB_DEPTH:
+                from . import import_notes
+                held = max(0, min(depth, MAX_HUB_DEPTH))
+                import_notes.warn(self.source_label(),
+                                  f"device {dev} hub depth {depth} is outside "
+                                  f"0..{MAX_HUB_DEPTH}; using {held}")
+                depth = held
+            out[dev] = depth
+        if bad:
+            self._warn_dropped_entries({"hub_depths": bad})
+        return out
 
     def set_hub_depths(self, depths) -> None:
-        """Re-decode in place with new per-device hub depths ({device: 0..5}). A
-        deeper device's response is read 2*depth frame rows later."""
-        new = {int(d): int(v) for d, v in dict(depths or {}).items()}
+        """Re-decode in place with new per-device hub depths ({device: 0..MAX_HUB_DEPTH}). A
+        deeper device's response is read 2*depth frame rows later; a depth outside the range
+        is clamped and reported."""
+        new = self._checked_hub_depths(depths)
         if new == self.hub_depths:
             return                               # unchanged -> skip the full re-decode
-        self.hub_depths = new
-        self._redecode()
+        with self._undone_on_failure():
+            self.hub_depths = new
+            self._redecode()
 
     def _autodetect_partial_dlv(self, settings) -> None:
         """Mark this a DLV capture when it's a mid-stream differential pair with no
@@ -753,21 +926,30 @@ class Session:
         from .analysis import dlv_detect
         if not dlv_detect.is_complementary(self.capture):
             return
+        if dlv_detect.rate_too_low(self.capture.sample_rate_hz):
+            from . import import_notes
+            import_notes.warn(self.source_label(),
+                              f"the two channels form a differential pair, but at "
+                              f"{int(self.capture.sample_rate_hz):,} Hz a DLV UI spans under "
+                              f"{dlv_detect.MIN_UI_SAMPLES:g} sample; it is not decoded as PHY3")
+            return
         det = dlv_detect.detect_columns(self.capture)
         if det is None:
             return
         cols, inverted = int(det[0]), bool(det[5])
         if inverted:                                   # DP/DN swapped: correct the pair
+            from . import import_notes
+            import_notes.warn(self.source_label(),
+                              "the differential pair's two channels are swapped (DN on the "
+                              "clock channel); they are read the other way round")
             cap = self.capture
             self.capture = Capture(cap.data_edges, cap.clock_edges,
                                    cap.initial_data, cap.initial_clock, cap.sample_rate_hz)
         self._dlv_forced = True
         self._forced_column_count = cols
         settings.forced_column_count = cols
-        # Record for provenance / a workspace reopen (harmless if the source is re-detected).
-        self.source["dlv"] = True
-        self.source["dlv_columns"] = cols
-        self.source["dlv_inverted"] = inverted
+        # The detection is not a decode input: a reopen detects again from the capture.
+        self.dlv_detected = (cols, inverted)
 
     def _make_dlv_source(self):
         """A fresh DlvSampleSource over the DP wire, starting at audio_start so the virtual
@@ -780,6 +962,7 @@ class Session:
         A cold start seeds `cols` from the recovered Safe-Lock count; a PARTIAL capture
         (no bring-up) has none, so it uses the blind-detected `forced_column_count` and
         starts at sample 0 (audio_start is 0)."""
+        from .analysis import dlv_detect
         cap = self.capture
         ce = np.asarray(cap.clock_edges, dtype=np.uint64)          # DP wire
         audio_start = int(self.link_control.audio_start_sample or 0)
@@ -787,12 +970,13 @@ class Session:
         n_before = int(np.searchsorted(ce, np.uint64(audio_start), side="left"))
         init_dp = bool(cap.initial_clock) ^ (n_before % 2 == 1)
         cols = int(self._forced_column_count or self.link_control.safe_lock_columns or 4)
-        nominal_ui = float(cap.sample_rate_hz) / (3_072_000.0 * cols) if cols > 0 else 0.0
+        nominal_ui = (float(cap.sample_rate_hz) / (dlv_detect.DLV_ROW_RATE_HZ * cols)
+                      if cols > 0 else 0.0)
         return swi3score.DlvSampleSource(
             np.ascontiguousarray(keep, dtype=np.uint64), init_dp,
             int(cap.sample_rate_hz), cols, nominal_ui)
 
-    def _symbol_source(self):
+    def _symbol_source(self, seg: Optional[dict] = None):
         """(source, dlv, cds_column) for the CDS symbol re-decode. DLV needs the recovered-
         clock source + Column-2 plain-NRZ CDS. Crucially it reuses the ALREADY-RUN main
         decode source (self._source), not a fresh one: only after the DLL has run does it
@@ -803,8 +987,24 @@ class Session:
         seeks a fresh, stateless source. DLV callers must pass start_ui > 0 (the seek path);
         the segment Column-0 UI is always > 0, so symbols()/around()/before() satisfy this."""
         if self.is_dlv:
-            return self._source, True, int(self._cds_horizontal_start)
+            return self._source, True, self._seg_cds(seg)
         return self.capture.sample_source(), False, 0
+
+    def _seg_cds(self, seg: Optional[dict]) -> int:
+        """The CDS column of a decode segment: 0 for FBCSE; for DLV the CDS_HorizontalStart
+        in effect there (its reset value, 2, until a commit moves it)."""
+        if seg is not None and "cds_column" in seg:
+            return int(seg["cds_column"])
+        return int(self._cds_horizontal_start)
+
+    def cds_column_at(self, sample: Optional[int] = None) -> int:
+        """The CDS column of the region under `sample` (the first region without one)."""
+        seg = None
+        if sample is not None:
+            seg = self._segment_for_sample(int(sample))
+        elif self.segments:
+            seg = self.segments[0]
+        return self._seg_cds(seg)
 
     def _configure_source_for_phy(self, settings) -> object:
         """Build the decoder's sample source for this capture's PHY and set the matching
@@ -813,8 +1013,8 @@ class Session:
         PHY3 (DLV) has no forwarded clock: a DlvSampleSource recovers the bit clock over
         the DP wire STARTING at audio_start (so the virtual PLL locks to the DLV Row-Sync
         edges, not the single-ended cold-start LC pulses), and the decoder skips NRZS and
-        reads the CDS at Column 2 (Safe-Lock-4, §12.1.10.1). FBCSE (PHY1/2) keeps the
-        forwarded-clock source. Shared by the initial decode AND every in-place re-decode
+        reads the CDS at CDS_HorizontalStart: Column 2, its PHY3 reset value, until a
+        commit moves it. FBCSE (PHY1/2) keeps the forwarded-clock source. Shared by the initial decode AND every in-place re-decode
         (_redecode), so a DLV session never silently reverts to FBCSE framing when a
         scrambler / hub-depth / register what-if / config-CSV change re-runs the decode."""
         self._cds_horizontal_start = 0             # DLV CDS column (0 = FBCSE, CDS at Col 0)
@@ -828,8 +1028,9 @@ class Session:
         if self.is_dlv:
             cols = int(self._forced_column_count or self.link_control.safe_lock_columns or 4)
             settings.dlv = True
-            settings.cds_horizontal_start = 2      # Safe-Lock-4 CDS position (§12.1.10.1)
-            self._cds_horizontal_start = 2
+            from .analysis.dlv_detect import DLV_CDS_COLUMN
+            settings.cds_horizontal_start = DLV_CDS_COLUMN     # CDS_HorizontalStart's reset
+            self._cds_horizontal_start = DLV_CDS_COLUMN
             settings.forced_column_count = cols
             self._forced_column_count = cols
             return self._make_dlv_source()
@@ -872,6 +1073,43 @@ class Session:
                 return int(ce[i])
         return int(r.audio_start_sample or 0)
 
+    # The inputs a re-decode reads that a setter writes first: mappings restored in place,
+    # and values restored by assignment.
+    _DECODE_INPUT_MAPS = ("forced_column_sections", "scrambler_overrides", "hub_depths",
+                          "register_overrides", "csv_sections", "_csv_section_cfg")
+    _DECODE_INPUT_VALUES = ("_config_csv", "_config_csv_tmp", "_csv_seed_key", "_ssp_row",
+                            "_ssp_from_sspa")
+
+    @contextlib.contextmanager
+    def _undone_on_failure(self, whole: bool = False):
+        """Around a setter that writes decode inputs and then calls `_redecode`: when that
+        decode fails, is stopped by the memory watchdog or is cancelled, or the binding
+        refuses an input, every input (and the source descriptor that persists them)
+        returns to what the kept decode was made with, so the Session reports and saves
+        only what it decoded and the same call can be retried. `_redecode` keeps the
+        previous decode in place itself. With `whole`, a scope holding more than one decode
+        also puts back every attribute a decode inside it set, so the decode kept is the one
+        from before the scope."""
+        maps = {a: dict(getattr(self, a)) for a in self._DECODE_INPUT_MAPS}
+        values = {a: getattr(self, a) for a in self._DECODE_INPUT_VALUES if hasattr(self, a)}
+        source = copy.deepcopy(self.source)
+        attrs = dict(self.__dict__) if whole else None
+        try:
+            yield
+        except BaseException:
+            if attrs is not None:
+                self.__dict__.clear()
+                self.__dict__.update(attrs)
+            for a, saved in maps.items():
+                cur = getattr(self, a)
+                cur.clear()
+                cur.update(saved)
+            for a, v in values.items():
+                setattr(self, a, v)
+            self.source.clear()
+            self.source.update(source)
+            raise
+
     def _redecode(self) -> None:
         """Rebuild the decoder from the current settings + overrides and re-run."""
         settings = swi3score.DecoderSettings()
@@ -887,17 +1125,27 @@ class Session:
         settings.imported_config_sections = sorted(self._csv_section_cfg)
         # Rebuild the PHY-correct source (DLV needs the recovered-clock source + settings;
         # without this a DLV session silently reverts to FBCSE framing on re-decode).
-        # A decode the watchdog stops leaves the previous one in place: the decoder reads
-        # its source by reference, so the old pair is restored together.
-        old = (self._source, self.decoder, self._cds_horizontal_start, self._forced_column_count)
+        # A source, decoder or decode that fails, a decode the watchdog stops, or a failure
+        # in any step that installs its results (commands, audio, segments, registers),
+        # leaves the previous decode in place: every attribute this method sets is put back
+        # together, so the decoder and the source it reads by reference, its commands, audio
+        # and register files stay one decode.
+        attrs = dict(self.__dict__)
+        try:
+            self._install_decode(settings)
+        except BaseException:
+            self.__dict__.clear()
+            self.__dict__.update(attrs)
+            raise
+
+    def _install_decode(self, settings) -> None:
+        """Build the source and decoder for `settings`, run it, and set every attribute the
+        Session derives from it (_redecode's body)."""
         self._source = self._configure_source_for_phy(settings)
         self.decoder = swi3score.Decoder(self._source, settings)
-        try:
-            run_watched(self.decoder)
-        except DecodeMemoryError:
-            (self._source, self.decoder, self._cds_horizontal_start,
-             self._forced_column_count) = old
-            raise
+        run_watched(self.decoder)
+        if not self._framing_warning_deferred:
+            self._warn_guessed_framing()
         self.commands = self.decoder.commands()
         self._rel_cmds = None                    # invalidate config-command cache
         self._eff_sorted = None                  # invalidate effective-sample sort cache
@@ -918,6 +1166,11 @@ class Session:
         self._reload_csv_seed()                  # config CSV may have changed (apply_config_csv)
         self.register_files = self._build_register_files(self._config_commands_since_reset(), None)
 
+    @property
+    def config_csv(self) -> str:
+        """The normalized global config CSV path the decode uses, or ''."""
+        return self._config_csv
+
     def apply_config_csv(self, path: Optional[str]) -> None:
         """Impose a Visualizer config CSV on the ALREADY-OPEN capture (no reopen): a
         capture that begins after the setup commit has no WriteA32/commit on the wire,
@@ -925,40 +1178,58 @@ class Session:
         audio reconstructs and the CDS column count/phase are known from row 0) AND
         seeds the bus grid + register map from it (Provenance.CSV — "CSV Import"), so
         both match the CSV. `path` None/"" removes it. The original path is kept in the
-        source descriptor so it survives a workspace reopen (session_from_source)."""
+        source descriptor so it survives a workspace reopen (session_from_source). A CSV
+        that does not read, or a decode that fails or is stopped (the CSV's or the SSP
+        re-phase's that follows it), leaves the Session, its decode and its source
+        descriptor as they were and removes any upgrade temp copy."""
+        old_tmp = getattr(self, "_config_csv_tmp", None)
+        new_tmp: List[Optional[str]] = [None]
+        with self._framing_warning_after():
+            try:
+                with self._undone_on_failure(whole=True):
+                    self._apply_config_csv(path, new_tmp)
+                    # The CSV is what gives a partial capture its port geometry, so only now
+                    # can an SSPA be used to anchor the phase (and applied backwards). See
+                    # lock_ssp_from_sspa.
+                    self.lock_ssp_from_sspa()
+            except BaseException:
+                self._discard_config_tmp(new_tmp[0])   # the kept decode reads the old one
+                raise
+        if old_tmp != new_tmp[0]:
+            self._discard_config_tmp(old_tmp)          # the previous upgrade temp
+
+    def _apply_config_csv(self, path: Optional[str], new_tmp: List[Optional[str]]) -> None:
+        """apply_config_csv's read and re-decode; the upgrade temp copy it makes goes in
+        `new_tmp[0]`."""
         if path:
             from .ingest import visualizer_csv
-            self.source["config_csv"] = path                 # original, for persistence
             norm = visualizer_csv.normalized_path(path)
-            self._discard_config_tmp()                        # drop the previous upgrade temp
-            self._config_csv_tmp = norm if norm != path else None
-            self._config_csv = norm
+            new_tmp[0] = norm if norm != path else None
             visualizer_csv.report_csv_warnings(norm, path)
+            self.source["config_csv"] = path             # original, for persistence
+            self._config_csv_tmp = new_tmp[0]
+            self._config_csv = norm
         else:
             self.source.pop("config_csv", None)
-            self._discard_config_tmp()
+            self._config_csv_tmp = None
             self._config_csv = ""
         # Explicit (re)apply: force the CSV seed to rebuild even if the path string is
-        # unchanged. An already-current CSV normalizes to its own path, so editing the
-        # file on disk and re-applying the SAME path would otherwise hit the path-keyed
-        # memo in _reload_csv_seed and keep the stale grid/register baseline while the
-        # C++ re-decode (which re-reads the file) moves on — a silent seed↔audio mismatch.
+        # unchanged. An already-current CSV normalizes to its own path, so editing the file
+        # on disk and re-applying the SAME path would otherwise hit the path-keyed memo in
+        # _reload_csv_seed and keep the stale grid/register baseline while the C++
+        # re-decode (which re-reads the file) moves on.
         self._csv_seed_key = None
         self._redecode()
-        # The CSV is what gives a partial capture its port geometry, so only now can an
-        # SSPA be used to anchor the phase (and applied backwards). See lock_ssp_from_sspa.
-        self.lock_ssp_from_sspa()
 
-    def _discard_config_tmp(self) -> None:
-        """Remove the temp CSV normalized_path created for an upgraded config (if we
-        own one), so repeated apply_config_csv calls don't leak temp files."""
-        tmp = getattr(self, "_config_csv_tmp", None)
+    @staticmethod
+    def _discard_config_tmp(tmp: Optional[str]) -> None:
+        """Remove a temp CSV normalized_path created for an upgraded config, so repeated
+        apply_config_csv calls don't leak temp files."""
         if tmp:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-        self._config_csv_tmp = None
 
     def sspa_ssp_row(self) -> Optional[int]:
         """Bus row of the first decoded SSPA's Stream Sync Point, or None if there is no
@@ -1007,10 +1278,10 @@ class Session:
         row = self.sspa_ssp_row()
         if row is None or row == self._ssp_row:
             return False
-        self._ssp_row = int(row)               # NOT _store_ssp_row: this is DERIVED, so it
-        self._ssp_from_sspa = True             # is re-derived on reopen rather than pinned
-        self._redecode()
-        self._ssp_from_sspa = True             # _redecode -> no _store_ssp_row, but be explicit
+        with self._undone_on_failure():
+            self._ssp_row = int(row)           # NOT _store_ssp_row: this is DERIVED, so it
+            self._ssp_from_sspa = True         # is re-derived on reopen rather than pinned
+            self._redecode()
         return True
 
     @property
@@ -1035,8 +1306,9 @@ class Session:
         if not self._config_csv:
             self._store_ssp_row(row)
             return
-        self._store_ssp_row(row)
-        self._redecode()
+        with self._undone_on_failure():
+            self._store_ssp_row(row)
+            self._redecode()
 
     def _store_ssp_row(self, row: int) -> None:
         """Set the manual SSP row and mirror it into the source descriptor (present when
@@ -1097,6 +1369,11 @@ class Session:
         self._csv_seed_key = self._config_csv
 
     # ---- factories ----
+    # The demo's audio samples per channel: at least 1, at most one second of 48 kHz audio,
+    # the size the demo menu builds. It equals swi3score.max_demo_samples, the longest
+    # stream the native generators build.
+    DEMO_SAMPLES_MAX = 48_000
+
     @classmethod
     def from_demo(cls, audio_samples_per_channel: int = 32, *,
                   cold_start: bool = False, phy: int = 2, variant: str = "",
@@ -1108,7 +1385,11 @@ class Session:
         `variant` ="flow_control" selects the four-mode flow-control demo (PHY2 framing).
         `delay_samples` starts the bus that much later in the capture (the two-Link demo's
         second Link); it is recorded in `source` only when set, so a plain demo's source
-        is unchanged."""
+        is unchanged. `audio_samples_per_channel` outside 1..DEMO_SAMPLES_MAX raises
+        ValueError."""
+        if not 1 <= int(audio_samples_per_channel) <= cls.DEMO_SAMPLES_MAX:
+            raise ValueError(f"audio_samples_per_channel {audio_samples_per_channel} is "
+                             f"outside 1..{cls.DEMO_SAMPLES_MAX:,}")
         cap = transitions.demo_capture(audio_samples_per_channel, cold_start=cold_start,
                                        phy=phy, variant=variant)
         source = {"type": "demo",
@@ -1123,9 +1404,26 @@ class Session:
     def window_samples(window_s, rate_hz: float):
         """(start_sample, end_sample) for `window_s` = (t0, t1) seconds at `rate_hz`: the
         nearest samples, the end inclusive (end_sample is one past the sample at t1, as
-        Capture.subcapture's range is half-open)."""
-        t0, t1 = float(window_s[0]), float(window_s[1])
-        return int(round(t0 * rate_hz)), int(round(t1 * rate_hz)) + 1
+        Capture.subcapture's range is half-open). A product past the float range is taken
+        exactly, so a finite time however large gives its sample number, which the window
+        rule then clamps (saleae_sal._normalise_window). A `window_s` that is not a pair of
+        numbers, a time or rate that is not finite, or an end before the start, raises
+        ValueError."""
+        try:
+            t0, t1 = float(window_s[0]), float(window_s[1])
+            rate = float(rate_hz)
+        except (TypeError, ValueError, IndexError, KeyError):
+            raise ValueError(f"window_s: {window_s!r} is not a pair of numbers") from None
+        if not (math.isfinite(t0) and math.isfinite(t1)):
+            raise ValueError(f"window_s: ({t0}, {t1}) is not a pair of finite times")
+        if not math.isfinite(rate):
+            raise ValueError(f"window_s: the sample rate {rate} Hz is not finite")
+        if t1 < t0:
+            raise ValueError(f"window_s: the end ({t1} s) is before the start ({t0} s)")
+        def sample(t: float) -> int:
+            x = t * rate
+            return round(x) if math.isfinite(x) else round(Fraction(t) * Fraction(rate))
+        return sample(t0), sample(t1) + 1
 
     @classmethod
     def _cut(cls, cap, src: dict, window, window_s=None):
@@ -1135,19 +1433,30 @@ class Session:
         cut, so a window saves decode time and memory after the read, not the read.
         `window_s` gives it in seconds instead, converted at the rate the capture was
         LOADED at (a complementary CSV pair loads at its true DLV rate, not the rate its
-        edge spacing suggests, so only the loaded capture knows)."""
+        edge spacing suggests, so only the loaded capture knows).
+
+        The window is read by .sal's own rule, saleae_sal._normalise_window: a pair of
+        finite numbers, a bound that is not a whole number of samples rounded to the nearest
+        (noted), a start before the capture read from 0 and an end past any sample count to
+        the capture's end (each noted), and an end not past the start a ValueError. `src`
+        records the window as read. A window that holds no transition on either channel is
+        noted."""
         if window is None and window_s is not None:
             window = cls.window_samples(window_s, cap.sample_rate_hz)
         if window is None:
             return cap
-        src["window"] = [int(window[0]), int(window[1])]
-        if int(window[0]) < 0:
-            from . import import_notes
-            path = src.get("path") or src.get("clock") or src.get("clock_path") or ""
-            import_notes.warn(import_notes.source_name(path),
-                              f"the window starts at {int(window[0]) / max(1, cap.sample_rate_hz):.9g}"
-                              f" s, before the capture; it is read from 0 s")
-        return cap.subcapture(int(window[0]), int(window[1]))
+        from . import import_notes
+        from .ingest import saleae_sal
+        path = src.get("path") or src.get("clock") or src.get("clock_path") or ""
+        label = import_notes.source_name(path)
+        s0, s1 = saleae_sal._normalise_window(label, window, max(1, int(cap.sample_rate_hz)))
+        src["window"] = [int(s0), int(s1)]
+        cut = cap.subcapture(s0, s1)
+        if cut.clock_edges.size == 0 and cut.data_edges.size == 0:
+            rate = max(1, int(cap.sample_rate_hz))
+            import_notes.warn(label, f"the window from {s0 / rate:.9g} s to {s1 / rate:.9g} s "
+                                     f"holds no transition on either channel")
+        return cut
 
     @classmethod
     def from_saleae_binary(cls, clock_path: str, data_path: str,
@@ -1170,10 +1479,16 @@ class Session:
         raises saleae_sal.SalTooLargeError rather than let a huge capture exhaust
         RAM). The window is recorded in `source` so a workspace reopens the same
         slice."""
+        from . import import_notes
         from .ingest import saleae_sal
-        if window is None and window_s is not None:
+        if window is not None or window_s is not None:
             rate = sample_rate_hz or saleae_sal.read_info(path).sample_rate_hz
-            window = cls.window_samples(window_s, rate)
+            if window is None:
+                window = cls.window_samples(window_s, rate)
+            # Read once here, by the rule _cut shares, so the source records the window
+            # the capture is cut to.
+            window = saleae_sal._normalise_window(import_notes.source_name(path), window,
+                                                  max(1, int(rate)))
         cap = saleae_sal.load_capture(path, clock_channel, data_channel,
                                       sample_rate_hz or None, auto_clock=auto_clock,
                                       window=window, max_bytes=max_bytes)
@@ -1190,11 +1505,12 @@ class Session:
     def from_digital_csv(cls, path: str, clock_col: int, data_col: int,
                          sample_rate_hz: int = 0, auto_dlv: bool = True, window=None,
                          window_s=None, **kw) -> "Session":
-        """Build a Session from a Logic digital-CSV export.
+        """Build a Session from a digital-CSV export.
 
         When `auto_dlv` and no rate is forced, a capture whose two channels form a
-        complementary differential pair is loaded at the TRUE sample rate (from the
-        timestamp quantum, not the finest edge spacing) so a partial DLV (PHY3) capture
+        complementary differential pair is loaded at the sample rate
+        `dlv_detect.true_sample_rate_csv` gives (the GCD of the transition spacings,
+        snapped to a standard analyzer rate) so a partial DLV (PHY3) capture
         decodes at the right samples/UI; the constructor then detects DLV, its column
         count, and the DP/DN polarity (see _autodetect_partial_dlv / analysis.dlv_detect).
         A normal forwarded-clock (FBCSE) CSV falls through to the standard load."""
@@ -1232,12 +1548,17 @@ class Session:
         taken from the first file). `clock_thresh`/`data_thresh` are optional (hi, lo)
         Schmitt pairs, auto-detected per channel when omitted (see
         analog.auto_threshold). `auto_clock` (default) assigns the forwarded clock by
-        transition count — the clock toggles every UI, so it is the busier line (the
-        same rule the .bin / digital-CSV importers use), which makes the `clock_path`/
+        transition count — the clock toggles every UI, so the busier channel is the clock, as
+        `CaptureProbe.busiest_pair` and the `auto_clock` option of the .sal and VCD readers
+        choose it — which makes the `clock_path`/
         `data_path` argument ORDER irrelevant. Pass `auto_clock=False` to honour the
-        given order verbatim."""
+        given order verbatim. One file given as both the clock and the data raises
+        ValueError."""
         from .ingest import analog
         from .ingest import wfm as wfm_ingest
+        from .ingest.timebase import require_distinct
+        require_distinct(clock_path, os.path.realpath(clock_path), os.path.realpath(data_path),
+                         "file")
         clk, dat = wfm_ingest.read_wfm_pair(clock_path, data_path)
         # The two files must be the two channels of ONE acquisition, sharing a time base:
         # capture_from_analog below takes only clk["time"] (reused for both channels).
@@ -1245,7 +1566,7 @@ class Session:
         # WFM-specific error here.
         n_clk, n_dat = clk["time"].size, dat["time"].size
         rate_clk, rate_dat = clk["sample_rate_hz"], dat["sample_rate_hz"]
-        rate_tol = 1e-6 * max(rate_clk, rate_dat)
+        rate_tol = 1e-6 * max(abs(rate_clk), abs(rate_dat))
         t0_clk = float(clk["time"][0]) if n_clk else 0.0
         t0_dat = float(dat["time"][0]) if n_dat else 0.0
         dt = 1.0 / rate_clk if rate_clk else 0.0
@@ -1279,20 +1600,31 @@ class Session:
         SELECTED channels by transition count (the busier line) — the UI turns it on
         for a plain two-channel file and off when the user has explicitly picked which
         of several channels is clock vs data. `clock_thresh`/`data_thresh` are optional
-        (hi, lo) Schmitt pairs; auto-detected when omitted."""
+        (hi, lo) Schmitt pairs; auto-detected when omitted. A clock and data selection that
+        name one channel (by name or index) raises ValueError."""
         from .ingest import analog, analog_csv
+        from .ingest.timebase import require_distinct
         parsed = analog_csv.read_analog_csv(path)
         channels = parsed["channels"]
         names = list(channels.keys())
 
         def _select(sel):
+            """A channel by header name, or by index into the file's channels; any other
+            selection raises ValueError naming the file and its channels."""
             if isinstance(sel, str) and sel in channels:
                 return sel
-            idx = int(sel)
+            try:
+                idx = int(sel)
+                if isinstance(sel, bool) or not 0 <= idx < len(names):
+                    raise IndexError(idx)
+            except (TypeError, ValueError, IndexError):
+                raise ValueError(f"{path}: no channel {sel!r}; the file has "
+                                 f"{', '.join(map(str, names)) or 'none'}") from None
             return names[idx]
 
         clock_name = _select(clock)
         data_name = _select(data)
+        require_distinct(path, clock_name, data_name, "channel")
         from . import import_notes
         cap = analog.capture_from_analog(parsed["time"], channels[clock_name],
                                          channels[data_name],
@@ -1304,70 +1636,207 @@ class Session:
                "data_thresh": data_thresh}
         return cls(cls._cut(cap, src, window, window_s), source=src, **kw)
 
+    @classmethod
+    def _demo_samples_in(cls, source: dict) -> int:
+        """A demo source's audio_samples_per_channel, clamped to 1..DEMO_SAMPLES_MAX with
+        an import note when it is outside; one that is not a whole number (`_source_int`)
+        raises ValueError naming the field."""
+        n = cls._source_int(source, "audio_samples_per_channel", 32)
+        kept = min(max(n, 1), cls.DEMO_SAMPLES_MAX)
+        if kept != n:
+            from . import import_notes
+            import_notes.warn(cls.label_of(source),
+                              f"audio_samples_per_channel {n:,} is outside "
+                              f"1..{cls.DEMO_SAMPLES_MAX:,}; the demo is built with {kept:,}")
+        return kept
+
     # Reconstruct a Session from a persisted `source` descriptor (workspace reload,
     # in-place re-decode). One dispatch, co-located with the from_* factories above, so
     # adding a capture format is a single-file change: add its from_* factory and one
     # branch here. The workspace layer just calls this (workspace.session_from_source).
+    @staticmethod
+    def _source_int(source: dict, key: str, default=None) -> int:
+        """`source[key]` (or `default` when absent and given) as an int. A value that is not
+        a whole number (a bool, a fraction, text that does not read as an integer) raises
+        ValueError naming the field."""
+        if key not in source and default is not None:
+            return int(default)
+        raw: Any = source.get(key)
+        try:
+            if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+                raise ValueError(raw)
+            return int(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"source {key}: {raw!r} is not an integer") from None
+
+    @staticmethod
+    def _source_window(source: dict) -> Optional[tuple]:
+        """The source's `window` as a (start, end) pair of numbers, or None when it has
+        none. Anything else (a wrong length, a bool, text, a null) raises ValueError naming
+        the field; the bounds are then read by the .sal window rule."""
+        win = source.get("window")
+        if win is None:
+            return None
+        if (not isinstance(win, (list, tuple)) or len(win) != 2
+                or not all(isinstance(v, (int, float, np.integer, np.floating))
+                           and not isinstance(v, bool) for v in win)):
+            raise ValueError(f"source window: {win!r} is not a (start, end) pair of sample "
+                             f"numbers")
+        return tuple(win)
+
+    @staticmethod
+    def _source_bounded(source: dict, key: str, default: int, lo: int, hi: int) -> int:
+        """`source[key]` read by _source_int, held to lo..hi: a value outside raises
+        ValueError naming the field."""
+        v = Session._source_int(source, key, default)
+        if not lo <= v <= hi:
+            raise ValueError(f"source {key}: {v} is outside {lo}..{hi}")
+        return v
+
+    @staticmethod
+    def _source_path(source: dict, key: str, *, optional: bool = False) -> str:
+        """`source[key]` as a file path. A path that is not non-empty text raises ValueError
+        naming the field; an `optional` one that is absent, null or empty reads as ""."""
+        raw = source.get(key)
+        if optional and (raw is None or raw == ""):
+            return ""
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"source {key}: {raw!r} is not a file path")
+        return raw
+
+    @staticmethod
+    def _source_text(source: dict, key: str) -> str:
+        """`source[key]` as non-empty text (a signal identifier); anything else, an absent
+        key included, raises ValueError naming the field."""
+        raw = source.get(key)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"source {key}: {raw!r} is not a name")
+        return raw
+
+    @staticmethod
+    def _source_flag(source: dict, key: str, default: bool) -> bool:
+        """`source[key]` as true/false; absent or null reads as `default`. Anything other
+        than a JSON true or false raises ValueError naming the field."""
+        raw = source.get(key)
+        if raw is None:
+            return bool(default)
+        if not isinstance(raw, bool):
+            raise ValueError(f"source {key}: {raw!r} is not true or false")
+        return raw
+
+    @staticmethod
+    def _source_threshold(source: dict, key: str) -> Optional[List[float]]:
+        """`source[key]` as a (high, low) threshold pair in volts, or None when absent or
+        null. A value that is not two finite numbers with high at least low raises
+        ValueError naming the field."""
+        raw = source.get(key)
+        if raw is None:
+            return None
+        if (isinstance(raw, (list, tuple)) and len(raw) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) for v in raw) and raw[0] >= raw[1]):
+            return [float(raw[0]), float(raw[1])]
+        raise ValueError(f"source {key}: {raw!r} is not a (high, low) pair of finite "
+                         f"numbers with high at least low")
+
+    @staticmethod
+    def _source_map(source: dict, key: str) -> dict:
+        """`source[key]` as a mapping; absent or null reads as {}. Anything else raises
+        ValueError naming the field."""
+        raw = source.get(key)
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"source {key}: {raw!r} is not a mapping")
+        return raw
+
+    # The demo PHYs and variants from_demo builds.
+    _DEMO_PHYS = (1, 2, 3)
+    _DEMO_VARIANTS = ("", "flow_control")
+
     @classmethod
     def from_source(cls, source: dict, register_map=None) -> "Session":
         """Rebuild a Session from a workspace `source` descriptor (keyed by
-        ``source['type']``, the tag each from_* factory stamps)."""
+        ``source['type']``, the tag each from_* factory stamps). A numeric field that does
+        not read or lies outside its range (ssp_row -1..2**63-1, delay_samples 0..2**63-1),
+        a malformed window, a file path that is not text, or a map field that is not a
+        mapping, a signal identifier that is not text, a flag (auto_clock, cold_start) that
+        is not true or false, or a threshold that is not a (high, low) pair of finite numbers
+        raises ValueError naming the field. A region config CSV entry that is not a
+        path is left out and reported, as Session reads it. A demo phy other than 1, 2 or 3,
+        or an unknown variant, builds the PHY2 or plain demo with an import warning."""
         kind = source.get("type")
+        num = cls._source_int
+        top = 2 ** 63 - 1
         # Decode inputs common to every source: an optional config-driving CSV, a
         # manual Stream Sync Point row, any region column-count pins, and the Bus Grid
         # label fields (all persisted in the source descriptor). Each factory rebuilds
         # `source` from its own args, so these must be forwarded explicitly or a reopen
         # silently drops them.
         common = dict(register_map=register_map,
-                      config_csv=source.get("config_csv", ""),
-                      ssp_row=int(source.get("ssp_row", -1)),
-                      forced_column_sections=source.get("forced_column_sections") or {},
-                      csv_sections=csv_sections_in(source),
-                      label_fields=source.get("label_fields") or {},
-                      dp_names=source.get("dp_names") or {},
-                      region_names=source.get("region_names") or {})
+                      config_csv=cls._source_path(source, "config_csv", optional=True),
+                      ssp_row=cls._source_bounded(source, "ssp_row", -1, -1, top),
+                      forced_column_sections=cls._source_map(source, "forced_column_sections"),
+                      csv_sections=_csv_section_entries(source),
+                      label_fields=cls._source_map(source, "label_fields"),
+                      dp_names=cls._source_map(source, "dp_names"),
+                      region_names=cls._source_map(source, "region_names"))
         if kind == "demo":
-            return cls.from_demo(int(source.get("audio_samples_per_channel", 32)),
-                                 cold_start=bool(source.get("cold_start", False)),
-                                 phy=int(source.get("phy", 2)),
-                                 variant=str(source.get("variant", "")),
-                                 delay_samples=int(source.get("delay_samples", 0)), **common)
+            n = cls._demo_samples_in(source)
+            phy = num(source, "phy", 2)
+            variant = source.get("variant", "")
+            if phy not in cls._DEMO_PHYS or variant not in cls._DEMO_VARIANTS:
+                from . import import_notes
+                if phy not in cls._DEMO_PHYS:
+                    import_notes.warn(cls.label_of(source), f"demo phy {phy} is not 1, 2 or "
+                                                            f"3; the PHY2 demo is built")
+                    phy = 2
+                if variant not in cls._DEMO_VARIANTS:
+                    import_notes.warn(cls.label_of(source), f"demo variant {variant!r} is not "
+                                                            f"known; the plain demo is built")
+                    variant = ""
+            return cls.from_demo(n,
+                                 cold_start=cls._source_flag(source, "cold_start", False),
+                                 phy=phy, variant=variant,
+                                 delay_samples=cls._source_bounded(source, "delay_samples", 0,
+                                                                   0, top), **common)
         # Every capture kind carries its window: a workspace saved from a windowed open
         # must reopen the same slice, not the whole (possibly unopenable) capture.
-        win = source.get("window")
-        win = tuple(win) if win else None
+        win = cls._source_window(source)
+        path = cls._source_path
         if kind == "saleae_binary":
-            return cls.from_saleae_binary(source["clock"], source["data"],
-                                          int(source["sample_rate_hz"]), window=win, **common)
+            return cls.from_saleae_binary(path(source, "clock"), path(source, "data"),
+                                          num(source, "sample_rate_hz"), window=win, **common)
         if kind == "sal":
-            return cls.from_sal(source["path"], int(source["clock_channel"]),
-                                int(source["data_channel"]),
-                                int(source.get("sample_rate_hz", 0)),
-                                auto_clock=bool(source.get("auto_clock", False)),
+            return cls.from_sal(path(source, "path"), num(source, "clock_channel"),
+                                num(source, "data_channel"),
+                                num(source, "sample_rate_hz", 0),
+                                auto_clock=cls._source_flag(source, "auto_clock", False),
                                 window=win, **common)
         if kind == "digital_csv":
-            return cls.from_digital_csv(source["path"], int(source["clock_col"]),
-                                        int(source["data_col"]),
-                                        int(source.get("sample_rate_hz", 0)), window=win,
+            return cls.from_digital_csv(path(source, "path"), num(source, "clock_col"),
+                                        num(source, "data_col"),
+                                        num(source, "sample_rate_hz", 0), window=win,
                                         **common)
+        flag, thresh = cls._source_flag, cls._source_threshold
         if kind == "vcd":
-            return cls.from_vcd(source["path"], str(source["clock_ident"]),
-                                str(source["data_ident"]),
-                                auto_clock=bool(source.get("auto_clock", False)), window=win,
+            return cls.from_vcd(path(source, "path"), cls._source_text(source, "clock_ident"),
+                                cls._source_text(source, "data_ident"),
+                                auto_clock=flag(source, "auto_clock", False), window=win,
                                 **common)
         if kind == "wfm":
-            return cls.from_wfm(source["clock_path"], source["data_path"],
-                                clock_thresh=source.get("clock_thresh"),
-                                data_thresh=source.get("data_thresh"),
-                                auto_clock=bool(source.get("auto_clock", True)),
-                                sample_rate_hz=int(source.get("sample_rate_hz", 0)), window=win,
+            return cls.from_wfm(path(source, "clock_path"), path(source, "data_path"),
+                                clock_thresh=thresh(source, "clock_thresh"),
+                                data_thresh=thresh(source, "data_thresh"),
+                                auto_clock=flag(source, "auto_clock", True),
+                                sample_rate_hz=num(source, "sample_rate_hz", 0), window=win,
                                 **common)
         if kind == "analog_csv":
-            return cls.from_analog_csv(source["path"], clock=source.get("clock", "CH1"),
+            return cls.from_analog_csv(path(source, "path"), clock=source.get("clock", "CH1"),
                                        data=source.get("data", "CH2"),
-                                       clock_thresh=source.get("clock_thresh"),
-                                       data_thresh=source.get("data_thresh"),
-                                       auto_clock=bool(source.get("auto_clock", False)),
+                                       clock_thresh=thresh(source, "clock_thresh"),
+                                       data_thresh=thresh(source, "data_thresh"),
+                                       auto_clock=flag(source, "auto_clock", False),
                                        window=win, **common)
         raise ValueError(f"unknown workspace source type: {kind!r}")
 
@@ -1481,23 +1950,28 @@ class Session:
         """Bus-row count (last row index + 1) — the upper bound for a row range."""
         return int(self.bus_row_for_sample(self.last_sample())) + 1
 
-    def _samples_per_ui(self) -> float:
-        """Samples per UI from the measured UI rate (falls back to the capture's
-        first-two-edges estimate). Used to map a UI export range to samples."""
-        if self.ui_rate_hz and self.sample_rate_hz:
-            return float(self.sample_rate_hz) / float(self.ui_rate_hz)
-        return float(self.capture.samples_per_ui())
-
     def sample_at_ui(self, ui: int) -> int:
-        """Capture sample of UI index `ui` (linear, from the measured UI rate). Clamped
-        to the capture; turns a UI export range into samples."""
-        s = int(round(max(0, int(ui)) * self._samples_per_ui()))
-        return max(0, min(s, self.last_sample()))
+        """First capture sample of UI index `ui`: the exact inverse of `ui_index`, so it holds
+        where the UI rate changes. Clamped to the capture; turns a UI export range into
+        samples."""
+        ui = max(0, int(ui))
+        hi = self.last_sample()
+        if hi <= 0 or ui <= self.ui_index(0):
+            return 0
+        if self.ui_index(hi) < ui:
+            return hi
+        lo = 0                                    # ui_index(lo) < ui <= ui_index(hi)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if self.ui_index(mid) >= ui:
+                hi = mid
+            else:
+                lo = mid
+        return hi
 
     def total_uis(self) -> int:
         """UI count over the capture — the upper bound for a UI range."""
-        spu = self._samples_per_ui()
-        return int(self.last_sample() / spu) + 1 if spu > 0 else 0
+        return self.ui_index(self.last_sample()) + 1
 
     def _capture_for_range(self, sample_range):
         """The capture to export: the whole capture (sample_range None) or a rebased
@@ -1520,9 +1994,10 @@ class Session:
         if self._dlv_forced and self.column_count > 0:
             # Partial DLV: no config commits on the wire, so force the operational width
             # (as grid_cells_at does) — else the frame collapses to the 2-column S1/S0
-            # default with no CDS column. Replay the decoded config so any writes show.
+            # default with no CDS column. Replay the decoded config from the last Cold
+            # Start so any writes show, as the CSV branch and the registers do.
             return swi3score.grid_from_commands(
-                self._grid_replay(self._config_commands()), rows,
+                self._grid_replay(self._config_commands_since_reset()), rows,
                 force_columns=int(self.column_count), dlv=True,
                 cds_horizontal_start=self._cds_horizontal_start)
         return self.decoder.grid_cells(rows)
@@ -1603,7 +2078,7 @@ class Session:
             # authoritative — so without forcing it here grid_from_commands collapses to
             # the default 2-column S1/S0 framing (no CDS column, Sync0 mis-drawn at col 1
             # instead of the last column). Force the real width so the frame draws Sync1
-            # at Column 0, the CDS at Column 2, and Sync0 at the last column.
+            # at Column 0, the CDS at its column, and Sync0 at the last column.
             force = int(self.column_count)
         return swi3score.grid_from_commands(replay, rows, force_columns=force,
                                             register_overrides=overrides,
@@ -1644,15 +2119,34 @@ class Session:
         cfg = swi3score.config_from_commands(replay, force_columns=force,
                                              register_overrides=overrides)
         # BuildConfig can't know the row rate (it's set from capture timing, not the
-        # registers), so derive it for this segment from the measured UI rate and the
-        # segment's column count — the UI rate is constant across a capture's segments,
-        # so 8-col reads 3.072 MRows/s where 16-col reads 1.536.
+        # registers). On FBCSE the UI rate holds across a capture's segments, so the row
+        # rate is the measured UI rate over this segment's column count (8-col reads
+        # 3.072 MRows/s where 16-col reads 1.536). On DLV the row rate holds and the UI
+        # rate follows the columns, so the row rate is the one rate_regions measures for
+        # the region under `sample`, else the decoder's.
         cols = int(cfg.get("num_columns", 0)) + 1
-        if self.ui_rate_hz and cols > 0:
-            cfg["row_rate_khz"] = self.ui_rate_hz / cols / 1000.0
         if self.is_dlv:
+            row_rate_hz = next((row for start, end, _ui, row in self.rate_regions()
+                                if start <= int(sample) <= end and row), None)
+            if row_rate_hz:
+                cfg["row_rate_khz"] = row_rate_hz / 1000.0
+            elif self.row_rate_khz:
+                cfg["row_rate_khz"] = float(self.row_rate_khz)
             cfg["phy3_enabled"] = True             # a DLV capture, even with no config commit
+        elif self.ui_rate_hz and cols > 0:
+            cfg["row_rate_khz"] = self.ui_rate_hz / cols / 1000.0
         return cfg
+
+    def _tx_operational_segment(self) -> Optional[dict]:
+        """The segment matching the decoder's column_count, else the widest; None when
+        there are no segments."""
+        if not self.segments:
+            return None
+        seg = next((s for s in self.segments
+                    if int(s.get("column_count", 0)) == int(self.column_count)), None)
+        if seg is None:
+            seg = max(self.segments, key=lambda s: int(s.get("column_count", 0)))
+        return seg
 
     def _tx_geometry(self):
         """(origin_ui, columns) for the OPERATIONAL geometry — the fallback when no
@@ -1660,15 +2154,59 @@ class Session:
         segment 0 is the narrow slow-clock preamble (e.g. 2 col); pick the segment
         matching the decoder's authoritative column_count (the audio config), else the
         widest, so the raster and its scrollbar agree."""
-        seg = None
-        if self.segments:
-            seg = next((s for s in self.segments
-                        if int(s.get("column_count", 0)) == int(self.column_count)), None)
-            if seg is None:
-                seg = max(self.segments, key=lambda s: int(s.get("column_count", 0)))
+        seg = self._tx_operational_segment()
         origin = int(seg["start_ui"]) if seg else 0
         cols = max(2, int(seg["column_count"]) if seg else self.column_count)
         return origin, cols
+
+    def _tx_dlv_region(self, seg: Optional[dict]) -> "tuple[int, int, int, int, int]":
+        """(origin_ui, cols, end_ui, row_lo, row_hi) of the DLV TX-map region of `seg`.
+
+        DLV `clock_edges` are the sparse DP-wire transitions, so a region is counted in bus
+        rows, which are the recovered Row Sync Points (`rsp[k]` opens bus row k). The region
+        spans rows [row_lo, row_hi): from the segment's `row_base` to the next segment's,
+        or to the last recovered RSP. `origin_ui` is the region's first Column-0 UI
+        (start_ui - its CDS column) and end_ui = origin_ui + rows x cols, the same UI scale
+        the segments' start_ui use. All zero-width when `seg` is None."""
+        if seg is None:
+            return 0, max(2, int(self.column_count)), 0, 0, 0
+        nrsp = int(self._recovered_row_syncs().size)
+        cols = max(2, int(seg["column_count"]))
+        row_lo = min(max(0, int(seg.get("row_base", 0))), nrsp)
+        nxt = next((b for a, b in zip(self.segments, self.segments[1:]) if a is seg), None)
+        row_hi = int(nxt["row_base"]) if nxt is not None else nrsp
+        row_hi = max(row_lo, min(row_hi, nrsp))
+        origin = max(0, int(seg["start_ui"]) - self._seg_cds(seg))
+        return origin, cols, origin + (row_hi - row_lo) * cols, row_lo, row_hi
+
+    def _tx_dlv_cells(self, cols: int, row_a: int, row_b: int) -> "tuple[np.ndarray, np.ndarray]":
+        """(bus_row, column) of every DP-wire transition in DLV bus rows [row_a, row_b).
+
+        A transition belongs to the row whose recovered RSP is the last at or before it,
+        and to the UI it opens: column = round((edge - rsp) / UI) mod cols, UI = row period
+        / cols, row period = recovered operational UI x operational columns. A UI carries
+        a transition iff its bit differs from the previous UI's, the convention the FBCSE
+        raster uses."""
+        empty = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+        rsp = self._recovered_row_syncs()
+        rc = self.recovered_clock()
+        row_b = min(int(row_b), int(rsp.size))
+        if rc is None or row_a >= row_b or row_a < 0 or cols <= 0:
+            return empty
+        row_period = float(rc[1]) * max(1, int(self.column_count))
+        ui = row_period / cols
+        if ui <= 0.0:
+            return empty
+        ce = np.asarray(self.capture.clock_edges, dtype=np.int64)
+        lo_s = int(rsp[row_a])
+        hi_s = int(rsp[row_b]) if row_b < rsp.size else int(round(int(rsp[-1]) + row_period))
+        e = ce[int(np.searchsorted(ce, lo_s, side="left")):
+               int(np.searchsorted(ce, hi_s, side="left"))]
+        if e.size == 0:
+            return empty
+        k = np.searchsorted(rsp, e, side="right").astype(np.int64) - 1
+        col = np.rint((e - rsp[k]) / ui).astype(np.int64) % cols
+        return k, col
 
     def _tx_bounds(self, sample=None):
         """(origin_ui, cols, end_ui) the TX map draws — the config region UNDER `sample`
@@ -1681,14 +2219,18 @@ class Session:
         seg = None
         if sample is not None and int(sample) >= int(self.audio_start_sample):
             seg = self._segment_for_sample(int(sample))
+        if self.is_dlv:
+            if seg is None:
+                seg = self._tx_operational_segment()
+            return self._tx_dlv_region(seg)[:3]
         if seg is not None:
             seg_start = int(seg["start_ui"])
             cols = max(2, int(seg["column_count"]))
             # Anchor the raster's Column 0 at the row opening (Sync1), not the segment's
-            # start_ui — for DLV start_ui is the CDS UI (Column `_cds_horizontal_start`),
-            # so without this the CDS lands at raster col 0 and the frame is shifted. 0 for
+            # start_ui — for DLV start_ui is the CDS UI (the segment's CDS column), so
+            # without this the CDS lands at raster col 0 and the frame is shifted. 0 for
             # FBCSE (unchanged). Region boundaries still use the unshifted seg_start.
-            origin = max(0, seg_start - int(self._cds_horizontal_start))
+            origin = max(0, seg_start - self._seg_cds(seg))
             later = [int(s["start_ui"]) for s in self.segments if int(s["start_ui"]) > seg_start]
             end_ui = min(later) if later else nui
             return origin, cols, min(end_ui, nui)
@@ -1700,7 +2242,7 @@ class Session:
         `sample` (bounded to it), else the operational segment to the capture end.
         `sample` selects the region geometry so the scrollbar matches the raster."""
         ce = self.capture.clock_edges
-        if ce.size < 2:
+        if ce.size < 2 and not self.is_dlv:
             return 0
         origin, cols, end_ui = self._tx_bounds(sample)
         # Ceil, not floor: a region that ends mid-row still has that trailing partial
@@ -1714,8 +2256,14 @@ class Session:
         tx_raster draws at — so Show Toggles opens at (and scrolls to) the cursor's row.
         Clamped to [0, tx_total_rows-1]."""
         origin, cols, _end = self._tx_bounds(sample)
-        ui = self._ui_for_sample(int(sample))
-        row = (ui - origin) // cols if cols else 0
+        if self.is_dlv:
+            seg = (self._segment_for_sample(int(sample))
+                   if int(sample) >= int(self.audio_start_sample) else None)
+            row_lo = self._tx_dlv_region(seg or self._tx_operational_segment())[3]
+            row = self.bus_row_for_sample(int(sample)) - row_lo
+        else:
+            ui = self._ui_for_sample(int(sample))
+            row = (ui - origin) // cols if cols else 0
         return int(max(0, min(row, self.tx_total_rows(sample) - 1)))
 
     def timing_column_roles(self, sample: Optional[int] = None) -> dict:
@@ -1818,7 +2366,7 @@ class Session:
         a window at a time (see tx_total_rows).
 
         Column 0 is the row opening (Sync1); the CDS column is `cds_col` (Column 0 for
-        FBCSE, Column 2 for DLV), flagged separately. Returns {column_count, cds_col,
+        FBCSE; for DLV the region's CDS_HorizontalStart), flagged separately. Returns {column_count, cds_col,
         row_labels (0-based, len == nrows), tx (nrows x ncols bool ndarray)}. Column
         geometry is the auto-detected/segment count, so it works pre-CSV."""
         ce = self.capture.clock_edges
@@ -1829,8 +2377,19 @@ class Session:
         nrows = max(1, int(rows))
         start_row = max(0, int(start_row))
         labels = [start_row + i for i in range(nrows)]
-        base = {"column_count": cols, "cds_col": int(self._cds_horizontal_start),
+        base = {"column_count": cols, "cds_col": self.cds_column_at(sample),
                 "row_labels": labels}
+        if self.is_dlv:
+            # DLV: rows are the recovered RSPs, not clock_edges indices (_tx_dlv_cells).
+            tx = np.zeros((nrows, cols), dtype=bool)
+            seg = (self._segment_for_sample(int(sample))
+                   if sample is not None and int(sample) >= int(self.audio_start_sample)
+                   else None) or self._tx_operational_segment()
+            _o, _c, _e, row_lo, row_hi = self._tx_dlv_region(seg)
+            a = row_lo + start_row
+            k, col = self._tx_dlv_cells(cols, a, min(row_hi, a + nrows))
+            tx[k - a, col] = True
+            return {**base, "tx": tx}
         if ce.size < 2:
             return {**base, "tx": np.zeros((nrows, cols), dtype=bool)}
         # UI index of (window row i, col c): row 0's Column 0 is at `origin` (start_ui),
@@ -1843,24 +2402,28 @@ class Session:
         valid = (ui >= 1) & (ui < hi)
         uic = np.clip(ui, 1, nui - 1)
         # A UI carries a transition iff its sampled bit differs from the previous UI's —
-        # i.e. a data edge in (clock_edge[ui-1], clock_edge[ui]]. This matches the
+        # i.e. a data edge in [clock_edge[ui-1], clock_edge[ui]). This matches the
         # decoder's own convention (CColumnDetector: level[i] != level[i-1]); attributing
         # the *next* interval's edge here would shift every column one left (lighting the
         # guard columns). Index preserves ce's dtype so searchsorted stays same-dtype.
         tx = (np.searchsorted(de, ce[uic]) - np.searchsorted(de, ce[uic - 1])) > 0
         return {**base, "tx": tx & valid}
 
-    def _tx_persist_key(self, sample: Optional[int]) -> "tuple[int, int, int]":
+    def tx_persist_key(self, sample: Optional[int]) -> "tuple[int, int, int]":
         """The (origin_ui, columns, end_ui) region key tx_persist_columns memoizes on —
         the config region containing `sample` (its segment's start_ui to the next
-        segment's, in that segment's column count), else the operational region."""
+        segment's, in that segment's column count), else the operational region. end_ui is
+        clamped to the capture's clock edges. DLV uses the row-counted region of
+        _tx_dlv_region."""
         ce = self.capture.clock_edges
         seg = self._segment_for_sample(int(sample)) if sample is not None else None
+        if self.is_dlv:
+            return self._tx_dlv_region(seg or self._tx_operational_segment())[:3]
         if seg is not None:
             origin = int(seg["start_ui"])
             cols = max(2, int(seg["column_count"]))
             nxt = [int(s["start_ui"]) for s in self.segments if int(s["start_ui"]) > origin]
-            end_ui = min(nxt) if nxt else int(ce.size)
+            end_ui = min(min(nxt) if nxt else int(ce.size), int(ce.size))
         else:
             origin, cols = self._tx_geometry()
             end_ui = int(ce.size)
@@ -1872,7 +2435,7 @@ class Session:
         render instantly on a cache hit and only go off-thread on the first visit to a
         region (see the persistence worker in main_window)."""
         cache = getattr(self, "_tx_persist_cache", None)
-        return cache.get(self._tx_persist_key(sample)) if cache else None
+        return cache.get(self.tx_persist_key(sample)) if cache else None
 
     def tx_persist_columns(self, sample: Optional[int] = None) -> "tuple[np.ndarray, int]":
         """(per-column ever-toggled boolean, column_count) for the CONFIGURATION REGION
@@ -1888,7 +2451,7 @@ class Session:
         ce = self.capture.clock_edges
         de = self.capture.data_edges
         # Region bounds in UI space (covering segment → next segment / capture end).
-        key = self._tx_persist_key(sample)
+        key = self.tx_persist_key(sample)
         origin, cols, end_ui = key
         cache = getattr(self, "_tx_persist_cache", None)
         if cache is None:
@@ -1898,7 +2461,14 @@ class Session:
             return hit
         lit = np.zeros(cols, dtype=bool)
         lo = max(1, origin)
-        if ce.size < 2 or end_ui <= lo:
+        if self.is_dlv:
+            seg = self._segment_for_sample(int(sample)) if sample is not None else None
+            _o, _c, _e, row_lo, row_hi = self._tx_dlv_region(seg or self._tx_operational_segment())
+            _k, col = self._tx_dlv_cells(cols, row_lo, row_hi)
+            if col.size:
+                lit = np.bincount(col, minlength=cols).astype(bool)
+            result = (lit, cols)
+        elif ce.size < 2 or end_ui <= lo:
             result = (lit, cols)
         else:
             # Which columns EVER toggled in the region. A UI toggled iff a data edge lands
@@ -2023,8 +2593,9 @@ class Session:
         """Synthetic 'Commit Point' command rows — one per confirmed sync-point commit,
         placed at the SSP where it takes effect (Row_Delay rows after the command), so
         the command table can show a row for the deferred effect (opcode/devices/group
-        populated). PROTOTYPE: these rows live only in the command-table list, not in the
-        decoded `commands` (so timeline ticks, error counts and audio are unaffected)."""
+        populated). These rows live only in the command-table list, not in the decoded
+        `commands`, so timeline ticks, error counts and audio exclude them. Code indexed by
+        a command-table position reads the table model, not `commands`."""
         rows = []
         for c in self.commands:
             if not (c.get("is_commit") and c.get("has_sync_point")
@@ -2125,7 +2696,12 @@ class Session:
         e.g. the .sal/.csv/.vcd file's basename, or 'PHY3 Demo Capture'. A two-file
         source (Saleae binary pair or .wfm pair) shows BOTH channel files (clock &
         data)."""
-        s = self.source or {}
+        return self.label_of(self.source)
+
+    @staticmethod
+    def label_of(source: Optional[dict]) -> str:
+        """source_label for a source descriptor."""
+        s = source or {}
         t = s.get("type")
         if t == "demo":
             # Name which demo is loaded (one per audio-mode PHY, plus the flow-control
@@ -2263,9 +2839,10 @@ class Session:
     def _recovered_row_syncs(self) -> np.ndarray:
         """The DLV Row Sync Points as a sorted int64 array (empty for FBCSE): the
         once-per-row Sync0→Sync1 (S0→S1) 0→1 edge that opens each row, resolved to the
-        actual DP-wire edge (see `_rsp_analysis` / `recovered_clock`). Only rows whose
-        opening edge is present are included; missing ones are surfaced separately by
-        `missing_rsp_samples`. Cached; the recovered clock is fixed after decode."""
+        actual DP-wire edge (see `_rsp_analysis` / `recovered_clock`). One entry per row,
+        so entry k is bus row k: the opening edge when it is present, else the predicted
+        position, which `missing_rsp_samples` lists. Cached; the recovered clock is fixed
+        after decode."""
         cached = getattr(self, "_rec_syncs_cache", None)
         if cached is not None:
             return cached
@@ -2446,9 +3023,9 @@ class Session:
         continuous scale as the command table / symbol viewer: row_base +
         (UI - start_ui) // column_count for the segment that covers it.
 
-        `start_ui` is the segment's ANCHOR UI, recorded at the CDS column
-        (`_cds_horizontal_start` — Column 0 for FBCSE, Column 2 for DLV), so the CDS
-        offset is added back to count rows from Column 0. It's 0 for FBCSE."""
+        `start_ui` is the segment's ANCHOR UI, recorded at the segment's CDS column
+        (Column 0 for FBCSE; the PHY3 CDS_HorizontalStart for DLV), so the CDS offset is
+        added back to count rows from Column 0. It's 0 for FBCSE."""
         seg = self._segment_for_sample(int(sample))
         if seg is None:
             return 0
@@ -2466,7 +3043,7 @@ class Session:
             if rsp.size:
                 return int(max(0, int(np.searchsorted(rsp, int(sample), side="right")) - 1))
         ui = self._ui_for_sample(int(sample))
-        return int(seg["row_base"]) + (ui - int(seg["start_ui"]) + self._cds_horizontal_start) // cols
+        return int(seg["row_base"]) + (ui - int(seg["start_ui"]) + self._seg_cds(seg)) // cols
 
     def bus_rows_for_samples(self, samples: np.ndarray) -> np.ndarray:
         """Vectorised :meth:`bus_row_for_sample` for an array of samples — used to
@@ -2475,7 +3052,7 @@ class Session:
         s = np.asarray(samples, dtype=np.int64)
         if s.size == 0:
             return np.zeros(0, dtype=np.int64)
-        segs = self.segments or [{"start_ui": 0, "row_base": 0,
+        segs = self.segments or [{"start_sample": 0, "start_ui": 0, "row_base": 0,
                                   "column_count": max(2, self.column_count)}]
         seg_starts = np.array([int(x["start_sample"]) for x in segs], dtype=np.int64)
         origin = np.array([int(x["start_ui"]) for x in segs], dtype=np.int64)
@@ -2573,12 +3150,7 @@ class Session:
                 keep &= np.isin(m["channel"].astype(np.int64), want_ch)
             if value_pred:
                 op, thr = value_pred
-                thr = int(thr)
-                sg = m["signed"]
-                ops = {"<=": sg <= thr, "<": sg < thr, "==": sg == thr,
-                       "!=": sg != thr, ">=": sg >= thr, ">": sg > thr}
-                if op in ops:
-                    keep &= ops[op]
+                keep &= self._VALUE_OPS[str(op)](m["signed"], int(thr))
             result = (m, np.flatnonzero(keep))
         self._filtered_cache = (key, result)
         return result
@@ -2586,11 +3158,19 @@ class Session:
     @staticmethod
     def _filter_key(ports, channels, value_pred):
         """Normalize (ports, channels, value_pred) to a hashable, order-independent
-        key for the `_filtered_positions` memo."""
+        key for the `_filtered_positions` memo. A value_pred operator other than the
+        _VALUE_OPS keys raises ValueError."""
         p = tuple(sorted((int(d), int(p)) for d, p in ports)) if ports else None
         c = tuple(sorted(int(x) for x in channels)) if channels else None
         v = (str(value_pred[0]), int(value_pred[1])) if value_pred else None
+        if v is not None and v[0] not in Session._VALUE_OPS:
+            raise ValueError(f"value_pred: {v[0]!r} is not one of "
+                             f"{', '.join(Session._VALUE_OPS)}")
         return (p, c, v)
+
+    # The value filter's comparisons of a sample's signed value with the threshold.
+    _VALUE_OPS = {"<=": operator.le, "<": operator.lt, "==": operator.eq,
+                  "!=": operator.ne, ">=": operator.ge, ">": operator.gt}
 
     def _marks_rows(self, m, sel) -> List[dict]:
         """Build row dicts for `sel` (positions into the start-sorted marks)."""
@@ -2739,13 +3319,10 @@ class Session:
         empty = {"sample": np.zeros(0, np.int64), "device": np.zeros(0, np.int32),
                  "dp": np.zeros(0, np.int32), "channel": np.zeros(0, np.int32),
                  "is_start": np.zeros(0, np.uint8)}
-        fn = getattr(self.decoder, "bit_samples_window", None)
-        if not callable(fn):
-            return empty
         window = self._port_bit_window_uis(lo_sample, hi_sample)
         if window is None:
             return empty
-        b = fn(window[0], window[1])
+        b = self.decoder.bit_samples_window(window[0], window[1])
         s = np.asarray(b["sample"], dtype=np.int64)
         if s.size == 0 or s.size > max_marks:
             return empty
@@ -2758,39 +3335,52 @@ class Session:
                 "channel": np.asarray(b["channel"], dtype=np.int32)[order],
                 "is_start": np.asarray(b["is_start"], dtype=np.uint8)[order]}
 
-    def _symbol_start_ui(self, desired: int, origin: int, cols: int) -> int:
+    def _symbol_start_ui(self, desired: int, origin: int, cols: int, cds: int = 0) -> int:
         """Snap a desired symbol-decode start UI to a Column-0 boundary. decode_symbols
         counts columns from `start_ui` (treating it as Column 0) and reads the CDS at
         `cds_column`, so start_ui MUST land on Column 0 — otherwise the column counter is
         phase-shifted and it samples the wrong column (for DLV, `origin` is the CDS column
         at Column 2, so `origin + k*cols` would sit on Column 2, making it read Sync1 as the
-        CDS). Column 0 of `origin`'s row is `origin - cds`; snap down to that lattice. For
+        CDS). Column 0 of `origin`'s row is `origin - cds` (`cds` is the segment's CDS
+        column); snap down to that lattice. For
         the shared DLV source the seek path needs start_ui > 0, so bump a Column-0-of-row-0
         result to the next row (row 0 carries only Sync/CDS framing — no data lost)."""
         if cols <= 0 or origin >= (2 ** 64 - 1):
             return max(0, int(desired))
-        col0 = int(origin) - int(self._cds_horizontal_start)      # Column-0 UI (== origin for FBCSE)
+        col0 = int(origin) - int(cds)                             # Column-0 UI (== origin for FBCSE)
         s = int(desired) - ((int(desired) - col0) % cols)         # snap down to a Column-0 boundary
         if self.is_dlv and s <= 0:
             s = col0 + cols                                       # row 1's Column 0 (seek path needs > 0)
         return max(0, s)
 
+    def _hub_depth_list(self) -> List[int]:
+        """Device i's hub depth at index i, for decode_symbols: the symbol pane frames a
+        hub-delayed response token as the decode's command parser does."""
+        return [int(self.hub_depths.get(d, 0)) for d in range(12)]   # Devices 0..11
+
     def symbols(self, max_symbols: int = 1024, start_ui: int = 0) -> List[dict]:
-        """Re-decode the CDS into classified 8b/10b symbols (fresh source).
+        """Re-decode the CDS into classified 8b/10b symbols (fresh source), framed with the
+        session's hub depths as the decode frames them.
 
         With no `start_ui`, decodes from the FIRST segment using that segment's
         column count (not the final one) so the start of a multi-config capture
         frames correctly. Rows match the streaming decoder via the segment's
-        Column-0 origin + cumulative row base.
+        Column-0 origin + cumulative row base. The decode ends at the next segment's
+        Column-0 UI, as symbols_around's does, so no symbol is framed with the first
+        segment's column count past it.
         """
         seg = self.segments[0] if self.segments else None
         cols = seg["column_count"] if seg else self.column_count
         origin = seg["start_ui"] if seg else (2 ** 64 - 1)
         base = seg["row_base"] if seg else 0
-        su = self._symbol_start_ui(start_ui or (seg["start_ui"] if seg else 0), origin, cols)
-        src, dlv, cds = self._symbol_source()
+        cds = self._seg_cds(seg)
+        su = self._symbol_start_ui(start_ui or (seg["start_ui"] if seg else 0), origin, cols, cds)
+        after = ([int(s["start_ui"]) for s in self.segments if int(s["start_ui"]) > origin]
+                 if seg else [])
+        end_ui = min(after) if after else 0
+        src, dlv, cds = self._symbol_source(seg)
         return swi3score.decode_symbols(src, cols, max_symbols, su, origin, base,
-                                        0, dlv, cds)
+                                        end_ui, dlv, cds, hub_depths=self._hub_depth_list())
 
     def symbols_around(self, sample: int, max_symbols: int = 1024) -> List[dict]:
         """Symbols at/just before the Column-0 row containing `sample`, framed with
@@ -2820,13 +3410,14 @@ class Session:
         # a few rows before it.)
         BACKUP_ROWS = max(24, max_symbols // 2)
         k = max(0, (target - origin) // cols - BACKUP_ROWS)
-        start_ui = self._symbol_start_ui(origin + k * cols, origin, cols)
+        start_ui = self._symbol_start_ui(origin + k * cols, origin, cols, self._seg_cds(seg))
         # Cap at the start of the following segment (0 = no cap for the last one).
         after = [int(s["start_ui"]) for s in self.segments if int(s["start_ui"]) > origin]
         end_ui = min(after) if after else 0
-        src, dlv, cds = self._symbol_source()
+        src, dlv, cds = self._symbol_source(seg)
         return swi3score.decode_symbols(src, cols, max_symbols, start_ui, origin,
-                                        seg["row_base"], end_ui, dlv, cds)
+                                        seg["row_base"], end_ui, dlv, cds,
+                                        hub_depths=self._hub_depth_list())
 
     def symbols_before(self, sample: int, max_symbols: int = 512) -> List[dict]:
         """The nearest chunk of CDS symbols BEFORE the Column-0 row containing `sample`
@@ -2864,10 +3455,13 @@ class Session:
                 end_ui = origin
                 continue
             k = max(0, rows_end - win_rows)
-            start_ui = self._symbol_start_ui(origin + k * cols, origin, cols)
-            src, dlv, cds = self._symbol_source()
+            start_ui = self._symbol_start_ui(origin + k * cols, origin, cols,
+                                             self._seg_cds(seg))
+            src, dlv, cds = self._symbol_source(seg)
+            # end_ui caps the decode at the window end
             syms = swi3score.decode_symbols(src, cols, max_symbols + 64, start_ui, origin,
-                                            seg["row_base"], end_ui, dlv, cds)   # end-cap at window end
+                                            seg["row_base"], end_ui, dlv, cds,
+                                            hub_depths=self._hub_depth_list())
             syms = [s for s in syms if int(s.get("start_sample", 0)) < anchor]
             if syms:
                 return syms
@@ -3031,27 +3625,79 @@ class Session:
         """Debug what-if: force (device, address) to `value` for config section
         `section_index`. Re-decodes so the Bus Grid, Register Map AND audio all
         reflect it (Provenance.UI in the map). Section-scoped — see register_overrides."""
-        self.register_overrides[(int(section_index), int(device), int(address))] = int(value) & 0xFF
-        self._redecode()
+        with self._undone_on_failure():
+            self.register_overrides[(int(section_index), int(device), int(address))] = (
+                int(value) & 0xFF)
+            self._redecode()
 
     # ---- Bus Grid label fields (pure display; no decode effect) ----
     #: Visualizer default: Channel|Bit (DisplayField.CHANNEL | DisplayField.BIT).
     DEFAULT_LABEL_FIELDS = 6
 
     @staticmethod
-    def _load_label_fields(raw) -> Dict[Tuple[int, int], int]:
+    def _load_label_fields(raw, dropped: Optional[List[str]] = None
+                           ) -> Dict[Tuple[int, int], int]:
         """Parse persisted label fields. Keys round-trip through JSON as "dev.dp"
-        strings (a JSON object can't hold a tuple key); unparseable entries are
-        dropped rather than raising — a hand-edited or older workspace must still
-        open, just without that port's preference."""
+        strings (a JSON object can't hold a tuple key). An entry whose key does not parse,
+        or whose value is not an integer 0..7 (a fraction included), is dropped rather than
+        raising — a hand-edited or older workspace must still open, just without that
+        port's preference — and, given `dropped`, listed there."""
         out: Dict[Tuple[int, int], int] = {}
         for k, v in dict(raw or {}).items():
             try:
                 dev, dp = str(k).split(".")
-                out[(int(dev), int(dp))] = int(v) & 7
-            except (ValueError, TypeError):
-                continue
+                if isinstance(v, float) and not v.is_integer():
+                    raise ValueError(v)
+                fields = int(v)
+                if not 0 <= fields <= 7:
+                    raise ValueError(v)
+                out[(int(dev), int(dp))] = fields
+            except _BAD_ENTRY:
+                if dropped is not None:
+                    dropped.append(repr(k))
         return out
+
+    @staticmethod
+    def _load_int_map(raw, dropped: Optional[List[str]] = None, value=int) -> dict:
+        """Parse a persisted map keyed by config section index (integers 0.._MAX_SECTION,
+        strings in JSON) with `value`(v) values; an entry whose key is not such an integer,
+        or whose value `value` refuses (for int, also a fraction or one outside the core's
+        32-bit range), is dropped and, given `dropped`, listed there."""
+        out: dict = {}
+        for k, v in dict(raw or {}).items():
+            try:
+                if value is int and isinstance(v, float) and not v.is_integer():
+                    raise ValueError(v)
+                if isinstance(k, float) and not k.is_integer():
+                    raise ValueError(k)
+                key, got = int(k), value(v)
+                if not 0 <= key <= _MAX_SECTION:
+                    raise ValueError(k)
+                if value is int and not -2 ** 31 <= got <= _MAX_SECTION:
+                    raise ValueError(v)
+                out[key] = got
+            except _BAD_ENTRY:
+                if dropped is not None:
+                    dropped.append(repr(k))
+        return out
+
+    _DROPPED_SHOWN = 3
+
+    def _warn_dropped_entries(self, dropped: Dict[str, List[str]]) -> None:
+        """One import note per source-descriptor field with entries a loader left out."""
+        from . import import_notes
+        for field, keys in dropped.items():
+            if not keys:
+                continue
+            shown = ", ".join(keys[:self._DROPPED_SHOWN])
+            more = len(keys) - self._DROPPED_SHOWN
+            if more > 0:
+                shown += f" and {more} more"
+            n = len(keys)
+            import_notes.warn(self.source_label(),
+                              f"{field}: {n} entr{'ies' if n != 1 else 'y'} that "
+                              f"{'do' if n != 1 else 'does'} not read ({shown}) "
+                              f"{'are' if n != 1 else 'is'} left out")
 
     def set_label_fields(self, device: int, dp: int, fields: int) -> None:
         """Set the Bus Grid label fields for one data port (1=Sample, 2=Channel,
@@ -3076,9 +3722,10 @@ class Session:
 
     # ---- data-port names (pure display) ----
     @staticmethod
-    def _load_dp_names(raw) -> Dict[Tuple[int, int], str]:
-        """Parse persisted names ("dev.dp" keys, as for the label fields); a blank or
-        unparseable entry is dropped."""
+    def _load_dp_names(raw, dropped: Optional[List[str]] = None
+                       ) -> Dict[Tuple[int, int], str]:
+        """Parse persisted names ("dev.dp" keys, as for the label fields); a blank entry
+        is dropped, and an unparseable one is dropped and, given `dropped`, listed there."""
         out: Dict[Tuple[int, int], str] = {}
         for k, v in dict(raw or {}).items():
             try:
@@ -3086,8 +3733,9 @@ class Session:
                 name = str(v).strip()
                 if name:
                     out[(int(dev), int(dp))] = name
-            except (ValueError, TypeError):
-                continue
+            except _BAD_ENTRY:
+                if dropped is not None:
+                    dropped.append(repr(k))
         return out
 
     def set_dp_name(self, device: int, dp: int, name: str) -> None:
@@ -3103,15 +3751,18 @@ class Session:
 
     # ---- config-region names (pure display) ----
     @staticmethod
-    def _load_region_names(raw) -> Dict[int, str]:
+    def _load_region_names(raw, dropped: Optional[List[str]] = None) -> Dict[int, str]:
+        """Parse persisted region names (section-index keys); a blank entry is dropped,
+        and an unparseable one is dropped and, given `dropped`, listed there."""
         out: Dict[int, str] = {}
         for k, v in dict(raw or {}).items():
             try:
                 name = str(v).strip()
                 if name:
                     out[int(k)] = name
-            except (ValueError, TypeError):
-                continue
+            except _BAD_ENTRY:
+                if dropped is not None:
+                    dropped.append(repr(k))
         return out
 
     def set_region_name(self, section: int, name: str) -> None:
@@ -3152,8 +3803,9 @@ class Session:
     def clear_register_overrides(self) -> None:
         if not self.register_overrides:
             return
-        self.register_overrides.clear()
-        self._redecode()
+        with self._undone_on_failure():
+            self.register_overrides.clear()
+            self._redecode()
 
     # ---- region-scoped forced column count ----
     def force_column_count_at(self, sample: Optional[int], columns: int) -> int:
@@ -3169,27 +3821,30 @@ class Session:
         to a different region on each call."""
         sect = self.segment_index_for_sample(int(sample)) if sample is not None else 0
         cols = int(columns)
-        if cols and not (2 <= cols <= 32):
-            raise ValueError(f"column count {cols} out of range (2..32)")
+        if cols and not (_MIN_COLUMNS <= cols <= _MAX_COLUMNS):
+            raise ValueError(f"column count {cols} out of range ({_MIN_COLUMNS}..{_MAX_COLUMNS})")
         if cols:
             if self.forced_column_sections.get(sect) == cols:
                 return sect                      # unchanged -> skip the full re-decode
-            self.forced_column_sections[sect] = cols
-        else:
-            if sect not in self.forced_column_sections:
-                return sect
-            del self.forced_column_sections[sect]
-        self._store_forced_columns()
-        self._redecode()
+        elif sect not in self.forced_column_sections:
+            return sect
+        with self._undone_on_failure():
+            if cols:
+                self.forced_column_sections[sect] = cols
+            else:
+                del self.forced_column_sections[sect]
+            self._store_forced_columns()
+            self._redecode()
         return sect
 
     def clear_forced_column_sections(self) -> None:
         """Remove every region column-count pin and re-decode."""
         if not self.forced_column_sections:
             return
-        self.forced_column_sections.clear()
-        self._store_forced_columns()
-        self._redecode()
+        with self._undone_on_failure():
+            self.forced_column_sections.clear()
+            self._store_forced_columns()
+            self._redecode()
 
     def _store_forced_columns(self) -> None:
         """Mirror the pins into the source descriptor so they survive a workspace
@@ -3215,13 +3870,16 @@ class Session:
         The section index is resolved before the re-decode, as force_column_count_at
         does, so the CSV cannot walk to another region on a second call."""
         sect = self.segment_index_for_sample(int(sample)) if sample is not None else 0
-        if path:
-            self.csv_sections[sect] = str(path)
-        elif self.csv_sections.pop(sect, None) is None:
+        if not path and sect not in self.csv_sections:
             return sect
-        self._store_csv_sections()
-        self._csv_section_cfg = self._read_csv_sections(report={sect} if path else set())
-        self._redecode()
+        with self._undone_on_failure():
+            if path:
+                self.csv_sections[sect] = str(path)
+            else:
+                del self.csv_sections[sect]
+            self._store_csv_sections()
+            self._csv_section_cfg = self._read_csv_sections(report={sect} if path else set())
+            self._redecode()
         return sect
 
     def csv_section_at(self, sample: Optional[int]) -> str:
@@ -3328,8 +3986,9 @@ class Session:
                for (s, d, a), v in dict(overrides or {}).items()}
         if new == self.register_overrides:
             return                               # unchanged -> skip the full re-decode
-        self.register_overrides = new
-        self._redecode()
+        with self._undone_on_failure():
+            self.register_overrides = new
+            self._redecode()
 
     def set_peripheral_map(self, device: int, pmap: Optional[object], *,
                            rebuild: bool = True) -> None:
@@ -3362,9 +4021,6 @@ class Session:
     @property
     def sample_rate_hz(self) -> int:
         return self.capture.sample_rate_hz
-
-    def sample_to_seconds(self, sample: int) -> float:
-        return sample / self.sample_rate_hz if self.sample_rate_hz else 0.0
 
 
 # Bytes per decoded audio sample once copied out as columns (Session._AUDIO_DTYPES).

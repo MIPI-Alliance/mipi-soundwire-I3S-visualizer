@@ -6,8 +6,8 @@ implied F_max, and the binding constraint. Timing mode renders the margins as te
 
 `CalcInputs` also carries a per-side spec source, so the same inequalities cover a
 mixed SWI3S ↔ SoundWire-1.3 bus. Defaults are SWI3S on both sides; see
-`spec_source` for what a cross-spec selection changes and for the divergences it
-leaves unreconciled.
+`spec_source` for what a cross-spec selection changes (`THRESHOLD_NOTE`, `TRF_NOTE`,
+`HANDOVER_CROSS_SPEC_NOTE`) and `docs/anchors.md` for the anchors.
 """
 from .calculator import (
     INEQUALITIES,
@@ -20,11 +20,14 @@ from .calculator import (
     ParamRange,
     Pick,
     PPPlacement,
+    RowPick,
+    RowPoint,
     Term,
     apply_row_picks,
     compute,
     default_swi3s_rows,
     find_worst_corner_rows,
+    find_worst_corner_rows_all,
     pp_net_pd,
 )
 from .delta_tpd import RampShape
@@ -36,16 +39,16 @@ from .spec_source import (
     fclk_ceiling_MHz,
     is_soundwire,
     preset,
-    pure_output_delay,
-    schmitt_delta_ns,
+    sw13_anchor_correction,
 )
 
 __all__ = [
     "RampShape", "CalcInputs", "CalcResults", "CalcRow", "InequalityBreakdown",
-    "Term", "ParamRange", "Inequality", "INEQUALITIES", "Pick",
+    "Term", "ParamRange", "Inequality", "INEQUALITIES", "Pick", "RowPick", "RowPoint",
     "PPPlacement", "PP_PLACEMENT_LABELS", "pp_net_pd",
-    "compute", "apply_row_picks", "find_worst_corner_rows", "default_swi3s_rows",
+    "compute", "apply_row_picks", "find_worst_corner_rows", "find_worst_corner_rows_all",
+    "default_swi3s_rows",
     "SpecSource", "SystemSize", "SPEC_SOURCES", "SPEC_LABELS",
-    "preset", "pure_output_delay", "schmitt_delta_ns", "fclk_ceiling_MHz",
+    "preset", "sw13_anchor_correction", "fclk_ceiling_MHz",
     "is_soundwire",
 ]

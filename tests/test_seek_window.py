@@ -51,6 +51,9 @@ def test_session_symbols_around():
     around = sess.symbols_around(mid)
     full = sess.symbols()
     assert 0 < len(around) <= len(full)
+    # The window is around the command: it reaches the command's row.
+    rows = [sym["row"] for sym in around if "row" in sym]
+    assert rows and min(rows) <= sess.commands[2]["bus_row"] <= max(rows)
 
 
 def test_symbol_rows_match_command_rows():

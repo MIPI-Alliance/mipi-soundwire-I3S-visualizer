@@ -5,7 +5,7 @@ These compare it with outputs SciPy produced for a fixed synthetic signal over c
 from 1 Hz to just under Nyquist, stored in tests/fixtures/highpass_reference.json.
 Regenerate them (SciPy required, and only with a reviewed diff):
 
-    python3 tests/test_filters.py --regen
+    python3 tests/test_filters.py --regenerate
 """
 import json
 import os
@@ -185,7 +185,7 @@ def test_the_native_cascade_refuses_malformed_input():
 
 
 if __name__ == "__main__":
-    if "--regen" in sys.argv:
+    if "--regenerate" in sys.argv:
         _regen()
     else:
         print(__doc__)

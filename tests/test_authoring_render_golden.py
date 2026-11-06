@@ -6,7 +6,7 @@ test_visualizer_engine (swviz model == golden); this snapshot covers render_payl
 issues + clashes (the decoration/validation layer).
 
 Regenerate (only with a reviewed diff; see docs/DEVELOPMENT.md):
-    PYTHONPATH=. python3 tests/test_authoring_render_golden.py --regen
+    PYTHONPATH=. python3 tests/test_authoring_render_golden.py --regenerate
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_authoring_render_golden.py
 """
@@ -54,7 +54,7 @@ def _regen() -> None:
 
 
 def test_authoring_render_matches_golden():
-    assert os.path.isfile(_GOLDEN), f"missing golden {_GOLDEN} (run --regen)"
+    assert os.path.isfile(_GOLDEN), f"missing golden {_GOLDEN} (run --regenerate)"
     golden = json.loads(pathlib.Path(_GOLDEN).read_text())
     configs = _all_configs()
     assert configs, f"no example configs under {_EXAMPLES}"
@@ -75,6 +75,6 @@ def test_authoring_render_matches_golden():
 if __name__ == "__main__":
     # The regeneration entry point only (run the check itself through pytest). Show the
     # golden diff for review before committing a regenerated file (docs/DEVELOPMENT.md).
-    if "--regen" not in sys.argv:
-        raise SystemExit("usage: python tests/test_authoring_render_golden.py --regen")
+    if "--regenerate" not in sys.argv:
+        raise SystemExit("usage: python tests/test_authoring_render_golden.py --regenerate")
     _regen()

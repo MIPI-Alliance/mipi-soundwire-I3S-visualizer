@@ -7,10 +7,9 @@ SoundWire I3S frames, interfaces, and data ports.
 from .bit_slot import BitSlotData, BitSlotState
 from .bus_model import BitInfo, BusModel, BusModelJSONEncoder, ClashType
 from .dataport import DataPort, DataPortConfig
-from .device import Device, create_device_map, get_devices_in_priority_order
+from .device import Device
 from .enums import DirectionType, DisplayField, FlowMode, SlotType, TransportPhase
 from .flow_control_port import FlowControlPort, FlowControlPortConfig, FlowControlPortState
-from .frame import ColInfo, FrameModel, RowInfo, SimpleJSONEncoder, SlotInfo
 from .interface import Interface
 
 __all__ = [
@@ -20,13 +19,7 @@ __all__ = [
     'ClashType',
     'FlowMode',
     'TransportPhase',
-    # Frame model (legacy)
-    'FrameModel',
-    'RowInfo',
-    'ColInfo',
-    'SlotInfo',
-    'SimpleJSONEncoder',
-    # Bus model (new)
+    # Bus model
     'BusModel',
     'BitInfo',
     'BusModelJSONEncoder',
@@ -45,6 +38,4 @@ __all__ = [
     'BitSlotState',
     # Device
     'Device',
-    'create_device_map',
-    'get_devices_in_priority_order',
 ]

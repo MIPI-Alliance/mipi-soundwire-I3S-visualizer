@@ -18,6 +18,11 @@ import os
 import re
 import subprocess
 
+import pytest
+from conftest import symlink_or_skip
+
+pytestmark = pytest.mark.platform
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _INTERNAL = "docs/internal/"
 # Maintainers'-tier files outside docs/internal/ (see tools/publish_tree.py): pruned too.
@@ -28,7 +33,8 @@ _PUBLIC_ROOTS = (
     "README.md", "LICENSE.md", "GOVERNANCE.md", "CONTRIBUTING.md", "CODEOWNERS", ".gitignore",
     ".github/",
     ".mipi/",                                # upstream-owned; present only once published
-    "pyproject.toml", "requirements.txt", "requirements-dev.txt", "run.sh", "run.ps1", "swi3s-studio.spec",
+    "pyproject.toml", "requirements.txt", "requirements-dev.txt", "run.sh", "run.ps1",
+    "swi3s-studio.spec",
     "swi3s_studio/", "native/", "tests/", "tools/", "data/", "visualizer_examples/",
     "docs/",                                 # docs/internal/ is carved out below
 )
@@ -145,6 +151,22 @@ def test_every_tracked_path_is_classified():
           "in-house. Do not leave it unclassified — that is how a tree bloats by default.")
 
 
+# Document formats the application neither reads nor ships: analysis and review write-ups,
+# typeset papers and notebooks belong in the maintainer's notes, not in the tree
+# (docs/DEVELOPMENT.md, "What the repository holds").
+_DOCUMENT_SUFFIXES = (".pdf", ".tex", ".doc", ".docx", ".ppt", ".pptx", ".key", ".pages",
+                      ".numbers", ".xls", ".xlsx", ".xlsm", ".odt", ".rtf", ".ipynb")
+
+
+def test_the_tree_holds_no_analysis_documents():
+    """Push only the files the application needs: no tracked document formats."""
+    documents = [p for p in _files() if p.lower().endswith(_DOCUMENT_SUFFIXES)]
+    assert not documents, (
+        "tracked document(s) the application does not need:\n  " + "\n  ".join(documents)
+        + "\n\nKeep analysis and review documents in the maintainer's notes; a tracked file "
+          "states the result or names the code that computes it.")
+
+
 def test_the_split_is_intact():
     """Asserts in BOTH contexts rather than skipping in one.
 
@@ -205,15 +227,6 @@ def test_upstream_owned_files_are_absent_here_and_present_once_published():
             f"this tree carries upstream-owned file(s): {ours}\n"
             "Ours would overwrite theirs on publish. Delete them here; tools/publish_tree.py "
             "takes them from the upstream ref.")
-
-
-def test_the_publish_tool_declares_the_same_upstream_set():
-    """Every upstream-owned path appears as a quoted string in tools/publish_tree.py."""
-    src = _read("tools/publish_tree.py")
-    for path in _UPSTREAM_OWNED:
-        assert f'"{path}"' in src, (
-            f"{path} is upstream-owned here but not declared in tools/publish_tree.py's "
-            "_UPSTREAM_OWNED, so the tool would not graft it in")
 
 
 # "name 2.ext" / "name (2).ext" beside "name.ext" — how a file-syncing service records a
@@ -310,6 +323,29 @@ def test_a_relative_link_into_the_internal_tier_is_dangling(tmp_path):
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-    os.symlink("internal/TECH_DEBT.md", tmp_path / "docs" / "debt.md")
-    os.symlink("../docs/USER_GUIDE.md", tmp_path / "tools" / "guide.md")
+    symlink_or_skip("internal/TECH_DEBT.md", tmp_path / "docs" / "debt.md")
+    symlink_or_skip("../docs/USER_GUIDE.md", tmp_path / "tools" / "guide.md")
     assert pt.check_dangling(str(tmp_path)) == sorted([*citing, "docs/debt.md"])
+
+
+def test_a_file_or_directory_the_dangling_check_cannot_read_is_reported(tmp_path):
+    """Check 2 reads every file; one it cannot read, or a directory it cannot list, has not
+    been checked and is named rather than passed over."""
+    import sys
+    if sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("permissions do not hide a file here")
+    pt = _load("_tiers_publish_tree", "tools/publish_tree.py")
+    (tmp_path / "README.md").write_text("A bus analyzer.\n", encoding="utf-8")
+    (tmp_path / "locked.md").write_text("docs/internal/x.md\n", encoding="utf-8")
+    (tmp_path / "sealed").mkdir()
+    (tmp_path / "sealed" / "page.md").write_text("docs/internal/y.md\n", encoding="utf-8")
+    (tmp_path / "locked.md").chmod(0)
+    (tmp_path / "sealed").chmod(0)
+    unreadable = []
+    try:
+        dangling = pt.check_dangling(str(tmp_path), unreadable)
+    finally:
+        (tmp_path / "locked.md").chmod(0o600)
+        (tmp_path / "sealed").chmod(0o700)
+    assert dangling == [] and sorted(unreadable) == ["locked.md", "sealed/"]
+

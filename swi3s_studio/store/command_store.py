@@ -1,9 +1,10 @@
-"""Out-of-core results store for decoded commands (Apache Arrow / Parquet).
+"""Command table for decoded commands (Apache Arrow / Parquet), a display and export cache.
 
 Keeps the command stream — sparse relative to the capture — in an Arrow table,
-memory-mappable and filterable, savable to Parquet. Audio has its own memmap +
-pyramid store (`audio_store`); the register-event log is derived from the
-WriteA32/Commit commands here.
+filterable and savable to Parquet; `load_commands` reads a saved table fully into memory.
+Audio has its own memmap + pyramid store (`audio_store`). `register_writes` yields the
+CRC-valid WriteA32 rows only (Commit rows are in the table, flagged is_commit, and are not
+yielded).
 """
 from __future__ import annotations
 

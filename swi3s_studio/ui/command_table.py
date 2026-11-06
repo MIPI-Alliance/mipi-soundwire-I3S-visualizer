@@ -5,6 +5,7 @@ WriteA32 reads e.g. "SLC.NumColumns" with a "NumColumns=3" tooltip.
 """
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import List, Optional
 
@@ -14,8 +15,9 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QAbstractItemView, QMenu, QTableView, QWidget
 
 from ..analysis import command_error, is_error
-from ..analysis.responses import response_summary
+from ..analysis.responses import command_payload, response_summary
 from ..model import RegisterMap
+from .quiet_focus import QuietFocusMixin
 from .row_origin import RowOriginMixin
 from .theme import VizTheme, analyzer_stylesheet
 
@@ -92,19 +94,6 @@ def _device_list(mask: int) -> str:
     return _collapse_ranges(devs) if devs else "—"
 
 
-def _response(cmd: dict) -> str:
-    return response_summary(cmd)
-
-
-def _payload(cmd: dict) -> bytes:
-    """The byte payload to show in the Data column: a Read's returned bytes
-    (`read_data`) for read commands, else the manager-packet `data` (writes). A
-    Read carries no manager-packet data, so it would otherwise show blank."""
-    if cmd.get("has_read_data") and cmd.get("read_data"):
-        return cmd.get("read_data") or b""
-    return cmd.get("data") or b""
-
-
 # ---- boolean free-text filter (and / or / parentheses over substring terms) ----
 # Tokeniser: split on parens and the AND/OR keywords (word-bounded, case-insensitive),
 # keeping them; the text between is a literal substring term (spaces preserved).
@@ -129,6 +118,15 @@ def _tokenize(text: str) -> list:
     return toks
 
 
+def _join(op: str, a, b):
+    """`a op b`, where a missing operand (None) leaves the other side unchanged."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (op, a, b)
+
+
 def parse_filter(text: str):
     """Parse a free-text query into a predicate AST. Grammar (AND binds tighter
     than OR; parentheses override; adjacent terms imply AND):
@@ -137,9 +135,20 @@ def parse_filter(text: str):
         and_expr := factor (('and')? factor)*
         factor   := '(' or_expr ')' | TERM
 
-    Returns an AST node (tuple) or None for empty input. Malformed input (e.g.
-    stray parens) is parsed best-effort and never raises."""
-    toks = _tokenize(text or "")
+    Returns an AST node (tuple) or None for empty input. Malformed input is parsed
+    best-effort and never raises: an operator with a missing operand ('write or') leaves
+    the other side as it is, an unmatched ')' is ignored, and an unclosed '(' closes at
+    the end."""
+    toks = []
+    depth = 0
+    for t in _tokenize(text or ""):
+        if t == ")":
+            if depth == 0:
+                continue                                  # unmatched ')'
+            depth -= 1
+        elif t == "(":
+            depth += 1
+        toks.append(t)
     if not toks:
         return None
     pos = 0
@@ -152,7 +161,7 @@ def parse_filter(text: str):
         node = parse_and()
         while peek() == "OR":
             pos += 1
-            node = ("or", node, parse_and())
+            node = _join("or", node, parse_and())
         return node
 
     def parse_and():
@@ -162,9 +171,9 @@ def parse_filter(text: str):
             t = peek()
             if t == "AND":
                 pos += 1
-                node = ("and", node, parse_factor())
-            elif t == "(" or (isinstance(t, tuple)):     # adjacency = implicit AND
-                node = ("and", node, parse_factor())
+                node = _join("and", node, parse_factor())
+            elif t == "(" or isinstance(t, tuple):       # adjacency = implicit AND
+                node = _join("and", node, parse_factor())
             else:
                 return node
 
@@ -180,8 +189,7 @@ def parse_filter(text: str):
         if isinstance(t, tuple):                          # TERM
             pos += 1
             return t
-        pos += 1                                          # stray ')' / operator — skip
-        return ("TERM", "")                               # matches anything
+        return None                                       # operator / ')' / end: no operand
 
     return parse_or()
 
@@ -243,17 +251,24 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
         the first keystroke after one fills it: QSortFilterProxyModel sweeps EVERY source row
         on the first invalidateFilter, so the whole table is rendered on the GUI thread once.
 
-        Built via _display_text rather than self.data(self.index(row, c)), which avoids a
-        QModelIndex construction and a role dispatch per cell. The filter's own debounce (see
-        main_window's expression dialog) keeps the sweep to one per typing pause rather than
-        one per character.
+        Built via haystack() (_display_text per column) rather than
+        self.data(self.index(row, c)), which avoids a QModelIndex construction and a role
+        dispatch per cell. The filter's own debounce (see main_window's expression dialog)
+        keeps the sweep to one per typing pause rather than one per character.
         """
         s = self._search_cache.get(row)
         if s is None:
-            cmd = self._cmds[row]
-            s = " ".join(str(self._display_text(cmd, n) or "") for n in _COLUMNS).lower()
+            s = self.haystack(self._cmds[row])
             self._search_cache[row] = s
         return s
+
+    def haystack(self, cmd: dict, time_text: Optional[str] = None) -> str:
+        """The lowercased, space-joined display text of one command. `time_text`
+        replaces the Time cell's text, for a view that shows a different time."""
+        return " ".join(
+            str((time_text if time_text is not None and n == "Time (µs)"
+                 else self._display_text(cmd, n)) or "")
+            for n in _COLUMNS).lower()
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._cmds)
@@ -353,9 +368,10 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
             err = _row_error_tooltip(cmd)
             if err:
                 return f"⚠ {err}"
-            if name in ("Address", "Register", "Data") and cmd.get("has_address") and _payload(cmd):
+            payload = command_payload(cmd)
+            if name in ("Address", "Register", "Data") and cmd.get("has_address") and payload:
                 lines = []
-                for i, b in enumerate(_payload(cmd)):
+                for i, b in enumerate(payload):
                     s = self._rmap.field_summary(cmd["address"] + i, b)
                     if not s:
                         preg = self._peripheral_reg(cmd, cmd["address"] + i)
@@ -364,7 +380,7 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
                     lines.append(s or f"0x{cmd['address']+i:08X} = 0x{b:02X}")
                 return "\n".join(lines)
             if name == "Response":                         # full text — the cell is capped/elided
-                return _response(cmd) or None
+                return response_summary(cmd) or None
             return None
         if role != Qt.DisplayRole:
             return None
@@ -373,13 +389,14 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
     def _display_text(self, cmd: dict, name: str):
         """The DisplayRole text for one column of one command.
 
-        ONE DEFINITION, called by data() above and by search_text() below, so the free-text
-        filter matches what the user can SEE.
+        ONE DEFINITION, called by data() and by haystack(), which search_text() here and
+        AllLinksCommandModel.search_text() build a row's text with, so the free-text filter
+        matches what the user can SEE.
 
-        TAKES (cmd, name) RATHER THAN A QModelIndex, so search_text can build a row's text
+        TAKES (cmd, name) RATHER THAN A QModelIndex, so haystack() can build a row's text
         without constructing a QModelIndex per cell and re-entering data()'s role dispatch.
         """
-        data = _payload(cmd)
+        data = command_payload(cmd)
         if name == "Row":                                  # SWI3S bus row (0-based, Column-0 index)
             return f"{self._display_row(cmd):,}"
         if name == "Time (µs)":
@@ -410,11 +427,11 @@ class CommandTableModel(RowOriginMixin, QAbstractTableModel):
                 return ""
             return "OK" if cmd.get("crc_valid") else "BAD"
         if name == "Response":
-            return _response(cmd)
+            return response_summary(cmd)
         return None
 
 
-class CommandTableView(QTableView):
+class CommandTableView(QuietFocusMixin, QTableView):
     def __init__(self) -> None:
         super().__init__()
         self.setStyleSheet(analyzer_stylesheet())
@@ -592,24 +609,67 @@ class CommandFilterProxy(QSortFilterProxyModel):
     def __init__(self) -> None:
         super().__init__()
         self._text_ast = None          # parsed boolean query (None = match all)
+        self._text_src = ""            # the text filter as typed
         self._kinds: set = set()       # empty = all command kinds
         self._kinds_none = False       # Commands ▸ None: no kind at all (not "empty = all")
         self._errors_only = False
         self._devices: set = set()     # empty = all; else device numbers to match
         self._groups: set = set()      # empty = all; else commit-group numbers
+        self._batch_depth = 0
+        self._batch_dirty = False
+        self._batch_before = None
+        # True while the rows are re-tested. A filter that hides the current row makes
+        # the view pick another current row; that is not a selection, and the shared
+        # cursor ignores it (main_window._on_command_selected).
+        self.refiltering = False
         self.setSortRole(SORT_ROLE)
+
+    def _criteria(self) -> tuple:
+        """Every filter criterion, comparable: two equal tuples accept the same rows."""
+        return (self.filter_text(), frozenset(self._kinds), self._kinds_none,
+                self._errors_only, frozenset(self._devices), frozenset(self._groups))
+
+    @contextlib.contextmanager
+    def batch(self):
+        """Group filter changes: each criterion takes effect at once, and the rows are
+        re-tested once, when the outermost batch ends and only if the criteria then differ
+        from those it started with. A re-test visits every source row, so a batch of N
+        changes costs one visit, not N."""
+        if self._batch_depth == 0:
+            self._batch_before = self._criteria()
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                dirty = self._batch_dirty and self._criteria() != self._batch_before
+                self._batch_dirty = False
+                self._batch_before = None
+                if dirty:
+                    self._refilter(lambda: None)
 
     def _refilter(self, apply) -> None:
         """Run `apply()` (which changes a criterion) as one filter change. Qt 6.10
         deprecates invalidateFilter() for begin/endFilterChange() bracketing the change;
-        the project supports PySide6 from 6.6, which has only the former."""
-        if _HAS_FILTER_CHANGE:
-            self.beginFilterChange()
+        the project supports PySide6 from 6.6, which has only the former. Inside `batch()`
+        the criterion changes and the re-test waits."""
+        if self._batch_depth:
             apply()
-            self.endFilterChange()
-        else:
-            apply()
-            self.invalidateFilter()
+            self._batch_dirty = True
+            return
+        prev = self.refiltering
+        self.refiltering = True
+        try:
+            if _HAS_FILTER_CHANGE:
+                self.beginFilterChange()
+                apply()
+                self.endFilterChange()
+            else:
+                apply()
+                self.invalidateFilter()
+        finally:
+            self.refiltering = prev
 
     def set_text(self, text: str) -> None:
         ast = parse_filter(text)
@@ -618,7 +678,7 @@ class CommandFilterProxy(QSortFilterProxyModel):
 
     def filter_text(self) -> str:
         """The text filter as typed (the parsed form is what filters)."""
-        return getattr(self, "_text_src", "")
+        return self._text_src
 
     def set_kinds(self, kinds, none: bool = False) -> None:
         """Show only these command kinds (empty set = all), or with `none`, no command."""
@@ -777,7 +837,10 @@ class AllLinksCommandModel(QAbstractTableModel):
         s = self._search_cache.get(row)
         if s is None:
             li, r = int(self._link[row]), int(self._row[row])
-            s = f"{self._names[li].lower()} {self._models[li].search_text(r)}"
+            cmd = self._models[li].command_at(r)
+            # The Time cell reads in global time here, so the filter matches that text.
+            s = (f"{self._names[li].lower()} "
+                 f"{self._models[li].haystack(cmd, f'{self._global_us(li, cmd):,.2f}')}")
             self._search_cache[row] = s
         return s
 

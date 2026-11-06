@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # conftest keeps every QSettings of the run in a throwaway ini, so save_preference() (here
 # and inside MainWindow.apply_theme) cannot touch the user's real appearance preference.
+import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
@@ -23,6 +24,8 @@ from swi3s_studio.ui.theme import (
     save_preference,
     saved_preference,
 )
+
+pytestmark = pytest.mark.gui
 
 
 def test_apply_palette():
@@ -45,7 +48,6 @@ def test_apply_palette():
     # Unknown mode falls back to dark (never leaves the palette half-applied).
     apply_palette("nonsense")
     assert VizTheme.MODE == "dark"
-    print("ok: apply_palette dark/light + derived keys + fallback")
 
 
 def test_resolve_mode():
@@ -54,7 +56,6 @@ def test_resolve_mode():
     # 'system' resolves to a concrete mode (depends on the offscreen platform's
     # reported scheme; must be one of the two, never 'system').
     assert resolve_mode("system") in ("dark", "light")
-    print("ok: resolve_mode maps system -> concrete dark/light")
 
 
 def test_preference_roundtrip():
@@ -68,7 +69,6 @@ def test_preference_roundtrip():
     # An invalid stored value falls back to the default ('system').
     QSettings().setValue(PREF_KEY, "bogus")
     assert saved_preference() == "system"
-    print("ok: preference save/load round-trip (+ invalid -> system)")
 
 
 def test_live_switch_rethemes_window():
@@ -103,7 +103,6 @@ def test_live_switch_rethemes_window():
 
     # The persisted preference reflects the last switch.
     assert win._appearance_pref == "dark" and saved_preference() == "dark"
-    print("ok: live MainWindow switch re-themes grid + keeps capture/cursor")
 
 
 def test_the_timing_page_follows_a_live_switch():

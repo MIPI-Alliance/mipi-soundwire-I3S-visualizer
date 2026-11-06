@@ -88,13 +88,15 @@ checks this on every pull request; to sign, comment on your PR exactly:
   on Windows) installs what testing needs, `requirements-dev.txt`, and builds the decode
   core. Before opening a PR, run
   `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows). It rebuilds the
-  native decode core and checks its ABI, then runs the test suite, `ruff`, the `mypy`
-  check, the leak scan and the screenshots check (every mode in light and dark, checked for
-  wrong-theme panes, widgets a theme switch missed, faint text and clipped labels); it skips
-  only the perf gate and the one-process-per-file pass.
+  native decode core and checks its ABI, then runs the test suite (each file in its own
+  process, several at once), `ruff`, the `mypy` check, the leak scan and the screenshots
+  check (every mode in light and dark, checked for wrong-theme panes, widgets a theme switch
+  missed, faint text and clipped labels); it skips only the perf gate. While you work,
+  `python3 tools/changed_tests.py --run` runs the test files your change touches.
   On a pull request, CI runs the test suite on Linux, macOS and Windows, and the perf,
-  coverage and lint jobs on Linux. If you run `pytest` directly after changing anything
-  under `native/`, rebuild the decode core first. See
+  coverage and lint (which includes the structural leak scan) jobs on Linux and the
+  installed-package job on Linux and Windows. If you run `pytest` directly after changing
+  anything under `native/`, rebuild the decode core first. See
   [docs/TESTING.md](docs/TESTING.md) for how the suites are organised.
 - **Docs change with the code.** If a change makes a sentence in the README, the User
   Guide or another doc wrong, correct it in the same PR.

@@ -83,3 +83,22 @@ def test_get_bits_in_row_cannot_return_a_removed_bit():
     row1 = m.get_bits_in_row(1)          # index 5 is row 1 of a 4-column frame
     assert not [b for b in row1 if b.device == 3 and b.slot == SlotType.GUARD_0], \
         "a deferred removal leaked into a row read"
+
+
+def test_clash_indices_are_listed_once_even_after_the_lists_are_replaced():
+    from swi3s_studio.swviz.models.bus_model import ClashType
+
+    def bit(index, clash):
+        return BitInfo(bit_index=index, dp=0, device=0, slot=SlotType.DATA,
+                       direction=DirectionType.SOURCE, clash=clash)
+
+    m = BusModel(num_rows=2, num_columns=4)
+    for index, clash in ((3, ClashType.DIFFERENT_DEVICE), (3, ClashType.DIFFERENT_DEVICE),
+                         (4, ClashType.SAME_DEVICE), (4, ClashType.SAME_DEVICE)):
+        m.add_bit(bit(index, clash))
+    assert m.bus_clashes == [3] and m.device_clashes == [4]
+    m.bus_clashes, m.device_clashes = [5], [6]          # a loader assigns the lists wholesale
+    m.add_bit(bit(5, ClashType.DIFFERENT_DEVICE))
+    m.add_bit(bit(3, ClashType.DIFFERENT_DEVICE))
+    m.add_bit(bit(6, ClashType.SAME_DEVICE))
+    assert m.bus_clashes == [5, 3] and m.device_clashes == [6]

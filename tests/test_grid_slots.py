@@ -46,6 +46,10 @@ def test_slot_to_grid_covers_placement_slot_types():
     # CDS routes through is_cds (viz_engine._CDS_SLOT_VALUE), not _SLOT_TO_GRID.
     assert SlotType.CDS.value == viz_engine._CDS_SLOT_VALUE
     assert SlotType.CDS.value not in m
-    # The shared 1–6 kinds map identity (GridSlot ints coincide with the C++ enum).
-    assert m[SlotType.DATA.value] == int(GridSlot.DATA)
-    assert m[SlotType.DRQ.value] == int(GridSlot.DRQ)
+    # Every mapped kind lands on the GridSlot of its own name: the shared 1–6 kinds are the C++
+    # ordinals, S0, S1 and HANDOVER (7–9) are the Visualizer-only cells.
+    for st in (SlotType.DATA, SlotType.TX_PRESENT, SlotType.GUARD_0, SlotType.GUARD_1,
+               SlotType.TAIL, SlotType.DRQ, SlotType.S0, SlotType.S1, SlotType.HANDOVER):
+        member = GridSlot.__members__.get(st.name)
+        assert member is not None, f"GridSlot has no member named {st.name}"
+        assert m[st.value] == int(member), st

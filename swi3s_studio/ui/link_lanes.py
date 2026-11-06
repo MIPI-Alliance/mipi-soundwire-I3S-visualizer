@@ -1,19 +1,22 @@
 """One pane per Link, stacked on one global time axis: the All Links form of the bottom panes.
 
 Each lane is an ordinary single-Link view (RawCaptureView, AudioView) that never learns about
-Links: the window binds lane k under `_as_link(k)` as it binds the one view today. What this
+Links: the window binds lane k under `_as_link(k)` exactly as it binds the single view. What this
 adds is the stack, a name over each lane, and the X sync: a lane's X is seconds of ITS
 capture, so a range shown on lane k is moved into global time with k's offset and back out
 with each other lane's. The lanes' axes are offset the same way, so they all read global
 time.
 
 A view takes part through `set_time_offset(seconds)` and, if it has an X axis, through
-`viewRangeChanged(t0, t1)`, `x_range_seconds()` and `set_x_range_seconds(t0, t1)`, all in
-seconds. The CDS and Samples tables have no X: they stack, each windowed on the cursor's
-instant in its Link, with their Time columns offset into global time.
+`viewRangeChanged(t0, t1)`, `x_range_seconds()`, `set_x_range_seconds(t0, t1)` and
+`set_x_bounds((t0, t1) or None)`, all in seconds. `set_x_bounds` gives each lane the span
+every Link covers, in its own capture's seconds, so lanes of different lengths can show one
+window; None (one lane) bounds the view by its own capture. The CDS and Samples tables have
+no X: they stack, each windowed on the cursor's instant in its Link, with their Time columns
+offset into global time.
 
-Lane 0 is the pane's own view, the one a single Link shows, so a window with one Link (or
-with the group on one Link) has exactly the pane it had.
+Lane 0 is the pane's own view, the one a single Link shows. With one Link (or the group on
+one Link) the pane shows lane 0 alone: unlabelled, unoffset, with no other lanes.
 """
 from __future__ import annotations
 

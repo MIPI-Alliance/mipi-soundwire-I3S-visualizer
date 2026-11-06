@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import os
 import pathlib
@@ -26,9 +27,16 @@ import pytest
 from swi3s_studio import cli
 from swi3s_studio.model import viz_engine
 
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXAMPLES = sorted(glob.glob(os.path.join(_ROOT, "visualizer_examples", "**", "*.csv"),
                              recursive=True))
+
+
+# Every subprocess below is bounded: a parsing regression that starts the UI instead of
+# exiting would otherwise hang the run rather than fail it (TimeoutExpired fails the test).
+_TIMEOUT_S = 180
 
 
 def _example(*parts):
@@ -47,7 +55,7 @@ def _run(*args):
     """Invoke the app as a SUBPROCESS: the exit code is what a caller sees, and the import
     check below needs a clean interpreter."""
     return subprocess.run([sys.executable, "-m", "swi3s_studio.app", *args],
-                          cwd=_ROOT, capture_output=True, text=True)
+                          cwd=_ROOT, capture_output=True, text=True, timeout=_TIMEOUT_S)
 
 
 def test_the_fixture_configs_have_the_properties_these_tests_assume():
@@ -80,7 +88,8 @@ def test_the_headless_path_imports_neither_qt_nor_the_ui(tmp_path):
         "ui = [m for m in sys.modules if m.startswith('swi3s_studio.ui')];"
         "print('PROBE', rc, len(qt), len(ui), ','.join(sorted(qt + ui)))"
     )
-    r = subprocess.run([sys.executable, "-c", probe], cwd=_ROOT, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-c", probe], cwd=_ROOT, capture_output=True,
+                       text=True, timeout=_TIMEOUT_S)
     assert r.returncode == 0, r.stderr
     line = next((ln for ln in r.stdout.splitlines() if ln.startswith("PROBE ")), None)
     assert line, f"probe produced no marker line; stdout={r.stdout!r} stderr={r.stderr!r}"
@@ -144,6 +153,23 @@ def test_a_bus_clash_exits_two_and_still_writes_the_model(tmp_path):
 
 def test_a_clean_config_exits_zero():
     assert _run("-c", _CLEAN, "-o", os.devnull).returncode == 0
+
+
+def test_a_truncated_drq_without_a_bus_clash_exits_two(tmp_path):
+    """A wide DRQ whose last UI falls past the row end is a configuration error the exit code
+    reports as a clash is, though the bus has no clash."""
+    from swi3s_studio.model.bus_config import BusConfig
+    cfg = BusConfig(num_columns=15)
+    port = cfg.dataports[3]
+    port.enabled, port.device_number, port.enable_ch, port.port_direction = True, 0, 1, True
+    port.flow_mode, port.fcp_horizontal_start, port.fcp_bit_width = 2, 15, 2
+    csv_path = tmp_path / "drq.csv"
+    csv_path.write_text(cfg.to_csv(), encoding="utf-8")
+    model, _i, _v = viz_engine.build_bus_model(str(csv_path))
+    assert not model.bus_clashes and model.warnings.drq_truncation_warnings == [("DP3", 17, 16)]
+    out = io.StringIO()
+    assert cli.run_headless(str(csv_path), str(tmp_path / "m.json"), out=out) == 2
+    assert (tmp_path / "m.json").is_file()
 
 
 _SPLIT_GUARD = _example("directed_tests", "intentional_errors", "CDS_split_guard_1.csv")
@@ -210,6 +236,15 @@ def test_demo_flags_still_parse():
     assert cli.parse(["x"])[0].demo is False
 
 
+def test_help_names_what_each_flag_opens():
+    """--demo-bringup opens the same capture as --demo, and the help says so; the config
+    flag names the file kind and leaves format versions to the CSV reader."""
+    help_text = " ".join(cli.build_parser().format_help().split())
+    assert "PHY2 demo capture" in help_text
+    assert "--demo-bringup Same as --demo" in help_text
+    assert "Visualizer config CSV" in help_text and "v2.0" not in help_text
+
+
 def test_help_describes_the_bus_model_not_a_frame_model():
     """The help text says "bus model", which is what -o writes, not "frame model"."""
     help_text = cli.build_parser().format_help()
@@ -219,11 +254,12 @@ def test_help_describes_the_bus_model_not_a_frame_model():
 
 # ---------------------------------------------------------------- the launchers forward argv
 # Both launchers forward their arguments to the app: run.sh through "$@", run.ps1 through
-# ValueFromRemainingArguments.
+# $args.
 #
 # Read as TEXT rather than executed: run.sh builds a venv and can install ~200 MB of wheels, and
-# run.ps1 does not run here at all. Both are thin wrappers, so the property is textual — the
-# argument reaches the app, and the launcher's own flag does not.
+# run.ps1 runs only on Windows (tests/test_run_scripts.py executes it there). The text guards
+# cover both on every platform: the argument reaches the app, and the launcher's own flag
+# does not.
 
 _RUN_SH = os.path.join(_ROOT, "run.sh")
 _RUN_PS1 = os.path.join(_ROOT, "run.ps1")
@@ -242,15 +278,23 @@ def test_run_sh_keeps_its_own_flag_out_of_the_app():
     """--rebuild is the launcher's; argparse would not recognise it, and passing it through would
     make every rebuild print a usage error."""
     text = pathlib.Path(_RUN_SH).read_text(encoding="utf-8")
-    assert '"$a" = "--rebuild"' in text or "--rebuild" in text.split("app_args=()")[1], (
-        "run.sh must strip its own --rebuild before forwarding")
+    import re
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert re.search(r"^\s*--rebuild\)[^\n]*\bcontinue\b", code, re.M), (
+        "run.sh must strip its own --rebuild before forwarding: its case arm must `continue` "
+        "past the forwarding line")
 
 
 def test_run_ps1_forwards_its_arguments_to_the_app():
     text = pathlib.Path(_RUN_PS1).read_text(encoding="utf-8")
-    assert "ValueFromRemainingArguments" in text, (
-        "run.ps1 must collect the remaining arguments, or the Windows launcher silently drops "
-        "them — the same defect run.sh had")
+    assert "$AppArgs = @($args)" in text, (
+        "run.ps1 must collect the remaining arguments from $args, or the Windows launcher "
+        "silently drops them")
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "[Parameter" not in code and "[CmdletBinding" not in code, (
+        "run.ps1 must stay a simple script: an advanced script gets the common parameters, and "
+        "-o is then an ambiguous prefix of -OutVariable and -OutBuffer, so `-o m.json` never "
+        "reaches the CLI")
     launch = [ln for ln in text.splitlines() if "swi3s_studio.app" in ln]
     assert any("@AppArgs" in ln for ln in launch), (
         f"run.ps1 launches the app without splatting the arguments: {launch!r}")
@@ -264,16 +308,6 @@ def test_run_ps1_propagates_the_exit_code():
         "run.ps1 must propagate the app's exit code; -o's 0/1/2 is useless otherwise")
 
 
-def test_both_launchers_agree_about_which_flags_open_no_window():
-    """The 'Starting SWI3S Studio…' notice must not promise a window that -o will not open. Two
-    scripts, one rule — they drift the moment only one is edited."""
-    sh = pathlib.Path(_RUN_SH).read_text(encoding="utf-8")
-    ps = pathlib.Path(_RUN_PS1).read_text(encoding="utf-8")
-    for flag in ("-o", "--output", "-h", "--help"):
-        assert flag in sh.split("headless=0")[1].split("fi")[0], f"run.sh: {flag} not detected"
-        assert flag in ps.split("$headless =")[1].split("if (")[0], f"run.ps1: {flag} not detected"
-
-
 # ------------------------------------------------- the launchers, EXECUTED rather than read
 # The text guards above assert that source LOOKS right. A quoting slip, a loop that builds the
 # array but never uses it, or a `set -u` failure on an empty array all leave the text matching
@@ -283,9 +317,8 @@ def test_both_launchers_agree_about_which_flags_open_no_window():
 # fake `python` on PATH, and stamps newer than their sources so the dependency install and the
 # native build are both skipped. What executes is the real script, including the argument loop.
 #
-# run.ps1 CANNOT be executed here — there is no PowerShell on this platform — so it keeps the
-# text guards only. That is a NOT-RUN-HERE gap, not a pass: running the gate on Windows is
-# where it gets exercised, and `.\run.ps1 -c cfg.csv -o m.json` belongs in that run.
+# run.ps1 is executed only on Windows, by tests/test_run_scripts.py; here it keeps the text
+# guards above.
 
 def _make_stub(tmp_path, passthrough=False):
     """A fake venv + fake python, so run.sh reaches its exec without installing anything.
@@ -356,7 +389,7 @@ def stub_launcher_passthrough(tmp_path):
 
 def _launch(env, record, *args):
     r = subprocess.run(["bash", _RUN_SH, *args], cwd=_ROOT, env=env,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=_TIMEOUT_S)
     forwarded = (record.read_text(encoding="utf-8").split("\n") if record.exists() else [])
     return r, [a for a in forwarded if a]
 
@@ -487,15 +520,14 @@ def test_run_sh_really_produces_its_own_name_in_usage(stub_launcher_passthrough)
     """
     env, record = stub_launcher_passthrough
     r = subprocess.run(["bash", _RUN_SH, "-h"], cwd=_ROOT, env=env,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=_TIMEOUT_S)
     usage = next((ln for ln in r.stdout.splitlines() if ln.startswith("usage:")), "")
     assert usage.startswith("usage: ./run.sh "), f"got {usage!r}; stdout={r.stdout!r}"
 
 
 def test_both_launchers_announce_themselves():
-    """run.ps1 cannot be executed here (no PowerShell), so this is a text guard for the Windows
-    half and the behavioural check above covers the Unix half. A run on Windows is what proves
-    the PowerShell side — the same NOT-RUN-HERE split as the forwarding tests."""
+    """A text guard for the PowerShell launcher; the behavioural check above covers the Unix
+    one."""
     sh = pathlib.Path(_RUN_SH).read_text(encoding="utf-8")
     ps = pathlib.Path(_RUN_PS1).read_text(encoding="utf-8")
     assert "SWI3S_LAUNCHER=./run.sh" in sh, "run.sh must name itself for the usage line"
@@ -543,3 +575,98 @@ def test_the_directed_tests_readme_lists_exactly_the_configs_that_report_issues(
     assert held == set(inside), f"in intentional_errors/ with no issue: {sorted(held - set(inside))}"
     assert {n: s.rstrip(":") for n, s in listed.items()} == \
         {n: s.rstrip(":") for n, s in inside.items()}
+
+
+def test_package_invocation_names_something_runnable(monkeypatch):
+    """`python -m swi3s_studio` sets argv[0] to __main__.py's full path; the usage line names the
+    command that was typed, not the file."""
+    monkeypatch.delenv("SWI3S_LAUNCHER", raising=False)
+    monkeypatch.setattr(sys, "argv", ["/some/where/swi3s_studio/__main__.py", "-h"])
+    name = cli.program_name()
+    assert name.endswith(" -m swi3s_studio"), name
+    assert "__main__" not in name
+
+
+def test_a_usage_error_from_the_package_entry_names_the_command():
+    r = subprocess.run([sys.executable, "-m", "swi3s_studio", "-o"], cwd=_ROOT,
+                       capture_output=True, text=True, timeout=_TIMEOUT_S,
+                       env={**os.environ, "SWI3S_LAUNCHER": ""})
+    assert r.returncode == 1
+    assert "-m swi3s_studio [-h]" in r.stderr and "__main__.py" not in r.stderr, r.stderr
+
+
+def test_a_launcher_whose_name_merely_ends_in_app_py_keeps_its_own_name(monkeypatch):
+    monkeypatch.delenv("SWI3S_LAUNCHER", raising=False)
+    monkeypatch.setattr(sys, "argv", ["/some/where/runapp.py", "-h"])
+    assert cli.program_name() == "runapp.py"
+
+
+@pytest.mark.parametrize("asked, built", [(-5, 1), (0, 1)])
+def test_headless_builds_at_least_one_row_as_the_ui_export_does(tmp_path, asked, built):
+    src = os.path.join(_ROOT, "tests", "fixtures", "flow_control_demo.csv")
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read().replace("RowsToDraw,32", f"RowsToDraw,{asked}")
+    assert f"RowsToDraw,{asked}" in text
+    cfg = tmp_path / "rows.csv"
+    cfg.write_text(text, encoding="utf-8")
+    out = tmp_path / "m.json"
+    r = _run("-c", str(cfg), "-o", str(out))
+    assert f"asks for {asked} rows; building {built}" in r.stderr, r.stderr
+    from swi3s_studio.swviz.io.json_handler import JSONHandler
+    assert JSONHandler.load_bus_model(str(out)).num_rows == built
+
+
+def test_headless_builds_at_most_the_ui_ceiling_of_rows(tmp_path):
+    """A RowsToDraw above the ceiling is built to the ceiling, with a note naming both."""
+    src = os.path.join(_ROOT, "tests", "fixtures", "flow_control_demo.csv")
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read().replace("RowsToDraw,32", "RowsToDraw,5000")
+    assert "RowsToDraw,5000" in text
+    cfg = tmp_path / "rows.csv"
+    cfg.write_text(text, encoding="utf-8")
+    out = tmp_path / "m.json"
+    r = _run("-c", str(cfg), "-o", str(out))
+    assert f"asks for 5000 rows; building {viz_engine.MAX_AUTHORED_ROWS}" in r.stderr, r.stderr
+    from swi3s_studio.swviz.io.json_handler import JSONHandler
+    assert JSONHandler.load_bus_model(str(out)).num_rows == viz_engine.MAX_AUTHORED_ROWS
+
+
+@pytest.mark.parametrize("wanted", [-5, 0, 1, 1024, 5000])
+def test_the_headless_and_ui_row_clamps_agree(tmp_path, wanted):
+    """The UI's Rows To Draw clamp and the headless build give the same row count for the
+    same RowsToDraw."""
+    from swi3s_studio.ui import main_window
+    src = os.path.join(_ROOT, "tests", "fixtures", "flow_control_demo.csv")
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read().replace("RowsToDraw,32", f"RowsToDraw,{wanted}")
+    assert f"RowsToDraw,{wanted}" in text
+    cfg = tmp_path / "rows.csv"
+    cfg.write_text(text, encoding="utf-8")
+    out = tmp_path / "m.json"
+    assert cli.run_headless(str(cfg), str(out), out=io.StringIO()) in (0, 2)
+    from swi3s_studio.swviz.io.json_handler import JSONHandler
+    ui_rows, _issue = main_window._authored_rows(wanted)
+    assert JSONHandler.load_bus_model(str(out)).num_rows == ui_rows
+
+
+def test_a_csv_missing_required_fields_reports_them_once(tmp_path):
+    """The handler's missing-field message reaches stderr once, in the error line: not also
+    from the row-count probe's load or the build's load."""
+    cfg = tmp_path / "incomplete.csv"
+    cfg.write_text("RowsToDraw,5000\n", encoding="utf-8")
+    r = _run("-c", str(cfg), "-o", str(tmp_path / "m.json"))
+    assert r.returncode == 1, r.stderr
+    assert "error: could not build a model from" in r.stderr, r.stderr
+    assert r.stderr.count("CSV missing required field(s)") == 1, r.stderr
+
+
+def test_a_missing_decode_core_names_how_to_install_it():
+    """Importing the package without the compiled core fails with the install command, not a
+    bare ModuleNotFoundError."""
+    probe = ("import sys; sys.modules['swi3score'] = None\n"
+             "try:\n    import swi3s_studio\n"
+             "except ImportError as e:\n    print('MSG', str(e).replace(chr(10), ' | '))\n")
+    r = subprocess.run([sys.executable, "-c", probe], cwd=_ROOT, capture_output=True,
+                       text=True, timeout=_TIMEOUT_S)
+    msg = next((ln for ln in r.stdout.splitlines() if ln.startswith("MSG ")), "")
+    assert "pip install ./native" in msg and "build_local.sh" in msg, (r.stdout, r.stderr)

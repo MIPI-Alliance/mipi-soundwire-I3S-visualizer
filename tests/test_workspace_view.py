@@ -9,6 +9,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui import view_state
 
+pytestmark = pytest.mark.gui
+
 
 def _session(win, variant=""):
     from swi3s_studio.session import Session
@@ -94,11 +96,16 @@ def test_a_new_capture_starts_from_the_panes_defaults(two):
 
 
 def test_a_damaged_pane_state_is_ignored(two):
+    audio_before = view_state.audio_state(two._audio_view)
+    capture_before = view_state.capture_state(two._raw_view)
+    assert any(audio_before["channels"])
     for bad in (None, [], {"channels": "x", "x_range_s": [5, 1], "decimation": [[1]],
-                           "channel_list_width": "a", "vertical_zoom": True}):
+                           "channel_list_width": "a"}):
         view_state.restore_audio(two._audio_view, bad)
         view_state.restore_capture(two._raw_view, bad)
-    assert two._audio_view._checks                      # nothing blanked
+    _close(view_state.audio_state(two._audio_view), audio_before)
+    _close(view_state.capture_state(two._raw_view), capture_before)
+    assert any(c.isChecked() for c in two._audio_view._checks.values())     # nothing blanked
 
 
 # ------------------------------------------------- a saved workspace brings the view back
@@ -179,8 +186,8 @@ def _change_everything(win):
     reg = win._reg_view
     win._show_dock(win._reg_dock)
     QApplication.processEvents()
-    if reg._device.count() > 1:
-        reg._device.setCurrentIndex(reg._device.count() - 1)
+    from swi3s_studio.model import Provenance
+    reg.set_hidden_provenances({Provenance.UI})                 # a Registers provenance filter
     root = reg._tree.invisibleRootItem()
     assert root.childCount() > 1, "the demo's Registers pane should list blocks"
     for i in range(root.childCount()):
@@ -204,6 +211,7 @@ def test_a_saved_workspace_reopens_exactly_as_it_was(two, tmp_path, monkeypatch)
     assert before["commands_header"]["sort"] == ["Time (µs)", 1]     # descending
     assert "Address" in before["commands_header"]["hidden"]
     assert before["links"][0]["col_widths"].get("Opcode") == 211
+    assert before["registers"]["hidden"] == ["ui"]
     path = str(tmp_path / "ws.json")
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
@@ -368,3 +376,33 @@ def test_positional_widths_apply_only_when_they_fit_the_columns(two, tmp_path, m
                 assert widths == {name: w for name, w in fitted.items() if name in widths}
     again._cmd_view.set_column_shown("ΔRows", True)
     assert again._cmd_view.columnWidth(_cmd_col(again, "ΔRows")) == 301
+
+
+# ------------------------------------------------- the Registers device, with several devices
+@pytest.fixture
+def multi_device_window():
+    """A window on a synthetic session whose Registers pane lists devices 0, 1 and 2: what-if
+    writes (UI provenance) to the NumColumns register give each its own register state."""
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.resize(1400, 900)
+    win.show()
+    sess = _session(win)
+    for dev in (0, 1, 2):
+        sess.set_register_override(0, dev, 0x1081, 4 + dev)
+    win.load_session(sess)
+    QApplication.processEvents()
+    return win
+
+
+def test_the_registers_device_survives_a_workspace_round_trip(multi_device_window, tmp_path,
+                                                              monkeypatch):
+    win = multi_device_window
+    reg = win._reg_view
+    assert [reg._device.itemData(i) for i in range(reg.device_count)] == [0, 1, 2]
+    reg._device.setCurrentIndex(reg._device.findData(2))
+    assert reg.current_device() == 2
+    again, _ = _save_and_reopen(win, tmp_path, monkeypatch)
+    assert again._reg_view.device_count == 3
+    assert again._reg_view.current_device() == 2

@@ -5,8 +5,9 @@
 
 Lists each name-like word in the tree at DIR that the baseline tree (default: public/main, the
 last published tree) does not contain, with where it appears. Exit 0 when there is nothing new
-or the list is approved; 1 when names wait for approval; 2 when the baseline cannot be read or
-an option is not recognised. tools/publish_tree.py runs it on the assembled tree, as its check
+or the list is approved; 1 when names wait for approval; 2 when the baseline cannot be read, an
+option is not recognised, or a file or directory of the tree cannot be read (it was not
+reviewed). tools/publish_tree.py runs it on the assembled tree, as its check
 5b. `--approve=DIGEST` is accepted as a synonym of `--approve-names=DIGEST`.
 
 A LIST OF NEW NAMES, NOT ANOTHER PATTERN. The leak scan is a denylist: it catches the strings
@@ -154,13 +155,23 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Paths under the tree last read by _read_dir that could not be read; they were not reviewed.
+_UNREADABLE: List[str] = []
+
+
 def _read_dir(root: str) -> Tuple[Dict[str, List[Tuple[str, int, str]]], Dict[str, str]]:
     """(word -> [(path, line, text)], unread path -> sha256) for every file under `root`,
     .git excluded. A path's own words are at line 0. A symlink, including one to a directory
-    (which is not descended into), is read as its target path, the text git stores for it."""
+    (which is not descended into), is read as its target path, the text git stores for it.
+    A file or directory that cannot be read is added to _UNREADABLE (as `dir/` for a directory)."""
     seen: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)
     unread: Dict[str, str] = {}
-    for base, dirs, files in os.walk(root):
+    _UNREADABLE.clear()
+
+    def unlistable(err: OSError) -> None:
+        _UNREADABLE.append(os.path.relpath(str(err.filename), root).replace(os.sep, "/") + "/")
+
+    for base, dirs, files in os.walk(root, onerror=unlistable):
         links = [d for d in dirs if os.path.islink(os.path.join(base, d))]
         dirs[:] = sorted(d for d in dirs if d != ".git" and d not in links)
         for name in sorted(files + links):
@@ -175,6 +186,7 @@ def _read_dir(root: str) -> Tuple[Dict[str, List[Tuple[str, int, str]]], Dict[st
                     with open(path, "rb") as f:
                         data = f.read()
             except OSError:
+                _UNREADABLE.append(rel)
                 continue
             text = _text_of(data)
             if text is None:
@@ -305,12 +317,24 @@ def main(argv: List[str] | None = None) -> int:
     approve = opts.get("approve-names", opts.get("approve"))
     tree = opts.get("tree", _ROOT)
     rev = opts.get("baseline", "public/main")
+    if not os.path.isdir(tree):
+        print(f"name review: --tree={tree}: no such directory", file=sys.stderr)
+        return 2
+    if not any(files for _base, _dirs, files in os.walk(tree)):
+        print(f"name review: --tree={tree} holds no files: nothing was reviewed", file=sys.stderr)
+        return 2
     try:
         baseline, baseline_unread = _read_rev(rev)
     except RuntimeError as exc:
         print(f"name review: cannot read the baseline tree {rev!r}: {exc}", file=sys.stderr)
         return 2
     seen, tree_unread = _read_dir(tree)
+    if _UNREADABLE:
+        print(f"name review: {len(_UNREADABLE)} path(s) could not be read, so nothing was "
+              f"reviewed for them:", file=sys.stderr)
+        for path in sorted(_UNREADABLE):
+            print(f"  {path}", file=sys.stderr)
+        return 2
     found = _new(seen, baseline)
     unread = {p: tree_unread[p] for p in _changed(tree_unread, baseline_unread)}
     if not found and not unread:

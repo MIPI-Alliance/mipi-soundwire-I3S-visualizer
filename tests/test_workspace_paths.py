@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 
 from swi3s_studio.workspace import LinkSpec, Workspace
 
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
+
 
 def _sal(folder, name="bus.sal"):
     os.makedirs(folder, exist_ok=True)
@@ -68,7 +70,6 @@ def test_a_lost_capture_is_reported_and_locating_one_file_finds_its_partner(tmp_
     Workspace(links=[LinkSpec(source=pair)]).save(str(tmp_path / "w.swi3s"))
     shutil.move(str(tmp_path / "a"), str(tmp_path / "b"))
     shutil.move(str(tmp_path / "w.swi3s"), str(tmp_path / "b" / "w.swi3s"))
-    os.makedirs(tmp_path / "c")
     ws = Workspace.load(str(tmp_path / "b" / "w.swi3s"))          # relative "a/..." is gone
     assert sorted(k for _i, k, _p in ws.missing_files()) == ["clock", "data"]
     ws.locate(0, "clock", str(tmp_path / "b" / "clk.bin"))
@@ -154,16 +155,16 @@ def test_a_lost_capture_can_be_located(opened, tmp_path, monkeypatch):
     assert len(again.links) == 1 and again._session.source["path"] == new
 
 
-def test_cancel_opens_nothing_and_skip_opens_the_rest(opened, tmp_path, monkeypatch):
+def test_cancel_or_skip_of_the_only_link_opens_nothing(opened, tmp_path, monkeypatch):
     win, cap = opened
     ws_path = str(tmp_path / "proj" / "bench.swi3s")
     _save(win, monkeypatch, ws_path)
     os.remove(cap)
     again, asked = _reopen(monkeypatch, ws_path, "cancel")
     assert asked and len(again.links) == 0 and getattr(again, "_load_thread", None) is None
-    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", lambda *a, **k: None)
+    errors = _no_errors(monkeypatch)
     again, _asked = _reopen(monkeypatch, ws_path, "skip")
-    assert len(again.links) == 0                      # its only Link was skipped
+    assert len(again.links) == 0 and errors == []     # its only Link was skipped, silently
 
 
 def _two_link_workspace(tmp_path):

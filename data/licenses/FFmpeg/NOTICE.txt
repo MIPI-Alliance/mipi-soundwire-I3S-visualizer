@@ -1,0 +1,21 @@
+FFmpeg libraries (shipped with Qt for Python)
+=============================================
+
+This bundle contains the FFmpeg libraries that Qt for Python (PySide6) carries for Qt
+Multimedia, which the audio view loads for playback:
+
+  libavcodec, libavformat, libavutil, libswresample and libswscale
+
+together with Qt's FFmpeg media plugin that loads them. They are the FFmpeg release that the
+bundled Qt for Python wheel is built with, unmodified; each library's file name carries its
+major version. The libraries identify their licence as "LGPL version 2.1 or
+later", and they are distributed here under the GNU Lesser General Public License, version
+2.1 (LGPL-2.1.txt).
+
+The FFmpeg libraries are separate files in this bundle, loaded dynamically, so a modified
+build of them can be substituted for the ones shipped here. Their source code, for the
+release those versions name, is available from the FFmpeg project, https://ffmpeg.org, and
+the Qt for Python sources from the Qt Project, https://code.qt.io.
+
+The Qt for Python and Qt libraries are covered by the notice in ../Qt-for-Python/NOTICE.txt.
+This project's own licence is LICENSE.md at the top level of the bundle.

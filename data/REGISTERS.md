@@ -52,8 +52,11 @@ Start physical-layer signalling on the raw DP/DN lines (spec §5.1.2). That sign
   direct `_CURR` write also copies to `_NEXT`. `_NEXT` cleared only by Cold Reset.
 - `excess1: true` → actual = stored + 1 (`SampleSize`, `SampleGrouping`, `Interval`,
   `HorizontalCount`, `BitWidth`, `ConverterClockDiv`; `NumColumns`: ColumnCount =
-  NumColumns + 1). Our placement engine already computes inclusive window ends as
-  `HorizontalStart + HorizontalCount`, which is correct for the excess-1 field.
+  NumColumns + 1). A field split over several registers carries the flag on its
+  least-significant part only; the whole assembled value is stored+1, so the high part
+  of a split Interval (`Interval_HI`) carries no flag. Our placement engine already
+  computes inclusive window ends as `HorizontalStart + HorizontalCount`, which is
+  correct for the excess-1 field.
 - Endianness: SLC `ManufacturerID`/`PartID`/`SkippingDenominator` are MSB-first;
   DP `Interval`/`Offset`/`ConverterClockDiv`/`SkippingNumerator` and `FCP_Offset`
   are LSB-first.

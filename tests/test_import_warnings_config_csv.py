@@ -1,6 +1,8 @@
 """Import warnings from a Visualizer config CSV: the native loader (swi3score.csv_warnings),
 the format upgrade (ingest.visualizer_csv), the Python parsers (BusConfig.from_csv,
-CSVHandler via viz_engine and the CLI), Session's config imports, and the window.
+CSVHandler via viz_engine and the CLI), a Reserved CDS_TailWidth 3 on each of those paths,
+the legacy CDS guard, polarity and tail width carried to every source, Session's config
+imports, and the window.
 
 Every input is synthetic: a config the app writes (demo_config) with cells edited."""
 import csv
@@ -18,8 +20,7 @@ from swi3s_studio.ingest import visualizer_csv
 from swi3s_studio.model.bus_config import BusConfig, demo_config
 from swi3s_studio.session import Session
 
-pytestmark = pytest.mark.skipif(not hasattr(swi3score, "csv_warnings"),
-                                reason="the built core predates csv_warnings; rebuild it")
+pytestmark = pytest.mark.gui
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,7 +54,14 @@ def _messages(fn, *a, **k):
 def test_a_config_the_app_writes_has_no_native_warnings(tmp_path):
     path = demo_config().to_csv_file(str(tmp_path / "clean.csv"))
     assert swi3score.csv_warnings(path) == []
-    assert swi3score.csv_warnings(os.path.join(HERE, "fixtures", "flow_control_demo.csv")) == []
+
+
+def test_the_native_loader_names_the_rows_a_file_lacks(tmp_path):
+    rows = [r for r in _rows()
+            if r[0] not in ("CDS_DriveTypePerSource", "CDS_EndDriveEarlyPerSource")]
+    assert swi3score.csv_warnings(_write(tmp_path / "lacking.csv", rows)) == [
+        "2 rows are missing and take their defaults: CDS_DriveTypePerSource, "
+        "CDS_EndDriveEarlyPerSource."]
 
 
 def test_a_port_with_no_device_on_the_bus_is_reported_disabled(tmp_path):
@@ -104,8 +112,72 @@ def test_unreadable_cells_and_cells_past_the_last_column_are_reported_per_field(
     ]
 
 
-def test_an_unopenable_path_has_no_warnings_and_the_core_is_unchanged(tmp_path):
-    assert swi3score.csv_warnings(str(tmp_path / "missing.csv")) == []
+def test_hex_and_binary_cells_read_as_their_values_and_bad_digits_are_reported(tmp_path):
+    rows = _rows()
+    _set(rows, "Interval_REG", 1, "0x7")                 # the demo's own values, re-spelt
+    _set(rows, "EnableCh_REG", 1, "0b11")
+    _set(rows, "HorizontalStart_REG", 1, "0X2")
+    _set(rows, "SampleSize_REG", 1, "0B11")
+    path = _write(tmp_path / "radix.csv", rows)
+    assert swi3score.csv_warnings(path) == []
+    clean = demo_config().to_csv_file(str(tmp_path / "clean.csv"))
+    assert swi3score.registers_from_csv(path) == swi3score.registers_from_csv(clean)
+
+    _set(rows, "Interval_REG", 1, "0xZZ")
+    _set(rows, "Offset_REG", 1, "0b12")
+    assert swi3score.csv_warnings(_write(tmp_path / "digits.csv", rows)) == [
+        "Interval_REG: 1 cell is not a valid value: DP0 '0xZZ' read as 0.",
+        "Offset_REG: 1 cell is not a valid value: DP0 '0b12' read as 1.",
+    ]
+
+
+def test_a_row_rate_with_trailing_text_is_reported_with_the_rate_read(tmp_path):
+    rows = _rows()
+    _set(rows, "RowRate", 1, "3072kHz")
+    assert swi3score.csv_warnings(_write(tmp_path / "rate.csv", rows)) == [
+        "RowRate: 1 cell is not a valid value: '3072kHz' read as 3072.0."]
+
+
+def test_interface_and_per_source_values_that_do_not_fit_are_reported(tmp_path):
+    rows = _rows()
+    _set(rows, "SkippingDenominator_REG", 1, "5000")
+    _set(rows, "CDS_BitWidth_REG", 1, "9")
+    _set(rows, "CDS_TailWidthPerSource", 1, "5")
+    _set(rows, "CDS_TailWidthPerSource", 3, "-1")
+    _set(rows, "CDS_DriveTypePerSource", 2, "2")
+    assert swi3score.csv_warnings(_write(tmp_path / "fit.csv", rows)) == [
+        "SkippingDenominator_REG 5000 does not fit its 12-bit register field (0..4095); the "
+        "expected registers carry its low 12 bits (904) and the decode uses the value as "
+        "written.",
+        "CDS_BitWidth_REG 9 does not fit its 3-bit register field (0..7); the expected "
+        "registers carry its low 3 bits (1) and the decode uses the value as written.",
+        "CDS_TailWidthPerSource does not fit its 2-bit register field (0..3) for Manager = 5, "
+        "Device 1 = -1; the expected registers carry its low 2 bits.",
+        "CDS_DriveTypePerSource does not fit its 1-bit register field (0..1) for Device 0 = 2; "
+        "the expected registers carry its low bit.",
+    ]
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("EnableCh_REG", "0x10003",
+     "EnableCh_REG does not fit its 16 channel bits for DP0 = 65539; only channels 0..15 are "
+     "read."),
+    ("DataPortNumber", "40",
+     "DataPortNumber is outside 0..31 for DP0 = 40; a negative number is ignored (the port "
+     "keeps its column's number) and a larger one addresses no data port register block."),
+    ("DataPortNumber", "-1",
+     "DataPortNumber is outside 0..31 for DP0 = -1; a negative number is ignored (the port "
+     "keeps its column's number) and a larger one addresses no data port register block."),
+])
+def test_a_channel_mask_or_port_number_out_of_range_is_reported(tmp_path, key, value, message):
+    rows = _rows()
+    _set(rows, key, 1, value)
+    assert swi3score.csv_warnings(_write(tmp_path / "range.csv", rows)) == [message]
+
+
+def test_an_unopenable_path_reports_why_and_the_core_is_unchanged(tmp_path):
+    missing = str(tmp_path / "missing.csv")
+    assert swi3score.csv_warnings(missing) == [f"Cannot open config CSV: {missing}"]
     from swi3s_studio.session import _REQUIRED_SCORE_ABI
     assert swi3score.score_abi == _REQUIRED_SCORE_ABI
 
@@ -124,6 +196,15 @@ def test_a_file_with_no_config_field_says_every_setting_defaults(tmp_path):
     _out, notes = _messages(visualizer_csv.normalized_path, str(p))
     assert [str(n) for n in notes] == [
         "capture.csv: no config field is recognised (no _REG row and no legacy field); every "
+        "setting takes its default."]
+
+
+@pytest.mark.parametrize("text", ["", "  \n", "AppVersion,3.1.0\nDescription,x\n"])
+def test_bus_config_says_every_setting_defaults_for_text_with_no_config_field(text):
+    with import_notes.collect() as notes:
+        BusConfig.from_csv_text(text, "bare.csv")
+    assert [str(n) for n in notes] == [
+        "bare.csv: no config field is recognised (no _REG row and no legacy field); every "
         "setting takes its default."]
 
 
@@ -181,7 +262,7 @@ def test_bus_config_reports_cells_rows_and_fields_it_does_not_read(tmp_path):
     assert {n.source for n in notes} == {"orig.csv"}
     assert [n.message for n in notes] == [
         "Interval_REG: 1 cell is not a valid value: DP1 'seven' read as 0.",
-        "GuardEnable_REG: 1 cell is not a valid value: DP0 'Ture' read as False.",
+        "GuardEnable_REG: 1 cell is not a valid value: DP0 'Ture' read as false.",
         "rows with fewer values than data ports or CDS sources, the missing cells reading as "
         "their default: HorizontalStart_REG (4 of 12).",
         "values past the last data port or CDS source column are ignored: Spacing_REG ('9').",
@@ -216,6 +297,303 @@ def test_the_cli_prints_the_warnings(tmp_path, capsys):
     err = capsys.readouterr().err
     assert ("warning: odd.csv: 1 field is not recognised and was ignored: Frobnicate "
             f"(line {len(rows)}).") in err
+
+
+# ---------------------------------------------------------------- Reserved CDS_TailWidth 3
+
+RESERVED = "CDS_TailWidth 3 is Reserved (0..2 UI are defined) for "
+
+
+def _tail_rows(cells):
+    """The demo rows with the per-source tail row set to `cells` (source index -> text)."""
+    rows = _rows()
+    for index, text in cells.items():
+        _set(rows, "CDS_TailWidthPerSource", index + 1, text)
+    return rows
+
+
+def _scalar_tail_rows(width):
+    """The demo rows with the legacy scalar tail row in place of the per-source one."""
+    return [r for r in _rows() if r[0] != "CDS_TailWidthPerSource"] + [
+        ["CDS_TailWidth_REG", str(width)]]
+
+
+def test_the_reserved_tail_width_is_the_same_value_in_both_engines():
+    from swi3s_studio.model import bus_config
+    from swi3s_studio.swviz.config.constants import InterfaceRanges
+    assert bus_config.CDS_TAIL_RESERVED == InterfaceRanges.RESERVED_CDS_TAIL_WIDTH == 3
+
+
+def test_bus_config_keeps_a_reserved_tail_width_and_reports_it_once(tmp_path):
+    rows = _tail_rows({2: "3"})
+    cfg, notes = _messages(BusConfig.from_csv, _write(tmp_path / "t.csv", rows),
+                           source="/somewhere/orig.csv")
+    assert cfg.cds_tail[2] == 3
+    assert [(n.source, n.message) for n in notes] == [(
+        "orig.csv",
+        "CDS_TailWidthPerSource: " + RESERVED + "Device 1 = 3; the value is kept as written, "
+        "the grid draws a 3-UI tail and the expected registers carry 3.")]
+
+
+@pytest.mark.parametrize("width", ["0", "1", "2"])
+def test_bus_config_reports_nothing_for_a_defined_tail_width(tmp_path, width):
+    cfg, notes = _messages(BusConfig.from_csv,
+                           _write(tmp_path / "t.csv", _tail_rows({0: width, 5: width})))
+    assert cfg.cds_tail[0] == cfg.cds_tail[5] == int(width)
+    assert notes == []
+
+
+@pytest.mark.parametrize("width", ["4", "7"])
+def test_a_tail_width_past_the_register_is_not_also_reported_as_reserved(tmp_path, width):
+    _cfg, notes = _messages(BusConfig.from_csv,
+                            _write(tmp_path / "t.csv", _tail_rows({1: width})))
+    assert [n.message for n in notes] == [
+        "CDS_TailWidthPerSource does not fit its 2-bit register field (0..3) for "
+        f"Device 0 = {width}; the expected registers carry its low 2 bits."]
+
+
+def test_bus_config_names_every_source_of_a_scalar_reserved_tail_width(tmp_path):
+    cfg, notes = _messages(BusConfig.from_csv,
+                           _write(tmp_path / "t.csv", _scalar_tail_rows(3)))
+    assert cfg.cds_tail == [3] * 13
+    reserved = [n.message for n in notes if RESERVED in n.message]
+    assert len(reserved) == 1
+    assert reserved[0].startswith("CDS_TailWidthPerSource: " + RESERVED + "Manager = 3, "
+                                  "Device 0 = 3, Device 1 = 3 and 10 more;")
+    _cfg, notes = _messages(BusConfig.from_csv, _write(tmp_path / "u.csv", _scalar_tail_rows(2)))
+    assert not [n for n in notes if "Reserved" in n.message]
+
+
+def test_the_csv_handler_keeps_a_reserved_tail_width_and_reports_it_once(tmp_path):
+    from swi3s_studio.model.viz_engine import build_bus_model
+    rows = _tail_rows({0: "3", 4: "3", 2: "1"})
+    line = 1 + next(i for i, r in enumerate(rows) if r[0] == "CDS_TailWidthPerSource")
+    _m, notes = _messages(build_bus_model, _write(tmp_path / "t.csv", rows), 4)
+    assert [(n.source, n.message) for n in notes] == [(
+        "t.csv", f"Line {line} (CDS_TailWidthPerSource): CDS_TailWidth 3 is Reserved (0..2 UI "
+        "are defined) for Manager = 3; Device 3 = 3; the value is kept as written and the grid "
+        "draws a 3-UI tail.")]
+    (_m, iface, _viz), _notes = _messages(build_bus_model, _write(tmp_path / "u.csv", rows), 4)
+    assert iface.CDS_Tail_PerSource[:5] == [3, 0, 1, 0, 3]
+    assert iface.CDS_TailWidth_REG == 3
+
+
+@pytest.mark.parametrize("width", ["0", "1", "2"])
+def test_the_csv_handler_reports_nothing_for_a_defined_tail_width(tmp_path, width):
+    from swi3s_studio.model.viz_engine import build_bus_model
+    _m, notes = _messages(build_bus_model,
+                          _write(tmp_path / "t.csv", _tail_rows({0: width, 3: width})), 4)
+    assert notes == []
+
+
+@pytest.mark.parametrize("width", ["4", "7"])
+def test_the_csv_handler_does_not_report_a_wide_tail_width_as_reserved(tmp_path, width):
+    from swi3s_studio.model.viz_engine import build_bus_model
+    _m, notes = _messages(build_bus_model,
+                          _write(tmp_path / "t.csv", _tail_rows({1: width})), 4)
+    assert len(notes) == 1
+    assert "does not fit its 2-bit register field" in notes[0].message
+    assert "Reserved" not in notes[0].message
+
+
+def test_the_csv_handler_reports_a_scalar_reserved_tail_width_for_every_source(tmp_path):
+    from swi3s_studio.model.viz_engine import build_bus_model
+    rows = _scalar_tail_rows(3)
+    _m, notes = _messages(build_bus_model, _write(tmp_path / "t.csv", rows), 4)
+    reserved = [n.message for n in notes if "Reserved" in n.message]
+    assert len(reserved) == 1
+    assert reserved[0].startswith(f"Line {len(rows)} (CDS_TailWidth_REG): " + RESERVED
+                                  + "Manager = 3; Device 0 = 3;")
+    assert reserved[0].endswith("Device 11 = 3; the value is kept as written and the grid "
+                                "draws a 3-UI tail.")
+    _m, notes = _messages(build_bus_model, _write(tmp_path / "u.csv", _scalar_tail_rows(2)), 4)
+    assert not [n for n in notes if "Reserved" in n.message]
+
+
+def test_the_engine_side_report_names_a_reserved_tail_width_as_bus_config_words_it(tmp_path):
+    path = _write(tmp_path / "t.csv", _tail_rows({2: "3"}))
+    with import_notes.collect() as notes:
+        msgs = visualizer_csv.report_csv_warnings(path, "/somewhere/orig.csv")
+    want = ("CDS_TailWidthPerSource: " + RESERVED + "Device 1 = 3; the value is kept as "
+            "written, the grid draws a 3-UI tail and the expected registers carry 3.")
+    assert msgs == [want]
+    assert [(n.source, n.message) for n in notes] == [("orig.csv", want)]
+    # One file read by BusConfig as well reports it once.
+    with import_notes.collect() as both:
+        visualizer_csv.report_csv_warnings(path, "/somewhere/orig.csv")
+        BusConfig.from_csv(path, source="/somewhere/orig.csv")
+    assert [n.message for n in both] == [want]
+
+
+@pytest.mark.parametrize("width", ["0", "1", "2", "5"])
+def test_the_engine_side_report_adds_no_reserved_note_for_another_width(tmp_path, width):
+    path = _write(tmp_path / "t.csv", _tail_rows({2: width}))
+    msgs, _notes = _messages(visualizer_csv.report_csv_warnings, path)
+    assert not [m for m in msgs if "Reserved" in m]
+
+
+@pytest.mark.parametrize("cells,listed", [
+    ({2: "3"}, "Device 1 = 3"),
+    ({0: "3", 4: "3", 2: "1"}, "Manager = 3, Device 3 = 3"),
+    ({i: "3" for i in range(5)}, "Manager = 3, Device 0 = 3, Device 1 = 3 and 2 more"),
+])
+def test_the_native_loader_words_a_reserved_tail_width_as_bus_config_does(tmp_path, cells,
+                                                                          listed):
+    from swi3s_studio.model.bus_config import reserved_cds_tail_note
+    path = _write(tmp_path / "t.csv", _tail_rows(cells))
+    want = ("CDS_TailWidthPerSource: " + RESERVED + listed + "; the value is kept as written, "
+            "the grid draws a 3-UI tail and the expected registers carry 3.")
+    assert swi3score.csv_warnings(path) == [want]
+    with import_notes.collect():
+        cfg = BusConfig.from_csv(path)
+    assert reserved_cds_tail_note(cfg.reserved_cds_tail_sources()) == want
+
+
+def test_the_native_loader_names_every_source_of_a_scalar_reserved_tail_width(tmp_path):
+    warnings = swi3score.csv_warnings(_write(tmp_path / "t.csv", _scalar_tail_rows(3)))
+    assert [w for w in warnings if "Reserved" in w] == [
+        "CDS_TailWidthPerSource: " + RESERVED + "Manager = 3, Device 0 = 3, Device 1 = 3 and 10 "
+        "more; the value is kept as written, the grid draws a 3-UI tail and the expected "
+        "registers carry 3."]
+    assert not [w for w in swi3score.csv_warnings(_write(tmp_path / "u.csv", _scalar_tail_rows(2)))
+                if "Reserved" in w]
+
+
+@pytest.mark.parametrize("width", ["4", "7", "-1"])
+def test_the_native_loader_reports_a_wide_tail_width_only_as_wide(tmp_path, width):
+    assert swi3score.csv_warnings(_write(tmp_path / "t.csv", _tail_rows({1: width}))) == [
+        "CDS_TailWidthPerSource does not fit its 2-bit register field (0..3) for "
+        f"Device 0 = {width}; the expected registers carry its low 2 bits."]
+
+
+def test_a_legacy_reserved_tail_width_read_by_the_native_route_is_reported_once(tmp_path):
+    p = tmp_path / "old.csv"
+    p.write_text("Columns per Row (2-32),8\nCDS Tail Width,3\n", encoding="utf-8")
+    with import_notes.collect() as notes:
+        out = visualizer_csv.normalized_path(str(p))
+        try:
+            visualizer_csv.report_csv_warnings(out, str(p))
+            BusConfig.from_csv(out, source=str(p))
+        finally:
+            os.remove(out)
+    reserved = [n for n in notes if "Reserved" in n.message]
+    assert [(n.source, n.message) for n in reserved] == [(
+        "old.csv", "CDS_TailWidthPerSource: " + RESERVED + "Manager = 3, Device 0 = 3, "
+        "Device 1 = 3 and 10 more; the value is kept as written, the grid draws a 3-UI tail "
+        "and the expected registers carry 3.")]
+
+
+def test_a_legacy_tail_width_of_3_is_carried_to_every_source(tmp_path):
+    p = tmp_path / "old.csv"
+    p.write_text("Columns per Row (2-32),8\nCDS Tail Width,3\n", encoding="utf-8")
+    out = visualizer_csv.normalized_path(str(p))
+    try:
+        cfg, notes = _messages(BusConfig.from_csv, out, source=str(p))
+        assert cfg.cds_tail == [3] * 13
+        assert [n for n in notes if "Reserved" in n.message] != []
+        assert {n.source for n in notes} == {"old.csv"}
+    finally:
+        os.remove(out)
+
+
+def _legacy_rows(path, extra):
+    """The current-format rows {name: values} a legacy file of `extra` lines upgrades to,
+    and the upgrade's import notes."""
+    path.write_text("Columns per Row (2-32),8\nRow Rate [kHz],3072\n" + "".join(
+        f"{line}\n" for line in extra), encoding="utf-8")
+    with import_notes.collect() as notes:
+        out = visualizer_csv.normalized_path(str(path))
+    try:
+        with open(out, encoding="utf-8") as f:
+            rows = {r[0]: r[1:] for r in csv.reader(f) if r}
+        with import_notes.collect():
+            cfg = BusConfig.from_csv(out)
+        native = swi3score.registers_from_csv(out)
+    finally:
+        os.remove(out)
+    return rows, cfg, native, [n.message for n in notes]
+
+
+@pytest.mark.parametrize("enabled,polarity,guard", [
+    ("True", "False", 1), ("True", "True", 2), ("False", "False", 0), ("yes", "1", 2)])
+def test_a_legacy_guard_and_polarity_are_carried_to_every_source(tmp_path, enabled, polarity,
+                                                                 guard):
+    rows, cfg, _native, notes = _legacy_rows(
+        tmp_path / "old.csv", [f"CDS Guard Enabled,{enabled}", f"CDS Guard Polarity,{polarity}"])
+    assert notes == []
+    assert rows["CDS_GuardEnabledPerSource"] == ["1" if guard else "0"] * 13
+    assert rows["CDS_GuardPolarityPerSource"] == ["1" if guard == 2 else "0"] * 13
+    assert cfg.cds_guard == [guard] * 13
+    from swi3s_studio.model.viz_engine import build_bus_model
+    p = tmp_path / "old.csv"
+    out = visualizer_csv.normalized_path(str(p))
+    try:
+        (_m, iface, _viz), _n = _messages(build_bus_model, out, 4)
+    finally:
+        os.remove(out)
+    assert iface.CDS_Guard_PerSource == [guard] * 13
+
+
+def test_a_legacy_guard_reaches_the_native_expected_registers(tmp_path):
+    """The native engine's expected registers for a port's device carry the legacy guard:
+    off, Guard 0 and Guard 1 differ in one register, the device's CDS guard."""
+    port = ["Data Port Enabled,True", "Data Port Channels,1"]
+
+    def registers(name, guard_rows):
+        _rows, _cfg, native, _notes = _legacy_rows(tmp_path / name, port + guard_rows)
+        return {(dev, addr): value for dev, addr, value in native}
+
+    off = registers("off.csv", [])
+    g0 = registers("g0.csv", ["CDS Guard Enabled,True", "CDS Guard Polarity,False"])
+    g1 = registers("g1.csv", ["CDS Guard Enabled,True", "CDS Guard Polarity,True"])
+    assert off.keys() == g0.keys() == g1.keys()
+    changed = {k for k in off if not off[k] == g0[k] == g1[k]}
+    assert len(changed) == 1
+    [key] = changed
+    assert len({off[key], g0[key], g1[key]}) == 3
+
+
+def test_a_legacy_polarity_on_a_disabled_guard_is_reported_and_written_as_guard_0(tmp_path):
+    rows, cfg, _native, notes = _legacy_rows(
+        tmp_path / "old.csv", ["CDS Guard Enabled,False", "CDS Guard Polarity,True"])
+    assert notes == ["1 legacy value did not fit and was changed: CDS Guard Polarity is true "
+                     "while CDS Guard Enabled is false; a polarity is kept only with its guard, "
+                     "so false is used."]
+    assert rows["CDS_GuardPolarityPerSource"] == ["0"] * 13
+    assert cfg.cds_guard == [0] * 13
+
+
+def test_a_legacy_file_without_guard_rows_upgrades_as_before(tmp_path):
+    """No guard row: every source is off, and adding the guard rows changes only the two
+    per-source guard rows of the upgraded file."""
+    plain, cfg, _native, notes = _legacy_rows(tmp_path / "plain.csv", ["CDS Tail Width,2"])
+    assert notes == [] and cfg.cds_guard == [0] * 13
+    assert plain["CDS_GuardEnabledPerSource"] == plain["CDS_GuardPolarityPerSource"] == ["0"] * 13
+    guarded, _cfg, _native, _notes = _legacy_rows(
+        tmp_path / "guarded.csv",
+        ["CDS Tail Width,2", "CDS Guard Enabled,True", "CDS Guard Polarity,True"])
+    changed = {k for k in plain.keys() | guarded.keys() if plain.get(k) != guarded.get(k)}
+    assert changed == {"CDS_GuardEnabledPerSource", "CDS_GuardPolarityPerSource"}
+
+
+_CLAMPED = ("1 legacy value did not fit and was changed: CDS/S0 Handover Width {w} is "
+            "outside 0 to 3; ")
+
+
+@pytest.mark.parametrize("width,handover,tail,message", [
+    (-1, False, 0, _CLAMPED + "an S1 tail width of 0 is used."),
+    (0, False, 0, None),
+    (3, True, 2, None),
+    (4, True, 2, _CLAMPED + "a handover and an S1 tail width of 2 are used."),
+    (8, True, 2, _CLAMPED + "a handover and an S1 tail width of 2 are used.")])
+def test_a_legacy_handover_width_outside_0_to_3_is_reported(tmp_path, width, handover, tail,
+                                                            message):
+    rows, cfg, _native, notes = _legacy_rows(tmp_path / "old.csv",
+                                             [f"CDS/S0 Handover Width,{width}"])
+    assert notes == ([] if message is None else [message.format(w=width)])
+    assert rows["EnforceCDSHandover"] == [str(handover)]
+    assert rows["S1TailWidth_REG"] == [str(tail)]
+    assert (cfg.enforce_cds_handover, cfg.s1_tail_width) == (handover, tail)
 
 
 # ---------------------------------------------------------------- Session's config imports

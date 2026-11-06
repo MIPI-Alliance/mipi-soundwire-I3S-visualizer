@@ -73,3 +73,14 @@ def test_pdm_decimation():
     dens = (np.sin(2.0 * np.pi * 100 * t / hi) > 0).astype(float)   # 100 Hz square in density
     rec = pdm_to_pcm(dens, hi, 48000)
     assert rec.max() > 0.3 and rec.min() < -0.3
+
+
+def test_a_decimation_beyond_the_denominator_bound_keeps_its_ratio():
+    """24.576 MHz -> 48 kHz is 512:1 and 14.4 MHz -> 48 kHz is 300:1, both past 256."""
+    for ir, n in ((24_576_000, 51_200), (14_400_000, 60_000)):
+        x = np.ones(n)
+        want = -(-n * 48_000 // ir)
+        assert resampled_length(n, ir, 48_000) == want
+        y = resample(x, ir, 48_000)
+        assert y.size == want
+        assert abs(y[y.size // 2] - 1.0) < 1e-3          # DC gain preserved mid-stream

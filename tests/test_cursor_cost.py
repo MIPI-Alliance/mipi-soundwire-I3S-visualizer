@@ -16,10 +16,13 @@ import threading
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.session import Session
 from swi3s_studio.ui.main_window import _SAMPLE_HALF_WINDOW, _TX_PERSIST_SYNC_MAX_UIS, MainWindow
+
+pytestmark = pytest.mark.gui
 
 _app = QApplication.instance() or QApplication([])
 
@@ -203,22 +206,40 @@ def test_the_cursor_cascade_skips_hidden_docks(monkeypatch):
     CDS symbol or Registers pane is not refreshed. The guards are a performance contract.
     """
     w = _win()
+    w.show()                                  # the guards read each dock's visible region
+    for _ in range(3):
+        _app.processEvents()                  # …which exists once the dock layout has run
     s = w._session
     ce = s.capture.clock_edges
-    for dock in (w._sample_dock, w._symbol_dock, w._reg_dock):
-        dock.hide()
-    _app.processEvents()
-
+    docks = {"samples": w._sample_dock, "symbols": w._symbol_dock,
+             "registers": w._reg_dock}
     touched: list = []
     monkeypatch.setattr(w, "_refresh_samples_around",
                         lambda *a, **k: touched.append("samples"))
     monkeypatch.setattr(w, "_refresh_symbols_around",
                         lambda *a, **k: touched.append("symbols"))
     monkeypatch.setattr(s, "register_files_at",
-                        lambda *a, **k: touched.append("registers") or [])
+                        lambda *a, **k: touched.append("registers") or {})
 
-    w._pending_cursor = (int(ce[len(ce) // 2]), False, False, False, -1)   # -1: no lane
-    w._apply_cursor_heavy()
+    def move():
+        touched.clear()
+        w._pending_cursor = (int(ce[len(ce) // 2]), False, False, False, -1)   # -1: no lane
+        w._apply_cursor_heavy()
+        return list(touched)
+
+    # Positive control: each pane, shown and raised, is refreshed by the same move.
+    for tag, dock in docks.items():
+        w._show_dock(dock)
+        dock.raise_()
+        _app.processEvents()
+        assert tag in move(), (
+            f"the {tag} pane was shown and the cursor move did not refresh it: the "
+            "hidden-dock check below would pass whatever the guards do")
+
+    for dock in docks.values():
+        dock.hide()
+    _app.processEvents()
+    move()
 
     assert not touched, (
         f"a cursor move rebuilt {touched} while those docks were hidden — the per-dock "

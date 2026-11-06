@@ -5,3 +5,4 @@
 # after the last line, or when the tree undoes a contributed commit between two lines.
 ff0aaac4b72eb2b22c531bc7e5de9a7f7fdf377d  2026-10-12 SWI3S Studio v3.0.20
 87d23419a2c23fc0e5f9cb68e9260ce67f7c8a9b  2026-10-22 Merge pull request #24 from MIPI-Alliance/docs/cleanup
+7c55ddb7d0b1421a52f5c99442c6d169056bf6a7  2026-10-23 SWI3S Studio v3.1.0

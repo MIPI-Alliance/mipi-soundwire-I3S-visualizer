@@ -11,8 +11,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import tempfile
 
+import pytest
+
 from swi3s_studio.session import Session
 from swi3s_studio.workspace import session_from_source
+
+pytestmark = pytest.mark.gui
 
 
 def test_manual_ssp_survives_negative_interval_csv():
@@ -23,7 +27,9 @@ def test_manual_ssp_survives_negative_interval_csv():
     from swi3s_studio.model.bus_config import demo_config
     with tempfile.TemporaryDirectory() as d:
         csv = demo_config().to_csv_file(os.path.join(d, "c.csv"))
-        txt = pathlib.Path(csv).read_text().replace("Interval_REG,7,", "Interval_REG,-1,")
+        original = pathlib.Path(csv).read_text()
+        txt = original.replace("Interval_REG,7,", "Interval_REG,-1,")
+        assert txt != original and "Interval_REG,-1," in txt     # the malformed CSV was built
         bad = os.path.join(d, "bad.csv")
         pathlib.Path(bad).write_text(txt)
         s = Session.from_demo(64, config_csv=bad, ssp_row=3)   # must not SIGFPE
@@ -59,46 +65,44 @@ def test_gui_exposes_ssp_controls():
     win = MainWindow()
     for name in ("set_ssp_at_cursor", "step_ssp_row", "set_ssp_row_async"):
         assert hasattr(win, name), name
-    # With a capture, set/step/clear run without error (re-decode on the worker path).
+    # With a capture, set/step/clear re-decode on the worker path and land on their row.
+    from conftest import pump_loads
     win.load_demo()
+    cmds = win._session.commands
+    win.cursor.set_sample(cmds[len(cmds) // 2]["start_sample"])    # a bus row, not the start
+    at_cursor = win._session.bus_row_for_sample(win.cursor.sample)
+    assert at_cursor >= 3 and win._session.ssp_row == -1
     win.set_ssp_at_cursor()
+    pump_loads(win)
+    assert win._session.ssp_row == at_cursor
     win.step_ssp_row(+1)
+    pump_loads(win)
+    assert win._session.ssp_row == at_cursor + 1
     win.set_ssp_row_async(-1)
+    pump_loads(win)
+    assert win._session.ssp_row == -1
 
 
 def test_ssp_redecode_keeps_audio_view():
     """Stepping the SSP must NOT re-show hidden tracks or reset the zoom — the user
     is watching one spot on one channel to judge sync."""
     from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    from swi3s_studio.ui.main_window import MainWindow
+    QApplication.instance() or QApplication([])
+    from conftest import pump_loads
 
-    def wait_for_load(win, limit=2000):
-        """Pump the event loop until the async re-decode thread joins (done runs on
-        the GUI thread via a queued signal, so it needs a spinning loop here). Wait on
-        wall-clock time, not a fixed iteration count — processEvents() returns instantly
-        on an empty queue, so a fixed count can elapse before a slow runner's worker
-        finishes."""
-        import time
-        deadline = time.time() + 60.0
-        while getattr(win, "_load_thread", None) is not None:
-            if time.time() > deadline:
-                raise AssertionError("re-decode did not finish")
-            app.processEvents()
-            time.sleep(0.005)
+    from swi3s_studio.ui.main_window import MainWindow
 
     win = MainWindow()
     win.load_demo()
     av = win._audio_view
     lanes = list(av.channel_selection())
-    if len(lanes) < 2:
-        return                                          # need >=2 tracks to hide one
+    assert len(lanes) >= 2, lanes                       # two tracks, to hide one
     keep = {lanes[0]}
     av.set_channel_selection(keep)                      # hide all but one
     assert av.channel_selection() == keep
     av.set_visible_index_range((100, 200))              # zoom to a window
     win.step_ssp_row(+1)                                # re-decode (async)
-    wait_for_load(win)
+    pump_loads(win)
     assert win._session.ssp_row >= 0                    # the re-decode actually ran
     assert av.channel_selection() == keep               # selection preserved
     x0, x1 = av.visible_index_range()

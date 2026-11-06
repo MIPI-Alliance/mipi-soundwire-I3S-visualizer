@@ -117,7 +117,7 @@ def test_decode_reset_table_matches_spec():
     slc = {r.name: r.reset_byte() for r in rm.blocks.get("SLC", [])}
     for nm in ("NumColumns", "SkippingDenominator_L", "SkippingDenominator_H",
                "SyncPointOffset", "ShortProtocolSpacer"):
-        assert slc.get(nm, 0) == 0, f"SLC {nm} reset expected 0, got 0x{slc.get(nm,0):02X}"
+        assert slc[nm] == 0, f"SLC {nm} reset expected 0, got 0x{slc[nm]:02X}"
 
 
 def test_apply_decoded_commands():
@@ -133,7 +133,7 @@ def test_apply_decoded_commands():
     assert dev0.value(0x2009) == 0x0F                     # SampleSizeGrouping = 16-bit PCM
     assert dev0.value(0x2081) & 0x80                      # EnableCh0 set
     assert dev0.provenance(0x2081) == Provenance.WRITTEN
-    # The demo is a single device with four data ports.
+    # The demo is a single device.
     assert set(files) == {0}
 
 
@@ -149,15 +149,19 @@ def test_register_override_unifies_grid_registers_audio():
     smp = int(s.capture.clock_edges[-1])
     sect = s.segment_index_for_sample(smp)
     base_audio = s.audio_count
+    base_grid = sorted(map(repr, s.grid_cells_at(smp, 8)))
 
     s.set_register_override(sect, dev, 0x20C1, 0x00)     # _CURR alias of DP0 EnableCh0/HCount (0x2081)
     assert s.audio_count != base_audio, "CURR override did not reach the audio decode"
+    assert sorted(map(repr, s.grid_cells_at(smp, 8))) != base_grid, \
+        "CURR override did not reach the bus grid"
     f = s.register_files_at(smp)
     assert f[dev].curr_value(0x2081) == 0x00
     assert f[dev].curr_provenance(0x2081) == Provenance.UI   # display provenance, section-scoped
 
     s.clear_register_overrides()                          # re-decodes back
     assert s.audio_count == base_audio
+    assert sorted(map(repr, s.grid_cells_at(smp, 8))) == base_grid
     assert s.register_files_at(smp)[dev].curr_provenance(0x2081) != Provenance.UI
 
 
@@ -573,6 +577,14 @@ def test_a_cds_curr_alias_write_changes_nothing():
     assert row is None or (not (row[1] and row[0] == 0x3C) and row[2] != 0x3C), row
     rm = RegisterMap.load()
     assert rm.resolve(0x11C6).register.access == "Dual-CURR-RO"
+    assert rm.read_only(0x11C6) and not rm.read_only(0x1186)
+    assert not rm.read_only(0x01C1) and not rm.read_only(0xFFFFFF)
+    # The window is the data's: every CDS alias at or above CDS_CURR_BASE is Dual-CURR-RO.
+    from swi3s_studio.model.registers import CDS_BASE, CDS_BLOCK_SIZE, CDS_CURR_BASE
+    for addr in range(CDS_BASE, CDS_BASE + CDS_BLOCK_SIZE):
+        res = rm.resolve(addr)
+        if res is not None and res.rank == "CURR":
+            assert rm.read_only(addr) and addr >= CDS_CURR_BASE, hex(addr)
     dev = DeviceRegisterFile(rm, 0)
     dev.apply_write(0x11C6, bytes([0x3C]))
     assert dev.curr_value(0x1186) != 0x3C and dev.value(0x1186) != 0x3C
@@ -590,3 +602,177 @@ def test_a_phy_curr_alias_write_is_immediate_and_mirrors_next():
     dev = DeviceRegisterFile(RegisterMap.load(), 0)
     dev.apply_write(0x01C1, bytes([0x3C]))
     assert dev.curr_value(0x0181) == 0x3C and dev.value(0x0181) == 0x3C
+
+
+def _block_addresses():
+    """Every address of the SLC, CDS and PHY Control blocks and of the first and last data
+    port blocks."""
+    from swi3s_studio.model.registers import DP_BASE, DP_STRIDE
+    spans = [(0x0100, 0x0400), (0x1000, 0x1200), (DP_BASE, DP_BASE + DP_STRIDE),
+             (DP_BASE + 31 * DP_STRIDE, DP_BASE + 32 * DP_STRIDE)]
+    return [a for lo, hi in spans for a in range(lo, hi)]
+
+
+def test_read_only_and_rw1c_tables_match_spec():
+    """CRegisterModel::IsReadOnly / Rw1cMask match RegisterMap.read_only / rw1c_mask, read
+    from data/registers.json, at every address of the modelled blocks."""
+    import swi3score
+    rm = RegisterMap.load()
+    n_ro = n_rw1c = 0
+    for a in _block_addresses():
+        assert swi3score.register_read_only(a) == rm.read_only(a), f"read-only 0x{a:04X}"
+        assert swi3score.register_rw1c_mask(a) == rm.rw1c_mask(a), f"RW1C mask 0x{a:04X}"
+        n_ro += rm.read_only(a)
+        n_rw1c += bool(rm.rw1c_mask(a))
+    assert n_ro and n_rw1c
+    assert rm.read_only(0x2005) and rm.read_only(0x11C6) and not rm.read_only(0x200B)
+    assert rm.rw1c_mask(0x2000) == 0xDF and rm.rw1c_mask(0x1021) == 0x03
+
+
+def _wr(addr, data):
+    return {"command": "WriteA32", "crc_valid": True, "has_address": True, "is_write": True,
+            "device_mask": 0b1, "address": addr, "data": bytes(data)}
+
+
+def _rd(addr, data):
+    return {"has_read_data": True, "read_data_crc_valid": True, "has_address": True,
+            "is_read": True, "device_mask": 0b1, "address": addr, "read_data": bytes(data),
+            "data": bytes(data)}
+
+
+def test_read_only_and_rw1c_writes_agree_across_engines():
+    """A write to a read-only byte changes nothing and an RW1C bit written 1 clears, in the
+    C++ model (registers_from_commands) and the Python replay (apply_commands) alike."""
+    from swi3s_studio.session import Session
+    s = Session.from_demo(8)
+    rm = s.register_map
+    cmds = [
+        _rd(0x2000, [0x1F]), _wr(0x2000, [0x05]),            # DP0 IntStat: 0x1F -> 0x1A
+        _rd(0x1021, [0x03]), _wr(0x1021, [0x01]),            # SLC DevStat: 0x03 -> 0x02
+        _rd(0x2005, [0x02]), _wr(0x2005, [0x03]),            # PortStatus (RO) keeps its read
+        _wr(0x1000, [0x55]),                                 # ID0 (RO): no effect
+        _wr(0x2004, [0x01, 0x03, 0xFF, 0xFF]),               # DevStat, PortStatus, ReadyCh_L/H
+    ]
+    cpp = s._build_register_files(cmds, None)[0]
+    py = apply_commands(rm, cmds)[0]
+    want = {0x2000: (0x1A, Provenance.WRITTEN), 0x1021: (0x02, Provenance.WRITTEN),
+            0x2005: (0x02, Provenance.READ), 0x2004: (0x00, Provenance.WRITTEN),
+            0x1000: (rm.resolve(0x1000).register.reset_byte(), Provenance.DEFAULT),
+            0x2006: (rm.resolve(0x2006).register.reset_byte(), Provenance.DEFAULT),
+            0x2007: (rm.resolve(0x2007).register.reset_byte(), Provenance.DEFAULT)}
+    for a, (value, prov) in want.items():
+        for name, f in (("C++", cpp), ("Python", py)):
+            assert (f.value(a), f.provenance(a)) == (value, prov), (
+                f"{name} 0x{a:04X}: {f.value(a):#x}/{f.provenance(a)}")
+    dev = DeviceRegisterFile(rm, 0)
+    assert dev.apply_write(0x2004, bytes([0x01, 0x03, 0xFF, 0xFF])) == [0x2005, 0x2006, 0x2007]
+    assert dev.apply_write(0x11C6, bytes([0x3C])) == [0x11C6]
+    assert dev.apply_write(0x200B, bytes([0x00])) == []
+
+
+def test_a_read_of_a_curr_alias_updates_curr_only_and_a_next_read_leaves_curr_alone():
+    """SLC NumColumns: _NEXT 0x1081, _CURR 0x10C1."""
+    dev = DeviceRegisterFile(RegisterMap.load(), 0)
+    dev.apply_read(0x10C1, bytes([0x40]))
+    assert dev.curr_value(0x1081) == 0x40
+    assert dev.curr_provenance(0x1081) == Provenance.READ
+    assert dev.value(0x1081) != 0x40 and dev.provenance(0x1081) == Provenance.DEFAULT
+    dev.apply_read(0x1081, bytes([0x21]))
+    assert dev.value(0x1081) == 0x21 and dev.curr_value(0x1081) == 0x40
+
+
+def test_a_data_port_with_no_commit_group_write_is_in_commit_group_zero():
+    """DP1 BitWidth_HorizontalStart: _NEXT 0x2180, _CURR 0x21C0. CommitGroupMemb resets to
+    CG0; a write of CG1 moves the port out of it."""
+    rm = RegisterMap.load()
+    dev = DeviceRegisterFile(rm, 0)
+    dev.apply_write(0x2180, bytes([7]))
+    dev.commit(0b0010)
+    assert dev.curr_value(0x2180) == 0
+    dev.commit(0b0001)
+    assert dev.curr_value(0x2180) == 7
+    moved = DeviceRegisterFile(rm, 0)
+    moved.apply_write(0x210A, bytes([0b0010]))
+    moved.apply_write(0x2180, bytes([7]))
+    moved.commit(0b0001)
+    assert moved.curr_value(0x2180) == 0
+    moved.commit(0b0010)
+    assert moved.curr_value(0x2180) == 7
+
+
+def _oracle_write(address, data, sample, mask=1):
+    return {"command": "WriteA32", "crc_valid": True, "has_address": True,
+            "address": address, "data": data, "device_mask": mask, "start_sample": sample}
+
+
+def _oracle_commit(confirmed, sample, mask=1, groups=1):
+    return {"command": "SSCR", "is_commit": True, "commit_confirmed": confirmed,
+            "group_mask": groups, "device_mask": mask, "start_sample": sample}
+
+
+def _oracle_read(address, data, sample, crc_ok, mask=1):
+    return {"command": "ReadA32", "has_read_data": True, "read_data_crc_valid": crc_ok,
+            "has_address": True, "address": address, "read_data": data,
+            "device_mask": mask, "start_sample": sample}
+
+
+def test_the_replay_promotes_next_to_curr_only_on_a_confirmed_commit():
+    rm = RegisterMap.load()
+    nxt = 0x1081                                           # NumColumns_NEXT, reset 0
+    reset = DeviceRegisterFile(rm, 0).curr_value(nxt)
+    staged = [_oracle_write(nxt, b"\x05", 10)]
+    cancelled = apply_commands(rm, staged + [_oracle_commit(False, 20)])[0]
+    assert cancelled.value(nxt) == 5 and cancelled.curr_value(nxt) == reset
+    confirmed = apply_commands(rm, staged + [_oracle_commit(True, 20)])[0]
+    assert confirmed.curr_value(nxt) == 5
+
+
+def test_the_replay_ignores_a_read_whose_data_failed_its_crc():
+    rm = RegisterMap.load()
+    addr = 0x1081
+    bad = apply_commands(rm, [_oracle_read(addr, b"\x07", 10, crc_ok=False)])
+    assert not bad
+    good = apply_commands(rm, [_oracle_read(addr, b"\x07", 10, crc_ok=True)])[0]
+    assert good.value(addr) == 7 and good.provenance(addr) == Provenance.READ
+
+
+def test_the_replay_as_of_a_sample_includes_a_command_starting_exactly_there():
+    rm = RegisterMap.load()
+    addr = 0x1081
+    cmds = [_oracle_write(addr, b"\x01", 100), _oracle_write(addr, b"\x02", 200),
+            _oracle_write(addr, b"\x03", 201)]
+    assert apply_commands(rm, cmds, up_to_sample=199)[0].value(addr) == 1
+    assert apply_commands(rm, cmds, up_to_sample=200)[0].value(addr) == 2
+    assert apply_commands(rm, cmds, up_to_sample=201)[0].value(addr) == 3
+
+
+def test_a_one_address_range_is_a_one_address_span():
+    from swi3s_studio.model.registers import _parse_offset_span
+    assert _parse_offset_span("0x10-0x10") == (0x10, 1)
+    assert _parse_offset_span("0x20-0x2F") == (0x20, 16)
+    assert _parse_offset_span("0x20-0x1F") == (None, 0)
+
+
+def test_an_enum_keeps_single_values_in_hex_or_b_tokens_and_drops_ranges():
+    from swi3s_studio.model.registers import _parse_enum
+    assert _parse_enum("b1001=v1.1, 0x02-0x0F=Rsvd, 0x0=Zero, 0x3=") == {9: "v1.1", 0: "Zero"}
+
+
+def test_a_negative_address_is_labelled_by_its_32_bit_region():
+    from swi3s_studio.model.registers import region_name
+    assert region_name(-1) == region_name(0xFFFFFFFF) == "SDCA (Remote)"
+
+
+def test_a_register_reset_byte_keeps_its_low_eight_bits():
+    from swi3s_studio.model.registers import RegisterSpec
+    spec = RegisterSpec(name="R", offset=0, abs_address=0, reset=0x1A5, access="RW",
+                        dual_ranked=False, curr_offset=None, fields=[])
+    assert spec.reset_byte() == 0xA5
+
+
+def test_a_bit_range_must_be_high_bit_first_within_a_byte():
+    from swi3s_studio.model.registers import _parse_bits
+    assert _parse_bits("[7:5]") == (7, 5) and _parse_bits("[3]") == (3, 3)
+    for bad in ("[3:7]", "[8:0]", "[9]"):
+        with pytest.raises(ValueError):
+            _parse_bits(bad)

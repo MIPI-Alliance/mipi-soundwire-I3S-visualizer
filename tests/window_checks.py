@@ -1,19 +1,25 @@
 """What a MainWindow shows must follow from its Links. `check_window` recomputes it.
 
-`check_window` derives each displayed quantity again, from the Links alone, and compares
-it with what is on screen. Call it after anything that changes the Links: a round-trip,
+`check_window` derives each displayed quantity again, from the Links' sessions and offsets,
+and compares it with what is on screen. Call it after anything that changes the Links: a round-trip,
 an offset, a removal.
 """
 from __future__ import annotations
 
 
+def link_total(link) -> int:
+    """A Link's extent in its own samples: its last command or audio sample, at least 1."""
+    s = link.session
+    return max([c.get("end_sample", 0) for c in s.commands] + [s.audio_end_sample, 1])
+
+
 def expected_band_bounds(win) -> list:
     """Each band's range in its own samples: the union of every Link's span in global time
     when there are two or more Links, else the capture itself."""
-    links, ribbons = list(win.links), win._ribbons
+    links = list(win.links)
     if len(links) < 2:
-        return [(0.0, float(max(1, r._total))) for r in ribbons[:len(links)]]
-    spans = [(link.to_ps(0), link.to_ps(r._total)) for link, r in zip(links, ribbons)]
+        return [(0.0, float(link_total(link))) for link in links]
+    spans = [(link.to_ps(0), link.to_ps(link_total(link))) for link in links]
     lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
     out = []
     for link in links:
@@ -32,6 +38,9 @@ def check_window(win) -> None:
 
     # One band per Link, each over the range the Links' spans and offsets give.
     assert len(win._ribbons) >= n, f"{len(win._ribbons)} bands for {n} Links"
+    totals = [r._total for r in win._ribbons[:n]]
+    assert totals == [link_total(link) for link in links], (
+        f"band totals {totals} are not the Links' extents")
     got = [r._bounds() for r in win._ribbons[:n]]
     assert got == expected_band_bounds(win), (
         f"band ranges {got} are not the ones the Links give {expected_band_bounds(win)}")

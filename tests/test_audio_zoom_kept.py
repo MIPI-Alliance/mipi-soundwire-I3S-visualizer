@@ -15,6 +15,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture
 def win():

@@ -16,10 +16,13 @@ import os
 import pathlib
 import tempfile
 
+import pytest
 import swi3score
 
 from swi3s_studio.model import viz_engine
 from swi3s_studio.model.bus_config import BusConfig, demo_config
+
+pytestmark = pytest.mark.gui
 
 
 def test_notifications_use_renamed_data_port():
@@ -156,7 +159,7 @@ def test_export_decoder_config_as_visualizer_csv():
     assert len(swi3score.grid_from_csv(p, 32)) > 0
 
 
-def test_cds_settings_dialog_owns_every_cds_field():
+def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
     """The interface column edits every CDS field through one "CDS Settings" button.
 
     WHAT IT GUARDS:
@@ -170,8 +173,8 @@ def test_cds_settings_dialog_owns_every_cds_field():
        cancelled outer dialog must discard an accepted inner one.
     3. The row's tooltip summarises the CDS settings at a glance.
 
-    exec() blocks headless, so accepted dialogs are simulated by driving the widgets and
-    the accept path directly.
+    exec() blocks headless, so it is replaced by an edit of the dialog's values and the
+    accept or reject result, and the panel's own handler is driven.
     """
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication, QPushButton
@@ -195,22 +198,34 @@ def test_cds_settings_dialog_owns_every_cds_field():
     # Every source Normal, not the register's reset of 0 (Special).
     assert panel._cfg.cds_drive_type == [CDS_DRIVE_NORMAL] * 13
 
-    dlg = CdsSettingsDialog(panel, bit_width=panel._cfg.cds_bit_width,
-                            drive_type=list(panel._cfg.cds_drive_type),
-                            end_drive_early=list(panel._cfg.cds_end_drive_early),
-                            enforce_handover=panel._cfg.enforce_cds_handover,
-                            guard=list(panel._cfg.cds_guard),
-                            tail=list(panel._cfg.cds_tail))
-    dlg._pick_bit(3)
-    dlg.drive_type[2] = CDS_DRIVE_SPECIAL   # as an accepted CdsDriveTypeDialog would
-    dlg.guard[1] = CDS_GUARD_G1             # ...and an accepted CdsGuardDialog
-    dlg._refresh()
-    assert dlg._summaries["guard"].text() == "1 device G1"
-    assert dlg._summaries["drive"].text() == "1 device Special"
-    dlg.accept()
-    panel._cfg.cds_bit_width = dlg.bit_width
-    panel._cfg.cds_drive_type = list(dlg.drive_type)
-    panel._cfg.cds_guard = list(dlg.guard)
+    emitted = []
+    panel.configChanged.connect(lambda: emitted.append(1))
+
+    def _edit(result, edits):
+        def _exec(dlg):
+            edits(dlg)
+            dlg._refresh()
+            return result
+        monkeypatch.setattr(CdsSettingsDialog, "exec", _exec)
+
+    def _accepted_edits(dlg):
+        dlg._pick_bit(3)
+        dlg.drive_type[2] = CDS_DRIVE_SPECIAL   # as an accepted CdsDriveTypeDialog would
+        dlg.guard[1] = CDS_GUARD_G1             # ...and an accepted CdsGuardDialog
+        dlg.tail[3] = 2
+        dlg.end_drive_early[4] = 1
+        dlg.enforce_handover = not dlg.enforce_handover
+
+    handover_before = panel._cfg.enforce_cds_handover
+    _edit(1, _accepted_edits)
+    panel._open_cds_settings_dialog()
+    assert emitted == [1]
+    assert panel._cfg.cds_bit_width == 3
+    assert panel._cfg.cds_drive_type[2] == CDS_DRIVE_SPECIAL
+    assert panel._cfg.cds_guard[1] == CDS_GUARD_G1
+    assert panel._cfg.cds_tail[3] == 2
+    assert panel._cfg.cds_end_drive_early[4] == 1
+    assert panel._cfg.enforce_cds_handover is (not handover_before)
     panel._update_cds_settings_row()
 
     tip = btn.toolTip()
@@ -225,19 +240,26 @@ def test_cds_settings_dialog_owns_every_cds_field():
     assert panel._cfg.cds_guard_enabled is True     # still derived, still read-only
 
     # (2) A CANCELLED outer dialog discards an inner accepted change.
-    before_guard = list(panel._cfg.cds_guard)
-    before_drive = list(panel._cfg.cds_drive_type)
-    dlg2 = CdsSettingsDialog(panel, bit_width=panel._cfg.cds_bit_width,
-                             drive_type=list(panel._cfg.cds_drive_type),
-                             end_drive_early=list(panel._cfg.cds_end_drive_early),
-                             enforce_handover=panel._cfg.enforce_cds_handover,
-                             guard=list(panel._cfg.cds_guard),
-                             tail=list(panel._cfg.cds_tail))
-    dlg2.guard[4] = CDS_GUARD_G1
-    dlg2.drive_type[5] = CDS_DRIVE_SPECIAL
-    dlg2.reject()
-    assert panel._cfg.cds_guard == before_guard, "a cancelled dialog wrote through"
-    assert panel._cfg.cds_drive_type == before_drive
+    before = (panel._cfg.cds_bit_width, list(panel._cfg.cds_drive_type),
+              list(panel._cfg.cds_end_drive_early), panel._cfg.enforce_cds_handover,
+              list(panel._cfg.cds_guard), list(panel._cfg.cds_tail))
+
+    def _cancelled_edits(dlg):
+        dlg._pick_bit(5)
+        dlg.guard[4] = CDS_GUARD_G1
+        dlg.drive_type[5] = CDS_DRIVE_SPECIAL
+        dlg.tail[6] = 3
+        dlg.end_drive_early[7] = 1
+        dlg.enforce_handover = not dlg.enforce_handover
+
+    emitted_before = len(emitted)
+    _edit(0, _cancelled_edits)
+    panel._open_cds_settings_dialog()
+    assert len(emitted) == emitted_before, "a cancelled dialog announced a change"
+    assert before == (panel._cfg.cds_bit_width, list(panel._cfg.cds_drive_type),
+                      list(panel._cfg.cds_end_drive_early), panel._cfg.enforce_cds_handover,
+                      list(panel._cfg.cds_guard), list(panel._cfg.cds_tail)), \
+        "a cancelled dialog wrote through"
 
 
 def test_cds_dialogs_are_laid_out_within_their_own_bounds():
@@ -733,8 +755,8 @@ def test_special_drive_labels_the_cds_cells_and_defeats_the_render_cache():
 def test_cds_end_drive_early_is_per_source_through_both_engines():
     """CDS_EndDriveEarly (registers.json CDS 0x87 bit 4), the second per-device CDS field.
 
-    0 = drive the CDS bit the full UI, 1 = stop half a UI early (mandatory on PHY3). Per
-    source because the register is in each device's own CDS block, exactly like the drive
+    0 = drive the CDS bit the full UI, 1 = stop before the end of the last UI (mandatory on
+    PHY3). Per source because the register is in each device's own CDS block, exactly like the drive
     type — so this asserts the same round-trips through both CSV engines.
 
     THE TWO NEIGHBOURS DEFAULT OPPOSITELY RELATIVE TO THEIR RESETS, and that is the trap
@@ -1065,3 +1087,32 @@ def test_the_cds_cell_shows_both_flags_on_a_second_line_and_widens_only_itself()
     assert flagged._cds_label(1) == "CDS\nSPx EDEx"
     assert flagged._cds_label(2) == "CDS x2\nSPx EDEx"
     assert plain._cds_label(2) == "CDS x2"
+
+
+def test_a_group_separator_cannot_be_typed_into_a_numeric_cell_and_never_breaks_commit():
+    """A thousands separator is not accepted by the numeric cells, and `commit_edits` (which
+    Save, Export and Compare call first) reads a cell holding text that is not a plain
+    number without raising, keeping the model's value."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.ui.authoring.authoring_panel import AuthoringPanel
+
+    QApplication.instance() or QApplication([])
+    panel = AuthoringPanel()
+    cell = panel._dp_num["interval"][0]
+    cell.clear()
+    QTest.keyClicks(cell, "1,000")
+    assert cell.text() == "1000"
+    state, _text, _pos = cell.validator().validate("1,000", 5)
+    assert state != cell.validator().State.Acceptable
+    panel.commit_edits()
+    assert panel._cfg.dataports[0].interval == 1000
+
+    panel._cfg.dataports[0].interval = 7
+    cell.setText("1,000")                    # text the validator never saw
+    panel._dp_num["offset"][1].setText("12")
+    panel.commit_edits()                     # must not raise
+    assert panel._cfg.dataports[0].interval == 7
+    assert panel._cfg.dataports[1].offset == 12, "one bad cell must not stop the later ones"

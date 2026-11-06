@@ -144,12 +144,28 @@ class BusModelBuilder:
         # "The swviz reference model is a published spec deliverable").
         self._transport_counts: dict[int, int] = {}
 
+        # EnableCh_REG values wider than the register, by DP index, held while a build runs
+        # on the 16-bit placement mask and put back when it ends.
+        self._wide_enable_ch: dict[int, int] = {}
+
     def build(self) -> BusModel:
         """Build the complete bus model.
+
+        The interface's configuration is left as it was given: a port's EnableCh_REG is
+        masked to the register's 16 bits for the duration of the build only.
 
         Returns:
             BusModel with all bits and clash information
         """
+        try:
+            return self._build()
+        finally:
+            for dp_index, value in self._wide_enable_ch.items():
+                self.interface.data_ports[dp_index].config.EnableCh_REG = value
+            self._wide_enable_ch.clear()
+
+    def _build(self) -> BusModel:
+        """Run the build steps; build() restores the masked registers afterwards."""
         self.logger.info(f'Building bus model: {self.num_rows} rows x {self.interface.num_columns} columns')
 
         # 0. Validate interface configuration
@@ -164,6 +180,8 @@ class BusModelBuilder:
                 if self._is_target_device(dp_index, device):
                     if self.viz_config.data_ports[dp_index].enabled:
                         self._process_data_port(dp_index, dp)
+
+        self._report_unplaced_data_ports()
 
         # 3. Generate visualizer handovers (post-processing to avoid DRQ collisions)
         self._generate_viz_handovers()
@@ -215,6 +233,29 @@ class BusModelBuilder:
 
         return self.bus_model
 
+    def _report_unplaced_data_ports(self) -> None:
+        """Report the drawn data ports whose device number names no device.
+
+        The placement loop visits the Manager and Devices 0-11 only, so a port on any
+        other device number is never placed. Its validation result (the DeviceNumber
+        range check) is recorded so the port is not dropped silently."""
+        for dp_index, dp in enumerate(self.interface.data_ports):
+            if (self._is_placed(dp_index)
+                    or not self.viz_config.data_ports[dp_index].enabled):
+                continue
+            result = self._dp_validator.validate(dp, dp_index)
+            self.logger.warning(f'DP{dp_index} is on device '
+                                f'{self.interface.get_dp_device(dp_index)} and is not drawn')
+            self.bus_model.warnings.validation_issues.append((f"DP{dp_index}", result))
+
+    def _is_placed(self, dp_index: int) -> bool:
+        """True when the data port's device number names a device the build places
+        (the Manager and Devices 0-11). A port on any other number is reported by
+        _report_unplaced_data_ports and skipped by every placement-derived detector."""
+        return (SpecialDevices.MANAGER
+                <= self.interface.get_dp_device(dp_index)
+                <= DataPortRanges.MAX_DEVICE_NUMBER)
+
     def _is_target_device(self, dp_index: int, device: int) -> bool:
         """Check if data port belongs to the target device.
 
@@ -225,10 +266,7 @@ class BusModelBuilder:
         Returns:
             True if data port belongs to this device
         """
-        dp_device = self.interface.get_dp_device(dp_index)
-        if device == SpecialDevices.MANAGER:
-            return dp_device == SpecialDevices.MANAGER
-        return dp_device == device
+        return self.interface.get_dp_device(dp_index) == device
 
     def _validate_interface(self) -> None:
         """Validate interface configuration settings.
@@ -272,6 +310,16 @@ class BusModelBuilder:
 
         self.logger.debug(f'PHY3 system slots: min_columns_needed={min_columns_needed}, '
                         f'num_columns={self.interface.num_columns}')
+        if min_columns_needed > self.interface.num_columns:
+            from ..utils.validators import ErrorSeverity, ValidationResult
+            result = ValidationResult()
+            result.add_error(
+                'System slot layout',
+                f'The PHY3 system slots need {min_columns_needed} columns but the frame has '
+                f'{self.interface.num_columns}; slots that do not fit overlap or are cut off',
+                severity=ErrorSeverity.ERROR
+            )
+            self.bus_model.warnings.validation_issues.append(('System slot layout', result))
 
         # S0 columns (at right edge)
         for col_offset in range(self.interface.s0_width):
@@ -382,11 +430,11 @@ class BusModelBuilder:
             from ..utils.validators import ErrorSeverity, ValidationResult
             result = ValidationResult()
             result.add_error(
-                'PHY3 Layout',
+                'System slot layout',
                 f'{slot_type.name} slot at column {column} is outside frame boundary (0-{self.interface.num_columns - 1})',
                 severity=ErrorSeverity.ERROR
             )
-            self.bus_model.warnings.validation_issues.append(('PHY3 Truncation', result))
+            self.bus_model.warnings.validation_issues.append(('System slot truncation', result))
             self.logger.warning(f'_add_column_bits: column {column} out of bounds [0, {self.interface.num_columns}) - slot truncated')
             return
 
@@ -401,7 +449,7 @@ class BusModelBuilder:
                 device=device,
                 dp=None,  # System slot
             )
-            self.bus_model.add_bit(bit_info)
+            self.bus_model.add_bit(bit_info, track_clashes=False)
 
             # Register with clash detector. _add_column_bits is only ever
             # used for system (CDS/S0/S1) slots, never per-data-port guards
@@ -412,7 +460,7 @@ class BusModelBuilder:
             elif slot_type == SlotType.TAIL:
                 self.clash_detector.check_tail_clash(row, column, device, is_cds=True)
             elif slot_type == SlotType.HANDOVER:
-                self.clash_detector.add_handover(row, column, device, [], is_cds=True)
+                self.clash_detector.add_handover(row, column, device, is_cds=True)
             else:
                 self.clash_detector.add_write(row, column, device)
 
@@ -558,6 +606,11 @@ class BusModelBuilder:
             # Store validation issues in bus_model for later display
             self.bus_model.warnings.validation_issues.append((f"DP{dp_index}", validation_result))
         # Continue processing - don't return early (real hardware has no validators)
+        # The placement counts and indexes channels over the 16 bits EnableCh_REG holds; the
+        # validator has reported any wider value. build() restores the caller's value.
+        if dp.config.EnableCh_REG >> 16:
+            self._wide_enable_ch[dp_index] = dp.config.EnableCh_REG
+            dp.config.EnableCh_REG &= 0xFFFF
 
         self.logger.debug(f'Processing data port DP{dp_index}')
 
@@ -717,7 +770,7 @@ class BusModelBuilder:
         # other slot type `direction` is derived from PortDirection_REG, so the two agree.
         clash_type = ClashType.NONE
         if direction == DirectionType.SOURCE:
-            has_clash, _, suppress_slots = self.clash_detector.check_write_clash(row, column, device)
+            has_clash, suppress_slots = self.clash_detector.check_write_clash(row, column, device)
             if has_clash:
                 clash_type = self._get_clash_type(bit_index)
             # If same-device guard and/or tail need suppressing, remove them from bus_model.
@@ -777,7 +830,7 @@ class BusModelBuilder:
             port_mode=dp.config.PortMode_REG,  # For test mode display
             scrambler_enabled=dp.config.ScramblerEn_REG,  # For scrambler indicator
         )
-        self.bus_model.add_bit(bit_info)
+        self.bus_model.add_bit(bit_info, track_clashes=False)
 
     def _add_guard_bit(self, row: int, column: int, dp_index: int, dp: DataPort,
                        device: int, bit_slot) -> None:
@@ -805,7 +858,7 @@ class BusModelBuilder:
                 dp=dp_index,
                 clash=clash_type,
             )
-            self.bus_model.add_bit(bit_info)
+            self.bus_model.add_bit(bit_info, track_clashes=False)
 
     def _add_tail_bit(self, row: int, column: int, dp_index: int, dp: DataPort,
                       device: int, bit_slot) -> bool:
@@ -831,7 +884,7 @@ class BusModelBuilder:
                 dp=dp_index,
                 clash=clash_type,
             )
-            self.bus_model.add_bit(bit_info)
+            self.bus_model.add_bit(bit_info, track_clashes=False)
             return True
         return False
 
@@ -853,14 +906,9 @@ class BusModelBuilder:
         peripheral 0-11) — the HANDOVER slot type already marks it implicit/non-physical,
         so no separate sentinel device is used.
         """
-        total_bits = self.num_rows * self.interface.num_columns
-
         # Iterate every recorded potential handover (no filtering).
         for start_row, start_column, dp_number in self._potential_handovers:
             bit_index = self.bus_model.bit_index(start_row, start_column)
-
-            if bit_index >= total_bits:
-                continue  # Don't place past end of frame
 
             dp_device = self.interface.get_dp_device(dp_number)   # real driver of this port
 
@@ -882,7 +930,7 @@ class BusModelBuilder:
                         dp=dp_number,
                         clash=ClashType.NONE,
                     )
-                    self.bus_model.add_bit(bit_info)
+                    self.bus_model.add_bit(bit_info, track_clashes=False)
                     continue
 
                 # There are non-handover bits - check clash rules
@@ -930,7 +978,7 @@ class BusModelBuilder:
                     dp=dp_number,
                     clash=clash_type,
                 )
-                self.bus_model.add_bit(bit_info)
+                self.bus_model.add_bit(bit_info, track_clashes=False)
                 continue
 
             # Position is empty - place handover without clash
@@ -942,7 +990,7 @@ class BusModelBuilder:
                 dp=dp_number,
                 clash=ClashType.NONE,
             )
-            self.bus_model.add_bit(bit_info)
+            self.bus_model.add_bit(bit_info, track_clashes=False)
 
     def _group_bits_by_index(self) -> dict:
         """Group all bits in the bus model by their bit_index.
@@ -1012,6 +1060,7 @@ class BusModelBuilder:
         A mismatch occurs when a source data port with scrambler enabled writes
         to a bit position that a sink data port without scrambler reads, or vice versa.
         """
+        warned = set(self.bus_model.warnings.scrambler_mismatches)
         # Check each position for source/sink scrambler mismatches
         for bit_index, bits in bits_by_index.items():
             # Find source and sink bits at this position (only DATA data bits)
@@ -1026,7 +1075,8 @@ class BusModelBuilder:
                     if source.scrambler_enabled != sink.scrambler_enabled:
                         # Mismatch found: (bit_index, source_dp, sink_dp)
                         mismatch = (bit_index, source.dp, sink.dp)
-                        if mismatch not in self.bus_model.warnings.scrambler_mismatches:
+                        if mismatch not in warned:
+                            warned.add(mismatch)
                             self.bus_model.warnings.scrambler_mismatches.append(mismatch)
                             self.logger.debug(
                                 f'Scrambler mismatch at bit {bit_index}: '
@@ -1038,10 +1088,10 @@ class BusModelBuilder:
         """Detect test mode mismatches between data ports at the same bit position.
 
         A mismatch occurs when:
-        - One data port is in test mode (test ones or test zeros) while another is in normal mode
-        - Two data ports are in different test modes (test ones vs test zeros)
+        - One data port is in a test mode (Test0 or Test1) while another is in normal mode
+        - Two data ports are in different test modes (Test0 vs Test1)
         """
-
+        warned = set(self.bus_model.warnings.test_mode_mismatches)
         # Check each position for test mode mismatches
         for bit_index, bits in bits_by_index.items():
             # Get all data port bits at this position (only DATA data bits)
@@ -1064,7 +1114,8 @@ class BusModelBuilder:
                     if bit1.port_mode != bit2.port_mode:
                         # Mismatch found: (bit_index, (dp1, mode1), (dp2, mode2))
                         mismatch = (bit_index, (bit1.dp, bit1.port_mode), (bit2.dp, bit2.port_mode))
-                        if mismatch not in self.bus_model.warnings.test_mode_mismatches:
+                        if mismatch not in warned:
+                            warned.add(mismatch)
                             self.bus_model.warnings.test_mode_mismatches.append(mismatch)
                             self.logger.debug(
                                 f'Test mode mismatch at bit {bit_index}: '
@@ -1082,7 +1133,7 @@ class BusModelBuilder:
         """
         num_columns = self.interface.num_columns
         for dp_index, dp in enumerate(self.interface.data_ports):
-            if not dp.config._drq_enabled:
+            if not dp.config._drq_enabled or not self.viz_config.data_ports[dp_index].enabled:
                 continue
             fcp_config = self.interface.flow_control_ports[dp_index].config
             last_ui_column = fcp_config.FCP_HorizontalStart_REG + fcp_config.FCP_BitWidth_REG
@@ -1104,7 +1155,7 @@ class BusModelBuilder:
         Compares expected bits per interval against actual bits placed in the
         bus model.
         """
-        from ..models.enums import FlowMode, SlotType
+        from ..models.enums import SlotType
 
         # Pre-group bits by DP index so each DP iterates only its own bits
         # instead of the full bus-model list (O(N) vs O(N x DPs)).
@@ -1115,7 +1166,7 @@ class BusModelBuilder:
             bits_by_dp.setdefault(bit_info.dp, []).append(bit_info)
 
         for dp_index, dp in enumerate(self.interface.data_ports):
-            if not self.viz_config.data_ports[dp_index].enabled:
+            if not self.viz_config.data_ports[dp_index].enabled or not self._is_placed(dp_index):
                 continue
 
             # Use popcount _num_channels property for performance
@@ -1129,7 +1180,7 @@ class BusModelBuilder:
 
             # Bits per channel (includes TxP if applicable)
             bits_per_channel = sample_size
-            if dp.config.FlowMode_REG in (FlowMode.TX_CONTROLLED, FlowMode.ASYNC):
+            if dp.config._txp_enabled:
                 bits_per_channel += 1  # TxP bit per channel
 
             # Wide bits (BitWidth_REG > 0) hold each DATA/TX_PRESENT bit for
@@ -1184,6 +1235,7 @@ class BusModelBuilder:
         they should have matching sample and bit numbers (channels may differ).
         A mismatch indicates a configuration error.
         """
+        warned = set(self.bus_model.warnings.sample_bit_mismatches)
         # Check each position for source/sink sample/bit mismatches
         for bit_index, bits in bits_by_index.items():
             # Find source and sink DATA data bits at this position
@@ -1202,7 +1254,8 @@ class BusModelBuilder:
                             source.dp, source.sample, source.bit,
                             sink.dp, sink.sample, sink.bit
                         )
-                        if mismatch not in self.bus_model.warnings.sample_bit_mismatches:
+                        if mismatch not in warned:
+                            warned.add(mismatch)
                             self.bus_model.warnings.sample_bit_mismatches.append(mismatch)
                             self.logger.warning(
                                 f'Sample/bit mismatch at bit {bit_index}: '
@@ -1222,7 +1275,7 @@ class BusModelBuilder:
 
         for dp_index, dp in enumerate(self.interface.data_ports):
             dp_viz = self.viz_config.data_ports[dp_index]
-            if not dp_viz.enabled:
+            if not dp_viz.enabled or not self._is_placed(dp_index):
                 continue
 
             # Check if it's a sink (PortDirection_REG = True means SINK)
@@ -1253,8 +1306,8 @@ class BusModelBuilder:
         Such a data port is enabled for drawing but emits nothing.
         """
         for dp_index, dp in enumerate(self.interface.data_ports):
-            if not self.viz_config.data_ports[dp_index].enabled:
-                continue  # Not enabled, no warning needed
+            if not self.viz_config.data_ports[dp_index].enabled or not self._is_placed(dp_index):
+                continue  # Not enabled or not placed, no warning needed
 
             # Use popcount _num_channels property for performance
             if dp.config._num_channels > 0:

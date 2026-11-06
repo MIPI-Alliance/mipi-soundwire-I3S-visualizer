@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from .port_names import port_label
 from .row_origin import RowOriginMixin
-from .theme import analyzer_stylesheet
+from .theme import VizTheme, analyzer_stylesheet
 
 _COLS = ["Row", "Time (µs)", "Port", "Binary", "Hex", "Decimal"]
 _OPS = ["—", "≤", "<", "=", "≠", "≥", ">"]        # "—" = no value filter
@@ -96,10 +96,24 @@ class _MultiSelect(QToolButton):
 
 
 def _binary(value: int, bits: int) -> str:
+    """`value` in `bits` bits, in groups of four from the LSB (a short group at the MSB end),
+    so each group is one digit of `_hex`."""
     bits = max(1, int(bits))
     b = format(int(value) & ((1 << bits) - 1), f"0{bits}b")
-    return " ".join(b[max(0, len(b) - i - 4):len(b) - i]
-                    for i in range(len(b) - 4, -4, -4)).strip() or b
+    head = len(b) % 4
+    return " ".join(([b[:head]] if head else []) + [b[i:i + 4] for i in range(head, len(b), 4)])
+
+
+def _parse_whole(text: str) -> int:
+    """A whole number as typed: decimal (leading zeros allowed), or with a 0x / 0o / 0b
+    prefix, ASCII digits only and no digit-group underscores. Raises ValueError for anything
+    else."""
+    if not text.isascii() or "_" in text:
+        raise ValueError(text)
+    try:
+        return int(text, 0)
+    except ValueError:
+        return int(text, 10)
 
 
 def _hex(value: int, bits: int) -> str:
@@ -152,6 +166,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         self._val_edit.setPlaceholderText("value")
         self._val_edit.setFixedWidth(90)
         self._val_edit.editingFinished.connect(self.filtersChanged.emit)
+        self._val_edit.textChanged.connect(lambda _t: self.check_value())
+        self._op_cb.currentIndexChanged.connect(lambda _i: self.check_value())
         bar = QHBoxLayout()
         bar.setContentsMargins(4, 2, 4, 0)
         bar.addWidget(QLabel("Port:"))
@@ -184,6 +200,10 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         lay.addWidget(self._table)
 
     # ---- configuration ----
+    def table_viewport(self) -> QWidget:
+        """The viewport of the sample table, for a note laid over it."""
+        return self._table.viewport()
+
     def set_sample_rate(self, rate_hz: float) -> None:
         self._rate = float(rate_hz or 0.0)
 
@@ -211,18 +231,33 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         (op, threshold) or None. Consumed by Session.samples_around."""
         ports = self._port_cb.selected() or None
         channels = self._chan_cb.selected() or None
-        pred = None
+        return ports, channels, self._value_filter()[0]
+
+    def _value_filter(self):
+        """((op, threshold) or None, whether the value box holds text that is not a whole
+        number)."""
         op = _OP_MAP.get(self._op_cb.currentText())
         txt = self._val_edit.text().strip()
-        if op and txt:
-            try:
-                pred = (op, int(txt, 0))
-            except ValueError:
-                pred = None
-        return ports, channels, pred
+        if not (op and txt):
+            return None, False
+        try:
+            return (op, _parse_whole(txt)), False
+        except ValueError:
+            return None, True
+
+    def check_value(self) -> bool:
+        """Mark the value box when its text is not a whole number (the filter is then not
+        applied); clear the mark otherwise. True when the box reads. Run on every edit and
+        after the box is set programmatically."""
+        bad = self._value_filter()[1]
+        self._val_edit.setStyleSheet(f"border: 1px solid {VizTheme.SEM_ERROR};" if bad else "")
+        self._val_edit.setToolTip("Not a whole number: the value filter is not applied."
+                                  if bad else "")
+        return not bad
 
     def retheme(self) -> None:
         self.setStyleSheet(analyzer_stylesheet())
+        self.check_value()
         self.set_lanes(list(self._lane_colors))
         self.set_samples(self._samples)
 
@@ -239,13 +274,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         passes `redraw=False`: set_lanes and set_samples fill the new Link next."""
         self._stream_names = dict(names or {})
         if redraw and self._lane_colors:
-            keep = self._port_cb.selected()
-            self.set_lanes(list(self._lane_colors))
-            if keep:
-                for act in self._port_cb._menu.actions():
-                    if isinstance(act.data(), (tuple, list)):
-                        act.setChecked(tuple(act.data()) in set(keep))
-                self._port_cb._update_text()
+            self.set_lanes(list(self._lane_colors))     # the port selection is kept
             self.set_samples(self._samples)
 
     # ---- data ----
@@ -315,7 +344,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
 
     def append_samples(self, samples: List[dict]) -> int:
         """Extend the window at the BOTTOM (scrolled to the end): add rows in place —
-        O(added), no full rebuild, no scroll disruption. Columns keep their sizes.
+        O(added), no full rebuild, the same rows in view (the scrollbar follows an
+        eviction). Columns keep their sizes.
         Caps the loaded window at `_MAX_LOADED`, evicting an equal-size chunk from the
         TOP (the opposite end) when it would grow past that — so a long scroll in one
         direction doesn't accumulate an unbounded number of rows/items. Returns the
@@ -325,6 +355,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         if not rows:
             return 0
         t = self._table
+        top_before = t.verticalScrollBar().value()
         base = len(self._samples)
         self._samples.extend(rows)
         prev = self._suppress_scroll
@@ -348,6 +379,13 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             self._suppress_scroll = prev
             self._suppress_select = prev_sel
         self._rebuild_starts()
+        if evicted:                           # the rows above went: keep the same content in view
+            sb = t.verticalScrollBar()
+            self._suppress_scroll = True
+            try:
+                sb.setValue(max(0, top_before - evicted))
+            finally:
+                self._suppress_scroll = prev
         return evicted
 
     def prepend_samples(self, samples: List[dict]) -> int:
@@ -469,6 +507,3 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         return (int(self._samples[0]["start_sample"]),
                 int(self._samples[-1]["start_sample"]))
 
-    @property
-    def sample_count(self) -> int:
-        return self._table.rowCount()

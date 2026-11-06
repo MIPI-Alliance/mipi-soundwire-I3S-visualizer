@@ -14,6 +14,8 @@ from test_stream_processing import _store, _tone
 
 from swi3s_studio.store.audio_store import StreamProcessing
 
+pytestmark = pytest.mark.gui
+
 _PROCESS = "Filter && Gain…"
 
 

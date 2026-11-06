@@ -21,6 +21,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
+pytestmark = pytest.mark.gui
+
 
 def _region(sess, cols):
     """(start, end, ui_hz, row_hz) of `sess`'s region running `cols` columns."""

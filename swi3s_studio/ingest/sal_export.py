@@ -55,8 +55,10 @@ import zipfile
 
 import numpy as np
 
+from ..fsutil import write_whole
 from . import saleae_binary
 from .capture import Capture
+from .saleae_sal import MAX_WINDOW_END
 
 # Deterministic namespace so a given (channel, name) always yields the same row id
 # (reproducible exports / golden tests) while still being a valid UUID for Logic.
@@ -229,6 +231,11 @@ def export_sal(capture: Capture, path: str, *,
     trailing gap to one shared capture-end sample so Logic sees a single timeline
     length. The result also round-trips exactly through
     `saleae_sal.load_capture(path, clock_channel, data_channel)`.
+
+    ValueError for equal channels, a sample rate of 0 or less, an edge at or past sample
+    2**62, or two edges of one channel on one sample. The project is written to a
+    temporary file beside `path` and replaces it only when complete, so a failure leaves
+    an existing `path` as it was.
     """
     if clock_channel == data_channel:
         raise ValueError(f"clock_channel and data_channel must differ (both {clock_channel})")
@@ -238,7 +245,10 @@ def export_sal(capture: Capture, path: str, *,
 
 
 def _write_sal(path: str, rate: int, channels) -> None:
-    """The .sal writer: `channels` is [(channel, name, initial_level, edges), ...]."""
+    """The .sal writer: `channels` is [(channel, name, initial_level, edges), ...]. An edge
+    at or past sample `MAX_WINDOW_END` (the end of the window the loader reads) raises
+    ValueError before anything is written. The archive is written through
+    `fsutil.write_whole`: built in a new file beside `path` and moved over it once complete."""
     if rate <= 0:
         raise ValueError(f"export_sal: capture.sample_rate_hz must be > 0 (got {rate})")
     blobs = [(ch, name, bool(init), np.ascontiguousarray(edges, dtype=np.uint64))
@@ -249,19 +259,26 @@ def _write_sal(path: str, rate: int, channels) -> None:
     for _ch, _name, _init, edges in blobs:
         if edges.size:
             last_edge = max(last_edge, int(edges[-1]))
+    if last_edge >= MAX_WINDOW_END:
+        raise ValueError(f"export_sal: the edge at sample {last_edge:,} is past the "
+                         f"{MAX_WINDOW_END:,} samples a .sal holds")
     capture_end = last_edge + 1
 
     # Synthetic capture: no wall-clock time. Use a fixed epoch so exports are
     # reproducible (byte-identical goldens); Logic only uses it for a display label.
     unix_ms, frac_ms = 0, 0.0
 
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as z:
-        z.writestr("meta.json", _meta_json(rate, [(ch, name) for ch, name, _i, _e in blobs],
-                                           unix_ms, frac_ms, capture_end))
-        for ch, _name, init, edges in blobs:
-            z.writestr(f"digital-{ch}.bin",
-                       saleae_binary.build_logic2_channel_v3(
-                           init, edges, sample_rate_hz=rate,
-                           unix_ms=unix_ms, frac_ms=frac_ms, capture_end=capture_end))
-        z.writestr("trigger-store.bin", _TRIGGER_STORE)   # required by Logic to open
+    def write(f) -> None:
+        with zipfile.ZipFile(f, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+            z.writestr("meta.json",
+                       _meta_json(rate, [(ch, name) for ch, name, _i, _e in blobs],
+                                  unix_ms, frac_ms, capture_end))
+            for ch, _name, init, edges in blobs:
+                z.writestr(f"digital-{ch}.bin",
+                           saleae_binary.build_logic2_channel_v3(
+                               init, edges, sample_rate_hz=rate,
+                               unix_ms=unix_ms, frac_ms=frac_ms, capture_end=capture_end))
+            z.writestr("trigger-store.bin", _TRIGGER_STORE)   # required by Logic to open
+
+    write_whole(path, write)
 

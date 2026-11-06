@@ -27,7 +27,13 @@ promotes). A data port's commit group is its CommitGroupMemb as the bus left it 
 Commit. A write to the _CURR alias sets _NEXT too (Dual-Curr-is-RW, "Register Access Type"
 table), so the history of a _NEXT alias also lists the writes to its _CURR alias (access
 "Write (CURR)"), and a later Commit promotes that value. A CDS register's _CURR alias is
-read-only (Dual-CURR-RO): a write to it is listed and changes nothing.
+read-only (Dual-CURR-RO): a write to it is listed in both histories, not applied, with the
+status "read-only _CURR alias: no effect", and changes nothing. A write to a register of
+access RO is listed, not applied, with the status "read-only register: no effect"; both are
+programming errors (`RegisterMap.read_only`); the other bytes of the same write keep their own
+status. A write to a register with write-1-to-clear
+(RW1C) bits clears each bit it writes 1 and keeps each it writes 0, and its access names
+that provenance: "Write (cleared by write)".
 
 A Commit promotes the devices its device mask selects, none when the mask is 0 (Section
 8.1.1.5.1, "Commit Phase for SSCR and DSCR Commands" table), as the register model does. A
@@ -51,7 +57,7 @@ from ..model.registers import (
     RegisterMap,
     selects_one_device,
 )
-from .errors import command_error
+from .errors import READ_ONLY_WRITE_MSG, command_error
 from .responses import peripheral_response_name, response_summary
 
 _READS = ("ReadA32", "ReadData")
@@ -70,7 +76,8 @@ class RegisterEvent:
     bus_row: int
     access: str                 # "Write", "Read", "Read (deferred delivery)" or "Commit";
                                 # "NEXT" in the brackets marks a _CURR register's _NEXT alias,
-                                # "CURR" a _NEXT register's _CURR alias
+                                # "CURR" a _NEXT register's _CURR alias, "cleared by write"
+                                # a write to a register with RW1C bits
     value: Optional[int]        # the byte at the address, when the command carried it
     applied: bool               # the register model took it (see the module docstring)
     status: str                 # "OK", or what went wrong
@@ -102,9 +109,26 @@ def _status(cmd: dict, access: str) -> str:
     if access == "Commit" and not cmd.get("commit_confirmed"):
         problems.append(name if name == "COMMIT_NOT_READY" else "not confirmed")
     other = command_error(cmd)
-    if other and other != "CRC error" and all(other not in p for p in problems):
+    # The read-only flag belongs to the whole write; each byte's own note says whether
+    # that byte was the read-only one, so a byte that landed stays "OK".
+    if (other and other not in ("CRC error", READ_ONLY_WRITE_MSG)
+            and all(other not in p for p in problems)):
         problems.append(other)
     return "; ".join(problems) or "OK"
+
+
+_READ_ONLY_CURR = "read-only _CURR alias: no effect"
+_READ_ONLY = "read-only register: no effect"
+_CLEARED = "cleared by write"
+
+
+def _read_only_note(rmap: RegisterMap, address: int) -> str:
+    """The status note for a write to `address` when the register model leaves it unchanged
+    (`RegisterMap.read_only`), else ""."""
+    if not rmap.read_only(address):
+        return ""
+    res = rmap.resolve(address)
+    return _READ_ONLY if res is not None and res.rank == "single" else _READ_ONLY_CURR
 
 
 def _rank_delta(rmap: RegisterMap, address: int, rank: str) -> Optional[int]:
@@ -140,17 +164,22 @@ def _commit_group(rmap: RegisterMap, staged: DeviceRegisterFile, next_addr: int)
     return staged.value(addr) or _CG0
 
 
-def _access(op: str, rank: str) -> str:
-    notes = ([rank] if rank else []) + (["deferred delivery"] if op == "ReadData" else [])
+def _access(op: str, rank: str, cleared: bool = False) -> str:
+    notes = (([rank] if rank else []) + (["deferred delivery"] if op == "ReadData" else [])
+             + ([_CLEARED] if cleared else []))
     kind = "Write" if op == "WriteA32" else "Read"
     return f"{kind} ({', '.join(notes)})" if notes else kind
 
 
-def _event(i: int, cmd: dict, access: str, value: Optional[int], applied: bool) -> RegisterEvent:
+def _event(i: int, cmd: dict, access: str, value: Optional[int], applied: bool,
+           note: str = "") -> RegisterEvent:
+    status = _status(cmd, access)
+    if note:
+        status = note if status == "OK" else f"{status}; {note}"
     return RegisterEvent(
         command_index=i, start_sample=int(cmd.get("start_sample", 0)),
         bus_row=int(cmd.get("bus_row", 0)), access=access, value=value,
-        applied=applied, status=_status(cmd, access), response=response_summary(cmd))
+        applied=applied, status=status, response=response_summary(cmd))
 
 
 def register_history(commands: List[dict], device: int, address: int,
@@ -222,6 +251,10 @@ def register_history(commands: List[dict], device: int, address: int,
             if rank == "CURR" and op != "WriteA32":
                 continue                              # a _CURR read leaves _NEXT as it is
             if base <= target < base + span:
-                out.append(_event(i, cmd, _access(op, rank),
-                                  payload[target - base] if payload else None, applied))
+                write = op == "WriteA32"
+                note = _read_only_note(rmap, target) if write else ""
+                cleared = write and bool(rmap.rw1c_mask(target))
+                out.append(_event(i, cmd, _access(op, rank, cleared),
+                                  payload[target - base] if payload else None,
+                                  applied and not note, note))
     return out

@@ -8,9 +8,21 @@
 
 -r requirements.txt
 
+# SPDX licence metadata in pyproject.toml needs setuptools 77 or later.
+setuptools>=77
 pytest>=8.0
-pytest-cov>=5.0      # the coverage floor CI enforces
+# tests/test_tooling_config.py reads the requirement files with it.
+packaging>=23
+pytest-cov>=7.0      # the coverage floor CI enforces
+# [tool.coverage.run] patch = ["subprocess"] (pyproject.toml) needs coverage 7.10 or later.
+coverage>=7.10
+pytest-xdist>=3.6    # the gate spreads its heaviest test files over workers
 ruff>=0.16
 # Pinned to the version tools/mypy_baseline.json records under "env": another mypy makes the
 # type ratchet NOT COMPARABLE. Change the two together.
 mypy==2.3.0
+
+# The offline core build (native/build_local.sh) compiles against the pybind11 headers of this
+# interpreter. `pip install ./native` builds in an isolated environment and takes the version
+# from native/pyproject.toml; keep the floor equal to that one.
+pybind11>=2.12

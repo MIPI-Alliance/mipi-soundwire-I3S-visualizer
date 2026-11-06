@@ -8,6 +8,7 @@ import pathlib
 import tempfile
 
 import numpy as np
+import pytest
 import swi3score
 from PySide6.QtWidgets import QApplication
 
@@ -15,6 +16,8 @@ from swi3s_studio.ingest import raw_export, transitions
 from swi3s_studio.ingest.capture import Capture
 from swi3s_studio.ingest.transitions import build_capture_from_levels
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 _app = QApplication.instance() or QApplication([])
 
@@ -93,7 +96,7 @@ def test_capture_export_dialog():
         dlg._start.setValue(2)
         dlg._end.setValue(10)
         rng = dlg.sample_range()
-        assert rng == (s.sample_at_bus_row(2), s.sample_at_bus_row(10))
+        assert rng == (s.sample_at_bus_row(2), s.sample_at_bus_row(11))      # To is inclusive
         assert rng[1] > rng[0]
 
 
@@ -126,7 +129,7 @@ def test_export_sal_tolerates_leading_zero_edge():
 
 def test_export_sal_with_range_on_dlv():
     """.sal export of a sub-range whose bounds land on DLV row-sync (RSP) edges does
-    not raise 'v3 delta must be >= 1' and round-trips."""
+    not raise 'v3 delta must be >= 1' and reads back as the same sub-range."""
     from swi3s_studio.ingest import saleae_sal
     cap = transitions.demo_capture(600, phy=3)
     s = Session(cap, dlv=True, forced_column_count=16)
@@ -135,7 +138,12 @@ def test_export_sal_with_range_on_dlv():
         p = os.path.join(d, "range.sal")
         s.export_sal(p, sample_range=rng)                             # must not raise
         c2 = saleae_sal.load_capture(p, 0, 1)
+    want = cap.subcapture(*rng)
     assert c2.clock_edges.size > 0
+    np.testing.assert_array_equal(c2.clock_edges.astype(np.int64), want.clock_edges.astype(np.int64))
+    np.testing.assert_array_equal(c2.data_edges.astype(np.int64), want.data_edges.astype(np.int64))
+    assert bool(c2.initial_clock) == bool(want.initial_clock)
+    assert bool(c2.initial_data) == bool(want.initial_data)
 
 
 def test_partial_dlv_grid_shows_frame():

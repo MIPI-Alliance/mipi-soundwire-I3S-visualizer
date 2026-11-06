@@ -87,6 +87,17 @@ class VizTheme:
     SCROLL_HANDLE: str
     SCROLL_HANDLE_HOVER: str
     HILITE_BG: str
+    DIAG_CLOCK: str
+    DIAG_DATA: str
+    DIAG_LEVEL: str
+    DIAG_GROUND: str
+    DIAG_TEXT: str
+    DIAG_DIM: str
+    DIAG_GUIDE: str
+    DIAG_OK: str
+    DIAG_BAD: str
+    DIAG_VALID: str
+    DIAG_KEEPER: str
     # Derived by apply_palette() rather than present in the palettes:
     GRID_BG: str
     SYM_COMMA: str
@@ -122,6 +133,14 @@ _DARK = {
     "SYM_KCODE": "#aa78d2", "SYM_UNKNOWN": "#c8c8c8",
     "SCROLL_HANDLE": "#5a6068", "SCROLL_HANDLE_HOVER": "#6f7680",
     "HILITE_BG": "#6f5410",
+    # The Timing page's term diagram: clock and data edges, a receiver's threshold, its offset
+    # ground, the text and the rails, the guides, a margin met and missed, a ramp's 80 % point
+    # and the keeper. Saturated and brighter than the shared marks, for a diagram read at a
+    # distance.
+    "DIAG_CLOCK": "#5aa2ff", "DIAG_DATA": "#3ddc84", "DIAG_LEVEL": "#a9bdff",
+    "DIAG_GROUND": "#2fb866", "DIAG_TEXT": "#f2f5f8", "DIAG_DIM": "#c3cad2",
+    "DIAG_GUIDE": "#9aa3ac", "DIAG_OK": "#8be05a", "DIAG_BAD": "#ff5c66",
+    "DIAG_VALID": "#ffc940", "DIAG_KEEPER": "#d59bff",
 }
 _LIGHT = {
     "WINDOW_BG": "#e7e9ec", "FRAME_BG": "#fafbfc", "ENTRY_BG": "#ffffff",
@@ -151,6 +170,10 @@ _LIGHT = {
     "SYM_KCODE": "#7d52b8", "SYM_UNKNOWN": "#888888",
     "SCROLL_HANDLE": "#b8bdc4", "SCROLL_HANDLE_HOVER": "#a0a6ad",
     "HILITE_BG": "#ffe7a3",
+    "DIAG_CLOCK": "#0050d8", "DIAG_DATA": "#007f37", "DIAG_LEVEL": "#0b2a7a",
+    "DIAG_GROUND": "#005c28", "DIAG_TEXT": "#111111", "DIAG_DIM": "#3a3a3a",
+    "DIAG_GUIDE": "#555555", "DIAG_OK": "#2a7a00", "DIAG_BAD": "#c00018",
+    "DIAG_VALID": "#9a6400", "DIAG_KEEPER": "#7b1fa2",
 }
 _PALETTES = {"dark": _DARK, "light": _LIGHT}
 
@@ -315,9 +338,8 @@ def analyzer_stylesheet() -> str:
     QTableView::item, QTreeView::item {{ padding: 1px 4px; }}
     QTreeView::branch:has-children:closed {{ image: url({_branch_svg("right")}); }}
     QTreeView::branch:has-children:open {{ image: url({_branch_svg("down")}); }}
-    /* A styled branch is painted without the selected row's fill (like ::item above), so
-       the arrow sat on a strip of panel colour: it takes the row's fill, and the arrow the
-       light shade of the row's white text. */
+    /* A selected branch takes the row's fill, and its arrow the light shade of the row's
+       white text. */
     QTreeView::branch:selected, QTreeView::branch:selected:!active {{
         background: {t.ACCENT};
     }}
@@ -459,11 +481,9 @@ def chrome_stylesheet() -> str:
         background: {t.FRAME_BG}; color: {t.TEXT};
         padding: 3px 6px; border: none; text-align: center;
     }}
-    /* NB: no `QDockWidget::close-button` QSS here on purpose, and the title bar is
-       replaced by a custom widget (_DockTitleBar in main_window). The native style
-       paints a pale button frame behind the X that a QSS `::close-button` background
-       can't suppress (QStyleSheetStyle re-renders the sub-control), so the close
-       button is owned + themed directly there instead. */
+    /* The dock title bar is a custom widget (_DockTitleBar in main_window), and its close
+       button is themed there: QSS cannot clear the native frame behind a
+       `QDockWidget::close-button`. */
     /* Each tab is a fully-rounded chip lifted a few px off both edges (top/bottom
        margin) so none of its corners are cut; deselected reads via dimmer text, selected
        via full text + an accent outline. */

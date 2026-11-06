@@ -11,18 +11,33 @@ UnsupportedSaleaeVersion with guidance to export Binary/CSV.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
 import sys
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from .. import import_notes
+from ..nputil import searchsorted
 from . import saleae_binary
 from .capture import Capture
+from .timebase import (
+    MAX_RATE_HZ,
+    TimeRangeError,
+    check_rate,
+    drop_nonfinite,
+    repeats,
+    require_distinct,
+    require_finite,
+    same_sample_note,
+    to_samples,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +96,6 @@ class SalCost:
             return self.est_peak_bytes
         return model.peak_bytes(int(window[0]), int(window[1]))
 
-    def fits_in(self, budget_bytes: int) -> bool:
-        return self.est_peak_bytes <= int(budget_bytes)
-
     def summary(self) -> str:
         def gb(n: int) -> str:
             return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
@@ -116,7 +128,7 @@ def estimate_cost(path: str, channels: Optional[List[int]] = None) -> SalCost:
     uncompressed = 0
     per_channel: Dict[int, int] = {}
     streamable = True
-    with zipfile.ZipFile(path) as z:
+    with _zip_errors(path), zipfile.ZipFile(path) as z:
         sizes = {i.filename: i.file_size for i in z.infolist()}
         for ch, name in info.digital_files.items():
             if ch not in want:
@@ -627,39 +639,6 @@ def _v3_span_streaming(fh, size: int, want_start: bool = False,
     return fail
 
 
-def capture_span_samples(path: str, channels: Optional[Sequence[int]] = None) -> int:
-    """Length of the capture in samples (0 if it can't be determined).
-
-    Read from the v3 block chain's last ``B_end`` by streaming block headers — no delta
-    decoding and no whole-blob `read()` — so it is safe to ask about a capture far too large
-    to open. v0 blobs have no such index and contribute 0.
-
-    ``channels`` restricts the walk to those device channels. **Pass it whenever the caller
-    knows which channels it will load.** Without it every digital channel in the archive is
-    walked, and on a compressed archive that is not cheap: the walk seeks with
-    ``ZipExtFile.seek()``, which for a DEFLATE member is implemented as read-and-discard
-    (and a backward seek re-reads from zero, as when a candidate start offset that walked
-    past the first 64 KiB fails).
-
-    Only STORED members get a true seek, which is why a test fixture written with
-    ``ZIP_STORED`` shows none of this — see `tests/test_sal_large_capture.py`.
-    """
-    info = read_info(path)
-    want = None if channels is None else {int(c) for c in channels}
-    best = 0
-    with zipfile.ZipFile(path) as z:
-        for ch, name in info.digital_files.items():
-            if want is not None and int(ch) not in want:
-                continue
-            try:
-                size = z.getinfo(name).file_size
-                with z.open(name) as fh:
-                    best = max(best, _v3_span_streaming(fh, size))
-            except Exception:
-                continue
-    return best
-
-
 def _v3_chains(path: str, info: "SalInfo", channels: Sequence[int]) -> Dict[int, tuple]:
     """``{channel: (chain_end, start_offset, largest block's run bytes, _BlockIndex,
     blob bytes)}`` from one header walk of each channel's blob
@@ -715,27 +694,101 @@ def _dig(meta: dict, *path, default=None):
     return cur
 
 
+# The largest meta.json read: a project's is a few hundred KB, and reading it is
+# bounded before anything is priced.
+_META_MAX_BYTES = 8 << 20
+
+
+def _whole_number(value) -> Optional[int]:
+    """`value` as an int when it is a whole number (an int of any size, an integral float,
+    or a string of either), else None. A bool, NaN, infinity and a fraction are not."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)                      # exact, whatever the size
+        except ValueError:
+            pass
+    try:
+        number = float(value) if isinstance(value, (float, str)) else None
+    except (ValueError, OverflowError):
+        return None
+    if number is None or number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(number) if number == int(number) else None
+
+
+@contextlib.contextmanager
+def _zip_errors(path: str, what: str = "a .sal capture"):
+    """Raise ValueError naming `path` for what a damaged zip, blob or meta.json raises
+    (a bad archive, a corrupt deflate stream, a missing entry, an unreadable or too deeply
+    nested meta.json, a read error), so the caller sees the file and not the codec. A
+    path that is missing or cannot be opened (FileNotFoundError, PermissionError,
+    IsADirectoryError) and a ValueError pass through."""
+    try:
+        yield
+    except (FileNotFoundError, PermissionError, IsADirectoryError):
+        raise
+    except (zipfile.BadZipFile, zlib.error, OSError, EOFError, KeyError, RuntimeError,
+            NotImplementedError, OverflowError) as e:     # RuntimeError: encrypted, too deep
+        reason = e.args[0] if isinstance(e, KeyError) and e.args else e
+        raise ValueError(f"{path}: cannot read as {what} "
+                         f"({type(e).__name__}: {reason})") from None
+
+
 def read_info(path: str) -> SalInfo:
-    with zipfile.ZipFile(path) as z:
-        meta = json.loads(z.read("meta.json"))
-        names = set(z.namelist())
-    sample_rate = int(_dig(meta, "data", "legacySettings", "sampleRate", "digital",
-                           default=0) or 0)
+    """The sample rate, digital channels and import notes of a .sal's meta.json. A file
+    that is not a readable zip with a JSON meta.json raises ValueError naming it."""
+    with _zip_errors(path):
+        with zipfile.ZipFile(path) as z:
+            with z.open("meta.json") as fh:
+                raw = fh.read(_META_MAX_BYTES + 1)
+            names = set(z.namelist())
+        if len(raw) > _META_MAX_BYTES:
+            raise ValueError(f"{path}: meta.json is larger than {_META_MAX_BYTES:,} bytes")
+        try:
+            meta = json.loads(raw)
+        except ValueError as e:                    # not JSON, not UTF-8, a huge integer
+            raise ValueError(f"{path}: meta.json is not readable JSON ({e})") from None
+        del raw
+    notes: List[str] = []
+    rate_raw = _dig(meta, "data", "legacySettings", "sampleRate", "digital", default=0)
+    sample_rate = _whole_number(rate_raw or 0)
+    if sample_rate is None or not 0 <= sample_rate <= MAX_RATE_HZ:
+        notes.append(f"meta.json sampleRate {rate_raw!r:.60} is not a whole number of hertz "
+                     f"from 1 to {MAX_RATE_HZ:,.0f}; the file gives no sample rate")
+        sample_rate = 0
     # binData[i] maps a per-channel file to its device channel & type. It mixes
     # Digital and Analog entries (and the file name isn't positional), so key off
     # entry["type"]=="Digital" and entry["file"].
     digital_files: Dict[int, str] = {}
-    notes: List[str] = []
     bin_data = _dig(meta, "binData", default=[]) or []
+    if not isinstance(bin_data, list):
+        notes.append("meta.json binData is not a list; the digital-N.bin file names "
+                     "are used")
+        bin_data = []
     unusable: List[str] = []
+    repeated: List[str] = []
     for entry in bin_data:
         if not isinstance(entry, dict) or entry.get("type") != "Digital":
             continue
         name = str(entry.get("file", "")).lstrip("./")
-        if name in names and "deviceChannel" in entry:
-            digital_files[int(entry["deviceChannel"])] = name
+        channel = _whole_number(entry.get("deviceChannel"))
+        if name in names and channel is not None:
+            if channel in digital_files:
+                repeated.append(f"{name} (channel {channel})")
+            else:
+                digital_files[channel] = name
         else:
             unusable.append(name or "(no file)")
+    if repeated:
+        n = len(repeated)
+        notes.append(f"{n} digital channel entr{'ies' if n != 1 else 'y'} in meta.json "
+                     f"repeat{'' if n != 1 else 's'} a device channel already listed and "
+                     f"{'are' if n != 1 else 'is'} skipped: "
+                     f"{', '.join(repeated[:4])}{' …' if n > 4 else ''}")
     if unusable:
         n = len(unusable)
         notes.append(f"{n} digital channel entr{'ies' if n != 1 else 'y'} in meta.json "
@@ -788,7 +841,8 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
     the line state at that block's START, and the block containing s0 is decoded anyway
     because it overlaps the window, so its own transitions give the level at s0 and no
     earlier block is decoded. Cost then scales with the window, not its start offset.
-    Terminator counting cannot replace the decode (see :func:`_count_and_discard`).
+    A skipped block's transitions are counted by decoding its run
+    (:func:`_count_and_discard`).
 
     ``trust_levels=False`` derives the level from the decoded parity of every preceding
     block, O(start offset). Levels are trusted only when a METADATA HEADER precedes the
@@ -974,12 +1028,10 @@ def _decode_overlap(fh, cnt: int, a: int, b: int, s0: int, limit: int, label: st
 def _count_and_discard(fh, nbytes: int, drop_last: bool, span=None, label: str = "") -> int:
     """Number of transitions in the next `nbytes` of delta run, discarding the bytes.
 
-    A skipped block contributes only its level PARITY, so all we need is the delta
-    count — but it has to be the real one. Counting bytes < 0x80 as terminators
-    over-reports: a multi-byte code whose MSB digit is < 0x40 encodes as
-    [digit+0x40, ..., terminal] (e.g. encode_v3_delta(65) == b"\\x40\\x40"), so both
-    bytes are < 0x80, and an odd over-count inverts the window's opening level. So
-    decode the run, a `_STREAM_CHUNK` at a time (`_stream_deltas`).
+    A skipped block contributes only its level PARITY, so only the delta count is
+    needed. It is the decoded count, a `_STREAM_CHUNK` at a time (`_stream_deltas`): a
+    code's last byte is not the only byte below 0x80 (encode_v3_delta(65) ==
+    b"\\x40\\x40").
 
     `drop_last` excludes the chain's trailing gap-to-capture-end delta, which is not a
     real transition. `span` is the block header's ``(A_start, B_end)``: when given, the
@@ -1014,7 +1066,7 @@ def _decode_channel(data: bytes, label: str, window=None):
     saleae_binary.parse_channel_v3_window). v0 is a flat table with no block
     index, so it decodes fully and slices after; that path
     is bounded by the f64 table itself, which is already in memory."""
-    version = saleae_binary.peek_version(data)
+    version = saleae_binary.peek_version(data, label)
     if version == 0:
         ch = saleae_binary.parse_channel(data, label)
         times = np.asarray(ch.times_s, dtype=np.float64)
@@ -1036,18 +1088,12 @@ def _times_to_edges(times: np.ndarray, origin: float, rate: float,
     """Convert v0 transition times (seconds) to uint64 edge samples in chunks.
 
     Converting a block at a time keeps the float64 transient to one chunk while the
-    result is written straight into the uint64 output. Bit-identical to
-    ``np.rint((times - origin) * rate).astype(uint64)``: the per-element arithmetic
-    is unchanged, and origin is a
-    lower bound on every time (min of begin-times + first edges), so no value is
-    negative before the uint64 cast."""
+    result is written straight into the uint64 output. Each chunk goes through
+    `timebase.to_samples`: ``round((times - origin) * rate)``, with `TimeRangeError`
+    raised for a time that is not a sample index at the rate."""
     out = np.empty(times.size, dtype=np.uint64)
     for i in range(0, times.size, step):
-        b = times[i:i + step].astype(np.float64)         # writable copy of just this chunk
-        b -= origin
-        b *= rate
-        np.rint(b, out=b)
-        out[i:i + step] = b.astype(np.uint64)
+        out[i:i + step] = to_samples(times[i:i + step], origin, rate)
     return out
 
 
@@ -1065,12 +1111,14 @@ class SalTooLargeError(MemoryError):
     `streamed` is False when a window was asked for but the channels are read whole
     whatever the window (a v0 blob, or no block chain that could be walked).
     `whole_channels` lists the channels of a streamed window whose blob does not walk
-    as a block chain, so they are read whole and `peak` includes them.
+    as a block chain, so they are read whole and `peak` includes them. `cause` is the
+    failure that sent a streamed window read to the whole-channel read, when one did.
     """
 
     def __init__(self, path: str, cost: "SalCost", available: int,
                  peak: Optional[int] = None, window: Optional[tuple] = None,
-                 streamed: bool = True, whole_channels: Sequence[int] = ()):
+                 streamed: bool = True, whole_channels: Sequence[int] = (),
+                 cause: str = ""):
         self.path = path
         self.cost = cost
         self.available = int(available)
@@ -1088,6 +1136,8 @@ class SalTooLargeError(MemoryError):
                     f"{available / 1e9:.1f} GB is available for one load, and these "
                     f"channels are read whole whatever the window. Free memory / use a "
                     f"machine with more RAM, or export a shorter capture.")
+            if cause:
+                text += f" (The streamed read of the window failed: {cause}.)"
         elif self.whole_channels:
             s0, s1 = self.window
             names = ", ".join(str(c) for c in self.whole_channels)
@@ -1106,6 +1156,62 @@ class SalTooLargeError(MemoryError):
         MemoryError.__init__(self, text)
 
 
+# The largest end of a window the readers take; an end past it is read to the capture's end.
+MAX_WINDOW_END = 1 << 62
+
+
+def _seconds(sample: int, rate: int) -> float:
+    """`sample` / `rate` as seconds; infinite for a sample count beyond float64."""
+    if abs(sample) >= 1 << 1000:
+        return math.inf if sample > 0 else -math.inf
+    return sample / rate
+
+
+def _window_bound(src: str, name: str, v) -> int:
+    """`v`, a window bound, as a whole sample number: an int is taken as it is and any
+    other number rounded to the nearest sample, noted. A value that is not a number, or
+    not finite, raises ValueError naming `src`."""
+    if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+        return int(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{src}: window: the {name} sample ({v!r}) is not a number") from None
+    if not math.isfinite(f):
+        raise ValueError(f"{src}: window: the {name} sample ({v}) is not a finite number")
+    n = int(round(f))
+    if n != f:
+        import_notes.warn(src, f"the window's {name} sample {v} is not a whole sample; "
+                               f"it is read as {n}")
+    return n
+
+
+def _normalise_window(src: str, window: tuple, rate: int) -> tuple:
+    """`window` as ``(start, end)`` ints a decode can take. `window` must be a pair of
+    finite numbers, else ValueError naming `src`; a bound that is not a whole number of
+    samples is rounded to the nearest, noted. A start before the capture is read from
+    sample 0 (noted), an end beyond what a sample count can hold is read to the end of
+    the capture (noted), and an end not past the start raises ValueError.
+    Session._cut reads windows the same way."""
+    try:
+        first, last = window
+    except (TypeError, ValueError):
+        raise ValueError(f"{src}: window must be a (start, end) pair of sample numbers "
+                         f"(got {window!r})") from None
+    s0, s1 = _window_bound(src, "start", first), _window_bound(src, "end", last)
+    if s0 < 0:
+        import_notes.warn(src, f"the window starts at {_seconds(s0, rate):.9g} s, before "
+                               f"the capture; it is read from 0 s")
+        s0 = 0
+    if s1 > MAX_WINDOW_END:
+        import_notes.warn(src, f"the window ends at {_seconds(s1, rate):.9g} s, past any "
+                               f"capture; it is read to the end of the capture")
+        s1 = MAX_WINDOW_END
+    if s1 <= s0:
+        raise ValueError(f"{src}: window: end_sample ({s1}) must be past start ({s0})")
+    return s0, s1
+
+
 def _check_window(src: str, window: tuple, span: int, rate: int) -> None:
     """Warn when `window` (start, end) samples runs past a capture `span` samples long
     (0: not known). The end is one past the window's last sample, and a window whose
@@ -1117,10 +1223,34 @@ def _check_window(src: str, window: tuple, span: int, rate: int) -> None:
     if s0 >= span:
         import_notes.warn(src, f"the window starts at {s0 / rate:.9g} s, at or after the "
                                f"capture's end at {end_s:.9g} s; nothing of it is read")
-    elif s1 - 1 > span + max(1, span // 1000):
+    elif s1 != MAX_WINDOW_END and s1 - 1 > span + max(1, span // 1000):
         import_notes.warn(src, f"the window ends at {(s1 - 1) / rate:.9g} s, past the "
                                f"capture's end at {end_s:.9g} s; it is read to the end of "
                                f"the capture")
+
+
+def _v0_clean(src: str, label: str, begin: float, times: Optional[np.ndarray]):
+    """(begin time, transition times) of a decoded channel with the times that are not
+    finite dropped, each noted under `src`. A v0 channel's begin time that is not finite
+    raises ValueError naming the channel; a v3 channel (`times` None) is returned as is."""
+    if times is None:
+        return begin, times
+    begin = require_finite(begin, f"{src}: {label}", "the header's begin time")
+    times, gone, first = drop_nonfinite(times)
+    if gone:
+        import_notes.warn(src, f"{label}: {saleae_binary.skipped_times_note(gone, first)}")
+    return begin, times
+
+
+def _v0_ordered(src: str, label: str, times: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """The transition times of a decoded v0 channel in time order, a channel whose times
+    step back noted under `src`; a v3 channel (`times` None) is returned as is."""
+    if times is None:
+        return times
+    times, note = saleae_binary.time_order(times)
+    if note:
+        import_notes.warn(src, f"{label}: {note}")
+    return times
 
 
 def load_capture(path: str, clock_channel: int, data_channel: int,
@@ -1131,10 +1261,13 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     """Build a Capture from a .sal, using the chosen clock & data channels.
 
     Decodes <SALEAE> version 0, 3 and 4 digital blobs (3 and 4 are one format); raises
-    saleae_binary.UnsupportedSaleaeVersion for any other version, and ValueError
-    if a channel isn't present. With ``auto_clock`` the forwarded clock is picked
-    as whichever of the two decoded channels has more transitions (it toggles every
-    UI), so the caller needn't know the probe order.
+    saleae_binary.UnsupportedSaleaeVersion for any other version or a v3 blob that does not
+    decode (its subclass MalformedSaleaeV3, whose message names the channel), and ValueError
+    if a channel isn't present, the clock and data channel are one channel, or the file is
+    not a readable .sal (a damaged archive or meta.json raises ValueError naming it). With
+    ``auto_clock`` the forwarded clock is picked as whichever of the two decoded channels
+    has more transitions (it toggles every UI), so the caller needn't know the probe
+    order.
 
     ``window`` is an optional ``(start_sample, end_sample)`` range. Only transitions
     inside it are decoded — on v3 the block chain is streamed, so memory scales with
@@ -1149,13 +1282,23 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     decoded (:meth:`SalCost.window_peak_bytes`: the blocks the window overlaps), not
     the file size.
 
-    Import warnings (import_notes) report meta.json channel entries that were skipped,
-    and a window that runs past the capture's end.
+    A v0 channel whose begin time is not finite raises ValueError naming the channel,
+    and so does a time more than 2**63 samples from the capture start. Import warnings
+    (import_notes) report meta.json channel entries that were skipped, v0 transition
+    times that are not finite (skipped), v0 times out of order (sorted), off the sample
+    grid or landing on one sample, v0 channels with different begin times, and a window
+    that starts before the capture (read from sample 0) or runs past its end. A window
+    whose end is not past its start raises ValueError, and so does a `sample_rate_hz` below
+    1 Hz, above `timebase.MAX_RATE_HZ` or not a number. A streamed window read that fails
+    unexpectedly is logged and the channel is read whole, after the memory guard has priced
+    that read.
     """
     info = read_info(path)
     src = import_notes.source_name(path)
     for note in info.notes:
         import_notes.warn(src, note)
+    if sample_rate_hz:
+        check_rate(sample_rate_hz, path)
     rate = int(sample_rate_hz or info.sample_rate_hz)
     if rate <= 0:
         raise ValueError(f"{path}: no digital sample rate in meta.json")
@@ -1163,6 +1306,9 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         if ch not in info.digital_files:
             raise ValueError(f"{path}: {role} channel {ch} not in capture "
                              f"(available: {info.channels})")
+    require_distinct(path, clock_channel, data_channel, "channel")
+    if window is not None:
+        window = _normalise_window(src, window, rate)
     # One header walk per channel, shared by the guard (the capture's length) and the
     # streaming decode (the validated chain start).
     chains = (_v3_chains(path, info, [clock_channel, data_channel])
@@ -1189,7 +1335,7 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         if budget > 0 and peak > budget:
             raise SalTooLargeError(path, cost, budget, peak=peak, window=window,
                                    streamed=streamed, whole_channels=unwalked)
-    with zipfile.ZipFile(path) as z:
+    with _zip_errors(path), zipfile.ZipFile(path) as z:
         def read_channel(ch: int):
             """Decode one channel, streaming when a window makes it possible.
 
@@ -1218,14 +1364,25 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
                         break                      # not a v3 chain: the retry won't help
                     except _UnstampedBlockLevels:
                         continue                   # re-stream, deriving the level by parity
-                    except saleae_binary.MalformedSaleaeV3:
-                        raise                      # a corrupt block: refused, not retried
-                    except Exception:
-                        break                      # fall through to the in-memory path
+                    except (saleae_binary.MalformedSaleaeV3, MemoryError):
+                        raise                      # a corrupt block, or no memory: not retried
+                    except Exception as exc:       # noqa: BLE001 - read whole, but priced
+                        logger.warning("%s: the streamed window read of %s failed; "
+                                       "reading the channel whole", src, label,
+                                       exc_info=True)
+                        if max_bytes != 0 and budget > 0 and cost.est_peak_bytes > budget:
+                            raise SalTooLargeError(
+                                path, cost, budget, window=window, streamed=False,
+                                cause=f"{type(exc).__name__}: {exc}") from None
+                        break
             return _decode_channel(z.read(name), label, window=window)
 
         clk_init, clk_times, clk_samp, clk_begin = read_channel(clock_channel)
         dat_init, dat_times, dat_samp, dat_begin = read_channel(data_channel)
+    clk_begin, clk_times = _v0_clean(src, f"digital ch{clock_channel}", clk_begin, clk_times)
+    dat_begin, dat_times = _v0_clean(src, f"digital ch{data_channel}", dat_begin, dat_times)
+    clk_times = _v0_ordered(src, f"digital ch{clock_channel}", clk_times)
+    dat_times = _v0_ordered(src, f"digital ch{data_channel}", dat_times)
     # Put both channels on one timeline. A v3 channel is already transition SAMPLES
     # from capture start (sample 0 == capture start). A v0 channel is transition TIMES
     # in seconds; convert them with origin = the capture-start time (begin_time),
@@ -1239,13 +1396,34 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     begins = [b for b, t in ((clk_begin, clk_times), (dat_begin, dat_times)) if t is not None]
     firsts = [float(t[0]) for t in (clk_times, dat_times) if t is not None and t.size]
     origin = min(begins + firsts) if (begins or firsts) else 0.0
+    # The version-0 checks of the .bin loader: times off the sample grid, two begin times,
+    # and (after the conversion) transitions on one sample.
+    for ch, times in ((clock_channel, clk_times), (data_channel, dat_times)):
+        if times is not None:
+            note = saleae_binary.grid_note(times, rate, origin)
+            if note:
+                import_notes.warn(src, f"digital ch{ch}: {note}")
+    if clk_times is not None and dat_times is not None:
+        note = saleae_binary.begin_times_note(clk_begin, dat_begin, rate)
+        if note:
+            import_notes.warn(src, f"digital ch{clock_channel} + digital ch{data_channel}: "
+                                   f"{note}")
 
-    def to_edges(times, samp):
-        return _times_to_edges(times, origin, rate) if times is not None else samp
+    def to_edges(ch, times, samp):
+        if times is None:
+            return samp
+        try:
+            edges = _times_to_edges(times, origin, rate)
+        except TimeRangeError as e:
+            raise ValueError(f"{path}: {e}") from None
+        same = repeats(edges)
+        if same:
+            import_notes.warn(src, f"digital ch{ch}: {same_sample_note(same, rate)}")
+        return edges
 
-    clk_edges = to_edges(clk_times, clk_samp)
-    clk_times = clk_samp = None                          # drop the v0 view (frees the blob bytes it aliases)
-    dat_edges = to_edges(dat_times, dat_samp)
+    clk_edges = to_edges(clock_channel, clk_times, clk_samp)
+    clk_times = clk_samp = None            # drop the v0 view (frees the blob bytes it aliases)
+    dat_edges = to_edges(data_channel, dat_times, dat_samp)
     dat_times = dat_samp = None
     # The forwarded clock toggles every UI, so it has the most transitions; when the
     # caller can't say which channel is which, pick the busier one as the clock.
@@ -1261,8 +1439,8 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
         def clip(edges, initial):
             # Rebased IN PLACE: every edge array here was built by this call, and a
             # streamed v3 channel is already inside the window, so it is not copied.
-            lo = int(np.searchsorted(edges, s0, side="right"))
-            hi = int(np.searchsorted(edges, s1, side="left"))
+            lo = int(searchsorted(edges, s0, side="right"))
+            hi = int(searchsorted(edges, s1, side="left"))
             kept = edges if (lo == 0 and hi == edges.size) else edges[lo:hi].copy()
             kept -= np.uint64(s0)                # every kept edge is > s0
             return kept, bool(initial) ^ (lo % 2 == 1)

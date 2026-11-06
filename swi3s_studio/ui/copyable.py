@@ -31,8 +31,10 @@ def enable_copy(view, *, multi: bool = False, cells: bool = False) -> None:
 
 def copy_selection(view) -> None:
     """Copy the view's selected cells to the clipboard as TSV (rows in visual order,
-    columns left-to-right). No-op when nothing is selected. A tree's row is told apart by
-    its place in the tree, not its row under its parent, which rows of two blocks share."""
+    columns left-to-right). Every row has a field for each column any selected cell is in,
+    empty where its own cell is not selected, so the columns stay aligned. No-op when
+    nothing is selected. A tree's row is told apart by its place in the tree, not its row
+    under its parent, which rows of two blocks share."""
     indexes = view.selectedIndexes() if hasattr(view, "selectedIndexes") else []
     if not indexes:
         return
@@ -40,10 +42,11 @@ def copy_selection(view) -> None:
     for ix in indexes:
         val = ix.data(Qt.DisplayRole)
         rows[_place(ix)][ix.column()] = "" if val is None else str(val)
+    columns = sorted({c for cols in rows.values() for c in cols})
     lines = []
     for r in sorted(rows):
         cols = rows[r]
-        lines.append("\t".join(cols[c] for c in sorted(cols)))
+        lines.append("\t".join(cols.get(c, "") for c in columns))
     QGuiApplication.clipboard().setText("\n".join(lines))
 
 

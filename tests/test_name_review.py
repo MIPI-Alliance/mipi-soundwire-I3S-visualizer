@@ -5,15 +5,13 @@ published tree would gain, splits identifiers so a name inside one is still seen
 until a person approves exactly that list. Every tree here is synthetic.
 """
 import os
-import subprocess
-import sys
 
 import pytest
+from conftest import commit_files, git_in, load_tool, symlink_or_skip
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "tools"))
+pytestmark = pytest.mark.platform
 
-import name_review  # noqa: E402
+name_review = load_tool("name_review")
 
 
 def _write(root, files):
@@ -25,17 +23,13 @@ def _write(root, files):
 
 
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, isolated_git):
     """A git repository whose HEAD is the 'published' baseline."""
     base = tmp_path / "base"
     base.mkdir()
-    _write(str(base), {"pkg/mod.py": "def parse_register(address):\n    return address\n",
-                       "README.md": "A register map importer for a bus analyzer.\n"})
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
-                ["git", "commit", "-q", "-m", "base"]):
-        subprocess.run(cmd, cwd=base, check=True, env=env, capture_output=True)
+    git_in(base, "init", "-q")
+    commit_files(base, {"pkg/mod.py": "def parse_register(address):\n    return address\n",
+                        "README.md": "A register map importer for a bus analyzer.\n"}, "base")
     return base
 
 
@@ -173,7 +167,7 @@ def test_the_digest_covers_an_unread_files_content(repo, tmp_path, monkeypatch, 
     name_review.main(args)
     d = capsys.readouterr().out.rsplit("--approve-names=", 1)[1].split()[0]
     assert name_review.main(args + [f"--approve-names={d}"]) == 0
-    _write(str(tree), {"data/big.raw": "zorblax " * 20})          # same path, same size
+    _write(str(tree), {"data/big.raw": "zorblaxx " * 20})         # same path, same size
     capsys.readouterr()
     assert name_review.main(args + [f"--approve-names={d}"]) == 1
     assert "not this list's digest" in capsys.readouterr().out
@@ -228,25 +222,23 @@ def test_a_non_latin_name_new_since_the_baseline_is_listed(repo, tmp_path):
 
 def test_a_symlink_is_read_as_its_target_path(repo, tmp_path):
     """A link to a directory is an entry, not descended into, and its target path is read,
-    as git stores it; a baseline symlink's target is part of the baseline's words."""
+    as git stores it."""
     outside = tmp_path / "quuxcorp_share"
     (outside / "inner").mkdir(parents=True)
     (outside / "inner" / "plughwords.txt").write_text("plughword\n", encoding="utf-8")
     tree = tmp_path / "tree"
     _write(str(tree), {"README.md": "A register map importer for a bus analyzer.\n"})
-    os.symlink(str(outside), tree / "captures")
+    symlink_or_skip(str(outside), tree / "captures")
     found = _review(repo, tree)
     assert found["quuxcorp"][0][:2] == ("captures", 1)
     assert "captures" in found and "plughword" not in found and "plughwords" not in found
 
 
-def test_a_baseline_symlinks_target_is_published(tmp_path):
+def test_a_baseline_symlinks_target_is_published(tmp_path, isolated_git):
+    """A baseline symlink's target path is part of the baseline's words."""
     base = tmp_path / "base"
     base.mkdir()
-    os.symlink("zorblaxdir/thing", base / "link")
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    for cmd in (["git", "init", "-q"], ["git", "add", "-A"],
-                ["git", "commit", "-q", "-m", "base"]):
-        subprocess.run(cmd, cwd=base, check=True, env=env, capture_output=True)
+    symlink_or_skip("zorblaxdir/thing", base / "link")
+    git_in(base, "init", "-q")
+    commit_files(base, {}, "base")
     assert "zorblaxdir" in name_review.vocabulary_of_rev("HEAD", cwd=str(base))

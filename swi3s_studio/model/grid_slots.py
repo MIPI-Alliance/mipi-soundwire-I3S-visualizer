@@ -12,7 +12,7 @@ The kinds are shared by:
 
 Ints 7–9 (S0/S1/Handover) are placement-only kinds the C++ decode never emits as
 data cells but the Visualizer authoring engine does. ``tests/test_grid_slots.py``
-pins 1–6 to ``swi3score.SLOT_NAMES``, catching a C++ enum reorder.
+pins 0–6 to ``swi3score.SLOT_NAMES``, catching a C++ enum reorder.
 """
 from __future__ import annotations
 

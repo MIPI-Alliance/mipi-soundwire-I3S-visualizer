@@ -1,4 +1,5 @@
-"""Flow-control demo: bit-exact round-trip + the mid-phase SPM framing lock.
+"""Flow-control demo: bit-exact round-trip, the mid-phase SPM framing lock, the FCP
+scrambler and DRQ placement.
 
 The synthetic flow-control demo (swi3score.make_demo_levels_flow_control) carries the
 four data ports a bus sniffer actually sees — one per flow mode, on four devices:
@@ -18,6 +19,11 @@ inside a Write payload/CRC byte must NOT re-frame or abandon the in-progress pha
 (SWI3S v1.1 §7.2.2 {ASW1907}: hold symbol alignment by counting bits mod 10 mid-phase;
 §8.2.1 {ASW2206}: a mid-phase SPM only ARMS header detection). dev1's
 WriteA32(0x2090, 0x60) forms such a pattern.
+
+Also pinned: FCP_ScramblerEn decodes from register 0x0E bit 3 and a scrambled FCP decodes
+to its generator; a config CSV keeps the FlowControlDelay and FCP_ScramblerEn resets; a
+decoded DRQ bit is read on its last UI, whether the bit is wide or cut short by the row
+edge; drq_sample marks the DRQ that permitted each sample.
 """
 import math
 import os
@@ -48,8 +54,9 @@ def _flow_expected(device: int, channel: int, index: int) -> int:
     return v & ((1 << (_FLOW_SS + 1)) - 1)
 
 
-def _decode_flow(samples_per_channel: int = 200):
-    levels = swi3score.make_demo_levels_flow_control(samples_per_channel)
+def _decode_flow(samples_per_channel: int = 200, fcp_scrambled: bool = False):
+    levels = swi3score.make_demo_levels_flow_control(samples_per_channel,
+                                                     fcp_scrambled=fcp_scrambled)
     src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
     dec = swi3score.Decoder(src, swi3score.DecoderSettings())
     dec.run()
@@ -221,20 +228,34 @@ def test_flow_handshake_validates_clean():
 
 def test_flow_delay_decoded_from_registers():
     """The DRQ->TxPresent pipeline depth (DPn_FlowControlDelay, 0x0E bit7) is decoded so
-    the handshake validator uses the right lookback. The demo leaves it at the reset
-    default (1 -> d=2 intervals) for the DRQ-mode ports."""
+    the handshake validator uses the right lookback. The demo writes 0x0E with bit 7
+    clear, so every port decodes 0 (d=1 interval)."""
     dec = _decode_flow(60)
     dps = {dp["device_number"]: dp for dp in dec.config_dataports()["dataports"]
            if dp["enabled"] and dp["enable_ch"]}
     for dev in (2, 3):                      # RX_CONTROLLED, ASYNC
         assert "flow_control_delay" in dps[dev], "flow_control_delay not surfaced"
-        assert dps[dev]["flow_control_delay"] in (0, 1)
+        assert dps[dev]["flow_control_delay"] == 0
 
 
-def test_flow_control_delay_round_trips_through_registers():
-    """A config CSV's DPn_FlowControlDelay (bit 7 of 0x0E) must survive
-    registers_from_csv. The demo's config leaves it at the reset default (1), so every
-    0x0E register for a DRQ mode must carry bit 7 set.
+def test_a_config_csv_keeps_the_flow_control_delay_reset():
+    """A config CSV has no FlowControlDelay field, so the config keeps the register reset
+    (FlowControlDelay 1) on the DRQ-mode ports."""
+    levels = swi3score.make_demo_levels_flow_control(60)
+    src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
+    settings = swi3score.DecoderSettings()
+    settings.config_csv_path = os.path.join(_FIXTURES, "flow_control_demo.csv")
+    dec = swi3score.Decoder(src, settings)
+    dec.run()
+    dps = {dp["device_number"]: dp for dp in dec.config_dataports()["dataports"] if dp["enabled"]}
+    for dev in (2, 3):                      # RX_CONTROLLED, ASYNC
+        assert dps[dev]["flow_control_delay"] == 1
+
+
+def test_registers_from_csv_carry_the_flow_control_delay_reset():
+    """A config CSV has no FlowControlDelay field, so the config keeps the register reset
+    (FlowControlDelay 1) and registers_from_csv emits 0x0E with bit 7 set for every DRQ
+    mode.
 
     The fixture path is resolved from __file__: registers_from_csv returns [] for a path it
     cannot open rather than raising.
@@ -255,14 +276,77 @@ def test_flow_control_delay_round_trips_through_registers():
         f"FlowControlDelay bit7 dropped: {[(d, hex(v)) for d, v in drq]}"
 
 
+def _fcp_scrambler_by_device(dec):
+    return {dp["device_number"]: dp["fcp_scrambler_en"]
+            for dp in dec.config_dataports()["dataports"] if dp["enabled"]}
+
+
+def test_fcp_scrambler_en_decodes_from_0x0e_bit3():
+    """FCP_ScramblerEn is 0x0E bit 3: the plain demo writes it clear, the fcp_scrambled
+    demo writes it set."""
+    plain = _fcp_scrambler_by_device(_decode_flow(40))
+    scrambled = _fcp_scrambler_by_device(_decode_flow(40, fcp_scrambled=True))
+    for dev in (2, 3):                      # RX_CONTROLLED, ASYNC
+        assert plain[dev] is False
+        assert scrambled[dev] is True
+
+
+def test_a_scrambled_fcp_decodes_to_its_generator():
+    """With FCP_ScramblerEn = 1 every DRQ bit goes through its port's LFSR, seeded when the
+    port is enabled and stepped once per DRQ bit across intervals and SSPAs. The decode
+    descrambles each DRQ with a per-port LFSR that persists the same way, so every
+    TxPresent pairs with the request the generator made and the audio round-trips."""
+    plain = swi3score.make_demo_levels_flow_control(200)
+    assert swi3score.make_demo_levels_flow_control(200, fcp_scrambled=True) != plain, \
+        "the DRQ cells carry the same levels scrambled and raw"
+    dec = _decode_flow(200, fcp_scrambled=True)
+    fc = dec.flow_control_stats()
+    assert fc["drq_bits"] > 0 and fc["checked"] > 0
+    assert fc["fails"] == 0, f"{fc['fails']} handshake violations of {fc['checked']} checked"
+    by = defaultdict(list)
+    for a in dec.audio():
+        by[(a["device"], a["channel"])].append(a["value"])
+    assert set(by) == set(_FLOW_FREQ)
+    for (dev, ch), seq in by.items():
+        assert seq == [_flow_expected(dev, ch, i) for i in range(len(seq))], (dev, ch)
+
+
+def test_a_config_csv_leaves_fcp_scrambler_en_at_its_reset():
+    """A config CSV has no FCP_ScramblerEn field: the config keeps the register's reset
+    (1), registers_from_csv emits 0x0E with bit 3 set for every port, and a decode under
+    the CSV descrambles the DRQ, so the plain demo's raw DRQ fails the handshake."""
+    csv = os.path.join(_FIXTURES, "flow_control_demo.csv")
+    regs = swi3score.registers_from_csv(csv)
+    flow0e = [val for _dev, addr, val in regs if (addr & 0xFF) == 0x0E]
+    assert flow0e and all(val & 0x08 for val in flow0e), [hex(v) for v in flow0e]
+    settings = swi3score.DecoderSettings()
+    settings.config_csv_path = csv
+    dec = swi3score.Decoder(swi3score.MemorySampleSource(
+        swi3score.make_demo_levels_flow_control(200), 98_304_000, 4), settings)
+    dec.run()
+    assert all(_fcp_scrambler_by_device(dec)[dev] for dev in (2, 3))
+    assert dec.flow_control_stats()["fails"] > 0
+
+
 def test_flow_drq_sample_annotated_on_samples():
-    """Each decoded flow-controlled sample carries drq_sample — the capture position of
-    the DRQ that permitted it (ABI 7); the field is populated, not left zero."""
+    """Each decoded flow-controlled sample carries drq_sample, the capture position of the
+    DRQ that permitted it (ABI 7). Only the first sample of each RX_CONTROLLED channel
+    (device 2, channels 7 and 8), taken in the startup interval where DRQ=1 is assumed,
+    stays unset; the ASYNC port (device 3) has none."""
     dec = _decode_flow(200)
-    drq_ports = [a for a in dec.audio() if a["device"] in (2, 3)]   # RX / ASYNC
+    seen: dict = defaultdict(int)
+    unset = set()
+    drq_ports = []
+    for a in dec.audio():
+        key = (a["device"], a["channel"])
+        index, seen[key] = seen[key], seen[key] + 1
+        if a["device"] in (2, 3):                                    # RX / ASYNC
+            drq_ports.append(a)
+            if a["drq_sample"] <= 0:
+                unset.add((a["device"], a["channel"], index))
     assert drq_ports, "no DRQ-mode samples"
-    assert any(a["drq_sample"] > 0 for a in drq_ports), \
-        "drq_sample never populated (dead reserved field)"
+    assert unset == {(2, 7, 0), (2, 8, 0)}
+    assert all(a["drq_sample"] <= a["start_sample"] for a in drq_ports if a["drq_sample"] > 0)
 
 
 @pytest.mark.parametrize("phy,variant", [(1, ""), (2, ""), (3, ""), (2, "flow_control")])
@@ -333,8 +417,8 @@ def test_manager_dataports_emit_no_peripheral_registers():
 
     per_device = {d: sum(1 for dev, _a, _v in regs if dev == d) for d in devices}
     assert len(set(per_device.values())) == 1, (
-        "device 0 carries a different number of register writes from its peers, which is how "
-        f"the manager's ports leaking onto it looked: {per_device}")
+        "every device carries the same number of register writes, "
+        f"so device 0 must not carry the manager's ports: {per_device}")
 
     seen = defaultdict(int)
     for dev, addr, _val in regs:
@@ -343,3 +427,67 @@ def test_manager_dataports_emit_no_peripheral_registers():
     assert not duplicates, (
         "the same (device, address) is written more than once, so one port's configuration "
         f"overwrites another's: {[f'dev{d} 0x{a:04X}' for d, a in duplicates]}")
+
+
+# ---- the DRQ observe point: a decode reads a DRQ bit on its last UI ----
+# The flow demo's config CSV, with every DRQ port's FCP_HorizontalStart and FCP_BitWidth
+# replaced. Its DRQ ports pair a Manager port with a peripheral port, so each DRQ is seen
+# in both directions: a sink data port's (source DRQ) and a source data port's (sink DRQ).
+_FLOW_COLUMNS = 16
+
+
+def _fcp_csv(tmp_path, hstart, width):
+    import csv
+    with open(os.path.join(_FIXTURES, "flow_control_demo.csv"), newline="") as f:
+        rows = list(csv.reader(f))
+    modes = next(r for r in rows if r[0] == "FlowMode_REG")[1:]
+    new = {"FCP_HorizontalStart_REG": hstart, "FCP_BitWidth_REG": width}
+    for r in rows:
+        if r[0] in new:
+            r[1:] = [str(new[r[0]]) if m in ("2", "3") else v for m, v in zip(modes, r[1:])]
+    path = tmp_path / f"fcp_{hstart}_{width}.csv"
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+    return str(path)
+
+
+def _drq_columns(levels, csv_path):
+    """(drq_bits, {(device, dp): bus-column distances from each DRQ-gated sample's DRQ read
+    to the sample's last bit})."""
+    st = swi3score.DecoderSettings()
+    st.config_csv_path = csv_path
+    dec = swi3score.Decoder(swi3score.MemorySampleSource(levels, 98_304_000, 4), st)
+    dec.run()
+    dist = defaultdict(set)
+    for a in dec.audio():
+        if a["drq_sample"]:
+            dist[(a["device"], a["dp"])].add(
+                ((a["end_sample"] - a["drq_sample"]) // 4) % _FLOW_COLUMNS)
+    return dec.flow_control_stats()["drq_bits"], dict(dist)
+
+
+@pytest.fixture(scope="module")
+def flow_levels_120():
+    return swi3score.make_demo_levels_flow_control(120)
+
+
+def test_a_wide_drq_bit_is_read_on_its_last_ui(tmp_path, flow_levels_120):
+    """A 3-UI DRQ bit (FCP_BitWidth 2) is read two columns after a 1-UI one at the same
+    FCP_HorizontalStart, in both directions."""
+    bits0, narrow = _drq_columns(flow_levels_120, _fcp_csv(tmp_path, 11, 0))
+    bits2, wide = _drq_columns(flow_levels_120, _fcp_csv(tmp_path, 11, 2))
+    assert {dev for dev, _ in narrow} >= {-1, 2, 3}       # Manager and peripheral ends
+    assert bits2 == bits0 > 0 and set(wide) == set(narrow)
+    for key, cols in narrow.items():
+        assert wide[key] == {(c - 2) % _FLOW_COLUMNS for c in cols}, key
+
+
+def test_a_drq_bit_cut_short_by_the_row_edge_is_read_on_the_rows_last_ui(
+        tmp_path, flow_levels_120):
+    """A wide DRQ bit starting on a row's last column ends there: each one is still read, on
+    that column, in both directions."""
+    last = _FLOW_COLUMNS - 1
+    bits0, narrow = _drq_columns(flow_levels_120, _fcp_csv(tmp_path, last, 0))
+    bits1, cut = _drq_columns(flow_levels_120, _fcp_csv(tmp_path, last, 1))
+    assert bits1 == bits0 > 0
+    assert cut == narrow and {dev for dev, _ in cut} >= {-1, 2, 3}

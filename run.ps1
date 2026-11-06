@@ -12,13 +12,15 @@
 
         powershell -ExecutionPolicy Bypass -File .\run.ps1
 #>
-# $Rebuild is THIS script's flag; everything else is forwarded to the app verbatim
-# (ValueFromRemainingArguments), so `.\run.ps1 -c cfg.csv -o m.json` reaches the CLI.
+# $Rebuild is THIS script's flag; everything else is forwarded to the app verbatim through
+# $args. The script stays a simple script (no [Parameter] or [CmdletBinding] attribute): an
+# advanced script gains the common parameters, and PowerShell matches -o to -OutVariable and
+# -OutBuffer as an ambiguous prefix before any argument is collected. So
+# `.\run.ps1 -c cfg.csv -o m.json` reaches the CLI.
 param(
-    [switch]$Rebuild,
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$AppArgs = @()
+    [switch]$Rebuild
 )
+$AppArgs = @($args)
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
@@ -70,8 +72,7 @@ function Show-HeaderHelp([string]$exe) {
     Write-Host ""
     Write-Host "Fixes:"
     Write-Host "  * Reinstall Python from python.org - the standard installer includes the"
-    Write-Host "    headers (tick 'Download debug binaries' / the development files if asked),"
-    Write-Host "    or:  winget install --id Python.Python.3.12 -e"
+    Write-Host "    headers, or:  winget install --id Python.Python.3.12 -e"
     Write-Host "  * An 'embeddable package' zip has NO headers - use the full installer."
     Write-Host "  * Already have headers elsewhere? Point the build at them:"
     Write-Host "      `$env:SKBUILD_CMAKE_DEFINE = 'Python_INCLUDE_DIR=C:\path\to\include'"
@@ -99,6 +100,10 @@ if (-not (Test-Path $venvDir)) {
     }
     Write-Host "Creating virtual environment with $pyCmd at $venvDir ..."
     & cmd /c "$pyCmd -m venv ""$venvDir"""
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Creating the virtual environment failed; nothing was installed."
+        exit 1
+    }
 }
 $python = Join-Path $venvDir "Scripts\python.exe"
 
@@ -109,6 +114,10 @@ if (-not (Test-Path $stamp) -or (Get-Item "requirements.txt").LastWriteTime -gt 
     Write-Host "Installing Python dependencies..."
     & $python -m pip install --upgrade pip | Out-Null
     & $python -m pip install -r requirements.txt
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Dependency install failed. Not stamping - will retry next run."
+        exit 1
+    }
     New-Item -ItemType File -Path $stamp -Force | Out-Null
     $installedDeps = $true
 }
@@ -147,8 +156,8 @@ if ($needNative) {
         exit 1
     }
     Write-Host "Building the swi3score decode core (needs a C++ compiler - see the README)..."
-    # --force-reinstall because the native version is a fixed 0.1.0, so a plain install
-    # no-ops and keeps a stale .pyd. --no-deps skips re-resolving the app deps.
+    # --force-reinstall replaces the installed module even when pip would judge it current.
+    # --no-deps skips re-resolving the app deps.
     & $python -m pip install --force-reinstall --no-deps .\native
     if ($LASTEXITCODE -ne 0) {
         # List the usual causes; do not assert one.
@@ -156,8 +165,8 @@ if ($needNative) {
 swi3score build failed. Not stamping - will retry next run.
   The build output above names the cause. The usual ones are:
     * 'Python.h: No such file or directory' -> the Python you are running has no
-      development headers. Reinstall it from python.org, or tick the debug/dev
-      binaries in the installer.
+      development headers. Reinstall it with the full python.org installer
+      (the embeddable zip has no headers).
     * 'No CMAKE_CXX_COMPILER could be found' -> install the Visual Studio Build
       Tools 'Desktop development with C++' workload (see the README).
 "@
@@ -168,9 +177,17 @@ swi3score build failed. Not stamping - will retry next run.
 
 # Announce the launch; the first launch after an install is slow while the OS scans the
 # newly written Qt libraries. -o implies headless, so no window message is printed.
-$headless = @($AppArgs | Where-Object { $_ -eq "-o" -or $_ -eq "--output" -or
+# Every spelling argparse accepts: -o FILE, -oFILE, -o=FILE and an unambiguous prefix of
+# --output or --help, with or without =VALUE (the same set as run.sh).
+$headless = @($AppArgs | Where-Object { $_ -eq "-o" -or $_ -like "-o*" -or $_ -eq "--output" -or
                                         $_ -like "-o=*" -or $_ -like "--output=*" -or
-                                        $_ -eq "-h" -or $_ -eq "--help" }).Count -gt 0
+                                        $_ -eq "--o" -or $_ -eq "--ou" -or $_ -eq "--out" -or
+                                        $_ -eq "--outp" -or $_ -eq "--outpu" -or
+                                        $_ -like "--o=*" -or $_ -like "--ou=*" -or
+                                        $_ -like "--out=*" -or $_ -like "--outp=*" -or
+                                        $_ -like "--outpu=*" -or
+                                        $_ -eq "-h" -or $_ -eq "--h" -or $_ -eq "--he" -or
+                                        $_ -eq "--hel" -or $_ -eq "--help" }).Count -gt 0
 if ($headless) {
     # nothing to announce: no window opens
 } elseif ($installedDeps) {

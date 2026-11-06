@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.command_table import DEFAULT_HIDDEN, DEFAULT_WIDTHS, UNSORTABLE
 
+pytestmark = pytest.mark.gui
+
 _DELTAS = ("ΔRows", "ΔTime (µs)")
 
 

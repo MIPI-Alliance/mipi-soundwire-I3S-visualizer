@@ -17,6 +17,8 @@ from conftest import pump_loads
 from PySide6.QtWidgets import QApplication
 from window_checks import check_window, snapshot
 
+pytestmark = pytest.mark.gui
+
 _SEEDS = (1, 2, 3)
 _STEPS = 40
 

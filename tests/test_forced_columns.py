@@ -17,6 +17,8 @@ import pytest
 
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 CSV_COLUMNS = 16          # NumColumns_REG 15 -> 16 columns
 
 
@@ -116,14 +118,25 @@ def test_config_csv_import_does_not_collapse_the_grid(tmp_path):
 
 
 def test_config_csv_import_keeps_commands_decodable(tmp_path):
-    """After a CSV import every command decodes CRC-valid: pins the parse, not just the
-    geometry.
+    """After a CSV import, every command the wire sends at the CSV's width decodes
+    CRC-valid and unchanged: pins the parse, not just the geometry.
+
+    A CSV sets the geometry of the whole capture, so the regions the wire runs at another
+    width are misframed and report garbled phases; only the matching region is compared.
     """
-    csv = _write_config_csv(tmp_path / "cfg.csv")
     s = Session.from_demo(48, phy=2, cold_start=True)
-    s.apply_config_csv(csv)
-    bad = [c for c in s.commands if not c.get("crc_valid", True)]
-    assert not bad, f"{len(bad)} CRC-invalid command(s) after importing the config CSV"
+    lo, hi = (int(s.segments[i]["start_sample"]) for i in (1, 2))
+    assert int(s.segments[1]["column_count"]) == 8
+
+    def in_region(cmds):
+        return [(c["command"], int(c["start_sample"])) for c in cmds
+                if lo <= int(c["start_sample"]) < hi and c.get("crc_valid", True)]
+
+    expected = in_region(s.commands)
+    assert expected and all(c.get("crc_valid", True) for c in s.commands
+                            if lo <= int(c["start_sample"]) < hi)
+    s.apply_config_csv(_write_config_csv(tmp_path / "cfg.csv", columns=8, second_port=False))
+    assert in_region(s.commands) == expected
 
 
 def test_cold_start_without_csv_still_seeds_safe_lock():
@@ -200,8 +213,6 @@ def test_repinning_the_same_width_is_a_no_op():
     s = Session.from_demo(48, phy=2, cold_start=True)
     sample = int(s.segments[1]["start_sample"]) + 500
     s.force_column_count_at(sample, 12)
-    marker = object()
-    s._sentinel = marker                      # survives only if no re-decode happens
     decoder_before = s.decoder
     s.force_column_count_at(sample, 12)
     assert s.decoder is decoder_before, "unchanged pin should skip the re-decode"
@@ -222,8 +233,9 @@ def test_pin_survives_a_workspace_round_trip():
     assert [int(x["column_count"]) for x in reopened.segments] == live
 
 
-def test_pin_drives_the_timeline_forced_badge():
-    """A pinned region's timeline band is labelled '(forced)'; an unpinned one is not."""
+def test_timeline_label_carries_the_forced_badge_of_a_pinned_section():
+    """A pinned section is recorded, and the timeline label of a forced band reads
+    '(forced)'; an unforced one does not."""
     from PySide6.QtWidgets import QApplication
 
     from swi3s_studio.ui.timeline import TimelineRibbon
@@ -232,6 +244,7 @@ def test_pin_drives_the_timeline_forced_badge():
     s = Session.from_demo(48, phy=2, cold_start=True)
     sample = int(s.segments[1]["start_sample"]) + 500
     sect = s.force_column_count_at(sample, 12)
+    assert s.forced_column_sections == {sect: 12}
 
     tl = TimelineRibbon()
     assert tl._segment_label(sect, 12, True) == "12col (forced)"

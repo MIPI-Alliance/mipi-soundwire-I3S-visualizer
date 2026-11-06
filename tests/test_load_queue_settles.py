@@ -14,6 +14,8 @@ import pytest
 from conftest import pump_loads
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+pytestmark = pytest.mark.gui
+
 # Where a load can fail: the decode on the worker thread; building the views, before or
 # after the session became a Link; and the caller's own follow-on.
 _STAGES = (None, "decode", "views", "views_after_link", "after")

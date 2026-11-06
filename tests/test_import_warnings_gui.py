@@ -4,10 +4,13 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from conftest import pump_loads
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio import import_notes
+
+pytestmark = pytest.mark.gui
 
 
 def _window():
@@ -69,10 +72,8 @@ def test_each_import_gets_its_own_window_and_closing_one_deletes_it():
 
 def test_a_failed_import_shows_its_error_not_a_warnings_window():
     win = _window()
-    try:
+    with pytest.raises(ValueError, match="unreadable"):
         with win.reporting_import():
             import_notes.warn("bad.csv", "x")
             raise ValueError("unreadable")
-    except ValueError:
-        pass
     assert win.import_warning_dialogs() == []

@@ -17,6 +17,8 @@ from swi3s_studio.model import Provenance
 from swi3s_studio.model.bus_config import BusConfig
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 _SAMPLES = 6000
 
 
@@ -79,8 +81,8 @@ def test_every_command_still_decodes(demo, tmp_path):
     s = _fresh()
     s.apply_config_csv_at(_mid(s, 1), _csv_of_region(s, 1, tmp_path / "r1.csv", drop_dp=3))
     assert len(s.commands) == len(demo.commands)
-    assert all(c.get("crc_valid") for c in s.commands) == all(
-        c.get("crc_valid") for c in demo.commands)
+    assert [(c["command"], c.get("crc_valid")) for c in s.commands] == [
+        (c["command"], c.get("crc_valid")) for c in demo.commands]
 
 
 def test_the_grid_and_register_map_show_it_as_csv(tmp_path):

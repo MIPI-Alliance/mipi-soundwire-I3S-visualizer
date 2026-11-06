@@ -14,6 +14,8 @@ from PySide6.QtWidgets import QApplication
 from swi3s_studio.ingest.transitions import DEMO_LINK2_DELAY_SAMPLES
 from swi3s_studio.workspace import DEMO_WORKSPACES, Workspace, demo_dir, source_files
 
+pytestmark = pytest.mark.gui
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MENU = [("PHY1", "phy1"), ("PHY2", "phy2"), ("PHY2 (Flow Control)", "phy2_flow_control"),
          ("PHY3 (DLV)", "phy3")]

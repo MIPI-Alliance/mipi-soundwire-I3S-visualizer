@@ -283,7 +283,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._tick_filter_key = None             # (_tick_gen) the mask below is for
         self._tick_filter_mask = None
         self._total = max(1, int(total_samples))
-        self._reset_view()                       # new capture → show the whole thing
+        self.reset_view()                       # new capture → show the whole thing
 
     def set_bringups(self, results) -> None:
         """Mark every link bring-up (Session.link_controls): the first — absent ('none')
@@ -361,10 +361,22 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     def _bounds(self):
         return self._domain if self._domain is not None else (0.0, float(max(1, self._total)))
 
+    def fit_view(self) -> None:
+        """Clamp the view into the bounds if it reaches past either end; a view inside
+        them is left as it is. Does not emit viewChanged."""
+        lo, hi = self._bounds()
+        if self._view_lo < lo or self._view_hi > hi:
+            self._set_view(self._view_lo, self._view_hi, emit=False)
+
     def set_view(self, lo: float, hi: float) -> None:
         """Show [lo, hi] (samples) as told by the stack. Unlike a user zoom this does not
         emit viewChanged, so ribbons following each other cannot ping-pong."""
         self._set_view(lo, hi, emit=False)
+
+    def zoom_to(self, lo: float, hi: float) -> None:
+        """Show [lo, hi] (samples) as a user zoom does: clamped like set_view, and
+        viewChanged emitted so the ribbons that follow this one move with it."""
+        self._set_view(lo, hi, emit=True)
 
     def _track_rect(self) -> QRectF:
         # Leave the bottom _AXIS_H px for the time ruler; the rest is the track.
@@ -372,7 +384,23 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         return QRectF(_MARGIN, 10, max(1, self.width() - 2 * _MARGIN),
                       max(1, h - 28 - _AXIS_H))
 
-    def _reset_view(self) -> None:
+    @property
+    def total(self) -> int:
+        """The capture's length in samples."""
+        return self._total
+
+    @property
+    def view_range(self) -> tuple:
+        """The visible sample window, (lo, hi)."""
+        return (self._view_lo, self._view_hi)
+
+    def set_peer_cursor(self, sample: int) -> None:
+        """Draw the cursor at `sample` of this capture without moving the view: another
+        Link's ribbon is the one the user is driving."""
+        self._cursor = int(sample)
+        self.update()
+
+    def reset_view(self) -> None:
         """Show the whole capture (clears any zoom/pan)."""
         self._view_lo, self._view_hi = self._bounds()
         self.update()
@@ -429,7 +457,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         span = max(min(hi - lo, total), 16.0)               # cap zoom-in at 16 samples
         if lo < d_lo:
             lo, hi = d_lo, d_lo + span
-        elif hi > d_hi:
+        elif hi >= d_hi:                                    # at or past the end: end there
             lo, hi = d_hi - span, d_hi
         else:
             hi = lo + span
@@ -439,7 +467,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             self.viewChanged.emit(self._view_lo, self._view_hi)
 
     def mouseDoubleClickEvent(self, event) -> None:
-        self._reset_view()
+        self.reset_view()
 
     def set_nav_starts(self, starts) -> None:
         """Restrict Left/Right arrow navigation to these (sorted) command samples — the
@@ -731,7 +759,6 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         step_samples = step_u / unit
         if step_samples < 1.0:                               # never sub-sample (deep zoom):
             step_samples = 1.0                               # otherwise the tick loop explodes
-        p.setPen(QPen(QColor(170, 170, 175)))
         import math
         first = math.floor(self._view_lo / step_samples)
         last = math.ceil(self._view_hi / step_samples)
@@ -744,7 +771,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             x = self._x_for(s)
             p.setPen(QPen(_C_AXIS))
             p.drawLine(int(x), int(y), int(x), int(y) + 4)
-            p.setPen(QPen(QColor(180, 180, 185)))
+            p.setPen(QPen(QColor(VizTheme.GRID_TEXT)))
             # Centred on its tick, except where that would cut it at the widget's edge
             # (the "0 ms" at the start): there it is pinned to the edge instead.
             rect, align = QRectF(x - 44, y + 4, 88, _AXIS_H - 4), Qt.AlignHCenter

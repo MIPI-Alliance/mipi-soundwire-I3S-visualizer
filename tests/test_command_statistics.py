@@ -16,6 +16,8 @@ import pytest
 from swi3s_studio.analysis.measurements import capture_measurements
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture(scope="module")
 def rows():
@@ -178,10 +180,13 @@ def test_per_kind_counts_match_the_commands():
 
     s = Session.from_demo(300, phy=2, cold_start=True)
     want = Counter(c.get("command", "") for c in s.commands)
+    checked = set()
     for r in _section(capture_measurements(s), "Commands"):
         label = r[0].strip()
         if label in want and _kind(r) in ("group", None) and r[0].startswith("  "):
             assert int(r[1]) == want[label], (label, r[1], want[label])
+            checked.add(label)
+    assert checked >= {"Ping", "WriteA32"}, f"kinds with no count row: {set(want) - checked}"
 
 
 # --------------------------------------------------------------------------
@@ -303,12 +308,19 @@ def test_every_detail_kind_is_adopted_by_its_group():
     from swi3s_studio.analysis import measurements as m
     from swi3s_studio.ui.measurements_view import _GROUPED_KINDS
 
-    cmds = [{"command": "WriteA32", "device": 0, "phase": "Write", "crc_valid": False,
-             "payload": [1, 2, 3], "is_error": True},
-            {"command": "WriteA32", "device": 1, "phase": "Write", "crc_valid": True,
-             "payload": [4, 5], "is_error": False}]
-    emitted = {_kind(r) for r in m._rw_detail_rows(cmds, reading=False)}
-    emitted |= {_kind(r) for r in m._ping_detail_rows([])}
+    cmds = [{"command": "WriteA32", "device_mask": 0x001, "phase": "Write",
+             "has_manager_packet": True, "crc_valid": False, "data": b"\x01\x02\x03"},
+            {"command": "WriteA32", "device_mask": 0x002, "phase": "Write",
+             "crc_valid": True, "data": b"\x04\x05"}]
+    pings = [{"command": "Ping", "phase": "GetStatus", "device_mask": 0xFFF,
+              "ping_status": [0, 1, -1, -1] + [-1] * 8}]
+    rw = list(m._rw_detail_rows(cmds, reading=False))
+    assert [r[0] for r in rw if r[2] == "detail"][:2] == ["    Device 0", "      bytes written"]
+    assert ("      errors", "1", "fail") in rw
+    ping = list(m._ping_detail_rows(pings))
+    assert any(r[0] == "    Device 0" for r in ping) and any(
+        r[1].endswith("NO_RESPONSE") for r in ping), ping
+    emitted = {_kind(r) for r in rw} | {_kind(r) for r in ping}
     stray = {k for k in emitted if k is not None} - set(_GROUPED_KINDS)
     assert not stray, (
         f"detail builders emit kind(s) {stray} that MeasurementsView will not fold into the "

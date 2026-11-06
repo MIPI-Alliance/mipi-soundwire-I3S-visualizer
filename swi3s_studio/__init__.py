@@ -1,13 +1,13 @@
 """SWI3S Studio — desktop MIPI SoundWire I3S bus analyzer.
 
 A PySide6 UI over the C++ decode core (`swi3score`, built from `native/`), with capture
-ingestion, an out-of-core results store, audio decode and timing analysis. See
-docs/architecture.md.
+ingestion, results held in memory (an Arrow command cache, audio min/max pyramids), audio
+decode and timing analysis. See docs/architecture.md.
 
 `__version__` is shown in the window title and kept in sync with pyproject.toml. Release
 notes, one file per version, are in docs/releases/.
 """
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 from .api import DecodeResult, decode, decode_capture
 from .ingest import saleae_binary

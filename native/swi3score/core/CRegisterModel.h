@@ -38,7 +38,7 @@ public:
     // commits iff (its CommitGroupMemb & groupMask) != 0 (Section 9.1.10.4).
     // Only the devices selected in 'deviceMask' (bit n = Device n) commit; a zero mask
     // selects none (Section 8.1.1.5.1, the "Commit Phase for SSCR and DSCR Commands"
-    // table). Call this at the SSP row for a CONFIRM_COMMIT'd SSCR.
+    // table). Call this at the SSP row for a CONFIRM_COMMIT'd SSCR or DSCR.
     void Commit(U8 groupMask, U16 deviceMask);
 
     // Debug what-if: force `value` into the register at `addr` for `dev`, exactly
@@ -58,9 +58,10 @@ public:
     // `addr` on `dev`. Rank-aware, mirroring the register-map display — a _CURR-alias
     // read updates the committed bank; a _NEXT-base/single read updates the live
     // display bank — and tagged READ (distinct from a manager WRITTEN). Reads apply
-    // IMMEDIATELY (never wait for a commit) and are folded ONLY into the register-map
-    // snapshot path (registersFromCommands), never the config the grid/audio decode
-    // from — a read reveals peripheral state, it is not a configuration write.
+    // IMMEDIATELY (never wait for a commit). A _CURR-alias or single-ranked read lands in
+    // the banks get() and BuildConfig read, so a read is applied only to a separate model
+    // (the register-map snapshot, registersFromCommands), never the one the grid/audio
+    // decode from: a read reveals peripheral state, it is not a configuration write.
     void ApplyRead(int dev, U32 addr, U8 value);
 
     // Reconstruct a config from observed register state: bus geometry plus every
@@ -81,17 +82,26 @@ public:
     // to, regardless of what the current command is writing. Unseen -> reset (0).
     int CurrentInterval(int dev, int dp) const;
 
+    // The committed CDS_HorizontalStart[4:0], or -1 before one is committed.
+    int CdsHorizontalStart() const;
+
+    // True when data port `dp` of device `dev` has a channel enabled in the committed rank.
+    bool PortRunning(int dev, int dp) const;
+
+    // The value a read of `addr` on `dev` returns now: committed, else its reset value.
+    U8 Current(int dev, U32 addr) const { return get(dev, addr); }
+
     // ShortProtocolSpacer (SLC 0x1083 _CURR), default false.
     bool ShortProtocolSpacer() const;
 
     bool AnyConfig() const { return !mDev.empty(); }
 
-    // True if a WriteA32 to `addr` takes effect on the COMMITTED (_CURR) state IMMEDIATELY
-    // — i.e. a single-ranked register, applied by applyWrite the moment it's written, with
-    // no Commit. (Dual-ranked writes stage in _NEXT and wait for a Commit.) The streaming
-    // decode uses this to reconfigure the payload engine right after such a write, so the
-    // audio/samples decode reflects the register state however it was set — not only at a
-    // commit. See applyWrite / isDualRanked.
+    // True if a WriteA32 to `addr` takes committed effect at once: a single-ranked register
+    // or a writable _CURR alias (dual-ranked _NEXT writes stage and wait for a Commit; a
+    // read-only byte, IsReadOnly, takes no write). The streaming decode uses this to
+    // reconfigure the payload engine right after such a write, so the audio/samples decode
+    // reflects the register state however it was set, not only at a commit. See applyWrite /
+    // isDualRanked.
     bool WriteIsImmediate(U32 addr) const;
 
     // Every committed (_CURR) register value observed, as (device, base_addr, value)
@@ -113,6 +123,17 @@ public:
     // Provenance tags for a register value in a Snapshot (parallel to the display
     // model's Provenance): distinguish a manager write from a peripheral-revealed read.
     enum Source : U8 { SrcDefault = 0, SrcWritten = 1, SrcRead = 2 };
+
+    // True if a WriteA32 to `addr` changes nothing because the byte is read-only: a register
+    // whose fields are all RO, or a read-only _CURR alias (CDS, Dual-CURR-RO). The decode
+    // flags such a write as a programming error (CommandRec::readOnlyWriteError). Mirrors
+    // data/registers.json, cross-checked by test_register_model.py.
+    static bool IsReadOnly(U32 addr);
+
+    // The write-1-to-clear (RW1C) bits of the register at `addr`, 0 when it has none: a 1
+    // written to such a bit clears it, a 0 leaves it as it was. Mirrors data/registers.json,
+    // cross-checked by test_register_model.py.
+    static U8 Rw1cMask(U32 addr);
 
     // Spec-defined reset byte for the register at `baseAddr` (the value an
     // un-written register reads as). This is the SINGLE place per-register resets

@@ -133,8 +133,18 @@ class DataPortValidator:
                          DataPortRanges.MIN_DEVICE_NUMBER, DataPortRanges.MAX_DEVICE_NUMBER)
 
         num_channels = bin(config.EnableCh_REG).count('1')
+        _check_range(result, 'EnableCh_REG', config.EnableCh_REG,
+                     DataPortRanges.MIN_ENABLE_CH, DataPortRanges.MAX_ENABLE_CH)
         _check_range(result, 'NumChannels', num_channels,
                      DataPortRanges.MIN_CHANNELS, DataPortRanges.MAX_CHANNELS)
+        _check_range(result, 'BitWidth_REG', config.BitWidth_REG,
+                     DataPortRanges.MIN_BIT_WIDTH, DataPortRanges.MAX_BIT_WIDTH)
+        _check_range(result, 'TailWidth_REG', config.TailWidth_REG,
+                     DataPortRanges.MIN_TAIL_WIDTH, DataPortRanges.MAX_TAIL_WIDTH)
+        _check_range(result, 'FlowMode_REG', int(config.FlowMode_REG),
+                     DataPortRanges.MIN_FLOW_MODE, DataPortRanges.MAX_FLOW_MODE)
+        _check_range(result, 'PortMode_REG', int(config.PortMode_REG),
+                     DataPortRanges.MIN_PORT_MODE, DataPortRanges.MAX_PORT_MODE)
         _check_range(result, 'ChannelGrouping_REG', config.ChannelGrouping_REG,
                      DataPortRanges.MIN_CHANNEL_GROUPING, DataPortRanges.MAX_CHANNEL_GROUPING)
         _check_range(result, 'Spacing_REG', config.Spacing_REG,
@@ -219,10 +229,17 @@ class DataPortValidator:
         return config.ChannelGrouping_REG
 
     @staticmethod
+    def _bits_per_channel_sample(config: Any) -> int:
+        """Bit UIs one channel-sample occupies: its data bits plus the TxPresent bit that
+        precedes it when the FlowMode sends one (Tx Controlled, Rx Controlled, Async)."""
+        return config.SampleSize_REG + 1 + int(bool(getattr(config, '_txp_enabled', False)))
+
+    @staticmethod
     def _drive_in_group(config: Any, effective_channel_grouping: int) -> int:
-        """Number of bus slots required to transmit one complete channel group."""
+        """Number of bus slots required to transmit one complete channel group,
+        TxPresent bits included."""
         return (
-            (config.SampleSize_REG + 1) *
+            DataPortValidator._bits_per_channel_sample(config) *
             (config.SampleGrouping_REG + 1) *
             effective_channel_grouping *
             (config.BitWidth_REG + 1)
@@ -494,7 +511,8 @@ class DataPortValidator:
         num_groups = (num_channels + effective_channel_grouping - 1) // effective_channel_grouping
         # Bits per single channel (the per-group total scales by that group's channel
         # count, which is smaller for a partial trailing group).
-        per_channel_bits = (config.SampleSize_REG + 1) * (config.SampleGrouping_REG + 1)
+        per_channel_bits = (self._bits_per_channel_sample(config) *
+                            (config.SampleGrouping_REG + 1))
 
         col = h_start
         for group_idx in range(num_groups):
@@ -652,9 +670,9 @@ class InterfaceValidator:
 
     def _validate_settings(self, result: ValidationResult) -> None:
         """Run all interface settings checks."""
-        self._check_phy3_requires_even_columns(result)
+        self._check_non_phy3_requires_even_columns(result)
 
-    def _check_phy3_requires_even_columns(self, result: ValidationResult) -> None:
+    def _check_non_phy3_requires_even_columns(self, result: ValidationResult) -> None:
         """When PHY3 is disabled (FBSCE PHYs used), NumColumns shall be even.
 
         num_columns = NumColumns_REG + 1, so for even num_columns,

@@ -11,9 +11,8 @@
 // so even multi-GB edge arrays are referenced zero-copy. An owning constructor is
 // provided for C++ use/tests.
 //
-// Semantics mirror the plugin's CBitstreamDecoder: each clock edge bounds one UI;
-// the data line is sampled JUST BEFORE the edge (sample S-1), since data changes
-// shortly after a clock edge.
+// Each clock edge bounds one UI; the data line is sampled JUST BEFORE the edge (sample
+// S-1), since data changes shortly after a clock edge.
 
 #ifndef SWI3SCORE_TRANSITIONSAMPLESOURCE_H
 #define SWI3SCORE_TRANSITIONSAMPLESOURCE_H

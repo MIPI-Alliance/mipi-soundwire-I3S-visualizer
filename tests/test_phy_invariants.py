@@ -21,8 +21,9 @@ from swi3s_studio.session import Session
 # Audio-mode PHYs that Session.from_demo can synthesize. All three inherit every invariant
 # below.
 PHYS = [1, 2, 3]
-_DEMO_SAMPLES = 1500          # spans the 4-col Safe-Lock → 16-col audio reconfigure and
-#                               leaves a deep region for drift/seek coverage.
+_DEMO_SAMPLES = 1500          # Column counts by region: PHY1 2 → 4, PHY2 2 → 8 → 16, PHY3 4 → 16
+#                               (Safe-Lock-4 → 16). 1500 samples span every reconfigure and
+#                               leave a deep region for drift/seek coverage.
 
 # The port set each demo synthesizes. NOT an invariant — demo shape, kept per PHY.
 _DEMO_STREAMS = {
@@ -109,7 +110,8 @@ def test_rsp_marks_are_periodic_one_per_row(sess):
     constant row period quantises to two adjacent sample counts (e.g. 325/326) — the ±1
     jitter a real capture shows — hence a spread of at most one sample, not exactly zero."""
     row = _row_samples(sess)
-    mid = int(sess.audio_start_sample) + int(0.5 * (sess.audio_end_sample - sess.audio_start_sample))
+    mid = int(sess.audio_start_sample) + int(
+        0.5 * (sess.audio_end_sample - sess.audio_start_sample))
     lo, hi = mid, mid + int(30 * row)
     marks = np.asarray(sess.cds_column_samples(lo, hi)).astype(np.int64)
     assert marks.size >= 8, marks.size

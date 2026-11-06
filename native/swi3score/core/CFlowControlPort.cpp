@@ -39,6 +39,7 @@ FcpEmit CFlowControlPort::clock_tick(bool dpIntervalSkipped)
             e.drqSamplePoint = true;        // wide sink DRQ samples on the last replay UI
         }
         --mWideBitRemaining;
+        e.drqObservePoint = mWideBitRemaining == 0 || mColumn == mNumColumns - 1;
         advanceColumn();
         return e;
     }
@@ -53,6 +54,7 @@ FcpEmit CFlowControlPort::clock_tick(bool dpIntervalSkipped)
             e.drqSamplePoint = true;        // narrow sink DRQ samples now
         }
         armDrqRepeat();
+        e.drqObservePoint = mWideBitRemaining == 0 || mColumn == mNumColumns - 1;
         advanceColumn();
         return e;
     }

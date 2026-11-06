@@ -1,4 +1,4 @@
-AppVersion,3.1.0
+AppVersion,3.2.0
 NumColumns_REG,31
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -8,7 +8,7 @@ EnforceS1Handover,False
 CDS_BitWidth_REG,0
 EnforceCDSHandover,False
 RowRate,192.0
-Description,"This example and the "Single Mic PHY1 FBCSE" example show Transport Patterns where the Payload bandwidth remains unchanged, but the Control Data Stream bandwidth is reduced."
+Description,"This example and the ""Single Mic PHY1 FBCSE"" example show Transport Patterns where the Payload bandwidth remains unchanged, but the Control Data Stream bandwidth is reduced."
 RowsToDraw,3
 CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
 CDS_GuardPolarityPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0

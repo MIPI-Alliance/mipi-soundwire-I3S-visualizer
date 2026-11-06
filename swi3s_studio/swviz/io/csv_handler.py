@@ -7,13 +7,16 @@ CSV file handler for loading and saving SoundWire I3S configurations.
 import csv
 import io
 import logging
+import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..config.constants import CSVFields
+from ..config.constants import CSVFields, InterfaceRanges
 from ..models.enums import DisplayField
 from ..viz import DataPortVizConfig, VizConfig
+from .json_handler import _write_text_whole
 
 # =============================================================================
 # Field Type Definitions
@@ -23,7 +26,7 @@ class FieldType(Enum):
     """Types of CSV field values."""
     INT = auto()       # Integer value
     FLOAT = auto()     # Float value
-    BOOL = auto()      # Boolean value (True/False or 0/1)
+    BOOL = auto()      # Boolean value (true/false, yes/no or 1/0: _TRUE_CELLS, _FALSE_CELLS)
     STRING = auto()    # String value
     BINARY_INT = auto() # Integer in binary format (0b prefix)
     DISPLAY_FIELDS = auto()  # DisplayField flags (s=sample, c=channel, b=bit)
@@ -77,13 +80,28 @@ CDS_GUARD_POLARITY_PER_SOURCE = 'CDS_GuardPolarityPerSource'
 CDS_TAIL_PER_SOURCE = 'CDS_TailWidthPerSource'
 # Drive type and end-drive-early are per source for the same reason: each register sits in
 # a device's own CDS block. Drive type: 1 Normal, 0 Special (a CDS 1 left high-Z for the
-# Manager's bus keeper). End drive early: 0 full UI, 1 stop half a UI early.
+# Manager's bus keeper). End drive early: 0 drive to the end of the UI,
+# 1 stop before the end of the last UI.
 CDS_DRIVE_TYPE_PER_SOURCE = 'CDS_DriveTypePerSource'
 CDS_EDE_PER_SOURCE = 'CDS_EndDriveEarlyPerSource'
 # The scalar spelling of the drive type, read only (never written) — see the load path.
 _CDS_DRIVE_TYPE_SCALAR = 'CDS_DriveType'
 
-# The plain 13-wide integer rows: csv_key -> (Interface attribute, default per source).
+
+def _reserved_tail_text(sources: List[str]) -> str:
+    """The warning for CDS_TailWidth 3 on `sources` (Manager, Device n), listing every
+    source joined by "; " and ending with the grid's 3-UI tail. The caller prefixes the
+    line and field. `bus_config.reserved_cds_tail_note` is the BusConfig and native
+    loader's own wording of the same fact."""
+    width = InterfaceRanges.RESERVED_CDS_TAIL_WIDTH
+    return (f"CDS_TailWidth {width} is Reserved (0..2 UI are defined) for "
+            f"{'; '.join(f'{s} = {width}' for s in sources)}; the value is kept as written "
+            f"and the grid draws a {width}-UI tail.")
+
+
+# The plain 13-wide integer rows: csv_key -> (Interface attribute, default per source,
+# lowest and highest legal cell). A cell outside its range keeps its low bits, as the
+# register field does, and is reported in a warning.
 # Add a new per-source CDS field as an entry here; the load and save loops read this
 # table. Mirrors bus_config._CDS_PER_SOURCE_INT_ROWS, which is the same list for the
 # other engine.
@@ -91,15 +109,47 @@ _CDS_DRIVE_TYPE_SCALAR = 'CDS_DriveType'
 # CDS_DriveType defaults to 1, against its register reset, so a file with no row reads
 # as Normal; CDS_EndDriveEarly defaults to 0, its register reset.
 _CDS_INT_PER_SOURCE = {
-    CDS_TAIL_PER_SOURCE: ('CDS_Tail_PerSource', 0),
-    CDS_DRIVE_TYPE_PER_SOURCE: ('CDS_DriveType_PerSource', 1),
-    CDS_EDE_PER_SOURCE: ('CDS_EndDriveEarly_PerSource', 0),
+    CDS_TAIL_PER_SOURCE: ('CDS_Tail_PerSource', 0,
+                          InterfaceRanges.MIN_CDS_TAIL_WIDTH, InterfaceRanges.MAX_CDS_TAIL_WIDTH),
+    CDS_DRIVE_TYPE_PER_SOURCE: ('CDS_DriveType_PerSource', 1, 0, 1),
+    CDS_EDE_PER_SOURCE: ('CDS_EndDriveEarly_PerSource', 0, 0, 1),
 }
 # Scalar CDS guard/tail registers: READ from v2 files (to derive the per-source rows)
 # and derived FROM the per-source rows on every load for the engine layout, but never
 # WRITTEN (the per-source rows are authoritative).
 _CDS_SCALAR_FIELDS = {'CDS_GuardEnabled_REG', 'CDS_GuardPolarity_REG', 'CDS_TailWidth_REG'}
 CDS_NUM_SOURCES = 13  # Manager + Device 0..11
+
+
+# =============================================================================
+# Cell Reading Rules
+# =============================================================================
+
+# A whole-number cell: decimal, 0x or 0b, ASCII digits only. These are the forms
+# BusConfig and the native loader read as a whole number.
+_WHOLE_NUMBER = (
+    (re.compile(r'0[bB][01]+'), 2, 2),
+    (re.compile(r'0[xX][0-9a-fA-F]+'), 16, 2),
+    (re.compile(r'[+-]?[0-9]+'), 10, 0),
+)
+_FLOAT_CELL = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+_TRUE_CELLS = ('true', '1', 'yes')
+_FALSE_CELLS = ('false', '0', 'no')
+# The most characters of a file's cell that an error or a warning quotes.
+_QUOTED_CHARS = 60
+# Unrecognised field names that one warning lists before it counts the rest.
+_NAMES_LISTED = 3
+
+
+def _clip(text: str) -> str:
+    """`text` as an error or warning shows a file's text: whole when it has at most
+    _QUOTED_CHARS characters, else the first _QUOTED_CHARS - 1 and an ellipsis."""
+    return text if len(text) <= _QUOTED_CHARS else text[:_QUOTED_CHARS - 1] + '\u2026'
+
+
+def _quote(text: str) -> str:
+    """`text` clipped, in single quotes."""
+    return f"'{_clip(text)}'"
 
 
 # =============================================================================
@@ -118,6 +168,16 @@ class CSVLoadResult:
     # Advisory only: nothing compares it against MIN_COMPATIBLE_CSV_VERSION. Wire in a
     # parse/compare here if a format break needs to reject or convert older files.
     file_app_version: Optional[str] = None
+    # The VizConfig the load filled: the one passed in, else the one created for the load.
+    viz_config: Optional[VizConfig] = None
+    # Per-row import warnings, each one complete message: a repeated field row, a
+    # DisplayFields character outside 's', 'c', 'b', a per-source CDS value, or a legacy
+    # scalar CDS_TailWidth_REG or CDS_DriveType, that does not fit its register field (its
+    # low bits are carried), a CDS tail width of 3 (Reserved), and a negative legacy scalar
+    # CDS_TailWidth_REG or CDS_DriveType (ignored: the CDS sources keep their defaults).
+    # A per-port register field is kept as written; the native loader reports one that
+    # does not fit.
+    warnings: List[str] = field(default_factory=list)
 
     # Fields a writer may leave out, whose absence is not reported by `notes`.
     OPTIONAL_FIELDS = frozenset({'Interface: Description'})
@@ -125,11 +185,18 @@ class CSVLoadResult:
     def notes(self, *, missing: bool = True) -> List[str]:
         """The load's import warnings as messages: the fields that were not recognised
         and ignored, and (with `missing`) the fields absent from the file that took their
-        defaults, OPTIONAL_FIELDS excepted. One message per kind."""
-        out: List[str] = []
+        defaults, OPTIONAL_FIELDS excepted. The per-row warnings come first, one message
+        each, then one message for the unrecognised fields and one for the missing. The
+        unrecognised message lists the first `_NAMES_LISTED` names, each cut to
+        `_QUOTED_CHARS` characters, and counts the rest."""
+        out: List[str] = list(self.warnings)
         if self.unrecognized_fields:
             n = len(self.unrecognized_fields)
-            names = ", ".join(f"{name} (line {line})" for line, name in self.unrecognized_fields)
+            names = ", ".join(
+                f"{_clip(name)} (line {line})"
+                for line, name in self.unrecognized_fields[:_NAMES_LISTED])
+            if n > _NAMES_LISTED:
+                names += f" and {n - _NAMES_LISTED} more"
             out.append(f"{n} field{'s are' if n != 1 else ' is'} not recognised and "
                        f"{'were' if n != 1 else 'was'} ignored: {names}.")
         gone = [f for f in self.missing_fields if f not in self.OPTIONAL_FIELDS]
@@ -242,13 +309,25 @@ class CSVHandler:
     _dataport_field_dict = {csv_field: (attr, ftype, excess) for csv_field, attr, ftype, excess in DATAPORT_FIELD_MAP}
     _dataport_viz_field_dict = {csv_field: (attr, ftype) for csv_field, attr, ftype in DATAPORT_VIZ_FIELD_MAP}
 
+    @staticmethod
+    def _known_field_names() -> frozenset:
+        """Every field name a load recognises, per-source CDS rows included."""
+        return frozenset(
+            {*CSVHandler._interface_field_dict, *CSVHandler._interface_viz_field_dict,
+             *CSVHandler._dataport_field_dict, *CSVHandler._dataport_viz_field_dict,
+             *CSVHandler.DEVICE_ASSIGNMENT_FIELDS,
+             CDS_GUARD_ENABLE_PER_SOURCE, CDS_GUARD_POLARITY_PER_SOURCE,
+             *_CDS_INT_PER_SOURCE, _CDS_DRIVE_TYPE_SCALAR})
+
     # =============================================================================
     # Value Parsing Methods
     # =============================================================================
 
     @staticmethod
     def parse_int_value(value: str) -> int:
-        """Parse an integer value in decimal, binary (0b), or hex (0x) format.
+        """Parse an integer value in decimal, binary (0b), or hex (0x) format, as BusConfig
+        and the native loader read a whole number: ASCII digits only, so an underscore or
+        another script's digit is not part of a number.
 
         Args:
             value: String value to parse (e.g., "123", "0b1111011", or "0xFFFF")
@@ -257,23 +336,25 @@ class CSVHandler:
             Integer value
 
         Raises:
-            ValueError: If value is empty or cannot be parsed as integer
+            ValueError: If value is empty or is not a whole number; the message quotes at
+                most `_QUOTED_CHARS` characters of it
         """
         value = value.strip()
         if not value:
             raise ValueError("Cannot parse integer from empty string")
-        try:
-            if value.startswith(('0b', '0B')):
-                return int(value, 2)
-            if value.startswith(('0x', '0X')):
-                return int(value, 16)
-            return int(value)
-        except ValueError:
-            raise ValueError(f"Cannot parse integer from '{value}'")
+        for pattern, base, skip in _WHOLE_NUMBER:
+            if pattern.fullmatch(value):
+                try:
+                    return int(value[skip:], base)
+                except ValueError:          # a decimal run past Python's digit limit
+                    break
+        raise ValueError(f"Cannot parse integer from {_quote(value)}")
 
     @staticmethod
     def parse_float_value(value: str) -> float:
-        """Parse a float value from string.
+        """Parse a float value from string, as BusConfig and the native loader read a number:
+        ASCII digits, one point, an exponent only when digits follow it, and a finite result,
+        so an underscore, another script's digit, 'nan' or 'inf' is not a number.
 
         Args:
             value: String value to parse (e.g., "123.45" or "3072")
@@ -282,21 +363,25 @@ class CSVHandler:
             Float value
 
         Raises:
-            ValueError: If value is empty or cannot be parsed as float
+            ValueError: If value is empty or is not a finite number; the message quotes at
+                most `_QUOTED_CHARS` characters of it
         """
         value = value.strip()
         if not value:
             raise ValueError("Cannot parse float from empty string")
-        try:
-            return float(value)
-        except ValueError:
-            raise ValueError(f"Cannot parse float from '{value}'")
+        if _FLOAT_CELL.fullmatch(value):
+            result = float(value)
+            if math.isfinite(result):
+                return result
+        raise ValueError(f"Cannot parse float from {_quote(value)}")
 
     @staticmethod
     def parse_bool_value(value: str) -> bool:
         """Parse a boolean value from string.
 
-        Accepts: True/False, true/false, 1/0
+        Accepts, in any case: true/false, yes/no, 1/0 (the spellings BusConfig and the
+        native loader accept). Any other text raises ValueError quoting at most
+        `_QUOTED_CHARS` characters of it.
 
         Args:
             value: String value to parse
@@ -304,19 +389,29 @@ class CSVHandler:
         Returns:
             Boolean value
         """
-        value = value.strip().lower()
-        if value in ('true', '1'):
+        text = value.strip().lower()
+        if text in _TRUE_CELLS:
             return True
-        elif value in ('false', '0'):
+        if text in _FALSE_CELLS:
             return False
-        else:
-            raise ValueError(f"Cannot parse boolean from '{value}'")
+        raise ValueError(f"Cannot parse boolean from {_quote(value.strip())}")
+
+    @staticmethod
+    def display_field_strays(value: str) -> str:
+        """The characters of a DisplayFields value that are not 's', 'c' or 'b'
+        (case-insensitive, surrounding whitespace ignored), in order and without repeats."""
+        out = ''
+        for ch in value.strip():
+            if ch.lower() not in 'scb' and ch not in out:
+                out += ch
+        return out
 
     @staticmethod
     def parse_display_fields(value: str) -> DisplayField:
         """Parse DisplayField flags from string.
 
-        Accepts: 's', 'c', 'b', 'sc', 'scb', etc.
+        Accepts: 's', 'c', 'b', 'sc', 'scb', etc. Any other character is ignored;
+        `display_field_strays` names them.
 
         Args:
             value: String with display field characters (s=sample, c=channel, b=bit)
@@ -397,11 +492,12 @@ class CSVHandler:
             filename: Path to CSV file to load
             interface: Interface object to populate with configuration
             viz_config: Optional VizConfig to populate with visualization settings.
-                       If None, a new VizConfig is created and returned via result.
+                       If None, a new VizConfig is created for the load and returned
+                       as `result.viz_config`.
 
         Returns:
             CSVLoadResult with success status, viz_config, missing_fields,
-            and any unrecognized fields
+            unrecognized fields and per-row warnings
         """
         logger = logging.getLogger('swi3s_visualizer.io')
         result = CSVLoadResult(success=False)
@@ -409,6 +505,7 @@ class CSVHandler:
         # Create VizConfig if not provided
         if viz_config is None:
             viz_config = VizConfig()
+        result.viz_config = viz_config
 
         # Reset interface device assignments to defaults before loading
         # This ensures stale MANAGER assignments don't persist across loads
@@ -440,18 +537,69 @@ class CSVHandler:
         cds_guard_enable_ps = None      # split guard rows, recombined after the loop
         cds_guard_polarity_ps = None
         legacy_cds_drive = None         # the scalar spelling; broadcast if seen
+        # A negative legacy scalar CDS tail width or drive type (key -> (line, value)) is
+        # not applied; the last row of its key decides, and it is reported after the loop
+        # unless the per-source row is present.
+        negative_scalar: Dict[str, Tuple[int, int]] = {}
+        tail_default = interface.CDS_TailWidth_REG
+        device_rows: Dict[str, List[Any]] = {}   # device-assignment rows, applied after the loop
+
+        # The row being read, so an error raised while parsing or storing one of its cells
+        # names the line, the field and (on a per-port row) the data port.
+        where: Dict[str, Any] = {'line': None, 'field': '', 'port': None}
 
         try:
-            with open(filename, encoding='utf8') as data_file:
+            with open(filename, encoding='utf-8-sig', newline='') as data_file:
                 csv_data = csv.reader(data_file)
                 row_count = 0
+                first_row_of: Dict[str, int] = {}   # recognised field name -> first line
+                known_fields = CSVHandler._known_field_names()
 
+                def parse_viz(raw: str, field_type: FieldType, line: int, name: str,
+                              strays_by_port: Optional[Dict[str, List[int]]] = None,
+                              port: int = 0) -> Any:
+                    """Parse a viz cell. A DisplayFields character outside s, c, b is
+                    reported at once, or recorded under `strays_by_port` when the caller
+                    reports one message for the whole row."""
+                    if field_type == FieldType.DISPLAY_FIELDS:
+                        strays = CSVHandler.display_field_strays(raw)
+                        if strays and strays_by_port is not None:
+                            strays_by_port.setdefault(strays, []).append(port)
+                        elif strays:
+                            result.warnings.append(
+                                f"Line {line} ({name}): '{strays}' is not one of s, c, b "
+                                f"and was ignored.")
+                    return CSVHandler.parse_value(raw, field_type)
+
+                def report_strays(strays_by_port: Dict[str, List[int]], line: int,
+                                  name: str) -> None:
+                    if not strays_by_port:
+                        return
+                    parts = "; ".join(
+                        f"'{strays}' (data port{'s' if len(ports) != 1 else ''} "
+                        f"{', '.join(map(str, ports))})"
+                        for strays, ports in strays_by_port.items())
+                    result.warnings.append(
+                        f"Line {line} ({name}): characters other than s, c, b were "
+                        f"ignored: {parts}.")
+
+                def need_value(row: List[str], line: int, name: str) -> bool:
+                    if len(row) >= 2:
+                        return True
+                    result.error_message = f"Line {line} ({name}): missing value"
+                    return False
+
+                last_line = 0
                 for count, row in enumerate(csv_data):
                     row_count = count
+                    # The physical line the record starts on; a quoted cell may span lines.
+                    line_no = last_line + 1
+                    last_line = csv_data.line_num
                     if not row or not row[0]:  # Skip empty rows
                         continue
 
                     field_name = row[0]
+                    where.update(line=line_no, field=field_name, port=None)
 
                     # Skip legacy encoding flag if present in old files
                     if field_name == CSVFields.SAVE_FILE_USING_EXCESS_ONE:
@@ -463,8 +611,40 @@ class CSVHandler:
                         result.file_app_version = row[1] if len(row) > 1 else ''
                         continue
 
+                    if field_name in known_fields:
+                        if field_name in first_row_of:
+                            result.warnings.append(
+                                f"Line {line_no} ({field_name}) repeats line "
+                                f"{first_row_of[field_name]}; the later row is used.")
+                        else:
+                            first_row_of[field_name] = line_no
+
+                    # A negative legacy scalar tail width is ignored, not refused.
+                    if field_name == 'CDS_TailWidth_REG':
+                        if not need_value(row, line_no, field_name):
+                            return result
+                        found_interface_fields.add(field_name)
+                        tail_value = CSVHandler.parse_value(row[1], FieldType.INT)
+                        if tail_value < 0:
+                            negative_scalar[field_name] = (line_no, tail_value)
+                            interface.CDS_TailWidth_REG = tail_default
+                        else:
+                            negative_scalar.pop(field_name, None)
+                            tail_max = InterfaceRanges.MAX_CDS_TAIL_WIDTH
+                            if tail_value > tail_max:
+                                result.warnings.append(
+                                    f"Line {line_no} (CDS_TailWidth_REG): {tail_value} does "
+                                    f"not fit its {tail_max.bit_length()}-bit register field "
+                                    f"({InterfaceRanges.MIN_CDS_TAIL_WIDTH}..{tail_max}); the "
+                                    f"low {tail_max.bit_length()} bits are carried.")
+                                tail_value &= tail_max
+                            interface.CDS_TailWidth_REG = tail_value
+                        continue
+
                     # Try interface parameter (exact match)
                     if field_name in CSVHandler._interface_field_dict:
+                        if not need_value(row, line_no, field_name):
+                            return result
                         found_interface_fields.add(field_name)
                         attr_name, field_type = CSVHandler._interface_field_dict[field_name]
                         value = CSVHandler.parse_value(row[1], field_type)
@@ -483,20 +663,44 @@ class CSVHandler:
                         values = row[1:]
                         if len(values) != CDS_NUM_SOURCES:
                             result.error_message = (
-                                f"Row {count + 1} ({field_name}): Expected {CDS_NUM_SOURCES} "
+                                f"Line {line_no} ({field_name}): Expected {CDS_NUM_SOURCES} "
                                 f"per-source values, found {len(values)}"
                             )
                             return result
                         if field_name in _CDS_INT_PER_SOURCE:
-                            attr, default = _CDS_INT_PER_SOURCE[field_name]
+                            attr, default, lo, hi = _CDS_INT_PER_SOURCE[field_name]
                             target = getattr(interface, attr)
+                            carried: List[str] = []
+                            reserved: List[str] = []
                             for src_index, raw_value in enumerate(values):
                                 # A blank cell takes the FIELD's default, not 0: on
                                 # CDS_DriveType 0 means Special, so reading a gap as zero
                                 # would silently relabel the bus.
-                                target[src_index] = (
-                                    CSVHandler.parse_value(raw_value, FieldType.INT)
-                                    if str(raw_value).strip() else default)
+                                cell = (CSVHandler.parse_value(raw_value, FieldType.INT)
+                                        if str(raw_value).strip() else default)
+                                if not lo <= cell <= hi:
+                                    # A register field holds only its width: the low bits
+                                    # are carried and the cell is reported.
+                                    source = ("Manager" if src_index == 0
+                                              else f"Device {src_index - 1}")
+                                    carried.append(f"{source} = {cell}")
+                                    cell &= hi
+                                elif (field_name == CDS_TAIL_PER_SOURCE
+                                      and cell == InterfaceRanges.RESERVED_CDS_TAIL_WIDTH):
+                                    reserved.append(
+                                        "Manager" if src_index == 0 else f"Device {src_index - 1}")
+                                target[src_index] = cell
+                            if reserved:
+                                result.warnings.append(
+                                    f"Line {line_no} ({field_name}): "
+                                    f"{_reserved_tail_text(reserved)}")
+                            if carried:
+                                result.warnings.append(
+                                    f"Line {line_no} ({field_name}): does not fit its "
+                                    f"{hi.bit_length()}-bit register field ({lo}..{hi}) for "
+                                    f"{'; '.join(carried)}; "
+                                    + ("the low bit is carried." if hi == 1
+                                       else f"the low {hi.bit_length()} bits are carried."))
                             found_cds_int_rows.add(field_name)
                         elif field_name == CDS_GUARD_ENABLE_PER_SOURCE:
                             cds_guard_enable_ps = [CSVHandler.parse_value(v, FieldType.BOOL)
@@ -513,13 +717,26 @@ class CSVHandler:
                     if field_name == _CDS_DRIVE_TYPE_SCALAR:
                         legacy_cds_drive = CSVHandler.parse_value(
                             row[1] if len(row) > 1 else "1", FieldType.INT)
+                        if legacy_cds_drive < 0:
+                            negative_scalar[field_name] = (line_no, legacy_cds_drive)
+                            legacy_cds_drive = None
+                            continue
+                        negative_scalar.pop(field_name, None)
+                        if legacy_cds_drive not in (0, 1):
+                            result.warnings.append(
+                                f"Line {line_no} ({_CDS_DRIVE_TYPE_SCALAR}): "
+                                f"{legacy_cds_drive} does not fit its 1-bit register field "
+                                f"(0..1); the low bit is carried.")
+                            legacy_cds_drive &= 1
                         continue
 
                     # Try interface viz parameter (exact match)
                     if field_name in CSVHandler._interface_viz_field_dict:
+                        if not need_value(row, line_no, field_name):
+                            return result
                         found_interface_viz_fields.add(field_name)
                         attr_name, field_type = CSVHandler._interface_viz_field_dict[field_name]
-                        value = CSVHandler.parse_value(row[1], field_type)
+                        value = parse_viz(row[1], field_type, line_no, field_name)
                         setattr(viz_config, attr_name, value)
                         continue
 
@@ -532,13 +749,14 @@ class CSVHandler:
                         num_data_ports = len(interface.data_ports)
                         if len(row) - 1 != num_data_ports:
                             result.error_message = (
-                                f"Row {count + 1} ({field_name}): Expected {num_data_ports} data port values, "
-                                f"found {len(row) - 1}"
+                                f"Line {line_no} ({field_name}): Expected "
+                                f"{num_data_ports} data port values, found {len(row) - 1}"
                             )
                             return result
 
                         # Set value for each data port
                         for dp_index, data_port in enumerate(interface.data_ports):
+                            where['port'] = dp_index
                             value = CSVHandler.parse_value(
                                 row[dp_index + 1], field_type
                             )
@@ -559,17 +777,19 @@ class CSVHandler:
                         num_data_ports = len(interface.data_ports)
                         if len(row) - 1 != num_data_ports:
                             result.error_message = (
-                                f"Row {count + 1} ({field_name}): Expected {num_data_ports} data port values, "
-                                f"found {len(row) - 1}"
+                                f"Line {line_no} ({field_name}): Expected "
+                                f"{num_data_ports} data port values, found {len(row) - 1}"
                             )
                             return result
 
                         # Set value for each data port viz config
+                        strays_by_port: Dict[str, List[int]] = {}
                         for dp_index in range(num_data_ports):
-                            value = CSVHandler.parse_value(
-                                row[dp_index + 1], field_type
-                            )
+                            where['port'] = dp_index
+                            value = parse_viz(row[dp_index + 1], field_type,
+                                              line_no, field_name, strays_by_port, dp_index)
                             setattr(viz_config.data_ports[dp_index], attr_name, value)
+                        report_strays(strays_by_port, line_no, field_name)
                         continue
 
                     # Try device assignment fields (stored in interface, not dataport)
@@ -581,31 +801,37 @@ class CSVHandler:
                         num_data_ports = len(interface.data_ports)
                         if len(row) - 1 != num_data_ports:
                             result.error_message = (
-                                f"Row {count + 1} ({field_name}): Expected {num_data_ports} data port values, "
-                                f"found {len(row) - 1}"
+                                f"Line {line_no} ({field_name}): Expected "
+                                f"{num_data_ports} data port values, found {len(row) - 1}"
                             )
                             return result
 
-                        # Handle device assignment fields. Order-INDEPENDENT despite
-                        # the two fields being separate rows: DeviceNumber only applies
-                        # when the DP isn't already MANAGER, and InManager always sets
-                        # MANAGER, so InManager wins regardless of which row is read
-                        # first (and DPs reset to device 0 before the load).
+                        # The two fields are separate rows, so both are held (a repeat
+                        # replaces its earlier row) and applied once the loop ends.
+                        parsed_cells: List[Any] = []
                         for dp_index in range(num_data_ports):
-                            value = CSVHandler.parse_value(row[dp_index + 1], field_type)
-                            if field_name == DATA_PORT_DEVICE_NUMBER:
-                                # Only set if not already set to MANAGER by InManager field
-                                if not interface.is_dp_in_manager(dp_index):
-                                    interface.set_dp_device(dp_index, value)
-                            elif field_name == DATA_PORT_IN_MANAGER:
-                                # InManager=True means device is MANAGER
-                                if value:
-                                    from ..config.constants import SpecialDevices
-                                    interface.set_dp_device(dp_index, SpecialDevices.MANAGER)
+                            where['port'] = dp_index
+                            parsed_cells.append(
+                                CSVHandler.parse_value(row[dp_index + 1], field_type))
+                        device_rows[field_name] = parsed_cells
                         continue
 
                     # Field was not recognized
-                    result.unrecognized_fields.append((count + 1, field_name))
+                    result.unrecognized_fields.append((line_no, field_name))
+
+                where['line'] = None
+
+                # Device assignment is order-independent: a port flagged ManagerDataport
+                # is the Manager's whatever its DeviceNumber, any other port takes its
+                # DeviceNumber (device 0 when the row is absent).
+                from ..config.constants import SpecialDevices
+                numbers = device_rows.get(DATA_PORT_DEVICE_NUMBER)
+                in_manager = device_rows.get(DATA_PORT_IN_MANAGER)
+                for dp_index in range(len(interface.data_ports)):
+                    if in_manager and in_manager[dp_index]:
+                        interface.set_dp_device(dp_index, SpecialDevices.MANAGER)
+                    elif numbers:
+                        interface.set_dp_device(dp_index, numbers[dp_index])
 
                 # Recombine the split per-source guard rows into CDS_Guard_PerSource
                 # (0=off, 1=G0, 2=G1). A missing polarity row defaults enabled entries
@@ -630,6 +856,18 @@ class CSVHandler:
                     interface.CDS_Guard_PerSource = [g] * 13
                 if CDS_TAIL_PER_SOURCE not in found_cds_int_rows:
                     interface.CDS_Tail_PerSource = [interface.CDS_TailWidth_REG] * 13
+                    if (interface.CDS_TailWidth_REG == InterfaceRanges.RESERVED_CDS_TAIL_WIDTH
+                            and 'CDS_TailWidth_REG' in first_row_of):
+                        result.warnings.append(
+                            f"Line {first_row_of['CDS_TailWidth_REG']} (CDS_TailWidth_REG): "
+                            + _reserved_tail_text(["Manager"] + [f"Device {d}" for d in range(12)]))
+                for scalar, per_source in (('CDS_TailWidth_REG', CDS_TAIL_PER_SOURCE),
+                                           (_CDS_DRIVE_TYPE_SCALAR, CDS_DRIVE_TYPE_PER_SOURCE)):
+                    if scalar in negative_scalar and per_source not in found_cds_int_rows:
+                        neg_line, neg_value = negative_scalar[scalar]
+                        result.warnings.append(
+                            f"Line {neg_line} ({scalar}): {neg_value} is negative and is "
+                            f"ignored; the CDS sources keep their defaults.")
                 # No per-source drive row: broadcast the scalar if the file carried one,
                 # else leave reset_to_defaults' all-Normal in place. End-drive-early has no
                 # scalar spelling.
@@ -711,7 +949,7 @@ class CSVHandler:
                 for data_port in interface.data_ports:
                     data_port.initialize()
 
-                # Store rows_to_draw from viz_config into result for backward compatibility
+                # The loaded RowsToDraw is reported as the result's rows_in_frame
                 result.rows_in_frame = viz_config.rows_to_draw
 
                 result.success = True
@@ -722,7 +960,14 @@ class CSVHandler:
 
         except Exception as e:
             logger.error(f'Failed to load CSV file: {filename}', exc_info=True)
-            result.error_message = str(e)
+            # A csv.Error or a UnicodeDecodeError is raised while the reader fetches the
+            # next buffered chunk, so `where` names an earlier row than the fault: both are
+            # reported without a line.
+            if where['line'] is None or isinstance(e, (csv.Error, UnicodeDecodeError)):
+                result.error_message = str(e)
+            else:
+                port = '' if where['port'] is None else f"data port {where['port']}: "
+                result.error_message = f"Line {where['line']} ({where['field']}): {port}{e}"
 
         return result
 
@@ -746,7 +991,9 @@ class CSVHandler:
         from ..version import app_version
         logger = logging.getLogger('swi3s_visualizer.io')
         try:
-            with io.open(filename, 'w', encoding='utf8') as outfile:
+            # The text is built whole and moved onto the target once complete, so a failed
+            # write leaves an existing file as it was.
+            with io.StringIO(newline='') as outfile:
                 writer = csv.writer(outfile, delimiter=',', lineterminator='\n')
 
                 # Stamp the LIVE Studio version (not a hardcoded literal) so saved
@@ -777,7 +1024,7 @@ class CSVHandler:
                                 + ['1' if v != 0 else '0' for v in interface.CDS_Guard_PerSource])
                 writer.writerow([CDS_GUARD_POLARITY_PER_SOURCE]
                                 + ['1' if v == 2 else '0' for v in interface.CDS_Guard_PerSource])
-                for csv_field, (attr, _default) in _CDS_INT_PER_SOURCE.items():
+                for csv_field, (attr, *_rest) in _CDS_INT_PER_SOURCE.items():
                     writer.writerow([csv_field]
                                     + [str(int(v)) for v in getattr(interface, attr)])
 
@@ -842,6 +1089,8 @@ class CSVHandler:
                         else:
                             values.append(str(value))
                     writer.writerow([csv_field] + values)
+
+                _write_text_whole(filename, outfile.getvalue(), newline='')
 
             logger.info(f'Successfully saved CSV file: {filename}')
         except (OSError, IOError) as e:

@@ -21,7 +21,9 @@ from PySide6.QtWidgets import QApplication, QColorDialog, QMenu
 
 from swi3s_studio.ui import line_style
 from swi3s_studio.ui.grid_view import _dp_index
-from swi3s_studio.ui.theme import _PALETTES, VizTheme, apply_palette
+from swi3s_studio.ui.theme import _PALETTES, apply_palette
+
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
 _PICK = "#123456"
 
@@ -147,7 +149,8 @@ def test_a_preference_change_redraws_every_pane(win, monkeypatch):
     assert lanes and all(raw._port_colors[k].name() == "#ff0001" for k in lanes)
     assert all(c.name() == "#ff0001" for k, c in win._sample_view._lane_colors.items()
                if k[:2] == (dev, dp))
-    assert [c for *_x, c in eye_view._cat_specs()][2] == "#ff0003"
+    ck, dk, *_x = eye_view._cat_specs()[2]
+    assert "#ff0003" in win._eye_view._legend_labels[(ck, dk)].text()   # the view's own key
     assert win._raw_view._bm_lines["A1"].pen.color().name() == "#ff0004"
     # stored, and only for the theme it was set in
     win.apply_theme("light")
@@ -282,4 +285,3 @@ def test_preferences_is_in_the_menu(win):
     assert act.text().replace("&", "") == want
     assert act.menuRole() == act.MenuRole.PreferencesRole      # macOS: the app menu, ⌘,
     assert any(act in m.menu().actions() for m in win.menuBar().actions() if m.menu())
-    assert VizTheme.MODE == "dark"

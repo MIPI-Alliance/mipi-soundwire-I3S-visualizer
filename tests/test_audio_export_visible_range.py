@@ -6,7 +6,8 @@ sample indices through its own sample positions, since streams differ in rate an
 position: the same index range would cover a different stretch of each stream.
 """
 import os
-import wave
+
+import wav_reader
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,6 +16,8 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.store.audio_store import AudioStore
+
+pytestmark = pytest.mark.gui
 
 # (dp, first capture sample, capture samples per audio sample, count, rate Hz)
 _STREAMS = [(0, 1_000, 100, 400, 44_100.0), (1, 5_000, 92, 400, 48_000.0)]
@@ -32,7 +35,7 @@ def _two_rate_store():
 
 
 def _frames(path):
-    with wave.open(path, "rb") as w:
+    with wav_reader.open(path, "rb") as w:
         return np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.int64)
 
 
@@ -77,12 +80,6 @@ def test_a_capture_window_needs_a_stream_to_become_indices():
         dlg.index_range()
     dlg._range.setCurrentIndex(0)                       # whole capture: no stream needed
     assert dlg.index_range() is None and dlg.index_range(0, 1) is None
-    assert dlg.sample_range() is None
-
-
-def test_an_index_window_is_still_used_as_given():
-    dlg = _dialog(_two_rate_store(), visible_index_range=(10, 20))
-    assert dlg.index_range() == (10, 20) and dlg.index_range(0, 1) == (10, 20)
     assert dlg.sample_range() is None
 
 

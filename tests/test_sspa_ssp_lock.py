@@ -17,27 +17,19 @@ import tempfile
 
 import numpy as np
 import pytest
+from conftest import tone_snr, worst_snr
 
 from swi3s_studio.ingest.capture import Capture
 from swi3s_studio.model.bus_config import BusConfig
 from swi3s_studio.session import Session
 
 _SAMPLES = 6000          # deep enough that the 16-col region holds an SSPA
-
-
-def _tone_snr(a) -> float:
-    """Single-tone SNR (dB): dominant FFT bin vs the rest. A correctly-phased PCM stream
-    reads well above 0; one decoded at the wrong interval phase collapses below it."""
-    a = np.asarray(a, dtype=np.float64)
-    if a.size < 512:
-        return -99.0
-    a = a - a.mean()
-    w = np.hanning(min(4096, a.size))
-    A = np.abs(np.fft.rfft(a[:w.size] * w)) ** 2
-    A[0] = 0.0
-    k = int(np.argmax(A))
-    sig = A[max(1, k - 2):k + 3].sum()
-    return 10.0 * np.log10(sig / (A.sum() - sig + 1e-9))
+_WINDOW = 512            # each half is under 4096 samples, so it is checked in 512-sample windows
+# A slice opens mid-stream and the decoder locks onto it within _LOCK samples; every
+# 512-sample window from there reads above 20 dB. The first half is checked from _ACQUIRE,
+# a 32-sample step past the lock.
+_LOCK = 160
+_ACQUIRE = _LOCK + 32
 
 
 def _slice_from(cap: Capture, t0: int) -> Capture:
@@ -112,17 +104,20 @@ def test_partial_capture_auto_locks_from_the_sspa(partial_capture, config_csv):
 
 
 def test_lock_applies_backwards_as_well_as_forwards(partial_capture, config_csv):
-    """THE point: with the SSPA anchor reduced modulo the interval period, the region
-    BEFORE the first SSPA decodes as cleanly as the region after it."""
+    """THE point: with the SSPA anchor reduced modulo the interval period, the first half
+    of the stream (the capture opens before its first SSPA) decodes as cleanly as the
+    second, in every 512-sample window of each, past the first _ACQUIRE samples the decoder
+    spends locking onto a slice that opens mid-stream."""
     s = Session(partial_capture, config_csv=config_csv)
     store = s.audio_store()
     checked = 0
     for dev, dp, ch in _pcm_streams(store):
         a = store.samples(dev, dp, ch)
         half = len(a) // 2
-        before, after = _tone_snr(a[:half]), _tone_snr(a[half:])
-        assert before > 20.0, f"dev{dev} dp{dp} ch{ch}: pre-SSPA SNR {before:.1f} dB"
-        assert after > 20.0, f"dev{dev} dp{dp} ch{ch}: post-SSPA SNR {after:.1f} dB"
+        assert tone_snr(a[_LOCK:_LOCK + _WINDOW]) > 20.0, (dev, dp, ch)
+        before, after = worst_snr(a[_ACQUIRE:half], _WINDOW), worst_snr(a[half:], _WINDOW)
+        assert before > 20.0, f"dev{dev} dp{dp} ch{ch}: first-half SNR {before:.1f} dB"
+        assert after > 20.0, f"dev{dev} dp{dp} ch{ch}: second-half SNR {after:.1f} dB"
         checked += 1
     assert checked > 0, "no PCM stream checked"
 
@@ -141,7 +136,7 @@ def test_without_the_lock_the_pre_sspa_region_is_garbled(partial_capture, config
     for dev, dp, ch in _pcm_streams(store):
         a = store.samples(dev, dp, ch)
         half = len(a) // 2
-        split.append((_tone_snr(a[:half]), _tone_snr(a[half:])))
+        split.append((tone_snr(a[:half]), tone_snr(a[half:])))
     assert split, "no PCM stream checked"
     assert all(before < 10.0 for before, _after in split), \
         f"pre-SSPA region should be garbled without the lock: {split}"
@@ -189,6 +184,9 @@ def test_apply_config_csv_triggers_the_lock(partial_capture, config_csv):
     s.apply_config_csv(config_csv)
     assert s.ssp_locked_from_sspa is True
     store = s.audio_store()
+    checked = 0
     for dev, dp, ch in _pcm_streams(store):
         a = store.samples(dev, dp, ch)
-        assert _tone_snr(a[:len(a) // 2]) > 20.0
+        assert worst_snr(a[_ACQUIRE:len(a) // 2], _WINDOW) > 20.0
+        checked += 1
+    assert checked > 0, "no PCM stream checked"

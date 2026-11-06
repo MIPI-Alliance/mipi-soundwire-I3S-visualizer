@@ -151,6 +151,12 @@ bool C8b10bDecoder::DecodeSymbol(U16 raw, U8& value, bool& isControl, bool& isCo
     if (x == 0xFF || y == 0xFF) {
         return false;
     }
+    // The two sub-blocks must not both lean the same way: a codeword carries 4, 5 or 6
+    // ones (disparity -2, 0 or +2).
+    const int ones = popcount(raw & 0x3FFu);
+    if (ones < 4 || ones > 6) {
+        return false;
+    }
     value = static_cast<U8>((y << 5) | x);
     return true;
 }
@@ -177,7 +183,22 @@ U16 C8b10bDecoder::EncodeByte(U8 value)
 {
     U8 x = value & 0x1F;
     U8 y = (value >> 5) & 0x7;
-    return static_cast<U16>((kCode5b6bMinus[x] << 4) | kCode3b4bMinus[y]);
+    const U8 six = kCode5b6bMinus[x];
+    U8 four = kCode3b4bMinus[y];
+    // A non-neutral 6b sub-block (four ones, disparity +2) leaves the running disparity
+    // positive, so the 3b/4b sub-block that follows takes its RD+ form: the complement of
+    // an unbalanced one, and 0011 for D.x.3. A balanced 6b sub-block leaves it unchanged.
+    const bool rdPlus = popcount(six) == 4;
+    // D.x.7 takes the alternate A7 (0111) where the primary would end the 6b sub-block's run
+    // in five like bits. The 6b sub-block of x = 17, 18, 20 is balanced, so the 3b/4b one
+    // follows at RD-.
+    if (y == 7 && (x == 17 || x == 18 || x == 20)) {
+        four = 0x7;
+    }
+    if (rdPlus && (popcount(four) != 2 || y == 3)) {
+        four = static_cast<U8>(~four & 0xF);
+    }
+    return static_cast<U16>((six << 4) | four);
 }
 
 U16 C8b10bDecoder::EncodeToken(int token)

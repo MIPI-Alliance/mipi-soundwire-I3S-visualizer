@@ -11,9 +11,10 @@ asymmetric data slew (rise vs fall) stands out. Log Y so a single edge too close
 the sample point (count = 1) is still visible.
 
 A multi-select filter narrows the transitions to any union of drivers (manager /
-peripheral), data ports, or columns, so you can see whose edges are marginal (CDS /
-Column-0 is the control stream, off by default). A "View Worst UI" navigator jumps the
-shared cursor to the worst transitions so they can be inspected in the Raw Capture pane.
+peripheral), data ports, or columns, so you can see whose edges are marginal. CDS (Column
+0, the control stream) is included by default; "All excl. CDS" removes it. A "View Worst
+UI" navigator jumps the shared cursor to the worst transitions so they can be inspected in
+the Raw Capture pane.
 
 Compute lives in `analysis.bus_timing`; this view only renders it. Aggregate over the
 capture (not cursor-driven), so it has no time cursor.
@@ -130,7 +131,8 @@ class EyeView(QWidget):
         self._filter.setPopupMode(QToolButton.InstantPopup)
         self._filter.setToolTip("Restrict the margins to any combination of drivers "
                                 "(manager / peripheral), data ports or columns. CDS "
-                                "(Column 0) is the control stream, off by default.")
+                                "(Column 0), the control stream, is included by default; "
+                                "'All excl. CDS' removes it.")
         self._filter.setMinimumWidth(210)
         self._filter_menu = _MultiMenu(self._filter)
         self._filter.setMenu(self._filter_menu)
@@ -251,19 +253,16 @@ class EyeView(QWidget):
         return p
 
     @staticmethod
-    def _hist_curve(plot, centers, counts, color):
-        """Filled step histogram in log10(count) space. Each contiguous run of non-zero
-        bins is one explicit closed polyline that starts/ends on the floor, so the
-        left/right end risers are drawn, the fill (down to the pinned floor) reaches the
-        x-axis with no gap and never overshoots the pen. Empty regions stay blank."""
+    def _hist_curve(plot, edges, counts, color):
+        """Filled step histogram in log10(count) space over the bin `edges` (one more than
+        `counts`). Each contiguous run of non-zero bins is one explicit closed polyline
+        that starts/ends on the floor, so the left/right end risers are drawn, the fill
+        (down to the pinned floor) reaches the x-axis with no gap and never overshoots the
+        pen. Empty regions stay blank."""
         pen = pg.mkPen(color, width=1.3)
         brush = pg.mkBrush(pg.mkColor(color).red(), pg.mkColor(color).green(),
                            pg.mkColor(color).blue(), 55)
-        if centers.size >= 2:
-            w = centers[1] - centers[0]
-            edges = np.concatenate([centers - w / 2, [centers[-1] + w / 2]])
-        else:
-            edges = np.array([0.0, 1.0])
+        edges = np.asarray(edges, dtype=float)
         counts = np.asarray(counts)
         n = len(counts)
         i = 0
@@ -329,6 +328,8 @@ class EyeView(QWidget):
             if item.get("port") is not None:
                 d, p = item["port"]
                 item["action"].setText(with_name(self._port_names, d, p, f"Device {d} DP{p}"))
+        if self._filter_items:
+            self._update_filter_text()
 
     def set_sections(self, sections) -> None:
         """Per config-section UI stats (from Session.section_ui_stats). Kept for callers;
@@ -435,6 +436,9 @@ class EyeView(QWidget):
         Manager, each peripheral port (Device N DPm), CDS, and each column, plus preset
         actions that set those checkboxes. Union of the checked items is the filter."""
         roles = self._col_roles
+        for sub_menu in self._filter_menu.findChildren(
+                QMenu, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            sub_menu.deleteLater()               # the Columns submenu and its actions
         self._filter_menu.clear()
         self._filter_items = []
         if not roles:
@@ -573,14 +577,13 @@ class EyeView(QWidget):
             res_ns = (1e9 / self._rate) if self._rate else 0.0
             nbins = 40 if res_ns <= 0 else int(max(1, min(40, np.floor(hi / res_ns))))
             edges = np.linspace(0.0, hi, nbins + 1)
-            centers = 0.5 * (edges[:-1] + edges[1:])
             mx = 1
             for ck, dk, _label, color in _cat_specs():
                 if (ck, dk) in self._cat_hidden:
                     continue
                 sel = (pol == ck) & (dr == dk)
                 hist, _ = np.histogram(vals[sel], bins=edges)
-                self._hist_curve(plot, centers, hist, color)
+                self._hist_curve(plot, edges, hist, color)
                 mx = max(mx, int(hist.max(initial=0)))
             return hi, mx
 

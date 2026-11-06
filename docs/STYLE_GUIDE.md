@@ -25,15 +25,16 @@ then the saved View ▸ Appearance choice). A theme switch calls `apply_palette`
 that caches colours. So:
 
 - Read `VizTheme.X` when you build a stylesheet, pen or brush, and call the builder
-  functions at that point. Never capture a colour or a built stylesheet in a module-level
-  constant: it keeps the palette of import time.
+  functions at that point. Never capture a colour that follows the theme, or a stylesheet
+  built from one, in a module-level constant: it keeps the palette of import time. The
+  exceptions are fixed colours that are the same in both palettes (the authoring dialogs'
+  selected green and unselected grey in `ui/authoring/dialogs.py`; the Bus Grid's transmit fill
+  `grid_view._TX_FILL`; the raw view's PLL-error red `raw_view._PLL_ERR_COLOR`) and colour-free
+  font-size strings (the Timing page's `_HEADER_CSS` and `_TITLE_CSS`).
 - A widget that caches colours gives itself a `retheme()` that rebuilds them, and is in
   the list `_restyle()` walks.
 - Define a new colour key in BOTH palettes and declare it on `VizTheme`
   (`tests/test_theme.py` checks the declarations against the palettes).
-
-The token vocabulary (frame / entry / accent / border) mirrors customtkinter's dark
-theme.
 
 ## 2. Palette
 
@@ -91,11 +92,18 @@ Helvetica/system sans throughout. Sizes are deliberately compact:
 | Element | Size / weight | Source |
 |---|---|---|
 | Body labels, entries | `12 px` | `authoring_stylesheet()` |
-| Panel-name headers | `15 px`, weight `600` | `_HEADER_CSS` |
-| Page/tab title | `18 px`, weight `600` | `main_window` |
+| Panel-name headers | `15 px`, weight `600` | `VizTheme.HEADER_CSS`; the Timing page's `_HEADER_CSS` is its font-scaled copy |
+| Page/tab title | `18 px`, weight `600` | `VizTheme.TITLE_CSS`; the Timing page's `_TITLE_CSS` is its font-scaled copy |
 | Notification header | bold | `notifications.py` |
-| Grid in-cell labels | scaled ~`10 px` | `grid_view._f_label` |
-| Grid row/col numbers | scaled `12 px`, bold | `grid_view._f_num` |
+| Grid in-cell labels | base `10 pt`, scaled | `grid_view._f_label` |
+| Grid row/col numbers | base `12 pt`, scaled, bold | `grid_view._f_num` |
+| Term diagram labels | `_FONT_DIAGRAM`, demi-bold; `_LABEL_NARROW` (0.85) of it in a column narrower than `_LABEL_FULL_W` (34 line heights) | `timing_view._FONT_DIAGRAM`, `timing_diagram._label_font` |
+| Term diagram panel heading | `_HEAD_SCALE` (1.04) of the body size, bold | `timing_diagram._HEAD_SCALE` |
+| Term diagram leg title | `_TITLE_SCALE` (1.12) of the body size, bold | `timing_diagram._TITLE_SCALE` |
+| Term diagram corner note | `_NOTE_SCALE` (0.85) of the body size | `timing_diagram._NOTE_SCALE` |
+
+The grid sets point sizes, not pixels: each base size is multiplied by the grid scale
+(1.125) and, on Windows, by 0.8 (`grid_view._fpt`).
 
 Rule: **one step down from "comfortable".** Parameter/label/entry text is 12px (not
 the OS default 13–14), which lets dense parameter grids breathe without scrolling.
@@ -105,13 +113,14 @@ Headers earn their size by weight (600), not by going large.
 
 Copy these patterns rather than reinventing per-widget CSS.
 
-### Action button (`_BTN_CSS`)
+### Action button
 ```
 background: ACCENT; color: white; border: none;
 border-radius: 6px; padding: 5px;
 :hover  background: ACCENT_HOVER;
 ```
-Blue, borderless, rounded, white text. Hover darkens to `ACCENT_HOVER`.
+Blue, borderless, rounded, white text. Hover darkens to `ACCENT_HOVER`. The stylesheet is
+built from `VizTheme` each time it is applied.
 
 ### Text entry / multi-line edit (`authoring_stylesheet`)
 ```
@@ -143,16 +152,18 @@ built, so the handle follows the active palette.
 
 ### Header label (`HEADER_CSS`)
 `font-size:15px; font-weight:600;` — used for panel names, centred where it titles
-a sub-panel. Page/mode titles use `TITLE_CSS` (18px/600). Both live in `VizTheme`.
+a sub-panel. Page/mode titles are 18px/600 (`TITLE_CSS`); both live in `VizTheme`, and the
+Timing page's title, `timing_view._TITLE_CSS`, is `TITLE_CSS` at the page's font scale.
 
 ### Tables & trees / item-views (`analyzer_stylesheet`)
 `QTableView`/`QTreeView`/`QTableWidget`/`QTreeWidget` get **no theme by default** —
 left alone they render with the platform's native (often light) chrome, which
 clashes with the dark Visualizer. Apply `analyzer_stylesheet()` to the view (the
 same way `authoring_stylesheet()` is applied to the AuthoringPanel) for:
-- `FRAME_BG` body, `WINDOW_BG` alternating rows, `BORDER` 1px gridlines + a 6px
-  rounded frame, `ACCENT` selection (white text), 12px text.
-- `QHeaderView::section` on `WINDOW_BG` with `BORDER` separators — a flat dark header.
+- `FRAME_BG` body with `alternate-background-color` also `FRAME_BG` (no row banding),
+  `BORDER` 1px gridlines + a 6px rounded frame, `ACCENT` selection (white text), 12px text.
+- `QHeaderView::section` and the corner button on `FRAME_BG`, separated only by `BORDER`
+  1px lines — the header shares the panel background.
 - `QPushButton` (the ACCENT recipe), themed `QComboBox`, centred `QCheckBox`, and the
   shared `scrollbar_qss()` — so a whole view themes from one call.
 
@@ -199,9 +210,11 @@ as local literals per view.
 
 | Group | Tokens | Used by |
 |---|---|---|
-| Canvas | `PLOT_BG` (`#1e2023`, slightly darker than panels), `CURSOR` (`#f5f5f5`), `AXIS` (`#787878`) | pyqtgraph plots, timeline, greyed text |
-| Traces | `TRACE_PALETTE` (6 pens), `RAW_DP`, `RAW_DN` | audio waveforms, raw DP/DN lines |
-| Semantic marks | `SEM_ERROR` / `SEM_ERROR_BG` / `SEM_SSP` / `SEM_COMMIT` / `SEM_READ` / `SEM_OTHER` / `SEM_PING` / `SEM_BOOKMARK` / `SEM_BRINGUP` | command table, symbol viewer, timeline ticks |
+| Canvas | `PLOT_BG` (`#1e2023`, slightly darker than panels), `PLOT_GRID_ALPHA` (gridline opacity over `PLOT_BG`), `CURSOR` (`#f5f5f5`), `AXIS` (`#787878`) | pyqtgraph plots, timeline, greyed text |
+| Traces | `TRACE_PALETTE` (6 pens), `DP_LINE_PALETTE` (12 data-port line colours), `RAW_DP`, `RAW_DN` | `TRACE_PALETTE`: the timeline's link-control section colours, the Timing (eye) view's edge flavours; `DP_LINE_PALETTE`: audio waveforms, Capture lane overlays and cursor pairs; `RAW_DP` / `RAW_DN`: the raw DP/DN lines |
+| Semantic marks | `SEM_ERROR` / `SEM_ERROR_BG` / `SEM_SSP` / `SEM_COMMIT` / `SEM_READ` / `SEM_OTHER` / `SEM_PING` / `SEM_BOOKMARK` / `SEM_BRINGUP` / `SEM_SYNC` | command table, symbol viewer, timeline ticks, commit Row-Sync-Point markers |
+| Highlight | `HILITE_BG` | the Timing page's highlighted term and parameter |
+| Term diagram | `DIAG_CLOCK` / `DIAG_DATA` / `DIAG_LEVEL` / `DIAG_GROUND` / `DIAG_TEXT` / `DIAG_DIM` / `DIAG_GUIDE` / `DIAG_OK` / `DIAG_BAD` / `DIAG_VALID` / `DIAG_KEEPER` | the Timing page's term diagram: clock and data edges, a receiver's threshold and its offset ground, text and rails, guides, a margin met and missed, a ramp's 80 % point, the keeper. Saturated and darker (light) or brighter (dark) than the shared marks; its strokes are fractions of its line height, not the 1 px rule |
 | Provenance | `PROV_DEFAULT` / `PROV_WRITTEN` / `PROV_CSV` / `PROV_UI` | register-map value column |
 | Symbol kinds | `SYM_INVALID` / `SYM_COMMA` / `SYM_ROBUST` / `SYM_DCODE` / `SYM_KCODE` / `SYM_UNKNOWN` | CDS symbol viewer |
 

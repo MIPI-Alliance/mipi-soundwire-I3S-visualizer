@@ -61,9 +61,14 @@ platform plugin"* even though everything is installed. Override the location wit
 `SWI3S_VENV=/path` (`$env:SWI3S_VENV` on Windows).
 
 That is the whole story on macOS and Windows, and on any Linux that has the Python
-development headers. **If a launcher stops with a message about `Python.h` or a C++
+development headers and the Qt libraries named below. **If a launcher stops with a message about `Python.h` or a C++
 compiler**, open the next section: both launchers pre-flight those and name what to
 install, rather than failing part-way through a compile.
+
+On Debian or Ubuntu the Qt GUI also needs system libraries:
+`sudo apt-get install -y --no-install-recommends libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0`,
+and `libxcb-cursor0` for a window on an X11 session. `tools/setup_dev.sh` prints the first line
+when Qt cannot start.
 
 <details>
 <summary><b>Build prerequisites — and building with no root</b> (locked-down build server, EDA/CAD farm, shared VM)</summary>
@@ -162,13 +167,15 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -c \
 
 </details>
 
-**Manual setup**, if you would rather not use a launcher — this is also what CI does:
+**Manual setup**, if you would rather not use a launcher (CI installs `requirements-dev.txt`, which includes `requirements.txt`, and `./native` the same way):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate            # Windows:  .venv\Scripts\activate
 python3 -m pip install -r requirements.txt
 python3 -m pip install ./native      # build the decode core (offline: bash native/build_local.sh)
+                                     # build_local.sh needs pybind11 headers: the interpreter's pybind11
+                                     # package or $PYBIND11_INCLUDE
 PYTHONPATH=. python3 -m swi3s_studio.app
 ```
 
@@ -176,12 +183,14 @@ After pulling changes that touch `native/`, rebuild the core
 (`python3 -m pip install --force-reinstall --no-deps ./native`; pip rebuilds a local
 directory even at the same package version, so the plain `python3 -m pip install ./native`
 the app's message gives rebuilds it too). The compiled module isn't tracked in git; the app
-reports an "out of date" message, with the rebuild command, when the core's ABI number is
-lower than the app requires, and not otherwise.
+refuses a core whose ABI number differs from the one it requires, with the rebuild command:
+an "out of date" message for an older core and a "newer than this app" message for a newer one.
 
 **A `swi3score*.so` at the checkout's root is imported first.** `bash native/build_local.sh`
-(the offline build, and the build `tests/gate.sh` runs on macOS and Linux) writes the module
-there, and `PYTHONPATH=.`, which `./run.sh` and the recipe above both set, puts it ahead of
+is the offline build that `tests/gate.sh` runs on macOS and Linux. It needs pybind11
+(`python3 -m pip install -r requirements-dev.txt`, or `pip install "pybind11>=2.12"`;
+`pip install ./native` fetches its own) and writes the module at the checkout's root.
+`PYTHONPATH=.`, which `./run.sh` and the recipe above both set, puts it ahead of
 the one pip installed. If that file exists, rebuild it with `bash native/build_local.sh`
 after pulling `native/` changes, or delete it so the installed build is used.
 `python3 -c 'import swi3score; print(swi3score.__file__)'`, run from the checkout's root,
@@ -193,10 +202,19 @@ names the module in use.
 
 ```bash
 swi3s-studio                                  # empty window
-swi3s-studio --demo                           # synthetic demo capture
+swi3s-studio --demo                           # synthetic PHY2 demo capture (one Link, with a Cold Start)
+swi3s-studio --demo-bringup                   # same as --demo
 swi3s-studio -c config.csv                    # open a config CSV in Bus-Visualizer mode
 swi3s-studio -c config.csv -o model.json      # headless: write the bus model, no window
 ```
+
+`swi3s-studio` and `swi3s-studio-cli` are console commands that `python3 -m pip install .` (or
+`-e .`) creates; the launchers and the manual setup above do not install them. Without that
+install, give the same arguments to the launcher (`./run.sh -c config.csv -o model.json`,
+`.\run.ps1 -c config.csv -o model.json`) or run `PYTHONPATH=. python3 -m swi3s_studio.app ...`.
+`--demo` is not the bundled two-Link workspace that **File ▸ Open Demo Capture ▸ PHY2** opens.
+
+On Windows use `swi3s-studio-cli` for scripting: the `swi3s-studio` launcher has no console, so it prints nothing and returns no exit code to the shell.
 
 **`-o` implies headless.** No window is opened and Qt is never even imported, so it runs on a
 machine with no display. It writes the same bus-model JSON as **File ▸ Export Bus Model (JSON)…** in
@@ -244,8 +262,8 @@ Exit codes, for scripting:
 
 ## Tech
 
-PySide6 (Qt 6) + pyqtgraph UI · pybind11 C++ decode core · Apache Arrow + NumPy memmap
-results store · macOS-first, cross-platform.
+PySide6 (Qt 6) + pyqtgraph UI · pybind11 C++ decode core · Apache Arrow command cache + NumPy
+audio pyramids, results held in memory · macOS-first, cross-platform.
 
 ## Layout
 
@@ -316,10 +334,10 @@ or CSV, whole or a window.
   filter and Audio and Capture views, the pane layout, zooms, the side panes' settings).
   Captures are named relative to the workspace, so a folder holding both can move, and a
   capture it cannot find is asked for. Results re-decode on open, so it stays portable.
-- **Compare** — **Decode ▸ Import Visualizer CSV…** can diff an expected config (CSV or
-  the authored config) against the decode: differing grid cells outlined, a per-cell
-  report, expected register values overlaid (the Registers pane's *Clear Compare* removes
-  it).
+- **Compare** — **Decode ▸ Import Visualizer CSV…** can compare an expected config (CSV or
+  the authored config) against the decode: the expected register values are overlaid in the
+  Registers pane (its *Clear Compare* removes them) and a report lists the registers that
+  differ.
 - **Decode ▸ Dataport Scramblers…** — override the descrambler per (device, data
   port): Auto / On / Off, then re-decode (fixes a mis-snooped `ScramblerEn`, which
   otherwise turns the stream into noise).
@@ -329,7 +347,7 @@ or CSV, whole or a window.
 
 ## Tests
 
-The test tools — pytest, pytest-cov, ruff and mypy at the version the type ratchet compares
+The test tools — pytest, pytest-cov, pytest-xdist, ruff and mypy at the version the type ratchet compares
 against — are listed in `requirements-dev.txt`, which also installs the runtime set. One
 script installs them and builds the decode core, into the same venv `run.sh` / `run.ps1` use:
 
@@ -342,20 +360,25 @@ It prints the venv's activate command and the test commands. By hand, in any env
 `python3 -m pip install -r requirements-dev.txt` and `python3 -m pip install ./native`.
 
 ```bash
-bash tests/gate.sh                    # THE release gate: suite + perf + ruff + mypy + ABI
+bash tests/gate.sh                    # the commit gate: ABI, suite (in parallel), perf, ruff, mypy, leak scan, screenshots
+bash tests/gate.sh --release          # the release gate: also the single-process run
+python3 tools/changed_tests.py --run  # dev loop: the test files your change touches
 python3 tools/screenshots.py          # just the screenshots check (build/screenshots/)
-bash tests/gate.sh --quick            # dev loop (skips perf + the process-isolated pass)
-python3 -m pytest                     # the functional suite (perf is deselected by default)
-bash tests/run_all.sh                 # every suite in its own process (gate.py --only per-suite)
+bash tests/gate.sh --quick            # the commit gate without the perf ceilings
+python3 -m pytest -n auto             # the functional suite, one worker per CPU
+bash tests/run_all.sh                 # every suite in its own process (gate.py --only suite)
 bash tests/run_all.sh --build         # rebuild the core first
 bash tests/run_all.sh --perf          # the perf benchmarks instead
-bash tests/run_all.sh --native        # also run the native C++ suite
+bash tests/run_all.sh --native        # also run the external native C++ suite ($SWI3S_NATIVE_CPP_SUITE names its runner)
 ```
 
-`gate.sh` is what a release must pass, on macOS, Windows **and** Linux, at the release commit — it
-rebuilds the native core and asserts `score_abi`, then runs the suite, the perf gate, the
-process-isolated pass, `ruff`, a mypy non-regression check, the leak scan and the screenshots
-check, reporting every failure rather than stopping at the first. The screenshots check
+`gate.sh --release` is what a release must pass, on macOS, Windows **and** Linux, at the release
+commit — it rebuilds the native core and asserts `score_abi`, then runs the suite (each file in
+its own process, several at once, and once more in a single process), the perf gate, `ruff`, a
+mypy non-regression check, the leak scan, the screenshots check and the native coverage,
+reporting every failure rather than stopping at the first. On a test guest it is
+`--release --on-guest`, which leaves the single-process run and the native coverage to the
+development machine (`docs/DEVELOPMENT.md`, Release checklist). What runs where and when is `docs/TESTING.md` §1.1. The screenshots check
 renders every mode in light and dark on the platform's own style, fails on wrong-theme panes,
 widgets a live theme switch missed, faint or missing text and clipped labels, and leaves a
 contact sheet in `build/screenshots/contact_sheet.png` to review. It needs `ruff` and `mypy` on `PATH` or importable by the
@@ -364,9 +387,9 @@ gate's Python, mypy at the version `tools/mypy_baseline.json` records under `env
 Another mypy version reports the ratchet NOT COMPARABLE, listed under NOT RUN HERE, which is
 not a pass.
 
-The runner is a pytest wrapper, so it covers exactly what `ci.yml` declares. CI runs on this
-repository and its lint/type job is blocking, but it has no process-isolated per-suite pass
-and no stale-core ABI assertion, so the enforced gate is `tools/gate.py`, run by hand on
+The runner wraps the gate's suite check, which runs the pytest selection (`-m "not perf"`) that `ci.yml` declares. CI runs on this
+repository and its lint/type job is blocking, but it runs no file in a process of its own
+and has no stale-core ABI assertion, so the enforced gate is `tools/gate.py`, run by hand on
 macOS, Windows and Linux at the release commit. See docs/DEVELOPMENT.md.
 
 A single suite runs directly (GUI suites need the Qt offscreen platform):
@@ -387,7 +410,7 @@ Version numbers, branches and tags follow [`GOVERNANCE.md`](GOVERNANCE.md): a mi
 release adds functionality, and a sub-minor release carries fixes only.
 
 **Supported:** 3.x, the current major version. Fixes are made on its latest minor
-version, currently 3.1; within a major version releases stay compatible, so moving up to
+version, currently 3.2; within a major version releases stay compatible, so moving up to
 the latest minor version is how an older 3.x install gets a fix. The SWI3S Traffic
 Visualizer's `v1.*` and `v2.*` releases are no longer maintained.
 

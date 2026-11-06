@@ -2,10 +2,10 @@
 that Revert gives back the decoded samples exactly."""
 import os
 import tempfile
-import wave
 
 import numpy as np
 import pytest
+import wav_reader
 
 from swi3s_studio.dsp import filters
 from swi3s_studio.store.audio_store import AudioStore, StreamProcessing, full_scale
@@ -137,7 +137,7 @@ def test_playback_and_export_follow_the_processing(tmp_path):
     pcm, _rate, nch, _fmt = store.pcm_play(1, 2)
     assert nch == 1 and np.max(np.abs(np.frombuffer(pcm, dtype=np.int16))) == 10_000
     path = store.export_wav(1, 2, str(tmp_path / "x.wav"))
-    with wave.open(path) as w:
+    with wav_reader.open(path) as w:
         data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
     assert np.max(np.abs(data)) == 10_000
 
@@ -172,6 +172,7 @@ def test_full_scale_follows_the_sample_width():
     assert np.max(store.samples(1, 2, 0)) == (1 << 23) - 1
 
 
+@pytest.mark.platform                                    # only Windows refuses to delete an open map
 def test_a_memory_mapped_store_reverts_and_closes():
     with tempfile.TemporaryDirectory() as d:
         store = _store([_tone()], mmap_dir=d)
@@ -271,5 +272,5 @@ def test_a_stream_with_no_rate_is_not_dc_blocked():
 def test_the_dc_blocker_round_trips_and_an_old_setting_reads_it_off():
     proc = StreamProcessing(highpass_hz=20.0, dc_block=True)
     assert StreamProcessing.from_json(proc.to_json()) == proc
-    old = {"highpass_hz": 20.0, "gain_db": 0.0, "allow_clipping": False}   # before 3.0.20
+    old = {"highpass_hz": 20.0, "gain_db": 0.0, "allow_clipping": False}   # a setting saved with no dc_block key
     assert StreamProcessing.from_json(old) == StreamProcessing(highpass_hz=20.0)

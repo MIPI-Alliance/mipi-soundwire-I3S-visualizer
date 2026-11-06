@@ -1,6 +1,6 @@
 """PHY1 (slow FBCSE) demo round-trip: a constant 4-column bus whose ports are
-REPOSITIONED mid-capture (no column-count change), matching the reference
-phy1_bus_config_1 -> _2 CSVs.
+REPOSITIONED mid-capture (no column-count change): the PCM pair moves from column 1 to
+column 3 and the PDM port from columns 2-3 to columns 1-2.
 
 PHY1 is the slow forwarded-clock PHY: CDS (NRZS) at Column 0, a 4-column geometry at
 1.536 MRows/s. Two 16-bit PCM ports (48 kHz) share one column interleaved (DP0 Offset 0
@@ -12,9 +12,12 @@ Run: PYTHONPATH=. python3 -m pytest tests/test_phy1_demo.py
 """
 import math
 
+import pytest
 from conftest import demo_skipped_rate_hz, demo_transported_samples
 
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 def test_phy1_cold_start_selects_fbcse_slow():
@@ -61,14 +64,14 @@ def test_phy1_audio_decodes_clean():
     assert lo <= len(dp0) <= hi, f"dp0 transported {len(dp0)}, expected {lo}..{hi} of {n}"
     assert len(dp1) == n, len(dp1)
     amp = (1 << 15) * 0.45
-    expect = [int(round(amp * math.sin(2 * math.pi * i / 64))) & 0xFFFF for i in range(8)]
-    assert dp0[:8] == expect, (dp0[:8], expect)
+    expect = [int(round(amp * math.sin(2 * math.pi * i / 64))) & 0xFFFF for i in range(len(dp0))]
+    assert dp0 == expect
 
 
 def test_phy1_midcapture_reconfigure_moves_ports():
     """The bus grid / config export follow the cursor across the placement change: early
-    in the audio the ports sit at config_1's columns (HS 1,1,2), later at config_2's
-    (HS 3,3,1) — a repositioning at a CONSTANT 4-column geometry."""
+    in the audio, before the commit, the ports sit at horizontal starts 1,1,2; later, after it,
+    at 3,3,1 — a repositioning at a CONSTANT 4-column geometry."""
     s = Session.from_demo(600, cold_start=True, phy=1)
     a0, a1 = int(s.audio_start_sample), int(s.audio_end_sample)
     early = s.config_dataports_at(int(a0 + 0.25 * (a1 - a0)))

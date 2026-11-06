@@ -7,7 +7,13 @@ Output is grouped into ordered, collapsible sections — each led by a
     Link Control  →  Regions  →  Commands  →  Peripheral Reports  →  Data Ports
 
 Rows within a section are ``(label, value)``
-or ``(label, value, kind)`` where kind is 'pass'/'fail' (green/red value) or None.
+or ``(label, value, kind)``. `kind` is:
+
+    'header'  a section's fold header (``value`` is "")
+    'group'   a second fold level inside a section; the 'detail' rows after it fold with it
+    'detail'  a breakdown row under the nearest 'group'
+    'pass' / 'fail'  green / red value (a 'fail' row may also be a group's child)
+    None      a plain row
 """
 from __future__ import annotations
 
@@ -19,25 +25,22 @@ from .errors import count_errors, is_error
 Row = Tuple  # (label, value) or (label, value, kind)
 
 
-def _link_control_rows(session) -> List[Row]:
-    """The Link Control section body: the decoded §5.1.2 bring-up sequence, the
-    §5.2.3 timing parameters vs their spec limits (PASS/FAIL), and any decoded
-    PM_Action link-state writes. Empty when the capture has no observable bring-up
-    and no PM actions."""
+def _bringup_rows(lc, indent: str = "") -> List[Row]:
+    """The rows of one link bring-up: its sequence, selected PHY, Safe-Lock width, and
+    the §5.2.3 timing parameters vs their [min, max] limits (PASS/FAIL). `indent`
+    prefixes every label."""
     rows: List[Row] = []
-    lc = getattr(session, "link_control", None)
     seq = getattr(lc, "sequence", "none") if lc is not None else "none"
     if lc is not None and seq != "none":
         phy = getattr(lc, "phy_name", None)
         kind = getattr(lc, "phy_kind", None)
-        rows.append(("Sequence", f"{seq.title()} Start"))
+        rows.append((f"{indent}Sequence", f"{seq.title()} Start"))
         if phy:
-            rows.append(("Selected PHY", f"{phy}" + (f" ({kind})" if kind else "")))
+            rows.append((f"{indent}Selected PHY", f"{phy}" + (f" ({kind})" if kind else "")))
         sl = getattr(lc, "safe_lock_columns", None)
         if sl:
-            rows.append(("Safe-Lock", f"{sl} columns"))
+            rows.append((f"{indent}Safe-Lock", f"{sl} columns"))
 
-    # §5.2.3 timing parameters vs their [min, max] limits.
     for t in list(getattr(lc, "timing", []) or []):
         lo, hi = t.get("min_us"), t.get("max_us")
         if lo is not None and hi is not None:
@@ -52,7 +55,28 @@ def _link_control_rows(session) -> List[Row]:
         status = "PASS" if ok else ("FAIL" if ok is False else "")
         kind = "pass" if ok else ("fail" if ok is False else None)
         val = f"{t['measured_us']:,.1f} µs   {limit}   {status}".rstrip()
-        rows.append((t.get("param", ""), val, kind))
+        rows.append((f"{indent}{t.get('param', '')}", val, kind))
+    return rows
+
+
+def _link_control_rows(session) -> List[Row]:
+    """The Link Control section body: the decoded §5.1.2 bring-up sequence, the
+    §5.2.3 timing parameters vs their spec limits (PASS/FAIL), and any decoded
+    PM_Action link-state writes. A capture whose Link is brought up again lists each
+    later bring-up as its own indented block, led by a "Bring-up N" row naming its
+    sequence and the time its strip begins; the numbering starts at 1 when the first
+    bring-up lists no rows (a capture that starts in audio mode). Empty when the capture
+    has no observable bring-up and no PM actions."""
+    lc = getattr(session, "link_control", None)
+    rows: List[Row] = _bringup_rows(lc)
+    rate = float(getattr(getattr(session, "capture", None), "sample_rate_hz", 0) or 0)
+    later = list(getattr(session, "link_controls", None) or [])[1:]
+    for n, r in enumerate(later, start=2 if rows else 1):
+        sections = getattr(r, "sections", None) or []
+        start = sections[0]["start"] if sections else (r.audio_start_sample or 0)
+        when = f" at {start / rate * 1e3:,.3f} ms" if rate > 0 else ""
+        rows.append((f"Bring-up {n}", f"{r.sequence.title()} Start{when}"))
+        rows.extend(_bringup_rows(r, "  "))
 
     # PM_Action (link state-machine) writes, decoded.
     from .link_events import link_events
@@ -186,7 +210,7 @@ def _rw_detail_rows(cmds: List[dict], *, reading: bool) -> List[Row]:
     return rows
 
 
-_RESP_REMOTE_READ_DEFERRED = 5      # per core/SwI3sResponseNames.h: token 5 on a Read phase
+_RESP_REMOTE_READ_DEFERRED = 5      # token 5 on a Read phase (analysis/responses.py)
 
 
 def _fold_deferred_reads(cmds: List[dict]) -> List[dict]:

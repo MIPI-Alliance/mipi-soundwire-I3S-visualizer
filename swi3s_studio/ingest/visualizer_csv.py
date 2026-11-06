@@ -19,8 +19,9 @@ so old files open everywhere (Compare, the decode config, the authoring panel).
 What an upgrade could not carry over (an unrecognised field, a v2.0 file the model
 could not read, a file with no config fields at all) is reported through
 ``import_notes`` under the original file's name, and ``report_csv_warnings`` reports
-what the native loader did not read as written. The upgrade always converges on the swviz model — parse into an
-``Interface`` / ``VizConfig`` then re-serialise with ``CSVHandler.save_csv`` — so
+what the native loader did not read as written. The upgrade always converges on the
+swviz model — parse into an ``Interface`` / ``VizConfig`` then re-serialise with
+``CSVHandler.save_csv`` — so
 new fields added in future versions are written automatically; the converter
 only has to learn how to READ each older layout, not how to emit the newest one.
 
@@ -32,12 +33,14 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 import os
 import re
 import tempfile
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import import_notes
+from .timebase import clipped, quoted
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,7 @@ _KNOWN = _INTERFACE_FIELDS | _DP_FIELDS | _SILENT_SKIP
 # Field names that only the legacy human-readable export has (never register-style).
 _LEGACY_MARKERS = ('Columns per Row', 'Save file using excess one', 'Data Port Name')
 
-# Trailing "(2-32)", "(0-8)", "[kHz] (1-6144)" are descriptive — drop when matching.
+# Trailing "(2-32)", "(0-8)", "[kHz] (1-48000)" are descriptive — drop when matching.
 _RANGE_RE = re.compile(r'\s*\([^)]*\)\s*$')
 
 
@@ -74,16 +77,35 @@ def _normalize(name: str) -> str:
     return _RANGE_RE.sub('', name).strip()
 
 
-def _parse_bool(s: str) -> bool:
-    return str(s).strip().lower() in ('true', '1', 'yes')
+_TRUE_TEXT = ('true', '1', 'yes')
+_FALSE_TEXT = ('false', '0', 'no')
+
+
+def _parse_bool(s: str, field: str = '', clamped: Optional[Callable[[str], None]] = None
+                ) -> bool:
+    """`s` as a flag: true/1/yes and false/0/no, in any case. Any other text is false and,
+    with `clamped`, reported as a value that did not fit, naming `field`."""
+    text = str(s).strip().lower()
+    if text in _TRUE_TEXT:
+        return True
+    if text not in _FALSE_TEXT and clamped:
+        clamped(f"{field or 'a flag'} is {quoted(str(s).strip())}, not true or false; "
+                f"false is used")
+    return False
 
 
 def _rows(text: str) -> List[Tuple[str, List[str]]]:
+    """(field name, values) per row. A row the csv module cannot read (a cell over its
+    field limit) raises ValueError naming the line."""
     out: List[Tuple[str, List[str]]] = []
-    for row in csv.reader(io.StringIO(text)):
-        if not row or not row[0].strip():
-            continue
-        out.append((_normalize(row[0]), [v.strip() for v in row[1:]]))
+    reader = csv.reader(io.StringIO(text))
+    try:
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            out.append((_normalize(row[0]), [v.strip() for v in row[1:]]))
+    except csv.Error as exc:
+        raise ValueError(f"line {reader.line_num}: {exc}") from None
     return out
 
 
@@ -92,20 +114,54 @@ def legacy_dict_from_text(text: str) -> Dict[str, List[str]]:
     return {f: v for f, v in _rows(text)}
 
 
+# The largest config CSV read, in characters: a register file is a few KB, so a file over
+# this is not one.
+MAX_CONFIG_CHARS = 8 << 20
+
+
+def read_config_text(path) -> str:
+    """The text of the config CSV at `path` (a spreadsheet's BOM is not a field). ValueError
+    naming the file when it is over `MAX_CONFIG_CHARS` characters or is not UTF-8 text; a
+    device or pipe is read no further than the limit."""
+    name = import_notes.source_name(str(path))
+    try:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            text = f.read(MAX_CONFIG_CHARS + 1)
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{name}: not a text config CSV ({exc})") from None
+    if len(text) > MAX_CONFIG_CHARS:
+        raise ValueError(f"{name}: too large for a config CSV (over {MAX_CONFIG_CHARS:,} "
+                         f"characters); is it a capture?")
+    return text
+
+
 def read_legacy_csv(path) -> Dict[str, List[str]]:
-    """Read a legacy CSV file into {normalised field name -> values}."""
-    with open(path, 'r', encoding='utf-8') as f:
-        return legacy_dict_from_text(f.read())
+    """Read a legacy CSV file into {normalised field name -> values}; ValueError naming
+    the file as `read_config_text` does."""
+    return legacy_dict_from_text(read_config_text(path))
+
+
+def _whole(text: str, field: str, port: Optional[int] = None) -> int:
+    """`text` as a whole number; ValueError naming the field (and data port) when it is
+    not one."""
+    try:
+        return int(text)
+    except ValueError:
+        where = f" for data port {port}" if port is not None else ""
+        raise ValueError(f"{field}{where} is {quoted(text)}, not a whole number") from None
 
 
 def _get_int(old: Dict[str, List[str]], field: str, i: int, default: int) -> int:
     vals = old.get(field, [])
-    return int(vals[i]) if i < len(vals) else default
+    return _whole(vals[i], field, i) if i < len(vals) else default
 
 
-def _get_bool(old: Dict[str, List[str]], field: str, i: int, default: bool) -> bool:
+def _get_bool(old: Dict[str, List[str]], field: str, i: int, default: bool,
+              clamped: Optional[Callable[[str], None]] = None) -> bool:
     vals = old.get(field, [])
-    return _parse_bool(vals[i]) if i < len(vals) else default
+    if i >= len(vals):
+        return default
+    return _parse_bool(vals[i], f"{field} for data port {i}", clamped)
 
 
 def _get_str(old: Dict[str, List[str]], field: str, i: int, default: str) -> str:
@@ -113,13 +169,38 @@ def _get_str(old: Dict[str, List[str]], field: str, i: int, default: str) -> str
     return vals[i] if i < len(vals) else default
 
 
+# Most unrecognised legacy field names one import warning lists.
+_LISTED_FIELDS = 8
+
+# Most channels a data port enables (EnableCh_REG is 16 bits).
+_MAX_CHANNELS = 16
+
+
+def _store(obj, attr: str, value, field: str, text: str) -> None:
+    """Set `obj.attr` to `value`, read from the legacy row `field` as `text`; a value the
+    model refuses raises ValueError naming the field and the cell."""
+    try:
+        setattr(obj, attr, value)
+    except ValueError as exc:
+        raise ValueError(f"{field} is {quoted(text)}, which the model refuses "
+                         f"({exc})") from None
+
+
 def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
-            source_stem: str = ''):
+            source_stem: str = '', clamped: Optional[Callable[[str], None]] = None):
     """Convert a parsed legacy (v1.73/v1.74) config dict to (Interface, VizConfig).
 
     Shared by the app's silent open path and the convert_174 CLI. Unrecognised
-    fields are reported via ``warn``."""
-    from ..swviz.config.constants import SpecialDevices
+    fields are reported via ``warn``. A value the converter changes to fit (a count below
+    1, more channels than a port has, Row Rate or Rows to Draw outside its range, a flag that is not
+    true/false/1/0/yes/no, which reads as false, a CDS/S0 Handover Width outside 0..3, a CDS
+    Guard Polarity on a disabled guard) is reported via ``clamped`` as text
+    naming the field, the port and the value used. The CDS guard, polarity and tail width
+    are written to every CDS source. A cell that is not a whole number, a Row Rate that is
+    not a finite number, and an interface value the model refuses (Columns per Row, S0 Width,
+    CDS Tail Width, Skipping Denominator) raise ValueError naming the field and the cell.
+    Per-port numbers are written as given; the native loader range-checks them."""
+    from ..swviz.config.constants import InterfaceRanges, SpecialDevices
     from ..swviz.models import Interface
     from ..swviz.models.enums import DisplayField
     from ..swviz.version import app_version
@@ -135,47 +216,93 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
     # fields (Channels, Sample Width, Sample Grouping, Interval) are stored as raw
     # REGs; otherwise they're 1-based counts needing a -1. `Columns per Row` is
     # always a natural value regardless, so NumColumns_REG is always value - 1.
-    already_excess_one = _parse_bool((old.get('Save file using excess one') or ['False'])[0])
+    already_excess_one = _parse_bool((old.get('Save file using excess one') or ['False'])[0],
+                                     'Save file using excess one', clamped)
+
+    def flag(field: str) -> bool:
+        """The first value of the legacy row `field` as a flag."""
+        return _parse_bool(old[field][0], field, clamped)
 
     # --- Interface --- (guard on truthiness: a present-but-empty row has [] values,
     # so `in old` would pass but old[k][0] would IndexError.)
     if old.get('Columns per Row'):
-        iface.NumColumns_REG = int(old['Columns per Row'][0]) - 1
+        _store(iface, 'NumColumns_REG',
+               _whole(old['Columns per Row'][0], 'Columns per Row') - 1,
+               'Columns per Row', old['Columns per Row'][0])
     if old.get('S0 S1 Enabled'):
-        iface.phy3_enabled = _parse_bool(old['S0 S1 Enabled'][0])
+        iface.phy3_enabled = flag('S0 S1 Enabled')
     if old.get('S0 Width'):
-        iface.s0_width = int(old['S0 Width'][0])
+        _store(iface, 's0_width', _whole(old['S0 Width'][0], 'S0 Width'),
+               'S0 Width', old['S0 Width'][0])
     if old.get('CDS Guard Enabled'):
-        iface.CDS_GuardEnabled_REG = _parse_bool(old['CDS Guard Enabled'][0])
+        iface.CDS_GuardEnabled_REG = flag('CDS Guard Enabled')
     # Older files predate the Guard 0/Guard 1 polarity choice; absent -> Guard 0
     # (False), matching the pre-polarity behaviour.
     if old.get('CDS Guard Polarity'):
-        iface.CDS_GuardPolarity_REG = _parse_bool(old['CDS Guard Polarity'][0])
+        iface.CDS_GuardPolarity_REG = flag('CDS Guard Polarity')
+    # One guard for every source, as the current format's per-source rows carry it (0 off,
+    # 1 Guard 0, 2 Guard 1). Those rows hold a polarity only with its guard enabled, so a
+    # polarity set on a disabled guard is reported and written as Guard 0.
+    if iface.CDS_GuardPolarity_REG and not iface.CDS_GuardEnabled_REG:
+        if clamped:
+            clamped("CDS Guard Polarity is true while CDS Guard Enabled is false; a polarity "
+                    "is kept only with its guard, so false is used")
+        iface.CDS_GuardPolarity_REG = False
+    guard = (2 if iface.CDS_GuardPolarity_REG else 1) if iface.CDS_GuardEnabled_REG else 0
+    iface.CDS_Guard_PerSource = [guard] * len(iface.CDS_Guard_PerSource)
     if old.get('CDS Tail Width'):
-        iface.CDS_TailWidth_REG = int(old['CDS Tail Width'][0])
+        _store(iface, 'CDS_TailWidth_REG', _whole(old['CDS Tail Width'][0], 'CDS Tail Width'),
+               'CDS Tail Width', old['CDS Tail Width'][0])
+        # One width for every source, as the current format's per-source row carries it.
+        iface.CDS_Tail_PerSource = [iface.CDS_TailWidth_REG] * len(iface.CDS_Tail_PerSource)
     # v1.74's UI label is "Skipping Denominator"; its loader expects "Interval
     # Denominator". Accept either; prefer the newer name if both exist.
     denom = old.get('Skipping Denominator') or old.get('Interval Denominator')
     if denom:
-        iface.SkippingDenominator_REG = int(denom[0])
+        _store(iface, 'SkippingDenominator_REG', _whole(denom[0], 'Skipping Denominator'),
+               'Skipping Denominator', denom[0])
     if old.get('CDS/S0 Handover Width'):
         # Legacy packed CDS handover and S1 tail into one width field. Split:
         # EnforceCDSHandover on when width>=1; S1TailWidth_REG is 0 for width 0-1,
         # 1 for width 2, 2 for width >=3.
-        w = int(old['CDS/S0 Handover Width'][0])
+        w = _whole(old['CDS/S0 Handover Width'][0], 'CDS/S0 Handover Width')
         iface.cds_handover_enabled = w > 0
         iface.tail_width = min(2, max(0, w - 1))
+        if not 0 <= w <= 3 and clamped:
+            clamped(f"CDS/S0 Handover Width {w} is outside 0 to 3; "
+                    f"{'a handover and ' if w > 0 else ''}an S1 tail width of "
+                    f"{iface.tail_width} {'are' if w > 0 else 'is'} used")
     if old.get('Draw S0 Handover'):
-        iface.s1_handover_enabled = _parse_bool(old['Draw S0 Handover'][0])
+        iface.s1_handover_enabled = flag('Draw S0 Handover')
     if old.get('Row Rate [kHz]'):
-        iface.row_rate = float(old['Row Rate [kHz]'][0])
+        text = old['Row Rate [kHz]'][0]
+        try:
+            rate = float(text)
+        except ValueError:
+            raise ValueError(f"Row Rate [kHz] is {quoted(text)}, not a number") from None
+        if not math.isfinite(rate):
+            raise ValueError(f"Row Rate [kHz] is {quoted(text)}, not a finite number")
+        low, high = InterfaceRanges.MIN_ROW_RATE, InterfaceRanges.MAX_ROW_RATE
+        iface.row_rate = min(high, max(low, rate))
+        if iface.row_rate != rate and clamped:
+            clamped(f"Row Rate [kHz] {clipped(text)} is outside {low:g} to {high:g}; "
+                    f"{iface.row_rate:g} is used")
     if old.get('Rows to Draw'):
-        viz.rows_to_draw = int(old['Rows to Draw'][0])
+        rows = _whole(old['Rows to Draw'][0], 'Rows to Draw')
+        low, high = InterfaceRanges.MIN_ROWS, InterfaceRanges.MAX_ROWS
+        viz.rows_to_draw = min(high, max(low, rows))
+        if viz.rows_to_draw != rows and clamped:
+            clamped(f"Rows to Draw {rows} is outside {low} to {high}; "
+                    f"{viz.rows_to_draw} is used")
 
     # Subtract 1 unless the file was saved in excess-one mode (REGs on disk).
     def excess1(field: str, i: int, default: int) -> int:
         raw = _get_int(old, field, i, default)
-        return raw if already_excess_one else max(0, raw - 1)
+        if already_excess_one:
+            return raw
+        if raw < 1 and clamped:
+            clamped(f"{field} {raw} for data port {i} is below 1; 1 is used")
+        return max(0, raw - 1)
 
     # v1.74 splits the interval into Integer + Numerator; v1.73 has a single
     # "Data Port Interval". Accept whichever the file carries.
@@ -190,6 +317,16 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
         # N-1 on disk. Both end at a (1<<count)-1 bitmask.
         raw_ch = _get_int(old, 'Data Port Channels', i, 1)
         n_channels = (raw_ch + 1) if already_excess_one else raw_ch
+        # The count the file means, when it stores one less.
+        means = f" ({n_channels} channels)" if already_excess_one else ""
+        if n_channels > _MAX_CHANNELS:
+            if clamped:
+                clamped(f"Data Port Channels {raw_ch}{means} for data port {i} is above "
+                        f"{_MAX_CHANNELS}; {_MAX_CHANNELS} channels are enabled")
+            n_channels = _MAX_CHANNELS
+        elif n_channels < 1 and clamped:
+            clamped(f"Data Port Channels {raw_ch}{means} for data port {i} is below 1; no "
+                    f"channel is enabled")
         cfg.EnableCh_REG = (1 << n_channels) - 1 if n_channels > 0 else 0
 
         cfg.ChannelGrouping_REG = _get_int(old, 'Data Port Channel Grouping', i, 0)
@@ -204,9 +341,9 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
         cfg.TailWidth_REG = _get_int(old, 'Data Port Tail Width', i, 0)
         cfg.BitWidth_REG = _get_int(old, 'Data Port Bit Width', i, 0)
         # Legacy Source=True means "is a source". PortDirection_REG=0 for source.
-        cfg.PortDirection_REG = not _get_bool(old, 'Source', i, True)
-        cfg.GuardEnable_REG = _get_bool(old, 'Data Port Guard Enabled', i, False)
-        cfg.SubRowInterval_REG = _get_bool(old, 'Data Port DRI', i, False)
+        cfg.PortDirection_REG = not _get_bool(old, 'Source', i, True, clamped)
+        cfg.GuardEnable_REG = _get_bool(old, 'Data Port Guard Enabled', i, False, clamped)
+        cfg.SubRowInterval_REG = _get_bool(old, 'Data Port DRI', i, False, clamped)
 
         # _REG fields with no legacy source — user-specified defaults.
         cfg.GuardPolarity_REG = False
@@ -224,11 +361,11 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
 
         viz_dp = viz.data_ports[i]
         viz_dp.name = _get_str(old, 'Data Port Name', i, f'DP{i}')
-        viz_dp.enabled = _get_bool(old, 'Data Port Enabled', i, False)
-        viz_dp.enable_handover = _get_bool(old, 'Draw Data Port Handover', i, True)
+        viz_dp.enabled = _get_bool(old, 'Data Port Enabled', i, False, clamped)
+        viz_dp.enable_handover = _get_bool(old, 'Draw Data Port Handover', i, True, clamped)
         viz_dp.display_fields = DisplayField.SAMPLE | DisplayField.CHANNEL
 
-        if _get_bool(old, 'Data Port In Manager', i, False):
+        if _get_bool(old, 'Data Port In Manager', i, False, clamped):
             iface.set_dp_device(i, SpecialDevices.MANAGER)
         else:
             iface.set_dp_device(i, _get_int(old, 'Data Port Device Number', i, 0))
@@ -322,20 +459,21 @@ def to_current_text(text: str, source: str = "") -> str:
     Already-current (or unrecognised) text is returned unchanged; legacy
     (v1.73/v1.74) and v2.0 files are converted. `source` names the file in the import
     warnings: unrecognised legacy fields, legacy per-port rows short of a value per data
-    port, a v2.0 file that does not upgrade, and text with no config fields at all."""
+    port, a v2.0 file that does not upgrade, and text with no config fields at all (an empty
+    or blank file included)."""
     version = detect_version(text)
     if version == "unknown":
-        if any(f for f, _ in _rows(text)):
-            import_notes.warn(source, "no config field is recognised (no _REG row and "
-                              "no legacy field); every setting takes its default.")
+        import_notes.warn(source, "no config field is recognised (no _REG row and "
+                          "no legacy field); every setting takes its default.")
         return text
     if version == "current":
         return text
     if version == "legacy":
         skipped: List[str] = []
+        changed: List[str] = []
         try:
             old = legacy_dict_from_text(text)
-            iface, viz = convert(old, skipped.append)
+            iface, viz = convert(old, skipped.append, clamped=changed.append)
             out = _model_to_text(iface, viz)
         except Exception as exc:  # noqa: BLE001 — turn a cryptic model error into a clear one
             # A legacy CSV can't be read as-is (the C++/BusConfig parsers only read
@@ -348,7 +486,14 @@ def to_current_text(text: str, source: str = "") -> str:
             n = len(skipped)
             import_notes.warn(source, f"{n} legacy field{'s are' if n != 1 else ' is'} not "
                               f"recognised and {'were' if n != 1 else 'was'} skipped: "
-                              f"{', '.join(skipped)}.")
+                              + ', '.join(clipped(f) for f in skipped[:_LISTED_FIELDS])
+                              + (f" and {n - _LISTED_FIELDS:,} more" if n > _LISTED_FIELDS
+                                 else "") + ".")
+        if changed:
+            n = len(changed)
+            shown = '; '.join(changed[:4]) + (' …' if n > 4 else '')
+            import_notes.warn(source, f"{n} legacy value{'s' if n != 1 else ''} did not fit "
+                              f"and {'were' if n != 1 else 'was'} changed: {shown}.")
         short = _legacy_short_rows(old)
         if short:
             import_notes.warn(source, "legacy per-port rows with fewer values than data "
@@ -360,13 +505,17 @@ def to_current_text(text: str, source: str = "") -> str:
 def normalized_path(path: str) -> str:
     """Return a filesystem path to a CURRENT-format version of the CSV at `path`.
 
-    If `path` is already current it is returned unchanged; otherwise it is upgraded
+    If `path` is already current it is returned unchanged (the native parser and the
+    Visualizer engine both skip a leading byte-order mark); otherwise it is upgraded
     (legacy or v2.0 -> current) and written to a temp file whose path is returned
     (the C++ parser reads files, not text). The temp file is left for the OS temp
     dir to reclaim; callers that want eager cleanup can remove it after use."""
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    upgraded = to_current_text(text, import_notes.source_name(path))
+    text = read_config_text(path)
+    name = import_notes.source_name(path)
+    try:
+        upgraded = to_current_text(text, name)
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from None
     if upgraded == text:
         return path
     fd, tmp = tempfile.mkstemp(suffix=".cur.csv", prefix="swi3s_cfg_")
@@ -379,7 +528,8 @@ def report_csv_warnings(cfg_path: str, source_path: str = "") -> List[str]:
     """Report, as import warnings for `source_path` (default `cfg_path`), what the native
     loader does not read as written in the current-format CSV at `cfg_path`
     (`swi3score.csv_warnings`): a port disabled for its DeviceNumber_REG, a value masked
-    or clamped to its register field, an unreadable cell. Returns the messages; empty
+    or clamped to its register field, a Reserved CDS_TailWidth 3 (worded as BusConfig words
+    it, so one file read by both reports it once), an unreadable cell. Returns the messages; empty
     when the loaded core does not provide `csv_warnings`."""
     import swi3score
     fn = getattr(swi3score, "csv_warnings", None)
@@ -390,3 +540,4 @@ def report_csv_warnings(cfg_path: str, source_path: str = "") -> List[str]:
     for m in msgs:
         import_notes.warn(src, m)
     return msgs
+

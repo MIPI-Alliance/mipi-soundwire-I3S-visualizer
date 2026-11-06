@@ -10,6 +10,7 @@ Two defences, both covered here:
      from the zip, never holding the inflated blob — so cost scales with the window.
 """
 import io
+import tracemalloc
 import zipfile
 
 import numpy as np
@@ -17,6 +18,8 @@ import pytest
 
 from swi3s_studio.ingest import saleae_binary as sb
 from swi3s_studio.ingest import saleae_sal as ss
+
+pytestmark = pytest.mark.platform
 
 _RATE = 500_000_000
 
@@ -186,15 +189,32 @@ def test_load_capture_window_is_rebased(tmp_path):
     assert cap.clock_edges.size and int(cap.clock_edges[0]) >= 0
 
 
-def test_capture_span_samples_streams_without_inflating(tmp_path):
+def test_the_capture_span_streams_without_inflating(tmp_path, monkeypatch):
     """The capture length comes from the block chain's last B_end, read by walking
     headers — it must be available without decoding (that is what lets the app ask
-    'how long is this?' about a file too big to open)."""
-    e = _edges()
-    blob = sb.build_channel_v3(False, e, chunk_size=250)
+    'how long is this?' about a file too big to open). No delta decoder runs, and the walk
+    of both channels peaks below half of ONE channel's blob, which reading either blob
+    whole would exceed."""
+    e = _edges(n=1_000_000)
+    blob = sb.build_channel_v3(False, e, chunk_size=4096)
     path = _write_sal(tmp_path, blob, blob)
-    span = ss.capture_span_samples(path)
+
+    def decoded(*args, **kwargs):
+        raise AssertionError("the span walk decoded a delta run")
+
+    for mod, name in ((sb, "parse_channel_v3"), (sb, "parse_channel_v3_window"),
+                      (sb, "decode_v3_deltas"), (sb, "_v3_decode_deltas_np"),
+                      (sb, "_v3_decode_block_np"), (ss, "_stream_deltas"),
+                      (ss, "_decode_channel")):
+        monkeypatch.setattr(mod, name, decoded)
+    tracemalloc.start()
+    try:
+        span = ss.window_model(path).span_samples
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
     assert span >= int(e[-1]), f"span {span} < last edge {int(e[-1])}"
+    assert peak < len(blob) // 2, f"the span walk peaked at {peak} B, a blob is {len(blob)} B"
 
 
 def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
@@ -211,7 +231,7 @@ def test_capture_span_is_the_same_on_a_compressed_archive(tmp_path):
     import zipfile as _z
     with _z.ZipFile(packed) as z:                     # the fixture really is compressed
         assert z.getinfo("digital-0.bin").compress_type == _z.ZIP_DEFLATED
-    assert ss.capture_span_samples(packed) == ss.capture_span_samples(stored) >= int(e[-1])
+    assert ss.window_model(packed).span_samples == ss.window_model(stored).span_samples >= int(e[-1])
 
 
 def test_capture_span_channels_filter_restricts_the_walk(tmp_path):
@@ -223,12 +243,12 @@ def test_capture_span_channels_filter_restricts_the_walk(tmp_path):
     b_short = sb.build_channel_v3(False, short, chunk_size=250)
     b_long = sb.build_channel_v3(False, long_, chunk_size=250)
     path = _write_sal(tmp_path, b_short, b_long)
-    both = ss.capture_span_samples(path)
-    only0 = ss.capture_span_samples(path, channels=[0])
-    only1 = ss.capture_span_samples(path, channels=[1])
+    both = ss.window_model(path).span_samples
+    only0 = ss.window_model(path, channels=[0]).span_samples
+    only1 = ss.window_model(path, channels=[1]).span_samples
     assert only1 > only0, (only0, only1)              # the fixture's premise
     assert both == only1, "unfiltered span should be the max over channels"
-    assert only0 == pytest.approx(int(short[-1]), rel=0.05) or only0 >= int(short[-1])
+    assert int(short[-1]) <= only0 <= int(short[-1]) * 1.05
 
 
 # ----------------------------------------------------------------------- estimation
@@ -292,12 +312,12 @@ def test_window_passes_a_budget_the_full_load_would_fail(tmp_path):
     budget = full.est_peak_bytes // 4          # too small for the whole file
     with pytest.raises(ss.SalTooLargeError):
         ss.load_capture(path, 0, 1, max_bytes=budget)
-    span = ss.capture_span_samples(path)
+    span = ss.window_model(path).span_samples
     cap = ss.load_capture(path, 0, 1, window=(0, span // 100), max_bytes=budget)
     assert cap.clock_edges.size < e.size, "window did not actually narrow the load"
 
 
-def test_available_memory_is_sane():
+def test_available_memory_is_sane(real_free_memory):
     """0 (unknown) or a positive byte count — never negative, which would make the
     guard refuse every capture."""
     assert ss.available_memory_bytes() >= 0
@@ -366,7 +386,7 @@ def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch,
         from_total = ss.memory_budget()
     assert "total RAM" in ss.budget_source(), ss.budget_source()
     assert any("psutil" in r.getMessage() for r in caplog.records), (
-        "a degraded memory guard must say so in the log — silence is the defect this fixes")
+        "a degraded memory guard must log which rule it used")
 
     monkeypatch.setattr(ss, "total_memory_bytes", lambda: 0)
     unknown = ss.memory_budget()
@@ -383,7 +403,7 @@ def test_the_unknown_memory_budget_degrades_in_steps_and_says_which(monkeypatch,
         f"({from_total}) on a machine larger than the assumed one")
     assert unknown == int(ss._ASSUMED_TOTAL_WHEN_UNKNOWN * ss._UNKNOWN_TOTAL_FRACTION), (
         "the unknown budget must be the total rule applied to a pessimistic assumed total, "
-        "not an independent constant — an independent constant is what inverted the tiers")
+        "not an independent constant")
 
 
 def test_the_memory_probes_agree_with_psutil_on_this_platform():
@@ -423,7 +443,7 @@ def test_the_peak_estimate_carries_the_decode_transient():
                       est_transitions=1_000_000, est_edge_bytes=8_000_000,
                       sample_rate_hz=_RATE)
     assert cost.est_peak_bytes == int(2_000_000_000 + 8_000_000 * ss._WHOLE_FILE_TRANSIENT)
-    assert ss._WHOLE_FILE_TRANSIENT > 1.0, "a transient of 1 would restore the under-prediction"
+    assert ss._WHOLE_FILE_TRANSIENT > 1.0, "the whole-file transient must exceed 1.0"
     # The blob term must NOT be multiplied: it is one allocation, not a pipeline.
     assert cost.est_peak_bytes < int(
         (2_000_000_000 + 8_000_000) * ss._WHOLE_FILE_TRANSIENT), "transient applied to the blob too"

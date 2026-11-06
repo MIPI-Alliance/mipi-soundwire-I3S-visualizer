@@ -26,9 +26,8 @@ class Interface:
     frame structure, and data port definitions.
     """
 
-    # Frame parameter ranges (delegated to InterfaceRanges as the single
-    # source of truth — kept here as class attributes for backward
-    # compatibility with callers that read Interface.MIN_* / Interface.MAX_*).
+    # Frame parameter ranges: class attributes that mirror InterfaceRanges,
+    # the single source of truth, for callers that read Interface.MIN_* / MAX_*.
     # NumColumns_REG is excess-1 encoded: register value N means N+1 actual columns
     MIN_COLUMNS_PER_ROW = InterfaceRanges.MIN_COLUMNS_PER_ROW
     MAX_COLUMNS_PER_ROW = InterfaceRanges.MAX_COLUMNS_PER_ROW
@@ -42,8 +41,6 @@ class Interface:
     MAX_SKIPPING_DENOMINATOR = InterfaceRanges.MAX_SKIPPING_DENOMINATOR
     MIN_S0_WIDTH = InterfaceRanges.MIN_S0_WIDTH
     MAX_S0_WIDTH = InterfaceRanges.MAX_S0_WIDTH
-    MIN_S1_WIDTH = InterfaceRanges.MIN_S1_WIDTH
-    MAX_S1_WIDTH = InterfaceRanges.MAX_S1_WIDTH
     MIN_CDS_WIDTH = InterfaceRanges.MIN_CDS_WIDTH
     MAX_CDS_WIDTH = InterfaceRanges.MAX_CDS_WIDTH
     MIN_CDS_TAIL_WIDTH = InterfaceRanges.MIN_CDS_TAIL_WIDTH
@@ -57,7 +54,6 @@ class Interface:
     # Integer properties with range validation
     NumColumns_REG: int = ValidatedInt('NumColumns_REG', MIN_COLUMNS, MAX_COLUMNS, 'NumColumns_REG')  # type: ignore[assignment]
     s0_width: int = ValidatedInt('s0_width', MIN_S0_WIDTH, MAX_S0_WIDTH, 'S0 width')  # type: ignore[assignment]
-    s1_width: int = ValidatedInt('s1_width', MIN_S1_WIDTH, MAX_S1_WIDTH, 'S1 width')  # type: ignore[assignment]
     CDS_BitWidth_REG: int = ValidatedInt('CDS_BitWidth_REG', MIN_CDS_WIDTH, MAX_CDS_WIDTH, 'CDS width')  # type: ignore[assignment]
     CDS_TailWidth_REG: int = ValidatedInt('CDS_TailWidth_REG', MIN_CDS_TAIL_WIDTH, MAX_CDS_TAIL_WIDTH, 'CDS tail width')  # type: ignore[assignment]
     # CDS_DriveType: 0 = Special (a CDS 1 is left high-Z, bus keeper holds), 1 = Normal
@@ -67,8 +63,8 @@ class Interface:
     # engine ignores both; they are carried so the CSV round-trips and the renderer can
     # annotate the Special case.
     CDS_DriveType_REG: int = ValidatedInt('CDS_DriveType_REG', 0, 1, 'CDS drive type')  # type: ignore[assignment]
-    # CDS_EndDriveEarly (0x87 bit 4): 0 = drive the full UI, 1 = stop half a UI early.
-    # Mandatory on PHY3. Per source like the drive type; this scalar is the Manager's,
+    # CDS_EndDriveEarly (0x87 bit 4): 0 = drive to the end of the UI, 1 = stop before the end of
+    # the last UI. Mandatory on PHY3. Per source like the drive type; this scalar is the Manager's,
     # derived on load. The placement engine ignores it — it changes when a driver lets go
     # inside a UI, not which column anything occupies.
     CDS_EndDriveEarly_REG: int = ValidatedInt('CDS_EndDriveEarly_REG', 0, 1, 'CDS end drive early')  # type: ignore[assignment]
@@ -123,7 +119,6 @@ class Interface:
         self.NumColumns_REG = 15  # Register value 15 = 16 actual columns
         self.phy3_enabled = False
         self.s0_width = Interface.MIN_S0_WIDTH
-        self.s1_width = Interface.MIN_S1_WIDTH
         self.cds_handover_enabled = True
         self.s1_handover_enabled = True
         self.CDS_GuardEnabled_REG = False
@@ -151,8 +146,8 @@ class Interface:
         # Defaults to all Normal, not the register's reset of 0, so a CSV with no such
         # row reads as Normal.
         self.CDS_DriveType_PerSource: List[int] = [1] * 13
-        # Per-source CDS_EndDriveEarly: 0 full UI, 1 stop half a UI early. Defaults to
-        # the register's reset of 0 (unlike CDS_DriveType_PerSource above).
+        # Per-source CDS_EndDriveEarly: 0 drive to the end of the UI, 1 stop before the end of
+        # the last UI. Defaults to the register's reset of 0 (unlike CDS_DriveType_PerSource above).
         self.CDS_EndDriveEarly_PerSource: List[int] = [0] * 13
 
     @property
@@ -259,8 +254,9 @@ class Interface:
         if device_num not in self.devices:
             self.devices[device_num] = Device(device_num, self)
 
-        # Add to target device
+        # Add to target device; the port drives the bus through its owner
         self.devices[device_num].add_data_port(dp)
+        dp._device = self.devices[device_num]
 
     def is_dp_in_manager(self, dp_index: int) -> bool:
         """Check if a data port is assigned to the manager.

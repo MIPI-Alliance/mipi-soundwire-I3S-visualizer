@@ -5,6 +5,7 @@
 #include <pybind11/numpy.h>
 
 #include <algorithm>          // std::copy
+#include <limits>             // decode_saleae_v3_deltas overflow bound
 #include <memory>             // pyOwner()
 #include <stdexcept>          // requireAudio() throws
 
@@ -27,6 +28,7 @@ static py::dict commandToDict(const CommandRec& c)
     py::dict d;
     d["command"] = c.command;
     d["phase"] = c.phase;
+    d["header_valid"] = c.headerValid;
     d["device_mask"] = c.deviceMask;
     d["has_manager_packet"] = c.hasManagerPacket;
     d["packet_length"] = c.packetLength;
@@ -55,6 +57,12 @@ static py::dict commandToDict(const CommandRec& c)
     // ERROR: a WriteA32 to an EnableCh _CURR (0xC1/0xD0/0xD1) register address while the
     // addressed port's Interval != 0 (Interval > 1 Row) — see CommandRec::enablechCurrError.
     d["enablech_curr_error"] = c.enablechCurrError;
+    // A single-ranked control register of a running port changed (a programming error,
+    // not a protocol error) — see CommandRec::runningPortWriteError.
+    d["running_port_write_error"] = c.runningPortWriteError;
+    // A write covered a read-only byte (a programming error) — see
+    // CommandRec::readOnlyWriteError.
+    d["read_only_write_error"] = c.readOnlyWriteError;
     // ERROR: this command's SSP landed while a skipping port was part-way through its skip
     // pattern (Section 9.1.6.2.1) — see CommandRec::unexpectedSspError.
     d["unexpected_ssp_error"] = c.unexpectedSspError;
@@ -139,6 +147,7 @@ static py::dict configToDict(const SwI3sConfig& cfg)
         e["fcp_offset"] = dp.FCP_Offset;
         e["fcp_guard_enable"] = dp.FCP_GuardEnable;
         e["fcp_guard_polarity"] = dp.FCP_GuardPolarity;
+        e["fcp_scrambler_en"] = dp.FCP_ScramblerEn;
         dps.append(e);
     }
     out["dataports"] = dps;
@@ -184,7 +193,7 @@ static std::shared_ptr<const void> pyOwner(py::object obj)
 
 PYBIND11_MODULE(swi3score, m)
 {
-    m.doc() = "SWI3S PHY2 decode core (reused from the Saleae plugin).";
+    m.doc() = "SWI3S decode core: PHY1/PHY2 forwarded-clock (FBCSE) and PHY3 (DLV) bus decode.";
 
     // ABI version of the Python<->native interface. Bump whenever a binding's
     // signature / return shape changes in a way the Python side depends on, or when an
@@ -192,7 +201,16 @@ PYBIND11_MODULE(swi3score, m)
     // relies on. swi3s_studio checks this at decode time and asks the user to rebuild if
     // the loaded .so is stale. A purely additive binding the Python side reaches with
     // getattr is not a bump.
-    m.attr("score_abi") = 16;
+    m.attr("score_abi") = 18;
+    // Protocol constants the Python side repeats (session._MIN_COLUMNS/_MAX_COLUMNS,
+    // dlv_detect.DLV_CDS_COLUMN and MIN_UI_SAMPLES); the tests pin each copy to these.
+    m.attr("min_column_count") = swi3s::kMinColumnCount;
+    m.attr("max_hub_depth") = swi3s::kMaxHubDepth;      // a hub depth above it reads as it
+    m.attr("max_grid_rows") = kMaxGridRows;
+    m.attr("max_demo_samples") = kMaxDemoSamplesPerChannel;   // every make_*_levels length
+    m.attr("max_column_count") = swi3s::kMaxColumnCount;
+    m.attr("dlv_cds_column") = swi3s::kDlvCdsColumn;   // PHY3 CDS_HorizontalStart reset value
+    m.attr("dlv_min_ui_samples") = DlvSampleSource::kMinUiSamples;
 
     py::class_<ISampleSource>(m, "ISampleSource");
 
@@ -208,6 +226,8 @@ PYBIND11_MODULE(swi3score, m)
                  // The source views the buffers of the arrays the casters produced: the
                  // caller's own arrays when they are already C-contiguous uint64 (zero
                  // copy), otherwise converted copies that exist only in these parameters.
+                 // The casters convert only what numpy casts to uint64 safely; a signed or
+                 // floating-point array does not match this overload and raises TypeError.
                  // Both are handed to the source as its owner, so whichever buffers it
                  // views live exactly as long as it does.
                  const std::uint64_t* clock = clockEdges.data();
@@ -221,27 +241,40 @@ PYBIND11_MODULE(swi3score, m)
              py::arg("clock_edges"), py::arg("data_edges"),
              py::arg("initial_clock"), py::arg("initial_data"), py::arg("sample_rate_hz"),
              "Capture-backed source: clock/data transition arrays (uint64; viewed without a "
-             "copy when C-contiguous uint64, converted once otherwise).");
+             "copy when C-contiguous uint64; a strided view, a list or a narrower unsigned "
+             "dtype is converted once; a signed or floating-point dtype raises TypeError).");
 
     py::class_<DlvSampleSource, ISampleSource>(m, "DlvSampleSource")
         .def(py::init([](py::array_t<std::uint64_t, py::array::c_style> dpEdges,
                          bool initialDp, std::uint64_t sampleRateHz, int initialColumns,
                          double nominalUiSamples) {
                  // DLV: one differential signal; only the DP-wire edges are needed (DN is
-                 // its complement). Owning copy (the DLL keeps derived rising-edge state).
+                 // its complement). The source views the buffer of the array the caster
+                 // produced (the caller's own when it is already C-contiguous uint64,
+                 // otherwise a converted copy) and holds that array as its owner, as
+                 // TransitionSampleSource does, with the same dtype rule.
+                 const std::uint64_t* dp = dpEdges.data();
+                 const auto dpN = static_cast<std::size_t>(dpEdges.size());
                  return new DlvSampleSource(
-                     std::vector<std::uint64_t>(dpEdges.data(), dpEdges.data() + dpEdges.size()),
-                     initialDp, sampleRateHz, initialColumns, nominalUiSamples);
+                     dp, dpN, initialDp, sampleRateHz, initialColumns, nominalUiSamples,
+                     pyOwner(std::move(dpEdges)));
              }),
              py::arg("dp_edges"), py::arg("initial_dp"), py::arg("sample_rate_hz"),
              py::arg("initial_columns"), py::arg("nominal_ui_samples") = 0.0,
-             "PHY3 (DLV) source: recovers the bit clock from the DP-wire edges via a virtual "
+             "PHY3 (DLV) source: recovers the bit clock from the DP-wire edges (uint64; viewed "
+             "without a copy when C-contiguous uint64; a strided view, a list or a narrower "
+             "unsigned dtype is converted once; a signed or floating-point dtype raises "
+             "TypeError) via a virtual "
              "DLL locked to the Sync1 row edges, sampling mid-UI. initial_columns = Safe-Lock "
-             "count; the decoder pushes NumColumns changes. nominal_ui_samples seeds the loop's "
+             "count (outside 2..32: the cold-start count); the decoder pushes NumColumns "
+             "changes. nominal_ui_samples seeds the loop's "
              "free-running UI estimate for the initial geometry (>0 = robust acquisition; the "
              "aperture tracks the once-per-row reference instead of the first two edges). "
              "Each later bring-up (DecoderSettings.restart_points) locks the loop again at its "
-             "first Row Sync, at the seeded row period over its Safe-Lock count.")
+             "first Row Sync, at the seeded row period over its Safe-Lock count. The loop "
+             "needs at least one sample per UI and the source ends where it has fewer; where "
+             "the next rising edge is more than 64 rows past the predicted Row Sync the loop "
+             "relocks at that edge, or ends when none remains and the capture runs on further.")
         .def("recovered_row_syncs", [](const DlvSampleSource& s) {
                  const auto& v = s.RecoveredRowSyncs();
                  return py::array_t<std::uint64_t>(
@@ -258,7 +291,8 @@ PYBIND11_MODULE(swi3score, m)
         .def_readwrite("dlv", &DecoderSettings::dlv,
                        "PHY3 (DLV) mode: no NRZS, CDS at cds_horizontal_start, recovered clock.")
         .def_readwrite("cds_horizontal_start", &DecoderSettings::cdsHorizontalStart,
-                       "DLV CDS column (e.g. 2 in Safe-Lock-4); 0 for FBCSE.")
+                       "DLV CDS column (CDS_HorizontalStart, e.g. 2 in Safe-Lock-4); a value "
+                       "outside 1..columns-2 reads at the reset value 2. Ignored for FBCSE.")
         .def_readwrite("config_csv_path", &DecoderSettings::configCsvPath)
         .def_readwrite("scrambler_overrides", &DecoderSettings::scramblerOverrides,
                        "Per-dataport scrambler override: list of (device, dp, on) "
@@ -338,7 +372,9 @@ PYBIND11_MODULE(swi3score, m)
         .def(py::init<ISampleSource&, const DecoderSettings&>(),
              py::arg("source"), py::arg("settings"),
              py::keep_alive<1, 2>())   // keep the source alive while the decoder lives
-        .def("run", &Decoder::run, py::call_guard<py::gil_scoped_release>())
+        .def("run", &Decoder::run, py::call_guard<py::gil_scoped_release>(),
+             "Decode the whole source. Runs once per Decoder; a second call raises "
+             "RuntimeError.")
         // commands() does NOT release the GIL, unlike audio_columns() / bit_samples() /
         // bit_samples_window() below: those release around a fill loop that is pure C++
         // over raw buffers, while this loop CREATES PYTHON OBJECTS (a dict per command),
@@ -449,9 +485,19 @@ PYBIND11_MODULE(swi3score, m)
             "streaming) — treat 0 as unknown, not done.")
         .def("request_stop", &Decoder::requestStop,
             "Ask an in-flight run() to stop (call from another thread; run() releases the "
-            "GIL). It returns within ~64k UIs with what it decoded so far.")
+            "GIL). It returns within 4096 UIs of reading, plus at most one detect window "
+            "already read, with what it decoded so far.")
         .def_property_readonly("stopped", &Decoder::stopped,
             "True if the last run() returned early because of request_stop().")
+        .def("cancel", &Decoder::cancel,
+            "Cancel an in-flight run() (thread-safe: call from another thread while run() "
+            "holds no GIL, or before run()). run() returns as request_stop() makes it "
+            "return, and cancelled is then True; what it decoded is incomplete, for the "
+            "caller to discard. A cancel before run() makes run() return without reading "
+            "the source.")
+        .def_property_readonly("cancelled", &Decoder::cancelled,
+            "True if the last run() returned early because of cancel(). False when the "
+            "run completed, including a cancel that arrived after its last poll.")
         .def_property_readonly("progress", &Decoder::progress,
             "progress_uis / total_uis in [0, 1], or 0.0 if total_uis is unknown (0).")
         .def("segments", [](const Decoder& d) {
@@ -464,14 +510,16 @@ PYBIND11_MODULE(swi3score, m)
                 e["row_base"] = s.rowBase;
                 e["restart"] = s.restart;
                 e["cold_start"] = s.coldStart;
+                e["cds_column"] = s.cdsColumn;
                 out.append(e);
             }
             return out;
-        }, "Decode segments (one per column count or link restart): each has "
-           "start_ui, start_sample, column_count, row_base (cumulative bus row at "
-           "the segment start), restart (opened by a later link bring-up, see "
-           "restart_points) and cold_start (that bring-up was a Cold Start). Bus "
-           "rows are continuous across segments.")
+        }, "Decode segments (one per column count, PHY3 CDS column or link restart): "
+           "each has start_ui (the UI of its first CDS bit), start_sample, column_count, "
+           "row_base (cumulative bus row at the segment start), restart (opened by a "
+           "later link bring-up, see restart_points), cold_start (that bring-up was a "
+           "Cold Start) and cds_column (0 for FBCSE; the PHY3 CDS_HorizontalStart in "
+           "effect). Bus rows are continuous across segments.")
         .def("bit_samples", [](const Decoder& d) {
             // Per-data-bit sample points (columnar), populated only when
             // settings.collect_bit_samples was set. Keys: sample, device, dp,
@@ -550,7 +598,8 @@ PYBIND11_MODULE(swi3score, m)
         }, py::arg("start_ui"), py::arg("end_ui"),
            "Windowed per-data-bit sample points for source-UI range [start_ui, end_ui] "
            "without a full re-decode: columnar sample/device/dp/channel/is_start. Needs a "
-           "seekable source and settings.decode_audio (else empty). This is the on-demand "
+           "seekable source and settings.decode_audio (else empty); a window starting past "
+           "the capture's last UI is empty. This is the on-demand "
            "path the Raw Capture 'Port Samples' overlay uses per visible window.")
         .def("grid_cells", [](const Decoder& d, int rows) {
             py::list out;
@@ -564,6 +613,14 @@ PYBIND11_MODULE(swi3score, m)
         }, "DLV Row Sync Point samples (each Column-0 UI's sample), from the decoder's "
            "own framing — the authoritative row boundaries for the recovered-clock RSP "
            "marks. Empty for FBCSE.")
+        .def("guessed_framing_samples", [](const Decoder& d) {
+            const auto& v = d.guessedFramingSamples();
+            return py::array_t<std::uint64_t>(
+                static_cast<py::ssize_t>(v.size()), v.data());
+        }, "Window-start samples where a known column count (forced, pinned, from a config "
+           "CSV, or a restart's Safe-Lock count) was framed with no CRC-valid command to "
+           "place Column 0 by: Column 0 is taken at the window's first UI, the UI after the "
+           "alignment edge. Empty when every such framing was validated.")
         .def("audio_sample_rates", [](const Decoder& d) {
             py::dict out;
             for (const auto& t : d.audioSampleRates())
@@ -598,10 +655,12 @@ PYBIND11_MODULE(swi3score, m)
 
     m.def("decode_symbols", [](ISampleSource& src, int columnCount, int maxSymbols,
                                std::uint64_t startUi, std::uint64_t rowOriginUi,
-                               long rowBase, std::uint64_t endUi, bool dlv, int cdsColumn) {
+                               long rowBase, std::uint64_t endUi, bool dlv, int cdsColumn,
+                               const std::vector<int>& hubDepths) {
         py::list out;
         for (const auto& s : decodeSymbols(src, columnCount, maxSymbols, startUi,
-                                           rowOriginUi, rowBase, endUi, dlv, cdsColumn)) {
+                                           rowOriginUi, rowBase, endUi, dlv, cdsColumn,
+                                           hubDepths)) {
             py::dict d;
             d["start_sample"] = s.startSample;
             d["end_sample"] = s.endSample;
@@ -616,13 +675,16 @@ PYBIND11_MODULE(swi3score, m)
     }, py::arg("source"), py::arg("column_count"), py::arg("max_symbols") = 0,
        py::arg("start_ui") = 0, py::arg("row_origin_ui") = ~0ull, py::arg("row_base") = 0,
        py::arg("end_ui") = 0, py::arg("dlv") = false, py::arg("cds_column") = swi3s::kCdsColumn,
+       py::arg("hub_depths") = std::vector<int>{},
        "Re-decode the CDS into classified 8b/10b symbols (optionally windowed). "
        "Pass row_origin_ui + row_base (a segment's Column-0 UI and cumulative row) "
        "to make symbol rows match the streaming decoder across segments. end_ui "
        "caps the decode at a segment boundary so it can't cross into a region with "
        "a different column width (0 = no cap). dlv=True reads the CDS as a plain-NRZ "
        "bit at cds_column (Column 2 for DLV) instead of NRZS at Column 0 — pass a "
-       "DlvSampleSource as the source for the recovered-clock, mid-UI sampling.");
+       "DlvSampleSource as the source for the recovered-clock, mid-UI sampling. "
+       "hub_depths (Device i's depth at index i) frames the symbols as the decode does: "
+       "the 2*depth gap bits before a delayed device's response token are skipped.");
 
     m.def("grid_from_registers", [](const std::vector<std::tuple<int, std::uint32_t, int>>& writes,
                                     int fallbackColumns, int rows, int forceColumns,
@@ -643,7 +705,9 @@ PYBIND11_MODULE(swi3score, m)
        "What-if grid layout from (device, address, value) register writes. "
        "force_columns (>=2) overrides the register-derived column count — e.g. to "
        "draw an earlier cold-start segment's physical width. dlv=true lays out the "
-       "PHY3 (DLV) framing: CDS at cds_horizontal_start, S1 at Column 0, S0 last.");
+       "PHY3 (DLV) framing: CDS at cds_horizontal_start, S1 at Column 0, S0 last. "
+       "Every grid_* layout holds rows to max_grid_rows and the column count to "
+       "min_column_count..max_column_count.");
 
     m.def("grid_from_commands", [](const std::vector<py::dict>& cmds, int rows,
                                    int forceColumns,
@@ -806,43 +870,61 @@ PYBIND11_MODULE(swi3score, m)
         SwI3sConfig cfg;
         std::string err;
         py::list out;
-        if (!cfg.LoadCsv(csvPath, err)) return out;
+        cfg.LoadCsv(csvPath, err);   // an unopenable file leaves its reason in warnings
         for (const auto& w : cfg.warnings) out.append(w);
         return out;
     }, py::arg("csv_path"),
        "What reading a visualizer CSV config did not take as written: one line per field "
        "(a port disabled for its DeviceNumber_REG, a value masked or clamped to its "
-       "register field, an unreadable cell, values past the last column). Empty for a "
-       "clean file or one that cannot be opened.");
+       "register field, a Reserved CDS_TailWidth 3, an unreadable cell, values past the "
+       "last column, a key that is not a config field). A file that cannot be opened "
+       "reports why. Empty for a clean file.");
+
+    m.def("pattern_period", [](const std::string& csvPath, long long cap) {
+        SwI3sConfig cfg;
+        std::string err;
+        cfg.LoadCsv(csvPath, err);
+        return cfg.patternPeriod(cap);
+    }, py::arg("csv_path"), py::arg("cap"),
+       "The LCM of the transport pattern periods, in Rows, of a visualizer CSV config's "
+       "enabled ports that carry a channel ((Interval + 1), times SkippingDenominator for a "
+       "skipping port), as the manual SSP row is reduced by; 1 when there is none. An LCM "
+       "above cap returns cap.");
 
     m.def("make_demo_levels", &MakeDemoLevels, py::arg("audio_samples_per_channel") = 32,
-          "Synthetic PHY2 stream: config + commit + scrambled stereo audio.");
+          "Synthetic PHY2 stream: two commits (2 -> 8 -> 16 columns) configuring four mono "
+          "ports: two 16-bit PCM (DP0 carrying 44.1 kHz by skipping, DP1) and two 1-bit PDM "
+          "(DP2, DP3), with DP1 and DP3 scrambled.");
 
     m.def("make_demo_levels_flow_control", &MakeDemoLevelsFlowControl,
-          py::arg("audio_samples_per_channel") = 32,
+          py::arg("audio_samples_per_channel") = 32, py::arg("fcp_scrambled") = false,
           "Synthetic PHY2 flow-control stream: four peripheral data ports (one per flow "
           "mode — NORMAL/TX_CONTROLLED/RX_CONTROLLED/ASYNC) on four devices, with 0/1 "
           "interval of transport jitter gated by TX_PRESENT (decodes bit-exact to a "
-          "uniform 48 ksps stream).");
+          "uniform 48 ksps stream). fcp_scrambled writes FCP_ScramblerEn = 1 and "
+          "scrambles every DRQ bit with its port's LFSR.");
 
     m.def("make_demo_levels_phy1", &MakeDemoLevelsPhy1, py::arg("audio_samples_per_channel") = 32,
           "Synthetic PHY1 (slow FBCSE) stream: a constant 4-column geometry with two 16-bit "
           "PCM ports (interleaved, DP1 scrambled) + one PDM port; a mid-capture commit "
           "REPOSITIONS the ports (config_1 -> config_2) without changing the column count.");
 
-    m.def("make_demo_levels_phy3", [](int n) {
-              DemoLevels d = MakeDemoLevelsPhy3(n);
+    m.def("make_demo_levels_phy3", [](int n, int cdsColumn) {
+              DemoLevels d = MakeDemoLevelsPhy3(n, cdsColumn);
               py::dict out;
               out["levels"] = d.levels;
               out["row_columns"] = d.rowColumns;
               return out;
           },
-          py::arg("audio_samples_per_channel") = 32,
+          py::arg("audio_samples_per_channel") = 32, py::arg("cds_column") = 2,
           "Synthetic PHY3 (DLV) stream: {'levels': per-UI logical differential levels "
           "(Sync1/CDS/payload/Sync0 framing), 'row_columns': each row's column count}. "
           "Safe-Lock-4 then a commit to 16 columns, same audio as make_demo_levels. "
           "row_columns lets build_dlv_capture_from_levels place edges at a constant row "
-          "period so the UI/bit-clock rate rises at the commit (4 -> 16 columns).");
+          "period so the UI/bit-clock rate rises at the commit (4 -> 16 columns). A "
+          "cds_column other than 2 is programmed with the 16-column config and moves the "
+          "CDS there at that commit. cds_column must lie in 1..14 and off the data-port "
+          "columns 4..9; any other value raises ValueError.");
 
     m.def("make_skipping_levels", &MakeSkippingLevels,
           py::arg("samples_per_channel") = 200, py::arg("numerator") = 13,
@@ -852,10 +934,87 @@ PYBIND11_MODULE(swi3score, m)
           "(denominator - numerator) of every denominator intervals and leaving the rest "
           "idle, with periodic SSPAs on the pattern period. Sample n has value n, so a "
           "decode that skips the wrong interval no longer counts up. misaligned_sspa puts "
-          "the SSPAs one Interval off the pattern boundary (an unexpected SSP).");
+          "the SSPAs one Interval off the pattern boundary (an unexpected SSP). A "
+          "denominator below 1 is written as 0, which reads as the reset value 1. Raises "
+          "ValueError for a numerator or denominator above 4095, or for a ratio whose "
+          "samples_per_channel * denominator / (denominator - numerator) intervals exceed "
+          "4 * max_demo_samples.");
 
-    m.def("make_dscr_disable_levels", &MakeDscrDisableLevels,          py::arg("samples_per_channel") = 32, py::arg("disable_all") = false,
-          "Test fixture: two 16-bit PCM ports; a DSCR disables dp1 (or both, disable_all) mid-stream.");
+    m.def("make_dscr_disable_levels", &MakeDscrDisableLevels,
+          py::arg("samples_per_channel") = 32, py::arg("disable_all") = false,
+          "Test fixture: two 16-bit PCM ports; a DSCR disables dp1 (or both, disable_all) "
+          "mid-stream. Raises ValueError when samples_per_channel is too small to place the "
+          "DSCR before its commit point.");
+    m.def("make_dscr_enable_levels", &MakeDscrEnableLevels, py::arg("samples_per_channel") = 32,
+          py::arg("enable_channel") = false,
+          "Test fixture: one 16-bit PCM port; a DSCR enables a second port (or, with "
+          "enable_channel, a second channel on the running port) mid-stream. Raises "
+          "ValueError when samples_per_channel is too small to place the DSCR before its "
+          "commit point.");
+    m.def("make_dscr_channel_set_levels", &MakeDscrChannelSetLevels,
+          py::arg("samples_per_channel") = 32, py::arg("from_mask") = 0x3,
+          py::arg("to_mask") = 0x1, py::arg("row_in_interval") = 0,
+          "Test fixture: one scrambled 16-bit PCM port with channels from_mask (bits 0-2; "
+          "0 reads as channel 0); a DSCR commits to_mask (bits 0-2), its commit point "
+          "row_in_interval (0..63) rows into an interval. Raises ValueError when "
+          "samples_per_channel is too small to place the DSCR before its commit point.");
+
+    m.def("make_channel_reseed_levels", &MakeChannelReseedLevels,
+          py::arg("samples_per_phase") = 32,
+          "Test fixture: one scrambled two-channel PCM port in seven phases; channel 1 is "
+          "enabled, disabled and re-enabled across SSCRs, then disabled and re-enabled by "
+          "DSCRs, while channel 0 runs throughout; then single-ranked 0x0B writes clear and "
+          "set ScramblerEn. A channel's scrambler is seeded when the channel is enabled or "
+          "ScramblerEn turns on.");
+    m.def("make_fcp_reseed_levels", &MakeFcpReseedLevels,
+          py::arg("intervals_per_phase") = 96, py::arg("generator_seed") = "enable",
+          "Test fixture: one RX_CONTROLLED port with a scrambled FCP across an SSCR, a "
+          "DSCR, and single-ranked 0x0E writes that remove and re-enable the FCP, then clear "
+          "and set FCP_ScramblerEn. generator_seed ('enable', 'sscr', 'dscr', 'interval', "
+          "'resume', 'continue') says where the wire's DRQ scrambler is seeded; 'enable' "
+          "seeds it at each FCP enable and where FCP_ScramblerEn turns on.");
+    m.def("make_fcp_move_levels", &MakeFcpMoveLevels,
+          py::arg("intervals_per_phase") = 96, py::arg("dscr") = false,
+          py::arg("fcp_h_start") = 13, py::arg("fcp_offset") = 12,
+          py::arg("flow_control_delay") = 0, py::arg("scrambled") = false,
+          py::arg("fcp_bit_width") = 0, py::arg("reenable") = false,
+          py::arg("commit_row_offset") = 0, py::arg("columns_after") = 16,
+          "Test fixture: one RX_CONTROLLED port (data from Row 2) with its DRQ at Column 11, "
+          "Row 12 and FlowControlDelay flow_control_delay (0 or 1); an SSCR (or a DSCR when "
+          "dscr) then commits FCP_HorizontalStart fcp_h_start, FCP_Offset fcp_offset and "
+          "FCP_BitWidth fcp_bit_width (0..3) alone, and the DRQ is sent at the new cell from "
+          "the commit point. TX_PRESENT follows the DRQ history from the port's enable, "
+          "across the commit. With reenable the second commit disables the port and a third "
+          "enables it again with the new placement, where its DRQ history starts again. "
+          "scrambled sets ScramblerEn: TX_PRESENT and the data bits pass through channel 0's "
+          "LFSR. commit_row_offset (0..15, an SSCR without reenable) lands the second "
+          "commit that many rows past the interval boundary, where the DRQ history starts "
+          "again; columns_after (16 or 32, 16 with reenable) is the column count the second "
+          "commit also commits. Raises ValueError for an intervals_per_phase too small to "
+          "place the commit (the smallest is 65 with the default arguments, 64 with a "
+          "commit_row_offset of 6 or more, 75 with reenable or columns_after 32), a "
+          "flow_control_delay other than 0 or 1, an "
+          "fcp_bit_width outside 0..3, a DRQ whose fcp_bit_width + 1 UIs leave Columns "
+          "1..15 or Rows 0..15 or reach Columns 2..14 of Rows 2..4, or a commit_row_offset "
+          "or columns_after outside its range.");
+    m.def("make_fcp_guard_tail_levels", &MakeFcpGuardTailLevels,
+          py::arg("intervals_per_phase") = 96, py::arg("dscr") = false,
+          py::arg("fcp_h_start") = 8, py::arg("fcp_offset") = 12,
+          py::arg("fcp_bit_width") = 0, py::arg("fcp_tail_width") = 0,
+          py::arg("fcp_guard_enable") = false, py::arg("fcp_guard_polarity") = false,
+          py::arg("async_mode") = false,
+          py::arg("first_guard_enable") = false, py::arg("first_guard_polarity") = false,
+          "Test fixture: one RX_CONTROLLED (ASYNC when async_mode) sink port (data from Row 2) "
+          "whose source DRQ sits at Column 11, Row 12 with no tail and its guard set by "
+          "first_guard_enable and first_guard_polarity (off by default); an SSCR (or a "
+          "DSCR when dscr) then commits FCP_HorizontalStart fcp_h_start, FCP_Offset "
+          "fcp_offset, FCP_BitWidth fcp_bit_width, FCP_TailWidth fcp_tail_width (each 0..3), "
+          "FCP_GuardEnable fcp_guard_enable and FCP_GuardPolarity fcp_guard_polarity alone. "
+          "From the commit point the DRQ is followed in its row by the guard UI, driven to "
+          "its polarity, and fcp_tail_width tail UIs holding the bus level. Raises ValueError "
+          "for an intervals_per_phase below 86 (too few to place the commit), a width "
+          "outside 0..3, or a cell outside Columns 1..15, Rows 0..15, or in Columns 2..14 "
+          "of Rows 2..4.");
 
     m.def("make_immediate_scrambler_levels", &MakeImmediateScramblerLevels,
           py::arg("samples_per_channel") = 32, py::arg("mid_interval") = false,
@@ -872,7 +1031,18 @@ PYBIND11_MODULE(swi3score, m)
           py::arg("samples_per_channel") = 32, py::arg("interval") = 0,
           "Test fixture: one PCM port committed with Interval=`interval`; a WriteA32 then "
           "re-asserts EnableCh0 directly at its _CURR address (0xC1). The decode must flag "
-          "the command's enablech_curr_error iff interval != 0 (Interval > 1 Row).");
+          "the command's enablech_curr_error iff interval != 0 (Interval > 1 Row). Raises "
+          "ValueError for an interval above 4095, past the 12-bit Interval register, or a "
+          "samples_per_channel x (interval + 1) above 3072000 Rows (48000 samples at a "
+          "64-row Interval).");
+
+    m.def("make_running_port_write_levels", &MakeRunningPortWriteLevels,
+          py::arg("samples_per_channel"), py::arg("offset"), py::arg("value"),
+          py::arg("base") = 0x2000u, py::arg("before_run") = false,
+          "Test fixture: one running PCM port; a single WriteA32 writes `value` to the "
+          "register at `base` + `offset` (`offset` 0..0xFF; the default base is dp0's block) "
+          "mid-stream, or with `before_run` as the last setup write before the SSCR (the "
+          "wire keeps the committed config).");
 
     m.def("decode_codeword", [](std::uint16_t raw) {
         U8 value = 0; bool isControl = false, isComma = false;
@@ -888,11 +1058,89 @@ PYBIND11_MODULE(swi3score, m)
        "is_control, is_comma}. Exposes the symbol decoder for both running-disparity "
        "forms so tests can verify RD-/RD+ coverage.");
 
+    m.def("encode_codeword", [](std::uint8_t value) {
+        return static_cast<int>(C8b10bDecoder::EncodeByte(value));
+    }, py::arg("value"),
+       "Test hook: the raw 10-bit D-code symbol (a@bit9..j@bit0) EncodeByte emits for `value`.");
+
     m.def("register_reset", [](std::uint32_t addr) {
         return (int)CRegisterModel::resetOf(addr);
     }, py::arg("address"),
        "Spec-defined reset byte the decode model uses for the register at `address` "
        "(what an un-written register reads as). Cross-checked vs data/registers.json.");
+
+    m.def("register_read_only", [](std::uint32_t addr) {
+        return CRegisterModel::IsReadOnly(addr);
+    }, py::arg("address"),
+       "Test hook: True when a WriteA32 to `address` changes nothing because the byte is "
+       "read-only (a register whose fields are all RO, or a CDS _CURR alias).");
+
+    m.def("register_rw1c_mask", [](std::uint32_t addr) {
+        return static_cast<int>(CRegisterModel::Rw1cMask(addr));
+    }, py::arg("address"),
+       "Test hook: the write-1-to-clear bits of the register at `address` (0 when none).");
+
+    m.def("register_write_is_immediate", [](std::uint32_t addr) {
+        return CRegisterModel().WriteIsImmediate(addr);
+    }, py::arg("address"),
+       "Test hook: True when a WriteA32 to `address` takes committed effect at once "
+       "(a single-ranked register or a writable _CURR alias), False when it stages in "
+       "_NEXT or the byte is read-only (see register_read_only).");
+
+    m.def("_token_symbol", [](int token) {
+        return static_cast<int>(C8b10bDecoder::EncodeToken(token));
+    }, py::arg("token"),
+       "Test hook: the raw 10-bit symbol of Robust Token `token` (0..15); 0 otherwise.");
+
+    m.def("_parse_cds_test", [](const std::vector<bool>& bits, std::vector<int> hubDepths,
+                                bool shortSpacer) {
+        CCommandTransportParser parser;
+        int depths[swi3s::kMaxPeripherals] = {0};
+        for (int i = 0; i < swi3s::kMaxPeripherals && i < (int)hubDepths.size(); ++i)
+            depths[i] = hubDepths[i];
+        parser.SetHubDepths(depths);
+        parser.SetShortProtocolSpacer(shortSpacer);
+        py::list out;
+        for (size_t k = 0; k < bits.size(); ++k) {
+            if (!parser.PushCdsBit(bits[k], (U64)k)) continue;
+            const SwI3sCommand& c = parser.Command();
+            py::dict d;
+            d["phase"] = c.PhaseName();
+            d["command"] = c.CommandName();
+            d["header_valid"] = c.headerValid;
+            d["crc_valid"] = c.crcValid;
+            d["device_mask"] = (int)c.deviceMask;
+            d["packet_length"] = (int)c.packetLength;
+            d["peripheral_response"] = c.peripheralResponse;
+            d["manager_response"] = c.managerResponse;
+            out.append(d);
+        }
+        return out;
+    }, py::arg("bits"), py::arg("hub_depths") = std::vector<int>{},
+       py::arg("short_spacer") = false,
+       "Test hook: push CDS bits through a command parser with the given hub depths and "
+       "ShortProtocolSpacer; returns one dict per completed phase (phase, command, "
+       "header_valid, crc_valid, device_mask, packet_length, peripheral_response, "
+       "manager_response).");
+
+    m.def("_cds_symbols_test", [](const std::vector<bool>& bits) {
+        C8b10bDecoder dec;
+        py::list out;
+        for (size_t k = 0; k < bits.size(); ++k) {
+            C8b10bDecoder::Symbol sym;
+            if (!dec.PushBit(bits[k], sym) || k + 1 < swi3s::kSymbolBits) continue;
+            int kind = 0, value = -1;
+            classifySymbol(sym, kind, value);
+            py::dict d;
+            d["kind"] = kind;
+            d["value"] = value;
+            d["raw"] = static_cast<int>(sym.raw);
+            out.append(d);
+        }
+        return out;
+    }, py::arg("bits"),
+       "Test hook: the symbols decode_symbols reports for CDS bits `bits` (kind, value, raw "
+       "per symbol, classified as decode_symbols classifies them).");
 
     // Test hook for the hub-delay decode path: build a Ping CDS bitstream whose
     // device tokens are 0,1,..,11, inserting 2*(emit_depth[i]-emit_depth[i-1])
@@ -945,9 +1193,9 @@ PYBIND11_MODULE(swi3score, m)
         // byte offset `off` in `buf` into an int64 array of deltas (each >= 1). A byte
         // < 0x40 is a single-byte code; otherwise the first byte is the MSB digit
         // (byte - 0x40), interior bytes >= 0x80 are digits (byte - 0x80), and the first
-        // byte < 0x80 terminates (raw low digit). Bit-identical to the Python
-        // decode_v3_deltas — this is the hot loop when reading 100s-of-millions-of-edges
-        // .sal captures, so it lives in C++.
+        // byte < 0x80 terminates (raw low digit). Equal to the Python decode_v3_deltas
+        // for every code whose delta fits int64; any other code throws. This is the hot loop when
+        // reading 100s-of-millions-of-edges .sal captures, so it lives in C++.
         py::buffer_info info = buf.request();
         const std::uint8_t* base = static_cast<const std::uint8_t*>(info.ptr);
         const std::size_t total = static_cast<std::size_t>(info.size);
@@ -971,24 +1219,36 @@ PYBIND11_MODULE(swi3score, m)
         py::array_t<std::int64_t> out(static_cast<py::ssize_t>(count));
         std::int64_t* o = out.mutable_data();
         // Pass 2: accumulate each code's base-128 value.
+        bool overflow = false;
         {
             py::gil_scoped_release rel;
             const std::uint8_t* p = begin;
             std::size_t k = 0;
-            while (p < end) {
+            // val * 128 + digit + 1 must fit int64: a digit that would take the delta past
+            // INT64_MAX refuses the code.
+            constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+            while (p < end && !overflow) {
                 std::uint8_t b = *p++;
                 if (b < 0x40) { o[k++] = static_cast<std::int64_t>(b) + 1; continue; }
                 std::int64_t val = static_cast<std::int64_t>(b) - 0x40;   // MSB digit
                 while (p < end) {
                     std::uint8_t bb = *p++;
-                    if (bb >= 0x80) { val = val * 128 + (bb - 0x80); }    // interior digit
-                    else { val = val * 128 + bb; break; }                 // terminal digit
+                    const bool interior = bb >= 0x80;
+                    const std::int64_t digit = interior ? bb - 0x80 : bb;
+                    if (val > (kMax - digit - 1) / 128) { overflow = true; break; }
+                    val = val * 128 + digit;
+                    if (!interior) break;                                 // terminal digit
                 }
+                if (overflow) break;
                 o[k++] = val + 1;
             }
         }
+        if (overflow)
+            throw std::invalid_argument(
+                "decode_saleae_v3_deltas: a delta code is too long for int64");
         return out;
     }, py::arg("buf"), py::arg("off"), py::arg("nbytes"),
        "Decode a Saleae v3 base-128 transition-delta run (uint8 buffer, offset, length) "
-       "to an int64 delta array. Bit-identical to the Python decode_v3_deltas.");
+       "to an int64 delta array (each >= 1). Raises ValueError for a code whose delta does not "
+       "fit int64.");
 }

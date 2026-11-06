@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from .timebase import MAX_LINE_CHARS
+
 # Edge arrays are uint64: one transition is 8 bytes once loaded.
 _EDGE_BYTES = 8
 
@@ -173,8 +175,8 @@ def _probe_bin(paths: List[str]) -> CaptureProbe:
         pr.channels.append(ProbedChannel(p, os.path.basename(p), n if n >= 0 else None))
         try:
             with open(p, "rb") as f:
-                head = f.read(saleae_binary._HEADER.size)
-            _m, _v, _t, _i, begin, end, _n = saleae_binary._HEADER.unpack(head)
+                head = f.read(saleae_binary.V0_HEADER.size)
+            _m, _v, _t, _i, begin, end, _n = saleae_binary.V0_HEADER.unpack(head)
             ends.append(float(end) - float(begin))
         except Exception:  # noqa: BLE001
             pass
@@ -189,7 +191,7 @@ def _probe_bin(paths: List[str]) -> CaptureProbe:
 
 def _probe_digital_csv(path: str) -> CaptureProbe:
     from . import digital_csv
-    header = digital_csv.read_header(path)
+    header = digital_csv.read_header(path)   # ValueError: empty, over-long, over-wide, non-text
     cols = list(range(1, len(header)))
     try:
         counts, rate = digital_csv.scan(path)          # one bounded pass: counts and rate
@@ -197,7 +199,7 @@ def _probe_digital_csv(path: str) -> CaptureProbe:
         counts, rate = [], 0
     with open(path, "rb") as fb:
         sample = fb.read(64 << 10)
-    rows = digital_csv._predict_rows(path, len(header), sample)
+    rows = digital_csv.predict_rows(path, sample)
     pr = CaptureProbe("digital_csv", [path], "Digital CSV (.csv)")
     # The counts read the first 2,000,000 rows: exact for a file that short, else a prefix.
     approx = rows > 2_000_000
@@ -206,10 +208,11 @@ def _probe_digital_csv(path: str) -> CaptureProbe:
     pr.sample_rate_hz = float(rate) or None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            next(f)
-            first = next(f).split(",")[0]
+            f.readline(MAX_LINE_CHARS)
+            first = f.readline(MAX_LINE_CHARS).split(",")[0]
         last = _last_line(path).split(",")[0]
-        pr.duration_s = max(0.0, float(last) - float(first))
+        scale = digital_csv.time_unit(header)[0]         # the Time column's unit, in seconds
+        pr.duration_s = max(0.0, (float(last) - float(first)) * scale)
     except Exception:  # noqa: BLE001
         pass
     # The loader's own pre-flight figure, so "fits" here is what its guard admits.
@@ -223,12 +226,15 @@ def _probe_vcd(path: str) -> CaptureProbe:
     info = vcd.read_info(path)
     sigs = info.scalar_signals
     idents = [s.ident for s in sigs]
+    scanned = True
     try:
         per, truncated, t_read = vcd.transition_counts_until(path, idents, 2_000_000)
     except Exception:  # noqa: BLE001
-        per, truncated, t_read = {}, False, 0
+        per, truncated, t_read, scanned = {}, False, 0, False
     pr = CaptureProbe("vcd", [path], "Value change dump (.vcd)")
-    pr.channels = [ProbedChannel(s.ident, s.name, per.get(s.ident), approx=truncated)
+    # The scan lists only signals that changed: one it read without a change has 0.
+    pr.channels = [ProbedChannel(s.ident, s.name, per.get(s.ident, 0 if scanned else None),
+                                 approx=truncated)
                    for s in sigs]
     tick = float(info.timescale_s or 0.0)
     pr.sample_rate_hz = float(info.sample_rate_hz) or None
@@ -276,7 +282,7 @@ def _probe_wfm(paths: List[str]) -> CaptureProbe:
 
 def _probe_analog_csv(path: str) -> CaptureProbe:
     from . import analog_csv
-    _pre, header, offset, _sample = analog_csv._scan_header(path)
+    _pre, header, offset, _sample = analog_csv.scan_header(path)
     names = header[1:]
     pr = CaptureProbe("analog_csv", [path], "Analog CSV (.csv, scope export)", analog=True)
     pr.channels = [ProbedChannel(n, n) for n in names]
@@ -338,8 +344,8 @@ def probe(paths: List[str]) -> CaptureProbe:
         return _probe_vcd(path)
     if lp.endswith(".csv"):
         from . import analog_csv
-        with open(path, encoding="utf-8", errors="replace") as f:
-            head = [next(f, "") for _ in range(40)]
+        with open(path, encoding="utf-8-sig", errors="replace") as f:   # a BOM is no cell
+            head = [f.readline(MAX_LINE_CHARS) for _ in range(40)]
         # A config CSV is "Name,value" rows, a register's name ending _REG; a capture CSV's
         # first field is Time, so a CHANNEL named …_REG does not make it one.
         if any(ln.startswith("AppVersion") or ln.split(",")[0].strip().endswith("_REG")

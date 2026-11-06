@@ -1,7 +1,8 @@
-"""Measurements pane: one row per completed bookmark PAIR (A, B, …) showing the delta
-between its two members in time, bus rows, and UIs. Updates live as bookmarks are
-added/dragged; clicking a row seeks the cursor to that pair's left member. With two or more
-Links a Link column says which bus each bookmark is on (and, for a pair, both).
+"""Measurements pane: the user's bookmark measurements in time, bus rows and UIs. A pair (A, B,
+...) shows a row for each member and a delta row between them; a lone bookmark shows its own
+row. Updates live as bookmarks are added/dragged; clicking a row seeks the cursor to that
+row's bookmark. With two or more Links a Link column says which bus each bookmark is on (and,
+for a delta row, both).
 
 Distinct from the "Statistics" pane (MeasurementsView), which shows whole-capture facts;
 this pane is purely the user's paired-bookmark measurements."""
@@ -24,7 +25,8 @@ _PAIR_LETTER_RE = re.compile(r"^([A-Za-z])")
 
 
 class PairMeasureView(QTableWidget):
-    #: a row was activated: (its seek value, the index of the Link it is on, or -1)
+    #: a row was activated: (its seek time in global picoseconds, the index of the Link it
+    #: is on, or -1)
     sampleSelected = Signal("qlonglong", int)
 
     # One ROW each for A1, A2 and their delta (A1-A2) — the members go down the rows, the
@@ -50,7 +52,7 @@ class PairMeasureView(QTableWidget):
         from .copyable import enable_copy
         enable_copy(self)          # ⌘/Ctrl+C copies the selected row (TSV); row-select is
                                    # kept so activating a row still drives the seek.
-        self._seek_samples: List[int] = []          # per-row sample to seek to
+        self._seek_ps: List[int] = []          # per-row global time (ps) to seek to
         self._rows: List[Tuple] = []                 # the last rows shown (re-drawn on retheme)
         self._seek_links: List[int] = []            # per-row Link index (-1 = unknown)
         self.setColumnHidden(self._LINK_COL, True)
@@ -68,7 +70,7 @@ class PairMeasureView(QTableWidget):
         """Each row is (label, ui, row, time, seek[, link name, link index]) — an A1, A2 or
         A1-A2 line. The Link fields are optional (blank / -1 without them)."""
         self._rows = list(rows)
-        self._seek_samples = [int(r[4]) for r in rows]
+        self._seek_ps = [int(r[4]) for r in rows]
         self._seek_links = [int(r[6]) if len(r) > 6 else -1 for r in rows]
         self.setRowCount(len(rows))
         for r, row in enumerate(rows):
@@ -86,5 +88,5 @@ class PairMeasureView(QTableWidget):
                 self.setItem(r, c, item)
 
     def _on_cell(self, row: int, _col: int) -> None:
-        if 0 <= row < len(self._seek_samples):
-            self.sampleSelected.emit(self._seek_samples[row], self._seek_links[row])
+        if 0 <= row < len(self._seek_ps):
+            self.sampleSelected.emit(self._seek_ps[row], self._seek_links[row])

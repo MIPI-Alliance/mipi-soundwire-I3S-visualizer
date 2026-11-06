@@ -15,6 +15,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.timeline import TimelineRibbon
 
+pytestmark = pytest.mark.gui
+
 _TOTAL = 1_000_000
 
 

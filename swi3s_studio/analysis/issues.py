@@ -1,6 +1,6 @@
 """A configuration issue surfaced by Visualization-mode authoring.
 
-The first-party Visualizer engine's (`swi3s_studio/swviz`) clashes + warnings are
+The Visualizer engine's (`swi3s_studio/swviz`) clashes + warnings are
 mapped to `Issue`s (`model/viz_engine.py::issues_from_model`), which the authoring
 notifications panel groups by severity and (where applicable) highlights on the bus grid.
 """

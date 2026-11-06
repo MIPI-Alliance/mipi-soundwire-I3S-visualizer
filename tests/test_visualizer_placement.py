@@ -1,7 +1,10 @@
 """SWI3S Visualizer placement regression.
 
 Asserts that **Studio's per-data-port placement (the C++ core) matches the
-visualizer's** for every example config.
+visualizer's** for every example config that has a per-port golden: 90 of the 96.
+The six without one are CDS_split_tail_1 and _2, CDS_split_guard_1, _2 and _3, and
+partial_channel_group_sample_grouping; they are intentional-error configs, covered by the
+bus-model golden of the swviz engine only.
 
 Fixtures:
 - `visualizer_examples/<category>/<name>.csv` (repo root) — the visualizer's
@@ -19,15 +22,21 @@ Column 0 (the CDS column, which Studio reserves) is excluded: the visualizer's
 *raw* model can place a misconfigured DP there, but Studio gives the CDS column to
 the control stream (the visualizer's engine flags it as a clash too).
 
+`test_a_source_port_places_its_tail_width_of_tail_cells_per_row` checks the swviz engine
+(`viz_engine.render_payload`) only; it reads neither the C++ core nor a golden.
+
 Run: PYTHONPATH=. python3 -m pytest tests/test_visualizer_placement.py
 """
 import glob
 import os
 import tempfile
+from collections import defaultdict
 
+import pytest
 import swi3score
 
-from swi3s_studio.model.bus_config import BusConfig
+from swi3s_studio.model.bus_config import BusConfig, demo_config
+from swi3s_studio.model.grid_slots import GridSlot
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VIZ = os.path.join(_HERE, "visualizer")
@@ -88,7 +97,8 @@ def _cases():
 
 def test_visualizer_examples_present():
     cases = list(_cases())
-    # The visualizer ships 58 directed + 30 spec-figure + 1 use-case configs.
+    # 59 directed + 30 spec-figure + 1 use-case configs have a per-port golden; the six
+    # intentional-error configs named in the module docstring have none.
     assert len(cases) == 90, f"expected 90 vendored configs, found {len(cases)}"
 
 
@@ -104,3 +114,25 @@ def test_placement_matches_visualizer():
         n += 1
     assert n == 90, n
     assert not fails, "placement mismatches:\n  " + "\n  ".join(fails)
+
+
+@pytest.mark.parametrize("guard", [False, True])
+@pytest.mark.parametrize("tail", [1, 2, 3])
+def test_a_source_port_places_its_tail_width_of_tail_cells_per_row(tmp_path, guard, tail):
+    """Under the swviz engine, each data row of a solo Source port ends with `tail` Tail
+    cells (TailWidth_REG 1..3) and one Guard cell when the guard is enabled."""
+    from swi3s_studio.model import viz_engine
+    cfg = demo_config()
+    dp = next(d for d in cfg.dataports if d.enabled)
+    dp.guard_enable, dp.tail_width = guard, tail
+    path = cfg.to_csv_file(str(tmp_path / "tail.csv"))
+    per_row = defaultdict(lambda: defaultdict(int))
+    for c in viz_engine.render_payload(path, 64)[0]:
+        if c["dp"] == 0 and not c.get("is_cds"):
+            per_row[c["row"]][c["slot"]] += 1
+    rows = [r for r in per_row.values() if r[int(GridSlot.DATA)]]
+    assert rows
+    guards = int(GridSlot.GUARD_0), int(GridSlot.GUARD_1)
+    for r in rows:
+        assert r[int(GridSlot.TAIL)] == tail, dict(r)
+        assert sum(r[g] for g in guards) == (1 if guard else 0), dict(r)

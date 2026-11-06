@@ -5,6 +5,8 @@ Everything here is decided before anything is decoded, from an `ingest.probe.Cap
 """
 from __future__ import annotations
 
+import html
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -52,12 +54,13 @@ class OpenRequest:
 def _gb(n: Optional[int]) -> str:
     if n is None:
         return "—"
-    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+    # The unit follows the ROUNDED figure, so no size reads "1000 MB".
+    return f"{n / 1e9:.1f} GB" if round(n / 1e6) >= 1000 else f"{n / 1e6:.0f} MB"
 
 
 def _edges(n: int, approx: bool) -> str:
     """An edge count as the dialog shows it: to two or three figures, `~` when approximate."""
-    if n >= 1_000_000:
+    if round(n / 1e3) >= 1000:               # the unit follows the rounded figure
         return f"~{n / 1e6:.1f}M"
     if n >= 10_000:
         return f"~{n / 1e3:.0f}k"
@@ -99,9 +102,10 @@ class _TimeSpin(QDoubleSpinBox):
 def _dur(s: Optional[float]) -> str:
     if s is None:
         return "—"
-    if s >= 1:
+    # The unit follows the rounded figure, so no duration reads "1000.000 ms".
+    if round(s, 3) >= 1:
         return f"{s:.3f} s"
-    if s >= 1e-3:
+    if round(s * 1e3, 3) >= 1:
         return f"{s * 1e3:.3f} ms"
     return f"{s * 1e6:.3f} µs"
 
@@ -178,6 +182,8 @@ class _LinkRow:
             if not hi or not lo:
                 raise ValueError("give both hi and lo, or neither")
             h, low = float(hi), float(lo)
+            if not (math.isfinite(h) and math.isfinite(low)):
+                raise ValueError("give each as a number of volts")
             if h <= low:
                 raise ValueError("hi must be above lo")
             return (h, low)
@@ -213,7 +219,8 @@ class OpenCaptureDialog(QDialog):
         sl = QVBoxLayout(src)
         # As many figures as the rate has (500 MHz, 98.304 MHz), not a fixed three decimals.
         rate = (f"{probe.sample_rate_hz / 1e6:.6g} MHz" if probe.sample_rate_hz else "rate —")
-        sl.addWidget(QLabel(f"<b>{probe.name}</b> · {probe.format_label} · "
+        sl.addWidget(QLabel(f"<b>{html.escape(probe.name)}</b> · "
+                            f"{html.escape(probe.format_label)} · "
                             f"{len(probe.channels)} channels · {rate}"))
         self._source_line = QLabel()           # its cost follows the Links (_show_costs)
         sl.addWidget(self._source_line)
@@ -431,7 +438,7 @@ class OpenCaptureDialog(QDialog):
     def _renumber_defaults(self) -> None:
         """Rows the user has not named get the next free "Link n" names (continuing the
         open Links' numbering when adding)."""
-        taken = self._taken_names() + [r.name.text() for r in self._rows if r.name_edited]
+        taken = self._taken_names() + [r.name.text().strip() for r in self._rows if r.name_edited]
         auto = [r for r in self._rows if not r.name_edited]
         for row, name in zip(auto, _default_names(taken, len(auto))):
             row.name.setText(name)

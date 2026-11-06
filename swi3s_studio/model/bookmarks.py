@@ -12,9 +12,8 @@ A bookmark belongs to the Link it was placed on: `sample` is in THAT Link's samp
 pair may span two Links, which is how an event on one bus is timed against another; this
 module never converts between Links (the window does, through its LinkSet).
 
-Persisted in the workspace; the legacy `[sample, ...]` format loads as ungrouped
-singles paired up in order (see `BookmarkSet.from_json`). A bookmark with no `link`
-(saved before Links) loads on Link 0.
+Persisted in the workspace. A bare number in the saved list reads as a sample on Link 0,
+paired in order (see `BookmarkSet.from_json`); a bookmark without `link` reads on Link 0.
 """
 from __future__ import annotations
 
@@ -67,9 +66,6 @@ class BookmarkSet:
 
     def samples(self) -> List[int]:
         return [b.sample for b in self._items]
-
-    def _members(self, group: str) -> List[Bookmark]:
-        return [b for b in self._items if b.group == group]
 
     def _incomplete_group(self) -> Optional[str]:
         """The earliest group (by creation letter order) with only one member, so the
@@ -154,19 +150,23 @@ class BookmarkSet:
 
     @classmethod
     def from_json(cls, data) -> "BookmarkSet":
-        """Load from the workspace. Accepts the current list-of-dicts form OR the legacy
-        list-of-ints (bare samples), which is paired up in order (A1, A2, B1, …)."""
+        """Load from the workspace. Each item is read by its own form: a mapping is a
+        bookmark, and a bare finite number is a sample on Link 0, paired up in order (A1,
+        A2, B1, ...) as `add` does. A mapping's numeric fields are read with int(), so a
+        value int() accepts is truncated and one it rejects skips the item. An item of any
+        other form is skipped."""
         s = cls()
-        if not data:
-            return s
-        if all(isinstance(x, (int, float)) for x in data):
-            for x in data:                       # legacy: bare samples, pair in order
-                s.add(int(x))
-            return s
-        for d in data:
-            s._items.append(Bookmark(sample=int(d["sample"]), group=str(d.get("group", "A")),
-                                     index=int(d.get("index", 1)), label=str(d.get("label", "")),
-                                     link=int(d.get("link", 0))))
+        for d in data or ():
+            try:
+                if isinstance(d, dict):
+                    s._items.append(Bookmark(
+                        sample=int(d["sample"]), group=str(d.get("group", "A")),
+                        index=int(d.get("index", 1)), label=str(d.get("label", "")),
+                        link=int(d.get("link", 0))))
+                elif isinstance(d, (int, float)) and not isinstance(d, bool):
+                    s.add(int(d))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
         return s
 
 

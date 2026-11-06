@@ -10,12 +10,15 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 import swi3score
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ingest import transitions
 from swi3s_studio.store.audio_store import AudioStore
 from swi3s_studio.ui.audio_view import AudioView
+
+pytestmark = pytest.mark.gui
 
 _app = QApplication.instance() or QApplication([])
 

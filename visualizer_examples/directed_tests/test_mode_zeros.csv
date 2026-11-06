@@ -1,4 +1,4 @@
-AppVersion,3.1.0
+AppVersion,3.2.0
 NumColumns_REG,15
 SkippingDenominator_REG,1
 PHY3Enabled,False
@@ -34,7 +34,7 @@ GuardEnable_REG,False,False,False,False,False,False,False,False,False,False,Fals
 GuardPolarity_REG,False,False,False,False,False,False,False,False,False,False,False,False
 SubRowInterval_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FlowMode_REG,0,0,0,0,0,0,0,0,0,0,0,0
-PortMode_REG,3,3,0,0,0,0,0,0,0,0,0,0
+PortMode_REG,2,2,0,0,0,0,0,0,0,0,0,0
 ScramblerEn_REG,False,False,False,False,False,False,False,False,False,False,False,False
 FCP_HorizontalStart_REG,0,0,0,0,0,0,0,0,0,0,0,0
 FCP_BitWidth_REG,0,0,0,0,0,0,0,0,0,0,0,0

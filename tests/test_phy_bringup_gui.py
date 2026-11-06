@@ -9,12 +9,15 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ingest import transitions
 from swi3s_studio.session import Session
 from swi3s_studio.ui.main_window import MainWindow
 from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
+
+pytestmark = pytest.mark.gui
 
 
 def test_bringup_demo_gates_grid_and_highlights_phy():

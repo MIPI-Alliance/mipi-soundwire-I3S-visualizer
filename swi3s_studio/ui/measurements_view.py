@@ -2,7 +2,7 @@
 
 Rows come from `analysis.capture_measurements` as `(metric, value)` or
 `(metric, value, kind)`. A `kind == "header"` row starts a collapsible SECTION
-(Link Control / Regions / Commands / Data Ports); clicking it folds the rows
+(Link Control / Regions / Commands / Peripheral Reports / Data Ports); clicking it folds the rows
 beneath it away, so a long capture's Statistics pane stays scannable. 'pass'/'fail'
 colour the value green/red.
 
@@ -66,6 +66,8 @@ class MeasurementsView(QTableWidget):
         children of the enclosing group when there is one (see _GROUPED_KINDS); a
         'header' or a plain row ends the group."""
         self.setRowCount(len(rows))
+        for r in range(len(rows)):
+            self.setRowHidden(r, False)       # a row index keeps its hidden flag across a refill
         self._sections = {}
         self._groups = {}
         self._group_owner = {}

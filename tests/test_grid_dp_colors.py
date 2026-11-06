@@ -18,6 +18,8 @@ import pytest
 from swi3s_studio.model import viz_engine
 from swi3s_studio.model.bus_config import BusConfig
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture
 def qapp():

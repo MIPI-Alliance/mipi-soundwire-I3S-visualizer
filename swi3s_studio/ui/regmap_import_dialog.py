@@ -11,6 +11,7 @@ that opened the dialog lists them in its Import warnings window.
 
 from __future__ import annotations
 
+import html
 import os
 from typing import Iterable, Optional
 
@@ -31,7 +32,13 @@ from PySide6.QtWidgets import (
 )
 
 from .. import import_notes
-from ..model.regmap_import import ImportReport, PeripheralRegisterMap, import_text
+from ..model.regmap_import import (
+    ImportReport,
+    PeripheralRegisterMap,
+    import_text,
+    library_dir,
+    read_text,
+)
 
 _PREVIEW_LIMIT = 50          # registers shown in the preview tree
 
@@ -106,7 +113,7 @@ class RegisterMapImportDialog(QDialog):
     # ---- import flow ----
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select register map", "",
+            self, "Select register map", self._path or library_dir(),
             "Register maps (*.xml *.json);;Vendor XML (*.xml);;Normalized (*.json);;All files (*)")
         if path:
             self._path = path
@@ -118,20 +125,21 @@ class RegisterMapImportDialog(QDialog):
         if not self._path:
             return
         try:
-            with open(self._path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
+            text, enc_notes = read_text(self._path)
             name = os.path.splitext(os.path.basename(self._path))[0]
             if self._path.lower().endswith(".json"):
                 with import_notes.collect() as notes:
                     self.pmap = PeripheralRegisterMap.from_json(text, os.path.basename(self._path))
                 report = _report_for_loaded(self.pmap)
+                report.warnings[:0] = enc_notes
                 report.warnings.extend(n.message for n in notes)
             else:
                 self.pmap, report = import_text(text, name, coalesce=self._coalesce.isChecked())
+                report.warnings[:0] = enc_notes
         except Exception as exc:  # noqa: BLE001 — surface any parse error to the user
             self.pmap = None
             self.report = None
-            self._summary.setText(f"<b>Import failed:</b> {exc}")
+            self._summary.setText(f"<b>Import failed:</b> {html.escape(str(exc))}")
             self._warnings.setPlainText("")
             self._preview.clear()
             self._buttons.button(QDialogButtonBox.Ok).setEnabled(False)
@@ -173,6 +181,7 @@ def _report_for_loaded(pmap: PeripheralRegisterMap) -> ImportReport:
     rep.register_count = len(pmap.registers)
     rep.field_count = sum(len(r.fields) for r in pmap.registers)
     rep.raw_bit_count = rep.field_count
+    rep.raw_unit = "fields"
     if pmap.registers:
         addrs = [r.abs_address for r in pmap.registers]
         rep.address_min, rep.address_max = min(addrs), max(addrs)

@@ -6,21 +6,23 @@ from conftest import _MODAL_CANCEL
 from PySide6 import QtWidgets
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
+pytestmark = pytest.mark.gui
+
 
 def test_every_static_helper_the_app_calls_is_guarded():
     """A helper the app starts calling but the guard does not know is a hang again. The
-    list is read from the source, so a new call site cannot slip past."""
+    list is read from the source: every static helper called on a Qt dialog class (a class
+    named Q...Dialog or QMessageBox) is checked."""
     import pathlib
     import re
     root = pathlib.Path(__file__).resolve().parent.parent / "swi3s_studio"
     used = set()
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        used |= set(re.findall(r"\b(QMessageBox|QFileDialog|QInputDialog)\.([a-z]\w*)\(",
-                               text))
+        used |= set(re.findall(r"\b(Q\w*Dialog|QMessageBox)\.([a-z]\w*)\(", text))
     used = {u for u in used if u[1] not in ("setDefaultButton",)}
     unguarded = sorted(f"{c}.{m}" for c, m in used if (c, m) not in _MODAL_CANCEL
-                       and callable(getattr(getattr(QtWidgets, c), m, None))
+                       and callable(getattr(getattr(QtWidgets, c, None), m, None))
                        and m.startswith(("get", "question", "information", "warning",
                                          "critical", "about", "exec")))
     assert not unguarded, f"modal helpers the conftest guard does not cover: {unguarded}"
@@ -40,6 +42,20 @@ def test_an_unpatched_modal_is_cancelled_and_recorded(_no_unexpected_modal):
                       "QMessageBox.question('Add Link?')",
                       "QMessageBox.exec('Found 3')"]
     opened.clear()                          # handled here; the guard's teardown passes
+
+
+def test_a_static_helper_with_a_parent_is_recorded_under_its_caption(_no_unexpected_modal):
+    """A static helper's first argument is the parent window, so the recorded name carries
+    the dialog's caption (the first string argument), not the parent's title."""
+    from PySide6.QtWidgets import QWidget
+    QApplication.instance() or QApplication([])
+    parent = QWidget()
+    parent.setWindowTitle("SWI3S Studio")
+    QFileDialog.getOpenFileName(parent, "Pick a capture")
+    QMessageBox.question(parent, "Add Link?", "?")
+    assert _no_unexpected_modal == ["QFileDialog.getOpenFileName('Pick a capture')",
+                                    "QMessageBox.question('Add Link?')"]
+    _no_unexpected_modal.clear()
 
 
 def test_a_menu_opened_on_an_instance_is_cancelled(monkeypatch, _no_unexpected_modal):

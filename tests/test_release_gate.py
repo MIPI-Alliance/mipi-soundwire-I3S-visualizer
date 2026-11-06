@@ -19,6 +19,9 @@ import re
 import sys
 
 import pytest
+from conftest import commit_files, git_in
+
+pytestmark = pytest.mark.platform
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CI = os.path.join(_ROOT, ".github", "workflows", "ci.yml")
@@ -26,9 +29,9 @@ _GATE = os.path.join(_ROOT, "tools", "gate.py")          # the implementation
 _GATE_SH = os.path.join(_ROOT, "tests", "gate.sh")       # bash wrapper
 _GATE_PS1 = os.path.join(_ROOT, "tests", "gate.ps1")     # PowerShell wrapper
 # A version reference in a release-notes file, EXCLUDING a spec citation: "Section 14.1.10"
-# parses as 14.1.10 and compares greater than every 3.0.x release. Narrowed rather than
-# allowlisted, as tools/leak_scan.py does for a §10.x spec citation against its private-IP
-# pattern. Do not name an address here: the scanner would flag this file.
+# parses as 14.1.10 and compares greater than every 3.0.x release. A spec citation is
+# excluded by the pattern itself, not by an allowlist. Do not name an address
+# here: the scanner would flag this file.
 _VERSION_NOT_A_CITATION = (
     # not introduced by a citation word or §
     r"(?<!§)(?<!Section )(?<!section )(?<!Table )(?<!table )(?<!Figure )(?<!figure )"
@@ -68,8 +71,10 @@ _NOT_IN_GATE = {
     # Coverage GATES (--cov-fail-under) in CI only. The local gate skips the second,
     # instrumented pass over the whole suite (~2.5 min): the documented "neither gate
     # subsumes the other" split — see docs/DEVELOPMENT.md.
-    "--cov=swi3s_studio": "coverage gates in CI only; the local gate skips the instrumented "
-                          "second pass (see DEVELOPMENT.md, 'Neither gate subsumes the other')",
+    "--cov-fail-under": "coverage gates in CI only; the local gate skips the instrumented "
+                        "second pass (see DEVELOPMENT.md, 'Neither gate subsumes the other')",
+    "tools/package_smoke.py": "installs the package into a fresh venv from a package index, so "
+                              "it is a CI-only check; the local gate does not do a network install",
 }
 
 # CI check -> the fragment that proves tools/gate.py runs the same thing.
@@ -79,6 +84,7 @@ _CI_TO_GATE = {
     "ruff check .": '"ruff", ["check", "."]',
     "tools/mypy_gate.py": "mypy_gate.py",
     "pip install ./native": "build_local.sh",
+    "tools/leak_scan.py": "leak_scan.py",
 }
 
 
@@ -169,7 +175,7 @@ def test_gate_runs_every_check_ci_declares():
         for gate_frag in mapped:
             assert gate_frag in gate, (
                 f"ci.yml runs {cmd!r} but tools/gate.py has no {gate_frag!r} — the gate and "
-                "CI have drifted, which is exactly how lint/type went unrun for five releases")
+                "CI have drifted")
     assert not unaccounted, (
         "ci.yml declares command(s) this guard does not recognise:\n  "
         + "\n  ".join(unaccounted)
@@ -184,6 +190,19 @@ def test_lint_job_is_blocking():
     lint = ci[ci.index("  lint:"):]
     assert "continue-on-error" not in lint.split("steps:")[0], \
         "the lint job must be blocking (no continue-on-error)"
+
+
+def test_every_ci_job_has_a_time_limit():
+    """Each job of ci.yml sets its own `timeout-minutes`, below the platform's 360-minute job
+    maximum, so a hung step fails the job rather than holding a runner for that limit."""
+    ci = _yaml_code(_CI)
+    body = ci[ci.index("\njobs:\n") + len("\njobs:\n"):]
+    jobs = re.split(r"^  (?=[\w-]+:\s*$)", body, flags=re.M)
+    jobs = {j.split(":", 1)[0]: j for j in jobs if j.strip()}
+    assert {"test", "perf", "package", "coverage", "lint"} <= set(jobs), sorted(jobs)
+    for name, text in jobs.items():
+        limit = re.search(r"^    timeout-minutes:\s*(\d+)\s*$", text, flags=re.M)
+        assert limit and 0 < int(limit.group(1)) < 360, f"ci.yml job {name!r} has no time limit"
 
 
 def test_mypy_result_is_not_discarded():
@@ -212,7 +231,7 @@ def test_release_checklist_points_at_the_gate_script():
         "docs/DEVELOPMENT.md must name tools/gate.py as the gate"
     # Separator-agnostic: the doc writes the Windows entry point as `.\tests\gate.ps1`.
     assert "gate.ps1" in dev, \
-        "the checklist must give the Windows entry point too — that half was once impossible"
+        "the checklist must give the Windows entry point too"
 
 
 # --- the docs must not describe a CI that no longer matches reality ----------------------
@@ -289,7 +308,7 @@ def test_published_docs_do_not_re_add_a_pattern_list():
     dev = _read(os.path.join("docs", "DEVELOPMENT.md"))
     assert "SWI3S_LEAK_PATTERNS" in dev, "the docs should point at the out-of-repo pattern file"
     assert "git grep -inE" not in dev, \
-        "docs/DEVELOPMENT.md is publishing a leak-pattern grep again — use tools/leak_scan.py"
+        "docs/DEVELOPMENT.md must not publish a leak-pattern grep — use tools/leak_scan.py"
 
 
 # --- the three version literals must agree ----------------------------------------------
@@ -312,8 +331,8 @@ def test_the_three_version_literals_agree():
     m = _re.search(r"^APP_VERSION\s*=\s*'([^']+)'", swviz, _re.M)
     assert m, "no APP_VERSION in swviz/version.py"
     assert m.group(1) == __version__, (
-        f"swviz APP_VERSION says {m.group(1)}, __version__ says {__version__} — this is the "
-        "literal that silently sat at 3.0.8 for three releases")
+        f"swviz APP_VERSION says {m.group(1)}, __version__ says {__version__} — the three "
+        "version literals must agree")
 
 
 def test_the_package_metadata_is_valid_and_ships_its_assets():
@@ -329,6 +348,8 @@ def test_the_package_metadata_is_valid_and_ships_its_assets():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")               # "[tool.setuptools] is still beta"
         conf = read_configuration(os.path.join(_ROOT, "pyproject.toml"))
+    assert conf["project"]["license"] == "BSD-3-Clause"
+    assert conf["project"]["license-files"] == ["LICENSE.md"]
     tool = conf["tool"]["setuptools"]
     pkg_root = pathlib.Path(_ROOT, "swi3s_studio")
     on_disk = {".".join(d.relative_to(_ROOT).parts) for d in [pkg_root, *pkg_root.rglob("*")]
@@ -423,7 +444,7 @@ def test_the_ratchet_reads_no_site_packages(monkeypatch):
 # the logic a release depends on — "did anything fail, and does that reach the exit code".
 # --------------------------------------------------------------------------------------
 
-_GATE_CHECKS = ("check_native", "check_pytest", "check_per_suite",
+_GATE_CHECKS = ("check_native", "check_pytest", "check_suite", "check_native_coverage",
                 "check_tool", "check_mypy", "check_leaks", "check_screenshots",
                 "check_native_cpp")
 
@@ -437,24 +458,39 @@ def _load_tool(filename: str):
     return mod
 
 
-def _run_gate(failed=(), not_run=(), argv=("tools/gate.py",)):
-    """Run gate.main() with every check stubbed out and the outcome seeded.
-
-    Seeding the two lists the checks would have appended to isolates the aggregation from
-    the checks themselves.
-    """
+def _stubbed_gate(stub=None):
+    """tools/gate.py with every check in `_GATE_CHECKS` replaced and both outcome lists
+    empty. `stub(g, name)` returns the replacement for check `name`; by default a check does
+    nothing."""
     g = _load_tool("gate.py")
     for name in _GATE_CHECKS:
         assert hasattr(g, name), f"gate.py no longer defines {name} — update this test"
-        setattr(g, name, lambda *a, **k: None)
-    g._FAILED[:] = list(failed)
-    g._NOT_RUN[:] = list(not_run)
+        setattr(g, name, stub(g, name) if stub else (lambda *a, **k: None))
+    g._FAILED[:] = []
+    g._NOT_RUN[:] = []
+    return g
+
+
+def _gate_main(g, argv):
+    """g.main() run with `argv` as the command line."""
     saved = sys.argv
     sys.argv = list(argv)
     try:
         return g.main()
     finally:
         sys.argv = saved
+
+
+def _run_gate(failed=(), not_run=(), argv=("tools/gate.py",)):
+    """Run gate.main() with every check stubbed out and the outcome seeded.
+
+    Seeding the two lists the checks would have appended to isolates the aggregation from
+    the checks themselves.
+    """
+    g = _stubbed_gate()
+    g._FAILED[:] = list(failed)
+    g._NOT_RUN[:] = list(not_run)
+    return _gate_main(g, argv)
 
 
 def test_the_gate_exits_zero_only_when_nothing_failed():
@@ -469,13 +505,28 @@ def test_the_gate_exits_nonzero_when_a_check_failed():
 
 
 def test_the_gate_reports_every_failure_so_one_cannot_hide_the_rest(capsys):
-    """The aggregating design: checks all run and every failure is named."""
-    rc = _run_gate(failed=["native build", "ruff", "leak scan"])
+    """The aggregating design: a failing check does not stop the checks after it, and every
+    failure is named in the summary."""
+    ran = []
+
+    def failing_check(g, name):
+        def failing(*a, **k):
+            label = name if not a else f"{name}:{a[0]}"
+            ran.append(label)
+            g._FAILED.append(label)
+        return failing
+
+    g = _stubbed_gate(failing_check)
+    rc = _gate_main(g, ["tools/gate.py", "--release"])
     out = capsys.readouterr().out
+    expected = [n for n, (_c, stages, _q) in g._CHECKS.items() if "release" in stages]
+    # Each release check calls one stubbed function with its own arguments, so every check of
+    # the stage ran exactly once and nothing outside it ran.
+    assert len(set(ran)) == len(ran) == len(expected) > 3, (ran, expected)
     assert rc == 1
-    assert "FAIL (3)" in out, out
-    for name in ("native build", "ruff", "leak scan"):
-        assert name in out, f"{name} missing from the summary:\n{out}"
+    assert f"FAIL ({len(ran)})" in out, out
+    for name in ran:
+        assert f"    - {name}\n" in out, f"{name} missing from the summary:\n{out}"
 
 
 def test_a_not_run_check_is_named_and_does_not_by_itself_fail(capsys):
@@ -498,7 +549,7 @@ def test_an_unrun_check_never_masks_a_real_failure(capsys):
 
 
 def test_quick_mode_still_cannot_pass_with_a_failure(capsys):
-    """--quick drops perf and the per-suite pass, which is why it says so in the summary —
+    """--quick drops the perf ceilings, which is why it says so in the summary —
     but it must not soften the verdict on what it DID run."""
     rc = _run_gate(failed=["ruff"], argv=("tools/gate.py", "--quick"))
     assert rc == 1
@@ -760,13 +811,54 @@ def test_the_citation_narrowing_works_in_both_directions():
         assert hits(version), f"real version reference MISSED: {version!r}"
 
 
+def _released_notes(root) -> set[str]:
+    """The versions whose notes the checkout at `root` must hold: 3.0.17, and every v3.x.y tag
+    from 3.0.17 on that is in HEAD's history (`git tag --merged HEAD`) and whose own tree
+    carries docs/releases/<tag>.md. A tag on another branch, or on a commit without its notes
+    (one made before the release commit), adds none; without git, only 3.0.17."""
+    import re as _re
+    import subprocess
+    try:
+        tags = subprocess.run(["git", "tag", "--merged", "HEAD", "-l", "v*"], cwd=root,
+                              capture_output=True, text=True).stdout.split()
+        tags = [t for t in tags if _re.fullmatch(r"v3\.\d+\.\d+", t)
+                and tuple(map(int, t[1:].split("."))) >= (3, 0, 17)]
+        carried = subprocess.run(["git", "cat-file", "--batch-check"], cwd=root,
+                                 input="".join(f"{t}:docs/releases/{t}.md\n" for t in tags),
+                                 capture_output=True, text=True).stdout.splitlines()
+    except FileNotFoundError:
+        tags, carried = [], []
+    return {"3.0.17"} | {t[1:] for t, line in zip(tags, carried)
+                         if not line.endswith(" missing")}
+
+
 def test_every_released_version_kept_its_notes():
     """The directory accumulates. A release whose notes vanished cannot be re-described, and
-    the publish tool would refuse to rebuild its tree."""
+    the publish tool would refuse to rebuild its tree. Every version `_released_notes` names
+    for the checkout has its docs/releases/v<version>.md."""
     import re as _re
     notes = os.listdir(os.path.join(_ROOT, "docs", "releases"))
     have = {m.group(1) for n in notes if (m := _re.fullmatch(r"v(\d+\.\d+\.\d+)\.md", n))}
-    assert "3.0.17" in have, f"docs/releases lost v3.0.17.md; present: {sorted(have)}"
+    missing = sorted(_released_notes(_ROOT) - have)
+    assert not missing, f"docs/releases lost the notes of {missing}; present: {sorted(have)}"
+
+
+def test_only_a_released_tag_in_the_checkouts_history_needs_its_notes(tmp_path, isolated_git):
+    """A tag in HEAD's history whose tree carries its notes is required; a tag on a side
+    branch is not, nor is one on a commit without its notes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_in(repo, "init", "-q", "-b", "main")
+    commit_files(repo, {"docs/releases/v3.0.18.md": "notes\n"}, "release 3.0.18")
+    git_in(repo, "tag", "v3.0.18")
+    commit_files(repo, {"a.txt": "a\n"}, "before 3.0.19's notes")
+    git_in(repo, "tag", "v3.0.19")
+    git_in(repo, "checkout", "-q", "-b", "side")
+    commit_files(repo, {"docs/releases/v3.1.0.md": "notes\n"}, "release 3.1.0")
+    git_in(repo, "tag", "v3.1.0")
+    assert _released_notes(repo) == {"3.0.17", "3.0.18", "3.1.0"}
+    git_in(repo, "checkout", "-q", "main")
+    assert _released_notes(repo) == {"3.0.17", "3.0.18"}
 
 
 def test_the_publish_tool_refuses_a_tree_with_no_notes(tmp_path):
@@ -899,43 +991,60 @@ def test_the_branch_message_is_derived_from_the_notes_verbatim():
 def test_only_runs_the_named_checks_and_never_reads_as_the_gate(capsys):
     """`--only` (what tests/run_all.sh calls) runs just what it names, in gate order, and its
     summary says it was partial: a bare PASS from a subset would read as the release gate."""
-    g = _load_tool("gate.py")
     ran = []
-    for name in _GATE_CHECKS:
-        setattr(g, name, lambda *a, _n=name, **k: ran.append(_n))
-    g._FAILED[:] = []
-    g._NOT_RUN[:] = []
-    saved = sys.argv
-    sys.argv = ["tools/gate.py", "--only", "per-suite,native"]
-    try:
-        rc = g.main()
-    finally:
-        sys.argv = saved
+    g = _stubbed_gate(lambda g, name: lambda *a, **k: ran.append(name))
+    rc = _gate_main(g, ["tools/gate.py", "--only", "suite,native"])
     out = capsys.readouterr().out
-    assert rc == 0 and ran == ["check_native", "check_per_suite"]
-    assert "a partial run, not the release gate" in out
+    assert rc == 0 and ran == ["check_native", "check_suite"]
+    assert "a partial run, not the gate" in out
 
 
 def test_only_refuses_an_unknown_check():
     g = _load_tool("gate.py")
     with pytest.raises(SystemExit, match="unknown: typo"):
-        g._selected(["tools/gate.py", "--only", "pytest,typo"])
+        g._selected(["tools/gate.py", "--only", "suite,typo"])
+
+
+def _ran_in(argv):
+    """The checks main() runs for `argv`, by the label each passes (check_pytest by its
+    marker), with every check stubbed."""
+    ran = []
+    g = _stubbed_gate(lambda g, name: lambda *a, **k: ran.append(
+        name if not a else f"{name}:{a[0]}"))
+    _gate_main(g, argv)
+    return ran
 
 
 def test_the_full_gate_does_not_run_the_opt_in_native_cpp_suite():
-    g = _load_tool("gate.py")
-    ran = []
-    for name in _GATE_CHECKS:
-        setattr(g, name, lambda *a, _n=name, **k: ran.append(_n))
-    g._FAILED[:] = []
-    g._NOT_RUN[:] = []
-    saved = sys.argv
-    sys.argv = ["tools/gate.py"]
-    try:
-        g.main()
-    finally:
-        sys.argv = saved
-    assert "check_native_cpp" not in ran and "check_per_suite" in ran
+    ran = _ran_in(["tools/gate.py"])
+    assert "check_native_cpp" not in ran and "check_suite" in ran
+
+
+def test_each_stage_runs_its_own_checks():
+    """docs/TESTING.md §1.1: the commit gate runs everything once, in parallel; a guest runs
+    no lint or type check (the same on every platform); only the release gate adds the
+    single-process run."""
+    commit = _ran_in(["tools/gate.py"])
+    guest = _ran_in(["tools/gate.py", "--guest"])
+    release = _ran_in(["tools/gate.py", "--release"])
+    assert "check_pytest:not perf" not in commit and "check_pytest:perf" in commit
+    assert {"check_tool:ruff", "check_mypy"} <= set(commit)
+    assert not {"check_tool:ruff", "check_mypy", "check_pytest:not perf"} & set(guest)
+    assert {"check_native", "check_suite", "check_pytest:perf", "check_leaks",
+            "check_screenshots"} <= set(guest)
+    assert set(release) == set(commit) | {"check_pytest:not perf", "check_native_coverage"}
+    on_guest = _ran_in(["tools/gate.py", "--release", "--on-guest"])
+    assert set(on_guest) == set(commit), "a guest leaves the single-process run and the native " \
+                                         "coverage to the development machine"
+
+
+def test_a_stage_over_its_budget_is_named_but_does_not_fail(capsys, monkeypatch):
+    g = _stubbed_gate()
+    clock = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(g.time, "monotonic", lambda: next(clock))
+    rc = _gate_main(g, ["tools/gate.py"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "OVER BUDGET: the commit gate took" in out, out
 
 
 def test_the_ratchet_reads_plain_output_and_refuses_output_it_cannot_read(monkeypatch):
@@ -978,6 +1087,26 @@ def _check_native_with_probe(monkeypatch, core_path, windows):
     g._FAILED[:] = []
     g.check_native()
     return list(g._FAILED)
+
+
+def test_the_gate_builds_the_core_without_the_callers_build_overrides(monkeypatch):
+    """$SWI3S_NATIVE_OUT and $SWI3S_NATIVE_FLAGS never reach the gate's build of the core."""
+    import subprocess
+    g = _load_tool("gate.py")
+    monkeypatch.setenv("SWI3S_NATIVE_OUT", "/elsewhere/swi3score.so")
+    monkeypatch.setenv("SWI3S_NATIVE_FLAGS", "-O1 -fprofile-instr-generate")
+    envs = []
+
+    def fake_run(cmd, **kw):
+        envs.append(kw.get("env"))
+        return subprocess.CompletedProcess(cmd, 1, "", "")
+    monkeypatch.setattr(g, "_run", fake_run)
+    g._FAILED[:] = []
+    g._NOT_RUN[:] = []
+    g.check_native()
+    assert envs and envs[0] is not None
+    assert not {"SWI3S_NATIVE_OUT", "SWI3S_NATIVE_FLAGS"} & set(envs[0])
+    assert envs[0]["PYTHON"] == sys.executable
 
 
 def test_the_native_probe_refuses_a_root_pyd_shadowing_the_windows_build(monkeypatch):
@@ -1062,13 +1191,115 @@ def test_the_publish_leak_check_fails_a_scan_that_read_fewer_files_than_ship(
         "the leak scan read 3 of the 4 files in the assembled tree; every file in it ships"]
 
 
+class _FakePopen:
+    """A pytest child that reports `out` and `code`, or hangs past the timeout."""
+    killed: list = []
+
+    def __init__(self, out="", code=0, hang=False):
+        self.out, self.returncode, self.hang, self.pid = out, code, hang, 4242
+
+    def communicate(self, timeout=None):
+        if self.hang and not _FakePopen.killed:
+            import subprocess
+            raise subprocess.TimeoutExpired("pytest", timeout)
+        return self.out, ""
+
+    def kill(self):
+        pass
+
+
+def test_check_6_names_the_failing_tests_and_bounds_the_suite(tmp_path, monkeypatch, capsys):
+    pt = _load_tool("publish_tree.py")
+    out = "x\nFAILED tests/test_a.py::test_one - boom\nERROR tests/test_b.py\n2 failed in 1s\n"
+    _FakePopen.killed = []
+    monkeypatch.setattr(pt, "_kill_tree", lambda p: _FakePopen.killed.append(p))
+
+    monkeypatch.setattr(pt.subprocess, "Popen", lambda cmd, **kw: _FakePopen(out, 1))
+    got = pt.run_assembled_suite(str(tmp_path), {}, timeout=5)
+    shown = capsys.readouterr().out
+    assert got and "FAILED" in got[0]
+    assert "FAILED tests/test_a.py::test_one" in shown and "ERROR tests/test_b.py" in shown
+    assert not _FakePopen.killed
+
+    monkeypatch.setattr(pt.subprocess, "Popen", lambda cmd, **kw: _FakePopen(hang=True))
+    assert "did not finish within 5 s" in pt.run_assembled_suite(str(tmp_path), {}, timeout=5)[0]
+    assert len(_FakePopen.killed) == 1
+
+    monkeypatch.setattr(pt.subprocess, "Popen",
+                        lambda cmd, **kw: _FakePopen("1 passed\n", 0))
+    assert pt.run_assembled_suite(str(tmp_path), {}) == []
+
+
+def _process_gone(pid):
+    """True when `pid` does not exist or is a zombie nothing has reaped (Linux, /proc)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
+def test_check_6_timeout_kills_the_processes_the_suite_started(tmp_path, monkeypatch):
+    """A timed-out suite takes its whole process group with it, not only pytest."""
+    import time
+    pt = _load_tool("publish_tree.py")
+    pidfile = tmp_path / "child.pid"
+    (tmp_path / "test_hang.py").write_text(
+        "import subprocess, time\n"
+        "def test_hang():\n"
+        "    p = subprocess.Popen(['sleep', '120'])\n"
+        f"    open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "    time.sleep(120)\n", encoding="utf-8")
+    real_popen = pt.subprocess.Popen
+
+    class _AfterStart(real_popen):
+        """communicate() waits for the suite to start its child before the time limit runs."""
+        def communicate(self, input=None, timeout=None):
+            deadline = time.monotonic() + 120
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.2)
+            return super().communicate(input, timeout=2)
+
+    monkeypatch.setattr(pt.subprocess, "Popen", _AfterStart)
+    got = pt.run_assembled_suite(str(tmp_path), dict(os.environ), timeout=2)
+    assert "did not finish" in got[0]
+    pid = int(pidfile.read_text(encoding="utf-8"))
+    for _ in range(50):
+        if _process_gone(pid):
+            return
+        time.sleep(0.1)
+    os.kill(pid, 9)
+    raise AssertionError("the suite's child process outlived the timeout")
+
+
+def test_the_build_overrides_name_every_variable_build_local_reads():
+    """gate.py and publish_tree.py remove the same variables, those of build_overrides.py, and
+    they are all of the SWI3S_* ones native/build_local.sh reads from the caller (the
+    toolchain selectors are kept)."""
+    gate, pt = _load_tool("gate.py"), _load_tool("publish_tree.py")
+    assert gate._BUILD_OVERRIDES == pt._BUILD_OVERRIDES
+    assert gate._BUILD_OVERRIDES == _load_tool("build_overrides.py").BUILD_OVERRIDES
+    with open(os.path.join(_ROOT, "native", "build_local.sh"), encoding="utf-8") as f:
+        read = set(re.findall(r"\$\{?(SWI3S_\w+)", f.read()))
+    assert read == set(gate._BUILD_OVERRIDES)
+
+
 def test_check_6_compiles_the_core_from_the_assembled_trees_own_sources(tmp_path, monkeypatch):
     """The core the suite imports is built from a copy of the assembled tree's native/, in a
-    work directory outside it, never copied from beside this checkout; a failed build is a
-    problem, not a fallback."""
+    work directory outside it, never copied from beside this checkout, with no
+    $SWI3S_NATIVE_OUT or $SWI3S_NATIVE_FLAGS from the caller; a failed build is a problem,
+    not a fallback."""
     import subprocess
     pt = _load_tool("publish_tree.py")
     monkeypatch.setattr(pt, "_WINDOWS", False)
+    monkeypatch.setenv("SWI3S_NATIVE_OUT", str(tmp_path / "elsewhere.so"))
+    monkeypatch.setenv("SWI3S_NATIVE_FLAGS", "-O1 -fprofile-instr-generate")
     dest, work = tmp_path / "dest", tmp_path / "work"
     (dest / "native").mkdir(parents=True)
     work.mkdir()
@@ -1077,6 +1308,9 @@ def test_check_6_compiles_the_core_from_the_assembled_trees_own_sources(tmp_path
 
     def fake_build(cmd, **kw):
         calls.append(cmd)
+        # A caller's output path or flags never reach the build of the published sources.
+        assert not {"SWI3S_NATIVE_OUT", "SWI3S_NATIVE_FLAGS"} & set(kw["env"]), kw["env"]
+        assert kw["env"]["PYTHON"] == sys.executable
         script = pathlib.Path(cmd[-1])
         assert script.read_text(encoding="utf-8") == "# published rev\n"
         (script.parent.parent / "swi3score.cpython-312-test.so").write_bytes(b"core")
@@ -1132,23 +1366,49 @@ def test_a_symlink_to_a_directory_is_counted_and_checked(tmp_path, monkeypatch):
     assert pt.check_dangling(str(dest)) == ["docs/tier"]
 
 
-def test_the_publish_tree_is_built_from_head_and_says_so(tmp_path, monkeypatch):
+def test_the_publish_tree_is_built_from_head_and_says_so(tmp_path, monkeypatch, isolated_git):
     """With no sha the tree is HEAD's: the usage says so, and uncommitted changes to tracked
     files are reported because they are not in it."""
-    import subprocess
     pt = _load_tool("publish_tree.py")
     assert "from HEAD: uncommitted changes are NOT included" in pt.__doc__
     assert "from the working tree" not in pt.__doc__
     repo = tmp_path / "repo"
     repo.mkdir()
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    (repo / "a.md").write_text("one\n", encoding="utf-8")
-    for cmd in (["git", "init", "-q"], ["git", "add", "a.md"],
-                ["git", "commit", "-q", "-m", "a"]):
-        subprocess.run(cmd, cwd=repo, check=True, env=env, capture_output=True)
+    git_in(repo, "init", "-q")
+    commit_files(repo, {"a.md": "one\n"}, "a")
     monkeypatch.setattr(pt, "_ROOT", str(repo))
     (repo / "untracked.md").write_text("x\n", encoding="utf-8")
     assert pt.uncommitted_changes() == []
     (repo / "a.md").write_text("two\n", encoding="utf-8")
     assert [ln[3:] for ln in pt.uncommitted_changes()] == ["a.md"]
+
+
+def test_check_6_names_the_failing_tests_when_the_caller_forces_colour(tmp_path, capsys):
+    """FORCE_COLOR in the caller's environment does not hide the FAILED lines."""
+    pt = _load_tool("publish_tree.py")
+    (tmp_path / "test_x.py").write_text("def test_a():\n    assert 0\n", encoding="utf-8")
+    env = dict(os.environ, FORCE_COLOR="1", CLICOLOR_FORCE="1")
+    got = pt.run_assembled_suite(str(tmp_path), env, timeout=120)
+    assert got and "FAILED" in got[0]
+    assert "    FAILED test_x.py::test_a" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("tool", ["gate.py", "publish_tree.py"])
+def test_a_character_the_console_cannot_encode_is_printed_not_raised(tool):
+    """The gate and the publish tool echo test output, which can hold characters a cp1252
+    console or log cannot encode ('▸'); each prints them as '?' and carries on."""
+    import subprocess
+    path = os.path.join(_ROOT, "tools", tool)
+    child = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('tool_under_test', {path!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "mod._tolerant_output()\n"
+        "print('Open Capture \\u25b8 From')\n"
+        "print('Open Capture \\u25b8 From', file=sys.stderr)\n")
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+    done = subprocess.run([sys.executable, "-c", child], capture_output=True, env=env,
+                          cwd=_ROOT, timeout=120)
+    assert done.returncode == 0, done.stderr.decode("cp1252", "replace")
+    assert done.stdout.decode("cp1252").strip() == "Open Capture ? From"

@@ -1,9 +1,7 @@
-// Streaming SWI3S PHY2 decoder over an ISampleSource, with the pipeline of the
-// analyzer plugin's SwI3sAnalyzer::WorkerThread and no SDK dependency: align to
-// Column 0, measure the UI rate + auto-detect the column count over a bounded
-// leading window, then run the NRZS -> 8b/10b -> command transport ->
-// register-snoop -> SSP/commit -> payload pipeline, collecting lightweight result
-// records.
+// Streaming SWI3S (PHY1, PHY2, PHY3) decoder over an ISampleSource, with no SDK
+// dependency: align to Column 0, measure the UI rate + auto-detect the column count over a
+// bounded leading window, then run the NRZS -> 8b/10b -> command transport ->
+// register-snoop -> SSP/commit -> payload pipeline, collecting lightweight result records.
 
 #ifndef SWI3SCORE_DECODER_H
 #define SWI3SCORE_DECODER_H
@@ -35,7 +33,9 @@ struct DecoderSettings
     // last column = Sync0 are framing (no port claims them). forcedColumnCount seeds the
     // Safe-Lock count; snoop drives changes. FBCSE (default) leaves dlv=false.
     bool dlv = false;
-    int  cdsHorizontalStart = 0;  // CDS column for DLV (e.g. 2 in Safe-Lock-4); 0 = FBCSE
+    int  cdsHorizontalStart = 0;  // DLV CDS column (CDS_HorizontalStart); outside 1..columns-2
+                                  // (0 included) the decode reads at the reset value 2.
+                                  // Ignored for FBCSE.
     std::string configCsvPath;    // optional visualizer CSV (mid-stream mode)
     // Per-dataport scrambler override: (device, dp, on). Present entries force
     // ScramblerEn for that (device, dp) regardless of the snooped/CSV config;
@@ -60,7 +60,8 @@ struct DecoderSettings
     // override the grid + register map show also drives the audio decode. Section-
     // scoped because a capture can change config (column count) mid-stream; keyed by
     // the section's index in segments() (stable — overrides don't move wire-detected
-    // section boundaries). Applied like a write + commit-all (see applyRegisterOverrides).
+    // section boundaries). Each override forces only the rank its address names, with no commit
+    // (see applyRegisterOverrides).
     std::vector<std::tuple<int, int, std::uint32_t, int>> registerOverrides;
     // Region-scoped forced column count: (section_index, column_count) pairs. Pins ONE
     // config section's bus geometry, overriding both the snooped NumColumns and the blind
@@ -104,10 +105,13 @@ struct DecoderSettings
     // Clock pauses with no bring-up after them: the first clock edge after each stop. Audio
     // mode never pauses its clock, so the analyzer lost samples or the capture was joined
     // there, and the bus may or may not carry on in phase. At each the decode checks the
-    // Column-0 phase of a fresh window at the current column count: in phase, it decodes on
-    // through as if nothing happened; out of phase (UIs were lost), it re-frames there, its
-    // payload engine reconfigured on the new phase, in a new segment that is no restart
-    // (geometry and registers kept). Any order; a restart point at the same sample wins.
+    // Column-0 phase of a fresh window: the window's column count is detected afresh (a
+    // section pin outranks it, a config CSV's count is kept, and a window too short to
+    // read keeps the current one) and the phase is checked against it. In phase, the
+    // decode goes on through as if nothing happened; out of phase (UIs were lost), it
+    // re-frames there, its payload engine reconfigured on the new phase, in a new segment
+    // that is no restart. Registers are kept. Any order; a restart point at the same
+    // sample wins.
     // FBCSE only: ignored when `dlv`. A DLV pause is a stretch with no row edges, and after
     // it the first rising edge need not open a row, so its row phase would have to be found
     // from the edges with no bring-up to anchor it.
@@ -127,6 +131,7 @@ struct CommandRec
 {
     std::string command;          // CommandName() e.g. "WriteA32", "Ping", "SSCR"
     std::string phase;            // PhaseName()
+    bool headerValid = false;     // all six Phase Header tokens read, PhaseID defined
     std::uint16_t deviceMask = 0;
     bool hasManagerPacket = false;
     std::uint8_t packetLength = 0;   // Manager Packet bytes (phase-header field)
@@ -143,7 +148,7 @@ struct CommandRec
     std::uint8_t rowDelay = 0;        // SSP Row_Delay (anchors the payload interval)
     std::uint16_t groupMask = 0;
     bool hasPingStatus = false;
-    int pingStatus[12] = {};          // default-initialised
+    int pingStatus[swi3s::kMaxPeripherals] = {};   // default-initialised
     bool hasReadData = false;
     std::vector<std::uint8_t> readData;
     bool readDataCrcValid = false;
@@ -155,6 +160,19 @@ struct CommandRec
     // 1 Row, i.e. the Interval register == 0) — otherwise it can land mid-interval and
     // desynchronize payload framing. See Decoder::feed's EnableCh_CURR check.
     bool enablechCurrError = false;
+    // PROGRAMMING ERROR, not a protocol error: this WriteA32 changed a single-ranked
+    // data-port control register — SampleSizeGrouping (0x09), PortControl (0x0B:
+    // ScramblerEn, PortDirection, PortMode), SkippingNumerator (0x0C-0x0D) or FlowControl
+    // (0x0E: FlowMode, FlowControlDelay, the FCP scrambler) — of a port that was running
+    // (a channel enabled in the committed rank). These take effect at once, so they are set
+    // while a port's channels are disabled. A write of the value already there changes
+    // nothing and is not flagged. See Decoder::changesRunningPortControl.
+    bool runningPortWriteError = false;
+    // PROGRAMMING ERROR, not a protocol error: this CRC-valid WriteA32 selected one device
+    // and covered a read-only byte (CRegisterModel::IsReadOnly: a register whose fields are
+    // all RO, or a CDS _CURR alias). The write leaves that byte unchanged. See
+    // Decoder::writesReadOnly.
+    bool readOnlyWriteError = false;
     // ERROR: this command generated an SSP (SSCR / SSPA) that landed while a Payload
     // Interval Skipping port was PART-WAY through its skip pattern — the accumulated
     // effect of the SkippingNumerator was not already 0, which Section 9.1.6.2.1 calls an
@@ -191,14 +209,15 @@ struct GridCell
     int dp = -1;
     int device = -1;         // owning peripheral (Device Mask bit), -1 if none
     int channel = -1;
-    int slot = 0;            // SwI3sSlot: 0 Empty,1 Data,2 TxPresent,3/4 Guard,5 Tail,6 Drq
+    int slot = 0;            // SwI3sSlot: 0 Empty,1 Data,2 TxPresent,3/4 Guard,5 Tail,6 Drq,
+                             // 7 S0, 8 S1 (DLV system cells)
     bool sampleHere = false;
     bool isCds = false;
     bool isSource = false;   // true = source half (top), false = sink half (bottom)
     int sample = 0;          // sample-in-group ordinal (for the S<sample> label)
     int bit = 0;             // numeric bit weight within the sample (MSB..0)
     bool scramblerEn = false;  // owning data port's ScramblerEn (scrambler indicator)
-    int portMode = 0;        // owning data port's PortMode (0 normal, 2 ones, 3 zeros)
+    int portMode = 0;        // owning data port's PortMode (0 Normal, 2 Test0, 3 Test1)
 };
 
 // One decoded CDS 8b/10b symbol (for the symbol viewer).
@@ -208,7 +227,8 @@ struct SymbolRec
     std::uint64_t endSample = 0;
     long row = 0;                // SWI3S bus row (Column-0 index) of the symbol start
     std::uint16_t raw = 0;       // 10-bit codeword (a@bit9 .. j@bit0)
-    int kind = 0;                // 0 invalid, 1 comma, 2 robust token, 3 D-code, 4 K-code
+    int kind = 0;                // 0 invalid, 1 comma, 2 robust token, 3 D-code, 4 K-code,
+                                 // 5 no response (undriven 0x3FF)
     int value = -1;              // D/K byte, or robust-token number, else -1
     bool aligned = false;
 };
@@ -227,6 +247,8 @@ struct SegmentRec
     long          rowBase = 0;        // cumulative bus row at the segment start
     bool          restart = false;    // opened by a later link bring-up (restartPoints)
     bool          coldStart = false;  // ...and that bring-up was a Cold Start
+    int           cdsColumn = 0;      // the CDS column (startUi is that column's UI): 0 for
+                                      // FBCSE; DLV's CDS_HorizontalStart in this segment
 };
 
 class Decoder
@@ -235,6 +257,8 @@ public:
     Decoder(ISampleSource& src, const DecoderSettings& settings)
         : mSrc(src), mSettings(settings) {}
 
+    // Decodes the whole source. Runs once per Decoder: a second call throws
+    // std::logic_error (build a new Decoder over a fresh source to decode again).
     void run();
 
     const std::vector<CommandRec>& commands() const { return mCommands; }
@@ -270,11 +294,20 @@ public:
     // authoritative, correctly-tracked row boundaries even across resyncs — unlike the
     // DLV sample source's internal row counter, which can diverge after a re-hunt.
     const std::vector<std::uint64_t>& rowSyncSamples() const { return mRowSyncSamples; }
+    // The window-start samples where a known column count (forced, pinned, from a config
+    // CSV, or a restart's Safe-Lock count) was framed with no CRC-valid command in the
+    // window to place Column 0: Column 0 is then taken at the window's first UI, the UI
+    // after the alignment edge. A clock resume (resumeAt) records one only when it changes
+    // the column count; at an unchanged count it keeps the current phase and records none.
+    const std::vector<std::uint64_t>& guessedFramingSamples() const {
+        return mGuessedFramingSamples;
+    }
     // Per-data-bit sample points (populated only when settings.collectBitSamples).
     const std::vector<BitSample>& bitSamples() const { return mEngine.bitSamples(); }
 
     // Flow-control DRQ<->TxPresent handshake validation results (SWI3S §14.2.2
-    // {ASW5205}), accumulated over the decode. checked/fails/drqBits; 0 fails = clean.
+    // {ASW5205}), accumulated since the last full Configure() (each SSCR-driven
+    // reconfigure restarts the accounting). checked/fails/drqBits; 0 fails = clean.
     const CPayloadEngine::FlowControlStats& flowControlStats() const {
         return mEngine.flowControlStats();
     }
@@ -314,13 +347,11 @@ public:
     // ---- decode progress (poll from another thread while run() is in flight) ----
     // run() is blocking and typically driven from a worker thread (bindings.cpp releases
     // the GIL across it) so the GUI thread can poll these for a progress dialog. Both are
-    // plain uint64 members incremented/set from run()'s thread; reads from another thread
-    // are safe for this coarse a readout WITHOUT a lock — each is written with a single
-    // aligned store (so a concurrent read never sees a torn value), progressUis() is
-    // monotonically non-decreasing for the life of one run(), and a stale/one-UI-behind
-    // read only makes the reported percentage briefly lag. Do not add finer
-    // synchronization here; that would defeat the point
-    // (a per-UI atomic/lock would cost more than the decode step itself).
+    // relaxed atomics with one writer (run()'s thread): a store is a plain load, add and
+    // store, not an atomic read-modify-write, so the per-UI cost is a plain increment, a
+    // concurrent read never sees a torn value, progressUis() is monotonically
+    // non-decreasing for the life of one run(), and a stale read only makes the reported
+    // percentage briefly lag.
     std::uint64_t progressUis() const { return mProgressUis; }
     // Total UI count for this run, or 0 if the source can't report one (pure streaming)
     // — callers should treat 0 as "unknown", not "100% done". Set from the source's
@@ -337,12 +368,25 @@ public:
         const double f = static_cast<double>(mProgressUis) / static_cast<double>(mTotalUis);
         return (f < 1.0) ? f : 1.0;
     }
-    // Ask an in-flight run() to stop, from another thread: it returns within ~64k UIs,
-    // with what it decoded so far, and stopped() says so. For a caller watching memory
-    // while the decode grows (the audio it produces cannot be predicted before decoding).
-    // Atomic, unlike the progress counters, because this one changes control flow.
+    // Ask an in-flight run() to stop, from another thread: it returns with what it decoded
+    // so far, and stopped() says so. For a caller watching memory while the decode grows
+    // (the audio it produces cannot be predicted before decoding).
     void requestStop() { mStopRequested.store(true, std::memory_order_relaxed); }
-    bool stopped() const { return mStopped; }
+    bool stopped() const { return mStopped.load(std::memory_order_relaxed); }
+
+    // Cancel an in-flight run(), from another thread: it returns promptly, and cancelled()
+    // says so. What it decoded before returning is incomplete and is for the caller to
+    // discard. A cancel made before run() makes run() return before reading the source.
+    //
+    // Both requests are atomic flags run() polls every kHaltPollUis UIs wherever it reads
+    // the source (the alignment hunt, every detect window, an inactive stretch, the
+    // stream) and once before it starts, so either one ends the decode within
+    // kHaltPollUis UIs of reading plus the window already read (at most one detect
+    // window, kDetectWindow UIs, being fed and its column count detected). A request
+    // that arrives after the last poll leaves the run complete, and neither flag is set.
+    void cancel() { mCancelRequested.store(true, std::memory_order_relaxed); }
+    bool cancelled() const { return mCancelled.load(std::memory_order_relaxed); }
+    static constexpr std::uint32_t kHaltPollUis = 4096;
 
 private:
     void feed(BitState level, std::uint64_t sampleNumber, std::uint64_t srcUi);
@@ -374,9 +418,11 @@ private:
     // a start sequence), or UINT64_MAX when none is pending.
     void updateNextStop();
     // Read the next UI to decode. Returns false at the end of the source (`crossing`
-    // None) or at a UI at or past the next restart point (`crossing` says whether it was
-    // a rising edge); that UI is the restart's. UIs in the inactive stretch before it are
-    // consumed without being decoded (goInactive).
+    // None), once a stop or cancel is seen (`crossing` None, mHalted set), or at a UI at or
+    // past the next restart point (`crossing` says whether it was a rising edge); that UI
+    // is the restart's. UIs in the inactive stretch before it are consumed without being
+    // decoded (goInactive). A caller checks mHalted before reading `crossing` None as the
+    // end of the source.
     bool readUi(bool& rising, bool& dataHigh, std::uint64_t& sn, Crossing& crossing);
     // The Link stopped at source UI `ui` (the first UI past the next restart's
     // inactiveFrom): from here to the restart nothing is decoded. A recovered clock (DLV)
@@ -389,7 +435,9 @@ private:
     void stopPorts();
     // Read UIs to the next rising clock edge (Column 0 opens on one). `aligned` says
     // whether it was found; if not, the return value says whether a restart point was.
-    Crossing alignToRising(bool& aligned);
+    // `levels` and `samples`, when given, receive every UI read, the rising one included.
+    Crossing alignToRising(bool& aligned, std::vector<bool>* levels = nullptr,
+                           std::vector<std::uint64_t>* samples = nullptr);
     // A later link bring-up (DecoderSettings::restartPoints): reset the registers on a
     // Cold Start and mark the segment it opens, then re-align, re-frame, reconfigure the
     // payload engine on the new Column-0 phase and feed a fresh window. `rising` is
@@ -411,8 +459,9 @@ private:
     void takeRestarts(Crossing crossing);
     // Read up to `n` UIs into levels/samples through readUi, stopping at a UI at or past
     // the next restart point, which is the restart's and not the window's. Every window
-    // read goes through here: the leading one is 262144 UIs, which a short first session
-    // fits inside whole.
+    // read goes through here: the leading one is 262144 UIs (1024 for DLV), which a short
+    // first session fits inside whole. A stop or cancel ends the read early (mHalted set);
+    // the partial window is then not fed.
     Crossing readWindow(int n, std::vector<bool>& levels, std::vector<std::uint64_t>& samples);
     // The bit-level framing reset shared by run(), resync() and restartAt(): NRZS phase,
     // comma hunt, Column-0 phase `startColumn`, pending commits, the watchdog count, and a
@@ -428,13 +477,19 @@ private:
     // was (re)configured; false if it was unchanged (so the caller skips a spurious config
     // epoch — e.g. a single-ranked write that rewrote a register with the same value).
     // `force` reconfigures an unchanged config too: a restart puts every port on the new
-    // Column-0 phase.
+    // Column-0 phase. `atCommit` marks a commit (SSCR or DSCR) on the wire: a full Configure
+    // there carries the DRQ history of a port that stays enabled
+    // (CPayloadEngine::Configure's keepDrqHistory); every other full Configure starts it
+    // afresh.
     bool maybeConfigureFromSnoop(int columnCount, int sectionIndex, bool preservePhase = false,
-                                 bool force = false);
+                                 bool force = false, bool atCommit = false);
     void applyScramblerOverrides();   // force per-(device,dp) ScramblerEn from settings
     // Fold what-if register overrides for config section `sectionIndex` into `regs`
-    // (ForceWrite + Commit-all), so the snooped config the audio engine uses matches
-    // the grid/register-map for that section. No-op if none match.
+    // as the grid and register map apply them, so the snooped config the audio engine
+    // uses matches them for that section. Each override forces only the rank its address
+    // names (a _CURR alias or a single-ranked register sets _CURR; a _NEXT base stages
+    // _NEXT) and commits nothing, so only a _CURR override changes the decoded config.
+    // No-op if none match.
     void applyRegisterOverrides(CRegisterModel& regs, int sectionIndex) const;
     // Region-scoped forced column count for `sectionIndex`, or 0 if none/out of range
     // (see DecoderSettings::forcedColumnSections).
@@ -443,6 +498,11 @@ private:
     int forcedColumnCount() const;
     void updateRowRateFromCapture(int columnCount);
     static int firstSelectedDevice(std::uint16_t mask);
+    // Does this CRC-valid WriteA32 change a single-ranked control register of a running
+    // port on any device it addresses? Read BEFORE the write is applied.
+    bool changesRunningPortControl(const SwI3sCommand& cmd) const;
+    // Does this WriteA32, selecting one device, cover a read-only byte?
+    static bool writesReadOnly(const SwI3sCommand& cmd);
 
     // ---- windowed bit-sample reconstruction (see bitSamplesInWindow) ----
     // A transport-phase event recorded during run(): a payload-engine (re)Configure or
@@ -486,6 +546,10 @@ private:
     bool   mHaveCsv = false;
     bool   mDecodeAudio = true;
     int    mColumnCount = 2;
+    // The column the CDS is read at: 0 for FBCSE. DLV: settings.cdsHorizontalStart when it
+    // lies in 1..columns-2, else 2 (the register's reset value); a committed
+    // CDS_HorizontalStart replaces it, and a DLV Cold Start restores it.
+    int    mCdsColumn = 0;
     int    mColumn = 0;
     std::uint64_t mRowCounter = 0;
     long   mPendingSspRow = -1;
@@ -507,15 +571,40 @@ private:
     long   mSspSyncRow = -1;
     double mMeasuredUiRateHz = 0.0;
 
-    // Decode progress (see progressUis()/totalUis()/progress()): a plain counter bumped
-    // once per UI in feed() (a single increment — negligible next to the decode work it
-    // sits beside) and a total read from the source's TotalUiCount() (0 if the source
-    // can't report one) at the start of run() and refreshed as totalUis() describes. No
-    // lock: see progressUis()'s comment for why a coarse cross-thread read is fine here.
-    std::uint64_t mProgressUis = 0;
-    std::uint64_t mTotalUis = 0;
+    // Decode progress (see progressUis()/totalUis()/progress()): a counter bumped once per
+    // UI in feed() and a total read from the source's TotalUiCount() (0 if the source
+    // can't report one) at the start of run() and refreshed as totalUis() describes.
+    // Written by run()'s thread only, read by any.
+    class RelaxedCounter {
+    public:
+        RelaxedCounter& operator=(std::uint64_t x) { v.store(x, std::memory_order_relaxed); return *this; }
+        RelaxedCounter& operator++() { v.store(v.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); return *this; }
+        std::uint64_t load() const { return v.load(std::memory_order_relaxed); }
+        operator std::uint64_t() const { return load(); }
+    private:
+        std::atomic<std::uint64_t> v{0};
+    };
+    RelaxedCounter mProgressUis;
+    RelaxedCounter mTotalUis;
+    bool mHasRun = false;                  // run() was called (a second call throws)
     std::atomic<bool> mStopRequested{false};
-    bool mStopped = false;           // run() returned early because of requestStop()
+    std::atomic<bool> mCancelRequested{false};
+    std::atomic<bool> mStopped{false};     // run() returned early because of requestStop()
+    std::atomic<bool> mCancelled{false};   // run() returned early because of cancel()
+    // Halt polling (see cancel()): once a poll sees a request, mHalted holds, every source
+    // read in run() reports the source ended and the stream loop exits.
+    bool mHalted = false;
+    std::uint32_t mPollCountdown = kHaltPollUis;
+    // True once a stop or cancel has been seen; polls the flags every kHaltPollUis calls.
+    bool halted()
+    {
+        if (mHalted) return true;
+        if (--mPollCountdown != 0) return false;
+        mPollCountdown = kHaltPollUis;
+        return pollHalt();
+    }
+    // Read both request flags now, recording which one ended the run.
+    bool pollHalt();
 
     // Continuous UI-rate tracking: the forwarded-clock rate can change mid-capture
     // (e.g. a cold-start slow preamble that speeds up 4x to operational rate) WITHOUT
@@ -546,6 +635,7 @@ private:
     // Every Column-0 UI's sample (row-start / Row Sync Point), from the decoder's own
     // framing — see rowSyncSamples().
     std::vector<std::uint64_t> mRowSyncSamples;
+    std::vector<std::uint64_t> mGuessedFramingSamples;   // see guessedFramingSamples()
 
     // Decode segments (one per column count or link restart); bus rows are continuous
     // across them.
@@ -577,6 +667,11 @@ private:
     bool                    mAudioReleased = false;   // see releaseAudio()
 };
 
+// A decoded 8b/10b symbol's SymbolRec kind and value: the undriven 0x3FF is kind 5, a
+// comma kind 1, a (near) Robust Token kind 2 with its token number, a K-code kind 4 and a
+// D-code kind 3 with the byte, anything else kind 0. Values without a number are -1.
+void classifySymbol(const C8b10bDecoder::Symbol& sym, int& kind, int& value);
+
 // Re-decode the Control Data Stream into classified 8b/10b symbols over a fresh
 // source (the symbol viewer's data source). Decodes up to `maxSymbols` (0 =
 // unbounded). If `startUi` > 0 and the source is seekable, it jumps there first
@@ -588,17 +683,30 @@ private:
 // `rowBase` UI) and `rowBase`; each symbol's row is then
 // rowBase + (symbolUi - rowOriginUi) / columnCount. Leave rowOriginUi at the
 // sentinel (default) for the standalone, single-segment behaviour.
+//
+// `hubDepths` gives Device i's hub depth at index i (absent = 0) for Devices
+// 0..kMaxPeripherals-1; a later entry is ignored and a negative depth reads as 0. With any
+// of those depths above 0 the symbols are framed by a command parser with them, as the
+// decode frames them: the 2*depth gap bits before a delayed device's response token belong
+// to no symbol, and the token is framed after them. With none the CDS is framed by a
+// free-running 8b/10b decoder that realigns on every comma.
 std::vector<SymbolRec> decodeSymbols(ISampleSource& src, int columnCount,
                                      int maxSymbols = 0, std::uint64_t startUi = 0,
                                      std::uint64_t rowOriginUi = ~0ull, long rowBase = 0,
                                      std::uint64_t endUi = 0, bool dlv = false,
-                                     int cdsColumn = swi3s::kCdsColumn);
+                                     int cdsColumn = swi3s::kCdsColumn,
+                                     const std::vector<int>& hubDepths = {});
+
+// The most rows layoutGrid lays out.
+static const int kMaxGridRows = 65536;
 
 // Lay out the 2D bus grid for a config (shared by the live decode and what-if).
 // PHY3 (DLV) differs from FBCSE framing: the CDS bit sits at `cdsColumn`
 // (CDS_HorizontalStart, e.g. 2 for Safe-Lock-4) instead of Column 0, and every
 // row opens with Sync1 (S1, Column 0) and closes with Sync0 (S0, last column) —
 // pass `dlv=true` to emit those system cells. FBCSE keeps CDS at Column 0, no S0/S1.
+// `rows` is held to kMaxGridRows and `columnCount` to kMinColumnCount..kMaxColumnCount
+// (0 or less reads as the cold-start count).
 std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int rows,
                                  bool dlv = false, int cdsColumn = swi3s::kCdsColumn);
 
@@ -636,7 +744,8 @@ struct CommandReplay
 // the real register model (faithful _NEXT/_CURR staging + commit-group promotion).
 // forceColumns >= kMinColumnCount overrides the derived width; 0 = derive.
 // `overrides` are what-if forced writes (device, address, value) folded in after the
-// replay (ForceWrite + Commit-all) — the SAME application the audio decode uses, so
+// replay, each forcing only the rank its address names with no commit — the SAME
+// application the audio decode uses, so
 // grid and audio agree. Already filtered to the cursor's config section by the caller.
 std::vector<GridCell> gridFromCommands(const std::vector<CommandReplay>& cmds,
                                        int rows, int forceColumns = 0,
@@ -653,10 +762,11 @@ SwI3sConfig configFromCommands(const std::vector<CommandReplay>& cmds, int force
 // gridFromCommands, PLUS bus reads overlaid (READ-tagged) — the register map's value
 // + provenance source, so register map / grid / audio share one decode authority.
 // Each tuple is (device, addr, cur, has_cur, cur_src, next, has_next, next_src) where
-// *_src is CRegisterModel::Source (1 written, 2 read). Reads are folded in HERE only
-// (never in gridFromCommands), so they colour the register map without perturbing the
-// grid/audio config. `overrides` are (device, address, value), pre-filtered to the
-// cursor's config section.
+// *_src is CRegisterModel::Source (1 written, 2 read). Writes, commits and reads apply in
+// command order, then the overrides are forced (an override wins over any read). Reads are
+// folded in HERE only (never in gridFromCommands), so they colour the register map without
+// perturbing the grid/audio config. `overrides` are (device, address, value), pre-filtered
+// to the cursor's config section.
 std::vector<std::tuple<int, std::uint32_t, std::uint8_t, bool, std::uint8_t,
                        std::uint8_t, bool, std::uint8_t>>
 registersFromCommands(const std::vector<CommandReplay>& cmds,

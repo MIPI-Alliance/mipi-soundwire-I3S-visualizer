@@ -20,7 +20,6 @@ _GROUPS = [
     (WARNING, "Warnings", "#F57C00"),      # orange - warning
     (INFO, "Informational", "#1976D2"),    # blue - informational
 ]
-_OK_COLOR = "#388E3C"                       # green - no errors
 
 
 class _Section(QWidget):
@@ -63,6 +62,7 @@ class _Section(QWidget):
         while self._cl.count():
             w = self._cl.takeAt(0).widget()
             if w is not None:
+                w.setParent(None)           # gone from the pane now, freed on the next pass
                 w.deleteLater()
         self._items = items
         for text, cells in items:
@@ -123,7 +123,7 @@ class NotificationsPanel(QWidget):
             self._host_l.addWidget(s)
         self._ok = QLabel("No issues detected")
         self._ok.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        self._ok.setStyleSheet(f"color:{_OK_COLOR};")
+        self._ok.setStyleSheet(f"color:{VizTheme.OK_GREEN};")
         self._host_l.addWidget(self._ok)
         self._host_l.addStretch(1)
         scroll.setWidget(host)
@@ -150,6 +150,7 @@ class NotificationsPanel(QWidget):
             f"border-radius:{VizTheme.CORNER_RADIUS}px; background:{VizTheme.FRAME_BG}; }}")
         self._scroll.setStyleSheet("QScrollArea { border:none; background:transparent; }"
                                    + scrollbar_qss())
+        self._ok.setStyleSheet(f"color:{VizTheme.OK_GREEN};")
         for s in self._sections.values():
             s.retheme()
 

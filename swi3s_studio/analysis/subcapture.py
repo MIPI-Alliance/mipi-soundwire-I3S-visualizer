@@ -104,13 +104,17 @@ def _levels_at(edges: np.ndarray, initial: bool, points: np.ndarray) -> np.ndarr
 def capture_to_symbols(capture) -> SymbolSequence:
     """Reduce `capture` to its :class:`SymbolSequence`: the data-line level (0/1) at
     each clock edge, in order — the per-UI data bit the clock samples. One searchsorted,
-    O(N), no sort. Rate-independent — see module docstring."""
+    O(N), no sort. Rate-independent — see module docstring.
+
+    The data line is read at the sample before the clock edge (sample 0 reads itself), the
+    decoder's rule: a data transition ON a clock-edge sample is not yet seen by that edge."""
     clk = np.asarray(capture.clock_edges, dtype=np.int64)
     dat = np.asarray(capture.data_edges, dtype=np.int64)
     if clk.size == 0:
         return SymbolSequence(syms=np.zeros(0, dtype=np.uint8),
                               samples=np.zeros(0, dtype=np.uint64))
-    dlevel = _levels_at(dat, capture.initial_data, clk)     # data bit at each clock edge
+    dlevel = _levels_at(dat, capture.initial_data,          # data bit at each clock edge
+                        np.maximum(clk - 1, 0))
     return SymbolSequence(syms=dlevel.astype(np.uint8),
                           samples=clk.astype(np.uint64))
 
@@ -271,7 +275,6 @@ def _search_one(main_seq, sub_seq, score_threshold: float, max_matches: int):
 
 
 def locate_subcapture(main, sub, *, max_matches: int = 64,
-                      tolerance: float = 0.05,
                       score_threshold: float = DEFAULT_SCORE_THRESHOLD,
                       progress=None,
                       diagnostics: dict = None) -> list:
@@ -280,8 +283,12 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
     Both are :class:`~swi3s_studio.ingest.capture.Capture` and may have different
     ``sample_rate_hz`` — matching is on the ORDERED sequence of data bits sampled at
     each clock edge (see module docstring), not absolute sample counts, so it is
-    rate-independent. `tolerance` is accepted and ignored. `score_threshold` is the
-    minimum fraction of matching symbols (default near-exact).
+    rate-independent. `score_threshold` is the minimum fraction of matching symbols
+    (default near-exact).
+
+    Raises ValueError for a PHY3 (DLV) capture, `main` or `sub`: its two lines are
+    complementary, so sampling the data line at the clock edges yields a bit stream with
+    no information (it alternates), and every sub would match everywhere.
 
     Orientation: `sub` is searched as-loaded first; if that finds nothing it is retried
     with clock/data SWAPPED, so a sub whose lines were assigned opposite to `main`'s
@@ -296,6 +303,13 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
         {"start_sample": int, "end_sample": int, "score": float}
     Empty list if nothing meets `score_threshold`.
     """
+    from .dlv_detect import is_complementary
+    for role, cap in (("main", main), ("sub", sub)):
+        if is_complementary(cap):
+            raise ValueError(
+                f"The {role} capture is a PHY3 (DLV) differential pair: its data line is "
+                f"the complement of its clock, so there is no per-UI data bit to match. "
+                f"Locate Sub-Capture compares PHY1 and PHY2 captures.")
     _p = progress or (lambda *_a: None)      # progress(fraction 0..1, phase label)
     _p(0.02, "Decoding capture…")
     main_seq = _timed("reduce main", capture_to_symbols, main)

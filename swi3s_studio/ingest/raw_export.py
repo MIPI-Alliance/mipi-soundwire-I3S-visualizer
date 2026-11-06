@@ -22,6 +22,7 @@ import os
 
 import numpy as np
 
+from ..fsutil import write_whole
 from . import saleae_binary
 from .capture import Capture
 
@@ -84,7 +85,9 @@ def export_csv(capture: Capture, path: str, *,
     columns (both by default). Times are `sample / sample_rate`, written
     full-precision so `round(time * rate)` recovers the exact sample. With both
     signals it round-trips through
-    `digital_csv.load_capture(path, clock_col=1, data_col=2, sample_rate_hz=rate)`."""
+    `digital_csv.load_capture(path, clock_col=1, data_col=2, sample_rate_hz=rate)`.
+    Two edges of one line at the same sample cannot be written as rows: that raises
+    ValueError."""
     rate = int(capture.sample_rate_hz)
     if rate <= 0:
         raise ValueError(f"export_csv: capture.sample_rate_hz must be > 0 (got {rate})")
@@ -98,6 +101,14 @@ def export_csv(capture: Capture, path: str, *,
                      capture.initial_data))
     if not cols:
         raise ValueError("export_csv: no signals selected")
+    for name, e, _ in cols:
+        # One row per sample cannot hold two edges of a line, so they would vanish.
+        same = np.flatnonzero(np.diff(e) == 0) if e.size > 1 else np.zeros(0, dtype=np.intp)
+        if same.size:
+            raise ValueError(
+                f"export_csv: {name!r} has two edges at sample {int(e[same[0]])} "
+                f"({same.size} such repeat{'s' if same.size != 1 else ''}); a CSV row holds "
+                f"one level per line, so the pulse cannot be written")
 
     all_edges = [e for _, e, _ in cols if e.size]
     samples = np.unique(np.concatenate(all_edges)) if all_edges else np.zeros(0, dtype=np.uint64)
@@ -114,7 +125,8 @@ def export_csv(capture: Capture, path: str, *,
     n = len(tvals)
     ncol = len(level_lists)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+
+    def write(f):
         w = csv.writer(f)
         w.writerow(["Time [s]", *names])             # header via csv (handles any quoting)
         # Data rows are plain numbers (no CSV quoting needed): build + write them in blocks
@@ -134,3 +146,4 @@ def export_csv(capture: Capture, path: str, *,
                         for i in range(base, end)]
             f.write("\r\n".join(rows))
             f.write("\r\n")
+    write_whole(path, write, mode="w", newline="", encoding="utf-8")

@@ -6,10 +6,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from conftest import pump_loads
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.link_state import LinkPanelState
+
+pytestmark = pytest.mark.gui
 
 
 def _win():
@@ -142,15 +145,19 @@ def test_dragging_another_links_bookmark_keeps_it_in_its_own_samples():
 
 
 def test_apply_workspace_restores_the_links_name_and_offset():
+    from swi3s_studio import import_notes
     from swi3s_studio.workspace import Workspace
     win = _win()
     ws = Workspace.single(source=win._session.source, name="Speaker bus", offset_ps=-5,
                           bookmarks=[{"sample": 3, "group": "A", "index": 1, "label": ""},
                                      {"sample": 4, "group": "A", "index": 2, "label": "",
                                       "link": 3}])            # a Link that is not loaded
-    win.apply_workspace(ws)
+    with import_notes.collect() as notes:
+        win.apply_workspace(ws, source="ws.swi3s")
     assert win.links.active.name == "Speaker bus" and win.links.active.offset_ps == -5
     assert [(b.sample, b.link) for b in win._bookmarks] == [(3, 0)]
+    assert [n.message for n in notes] == [
+        "1 saved cursor on a Link that was not opened was not restored"]
 
 
 def test_saving_writes_every_link(tmp_path, monkeypatch):
@@ -337,6 +344,20 @@ def test_a_link_added_while_all_links_is_on_joins_the_table():
     model = win._all_model
     assert win._cmd_all and win._cmd_proxy.sourceModel() is model
     assert {model.link_at(r) for r in range(model.rowCount())} == {0, 1, 2}
+
+
+def test_a_link_added_while_all_links_is_on_keeps_the_row_at_the_cursor_current():
+    win, _first, _second = _with_added_link()
+    win._errors_only_act.setChecked(False)
+    win.set_commands_scope_all(True)
+    assert win._cmd_view.currentIndex().row() == 0
+    win.load_session(_flow_control(win), add_link=True)
+    model, proxy = win._all_model, win._cmd_proxy
+    cur = win._cmd_view.currentIndex()
+    assert cur.isValid()
+    t = win.links.active.to_ps(win.cursor.sample) + 0.5
+    want = max(0, sum(1 for p in model.positions_ps if p <= t) - 1)
+    assert proxy.mapToSource(cur).row() == want
 
 
 def test_add_link_appends_switches_to_it_and_shows_the_switcher():
@@ -599,6 +620,71 @@ def test_selecting_an_all_links_row_shows_its_link_and_keeps_the_scope():
     assert win.links.active_index == 0
     assert win.cursor.sample == first.command_cursor_sample(cmd)
     assert win._cmd_all and win._cmd_proxy.sourceModel() is win._all_model
+
+
+def test_a_click_on_any_all_links_row_leaves_that_row_highlighted():
+    """A real click on each All Links row, on either Link: the clicked row is the current
+    row and the only one selected, its Link is the active one, and the cursor is on its
+    command."""
+    from swi3s_studio.ui.main_window import MainWindow
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.resize(1600, 1000)
+    win.show()
+    win.load_demo_links()
+    win._errors_only_act.setChecked(False)
+    win.set_commands_scope_all(True)
+    app.processEvents()
+    view, proxy, model = win._cmd_view, win._cmd_proxy, win._all_model
+    col = next(c for c in range(proxy.columnCount())
+               if not view.isColumnHidden(c) and view.columnWidth(c) > 4)
+    rows = range(1, min(81, proxy.rowCount()))     # row 0 is current already
+    links = [model.link_at(proxy.mapToSource(proxy.index(r, 0)).row()) for r in rows]
+    assert len(set(links)) == 2
+    wrong = []
+    for r in rows:
+        idx = proxy.index(r, col)
+        view.scrollTo(idx)
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier,
+                         view.visualRect(idx).center())
+        app.processEvents()
+        link, cmd, _pos = win._row_target(proxy.mapToSource(idx).row())
+        sel = sorted({i.row() for i in view.selectionModel().selectedIndexes()})
+        if (view.currentIndex().row(), sel, win.links.active_index) != (r, [r], link) or \
+                win.cursor.sample != win._session.command_cursor_sample(cmd):
+            wrong.append(r)
+    assert wrong == []
+
+
+def test_page_down_after_a_click_on_another_links_band_highlights_the_row_at_the_cursor():
+    """Commands shows Link 2; a click on Link 1's band makes Link 1 active; PageDown in
+    Commands then moves to Link 2 and highlights the row the cursor lands on."""
+    import bisect
+
+    from swi3s_studio.ui.main_window import MainWindow
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.resize(1600, 1000)
+    win.show()
+    win.load_demo_links()
+    win._errors_only_act.setChecked(False)
+    app.processEvents()
+    assert win._pane_link["commands"] == 1
+    first = win.links[0].session
+    win._on_ribbon_seek(win._ribbons[0],
+                        int(first.commands[len(first.commands) // 2]["start_sample"]))
+    assert win.links.active_index == 0
+    view = win._cmd_view
+    view.setFocus()
+    for _ in range(3):
+        QTest.keyClick(view, Qt.Key_PageDown)
+        app.processEvents()
+        here = win._in_group("commands", win.cursor.sample)
+        want = bisect.bisect_right(win.links[1].view.starts, here) - 1
+        cur = win._cmd_proxy.mapToSource(view.currentIndex()).row()
+        sel = {win._cmd_proxy.mapToSource(i).row()
+               for i in view.selectionModel().selectedIndexes()}
+        assert (cur, sel) == (want, {want})
 
 
 def test_the_all_links_filter_applies_across_links_and_leaving_restores_the_links_own():
@@ -1145,7 +1231,7 @@ def test_a_digital_csv_with_more_than_two_channels_offers_each_clock_with_a_data
     path = tmp_path / "four.csv"
     lines = ["Time [s],CLK1,CLK2,D1,D2"]
     for i in range(400):                                 # two busy clocks, two quiet lines
-        lines.append(f"{i * 1e-6:.9f},{i % 2},{(i // 1) % 2},{(i // 50) % 2},{(i // 80) % 2}")
+        lines.append(f"{i * 1e-6:.9f},{i % 2},{(i + i // 4) % 2},{(i // 50) % 2},{(i // 80) % 2}")
     path.write_text("\n".join(lines) + "\n")
     win = _win()
     seen = []
@@ -1159,7 +1245,8 @@ def test_a_digital_csv_with_more_than_two_channels_offers_each_clock_with_a_data
     win.open_capture()
     names = ["CLK1", "CLK2", "D1", "D2"]
     (c1, d1), (c2, d2), texts = seen
-    assert {names[c1], names[c2]} == {"CLK1", "CLK2"} and {names[d1], names[d2]} == {"D1", "D2"}
+    assert (names[c1], names[c2]) == ("CLK1", "CLK2")      # CLK1 (399 edges) before CLK2 (300)
+    assert {names[d1], names[d2]} == {"D1", "D2"}
     assert all("edges)" in t for t in texts)
 
 
@@ -1247,7 +1334,8 @@ def test_a_background_persistence_result_keeps_the_grid_links_cds_column(monkeyp
 
     import swi3s_studio.ui.main_window as mw
     win, first, second = _with_added_link()
-    first._cds_horizontal_start, second._cds_horizontal_start = 0, 2   # FBCSE, DLV
+    monkeypatch.setattr(first, "cds_column_at", lambda sample=None: 0)    # FBCSE
+    monkeypatch.setattr(second, "cds_column_at", lambda sample=None: 2)   # DLV
     for s in (first, second):
         monkeypatch.setattr(s, "tx_persist_cached", lambda sample: None)
     monkeypatch.setattr(mw, "_TX_PERSIST_SYNC_MAX_UIS", -1)            # every scan in the background
@@ -1351,3 +1439,163 @@ def test_leaving_all_links_restores_the_order_the_link_had():
     win.set_commands_scope_all(True)
     win.set_commands_scope_all(False)
     assert _rows(win) == chosen
+
+
+# ---- every indicator agrees with the state after a pick, a filter, a reopen, a removal ----
+
+def _indicators_agree(win):
+    """check_window, plus every band's playhead at the cursor's instant on its own Link
+    and the Links menu marking the active Link."""
+    from window_checks import check_window
+    check_window(win)
+    links, a = win.links, win.links.active_index
+    heads = [r._cursor for r in win._ribbons[:len(links)]]
+    want = [links.convert(win.cursor.sample, a, j) for j in range(len(links))]
+    assert heads == want, f"band playheads {heads}, the cursor's instant gives {want}"
+    assert [act.isChecked() for act in win._link_actions] == [
+        i == a for i in range(len(links))]
+
+
+def test_a_link_picked_in_the_commands_picker_moves_every_playhead_with_the_clamp():
+    """The cursor's instant lies before Link 2's capture, so picking Link 2 clamps it to
+    Link 2's sample 0: a new instant, which every band and pane then shows."""
+    win, _first, _second = _with_added_link()
+    win.switch_link(0)
+    win.set_link_offset(1, 50_000_000)                  # Link 2 starts 50 µs in
+    win.cursor.set_sample(0)
+    win._on_link_combo(1)
+    assert win.links.active_index == 1 and win.cursor.sample == 0
+    _indicators_agree(win)
+    assert win._raw_view._cursor_sample == win.links.convert(0, 1, 0), (
+        "the Capture pane kept the old instant")
+
+
+def _current_source_row(win):
+    idx = win._cmd_view.currentIndex()
+    return win._cmd_proxy.mapToSource(idx).row() if idx.isValid() else None
+
+
+def _nearest_visible_row(win, sample):
+    """The visible command in effect at `sample`: the last one whose cursor sample is at or
+    before it, else the first visible one."""
+    proxy = win._cmd_proxy
+    shown = sorted(proxy.mapToSource(proxy.index(r, 0)).row() for r in range(proxy.rowCount()))
+    before = [r for r in shown if win._starts[r] <= sample]
+    return before[-1] if before else shown[0]
+
+
+def test_a_command_filter_change_never_moves_the_cursor():
+    """A filter that hides the current row makes the table pick another current row; the
+    cursor stays, and the table re-selects the nearest visible command for it."""
+    win = _win()
+    kinds = sorted({a.data() for a in win._kind_menu._actions})
+    hid_current = 0
+
+    def changed(what, apply):
+        nonlocal hid_current
+        before = _current_source_row(win)
+        apply()
+        win._on_command_filter_changed()
+        assert win.cursor.sample == cur, f"{what} moved the cursor"
+        if win._cmd_proxy.rowCount():
+            assert _current_source_row(win) == _nearest_visible_row(win, cur), what
+            if before is not None and not win._cmd_proxy.filterAcceptsRow(before, QModelIndex()):
+                hid_current += 1
+
+    proxy = win._cmd_proxy
+    for cur in (0, 3_000_000):
+        win.cursor.set_sample(cur)
+        win._on_command_filter_changed()
+        changed("the expression filter", lambda: proxy.set_text("Write"))
+        changed("clearing the expression", lambda: proxy.set_text(""))
+        for kind in kinds:
+            changed(f"hiding {kind}", lambda k=kind: proxy.set_kinds(set(kinds) - {k}))
+            changed(f"showing {kind} again", lambda: proxy.set_kinds(set()))
+    assert hid_current, "no filter change hid the current row"
+
+
+def test_a_workspace_saved_with_a_filter_reopens_at_its_cursor(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+    win = _win()
+    win.cursor.set_sample(3_272_343)
+    win._cmd_proxy.set_text("Write")
+    win._on_command_filter_changed()
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win.save_workspace()
+    win.open_workspace()
+    pump_loads(win)
+    assert win._cmd_proxy.filter_text() == "Write"
+    assert win.cursor.sample == 3_272_343
+
+
+@pytest.mark.parametrize("bottom_all", [False, True])
+@pytest.mark.parametrize("offset_ps", [1_000_000, -2_000_000])
+def test_a_reopened_workspace_shows_its_active_link_and_cursor_everywhere(
+        tmp_path, monkeypatch, bottom_all, offset_ps):
+    """Saved on Link 2 at the cursor the window still has: the offsets move the mapping
+    while the cursor's sample stays, and the bottom panes' restore in All Links is not a
+    touch that makes Link 1 active."""
+    from PySide6.QtWidgets import QFileDialog
+    win, _first, _second = _with_added_link()
+    win.set_link_offset(1, offset_ps)
+    win.switch_link(1)
+    if bottom_all:
+        win.set_bottom_scope_all(True)
+    cur = 5000                    # not a fresh load's first sample, 0
+    win.cursor.set_sample(cur)
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win.save_workspace()
+    win.open_workspace()
+    pump_loads(win)
+    assert win.links.active_index == 1 and win.cursor.sample == cur
+    assert win._bottom_all == bottom_all
+    _indicators_agree(win)
+
+
+def test_a_lane_restored_by_a_workspace_does_not_make_its_link_active():
+    """In All Links a lane's filter change is a touch on that Link; the same signal from a
+    workspace's restore is not."""
+    win, _first, _second = _with_added_link()
+    win.switch_link(1)
+    win.set_bottom_scope_all(True)
+    lane0 = win._sample_lanes.views[0]
+    win._ws_source = "ws.json"
+    try:
+        lane0.filtersChanged.emit()
+    finally:
+        win._ws_source = None
+    assert win.links.active_index == 1, "the restore made Link 1 active"
+    lane0.filtersChanged.emit()
+    assert win.links.active_index == 0, "a lane's own filter change is a touch on its Link"
+
+
+def test_removing_the_link_that_reached_furthest_fits_the_timeline_to_the_rest():
+    win, _first, _second = _with_added_link()
+    win.set_link_offset(1, -100_000_000_000)            # Link 2 starts 100 ms earlier
+    assert win._ribbons[0].view_range[0] < 0
+    win.remove_link(1, confirm=False)
+    ribbon = win._ribbons[0]
+    lo, hi = ribbon.view_range
+    b_lo, b_hi = ribbon._bounds()
+    assert b_lo <= lo < hi <= b_hi, f"view {(lo, hi)} reaches past the capture {(b_lo, b_hi)}"
+    _indicators_agree(win)
+
+
+def test_a_row_picked_in_the_commands_table_is_read_from_the_link_the_table_shows():
+    """The Commands pane shows Link 2 while another group made Link 1 active: a row picked
+    there moves the cursor to Link 2's command, on Link 2."""
+    win, _first, second = _with_added_link()
+    win.set_group_link("commands", 1)
+    win.set_group_link("grid", 0)
+    assert win.links.active_index == 0 and win._pane_link["commands"] == 1
+    proxy = win._cmd_proxy
+    row = 1
+    src = proxy.mapToSource(proxy.index(row, 0)).row()
+    cmd = win._links[1].view.cmd_model.command_at(src)
+    win._cmd_view.setCurrentIndex(proxy.index(row, 0))
+    assert win.links.active_index == 1
+    assert win.cursor.sample == second.command_cursor_sample(cmd)

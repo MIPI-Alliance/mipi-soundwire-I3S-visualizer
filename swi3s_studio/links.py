@@ -9,8 +9,8 @@ A Link's IDENTITY is its position in the set. The name is display only, so renam
 never has to touch anything that refers to it.
 
 TIME. Each Link counts time in its own capture's samples. The global time the Links share is
-int64 picoseconds, and `LinkEntry.to_ps` / `to_sample` are the ONLY conversion — nothing else
-does the arithmetic:
+int64 picoseconds, and `LinkEntry.to_ps` / `to_sample` are the conversion of a sample number
+that is kept or compared:
 
     t_ps   = round(sample * 1e12 / rate_hz) + offset_ps
     sample = round((t_ps - offset_ps) * rate_hz / 1e12)
@@ -19,16 +19,22 @@ The arithmetic is exact (rationals, not floats), so a round trip returns the sam
 any rate below 1 THz: the picosecond rounding moves the value by at most rate/2e12 of a
 sample. The offset is signed, and changing it moves nothing but this mapping.
 
+The window converts in float64 only where the result is drawn or printed: the positions of a
+whole Link's rows on the shared axis, the seconds of a displayed time and the picoseconds of
+an offset typed in seconds. Those values are never converted back to a sample.
+
 `LinkEntry.view` is an opaque slot for the UI's per-Link panel state; this module never
 reads it, which keeps it free of Qt.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Iterator, List, Optional
 
 _DEFAULT_PREFIX = "Link "
+_DEFAULT_NUMBER_RE = re.compile(r"[0-9]{1,9}")
 _PS_PER_S = 10 ** 12
 
 
@@ -52,9 +58,10 @@ class LinkEntry:
 
 
 def _default_number(name: str) -> Optional[int]:
-    """n for a default name "Link n", else None (a user-chosen name)."""
+    """n for a default name "Link n" (ASCII digits, at most nine), else None (a user-chosen
+    name)."""
     tail = name[len(_DEFAULT_PREFIX):]
-    if name.startswith(_DEFAULT_PREFIX) and tail.isdigit():
+    if name.startswith(_DEFAULT_PREFIX) and _DEFAULT_NUMBER_RE.fullmatch(tail):
         return int(tail)
     return None
 

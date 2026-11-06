@@ -5,10 +5,12 @@ The conftest guard fails a test that reaches a modal; `_drive` below is the sanc
 through: it replaces `exec` on one dialog class with a function that plays the user.
 """
 import os
-import wave
+
+import wav_reader
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -17,6 +19,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
 )
+
+pytestmark = pytest.mark.gui
 
 
 def _app():
@@ -51,7 +55,8 @@ def test_audio_export_rate_parsing():
     assert _parse_rate("48 kHz") == 48_000
     assert _parse_rate("22.05 kHz") == 22_050
     assert _parse_rate("32000") == 32_000
-    assert _parse_rate("fast") is None                  # typed nonsense: native, not a crash
+    with pytest.raises(ValueError):
+        _parse_rate("fast")                             # typed nonsense is refused, not native
 
 
 def test_the_audio_export_dialog_lists_every_stream_and_seeds_the_playback_rate():
@@ -61,14 +66,15 @@ def test_the_audio_export_dialog_lists_every_stream_and_seeds_the_playback_rate(
     streams = list(store.streams())
     assert len(streams) >= 2
     first = streams[0]
-    dlg = AudioExportDialog(store, visible_index_range=(10, 20),
+    dlg = AudioExportDialog(store, visible_sample_range=(10, 20),
                             default_rates={first: 16_000}, parent=win)
     assert dlg.selected_streams() == streams             # all ticked by default
     assert dlg.target_rate(*first) == 16_000             # export matches playback
     assert dlg.target_rate(*streams[1]) is None          # native
     assert dlg.index_range() is None                      # whole capture first
     dlg._range.setCurrentIndex(1)
-    assert dlg.index_range() == (10, 20)
+    assert dlg.sample_range() == (10, 20)
+    assert dlg.index_range(*first) == store.stream_index_range(*first, 10, 20)
     dlg._rates[first].setEditText("22.05 kHz")           # a rate typed, not picked
     assert dlg.target_rate(*first) == 22_050
 
@@ -91,7 +97,7 @@ def test_export_audio_writes_the_chosen_stream_at_the_chosen_rate(tmp_path, monk
     win.export_audio()
     written = sorted(os.listdir(tmp_path))
     assert written == [f"swi3s_dev{keep[0]}_dp{keep[1]}.wav"]
-    with wave.open(str(tmp_path / written[0])) as w:
+    with wav_reader.open(str(tmp_path / written[0])) as w:
         assert w.getframerate() == 16_000
     assert told and told[0][0] == "Audio exported" and "16 kHz" in told[0][1]
 
@@ -288,7 +294,7 @@ def test_export_audio_visible_range_covers_the_same_time_on_every_stream(tmp_pat
     win.export_audio()
     secs = {}
     for dev, dp in keep:
-        with wave.open(str(tmp_path / f"swi3s_dev{dev}_dp{dp}.wav")) as w:
+        with wav_reader.open(str(tmp_path / f"swi3s_dev{dev}_dp{dp}.wav")) as w:
             secs[(dev, dp)] = w.getnframes() / w.getframerate()
     a, b = secs[(0, 0)], secs[(0, 1)]
     assert a > 0 and abs(a - b) <= 2.0 / 44100, secs

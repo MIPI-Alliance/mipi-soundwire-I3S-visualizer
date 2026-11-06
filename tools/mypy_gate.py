@@ -27,6 +27,9 @@ baseline without `per_platform` compares every platform with `per_file`.
 
     python3 tools/mypy_gate.py            # check (used by tests/gate.sh and ci.yml)
     python3 tools/mypy_gate.py --update   # record the current state as the new baseline
+    python3 tools/mypy_gate.py --allow-incomparable   # exit 0 where the result is NOT COMPARABLE
+
+Any other argument is refused with exit 2 before mypy runs.
 """
 from __future__ import annotations
 
@@ -48,6 +51,8 @@ def _baseline_mypy() -> str:
             return str(json.load(f).get("env", {}).get("mypy", "?"))
     except (OSError, ValueError, AttributeError):
         return "?"
+
+
 _TARGET = "swi3s_studio"
 _LINE = re.compile(r"^(?P<file>[^:]+):\d+:(?:\d+:)? error:")
 _PLATFORMS = ("darwin", "linux", "win32")
@@ -150,12 +155,22 @@ def _run_mypy_on(platform: str) -> tuple[dict[str, int], str]:
     return counts, proc.stdout
 
 
-def main() -> int:
+_OPTIONS = ("--update", "--allow-incomparable")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    bad = [a for a in args if a not in _OPTIONS]
+    if bad:
+        print(f"mypy_gate: unknown argument(s): {' '.join(bad)}\n"
+              "usage: python3 tools/mypy_gate.py [--update] [--allow-incomparable]",
+              file=sys.stderr)
+        return 2
     counts, raw = _run_mypy()
     total = sum(counts.values())
     env = _env_fingerprint()
 
-    if "--update" in sys.argv:
+    if "--update" in args:
         record = {"env": env, "total": total, "per_file": dict(sorted(counts.items()))}
         if _BY_PLATFORM:
             record["per_platform"] = {plat: dict(sorted(c.items()))
@@ -190,7 +205,7 @@ def main() -> int:
         print("\nA different mypy version can change the count for identical source. Install\n"
               f"mypy {base_env.get('mypy', '?')} (or re-baseline deliberately with --update);\n"
               "this result is neither a pass nor a regression.")
-        if "--allow-incomparable" in sys.argv:
+        if "--allow-incomparable" in args:
             print("\n--allow-incomparable: exiting 0. mypy ran, but no count was compared,\n"
                   "so this run does NOT catch a regression.")
             return 0

@@ -6,8 +6,12 @@ failed its CRC, a deferred read delivered by a later ReadData, and a deferred re
 ReadData failed or got no answer. A dual-ranked register's _CURR alias lists its _NEXT
 accesses and the Commits that promote them.
 """
+import pytest
+
 from swi3s_studio.analysis.register_history import register_history
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 def _write(addr, data, *, mask=0b1, crc=True, pr=0, sample=0, row=0):
@@ -118,10 +122,108 @@ def test_a_data_ports_commit_group_is_its_membership_as_the_bus_left_it():
         (0, "Write (NEXT)"), (1, "Commit"), (4, "Commit")]
 
 
+def test_a_data_port_not_written_to_commits_with_group_0_only():
+    """CommitGroupMemb never written reads as Commit Group 0, so a group-1 Commit does not
+    promote the port's staged value."""
+    cmds = [_write(0x2180, [7]), _commit(0b0010), _commit(0b0001)]
+    assert [(e.command_index, e.access) for e in register_history(cmds, 0, 0x21C0)] == [
+        (0, "Write (NEXT)"), (2, "Commit")]
+
+
+def test_a_write_selecting_several_devices_is_listed_and_not_staged():
+    """A multicast WriteA32 is listed with its mask error and promotes nothing: the Commit that
+    follows has no staged value."""
+    cmds = [_write(0x1081, [3], mask=0b11, sample=1), _commit(0b0001, sample=2)]
+    ev = register_history(cmds, 0, 0x10C1)
+    assert [(e.command_index, e.access, e.value, e.applied, e.status) for e in ev] == [
+        (0, "Write (NEXT)", 3, False, "device mask: expected 1, got 2"),
+        (1, "Commit", None, False, "OK")]
+
+
+def test_a_command_starting_on_a_bus_reset_sample_sees_only_what_followed_the_reset():
+    cmds = [_write(0x1081, [3], sample=5), _commit(0b0001, sample=10)]
+    on_reset = register_history(cmds, 0, 0x10C1, resets=[10])
+    assert [(e.access, e.value, e.applied) for e in on_reset] == [
+        ("Write (NEXT)", 3, True), ("Commit", None, False)]
+    before = register_history(cmds, 0, 0x10C1, resets=[11])
+    assert [(e.access, e.value, e.applied) for e in before] == [
+        ("Write (NEXT)", 3, True), ("Commit", 3, True)]
+
+
+def test_a_curr_read_is_not_in_the_next_aliases_history_but_a_curr_write_is():
+    cmds = [_read(0x10C1, [3], sample=1), _write(0x10C1, [3], sample=2)]
+    assert [(e.command_index, e.access) for e in register_history(cmds, 0, 0x1081)] == [
+        (1, "Write (CURR)")]
+    assert [(e.command_index, e.access) for e in register_history(cmds, 0, 0x10C1)] == [
+        (0, "Read"), (1, "Write")]
+
+
 def test_a_commit_with_nothing_staged_is_listed_but_not_applied():
     ev = register_history([_commit(0b0001)], 0, 0x10C1)
     assert [(e.access, e.value, e.applied, e.status) for e in ev] == [
         ("Commit", None, False, "OK")]
+
+
+def test_a_write_to_a_read_only_curr_alias_is_listed_and_not_applied():
+    """CDS_HorizontalStart: _NEXT 0x1184, _CURR 0x11C4, Dual-CURR-RO. A CRC-valid write to
+    0x11C4 changes nothing in the register model, so both histories list it unapplied, and
+    the Commit that follows has nothing staged to promote."""
+    cmds = [_write(0x11C4, [5], sample=1), _commit(0b0001, sample=2)]
+    curr = register_history(cmds, 0, 0x11C4)
+    assert [(e.command_index, e.access, e.value, e.applied, e.status) for e in curr] == [
+        (0, "Write", 5, False, "read-only _CURR alias: no effect"),
+        (1, "Commit", None, False, "OK")]
+    nxt = register_history(cmds, 0, 0x1184)
+    assert [(e.command_index, e.access, e.value, e.applied, e.status) for e in nxt] == [
+        (0, "Write (CURR)", 5, False, "read-only _CURR alias: no effect")]
+    # A failed packet keeps its own status and gains the note.
+    bad = register_history([_write(0x11C4, [5], crc=False)], 0, 0x11C4)
+    assert bad[0].status.endswith("; read-only _CURR alias: no effect") and not bad[0].applied
+    # A dual-ranked register whose _CURR alias is read-write is unaffected.
+    ok = register_history([_write(0x10C1, [3])], 0, 0x10C1)
+    assert [(e.access, e.applied, e.status) for e in ok] == [("Write", True, "OK")]
+    # A write to the _NEXT alias of the read-only register stages normally: only the
+    # _CURR alias is read-only.
+    staged = register_history([_write(0x1184, [5], sample=1)], 0, 0x1184)
+    assert [(e.access, e.applied, e.status) for e in staged] == [("Write", True, "OK")]
+
+
+def test_a_write_to_a_read_only_register_is_listed_and_not_applied():
+    """PortStatus (DP0 0x2005) is RO: a write to it is listed, not applied, and says why. A
+    multi-byte write applies its other bytes."""
+    cmds = [_write(0x2004, [0x01, 0x03], sample=1)]       # DevStat (RW1C), PortStatus (RO)
+    ro = register_history(cmds, 0, 0x2005)
+    assert [(e.access, e.value, e.applied, e.status) for e in ro] == [
+        ("Write", 0x03, False, "read-only register: no effect")]
+    assert [e.applied for e in register_history(cmds, 0, 0x2004)] == [True]
+
+
+def test_a_write_spanning_a_writable_and_a_read_only_byte_marks_only_the_read_only_one():
+    """DP0 0x2004 DevStat (RW1C) and 0x2005 PortStatus (RO), with the decoder's whole-write
+    read_only_write_error flag set: the byte that landed is OK, the read-only byte carries
+    the one note that says it did not."""
+    cmd = {**_write(0x2003, [0x01, 0x02, 0x03], sample=1), "read_only_write_error": True}
+    landed = register_history([cmd], 0, 0x2003)
+    assert [(e.applied, e.status, e.failed) for e in landed] == [(True, "OK", False)]
+    rw1c = register_history([cmd], 0, 0x2004)
+    assert [(e.applied, e.status, e.failed) for e in rw1c] == [(True, "OK", False)]
+    ro = register_history([cmd], 0, 0x2005)
+    assert [(e.applied, e.status) for e in ro] == [(False, "read-only register: no effect")]
+    # Another error of the command still shows on every byte.
+    bad = {**cmd, "crc_valid": False}
+    assert register_history([bad], 0, 0x2003)[0].status.startswith("CRC error")
+
+
+def test_a_write_to_an_rw1c_register_names_its_provenance():
+    """DP0 IntStat (0x2000) is RW1C: a write clears the bits it writes 1, and its access says
+    "cleared by write". A read of it, and a write to a plain RW register, do not."""
+    cmds = [_read(0x2000, [0x1F], sample=1), _write(0x2000, [0x05], sample=2),
+            _write(0x200B, [0x08], sample=3)]
+    ev = register_history(cmds, 0, 0x2000)
+    assert [(e.access, e.value, e.applied) for e in ev] == [
+        ("Read", 0x1F, True), ("Write (cleared by write)", 0x05, True)]
+    assert ev[1].status == "OK"
+    assert [e.access for e in register_history(cmds, 0, 0x200B)] == ["Write"]
 
 
 def test_the_demo_has_history_for_a_register_it_writes():

@@ -17,9 +17,9 @@ Faithful port of `mipi-soundwire-I3S-visualizer/src/ui/frame_renderer.py`
 (COLUMN_SIZE=39, ROW_SIZE=30, Helvetica). Renders on a QGraphicsScene so the
 key/labels are included in the SVG/PNG export.
 
-Deferred: the *system* CDS / S1 handover columns (a fixed-column turnaround driven
-by the interface's CDS/S1 handover-enable, independent of the data ports) — the
-C++ grid models CDS only as Column 0, so those leading arrows aren't placed yet.
+A decoded grid draws the cells `Session.grid_cells()` places, with the CDS as Column 0;
+the CDS and S1 guard, tail and handover cells of the interface's CDS block are drawn only
+from the engine's BusModel (set_bus_model).
 """
 from __future__ import annotations
 
@@ -40,7 +40,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView
 
+from ..fsutil import write_whole
 from ..model.grid_slots import GridSlot
+from ..swviz.models.enums import port_mode_bit
 from . import line_style
 from .theme import VizTheme
 
@@ -64,6 +66,7 @@ _ROWHDR_W = _s(30)             # left gutter for row numbers
 _COLHDR_H = _s(22)             # column-number header band
 _KEY_H = _s(26)                # top data-port colour-key band
 _SSKEY_W = _s(48)              # right-hand Source/Sink key column
+_MAX_PNG_BYTES = 1 << 30       # largest PNG export raster (ARGB32); larger scenes export as SVG
 _APP_FONT = "Helvetica"        # matches the visualizer; portable in SVG
 
 # Grid colours come from the shared visualizer theme (lines/text a touch lighter,
@@ -109,7 +112,7 @@ def dp_line_color(device: int, dp: int, overrides=None) -> QColor:
 def bookmark_pair_color(label: str) -> QColor:
     """Colour for a bookmark PAIR, rotating the data-port line palette by pair letter (A,
     B, C, …) so each pair gets a distinct, consistent colour across every pane (timeline /
-    capture / audio / the Bookmarks table). Every use is a line or text, so it is the
+    capture / audio / the Cursors table). Every use is a line or text, so it is the
     per-theme line colour (line_style's `bookmark` kind, which defaults to the data-port
     line palette). Falls back to the first entry for an unlabelled mark."""
     letter = (str(label) or "A")[:1].upper()
@@ -138,22 +141,14 @@ _DEV_MANAGER, _DEV_UNIVERSAL = -1, -2
 _CLASH_COLOR = {"bus": QColor(0xD3, 0x2F, 0x2F), "device": QColor(0xFB, 0xC0, 0x2D),
                 "read": QColor(0x19, 0x76, 0xD2)}
 
-# Config-vs-decoded comparison + authoring clash outlines (CanvasColors).
-_DIFF_PEN = {
-    "changed": QColor(0xFB, 0xC0, 0x2D),
-    "decoded_only": QColor(80, 200, 110),
-    "expected_only": QColor(0xD3, 0x2F, 0x2F),
-    "clash": QColor(0xD3, 0x2F, 0x2F),
-}
-
 
 def _cells_key(cells):
     """Fast content-cache key for a grid-cell list. Cells are flat dicts of hashable
     scalars with a FIXED key order (gridCellToDict / render_payload build them the same
     way every time), so a tuple of each cell's values is an equivalent cache key to the
     recursive sorted-items _freeze — but without sorting ~13 keys per cell on every
-    settled cursor move. A differing key order across calls would only cause a false cache
-    MISS (a harmless rebuild), never a false hit, so this is safe."""
+    settled cursor move. Every builder must emit the same keys in the same order: the key
+    holds the values only, so two cells built in different key orders could compare equal."""
     return tuple(tuple(c.values()) for c in cells)
 
 
@@ -192,8 +187,6 @@ class GridView(QGraphicsView):
         # rebuilt by _draw_top_key, consumed by mousePressEvent. Empty in engine
         # (Visualizer) mode, where label fields are edited from the authoring panel.
         self._key_hits: List[Tuple[QRectF, Tuple[int, int]]] = []
-        self._sys_slots: List[tuple] = []
-        self._engine_mode = False
         self._clashes: dict = {}
         self._cell_at: dict = {}    # (row,col) -> cells; (re)built in set_bus_model, read by _clash_x
         # Peripheral (device>=0) roster "present on the bus" — devices that drive any
@@ -201,13 +194,13 @@ class GridView(QGraphicsView):
         # "P Mix" when a present peripheral isn't guarding a given column (see
         # _draw_cds_system). Rebuilt in set_bus_model; empty otherwise.
         self._present_periph: set = set()
-        # What a CDS cell is labelled. "CDS" normally; "CDS_SP" when the config sets
-        # CDS_DriveType to Special, where a CDS bit of 1 is left high-Z for the Manager's
-        # bus keeper to hold rather than actively driven — a decode-visible difference
-        # (NRZS) worth seeing on the cell. Held as ONE attribute read by the three paths
-        # that draw a CDS cell (the merged run in _draw_row, _sys_full's synthesized block,
-        # and the TX raster's column 0). Only the Visualizer path sets it; the analyzer and
-        # TX map leave it at the default. See bus_config.cds_symbol.
+        # What a CDS cell is labelled: "CDS", or "CDS" over a flags line (SP / SPx / EDE /
+        # EDEx) when the config sets CDS_DriveType to Special (a CDS bit of 1 is left high-Z
+        # for the Manager's bus keeper to hold rather than actively driven, a decode-visible
+        # difference) or end-drive-early. Held as ONE attribute read by the two paths
+        # that draw a CDS cell (the merged run in _draw_row and the TX raster's column 0).
+        # Only the Visualizer path sets it; the analyzer and TX map leave it at the
+        # default. See bus_config.cds_symbol.
         self._cds_symbol = "CDS"
         # column -> extra width, for the CDS run only (see _size_cds_columns). Empty means a
         # uniform _CW grid, which is every path that draws no CDS flags.
@@ -300,7 +293,6 @@ class GridView(QGraphicsView):
         bus geometry to draw yet)."""
         self._scene.clear()
         self._key_hits = []   # swatch rects died with the scene
-        self._engine_mode = False
         self._clashes = {}
         self._tx_raster_key = None   # scene no longer holds the cached TX raster
         self._content_key = None     # nor the cached cell grid
@@ -319,22 +311,19 @@ class GridView(QGraphicsView):
 
     def set_cells(self, cells: List[dict], column_count: int,
                   cds_labels: dict | None = None,
-                  dp_display: dict | None = None,
-                  system_slots: list | None = None) -> None:
+                  dp_display: dict | None = None) -> None:
         """Render the grid. `cds_labels` maps row -> short CDS symbol text for that
         row's Column 0. `dp_display` maps (device, dp) -> {"display_fields": int
         (1=Sample 2=Channel 4=Bit), "handover": bool} for the Visualizer display
         semantics that aren't register-level (label fields + handover-enable). When
-        absent, a port defaults to Channel|Bit labels with handover on.
-        `system_slots` is a list of (col, kind) interface-level CDS-block slots
-        drawn at every row — kind in {'cds','guard','tail','handover'}."""
+        absent, a port defaults to Channel|Bit labels with handover on."""
         # Manual cursor navigation calls this repeatedly with unchanged content (the grid
         # only changes at register-write boundaries, not every sample); a full scene
         # rebuild is expensive, so skip it when the content key matches (mirrors
         # set_tx_raster). Colours aren't in the key — retheme() resets it. See _freeze.
         try:
             key = ("cells", int(column_count), self._show_key, _cells_key(cells),
-                   _freeze(cds_labels), _freeze(dp_display), _freeze(system_slots))
+                   _freeze(cds_labels), _freeze(dp_display))
         except TypeError:
             key = None
         if key is not None and key == self._content_key:
@@ -345,17 +334,15 @@ class GridView(QGraphicsView):
         self._tx_raster_key = None   # scene no longer holds the cached TX raster
         cds_labels = cds_labels or {}
         self._dp_display = dp_display or {}
-        self._sys_slots = list(system_slots or [])
-        self._engine_mode = False
         # Back to the plain symbol: this is the decoded (analyzer) grid, which reads a
         # capture rather than an authored config, so it has no CDS_DriveType to honour.
         # Reset explicitly — the attribute survives a mode switch otherwise, and the
-        # Visualizer's "CDS_SP" would leak onto an analyzer grid.
+        # Visualizer's flagged symbol would leak onto an analyzer grid.
         self._cds_symbol = "CDS"
         self._clashes = {}
         self._assign_stream_colors(cells)
-        # No CDS flags on the decoded path (see set_cells), so this is a no-op there — called
-        # anyway so a future analyzer-side label cannot forget it.
+        # No CDS flags on the decoded path (see bus_config.cds_symbol), so this is a no-op
+        # there — called anyway so a future analyzer-side label cannot forget it.
         self._size_cds_columns(cells, self._cds_label(1))
 
         rows = max((c["row"] for c in cells), default=-1) + 1
@@ -372,7 +359,7 @@ class GridView(QGraphicsView):
         for c in cells:
             by_row.setdefault(c["row"], []).append(c)
         for r in range(rows):
-            self._draw_row(r, by_row.get(r, []), cols, cds_labels)
+            self._draw_row(r, by_row.get(r, []), cds_labels)
 
         self._draw_frame(rows, cols)
         self._finalize_scene(reset_scroll=True)
@@ -381,16 +368,16 @@ class GridView(QGraphicsView):
                       num_rows: int, slot_names: Optional[Dict[int, str]] = None,
                       cds_symbol: str = "CDS") -> None:
         """Render from the Visualizer engine's BusModel (via viz_engine.render_payload):
-        the cells already include the CDS/S0/S1/handover system bits with device, so
-        the per-source-port handover heuristic + CDS-block synthesis are suppressed
+        the cells already include the CDS/S0/S1/handover system bits with device,
         and clash markers (X) are drawn from the model's clash lists.
 
         ``slot_names`` maps a config-slot index to the port's user-assigned name, used to
         label the colour key; without it the key falls back to "Mgr·DP0"/"D1·DP0".
 
-        ``cds_symbol`` is what the CDS cells are labelled — "CDS", or "CDS_SP" when the
-        config sets CDS_DriveType to Special. It is a rendering label only: no cell moves,
-        which is why it arrives here rather than through the engine's bit model."""
+        ``cds_symbol`` is what the CDS cells are labelled — "CDS", or "CDS" over a flags
+        line when the config sets CDS_DriveType or end-drive-early (see
+        bus_config.cds_symbol). It is a rendering label only: no cell moves, which is why
+        it arrives here rather than through the engine's bit model."""
         # Content cache (see set_cells): skip the full rebuild when the model + clashes
         # are unchanged, as on a cursor move within one config region. THE CDS SYMBOL IS
         # IN THE KEY: nothing else in the key moves when only CDS_DriveType is toggled.
@@ -409,8 +396,6 @@ class GridView(QGraphicsView):
         self._tx_raster_key = None   # scene no longer holds the cached TX raster
         self._dp_display = {}
         self._slot_names = {int(k): str(v) for k, v in (slot_names or {}).items()}
-        self._sys_slots = []
-        self._engine_mode = True
         self._clashes = clashes or {}
         self._assign_stream_colors(cells, by_slot=True)
         self._size_cds_columns(cells, self._cds_label(1))
@@ -430,7 +415,7 @@ class GridView(QGraphicsView):
             by_row.setdefault(c["row"], []).append(c)
             self._cell_at.setdefault((c["row"], c["col"]), []).append(c)
         for r in range(rows):
-            self._draw_row(r, by_row.get(r, []), cols, {})
+            self._draw_row(r, by_row.get(r, []), {})
         # clash markers (X) over the offending cells, contained to the cell region
         for (r, c), kind in self._clashes.items():
             if 0 <= r < rows and 0 <= c < cols:
@@ -465,10 +450,8 @@ class GridView(QGraphicsView):
         self._content_key = None     # scene now holds a TX raster, not a cell grid
         self._scene.clear()
         self._key_hits = []   # swatch rects died with the scene
-        self._engine_mode = False
         self._clashes = {}
         self._dp_display = {}
-        self._sys_slots = []
         self._cell_at = {}
         self._cds_symbol = "CDS"     # a capture raster, not an authored config
         self._col_extra = {}         # ...and a uniform grid
@@ -552,9 +535,9 @@ class GridView(QGraphicsView):
             else:
                 ytop, h = y0, _HALF
         pen = QPen(_CLASH_COLOR.get(kind, _CLASH_COLOR["bus"]), 2)
-        m = 2
-        self._scene.addLine(x + m, ytop + m, x + _CW - m, ytop + h - m, pen)
-        self._scene.addLine(x + _CW - m, ytop + m, x + m, ytop + h - m, pen)
+        m, w = 2, self._colw(c)                 # a widened CDS column's own width
+        self._scene.addLine(x + m, ytop + m, x + w - m, ytop + h - m, pen)
+        self._scene.addLine(x + w - m, ytop + m, x + m, ytop + h - m, pen)
 
     # ---- geometry ----
     def _finalize_scene(self, reset_scroll: bool = False) -> None:
@@ -578,12 +561,14 @@ class GridView(QGraphicsView):
 
     # ---- column geometry: every column is _CW WIDE EXCEPT the CDS run ----
     #
-    # Only the columns that carry a long CDS label widen (`CDS_SPx` needs 58 px in a 44 px
-    # cell); the rest stay _CW, so the grid still fits 32 columns on screen.
+    # Only the columns that carry a long CDS label widen (a flags line such as `SPx EDEx` needs
+    # 58 px in a 44 px cell); the rest stay _CW, so the grid still fits 32 columns on screen.
     #
-    # `_col_extra` maps a column index to the pixels it gains, and `_col_off` is its running
-    # prefix sum so `_cx` stays O(1). Both are rebuilt per render (see `_size_cds_columns`) and
-    # empty by default, so a path that widens nothing draws a uniform grid.
+    # `_col_extra` maps a column index to the pixels it gains, and `_col_off` sums the entries
+    # before a column on each call: only the CDS run widens, so the sum is over a few entries,
+    # and with none widened `_cx` does no sum. `_col_extra` is rebuilt per render (see
+    # `_size_cds_columns`) and empty by default, so a path that widens nothing draws a uniform
+    # grid.
     def _cx(self, c: int) -> float:
         return _ROWHDR_W + c * _CW + self._col_off(c)
 
@@ -688,11 +673,10 @@ class GridView(QGraphicsView):
         return int(d.get("display_fields", 6)), bool(d.get("handover", True))
 
     # ---- per-row drawing (merge + dispatch) ----
-    def _draw_row(self, r: int, row_cells: List[dict], cols: int,
-                  cds_labels: dict) -> None:
+    def _draw_row(self, r: int, row_cells: List[dict], cds_labels: dict) -> None:
         # CDS full-height cells — merge consecutive CDS columns into one "CDS"
         # (or "CDS x{n}") cell with bit dividers, like the Visualizer. The base symbol
-        # is "CDS_SP" instead when the config drives the CDS passively (see _cds_symbol).
+        # carries a flags line when the config sets CDS drive flags (see _cds_symbol).
         cds_cols = sorted(c["col"] for c in row_cells if c["is_cds"])
         i = 0
         while i < len(cds_cols):
@@ -755,24 +739,6 @@ class GridView(QGraphicsView):
                 self._draw_segment(r, cell, n, is_src, df)
                 i += n
 
-        # Interface CDS-block system slots (explicitly supplied by the caller). In
-        # engine mode the model already supplies CDS/S0/S1/HANDOVER bits, so nothing
-        # is synthesized here. Handover turnarounds are NOT drawn for a decoded
-        # (analyzer) grid — they are a Visualizer-only annotation, emitted by the
-        # engine (set_bus_model) as _HANDOVER cells when the config enables them.
-        if not self._engine_mode:
-            for col, kind in self._sys_slots:
-                if not (0 <= col < cols):
-                    continue
-                if kind == "handover":
-                    self._handover(r, col)
-                elif kind == "tail":
-                    self._sys_tail(r, col)
-                elif kind == "guard":
-                    self._sys_full(r, col, "G0")
-                else:                                  # 'cds'
-                    self._sys_full(r, col, self._cds_label(1), is_cds=True)
-
     def _cds_label(self, n: int) -> str:
         """The CDS cell's label for a run of `n` merged columns.
 
@@ -784,18 +750,6 @@ class GridView(QGraphicsView):
         if n > 1:
             head = f"{head} x{n}"
         return f"{head}\n{flags}" if flags else head
-
-    def _sys_full(self, r: int, col: int, label: str, *, is_cds: bool = False) -> None:
-        # `is_cds` is PASSED, not inferred from the label, which may be "CDS" or "CDS_SP".
-        cell = {"row": r, "col": col, "is_cds": is_cds, "slot": 0,
-                "dp": -1, "channel": -1, "is_source": True}
-        self._full_cell(r, col, 0, _BG, label, _LABEL, cell)
-
-    def _sys_tail(self, r: int, col: int) -> None:
-        """Full-height CDS/S1 tail: the decaying ringing 'rail' symbol."""
-        cell = {"row": r, "col": col, "is_cds": False, "slot": _TAIL, "dp": -1,
-                "channel": -1, "is_source": True}
-        self._tail(r, col, 0, True, _BG, cell)
 
     def _draw_cds_system(self, r: int, cells: List[dict]) -> None:
         """Draw the CDS system guard/tail cells for a row, SPLIT into a Manager band
@@ -952,14 +906,15 @@ class GridView(QGraphicsView):
     def _data_label(cell: dict, df: int, n: int) -> str:
         """Port of BitSlotData.to_label + the renderer's test-mode / merge suffix.
         TxPresent and DRQ have fixed labels; DATA honours the display fields, with
-        the Bit field replaced by T1/T0 in test mode and an 'xN' suffix only when
-        the Bit field is shown (wide-bit replay)."""
+        the Bit field replaced by T0 in Test0 (PortMode 2) or T1 in Test1 (PortMode 3),
+        and an 'xN' suffix only when the Bit field is shown (wide-bit replay)."""
         slot = cell["slot"]
         if slot == _TXP:
             return f"TxP{cell['channel']}"
         if slot == _DRQ:
             return "DRQ"
-        testind = {2: "T1", 3: "T0"}.get(cell.get("port_mode", 0))
+        level = port_mode_bit(cell.get("port_mode", 0))
+        testind = None if level is None else f"T{level}"
         parts = []
         if df & 1:
             parts.append(f"S{cell['sample']}")
@@ -996,13 +951,13 @@ class GridView(QGraphicsView):
         y = self._cy(r) + (0 if is_src else _HALF)
         w = (extra + 1) * _CW
         rect = self._scene.addRect(QRectF(x, y, w, _HALF), QPen(_LINE, 1), QBrush(color))
-        self._diff(rect, cell)
+        self._set_tooltip(rect, cell)
         self._bit_dividers(x, y, _HALF, extra, c)
         if scrambler:
             # scrambler indicator: a black square flush in the cell's top-left
             # corner (touching the top and left borders) per scrambled bit column
             for k in range(extra + 1):
-                sx = x + self._span_w(c, k)
+                sx = self._cx(c + k)
                 self._scene.addRect(QRectF(sx, y, 6, 6),
                                     QPen(Qt.NoPen), QBrush(QColor(0, 0, 0)))
         if label:
@@ -1014,7 +969,7 @@ class GridView(QGraphicsView):
         y = self._cy(r)
         w = self._span_w(c, extra + 1)
         rect = self._scene.addRect(QRectF(x, y, w, _RH), QPen(_LINE, 1), QBrush(fill))
-        self._diff(rect, cell)
+        self._set_tooltip(rect, cell)
         self._bit_dividers(x, y, _RH, extra, c)
         if label:
             self._text(label, x, y, w, _RH, ink)
@@ -1037,7 +992,7 @@ class GridView(QGraphicsView):
             h, fill = _HALF, color
         w = self._span_w(c, cols)
         rect = self._scene.addRect(QRectF(x, y0, w, h), QPen(_LINE, 1), QBrush(fill))
-        self._diff(rect, cell)
+        self._set_tooltip(rect, cell)
         if label:
             self._text(label, x + 1, y0, _CW * 0.40, h, _LABEL)
         # zigzag with exponentially decaying amplitude, starting after any label
@@ -1060,10 +1015,8 @@ class GridView(QGraphicsView):
         for a, b in zip(pts, pts[1:]):
             self._scene.addLine(a[0], a[1], b[0], b[1], pen)
 
-    def _diff(self, rect, cell: dict) -> None:
-        diff = cell.get("diff")
-        if diff and diff in _DIFF_PEN:
-            rect.setPen(QPen(_DIFF_PEN[diff], 2))
+    def _set_tooltip(self, rect, cell: dict) -> None:
+        """Give the cell's item a tooltip naming its row, column and what it carries."""
         tip = f"row {cell['row']}, col {cell['col']}"
         if cell.get("is_cds"):
             tip += ": CDS"
@@ -1084,8 +1037,8 @@ class GridView(QGraphicsView):
     def _handover(self, r: int, c: int) -> None:
         """Two short arrows with filled heads (Visualizer _draw_handover): top →
         in the source half, bottom ← in the sink half. Emitted only for the
-        Visualizer engine grid (set_bus_model _HANDOVER cells) and explicit system
-        slots — never synthesized for a decoded (analyzer) grid."""
+        Visualizer engine grid (set_bus_model _HANDOVER cells) — never synthesized for
+        a decoded (analyzer) grid."""
         x = self._cx(c)
         y0 = self._cy(r)
         pen = QPen(_LABEL, 1.4)
@@ -1237,8 +1190,12 @@ class GridView(QGraphicsView):
         self._scene.addPath(path, pen).setZValue(51)
 
     def export_image(self, path: str) -> str:
-        """Render the current grid scene to PNG (.png) or SVG (.svg)."""
-        from PySide6.QtCore import QSize
+        """Render the current grid scene to SVG (a path ending in .svg) or PNG (any other
+        path, whatever its suffix; a raster over `_MAX_PNG_BYTES` is refused). The image is
+        rendered in memory and written whole (`fsutil.write_whole`), so a failure leaves an
+        existing file at `path` as it was. Returns `path`; raises OSError when nothing was
+        written."""
+        from PySide6.QtCore import QBuffer, QIODevice, QSize
         from PySide6.QtGui import QImage, QPainter
 
         rect = self._scene.itemsBoundingRect()
@@ -1248,11 +1205,15 @@ class GridView(QGraphicsView):
         rect = rect.adjusted(-margin, -margin, margin, margin)
         if path.lower().endswith(".svg"):
             from PySide6.QtSvg import QSvgGenerator
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
             gen = QSvgGenerator()
-            gen.setFileName(path)
+            gen.setOutputDevice(buf)
             gen.setSize(QSize(int(rect.width()) + 1, int(rect.height()) + 1))
             gen.setViewBox(QRectF(0, 0, rect.width(), rect.height()))
             painter = QPainter(gen)
+            if not painter.isActive():
+                raise OSError(f"Cannot write {path}")
             # Fill the theme background first — QSvgGenerator doesn't paint the scene's
             # background brush, so without this the SVG has a transparent (viewer-white)
             # background while the content is themed for the current mode, giving a
@@ -1260,12 +1221,26 @@ class GridView(QGraphicsView):
             painter.fillRect(QRectF(0, 0, rect.width(), rect.height()), _BG)
             self._scene.render(painter, QRectF(), rect)
             painter.end()
+            data = bytes(buf.data())
+            if not data:
+                raise OSError(f"Cannot write {path}")
         else:
-            img = QImage(int(rect.width()) + 1, int(rect.height()) + 1,
-                         QImage.Format_ARGB32)
+            w, h = int(rect.width()) + 1, int(rect.height()) + 1
+            if w * h * 4 > _MAX_PNG_BYTES:
+                raise OSError(f"The grid is {w} x {h} pixels, too large for a PNG; "
+                              "export it as SVG or draw fewer rows")
+            img = QImage(w, h, QImage.Format_ARGB32)
+            if img.isNull():
+                raise OSError(f"Not enough memory for a {w} x {h} pixel PNG; "
+                              "export it as SVG or draw fewer rows")
             img.fill(_BG)
             painter = QPainter(img)
             self._scene.render(painter, QRectF(), rect)
             painter.end()
-            img.save(path)
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            if not img.save(buf, "PNG"):
+                raise OSError(f"Cannot write {path}")
+            data = bytes(buf.data())
+        write_whole(path, lambda f: f.write(data), mode="wb")
         return path
