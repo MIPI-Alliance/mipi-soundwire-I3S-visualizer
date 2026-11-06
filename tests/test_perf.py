@@ -12,6 +12,7 @@ Run: PYTHONPATH=. python3 -m pytest -m perf tests/test_perf.py
 import gc
 import os
 import pathlib
+import sys
 import tempfile
 import time
 
@@ -25,10 +26,9 @@ from swi3s_studio.ingest import digital_csv
 pytestmark = pytest.mark.perf
 
 
-# GitHub's shared runners (GITHUB_ACTIONS=true) run the two whole-window cascades below at
-# about 2.2x a Mac's time, so they get their own ceilings, at ~2x the medians the
-# `perf margins` section prints there (Link switch ~770 ms, cursor move ~118 ms). The cliffs
-# the tests exist for cost 2.5-4x.
+# GitHub's shared runners (GITHUB_ACTIONS=true) run the two whole-window cascades below
+# slower than a development machine, so they get their own ceilings; the medians are in the
+# `perf margins` section.
 _SHARED_RUNNER = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
@@ -91,7 +91,7 @@ def test_engine_build_ceiling():
 
 
 def test_digital_csv_import_ceiling():
-    """Vectorized digital-CSV import over ~100k rows — guards channel_transition_counts +
+    """Vectorized digital-CSV import over ~100k rows — guards scan +
     infer_sample_rate + load_capture (all vectorized, no per-row Python loops)."""
     n = 100_000
     with tempfile.TemporaryDirectory() as d:
@@ -101,7 +101,7 @@ def test_digital_csv_import_ceiling():
             f.writelines(f"{s / _RATE:.12g},{s & 1},{(s // 3) & 1}\n" for s in range(n))
 
         def run():
-            digital_csv.channel_transition_counts(p)
+            digital_csv.scan(p)
             digital_csv.infer_sample_rate(p)
             digital_csv.load_capture(p, clock_col=1, data_col=2)
 
@@ -114,7 +114,7 @@ def test_digital_csv_import_ceiling():
 # O(active/#edges).
 # It hides from the other perf tests because they use tiny captures — these use a large
 # SYNTHETIC capture (edges only, no decode) so the O(#UIs) path is unmistakably slow
-# while the correct O(#edges) path stays sub-second. See the maintainers' performance notes.
+# while the correct O(#edges) path stays sub-second.
 
 _BIG_UIS = 30_000_000     # clock edges (≈ UIs); big enough that an O(#UIs) scan is seconds
 
@@ -133,17 +133,18 @@ def _big_capture():
 
 def test_link_control_decode_ceiling():
     """Cold/Warm-start detection must read only a bounded PREFIX of the edges — a bring-up
-    is a few dozen slow pulses at the very start. Over 30M edges the prefix scan is ~1ms;
-    a full sort/scan of the capture (both orientations) is ~1s+."""
+    is a few dozen slow pulses at the very start. The cost is independent of the capture's
+    length."""
     from swi3s_studio.analysis.link_control import decode_link_control
     dt = _elapsed(lambda: decode_link_control(_big_capture()))
-    assert dt < 0.5, f"decode_link_control took {dt:.2f}s (ceiling 0.5s) — scanning all edges again?"
+    assert dt < 0.5, (f"decode_link_control took {dt:.2f}s (ceiling 0.5s) — "
+                      "decode_link_control must not scan every edge")
 
 
 def test_tx_persist_columns_ceiling():
     """TX-map persistence must scan the region's DATA EDGES (O(#edges)), never every UI
-    with np.logical_or.at. Drive the scan over a 30M-UI region with sparse data edges: the
-    correct path is <0.1s, an O(#UIs) regression is several seconds. (A throwaway demo
+    with np.logical_or.at. Drive the scan over a 30M-UI region with sparse data edges; the
+    cost follows the data edges, not the UI count. (A throwaway demo
     session's capture/segment is swapped for the big synthetic one — tx_persist_columns
     only reads those two.)"""
     from swi3s_studio.session import Session
@@ -155,7 +156,8 @@ def test_tx_persist_columns_ceiling():
                       "end_sample": int(cap.clock_edges[-1]), "row_base": 0}]
     sess._tx_persist_cache = {}
     dt = _elapsed(lambda: sess.tx_persist_columns(int(cap.clock_edges[100])))
-    assert dt < 1.5, f"tx_persist_columns took {dt:.2f}s (ceiling 1.5s) — scanning every UI again?"
+    assert dt < 1.5, (f"tx_persist_columns took {dt:.2f}s (ceiling 1.5s) — "
+                      "tx_persist_columns must not scan every UI")
 
 
 def test_command_filter_first_keystroke_ceiling():
@@ -165,11 +167,11 @@ def test_command_filter_first_keystroke_ceiling():
     row-text cache is cold after set_commands/set_peripheral_maps — so the first character
     typed into Filter ▸ Expression renders the whole table on the GUI thread, after every
     load, re-decode and Clear All Filters. The row string is built via _display_text (no
-    QModelIndex, no role dispatch), ~10x cheaper than self.data(self.index(row, col)) for
-    all twelve columns.
+    QModelIndex, no role dispatch), not through self.data(self.index(row, col)) for all
+    twelve columns.
 
     A CEILING, NOT A BENCHMARK: generous enough for a loaded runner, tight enough to catch
-    the index+role path (~6 s at 50k rows).
+    a row string built through the index and role path at 50k rows.
     """
     from PySide6.QtWidgets import QApplication
 
@@ -194,8 +196,8 @@ def test_command_filter_first_keystroke_ceiling():
     assert proxy.rowCount() > 0, "the filter matched nothing — the measurement is hollow"
     assert dt < 3.0, (
         f"the first filter keystroke took {dt:.2f}s over {rows:,} commands (ceiling 3s). "
-        "Rebuilding the row cache through data()/index() per cell costs ~2.9s here and "
-        "~11.5s at 200k — on the GUI thread.")
+        "The row cache must be built through _display_text, not data()/index() per cell, "
+        "which runs on the GUI thread.")
 
 
 def test_guard_suppressing_build_stays_linear_in_rows():
@@ -239,7 +241,7 @@ def test_guard_suppressing_build_stays_linear_in_rows():
         ratio = large / max(small, 1e-3)
         assert ratio < 8.0, (
             f"4x the rows cost {ratio:.1f}x the time ({small:.2f}s -> {large:.2f}s): the "
-            "per-removal rebuild of bus_model.bits looks to be back")
+            "cost must stay linear: bus_model.bits must not be rebuilt per removal")
     finally:
         logging.disable(logging.NOTSET)
 
@@ -250,8 +252,8 @@ def test_low_entropy_locate_ceiling():
     A constant (never-toggling) sub-pattern makes almost every offset in the main capture an
     exact match, which without a cap on collected hits is O(N * hits). tests/test_subcapture.py
     keeps a LOOSE bound in the default suite — a hang is worth catching on every config — and
-    the ceiling that would actually notice a slowdown lives here, where runner jitter cannot
-    redden an ordinary run.
+    the ceiling that would notice a slowdown lives here, where runner jitter cannot redden an
+    ordinary run. The ceiling is a cliff detector, set per platform class.
     """
     import numpy as np
 
@@ -265,16 +267,23 @@ def test_low_entropy_locate_ceiling():
     sub_clk = (np.arange(1, 601, dtype=np.int64) * 2).astype(np.uint64)
     sub = Capture(clock_edges=sub_clk, data_edges=np.zeros(0, dtype=np.uint64),
                   initial_clock=False, initial_data=False, sample_rate_hz=1_000_000)
-    sub_no_match = Capture(clock_edges=sub_clk, data_edges=sub_clk,
-                           initial_clock=False, initial_data=True,
+    # A data line that toggles a sample after every clock edge matches nothing in `main` (whose
+    # data line is constant) and is not the complement of its clock (a PHY3 pair is refused).
+    sub_no_match = Capture(clock_edges=sub_clk, data_edges=sub_clk + np.uint64(1),
+                           initial_clock=False, initial_data=False,
                            sample_rate_hz=1_000_000)
 
+    found = {}
+
     def both():
-        locate_subcapture(main, sub)              # the exact-match path (capped)
-        locate_subcapture(main, sub_no_match)     # the seed path (no matches)
+        found["exact"] = locate_subcapture(main, sub)              # the exact-match path (capped)
+        found["none"] = locate_subcapture(main, sub_no_match)      # the seed path (no matches)
 
     dt = _elapsed(both)
-    assert dt < 15.0, f"low-entropy locate took {dt:.2f}s (ceiling 15s) — perf regression?"
+    assert found["exact"] and all(m["score"] == 1.0 for m in found["exact"]), (
+        "the constant sub-pattern matched nothing: the exact-match path was not timed")
+    assert found["none"] == [], "the toggling sub-pattern matched: the seed path was not timed"
+    assert dt < 1.0, f"low-entropy locate took {dt:.2f}s (ceiling 1s) — perf regression?"
 
 
 def test_decoded_samples_rebuild_ceiling():
@@ -320,7 +329,7 @@ def test_tx_persist_inline_threshold_stays_inline():
 
     TX-map persistence scans a whole config region. main_window computes it on the GUI
     thread when the region is at or below this many UIs and on a worker thread above, so
-    the constant IS the freeze a cursor move can cause. The scan measures ~32 ns/UI.
+    the constant IS the freeze a cursor move can cause.
 
     This drives the scan over a region of exactly the threshold size and holds it to a
     ceiling a user would not notice, so raising the constant reddens the gate. The ceiling
@@ -355,16 +364,16 @@ def test_tx_persist_inline_threshold_stays_inline():
 def test_cursor_move_budget_with_every_dock_visible():
     """The WHOLE cursor cascade, with every dock open.
 
-    Every other ceiling here times one function; this drives the cascade across ten docks:
-    raw view, register replay, command selection, CDS symbols, Decoded Samples, and the bus
-    grid.
+    Every other ceiling here times one function; this drives the cascade across every dock,
+    all ten of them visible: raw view, register replay, command selection, CDS symbols,
+    Decoded Samples, and the bus grid among them.
 
     THE FIXTURE SIZE IS THE POINT: on a small demo a capture-PROPORTIONAL per-move cost
-    barely registers. from_demo(20000) costs ~1.9 s to build and lands at 10.2 M UIs / 408
-    commands / 3 config regions, the scale of a multi-second real capture.
+    barely registers. from_demo(20000) holds over 5 M UIs and more than one config region,
+    the scale of a multi-second real capture; the test asserts both.
 
-    Baseline here is 29.8-31.0 ms median / 38.5-38.8 ms worst, stable to ~1 ms across runs,
-    so the ceilings sit at ~4x and ~6x. That headroom is for a slower runner, not for drift.
+    The ceilings are cliff detectors with headroom for a slower runner, not for drift; the
+    medians are in the `perf margins` section.
 
     A KNOWN constant being raised is caught deterministically elsewhere: by
     _SAMPLE_HALF_WINDOW <= 1000 in test_decoded_samples_rebuild_ceiling and by the counts in
@@ -389,7 +398,8 @@ def test_cursor_move_budget_with_every_dock_visible():
         d.setVisible(True)
     app.processEvents()
     shown = sum(1 for d in docks if d.isVisible())
-    assert shown >= 5, f"only {shown}/{len(docks)} docks visible — the cascade is not loaded"
+    assert shown == len(docks) >= 10, (
+        f"{shown}/{len(docks)} docks visible — the cascade is not loaded on every dock")
     s = w._session
     assert len(s.capture.clock_edges) > 5_000_000, (
         f"fixture is only {len(s.capture.clock_edges):,} UIs — too small for a "
@@ -412,20 +422,17 @@ def test_cursor_move_budget_with_every_dock_visible():
     times.sort()
     median, worst = times[len(times) // 2], times[-1]
     ceiling, worst_ceiling = (0.24, 0.5) if _SHARED_RUNNER else (0.12, 0.25)
-    base, worst_base = ("~118", "~143") if _SHARED_RUNNER else ("~30", "~39")
     record_perf("cursor move", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
         f"median cursor move {median * 1000:.0f} ms across {shown} visible docks over "
-        f"{len(ce):,} UIs (ceiling {ceiling * 1000:.0f} ms, baseline {base} ms; worst "
+        f"{len(ce):,} UIs (ceiling {ceiling * 1000:.0f} ms; worst "
         f"{worst * 1000:.0f} ms). "
         "Something on the cascade is doing work proportional to the capture on the GUI "
         "thread — see tests/test_cursor_cost.py for which counts to check first.")
     assert worst < worst_ceiling, (
-        f"worst cursor move {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms, "
-        f"baseline {worst_base} ms), median "
-        f"{median * 1000:.0f} ms. A single move stalling while the rest are fast is a COLD "
-        "path — a first-visit scan running inline instead of on a worker "
-        "(_TX_PERSIST_SYNC_MAX_UIS) is the shape that did this before.")
+        f"worst cursor move {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms), "
+        f"median {median * 1000:.0f} ms. A single move stalling while the rest are fast is a COLD "
+        "path — a first-visit scan must run on a worker (_TX_PERSIST_SYNC_MAX_UIS), not inline.")
 
 
 
@@ -437,12 +444,11 @@ def test_link_switch_budget_with_every_dock_visible():
     store's gap-split envelope windows) are pinned DETERMINISTICALLY by counts in
     tests/test_links_gui.py, because a ceiling loose enough for a shared runner cannot see
     them. This is the cliff detector for what those counts do not cover, a new O(capture)
-    step on the bind. Ceilings at ~3x the measured median / ~4x the worst.
+    step on the bind. The ceilings are cliff detectors; the medians are in the `perf margins`
+    section.
 
-    WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. The same bind measures ~770 ms median
-    there, with a worst of up to ~2.2 s; ~2x the Windows median still catches the cliff,
-    which costs 2.5-4x. A shared GitHub runner (_SHARED_RUNNER) gets the same ceilings, from
-    the ~770 ms medians it measures.
+    WINDOWS GETS ITS OWN CEILINGS, 1.5 s / 2.4 s. A shared GitHub runner (_SHARED_RUNNER)
+    gets the same ceilings.
     """
     import sys
     import time
@@ -463,6 +469,8 @@ def test_link_switch_budget_with_every_dock_visible():
     for d in docks:
         d.setVisible(True)
     app.processEvents()
+    hidden = [d.objectName() for d in docks if not d.isVisible()]
+    assert not hidden, f"docks not visible, so the switch does not bind them: {hidden}"
     for i in (0, 1):                                    # first shows build the caches
         w.switch_link(i)
         app.processEvents()
@@ -476,16 +484,15 @@ def test_link_switch_budget_with_every_dock_visible():
     median, worst = times[len(times) // 2], times[-1]
     slow = sys.platform == "win32" or _SHARED_RUNNER
     ceiling, worst_ceiling = (1.5, 2.4) if slow else (0.75, 1.2)
-    base, worst_base = ("~770", "~820") if slow else ("~345", "~365")
     record_perf("Link switch", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
-        f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms, "
-        f"baseline {base} ms; worst {worst * 1000:.0f} ms). Something on the bind is doing "
+        f"median Link switch {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms; "
+        f"worst {worst * 1000:.0f} ms). Something on the bind is doing "
         "work proportional to the capture — check the counts in tests/test_links_gui.py "
         "first.")
     assert worst < worst_ceiling, (
-        f"worst Link switch {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms, "
-        f"baseline {worst_base} ms), median {median * 1000:.0f} ms.")
+        f"worst Link switch {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms), "
+        f"median {median * 1000:.0f} ms.")
 
 _SAL_WRITER = r"""
 import json, sys, zipfile
@@ -543,15 +550,13 @@ print(json.dumps({"predicted": cost.est_peak_bytes, "before": before, "peak": pe
 def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     """est_peak_bytes is a PREDICTION OF RSS; this compares it to a measured RSS.
 
-    Build a .sal, load it whole in a clean subprocess, and compare the prediction against
-    that process's own peak RSS. Two bounds, and the directions mean different things:
-      * predicted >= actual -- the guard must never promise a load will fit and be wrong.
-        The bare sum (a transient of 1, i.e. _STREAM_TRANSIENT missing from the whole-file
-        branch) predicts 0.18 GB where this fixture measures 0.20 GB.
+    Build a .sal (10M transitions per channel), load it whole in a clean subprocess, and
+    compare the prediction against that process's own peak RSS. Two bounds, and the
+    directions mean different things:
+      * predicted >= actual -- the guard must never promise a load will fit and be wrong,
+        so the whole-file branch must carry _STREAM_TRANSIENT, not the bare sum.
       * predicted <= 3x actual -- the guard must not refuse loads that would have fitted,
-        which is the failure mode of "just multiply everything by a big number". A
-        whole-file transient of 4 is 3.2x and trips it.
-    Measured pred/actual: 1.67 here (10M transitions per channel).
+        which is the failure mode of "just multiply everything by a big number".
     """
     import json
     import subprocess
@@ -590,8 +595,7 @@ def test_the_peak_estimate_matches_a_measured_load(tmp_path):
     assert predicted >= actual, (
         f"est_peak_bytes predicted {predicted / 1e9:.3f} GB but the load actually took "
         f"{actual / 1e9:.3f} GB ({actual / predicted:.2f}x). The guard UNDER-predicts, so it "
-        "will let a capture through that does not fit — that is how a 20.29 GB prediction "
-        "reached ~60 GB resident. The transient belongs on the edge term "
+        "will let a capture through that does not fit. The transient belongs on the edge term "
         "(uncompressed + est_edge_bytes * _STREAM_TRANSIENT).")
     assert predicted <= 3 * actual, (
         f"est_peak_bytes predicted {predicted / 1e9:.3f} GB for a load that took "
@@ -603,11 +607,11 @@ def test_zoom_and_pan_budget():
     """Wheel-zoom and pan on a timeline ribbon carrying 100k commands.
 
     What a zoom costs is the ribbon's per-pixel tick decimation: a bisect to the view and a
-    vectorised per-column maximum (tests/test_timeline_decimation.py pins the answer):
-    ~2.3 ms median at 100k, ~3 ms at 400k, and ~2 ms zoomed in at any count. The ceilings
-    sit at ~10x that, which a slow shared runner clears and a per-command Python loop
-    (76 ms here) does not. tests/test_timeline_interaction.py
-    pins by COUNT that a zoom moves no cursor and rebuilds no pane, which is the rest.
+    vectorised per-column maximum (tests/test_timeline_decimation.py pins the answer). The
+    ceilings are cliff detectors that a slow shared runner clears and a per-command Python
+    loop does not.
+    tests/test_timeline_interaction.py pins by COUNT that a zoom moves no cursor and rebuilds
+    no pane, which is the rest.
     """
     import time
 
@@ -644,18 +648,17 @@ def test_zoom_and_pan_budget():
     median, worst = times[len(times) // 2], times[-1]
     assert median < 0.025, (
         f"median zoom/pan step {median * 1000:.1f} ms over {n:,} commands (ceiling 25 ms, "
-        f"baseline ~2.3 ms; worst {worst * 1000:.1f} ms): the ribbon's tick decimation is "
-        "doing per-command work again — a Python loop over every command was 76 ms here")
+        f"worst {worst * 1000:.1f} ms): the ribbon's tick decimation is "
+        "doing per-command work; the decimation must not loop over every command")
     assert worst < 0.05, (
-        f"worst zoom/pan step {worst * 1000:.1f} ms (ceiling 50 ms, baseline ~3 ms)")
+        f"worst zoom/pan step {worst * 1000:.1f} ms (ceiling 50 ms)")
 
 
 def test_the_widest_line_weight_paints_within_budget(monkeypatch):
     """Preferences ▸ Waveforms lets the Audio and Capture traces be up to 4 px wide, and a
-    pen wider than 1 px is stroked far more slowly. Measured on the full-size demo (a
-    1400 px wide paint, median of 7): ~16 ms for Audio's four tracks and ~26 ms for Capture
-    at 4 px. The cost is a step from 1 px to anything wider, not a slope. The ceilings sit
-    at ~5x the 4 px figures: a cliff, not drift."""
+    pen wider than 1 px is stroked far more slowly. Each pane is timed on the full-size demo
+    at 4 px, a 1400 px wide paint, median of 7. The cost is a step from 1 px to anything
+    wider, not a slope. The ceilings catch a cliff, not drift."""
     from PySide6.QtWidgets import QApplication
 
     from swi3s_studio.ui import line_style
@@ -689,4 +692,71 @@ def test_the_widest_line_weight_paints_within_budget(monkeypatch):
         times = sorted(_elapsed(fn) for _ in range(7))
         assert times[3] < ceiling, (
             f"{name} paints in {times[3] * 1000:.1f} ms median at 4 px (ceiling "
-            f"{ceiling * 1000:.0f} ms; measured ~16 / ~26 ms for Audio / Capture)")
+            f"{ceiling * 1000:.0f} ms)")
+
+
+def _time_recompute(tv, app, repeats: int = 5) -> tuple:
+    """(median, worst) seconds of `repeats` recomputes of `tv`, each asserted to have computed
+    margins: a recompute refused (a page still loading, an input the model cannot evaluate)
+    returns at once and would time nothing."""
+    times = []
+    assert not tv._loading, "the Timing page is still loading, so a recompute does nothing"
+    for _ in range(repeats):
+        tv._rendered = None
+        t0 = time.perf_counter()
+        tv._recompute()
+        app.processEvents()
+        times.append(time.perf_counter() - t0)
+        assert tv._compute_error == "" and tv._rendered is not None, (
+            f"the recompute computed no margins: {tv._compute_error or 'nothing rendered'}")
+    times.sort()
+    return times[len(times) // 2], times[-1]
+
+
+def test_timing_recompute_budget():
+    """One Timing Calculator recompute: every inequality's worst corner in both columns.
+
+    The corner search evaluates each perturbed row once for all inequalities together
+    (`find_worst_corner_rows_all`), searching alpha and delta jointly with the slews and tau,
+    and each evaluation runs every leg at each device-supply assignment. The ceilings are
+    3.0 s (median) and 4.5 s (worst) on a Mac, and 6.0 s and 9.0 s on Windows and on a shared
+    runner (_SHARED_RUNNER). A page with a SoundWire Peripheral is timed
+    separately, against its own ceilings of 7.0 s and 10.0 s (13.0 s and 18.0 s on Windows and
+    on a shared runner). The `perf margins` section prints the medians.
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.timing.spec_source import is_soundwire
+    from swi3s_studio.ui.timing_view import TimingView
+
+    app = QApplication.instance() or QApplication([])
+    tv = TimingView()
+    tv.show()
+    app.processEvents()
+    slow = sys.platform == "win32" or _SHARED_RUNNER
+    ceiling, worst_ceiling = (6.0, 9.0) if slow else (3.0, 4.5)
+    median, worst = _time_recompute(tv, app)
+    record_perf("Timing recompute", median, ceiling, worst, worst_ceiling)
+    assert median < ceiling, (
+        f"median Timing recompute {median * 1000:.0f} ms (ceiling {ceiling * 1000:.0f} ms): "
+        "the worst-corner search must evaluate each perturbed row once for all inequalities")
+    assert worst < worst_ceiling, (
+        f"worst Timing recompute {worst * 1000:.0f} ms (ceiling {worst_ceiling * 1000:.0f} ms)")
+
+    combo = tv._per_spec_combo
+    index = combo.findData("SW13_1V2")
+    assert index >= 0, "the Peripheral spec list has no SW13_1V2 entry to time"
+    combo.setCurrentIndex(index)
+    app.processEvents()
+    assert is_soundwire(combo.currentData()), "the SoundWire Peripheral page is not selected"
+    slow = sys.platform == "win32" or _SHARED_RUNNER
+    ceiling, worst_ceiling = (13.0, 18.0) if slow else (7.0, 10.0)
+    median, worst = _time_recompute(tv, app)
+    record_perf("Timing recompute (SoundWire Peripheral)", median, ceiling, worst, worst_ceiling)
+    assert median < ceiling, (
+        f"median Timing recompute with a SoundWire Peripheral {median * 1000:.0f} ms "
+        f"(ceiling {ceiling * 1000:.0f} ms)")
+    assert worst < worst_ceiling, (
+        f"worst Timing recompute with a SoundWire Peripheral {worst * 1000:.0f} ms "
+        f"(ceiling {worst_ceiling * 1000:.0f} ms)")
+    tv.close()

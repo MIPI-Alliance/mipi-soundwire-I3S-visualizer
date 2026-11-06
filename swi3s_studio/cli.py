@@ -9,24 +9,23 @@ of them. The parser lives here too, so the whole surface is testable without Qt.
     swi3s-studio -c config.csv                   # open a config CSV in Bus-Visualizer mode
     swi3s-studio -c config.csv -o model.json     # headless: write the bus model, no window
 
-`-o` writes the BUS model (`BusModelJSONEncoder`), which `JSONHandler.load_bus_model`
-round-trips. `save_frame_model` still exists for the legacy shape; nothing here emits it.
+`-o` writes the BUS model (`BusModelJSONEncoder`), a summary `JSONHandler.load_bus_model`
+reads back: each bit's position, slot, direction, device, port, sample, channel, bit and
+clash, the clash and read-overlap lists, and the truncation/validation port lists. It does
+not carry a bit's port mode, scrambler flag or display fields.
 `-o` requires `-c`, and the parser reports a missing `-c` with usage attached.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import logging
 import os
 import sys
 
 _EXIT_OK = 0
 _EXIT_ERROR = 1
 _EXIT_CRITICAL = 2      # a model was written, but it contains a bus clash / truncated DRQ
-
-# The same ceiling the UI's Export applies to RowsToDraw (main_window.export_frame_json). A CSV
-# may ask for any number of rows and the model is built row by row. Clamped rather than
-# refused, and REPORTED when it applies.
-_MAX_ROWS = 1024
 
 
 class _Parser(argparse.ArgumentParser):
@@ -50,17 +49,20 @@ def program_name() -> str:
       ./run.sh / .\\run.ps1     -> "run.sh" / ".\\run.ps1"   (the launcher exports it)
       swi3s-studio             -> "swi3s-studio"           (argv[0] IS the console script)
       python -m swi3s_studio.app -> "python -m swi3s_studio.app"
+      python -m swi3s_studio     -> "python -m swi3s_studio"
 
-    Under `python -m`, argv[0] is the full path to app.py, so argparse's own default would
-    print `usage: app.py …`.
+    Under `python -m`, argv[0] is the full path to app.py or __main__.py, so argparse's own
+    default would print `usage: app.py …` or `usage: __main__.py …`.
     """
     launcher = os.environ.get("SWI3S_LAUNCHER", "").strip()
     if launcher:
         return launcher
     argv0 = sys.argv[0] if sys.argv else ""
     # `python -m pkg.mod` sets argv[0] to the module's own file path.
-    if not argv0 or argv0.endswith((os.sep + "app.py", "/app.py", "app.py")):
-        exe = os.path.basename(sys.executable) or "python3"
+    exe = os.path.basename(sys.executable) or "python3"
+    if os.path.basename(argv0) == "__main__.py":
+        return f"{exe} -m swi3s_studio"
+    if not argv0 or os.path.basename(argv0) == "app.py":
         return f"{exe} -m swi3s_studio.app"
     return os.path.basename(argv0)
 
@@ -74,12 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
                "truncated DRQ).",
     )
     p.add_argument("-c", "--config", metavar="FILE",
-                   help="Input v2.0 CSV configuration file")
+                   help="Visualizer config CSV file to open (or to build the bus model from "
+                        "with -o)")
     p.add_argument("-o", "--output", metavar="FILE",
                    help="Output bus model to JSON file (implies headless mode; requires -c)")
-    p.add_argument("--demo", action="store_true", help="Open the synthetic demo capture")
-    p.add_argument("--demo-bringup", action="store_true",
-                   help="Open the demo capture with a §5.1.2 Cold Start")
+    p.add_argument("--demo", action="store_true",
+                   help="Open the synthetic PHY2 demo capture (one Link, with a §5.1.2 Cold "
+                        "Start)")
+    p.add_argument("--demo-bringup", action="store_true", help="Same as --demo")
     return p
 
 
@@ -96,6 +100,17 @@ def parse(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return args, [argv[0], *rest]
 
 
+@contextlib.contextmanager
+def _logging_silenced():
+    """Suppress every log record inside the block, restoring the prior threshold after."""
+    prior = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(prior)
+
+
 def run_headless(config: str, output: str, out=None) -> int:
     """Build the bus model from `config` and write it to `output` as JSON.
 
@@ -107,31 +122,38 @@ def run_headless(config: str, output: str, out=None) -> int:
         print(f"error: configuration file not found: {config}", file=sys.stderr)
         return _EXIT_ERROR
 
-    from .model.viz_engine import build_bus_model, issues_from_model
+    from .model.viz_engine import MAX_AUTHORED_ROWS, build_bus_model, issues_from_model
     from .swviz.io.csv_handler import CSVHandler
     from .swviz.io.json_handler import JSONHandler
     from .swviz.models.interface import Interface
     from .swviz.viz import VizConfig
 
-    # Read RowsToDraw first so the clamp can be REPORTED rather than applied behind the
-    # caller's back. Parsing the CSV twice is cheap next to building the model. A CSV that
-    # does not load is reported by build_bus_model below, so the probe only reads rows from
-    # a successful load.
+    # RowsToDraw is clamped to 1..MAX_AUTHORED_ROWS, the range the UI applies. Read it first
+    # so the clamp can be REPORTED rather than applied behind the caller's back. Parsing the
+    # CSV twice is cheap next to building the model. A CSV that does not load is reported by
+    # build_bus_model below, so the probe only reads rows from a successful load. The probe's
+    # log output is silenced and so is the build of a CSV the probe could not load, so the
+    # handler's message reaches the caller once, in the error line.
     rows: int | None = None
+    unloadable = False
     try:
         probe = VizConfig()
-        loaded = CSVHandler.load_csv(config, Interface(), probe).success
+        with _logging_silenced():
+            loaded = CSVHandler.load_csv(config, Interface(), probe).success
+        unloadable = not loaded
         wanted = int(probe.rows_to_draw)
-        if loaded and wanted > _MAX_ROWS:
-            print(f"note: {config} asks for {wanted} rows; building {_MAX_ROWS} "
-                  f"(the same ceiling the UI's Export applies)", file=sys.stderr)
-            rows = _MAX_ROWS
+        clamped = max(1, min(wanted, MAX_AUTHORED_ROWS))
+        if loaded and clamped != wanted:
+            print(f"note: {config} asks for {wanted} rows; building {clamped} "
+                  f"(the same range the UI's Export applies)", file=sys.stderr)
+            rows = clamped
     except Exception:                                     # noqa: BLE001 - the real load reports
         rows = None
 
     from . import import_notes
     try:
-        with import_notes.collect() as notes:
+        with import_notes.collect() as notes, \
+                (_logging_silenced() if unloadable else contextlib.nullcontext()):
             bus_model, _iface, _viz = build_bus_model(config, rows)
     except Exception as exc:                              # noqa: BLE001 - report, don't traceback
         print(f"error: could not build a model from {config}: {exc}", file=sys.stderr)

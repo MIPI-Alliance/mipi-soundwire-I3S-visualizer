@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from swi3s_studio.ui.mode_controller import ANALYSIS, TIMING, VISUALIZATION
 
+pytestmark = pytest.mark.gui
+
 _BAR = {
     VISUALIZATION: ["Mode", "File", "View", "Help"],
     TIMING: ["Mode", "File", "View", "Help"],
@@ -102,10 +104,10 @@ def test_the_analyzers_menus_and_keys_are_off_elsewhere(win, mode):
     # Preferences is the waveform colours and weights: the Analyzer's, ⌘, included.
     for act in (win._colors_action, win._prefs_action):
         assert not act.isVisible() and not act.isEnabled()
-    # Of the View menu's pane items only Maximize Pane stays, in the Timing Calculator, where
-    # it gives the Timing Inequalities the whole page.
+    # Of the View menu's pane items only Maximize Pane stays: it gives the Timing Inequalities,
+    # or the Visualizer's grid, the whole page.
     shown = [a for a in win._view_pane_actions if a.isVisible()]
-    assert shown == ([win._maximize_action] if mode == TIMING else []), [a.text() for a in shown]
+    assert shown == [win._maximize_action], [a.text() for a in shown]
 
 
 def test_capture_items_wait_for_a_capture(win):
@@ -226,16 +228,27 @@ def test_help_has_the_guide_and_about(win, monkeypatch):
 # ---- where the Links items live ---------------------------------------------------------
 
 def _all_menu_texts(win):
+    """The text of every item under every menu-bar menu, in every mode. The window is left
+    in the mode it was in. Fails when the walk misses the menus (it reaches no Quit)."""
+    from PySide6.QtWidgets import QMenu
+    menus = {m.menuAction(): m for m in win.findChildren(QMenu)}
     out = []
 
     def walk(menu):
         for a in menu.actions():
             out.append(_text(a))
-            if a.menu() is not None:
-                walk(a.menu())
-    for menu in (win._file_menu, win._decode_menu, win._devices_menu, win._audio_menu,
-                 win._view_menu, win._help_menu, win._links_menu):
-        walk(menu)
+            if a in menus and menus[a] is not menu:
+                walk(menus[a])
+    start = win._mode_mgr.current()
+    try:
+        for mode in (VISUALIZATION, TIMING, ANALYSIS):
+            win._mode_mgr.switch_to(mode)
+            for bar_action in win.menuBar().actions():
+                if bar_action in menus:
+                    walk(menus[bar_action])
+    finally:
+        win._mode_mgr.switch_to(start)
+    assert any(t.startswith("Quit") for t in out) and len(out) > 100, out
     return out
 
 
@@ -311,6 +324,23 @@ def test_the_shortcuts_help_spells_modifiers_for_the_platform(win, monkeypatch):
         monkeypatch.setattr(sys, "platform", platform)
         w.show_keyboard_shortcuts()
         assert want in shown[-1] and never not in shown[-1]
+
+
+def test_the_user_guide_is_found_in_an_installed_layout(win, monkeypatch, tmp_path):
+    """With no bundle or checkout copy, the guide is read from
+    <prefix>/share/swi3s-studio/docs/USER_GUIDE.md."""
+    import sys
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    prefix = tmp_path / "prefix"
+    guide = prefix / "share" / "swi3s-studio" / "docs" / "USER_GUIDE.md"
+    guide.parent.mkdir(parents=True)
+    guide.write_text("# Installed guide marker\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    win.show_user_guide()
+    assert win._guide.isVisible() and "Installed guide marker" in win._guide.toPlainText()
+    win._guide.close()
 
 
 def test_the_user_guide_closes_with_the_window(win):
@@ -417,11 +447,14 @@ def test_none_is_kept_per_link_when_switching(analyzer):
     assert analyzer._cmd_proxy.rowCount() == 0 and analyzer._kind_menu._none
 
 
-def test_the_filter_keys_do_nothing_outside_the_analyzer(win):
+def test_the_filter_keys_do_nothing_outside_the_analyzer(analyzer):
+    win = analyzer
     win._mode_mgr.switch_to(VISUALIZATION)
     before = win._cmd_proxy.rowCount()
+    assert before > 0
     _press(win, "Ctrl+5")
     assert win._cmd_proxy.rowCount() == before
+    assert not win._kind_menu._none
 
 
 @pytest.mark.parametrize("platform, items", [
@@ -461,6 +494,76 @@ def test_the_shortcuts_help_lists_the_analyzers_keys_only_in_the_analyzer(win, m
                   "Manual Stream Sync Point", "Waveform settings"):
         assert f"<b>{title}" in here, title               # every Analyzer group, by name
     assert "listed in the Bus Analyzer" not in here
+
+
+def _reachable(action) -> bool:
+    """Whether a QAction's shortcut can fire: it is enabled and visible, and it sits in a
+    menu every one of whose ancestors is shown in the menu bar, or on a visible widget."""
+    from PySide6.QtWidgets import QMenu, QMenuBar, QWidget
+    if not (action.isEnabled() and action.isVisible()):
+        return False
+    for host in action.associatedObjects():
+        if isinstance(host, QMenu):
+            menu, shown = host, True
+            while menu is not None:
+                item = menu.menuAction()
+                if not (item.isVisible() and item.isEnabled()):
+                    shown = False
+                    break
+                owners = item.associatedObjects()
+                if any(isinstance(o, QMenuBar) for o in owners):
+                    break
+                menu = next((o for o in owners if isinstance(o, QMenu)), None)
+                shown = menu is not None
+            if shown:
+                return True
+        elif isinstance(host, QWidget) and not isinstance(host, QMenuBar) and host.isVisible():
+            return True
+    return False
+
+
+def _listed_keys(html: str) -> set:
+    """Every key the shortcuts help names, one entry per key ("1…9" expanded)."""
+    import re
+    from html import unescape
+    keys = set()
+    for cell in re.findall(r"<code>(.*?)</code>", html):
+        for key in unescape(cell).replace("\xa0", " ").strip().split(" / "):
+            m = re.fullmatch(r"(.*)(\d)…(\d)", key.strip())
+            if m:
+                keys.update(f"{m.group(1)}{d}" for d in range(int(m.group(2)),
+                                                              int(m.group(3)) + 1))
+            else:
+                keys.add(key.strip())
+    return keys
+
+
+@pytest.mark.parametrize("mode", [ANALYSIS, TIMING, VISUALIZATION])
+def test_the_shortcuts_help_lists_every_key_active_in_the_mode(win, monkeypatch, mode):
+    """Each mode's help names every shortcut that works there: a reachable menu item's
+    key and an enabled pane key (copy, page) on a pane that is shown."""
+    import sys
+
+    from PySide6.QtGui import QShortcut
+    win.load_demo_links()                       # two Links: the Links keys are live
+    win.show()
+    win._mode_mgr.switch_to(mode)
+    QApplication.processEvents()
+    shown = []
+    monkeypatch.setattr(win, "_info_box", lambda title, html: shown.append(html))
+    monkeypatch.setattr(sys, "platform", "win32")     # keys spelled as Qt's portable text
+    win.show_keyboard_shortcuts()
+    listed = _listed_keys(shown[0])
+    active = {a.shortcut().toString(QKeySequence.PortableText): _text(a)
+              for a in win.findChildren(QAction)
+              if not a.shortcut().isEmpty() and _reachable(a)}
+    for sc in win.findChildren(QShortcut):
+        host = sc.parent()
+        if sc.isEnabled() and not sc.key().isEmpty() and host.isVisible():
+            active[sc.key().toString(QKeySequence.PortableText)] = type(host).__name__
+    assert active, "no shortcut found: nothing was tested"
+    missing = {k: v for k, v in active.items() if k not in listed}
+    assert not missing, f"{mode}: active but not in the shortcuts help: {missing}"
 
 
 def test_the_status_bar_shows_what_the_window_just_did(win):

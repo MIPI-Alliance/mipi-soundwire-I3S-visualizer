@@ -6,9 +6,14 @@ the pane whose title-bar button or title was used. Maximizing saves the whole ar
 compared here as the window's saved state, except that the maximized pane stays the tab in
 front of its group and keeps the focus, so the key pressed again acts on the same pane.
 Anything that shows, hides or closes a pane, leaves the Bus Analyzer or opens a workspace
-puts the panes back first; a resize the layout asks for meanwhile is made to the arrangement
+puts the panes back first. The maximized pane cannot be dragged out, and making it
+floating puts the panes back; a resize the layout asks for meanwhile is made to the arrangement
 put back; and a workspace saved while one is maximized records the arrangement it returns to.
+In the Timing Calculator the inequalities, or the term diagram, take the page and the key
+restores them; in the Bus Visualizer the grid does, by its top-right button, the key, Maximize
+Frame or a splitter drag. Both stay maximized across a mode switch.
 """
+import contextlib
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,6 +23,8 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
 
 @pytest.fixture
@@ -320,6 +327,52 @@ def test_a_floating_pane_is_maximized_in_the_window_and_floats_again_after(win):
     assert bytes(win.saveState()) == expected
 
 
+def test_the_maximized_pane_cannot_be_dragged_out_and_floated_it_puts_the_panes_back(win):
+    from PySide6.QtWidgets import QDockWidget
+    dock = win._grid_dock
+    floatable = bool(dock.features() & QDockWidget.DockWidgetFloatable)
+    assert floatable, "the Bus Grid pane is floatable before it is maximized"
+    before = bytes(win.saveState())
+    win.toggle_maximized_pane(dock)
+    _settle()
+    assert not dock.features() & QDockWidget.DockWidgetFloatable
+    dock.setFloating(True)
+    _settle()
+    assert win.maximized_pane() is None and win._central_stack.isVisible()
+    assert win._maximize_action.text() == "Maximize Pane"
+    assert not dock.isFloating()
+    assert bool(dock.features() & QDockWidget.DockWidgetFloatable) == floatable
+    assert bytes(win.saveState()) == _with_in_front(win, before, dock)
+
+
+def test_the_restore_after_a_floated_maximized_pane_belongs_to_the_pane(win, monkeypatch):
+    """The deferred restore is a timer owned by the pane, so it never fires on a window
+    that has been destroyed."""
+    import swi3s_studio.ui.main_window as mw
+    owners = []
+    monkeypatch.setattr(mw.timers, "after", lambda ms, owner, fn: owners.append(owner))
+    dock = win._grid_dock
+    win.toggle_maximized_pane(dock)
+    _settle()
+    owners.clear()
+    win._on_dock_floated(dock, True)
+    assert dock in owners
+
+
+def test_the_dock_layout_timers_belong_to_the_window_and_the_pane(win, monkeypatch):
+    """The deferred tab sync is owned by the window and the deferred pane refresh by the
+    pane, so neither fires on a deleted widget."""
+    import swi3s_studio.ui.main_window as mw
+    owners = []
+    monkeypatch.setattr(mw.timers, "after", lambda ms, owner, fn: owners.append(owner))
+    win._pane_tabs_pending = False
+    win._schedule_pane_tabs()
+    assert owners == [win]
+    owners.clear()
+    win._on_dock_floated(win._grid_dock, False)
+    assert owners == [win._grid_dock]
+
+
 def test_with_no_pane_selected_nothing_changes(win):
     before = bytes(win.saveState())
     win.setFocus()                                   # the window itself is no pane
@@ -349,6 +402,54 @@ def test_hiding_a_pane_from_the_view_menu_puts_the_panes_back_and_keeps_it_hidde
     assert win._timeline_dock.isHidden(), "the restore showed it again"
     assert not win._dock_actions[win._timeline_dock].isChecked()
     assert win._sample_dock in _shown(win)
+
+
+def _popup_action(w, label):
+    """The item `label` of the menu a right-click on the menu bar or a title bar opens."""
+    menu = w.createPopupMenu()
+    assert menu is not None
+    try:
+        return next(a for a in menu.actions() if a.text() == label)
+    finally:
+        menu.deleteLater()
+
+
+def test_the_title_bar_menu_hides_the_maximized_pane_through_the_view_menu(win):
+    """Unchecking the maximized pane in the right-click menu puts the panes back and
+    leaves it hidden; the window is never left with nothing in it."""
+    win.toggle_maximized_pane(win._reg_dock)
+    _settle()
+    act = _popup_action(win, "Registers")
+    assert act is win._dock_actions[win._reg_dock] and act.isChecked()
+    act.setChecked(False)
+    _settle()
+    assert win.maximized_pane() is None and win._central_stack.isVisible()
+    assert win._reg_dock.isHidden() and win._grid_dock in _shown(win)
+    assert win._maximize_action.text() == "Maximize Pane"
+
+
+def test_the_title_bar_menu_shows_a_hidden_pane_after_putting_the_panes_back(win):
+    win._dock_actions[win._grid_dock].setChecked(False)
+    _settle()
+    win.toggle_maximized_pane(win._eye_dock)
+    _settle()
+    _popup_action(win, "Bus Grid").setChecked(True)
+    _settle()
+    assert win.maximized_pane() is None and win._central_stack.isVisible()
+    assert win._grid_dock in _shown(win)
+
+
+def test_the_title_bar_menu_lists_only_the_view_menus_pane_items(win):
+    from swi3s_studio.ui.mode_controller import VISUALIZATION
+    menu = win.createPopupMenu()
+    try:
+        assert set(menu.actions()) == set(win._dock_actions.values())
+        assert not {d.toggleViewAction() for d in win._dock_area} & set(menu.actions())
+    finally:
+        menu.deleteLater()
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    assert win.createPopupMenu() is None
 
 
 def test_closing_the_maximized_pane_puts_the_panes_back(win):
@@ -490,13 +591,15 @@ def test_leaving_the_bus_analyzer_puts_the_panes_back_before_it_saves_its_layout
         "the Analyzer came back maximized or rearranged")
 
 
-def test_outside_the_bus_analyzer_the_item_is_hidden_and_does_nothing(win):
+def test_outside_the_bus_analyzer_no_analyzer_pane_is_maximized(win):
+    """In the Bus Visualizer the item maximizes the grid (see below); an Analyzer pane asked
+    for there is not maximized."""
     from swi3s_studio.ui.mode_controller import VISUALIZATION
     win._mode_mgr.switch_to(VISUALIZATION)
     _settle()
-    assert not win._maximize_action.isEnabled() and not win._maximize_action.isVisible()
+    assert win._maximize_action.isEnabled() and win._maximize_action.isVisible()
     win.toggle_maximized_pane(win._sample_dock)
-    assert win.maximized_pane() is None
+    assert win.maximized_pane() is None and win._viz_split.sizes()[0] > 0
 
 
 def test_the_shortcuts_help_lists_the_key(win, monkeypatch):
@@ -540,3 +643,258 @@ def test_the_timing_inequalities_maximize_to_the_whole_page(win):
     page.maximizeRequested.emit()
     _settle()
     assert not page.is_maximized()
+
+
+def test_the_key_puts_a_maximized_term_diagram_back(win):
+    """While the term diagram has the Timing page, View ▸ Maximize Pane reads Restore Panes
+    and puts the diagram back, leaving the inequalities as they were; the diagram's own ⤢
+    keeps the menu in step."""
+    from swi3s_studio.ui.mode_controller import TIMING
+    win._mode_mgr.switch_to(TIMING)
+    _settle()
+    page = win._timing_page
+    page._hl = {"Man_t_DD"}
+    page._draw_term("Man_t_DD", "MP_setup")
+    page._diagram_max_btn.click()
+    _settle()
+    assert page.is_diagram_maximized() and not page._topbar.isVisible()
+    assert win._maximize_action.text() == "Restore Panes"
+
+    win._maximize_action.trigger()                   # the key's action
+    _settle()
+    assert not page.is_diagram_maximized() and not page.is_maximized()
+    assert page._ineq_scroll.isVisible() and page._topbar.isVisible()
+    assert not page._diagram_max_btn.isChecked()
+    assert win._maximize_action.text() == "Maximize Pane"
+
+    win._maximize_action.trigger()                   # the inequalities maximized
+    _settle()
+    assert page.is_maximized() and not page._topbar.isVisible()
+    page._diagram_max_btn.click()
+    _settle()
+    assert page.is_diagram_maximized() and win._maximize_action.text() == "Restore Panes"
+    page._diagram.doubleClicked.emit()               # the diagram back by its own control
+    _settle()
+    assert page.is_maximized() and not page._topbar.isVisible()
+    assert win._maximize_action.text() == "Restore Panes" and win._timing_max_btn.isChecked()
+    win._maximize_action.trigger()
+    _settle()
+    assert not page.is_maximized() and page._topbar.isVisible()
+
+
+def test_the_visualizer_grid_has_a_maximize_button_at_its_top_right(win):
+    """In the Bus Visualizer the grid's ⤢, pinned to its top right, the key (View ▸ Maximize
+    Pane) and the authoring panel's Maximize Frame each give the grid the whole page, the
+    parameters collapsed, and the same toggle puts them back; the ⤢ reads Restore while the
+    grid has the page."""
+    from swi3s_studio.ui.mode_controller import VISUALIZATION
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    btn, grid = win._viz_max_btn, win._viz_grid
+    assert btn.isVisible() and btn.parent() is grid and btn.text() == "⤢"
+    vp = grid.viewport().geometry()
+    assert vp.contains(btn.geometry()) and btn.geometry().right() > vp.right() - 2 * btn.width()
+    assert btn.geometry().top() < vp.top() + btn.height()
+    assert win._maximize_action.isVisible() and win._maximize_action.isEnabled()
+
+    btn.click()
+    _settle()
+    assert win._viz_split.sizes()[0] == 0 and btn.isChecked() and btn.isVisible()
+    assert "Restore" in btn.toolTip() and win._maximize_action.text() == "Restore Panes"
+    assert grid.viewport().geometry().contains(btn.geometry())
+
+    win._maximize_action.trigger()                   # the key's action
+    _settle()
+    assert win._viz_split.sizes()[0] > 0 and not btn.isChecked()
+    assert win._maximize_action.text() == "Maximize Pane"
+
+    win._authoring.maximizeRequested.emit()          # Maximize Frame
+    _settle()
+    assert win._viz_split.sizes()[0] == 0 and btn.isChecked()
+    btn.click()
+    _settle()
+    assert win._viz_split.sizes()[0] > 0 and not btn.isChecked()
+
+
+def _viz_agrees(win, maximized):
+    """The split, the grid's ⤢ (checked and tooltip), View ▸ Maximize Pane and the DP key all
+    say the same thing about the Visualizer's grid."""
+    btn = win._viz_max_btn
+    assert (win._viz_split.sizes()[0] == 0) is maximized
+    assert btn.isChecked() is maximized
+    assert ("Restore" in btn.toolTip()) is maximized
+    assert win._maximize_action.text() == ("Restore Panes" if maximized else "Maximize Pane")
+    assert win._viz_grid.show_key is maximized
+
+
+def test_the_visualizer_grid_stays_maximized_across_a_mode_switch(win):
+    """A maximized grid is still maximized on coming back to the Bus Visualizer, every
+    indicator with it, and the next toggle restores the parameters."""
+    from swi3s_studio.ui.mode_controller import TIMING, VISUALIZATION
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    win._viz_max_btn.click()
+    _settle()
+    _viz_agrees(win, True)
+    win._mode_mgr.switch_to(TIMING)
+    _settle()
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    _viz_agrees(win, True)
+    win._maximize_action.trigger()
+    _settle()
+    _viz_agrees(win, False)
+
+
+def test_the_timing_inequalities_stay_maximized_across_a_mode_switch(win):
+    """Maximized Timing inequalities are still maximized on coming back to the Timing
+    Calculator, and the next toggle restores the top bar."""
+    from swi3s_studio.ui.mode_controller import ANALYSIS, TIMING
+    win._mode_mgr.switch_to(TIMING)
+    _settle()
+    page = win._timing_page
+    win._maximize_action.trigger()
+    _settle()
+    assert page.is_maximized() and not page._topbar.isVisible()
+    win._mode_mgr.switch_to(ANALYSIS)
+    _settle()
+    win._mode_mgr.switch_to(TIMING)
+    _settle()
+    assert page.is_maximized() and not page._topbar.isVisible()
+    assert win._maximize_action.text() == "Restore Panes"
+    win._maximize_action.trigger()
+    _settle()
+    assert not page.is_maximized() and page._topbar.isVisible()
+
+
+def test_dragging_the_visualizer_splitter_shut_maximizes_the_grid(win):
+    """Collapsing the parameters by dragging the splitter is a maximize: the ⤢, the View item
+    and the DP key follow it, and the next toggle restores the parameters."""
+    from swi3s_studio.ui.mode_controller import VISUALIZATION
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    split = win._viz_split
+    split.moveSplitter(0, 1)                         # the handle dragged to the top
+    _settle()
+    _viz_agrees(win, True)
+    win._viz_max_btn.click()
+    _settle()
+    _viz_agrees(win, False)
+    assert split.sizes()[0] > 1
+    split.moveSplitter(0, 1)
+    _settle()
+    split.moveSplitter(split.height() // 2, 1)       # and dragged open again
+    _settle()
+    _viz_agrees(win, False)
+
+
+# ---- the shared cursor stays where it is ----
+
+@contextlib.contextmanager
+def _qt_messages():
+    """The messages Qt prints meanwhile, less the offscreen platform's notices."""
+    from PySide6.QtCore import qInstallMessageHandler
+    seen: list = []
+    previous = qInstallMessageHandler(
+        lambda _kind, _ctx, msg: seen.append(msg)
+        if "This plugin does not support" not in msg else None)
+    try:
+        yield seen
+    finally:
+        qInstallMessageHandler(previous)
+
+
+def test_maximizing_and_restoring_any_pane_leaves_the_cursor(win):
+    """restoreState re-shows the panes and Qt passes the focus through them; a table that
+    gains the focus with no current row takes its first one, and that is not a selection."""
+    cur = 2_000_000
+    win.cursor.set_sample(cur)
+    _settle()
+    panes = ["commands"] + [d for d in win._dock_area if d is not win._timeline_dock]
+    with _qt_messages() as seen:
+        for pane in panes:
+            win.toggle_maximized_pane(pane)
+            _settle()
+            assert win.maximized_pane() is not None, _name(pane)
+            win.restore_panes()
+            _settle()
+            assert win.cursor.sample == cur, f"restoring after {_name(pane)} moved the cursor"
+        win._symbol_dock.setFloating(True)
+        _settle()
+        assert win.cursor.sample == cur, "floating the CDS pane moved the cursor"
+        win._symbol_dock.setFloating(False)
+        _settle()
+        assert win.cursor.sample == cur, "docking the CDS pane moved the cursor"
+    assert seen == [], seen
+
+
+def test_removing_a_link_while_a_pane_is_maximized_leaves_the_cursor():
+    """Removing a Link puts the panes back first (its band count changes); the restore
+    must not move the cursor, nor reach the Commands table of the Link being removed."""
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.resize(1400, 900)
+    win.show()
+    win.load_demo_links()                         # Link 2 active
+    _settle()
+    assert win.links.active_index == 1
+    cur = 1_500_000
+    win.cursor.set_sample(cur)
+    _settle()
+    with _qt_messages() as seen:
+        win.toggle_maximized_pane(win._audio_dock)
+        _settle()
+        win.remove_link(1, confirm=False)
+        _settle()
+    assert win.maximized_pane() is None
+    assert win.cursor.sample == cur, "the removal moved the cursor"
+    assert seen == [], seen
+
+
+def test_a_focus_in_on_the_commands_table_leaves_the_shared_cursor(win):
+    """Qt makes the first row current when the table gains the focus with none; the
+    window does not move the cursor to that command."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QFocusEvent
+    view = win._cmd_view
+    assert win._cmd_proxy.rowCount() > 2
+    target = win.cursor.sample + 12345
+    win.cursor.set_sample(target)
+    _settle()
+    win._cmd_model.beginResetModel()             # a reset leaves the view no current row
+    win._cmd_model.endResetModel()
+    assert not view.currentIndex().isValid() and win.cursor.sample == target
+    QApplication.sendEvent(view, QFocusEvent(QEvent.FocusIn, Qt.TabFocusReason))
+    _settle()
+    assert view.currentIndex().isValid(), "Qt did not pick a current row: nothing was tested"
+    assert win.cursor.sample == target
+
+
+def test_a_focus_in_on_a_table_with_no_current_row_selects_nothing():
+    """The rule at its source: Qt makes the first row current on a focus-in, and neither
+    the CDS table nor the Commands table reports it as a selection."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QFocusEvent, QStandardItemModel
+
+    from swi3s_studio.ui.command_table import CommandTableView
+    from swi3s_studio.ui.symbol_view import SymbolView
+    QApplication.instance() or QApplication([])
+    sym = SymbolView()
+    sym.set_symbols([{"kind": 3, "raw": 0x2AA, "value": 1, "start_sample": 100 * k,
+                      "row": k} for k in range(1, 4)])
+    seen: list = []
+    sym.sampleSelected.connect(seen.append)
+    QApplication.sendEvent(sym, QFocusEvent(QEvent.FocusIn, Qt.TabFocusReason))
+    assert sym.currentRow() == 0, "Qt did not pick a current row: nothing was tested"
+    assert seen == [] and not sym.focus_changing
+    sym.setCurrentCell(2, 0)                     # an explicit select still reports
+    assert seen == [300]
+
+    view = CommandTableView()
+    model = QStandardItemModel(3, 2)
+    view.setModel(model)
+    during: list = []
+    view.selectionModel().currentChanged.connect(lambda *_: during.append(view.focus_changing))
+    QApplication.sendEvent(view, QFocusEvent(QEvent.FocusIn, Qt.TabFocusReason))
+    assert during == [True] and not view.focus_changing

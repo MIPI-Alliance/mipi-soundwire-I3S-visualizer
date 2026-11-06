@@ -1,8 +1,10 @@
-"""Timing view (EyeView) colour-key flavour toggle.
+"""Timing view (EyeView) colour-key flavour toggle, worst-UI ranking and axis ticks.
 
 Clicking a clock/data edge colour-key entry hides/shows that flavour in the plot
 and greys the key entry. This is view-level (Qt), so it lives here rather than in
-the compute-only test_bus_timing.
+the compute-only test_bus_timing. The View Worst UI list ranks transitions by the
+smaller of setup and hold, then by time, keeping the 500 smallest; the x ticks step by
+1/2/5·10ⁿ from 0 to the end, and the count ticks are decades.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_eye_view.py
 """
@@ -10,11 +12,14 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.session import Session
 from swi3s_studio.ui.eye_view import EyeView, _cat_specs
 from swi3s_studio.ui.theme import VizTheme
+
+pytestmark = pytest.mark.gui
 
 
 def _view():
@@ -100,3 +105,43 @@ def test_a_cached_timing_pane_measures_each_region_on_its_own():
     finally:
         eye_view.measure_bus_timing = real
     assert not calls                                               # every region cached
+
+
+# ---- the worst-UI ranking and the axis ticks ----
+
+def test_the_worst_uis_rank_by_the_smaller_side_then_by_time():
+    import numpy as np
+    sample = np.array([10, 40, 30, 20, 50])
+    setup = np.array([5.0, 1.0, 3.0, 1.0, 9.0])
+    hold = np.array([2.0, 7.0, 3.0, 8.0, 0.5])            # margins 2, 1, 3, 1, 0.5
+    assert EyeView._compute_worst(sample, setup, hold) == [
+        (50, 9.0, 0.5), (20, 1.0, 8.0), (40, 1.0, 7.0), (10, 5.0, 2.0), (30, 3.0, 3.0)]
+    assert [w[0] for w in EyeView._compute_worst(sample, setup, hold, take=3)] == [50, 20, 40]
+    assert EyeView._compute_worst(sample[:0], setup[:0], hold[:0]) == []
+
+
+def test_the_worst_list_keeps_the_500_smallest_margins():
+    import numpy as np
+    n = 600
+    margin = np.arange(n, 0, -1, dtype=float)              # the last sample is the worst
+    got = EyeView._compute_worst(np.arange(n), margin, margin + 1.0)
+    assert len(got) == 500
+    assert [w[0] for w in got[:3]] == [599, 598, 597] and got[-1][0] == 100
+
+
+@pytest.mark.parametrize("hi, labels", [
+    (10.0, ["0", "5", "10"]), (8.0, ["0", "2", "4", "6", "8"]), (1.0, ["0", "0.5", "1"]),
+    (0.3, ["0", "0.1", "0.2", "0.3"]), (7.0, ["0", "2", "4", "6"]), (0.0, ["0"]),
+    (-1.0, ["0"])])
+def test_the_x_ticks_step_by_1_2_or_5_from_0_up_to_the_end(hi, labels):
+    assert [lab for _v, lab in EyeView._x_ticks(hi)] == labels
+
+
+@pytest.mark.parametrize("count, labels", [
+    (0, ["1", "10"]), (9, ["1", "10"]), (99, ["1", "10", "100"]),
+    (999, ["1", "10", "100", "1k"]), (1000, ["1", "10", "100", "1k", "10k"]),
+    (2_000_000, ["1", "10", "100", "1k", "10k", "100k", "1M", "10M"])])
+def test_the_count_ticks_are_decades_up_to_the_one_above_the_count(count, labels):
+    ticks = EyeView._decade_ticks(count)
+    assert [lab for _k, lab in ticks] == labels
+    assert [k for k, _lab in ticks] == [float(k) for k in range(len(labels))]

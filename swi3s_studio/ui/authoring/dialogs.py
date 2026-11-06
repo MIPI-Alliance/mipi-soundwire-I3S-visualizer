@@ -1,22 +1,26 @@
-"""Per-data-port editing dialogs — Qt ports of the SWI3S Visualizer's dialogs
-(`src/ui/dialogs/*`). Each mirrors the original's title, buttons, layout, and the
-green-selected / grey-unselected button styling, and exposes its result + a
-`cancelled` flag after `exec()`.
+"""Per-data-port editing dialogs, in the SWI3S Visualizer's style: green-selected /
+grey-unselected buttons, a rounded OK / Cancel row. `exec()` returns Accepted on OK; the
+result is in the dialog's named attributes.
 
-- DeviceSelectorDialog   — Manager (M) or device 0-11 (radio)
-- ChannelSelectorDialog  — toggle channels 0-15 (Clear / All)
-- GuardSelectorDialog    — Guard 0 / Guard 1 / Off
-- FlowModeSelectorDialog — Normal / Tx / Rx / Async + Flow Control Port params
-- PortModeSelectorDialog — Normal (Off) / Ones / Zeros
-- DisplayOptionsDialog   — Draw DataPort + Sample / Channel / Bit label fields
-- CdsGuardDialog         — per-source (Manager + Device 0-11) Guard 0 / Guard 1 / Off
-- CdsTailDialog          — per-source (Manager + Device 0-11) Tail Width 0-3
+- DeviceSelectorDialog      — Manager (M) or device 0-11 (radio)
+- ChannelSelectorDialog     — toggle channels 0-15 (Clear / All)
+- GuardSelectorDialog       — Guard 0 / Guard 1 / Off
+- FlowModeSelectorDialog    — Normal / Tx / Rx / Async + Flow Control Port params
+- PortModeSelectorDialog    — Normal (Off) / Test0 (all 0) / Test1 (all 1)
+- DisplayOptionsDialog      — Draw DataPort + Sample / Channel / Bit label fields
+- GridLabelFieldsDialog     — a decoded port's grid label fields
+- DataPortIdentityDialog    — a data port's number and name
+- CdsGuardDialog            — per-source (Manager + Device 0-11) Guard 0 / Guard 1 / Off
+- CdsTailDialog             — per-source (Manager + Device 0-11) Tail Width 0-2
+- CdsDriveTypeDialog        — per-source drive type
+- CdsEndDriveEarlyDialog    — per-source end drive early
+- CdsSettingsDialog         — every CDS setting behind one entry point
 """
 from __future__ import annotations
 
 from typing import List
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QLocale, QSize, Qt
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -53,6 +57,15 @@ _UNSELECTED = "#808080"                   # grey
 _BTN_BASE = "border:none; border-radius:8px; font-weight:500;"
 _SEL_CSS = f"background:{_SELECTED}; color:white; {_BTN_BASE}"
 _UNSEL_CSS = f"background:{_UNSELECTED}; color:white; {_BTN_BASE}"
+
+
+def plain_validator(v):
+    """`v` reading plain digits and a '.' decimal point in every locale, with no group
+    separator: an entry's text is then always something `int()` / `float()` read."""
+    loc = QLocale.c()
+    loc.setNumberOptions(QLocale.RejectGroupSeparator)
+    v.setLocale(loc)
+    return v
 
 
 class _ElidingLabel(QLabel):
@@ -315,7 +328,8 @@ class FlowModeSelectorDialog(QDialog):
     @staticmethod
     def _int_entry(lo: int, hi: int, val: int) -> QLineEdit:
         e = QLineEdit(str(val)); e.setFixedWidth(56); e.setAlignment(Qt.AlignCenter)
-        e.setValidator(QIntValidator(lo, hi))
+        e.setValidator(plain_validator(QIntValidator(lo, hi)))
+        e.textChanged.connect(lambda _t, w=e: w.setStyleSheet(""))
         return e
 
     def _select(self, m: int) -> None:
@@ -326,17 +340,33 @@ class FlowModeSelectorDialog(QDialog):
         self._fcp_box.setEnabled(m in (2, 3))
 
     def accept(self) -> None:
-        self.fcp_h_start = int(self._hs.text() or 0)
-        self.fcp_bit_width = int(self._bw.text() or 0)
-        self.fcp_tail_width = int(self._tw.text() or 0)
-        self.fcp_offset = int(self._off.text() or 0)
+        """Commit the entries; an empty entry is 0. An entry outside its range keeps the
+        dialog open with the entry marked, while the parameters apply (Rx or Async), and is
+        left uncommitted otherwise."""
+        entries = (self._hs, self._bw, self._tw, self._off, self._gp)
+        values = {}
+        for e in entries:
+            if not e.text():
+                values[e] = 0
+            elif e.hasAcceptableInput():
+                values[e] = int(e.text())
+        bad = [e for e in entries if e not in values]
+        if bad and self._fcp_box.isEnabled():
+            for e in bad:
+                e.setStyleSheet(f"border: 1px solid {VizTheme.SEM_ERROR};")
+            bad[0].setFocus()
+            return
+        self.fcp_h_start = values.get(self._hs, self.fcp_h_start)
+        self.fcp_bit_width = values.get(self._bw, self.fcp_bit_width)
+        self.fcp_tail_width = values.get(self._tw, self.fcp_tail_width)
+        self.fcp_offset = values.get(self._off, self.fcp_offset)
         self.fcp_guard_enable = self._ge.isChecked()
-        self.fcp_guard_polarity = int(self._gp.text() or 0)
+        self.fcp_guard_polarity = values.get(self._gp, self.fcp_guard_polarity)
         super().accept()
 
 
 class PortModeSelectorDialog(QDialog):
-    _MODES = [(0, "Normal (Off)"), (2, "Ones"), (3, "Zeros")]
+    _MODES = [(0, "Normal (Off)"), (2, "Test0 (0s)"), (3, "Test1 (1s)")]
 
     def __init__(self, parent, port_mode: int = 0, dp_index: int = 0) -> None:
         super().__init__(parent)
@@ -478,7 +508,8 @@ class DataPortIdentityDialog(QDialog):
     """Edit a data port's logical number (0-31) and display name. Opened from the
     DP name chip in the authoring table. The (device, number) uniqueness rule is
     enforced by the caller (a device may not reuse a number; the same number is
-    fine across devices)."""
+    fine across devices). A number outside 0-31 opens clamped into the spin box and is
+    kept as it was unless the spin box is changed; a name left as it opened is kept too."""
 
     def __init__(self, parent, dp_number: int = 0, name: str = "",
                  dp_index: int = 0) -> None:
@@ -499,13 +530,16 @@ class DataPortIdentityDialog(QDialog):
         form.addRow("Name:", self._name)
         root.addLayout(form)
         root.addWidget(_OkCancel(self))
+        self._opened = (self._num.value(), self._name.text().strip())
 
     def accept(self) -> None:
-        self.dp_number = self._num.value()
+        if self._num.value() != self._opened[0]:
+            self.dp_number = self._num.value()
         name = self._name.text().strip()
-        # If left at the resolved default ("DP{number}"), store empty so the name
-        # keeps auto-following the number rather than pinning a literal default.
-        self.name = "" if name == f"DP{self.dp_number}" else name
+        if name != self._opened[1]:              # a name left as it opened is kept
+            # If left at the resolved default ("DP{number}"), store empty so the name
+            # keeps auto-following the number rather than pinning a literal default.
+            self.name = "" if name == f"DP{self.dp_number}" else name
         super().accept()
 
 
@@ -625,11 +659,12 @@ class CdsGuardDialog(_CdsPerSourceDialog):
 
 
 class CdsTailDialog(_CdsPerSourceDialog):
-    """Per-source CDS tail width (0-3 UI). `self.tail` aliases `self.values`."""
+    """Per-source CDS tail width (0-2 UI; CDS_TailWidth 3 is Reserved). `self.tail` aliases
+    `self.values`."""
 
     TITLE = "CDS Tail Width"
     PROMPT = "Select Tail Width per source:"
-    OPTIONS = ((0, "0"), (1, "1"), (2, "2"), (3, "3"))
+    OPTIONS = ((0, "0"), (1, "1"), (2, "2"))
     BTN_W = 34
 
     @property
@@ -726,8 +761,8 @@ class CdsSettingsDialog(QDialog):
     state.
 
     NOTHING IS COMMITTED UNTIL OK, including a change made two dialogs deep: the per-source
-    dialogs edit copies handed back through `guard` / `tail` / `drive_type`, so cancelling
-    the outer dialog discards them.
+    dialogs edit copies handed back through `guard` / `tail` / `drive_type` /
+    `end_drive_early`, so cancelling the outer dialog discards them.
 
     ONE GRID, TWO COLUMNS, FIXED WIDTH: every label is right-aligned in column 0, every
     control sits in column 1, dividers SPAN both, and no selection changes the width.
@@ -737,7 +772,8 @@ class CdsSettingsDialog(QDialog):
     """
 
     # The minimum width; no selection resizes the window.
-    # test_cds_settings_dialog_fits_its_content measures the real content against it.
+    # tests/test_authoring.py::test_cds_dialogs_are_laid_out_within_their_own_bounds measures
+    # the real content against it.
     _WIDTH = 470
 
     def __init__(self, parent, *, bit_width: int, drive_type: List[int],
@@ -842,9 +878,10 @@ class CdsSettingsDialog(QDialog):
     def _refresh(self) -> None:
         for value, btn in self._bit.items():
             btn.setStyleSheet(_SEL_CSS if value == self.bit_width else _UNSEL_CSS)
-        self._bit[self.bit_width].setToolTip(
-            f"Register value {self.bit_width} — excess-1, so "
-            f"{self.bit_width + 1} UI per CDS bit")
+        if self.bit_width in self._bit:      # a value outside 0-7 leaves every button unselected
+            self._bit[self.bit_width].setToolTip(
+                f"Register value {self.bit_width} — excess-1, so "
+                f"{self.bit_width + 1} UI per CDS bit")
         for kind, attr in _CDS_SETTINGS_KINDS.items():
             self._summaries[kind].setText(cds_summary(getattr(self, attr), kind))
 

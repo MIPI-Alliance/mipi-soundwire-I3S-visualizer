@@ -2,7 +2,7 @@
 
 The decoder accepts BOTH running-disparity (RD-/RD+) forms of every one of the 256
 data bytes, including the two *balanced* exceptions, 5b/6b D.07 and 3b/4b D.x.3,
-whose RD+ codewords are 000111 and 0011. EncodeByte emits only the RD- form, so this
+whose RD+ codewords are 000111 and 0011. EncodeByte emits one form per byte, so this
 test builds both forms from the standard tables directly.
 
 Run: python3 -m pytest tests/test_8b10b_disparity.py
@@ -61,6 +61,8 @@ def test_both_disparity_forms_decode():
         for six in _forms6(x):
             for four in _forms4(y):
                 raw = (six << 4) | four
+                if not 4 <= _popcount(raw) <= 6:
+                    continue                      # two same-sign sub-blocks: illegal
                 d = swi3score.decode_codeword(raw)
                 if not d["valid"] or d["value"] != value:
                     bad.append((value, raw, d["valid"], d["value"]))
@@ -72,6 +74,28 @@ def test_balanced_exceptions_specifically():
     # 5b/6b D.07 RD+ = 000111 (0x07); pair with a known-good fghj to make 0xE7.
     d = swi3score.decode_codeword((0x07 << 4) | 0x01)   # x=7, y=7 -> 0xE7
     assert d["valid"] and d["value"] == 0xE7, d
-    # 3b/4b D.x.3 RD+ = 0011 (0x3); pair with a known-good abcdei (x=0 -> 0x18B... )
+    # 3b/4b D.x.3 RD+ = 0011 (0x3); paired with the 6b D.0 RD+ form 011000 it is D.0.3 = 0x60.
     d = swi3score.decode_codeword((0x18B & 0x3F0) | 0x3)
-    assert d["valid"] and (d["value"] >> 5) == 3, d
+    assert d["valid"] and d["value"] == 0x60, d
+
+
+def test_same_sign_sub_blocks_are_not_a_legal_codeword():
+    """A 6b sub-block and a 4b sub-block that both lean the same way carry 3 or 7 ones,
+    which no running-disparity sequence produces. D.0.0 with both RD- sub-blocks, and its
+    complement, are rejected."""
+    for raw in (0x27B, (~0x27B) & 0x3FF):
+        assert _popcount(raw) not in (4, 5, 6)
+        assert not swi3score.decode_codeword(raw)["valid"], hex(raw)
+
+
+def test_encoder_emits_only_legal_codewords_that_decode_to_their_byte():
+    """Every byte's EncodeByte codeword carries 4, 5 or 6 ones and decodes back to the
+    byte; D.0.0 is the byte whose two RD- sub-blocks together carry seven ones."""
+    bad = []
+    for value in range(256):
+        raw = swi3score.encode_codeword(value)
+        d = swi3score.decode_codeword(raw)
+        if not 4 <= _popcount(raw) <= 6 or not d["valid"] or d["value"] != value:
+            bad.append((value, hex(raw), d))
+    assert not bad, f"{len(bad)} bytes encode to an illegal or mis-decoding codeword: {bad[:4]}"
+    assert swi3score.encode_codeword(0x00) == 0b1001110100      # D.0.0, RD- form

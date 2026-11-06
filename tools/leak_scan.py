@@ -60,7 +60,7 @@ _CONTAINER = "/" + r"Library/(?:Daemon )?" + r"Containers/"
 #
 # The fifth-octet guard is `(?!\.\d)`: only a dot FOLLOWED BY A DIGIT means "this is not
 # an address", so a sentence-final period after an address still matches.
-_IPV4_TAIL = r"(?!\.?\d)(?!\.\d)"   # no 5th octet; a sentence-final '.' is fine
+_IPV4_TAIL = r"(?!\.\d)"   # no 5th octet; a sentence-final '.' is fine
 
 _STRUCTURAL: list[tuple[str, str]] = [
     (r"(?<!§)\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b" + _IPV4_TAIL,
@@ -108,6 +108,12 @@ def _own_path_patterns(root: str, why: str = "absolute path of the tree being sc
             for sp in sorted(spellings)]
 
 
+def _nul_paths(raw: bytes) -> list[str]:
+    """The paths in a NUL-separated git listing. `-z` keeps a non-ASCII name as its real
+    bytes; without it git writes the name C-quoted ("\\303\\251.md"), which names no file."""
+    return [os.fsdecode(f) for f in raw.split(b"\0") if f]
+
+
 def _files(rev: str | None, tree: str | None = None) -> list[str]:
     """Paths to scan, relative to `tree` when one is given and to _ROOT otherwise.
 
@@ -119,19 +125,22 @@ def _files(rev: str | None, tree: str | None = None) -> list[str]:
         found, _SKIPPED[:] = _walk(tree)
         return found
     if rev:
-        out = subprocess.run(["git", "ls-tree", "-r", "--name-only", rev],
-                             cwd=_ROOT, capture_output=True, text=True, check=True)
-        return [f for f in out.stdout.splitlines() if f]
+        out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", rev],
+                             cwd=_ROOT, capture_output=True, check=True)
+        return _nul_paths(out.stdout)
 
     # Tracked files plus untracked ones that are not ignored: what the next commit can carry.
-    out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-                         cwd=_ROOT, capture_output=True, text=True)
-    if out.returncode == 0 and out.stdout.strip():
-        return sorted({f for f in out.stdout.splitlines() if f})
+    out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                         cwd=_ROOT, capture_output=True)
+    if out.returncode == 0 and out.stdout.strip(b"\0 \n"):
+        return sorted(set(_nul_paths(out.stdout)))
 
     found, _SKIPPED[:] = _walk(_ROOT)
     return found
 
+
+# Listed paths whose content could not be read; a file that cannot be read has not been scanned.
+_UNREADABLE: list[str] = []
 
 # Paths the last filesystem walk left out because the tree's .gitignore excludes them.
 _SKIPPED: list[str] = []
@@ -186,13 +195,17 @@ def _walk(root: str) -> tuple[list[str], list[str]]:
 
     Skipped: `.git`, whatever the tree's own .gitignore excludes (what a git listing would
     leave out), the top-level native core, and an AppleDouble `._name` beside its `name`.
+    A directory that cannot be listed is added to _UNREADABLE (its files are not scanned).
     A symlink is a file, as git stores it, whatever it points at: a link to a directory is
     listed and not descended into, and _content reads its target path.
     POSIX separators always: _SELF and every caller compare against "a/b.py"."""
     rules = _gitignore_rules(root)
     found: list[str] = []
     skipped: list[str] = []
-    for base, dirs, names in os.walk(root):
+    def unlistable(err: OSError) -> None:
+        _UNREADABLE.append(os.path.relpath(str(err.filename), root).replace(os.sep, "/") + "/")
+
+    for base, dirs, names in os.walk(root, onerror=unlistable):
         rel_base = os.path.relpath(base, root).replace(os.sep, "/")
         rel_base = "" if rel_base == "." else rel_base + "/"
         keep = []
@@ -227,7 +240,11 @@ def _content(path: str, rev: str | None, tree: str | None = None) -> tuple[str, 
     * Binary files still get their printable ASCII runs, for names in capture headers.
     """
     if rev:
-        p = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=_ROOT, capture_output=True)
+        # `rev:./path` is read relative to _ROOT, as `git ls-tree` lists it, wherever _ROOT
+        # sits in its repository.
+        p = subprocess.run(["git", "show", f"{rev}:./{path}"], cwd=_ROOT, capture_output=True)
+        if p.returncode != 0:
+            _UNREADABLE.append(path)
         raw = p.stdout if p.returncode == 0 else b""
     else:
         full = os.path.join(_ROOT if tree is None else tree, path)
@@ -239,7 +256,10 @@ def _content(path: str, rev: str | None, tree: str | None = None) -> tuple[str, 
         try:
             with open(full, "rb") as f:
                 raw = f.read()
-        except (OSError, IsADirectoryError):
+        except FileNotFoundError:
+            return "", False             # listed by the index, deleted in the working tree
+        except OSError:
+            _UNREADABLE.append(path)
             return "", False
 
     return decode_bytes(raw)
@@ -366,7 +386,14 @@ def main() -> int:
     text_arg = next((a.split("=", 1)[1] for a in sys.argv[1:]
                      if a.startswith("--text=")), None)
     tree = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--tree=")), None)
-    rev = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if len(positional) > 1:
+        print(f"one <sha> at most, not: {' '.join(positional)}\n{__doc__}", file=sys.stderr)
+        return 2
+    rev = positional[0] if positional else None
+    if rev and text_arg is not None:
+        print("--text= scans a file; it takes no <sha>", file=sys.stderr)
+        return 2
     if tree is not None:
         if rev or text_arg is not None:
             print("--tree= scans a directory; it takes no <sha> and no --text=",
@@ -395,7 +422,13 @@ def main() -> int:
         return _scan_text(text_arg, patterns)
 
     hits: list[tuple[str, int, str, str]] = []
+    _UNREADABLE.clear()
     files = _files(rev, tree)
+    if not files:
+        print("leak scan: no files to scan, so nothing was scanned", file=sys.stderr)
+        for path in _UNREADABLE:
+            print(f"  could not be read: {path}", file=sys.stderr)
+        return 2
     n_binary = 0
     for path in files:
         # The PATH itself can leak — a fixture named after a device discloses it without the
@@ -443,7 +476,13 @@ def main() -> int:
         print("  no $SWI3S_LEAK_PATTERNS set — structural checks only. Host names, repository"
               "\n  names and lab addresses are NOT covered by this run.")
 
+    if _UNREADABLE:
+        print(f"\n{len(_UNREADABLE)} LISTED FILE(S) COULD NOT BE READ, so they were NOT scanned:")
+        for path in _UNREADABLE:
+            print(f"  {path}")
     if not hits:
+        if _UNREADABLE:
+            return 1
         print("\nno leaks found")
         return 0
     print(f"\n{len(hits)} POSSIBLE LEAK(S):")

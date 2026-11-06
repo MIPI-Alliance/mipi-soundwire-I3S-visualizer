@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QApplication, QTabBar
 
 from swi3s_studio.ui.main_window import MainWindow
 
+pytestmark = pytest.mark.gui
+
 _app = QApplication.instance() or QApplication([])
 
 _RIGHT = ["Registers", "Statistics", "Cursors"]

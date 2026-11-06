@@ -1,9 +1,15 @@
 """Timing-mode tests.
 
-- The ported compute core matches the source `swtiming.calculator` exactly (pinned
-  to equality rather than re-derived).
-- The TimingView renders the four inequalities + binding summary, recomputes on
-  input change, and its inputs round-trip through the workspace dict.
+- The TimingView renders its eleven headings over the 17 inequalities and the summary
+  table, and its inputs round-trip through the workspace dict.
+- Every displayed symbol follows one naming scheme and every crossing, ramp and anchor term
+  names its edge; no leg reads, or moves with, a lane it
+  has no business reading (`_LEGAL_LANES`); terms read in physical time order; P->P legs
+  letter A as the driver and B as the sampler; the inequalities are numbered in display
+  order; a click and the painted row agree.
+- One supply per device, each leg at its worst assignment; the F_max column, and the toggle
+  ceiling no UI-scaled leg's F_max passes (`toggle_ceiling_MHz`).
+- A Manager that forces its keeper leaves keeper_Man not applicable and moves no other leg.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_timing.py
 """
@@ -14,6 +20,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 
 from swi3s_studio.timing import INEQUALITIES, CalcInputs, compute
+from swi3s_studio.timing.spec_source import LaunchMode
+
+pytestmark = pytest.mark.gui
 
 
 def test_compute_defaults_shape():
@@ -26,18 +35,120 @@ def test_compute_defaults_shape():
     assert res.F_max_binding_MHz >= 0.0
 
 
+@pytest.mark.parametrize("kw,match", [
+    (dict(tRF_tolerance_frac=1.0), "per-edge slew tolerance"),
+    (dict(tRF_tolerance_frac=1.5), "per-edge slew tolerance"),
+    (dict(tRF_tolerance_frac=-0.01), "per-edge slew tolerance"),
+    (dict(V_SEOS_tol_frac=1.0), "V_SEOS_tol_frac"),
+    (dict(V_SEOS_tol_frac=1.5), "V_SEOS_tol_frac"),
+    (dict(V_SEOS_tol_frac=-0.01), "V_SEOS_tol_frac"),
+    (dict(Per_t_IS_max_ns=float("nan")), "Per_t_IS_max_ns"),
+    (dict(tRF_Man_CLK_ns=float("nan")), "tRF_Man_CLK_ns"),
+    (dict(handover_UIs=float("inf")), "handover_UIs"),
+    (dict(Man_t_DD_floor_ns=float("inf")), "Man_t_DD_floor_ns"),
+    (dict(F_CLK_target_MHz=0.0), "F_CLK_target_MHz"),
+    (dict(vPCB_cm_per_ns=0.0), "vPCB_cm_per_ns"),
+    (dict(V_SEOS_nom_V=0.0), "V_SEOS_nom_V"),
+    (dict(duty_min=0.0), "duty_min"),
+    (dict(duty_min=0.0, launch_mode=LaunchMode.CLK2), "duty_min"),
+    (dict(duty_min=-0.1), "duty_min"),
+    (dict(duty_min=0.6), "duty_min"),
+    (dict(handover_UIs=-1.0), "handover_UIs"),
+    (dict(tRF_Man_CLK_ns=-5.0), "tRF_Man_CLK_ns"),
+    (dict(tRF_Man_DATA_ns=-0.1), "tRF_Man_DATA_ns"),
+    (dict(tRF_Per_DATA_ns=-0.1), "tRF_Per_DATA_ns"),
+    (dict(bus_length_cm=-10.0), "bus_length_cm"),
+    (dict(vPCB_err_frac=-0.01), "vPCB_err_frac"),
+    (dict(V_noise_pp_frac=-0.01), "V_noise_pp_frac"),
+    (dict(t_keeper_ns=-2.0), "t_keeper_ns"),
+])
+def test_an_input_no_leg_can_be_evaluated_at_is_refused_with_a_value_error(kw, match):
+    """`compute` refuses, with a ValueError naming the input, a number that is not finite, a
+    per-edge slew tolerance or supply tolerance outside [0, 1), a clock rate, trace velocity
+    or nominal supply that is not positive, a duty floor outside (0, 0.5], a negative
+    handover UI count, and a negative slew, bus length, trace mismatch, noise fraction or
+    keeper response; the Timing view shows that message in place of the margins. A slew
+    tolerance just below 100 %, a zero supply tolerance, a duty floor of one half, zero
+    handover UIs and a zero bus length, mismatch, noise fraction and keeper response are
+    still evaluated."""
+    with pytest.raises(ValueError, match=match):
+        compute(CalcInputs(**kw))
+    assert compute(CalcInputs(tRF_tolerance_frac=0.99)).breakdowns
+    assert compute(CalcInputs(V_SEOS_tol_frac=0.0)).breakdowns
+    assert compute(CalcInputs(duty_min=0.5, handover_UIs=0.0)).breakdowns
+    assert compute(CalcInputs(bus_length_cm=0.0, vPCB_err_frac=0.0, V_noise_pp_frac=0.0,
+                              t_keeper_ns=0.0)).breakdowns
+
+
+def test_a_tie_between_supply_assignments_is_one_to_the_rounding_of_its_sums():
+    """`compute` keeps, of the runs whose margins are within 1e-12 ns of a leg's least, one
+    whose case is the leg's first (`_worse_case`) where there is one, as `_worse_case` does
+    between polarities. Checked where PM_hold's runs tie to the last bit and the exact least is
+    the leg's second case."""
+    from dataclasses import replace
+
+    from swi3s_studio.timing.calculator import _compute_at
+
+    def second(b):
+        return ((b.sampling_rising is not None and b.sampling_rising == b.is_setup)
+                or b.closing_rising is False)
+
+    for inp in (CalcInputs(tRF_Man_CLK_ns=3.0, tRF_Man_DATA_ns=5.0, tRF_Per_DATA_ns=3.0,
+                           V_noise_pp_frac=0.0, tRF_tolerance_frac=0.0, bus_length_cm=0.0,
+                           handover_UIs=0.0), CalcInputs()):
+        lanes = inp.fast_edge_lanes()
+        edges = [frozenset(), frozenset(lanes)] if lanes else [frozenset()]
+        runs = [_compute_at(replace(inp, fast_data_edge=e), s)
+                for e in edges for s in inp.supply_corners()]
+        reported = compute(inp).breakdowns
+        for leg in INEQUALITIES:
+            least = min(r.breakdowns[leg].margin_ns for r in runs)
+            tied = [r.breakdowns[leg] for r in runs
+                    if r.breakdowns[leg].margin_ns <= least + 1e-12]
+            assert reported[leg].margin_ns <= least + 1e-12, leg
+            if any(not second(b) for b in tied):
+                assert not second(reported[leg]), (leg, inp)
+
+
+def test_a_clocked_manager_launch_carries_its_placement_note_on_every_leg():
+    """A clocked Manager t_DD or t_ZD placed off its row's value says so wherever it is
+    shown: every `Man_t_DD` and `Man_t_ZD` term carries one note, the setup and hold legs',
+    the keeper's and an EndDriveEarly release's alike."""
+    for ede in (False, True):
+        inp = CalcInputs(launch_mode=LaunchMode.CLK4, Man_t_DD_max_ns=9.0,
+                         Man_t_DD_floor_ns=9.0, F_CLK_target_MHz=12.288, Man_ede=ede)
+        notes: dict[str, set[str]] = {}
+        legs: dict[str, set[str]] = {}
+        for leg, b in compute(inp).breakdowns.items():
+            for t in b.terms:
+                if t.symbol in ("Man_t_DD", "Man_t_ZD"):
+                    notes.setdefault(t.symbol, set()).add(t.note)
+                    legs.setdefault(t.symbol, set()).add(leg)
+        assert len(notes["Man_t_DD"]) == 1 and "snapped" in next(iter(notes["Man_t_DD"]))
+        assert len(notes["Man_t_ZD"]) == 1 and next(iter(notes["Man_t_ZD"]))
+        assert ("MP_contention" if ede else "keeper_Man") in legs["Man_t_DD"], legs
+
+
+def test_the_lane_decomposition_check_scales_with_the_slews():
+    """The check that each displayed `coefficient · t_RF` equals the envelope's ns value is
+    relative to the values, so a slew far past the spin boxes' range is evaluated rather than
+    refused for its rounding."""
+    r = compute(CalcInputs(tRF_Man_CLK_ns=1e7, tRF_Man_DATA_ns=1e7, tRF_Per_DATA_ns=7e6))
+    assert set(r.breakdowns) == set(INEQUALITIES)
+
+
 def test_view_renders_and_roundtrips():
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.timing_view import TimingView
     tv = TimingView()
-    # The Spec/Proposed calculator shows the four inequalities in its summary.
+    # The summary names the setup and hold directions.
     txt = tv.summary_text()
     for label in ("MP setup", "MP hold", "PM setup", "PM hold"):
         assert label in txt, label
-    # Four inequality headings (blank spacer rows sit between them). The setup
-    # headings carry two inequalities — the normal one and the handover (t_ZD)
-    # variant — stacked under one title, each with an equation + Spec/Example rows.
+    # Eleven headings over the 17 inequalities (blank spacer rows sit between them). The
+    # setup and hold headings carry two inequalities — the normal one and the handover
+    # (t_ZD) variant — stacked under one title, each with an equation + Spec/Example rows.
     tops = [tv._tree.topLevelItem(i) for i in range(tv._tree.topLevelItemCount())]
     heads = [it for it in tops if it.text(0)]        # spacers have empty text
     # SIX setup/hold headings — Manager/Peripheral, Peripheral/Manager and the two
@@ -95,12 +206,102 @@ def test_view_renders_and_roundtrips():
     assert tv2.inputs("spec").Man_shape == tv2.inputs("proposed").Man_shape
 
 
+def test_the_toggle_ceiling_is_one_slowest_edge_per_shortest_half_period():
+    """`toggle_ceiling_MHz` is 1000·duty_min / t_RF,max: the top of the slowest lane's spec
+    range (8.3 ns on SWI3S, t_Slew_Clock's max on SoundWire), or a lane's row value above it."""
+    from dataclasses import replace
+
+    from swi3s_studio.timing.calculator import toggle_ceiling_MHz
+    inp = CalcInputs()
+    assert toggle_ceiling_MHz(inp) == pytest.approx(1000.0 * 0.45 / 8.3)
+    assert toggle_ceiling_MHz(replace(inp, tRF_Per_DATA_ns=10.0)) == pytest.approx(45.0)
+    assert toggle_ceiling_MHz(replace(inp, duty_min=0.5)) == pytest.approx(500.0 / 8.3)
+    sw = replace(inp, Man_spec="SW13_1V2", Per_spec="SW13_1V2", tRF_Man_CLK_ns=3.0,
+                 tRF_Man_DATA_ns=3.0, tRF_Per_DATA_ns=3.0)
+    assert toggle_ceiling_MHz(sw) == pytest.approx(1000.0 * 0.45 / 5.0)
+    assert toggle_ceiling_MHz(replace(sw, system_size="large")) == pytest.approx(75.0)
+
+
+@pytest.mark.parametrize("mode", list(LaunchMode))
+def test_no_ui_scaled_leg_reports_an_fmax_past_the_toggle_ceiling(mode):
+    """A leg that passes up to the ceiling fails there, and its note names the ceiling with the
+    numbers of its formula, 1000 × duty_min / t_RF,max; a leg with no UI-scaled part keeps inf
+    or 0.0. MP_hold_ho at N_HO = 1 under the analog launch passes up to the ceiling."""
+    import math
+
+    from swi3s_studio.timing.calculator import toggle_ceiling_MHz
+    inp = CalcInputs(launch_mode=mode)
+    ceiling = toggle_ceiling_MHz(inp)
+    res = compute(inp)
+    for ineq, b in res.breakdowns.items():
+        assert b.F_max_MHz <= ceiling or math.isinf(b.F_max_MHz), (ineq, b.F_max_MHz)
+        at = math.isclose(b.F_max_MHz, ceiling, rel_tol=1e-12)
+        assert at == ("toggle ceiling" in b.F_max_note), (ineq, b.F_max_note)
+        if at:
+            assert (f"1000 × 0.45 / t_RF,max = 1000 × 0.45 / 8.30 ns = {ceiling:.2f} MHz"
+                    in b.F_max_note), (ineq, b.F_max_note)
+    if mode is LaunchMode.ANALOG:
+        assert res.breakdowns["MP_hold_ho"].F_max_MHz == pytest.approx(ceiling)
+    assert res.breakdowns["PM_hold"].F_max_MHz == math.inf
+
+
+@pytest.mark.parametrize("kw", [{}, {"Man_ede": True, "Per_ede": True},
+                                {"Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2"},
+                                {"launch_mode": LaunchMode.CLK4}],
+                         ids=["default", "ede", "soundwire", "4x"])
+def test_a_forced_keeper_leaves_keeper_man_not_applicable_and_moves_no_other_leg(kw):
+    """`CalcInputs.Man_keeper_forced`: keeper_Man has no terms, an infinite margin and F_max
+    and a reason; every other leg, keeper_Per included, keeps its terms, margin and F_max,
+    and so, at these inputs, where keeper_Man does not bind, the binding rate is unchanged."""
+    import math
+    from dataclasses import replace
+    inp = CalcInputs(**kw)
+    free, forced = compute(inp), compute(replace(inp, Man_keeper_forced=True))
+    k = forced.breakdowns["keeper_Man"]
+    assert k.not_applicable and not k.terms
+    assert k.margin_ns == math.inf and k.F_max_MHz == math.inf
+    assert not free.breakdowns["keeper_Man"].not_applicable
+    for ineq in INEQUALITIES:
+        if ineq == "keeper_Man":
+            continue
+        a, b = free.breakdowns[ineq], forced.breakdowns[ineq]
+        assert (a.margin_ns, a.F_max_MHz, [t.symbol for t in a.terms]) == (
+            b.margin_ns, b.F_max_MHz, [t.symbol for t in b.terms]), ineq
+    assert free.binding_inequality != "keeper_Man"
+    assert forced.F_max_binding_MHz == free.F_max_binding_MHz
+
+
+def test_a_forced_keeper_moves_the_binding_rate_off_keeper_man_where_it_binds(monkeypatch):
+    """Where keeper_Man binds (`_BINDING_CASES` in tests/test_timing_fmax_rate.py) the free
+    result binds on it at about 15.55 MHz; with the Manager forcing its keeper the binding
+    moves to MP_setup at its own F_max, about 16.09 MHz. A leg that does not apply never
+    bounds `F_max_binding_MHz` or names `binding_inequality`, whatever its rate bound reads."""
+    from dataclasses import replace
+
+    from swi3s_studio.timing.calculator import CalcResults
+    inp = CalcInputs(Man_t_DZ_max_ns=0.0, Man_t_DD_min_ns=12.0, Man_t_DD_max_ns=21.0,
+                     Per_t_DD_max_ns=6.0, Per_t_IS_max_ns=2.0, t_keeper_ns=4.0,
+                     F_CLK_target_MHz=12.288)
+    free, forced = compute(inp), compute(replace(inp, Man_keeper_forced=True))
+    assert free.binding_inequality == "keeper_Man"
+    assert free.F_max_binding_MHz == pytest.approx(15.55, abs=0.01)
+    assert forced.binding_inequality == "MP_setup"
+    assert forced.F_max_binding_MHz == forced.breakdowns["MP_setup"].F_max_MHz
+    assert forced.F_max_binding_MHz == pytest.approx(16.09, abs=0.01)
+    assert forced.F_max_binding_MHz > free.F_max_binding_MHz
+    monkeypatch.setattr(CalcResults, "_rate_bound_MHz", staticmethod(
+        lambda b: 0.0 if b.not_applicable else b.F_max_MHz))
+    assert forced.binding_inequality == "MP_setup"
+    assert forced.F_max_binding_MHz == pytest.approx(16.09, abs=0.01)
+
+
 def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
     """F_max is shown for hold, contention and keeper legs too, wherever the margin has a
     UI-scaled part; "—" only where no rate bounds the leg.
 
     The summary and the results tree both print the worst-corner breakdown's own F_max, and
-    the default page carries non-setup legs with a finite one (the keeper's closing UI).
+    on the default page every leg with a UI-scaled part has a finite one in both columns: the
+    hold legs with a handover UI, the contention legs and the keeper legs (the closing UI).
     """
     import math
 
@@ -110,18 +311,27 @@ def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
     tv = TimingView()
     spec_w = tv._per_inequality_worst("spec")
     prop_w = tv._per_inequality_worst("proposed")
+    # The margin table runs from the header to the first blank line; the "Terms" block follows.
+    table = tv.summary_text().split("\n\n", 1)[0].splitlines()[1:]
     rows = {line.split(" | ")[0].split(") ", 1)[1].replace(" ", "_"): line.split(" | ")
-            for line in tv.summary_text().splitlines()[1:]}
+            for line in table}
     for ineq in INEQUALITIES:
         cells = rows[ineq]
         assert cells[4] == tv._fmt_fmax(spec_w[ineq].F_max_MHz), (ineq, cells)
         assert cells[5] == tv._fmt_fmax(prop_w[ineq].F_max_MHz), (ineq, cells)
-    finite = [i for i in INEQUALITIES if not spec_w[i].is_setup
-              and 0.0 < spec_w[i].F_max_MHz < math.inf]
-    assert {"keeper_Man", "keeper_Per"} <= set(finite), finite
+    scaled = {"MP_hold_ho", "PP_hold_ho", "MP_contention", "PM_contention", "PP_contention",
+              "keeper_Man", "keeper_Per"}
+    for side in (spec_w, prop_w):
+        finite = {i for i in INEQUALITIES if not side[i].is_setup
+                  and 0.0 < side[i].F_max_MHz < math.inf}
+        assert scaled <= finite, sorted(scaled - finite)
 
-    # The tree's F_max cell says the same, with its unit.
-    shown = {}
+    # The tree's F_max cell says the same in both columns, with its unit, and "—" where no
+    # rate bounds the leg.
+    def cell(x):
+        return "—" if not math.isfinite(x) else ("FAIL" if x <= 0 else f"{x:.3f} MHz")
+
+    shown: dict[tuple[str, str], str] = {}
     for i in range(tv._tree.topLevelItemCount()):
         head = tv._tree.topLevelItem(i)
         current = None
@@ -129,10 +339,16 @@ def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
             kid = head.child(c)
             if "≥ 0" in kid.text(0):
                 current = INEQUALITIES[int(kid.text(0).split(")")[0]) - 1]
-            elif current and "Specification" in kid.text(0):
-                shown[current] = kid.text(2)
-    for ineq in finite:
-        assert shown[ineq] == f"{spec_w[ineq].F_max_MHz:.3f} MHz", (ineq, shown[ineq])
+            elif current:
+                for col in ("Specification", "Example"):
+                    if f"{col}:" in kid.text(0):
+                        shown[current, col] = kid.text(2)
+    for ineq in INEQUALITIES:
+        for col, worst in (("Specification", spec_w), ("Example", prop_w)):
+            assert shown.get((ineq, col)) == cell(worst[ineq].F_max_MHz), \
+                (ineq, col, shown.get((ineq, col)))
+    unbounded = [i for i in INEQUALITIES if math.isinf(spec_w[i].F_max_MHz)]
+    assert unbounded and all(shown[i, "Specification"] == "—" for i in unbounded), unbounded
 
 
 def test_phy1_selector_reseeds_spec_and_persists():
@@ -195,21 +411,47 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
 
     The scheme, in one place because it is checked in one place:
 
-      * A crossing is `X_<pair>,<role> · <device>_t_RF,<LANE>`.
-      * `<pair>` ∈ MP / PM / PP. `<role>` ∈ late / early — setup is eroded by a LATE crossing
-        and hold by an EARLY one — MANDATORY and LAST. Where a leg reads ONE lane twice the two
-        crossings are GATHERED into a parenthesised expression,
-        `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK`, because one pin has one slew; every
-        symbol inside the bracket obeys this same grammar (see `_gather_lane_terms`). P→P
-        inserts a device letter before it (A drives, B samples); the letter narrows the role,
-        it never replaces it. Never `clk`/`data`: that is the lane, and the lane is named by
-        the t_RF beside it.
+      * A crossing is `X_<pair>[,<device>],<edge>[,slow|fast],<role> · <device>_t_RF,<LANE>`,
+        its qualifiers in that order.
+      * `<pair>` ∈ MP / PM / PP / K, named for a single crossing's direction, driver then
+        receiver: a Peripheral's detection of the Manager's clock is `X_MP`
+        (`calculator.clock_detection_symbol`), `X_PM` a Peripheral's data crossing at the
+        Manager or a Sigma_cross,PM sum's addend, `X_PP` A's data crossing at B on a P→P data
+        leg, on `Per_t_RF,DATA` only, and `X_K` the data's crossing of the keeper's threshold.
+      * `<device>` is P→P's device letter: `A` or `B` on `X_MP` (A drives, B samples), `B` on
+        `X_PP`. A leg with a single Peripheral carries none. The letter narrows the crossing,
+        it never replaces the role.
+      * `<edge>` IS MANDATORY: every crossing names the polarity of its edge, `rise` or
+        `fall`, and a Sigma_cross,PM sum's two addends both carry the sum's case letters,
+        the clock edge then the data edge, `rr` / `rf` / `fr` / `ff` (`X_PM` only). No
+        polarity is implied by an unqualified symbol.
+      * An EDGE QUALIFIER may sit between the polarity and the role: `slow` before `early`,
+        `fast` before `late`. It names a clock detection on an edge two peripherals share
+        whose slew factor is the other corner's, (1 + τ) for `slow` and (1 − τ) for `fast`
+        (`calculator._role_on_edge`), so the symbol names a coefficient distinct from the
+        corner's own. `fast` also sits before `late` on a data crossing whose slow-edge role
+        is evaluated on the fast edge (`CalcInputs.fast_data_edge`), `X_PM,rr,fast,late` and
+        `X_K,rise,fast,late`. `slow,late` and `fast,early` do not exist: those are the role's
+        own factor, written without a qualifier.
+      * `<role>` ∈ late / early — setup is eroded by a LATE crossing and hold by an EARLY one
+        — MANDATORY and LAST. Never `clk`/`data`: that is the lane, and the lane is named by
+        the t_RF beside it. Where a leg reads ONE lane twice the two crossings are GATHERED
+        into a parenthesised expression, `(X_MP,A,rise,late − X_MP,B,fall,early) ·
+        Man_t_RF,CLK`, because one pin has one slew; every symbol inside the bracket obeys
+        this same grammar (see `_gather_lane_terms`).
       * THE LANE IS ALWAYS QUALIFIED, `,CLK` or `,DATA`, on every term including the swing
         addend.
+      * The ramp from a launch's anchor to V_OH / V_OL is `<device>_t_RF,DATA,rise` or
+        `,fall`, naming the edge it is priced on, then `,fast` where it is priced on the fast
+        edge (`calculator.to_voh_symbol`). A SoundWire anchor correction names its edges
+        (`calculator.anchor_symbol`): a Peripheral's data edge, `<device>_t_<DD|ZD>,anchor,rise`
+        / `,fall`, a Manager's clock then data edge with the case letters, `,anchor,rr` /
+        `,rf` / `,fr` / `,ff`, then `,fast` where it is priced on the fast data edge.
       * Every symbol subscripts. The underscore before a token is the marker, so a symbol
         rendering with a bare `_` left in it is misspelled (the spec writes `Man_tDD`; this
         file writes `Man_t_DD`).
-      * A term multiplied by a lane's t_RF must actually MOVE with that lane.
+      * The lane a term's symbol names is the lane whose row value its factor carries,
+        checked with the three lanes at distinct slews so no lane can stand in for another.
     """
     import re
     from dataclasses import replace
@@ -221,7 +463,24 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
                    ("Per", "DATA"): "tRF_Per_DATA_ns"}
 
     configs = [{}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
-               {"pp_placement": "driver_far"}]
+               {"handover_UIs": 2.0}, {"pp_placement": "driver_far"}, {"Man_spec": "SW13_1V2"},
+               {"V_IH_min_frac": 0.40, "V_IL_max_frac": 0.50},
+               {"V_IL_min_frac": 0.30, "V_IH_max_frac": 0.60},
+               {"V_IL_max_frac": 0.60, "tRF_Man_CLK_ns": 8.3, "V_noise_pp_frac": 0.0},
+               # Sigma_cross,PM,hold's same-polarity cases, rr and ff, at zero noise.
+               {"V_noise_pp_frac": 0.0, "V_SEOS_tol_frac": 0.0, "tRF_tolerance_frac": 0.0,
+                "tRF_Man_CLK_ns": 3.0, "tRF_Man_DATA_ns": 3.0, "tRF_Per_DATA_ns": 8.3},
+               # Exponential ramps at V_OH + V_OL ≠ 1, where the two polarities' ramps to
+               # V_OH / V_OL differ.
+               *({"V_OH_min_frac": 0.85, "V_OL_max_frac": 0.25, "Man_shape": "exp",
+                  "Per_shape": "exp", **kw} for kw in (
+                   {}, {"Man_ede": True, "Per_ede": True},
+                   {"Man_spec": "SW13_1V2", "Man_ede": True, "Per_ede": True},
+                   {"Per_spec": "SW13_1V2"})),
+               {"Per_spec": "SW13_1V2", "tRF_Per_DATA_ns": 8.3},
+               # A ramp priced on the fast edge facing a SoundWire Manager's keeper.
+               {"Man_spec": "SW13_1V2", "Per_spec": "SWI3S_PHY2_EDE", "Man_ede": True,
+                "Per_ede": True}]
     symbols = {}
     for kw in configs:
         for name, b in compute(replace(CalcInputs(), **kw)).breakdowns.items():
@@ -232,21 +491,37 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
     def _heads(sym: str) -> list[str]:
         """The crossing symbols in a term's head.
 
-        A GATHERED term's head is a parenthesised expression — `(X_PP,A,late - X_PP,B,early)`
-        — because two crossings of one pin net into one product. Every symbol inside it must
+        A GATHERED term's head is a parenthesised expression —
+        `(X_MP,A,rise,late − X_MP,B,fall,early)` — because two crossings of one pin net into one
+        product. Every symbol inside it must
         satisfy the same grammar as a lone one.
         """
         head = sym.partition(" · ")[0]
         if head.startswith("(") and head.endswith(")"):
-            return [h.strip() for h in re.split(r"[-+]", head[1:-1]) if h.strip()]
+            return [h.strip() for h in re.split(r"[−+]", head[1:-1]) if h.strip()]
         return [head]
 
+    seen: set[str] = set()
+    ramp_seen: set[str] = set()
+    anchor_seen: set[str] = set()
     for sym in sorted(symbols):
         rendered = _subscript(sym)
         assert "_" not in re.sub(r"<sub>.*?</sub>|[A-Za-z]+_t(?=<sub>)", "", rendered), \
             f"{sym!r} renders as {rendered!r} with an underscore still showing"
 
         if " · " not in sym:
+            if ",anchor" in sym:
+                m = (re.fullmatch(r"Man_t_(DD|ZD),anchor,(rr|rf|fr|ff)(,fast)?", sym)
+                     or re.fullmatch(r"Per_t_(DD|ZD),anchor,(rise|fall)(,fast)?", sym))
+                assert m, f"{sym!r}: an anchor correction reads `<device>_t_<row>,anchor`, " \
+                    "then `,rr` / `,rf` / `,fr` / `,ff` on a Manager or `,rise` / `,fall` on a " \
+                    "Peripheral, then `,fast`"
+                anchor_seen.add(f"{sym[:3]}:{m.group(2)}{m.group(3) or ''}")
+            if "_t_RF," in sym:
+                m = re.fullmatch(r"(Man|Per)_t_RF,DATA,(rise|fall)(,fast)?", sym)
+                assert m, f"{sym!r}: the ramp to V_OH / V_OL reads " \
+                    "`<device>_t_RF,DATA,<rise|fall>`, then `,fast`"
+                ramp_seen.add(",".join(q for q in (m.group(2), m.group(3) and "fast") if q))
             continue
         _head, _, lane_sym = sym.partition(" · ")
         m = re.fullmatch(r"(Man|Per)_t_RF,(CLK|DATA)", lane_sym)
@@ -257,21 +532,44 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
             if not head.startswith("X_"):
                 continue
             parts = head.split(",")
-            assert parts[0] in ("X_MP", "X_PM", "X_PP"), sym
+            assert parts[0] in ("X_MP", "X_PM", "X_PP", "X_K"), sym
+            seen.update(parts)
             for qual in parts[1:]:
                 assert qual not in ("clk", "data"), \
                     f"{sym!r}: the lane is named by {lane_sym!r}; role must be late/early"
-                assert qual in ("late", "early", "A", "B"), \
-                    f"{sym!r}: bad qualifier {qual!r}"
-            # THE ROLE IS MANDATORY AND IT COMES LAST. Checked positionally rather than
-            # as a set: `A` is a legal token, so as a set `X_PP,A` would pass while saying
-            # nothing about WHICH crossing of A's it is. A device letter narrows the role,
-            # it does not replace it.
-            assert parts[-1] in ("late", "early"), \
-                f"{sym!r}: every crossing ends in the role — a device letter is not one"
-            for qual in parts[1:-1]:
-                assert qual in ("A", "B"), \
-                    f"{sym!r}: only a device letter may sit between the pair and the role"
+            m = re.fullmatch(r"X_(MP|PM|PP|K)(?:,(A|B))?,(rise|fall|rr|rf|fr|ff)"
+                             r"(?:,(slow|fast))?,(late|early)", head)
+            assert m, f"{sym!r}: a crossing reads " \
+                "`X_<pair>[,<device>],<edge>[,slow|fast],<role>`, its edge mandatory"
+            pair, device, edge, slew, role = m.groups()
+            # The device letter is P->P's: A or B on a clock detection, B on A's data at B.
+            assert device in {"MP": (None, "A", "B"), "PP": ("B",), "PM": (None,),
+                              "K": (None,)}[pair], f"{sym!r}: no {device!r} on X_{pair}"
+            # The case letters name a Sigma_cross,PM sum's two edges; a single crossing names
+            # its one edge.
+            assert (len(edge) == 2) <= (pair == "PM"), \
+                f"{sym!r}: `{edge}` names a Sigma_cross,PM sum's two edges"
+            # A P->P data crossing is on the Peripheral's data lane; a clock detection is X_MP.
+            assert pair != "PP" or lane_sym == "Per_t_RF,DATA", \
+                f"{sym!r}: a clock detection is X_MP, driver then receiver"
+            # The edge qualifier names the OTHER corner's factor: a clock detection on a
+            # shared edge, or a data crossing on a fast edge.
+            if slew:
+                assert (slew, role) in (("slow", "early"), ("fast", "late")), \
+                    f"{sym!r}: an edge qualifier names the OTHER corner's slew factor"
+                assert lane_sym == "Man_t_RF,CLK" or (slew, lane_sym[-4:]) == (
+                    "fast", "DATA"), \
+                    f"{sym!r}: a clock detection on a shared edge, or a data crossing on a " \
+                    "fast edge"
+    # Every qualifier the scheme names is produced by the swept configs, so each rule above
+    # runs on at least one symbol.
+    named = {"X_MP", "X_PM", "X_PP", "X_K", "A", "B", "late", "early", "slow", "fast", "fall",
+             "rise", "rr", "rf", "fr", "ff"}
+    assert named <= seen, f"the sweep yields no symbol with {sorted(named - seen)}"
+    assert ramp_seen == {"rise", "fall", "rise,fast", "fall,fast"}, ramp_seen
+    assert {"Per:rise", "Per:fall"} <= anchor_seen, anchor_seen
+    assert {"Man:rr", "Man:rf", "Man:fr", "Man:ff"} <= anchor_seen, anchor_seen
+    assert any(a.endswith(",fast") for a in anchor_seen), anchor_seen
 
     # ...and the lane a term NAMES is the lane it READS. Checked through `factors`, not
     # through the term's value: `Term.factors` is `(coefficient, t_RF)` and the SECOND
@@ -282,7 +580,11 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
     # changes the clock leg's coefficient — a term's value moving with another lane is not
     # evidence that it names the wrong one. (That is real behaviour, documented on
     # `sigma_pm_setup_lanes`.)
-    base = CalcInputs()
+    #
+    # The three lanes carry distinct slews, so a factor carrying another lane's row fails.
+    base = CalcInputs(tRF_Man_CLK_ns=3.0, tRF_Man_DATA_ns=4.0, tRF_Per_DATA_ns=7.0)
+    assert len({getattr(base, f) for f in _LANE_FIELD.values()}) == len(_LANE_FIELD)
+    checked = 0
     for (device, which), field in _LANE_FIELD.items():
         want = f"{device}_t_RF,{which}"
         for leg, b in compute(base).breakdowns.items():
@@ -302,6 +604,116 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
                 assert any(term.factors[-1] == pytest.approx(v) for v in allowed_values), (
                     f"{leg}: {term.symbol!r} names {want} but multiplies {term.factors[-1]}, "
                     f"and that row offers {sorted(allowed_values)}")
+                checked += 1
+    assert checked, "no term names a lane's t_RF"
+
+
+def test_every_crossing_and_ramp_symbol_names_its_edge():
+    """No polarity is implied by an unqualified symbol. Every crossing `X_…` names its edge,
+    `rise` or `fall`, or on a Sigma_cross,PM sum's addend the sum's case letters, clock edge
+    then data edge, `rr` / `rf` / `fr` / `ff`; every ramp from a launch's anchor to V_OH /
+    V_OL is `<device>_t_RF,DATA,rise` or `,fall`, then `,fast`; every SoundWire anchor term
+    names its edges; and no detection of the Manager's clock is `X_PP`, which is A's data at
+    B alone.
+
+    Swept over every pairing of the spec sources, EndDriveEarly on either side and zero, one
+    and two handover UIs; linear and exponential ramps at symmetric and asymmetric V_OH /
+    V_OL; each P->P placement at unequal slews; zero noise, where Sigma_cross,PM's
+    same-polarity cases bind; every leg at every supply assignment on both data-edge sets
+    (`CalcInputs.fast_data_edge`); and the Timing view's Specification and Proposed
+    columns."""
+    import itertools
+    import re
+    from dataclasses import replace
+
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.timing.calculator import _compute_at
+    from swi3s_studio.timing.spec_source import SPEC_SOURCES
+
+    crossing = re.compile(r"X_(MP|PM|PP|K)(?:,(A|B))?,(rise|fall|rr|rf|fr|ff)"
+                          r"(?:,(slow|fast))?,(late|early)")
+    ramp = re.compile(r"(Man|Per)_t_RF,DATA,(rise|fall)(,fast)?")
+    anchor = re.compile(r"Man_t_(DD|ZD),anchor,(rr|rf|fr|ff)(,fast)?"
+                        r"|Per_t_(DD|ZD),anchor,(rise|fall)(,fast)?")
+    seen: dict[str, set[str]] = {"X": set(), "ramp": set(), "anchor": set()}
+
+    def check(breakdowns, where):
+        for leg, b in breakdowns.items():
+            for t in b.terms:
+                sym = t.symbol
+                if " · " in sym:
+                    head, _, lane = sym.partition(" · ")
+                    heads = [h.strip() for h in re.split(r"[−+]", head.strip("()"))
+                             if h.strip().startswith("X_")]
+                    for h in heads:
+                        m = crossing.fullmatch(h)
+                        assert m, f"{where} {leg}: {sym!r} names no edge"
+                        pair, _dev, edge, _slew, _role = m.groups()
+                        assert edge in ("rise", "fall") or pair == "PM", \
+                            f"{where} {leg}: {sym!r}: case letters belong to an X_PM sum"
+                        assert pair != "PP" or lane == "Per_t_RF,DATA", \
+                            f"{where} {leg}: {sym!r}: a clock detection is X_MP"
+                        seen["X"].add(f"{pair}:{edge}")
+                elif ",anchor" in sym:
+                    m = anchor.fullmatch(sym)
+                    assert m, f"{where} {leg}: {sym!r} names no edge"
+                    seen["anchor"].add(sym)
+                elif "_t_RF," in sym:
+                    m = ramp.fullmatch(sym)
+                    assert m, f"{where} {leg}: {sym!r} names no edge"
+                    seen["ramp"].add(sym)
+
+    configs = [dict(Man_spec=man, Per_spec=per, Man_ede=me, Per_ede=pe, handover_UIs=n)
+               for man, per, (me, pe), n in itertools.product(
+                   SPEC_SOURCES, SPEC_SOURCES,
+                   ((False, False), (True, False), (False, True), (True, True)),
+                   (0.0, 1.0, 2.0))]
+    configs += [dict(Man_spec=man, Per_spec=per, Man_shape=ms, Per_shape=ps, Man_ede=e,
+                     Per_ede=e, handover_UIs=n, V_OH_min_frac=voh, V_OL_max_frac=vol)
+                for (ms, ps), (man, per), e, n, (voh, vol) in itertools.product(
+                    (("exp", "exp"), ("exp", "linear"), ("linear", "exp")),
+                    (("SWI3S_PHY2", "SWI3S_PHY2"), ("SW13_1V2", "SWI3S_PHY2_EDE"),
+                     ("SWI3S_PHY2_EDE", "SW13_1V2")),
+                    (False, True), (0.0, 1.0), ((0.80, 0.20), (0.85, 0.25), (0.90, 0.10)))]
+    configs += [dict(tRF_Man_CLK_ns=clk, tRF_Man_DATA_ns=md, tRF_Per_DATA_ns=pd,
+                     pp_placement=pl, handover_UIs=n, Man_ede=e, Per_ede=e)
+                for (clk, md, pd), pl, n, e in itertools.product(
+                    ((3.0, 5.0, 8.3), (8.3, 6.0, 3.0)),
+                    ("unknown", "both_near", "driver_near", "driver_far", "both_far"),
+                    (0.0, 1.0), (False, True))]
+    # Without noise, where Sigma_cross,PM's same-polarity cases, rr and ff, bind.
+    configs += [{"V_noise_pp_frac": 0.0},
+                {"V_noise_pp_frac": 0.0, "V_SEOS_tol_frac": 0.0, "tRF_tolerance_frac": 0.0,
+                 "tRF_Man_CLK_ns": 3.0, "tRF_Man_DATA_ns": 3.0, "tRF_Per_DATA_ns": 8.3},
+                {"V_noise_pp_frac": 0.0, "tRF_tolerance_frac": 0.0, "handover_UIs": 2.0,
+                 "V_IL_max_frac": 0.60}]
+    for kw in configs:
+        inp = CalcInputs(**kw)
+        lanes = inp.fast_edge_lanes()
+        for e in ([frozenset(), frozenset(lanes)] if lanes else [frozenset()]):
+            for sup in inp.supply_corners():
+                check(_compute_at(replace(inp, fast_data_edge=e), sup).breakdowns,
+                      f"{kw} {sorted(e)} {sup}")
+
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.timing_view import TimingView
+    for man, per in (("SWI3S_PHY2", "SWI3S_PHY2"), ("SWI3S_PHY2_EDE", "SWI3S_PHY2_EDE"),
+                     ("SW13_1V2", "SWI3S_PHY2"), ("SWI3S_PHY2", "SW13_1V2")):
+        tv = TimingView()
+        tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData(man))
+        tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData(per))
+        for side in ("spec", "proposed"):
+            check(tv._per_inequality_worst(side), f"view {man}/{per} {side}")
+        tv.deleteLater()
+
+    # Every kind of edge name is reached, so each rule above runs.
+    assert {f"{p}:{e}" for p in ("MP", "PP", "K") for e in ("rise", "fall")} | {
+        f"PM:{e}" for e in ("rise", "fall", "rr", "rf", "fr", "ff")} <= seen["X"], seen["X"]
+    assert {f"{d}_t_RF,DATA,{e}{f}" for d in ("Man", "Per") for e in ("rise", "fall")
+            for f in ("", ",fast")} <= seen["ramp"], seen["ramp"]
+    assert {"Per_t_DD,anchor,rise", "Per_t_DD,anchor,fall", "Man_t_DD,anchor,rr",
+            "Man_t_ZD,anchor,ff"} <= seen["anchor"], seen["anchor"]
 
 
 # Which t_RF lanes each leg is ALLOWED to read, declared per leg. Wrong-lane bugs are
@@ -315,7 +727,9 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
 #
 # So an M→P leg reads the Manager's two lanes; P→M reads the Manager's clock and the
 # peripheral's data; and P→P reads the Manager's clock (both peripherals take it) and the
-# PERIPHERAL's data — never Man DATA, because no Manager drives that link.
+# PERIPHERAL's data — never Man DATA, because no Manager drives that link. A keeper leg reads
+# its releaser's data, and keeper_Per also the clock, through its Peripheral's detections of
+# the edges that open and close the UI.
 _LEGAL_LANES = {
     "MP_setup": {"Man CLK", "Man DATA"}, "MP_setup_ho": {"Man CLK", "Man DATA"},
     "MP_hold": {"Man CLK", "Man DATA"},  "MP_hold_ho": {"Man CLK", "Man DATA"},
@@ -325,7 +739,7 @@ _LEGAL_LANES = {
     "PP_hold": {"Man CLK", "Per DATA"},  "PP_hold_ho": {"Man CLK", "Per DATA"},
     "MP_contention": {"Man CLK"}, "PM_contention": {"Man CLK"},
     "PP_contention": {"Man CLK"},
-    "keeper_Man": {"Man DATA"}, "keeper_Per": {"Per DATA"},
+    "keeper_Man": {"Man DATA"}, "keeper_Per": {"Man CLK", "Per DATA"},
 }
 
 
@@ -345,7 +759,8 @@ def test_no_leg_reads_a_lane_it_has_no_business_reading():
                "Per_t_RF,DATA": "Per DATA"}
 
     for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
-               {"pp_placement": "driver_far"}):
+               {"pp_placement": "driver_far"}, {"Man_spec": "SW13_1V2"},
+               {"Per_spec": "SW13_1V2"}):
         for leg, b in compute(replace(CalcInputs(), **kw)).breakdowns.items():
             allowed = _LEGAL_LANES.get(leg)
             assert allowed is not None, (
@@ -361,10 +776,17 @@ def test_no_leg_reads_a_lane_it_has_no_business_reading():
                     f"{sorted(allowed)} — either the leg is wrong or _LEGAL_LANES is")
 
 
-# Lanes a leg reads through a term that carries no `· t_RF` product, declared per leg. A
-# releasing EDE peripheral lets go after its own ramp completes, so the swing of its DATA lane
-# is inside the `Per_t_DZ,EDE` value (`_per_ede_release_vs_edge_ns`).
+# Lanes a leg reads through a term that carries no `· t_RF` product, declared per leg and per
+# releasing side. A releasing EDE side lets go its EDE Delay after its own ramp reaches 80 %, so
+# the leg reads the RELEASER's DATA lane through its ramp term, `<dev>_t_RF,DATA`
+# (`_ede_release_terms`): the Manager releases on M->P, a peripheral on P->M and P->P.
+_LEGAL_LANES_MAN_EDE = {"MP_contention": {"Man DATA"}}
 _LEGAL_LANES_PER_EDE = {"PM_contention": {"Per DATA"}, "PP_contention": {"Per DATA"}}
+# A SoundWire side's launch carries its anchor correction (`sw13_anchor_correction`), which
+# places the 20 % point by the side's data slew and, for a Manager, its clock slew: a turn-on
+# at t_ZD + q·k + z·s, a t_OV at t_OV + p·k − s.
+_LEGAL_LANES_SW_MAN = {"PM_contention": {"Man DATA"}, "keeper_Man": {"Man CLK"}}
+_LEGAL_LANES_SW_PER = {"MP_contention": {"Per DATA"}, "PP_contention": {"Per DATA"}}
 
 
 def test_no_leg_margin_moves_with_a_lane_it_has_no_business_reading():
@@ -379,7 +801,8 @@ def test_no_leg_margin_moves_with_a_lane_it_has_no_business_reading():
     field = {"Man CLK": "tRF_Man_CLK_ns", "Man DATA": "tRF_Man_DATA_ns",
              "Per DATA": "tRF_Per_DATA_ns"}
     for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
-               {"pp_placement": "driver_far"}):
+               {"pp_placement": "driver_far"}, {"Man_spec": "SW13_1V2"},
+               {"Per_spec": "SW13_1V2"}):
         base = replace(CalcInputs(), **kw)
         ref = compute(base).breakdowns
         for lane, f in field.items():
@@ -387,8 +810,14 @@ def test_no_leg_margin_moves_with_a_lane_it_has_no_business_reading():
                 moved = compute(replace(base, **{f: trf})).breakdowns
                 for leg, b in ref.items():
                     allowed = set(_LEGAL_LANES[leg])
+                    if base.Man_ede:
+                        allowed |= _LEGAL_LANES_MAN_EDE.get(leg, set())
                     if base.Per_ede:
                         allowed |= _LEGAL_LANES_PER_EDE.get(leg, set())
+                    if base.Man_spec == "SW13_1V2":
+                        allowed |= _LEGAL_LANES_SW_MAN.get(leg, set())
+                    if base.Per_spec == "SW13_1V2":
+                        allowed |= _LEGAL_LANES_SW_PER.get(leg, set())
                     if lane in allowed:
                         continue
                     assert moved[leg].margin_ns == pytest.approx(b.margin_ns, abs=1e-12), (
@@ -410,20 +839,20 @@ def test_no_leg_shows_a_structurally_zero_term():
         INEQUALITIES,
         apply_row_picks,
         default_swi3s_rows,
-        find_worst_corner_rows,
+        find_worst_corner_rows_all,
     )
     from swi3s_studio.timing.spec_source import SPEC_SOURCES
 
-    may_read_zero = {"Man_t_IH", "t_PD,mis", "t_PD", "2·t_PD", "Man_t_DZ", "Man_t_DZ,EDE",
-                     "Per_t_DZ"}
+    # A SoundWire anchor correction of zero is no term (`_launch_terms`), so none is here.
+    may_read_zero = {"Man_t_IH", "t_PD,mis", "t_PD", "Man_t_DZ", "Per_t_DZ"}
     rows = default_swi3s_rows()
     for spec in SPEC_SOURCES:
         for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
                    {"pp_placement": "driver_far"}, {"bus_length_cm": 0.0},
                    {"t_keeper_ns": 0.0}):
             inp = replace(CalcInputs(Man_spec=spec, Per_spec=spec), **kw)
-            corners = [inp] + [apply_row_picks(inp, rows, find_worst_corner_rows(leg, rows, inp))
-                               for leg in INEQUALITIES]
+            picks = find_worst_corner_rows_all(INEQUALITIES, rows, inp)
+            corners = [inp] + [apply_row_picks(inp, rows, picks[leg]) for leg in INEQUALITIES]
             for c in corners:
                 for leg, b in compute(c).breakdowns.items():
                     for t in b.terms:
@@ -546,21 +975,25 @@ def test_every_printed_term_resolves_to_a_key():
     cannot be identified should still be clickable and self-consistent rather than crash a
     render. That makes this test the only thing standing between a new term and a highlight
     that quietly matches nothing, so it sweeps the configurations that change which terms
-    exist at all: EDE swaps in `Per_t_hold`, a clocked launch changes nothing but a
-    SoundWire side changes the anchor conversions, `t_keeper_ns=0` drops a term entirely,
+    exist at all: EDE swaps in `Per_t_EDE`, a clocked launch changes nothing but a
+    SoundWire side adds the anchor corrections, `t_keeper_ns=0` drops a term entirely,
     and a pinned P->P placement adds the two traversals.
     """
     from dataclasses import replace
 
     from swi3s_studio.timing import default_swi3s_rows
-    from swi3s_studio.timing.spec_source import LaunchMode
     from swi3s_studio.ui.timing_view import _ROWLESS_TERM_KEYS, _key_class, _term_key
 
     rows = {r.name for r in default_swi3s_rows()}
     syms = set()
     for kw in ({}, {"handover_UIs": 0.0}, {"Man_ede": True, "Per_ede": True},
                {"pp_placement": "driver_far"}, {"launch_mode": LaunchMode.CLK4},
-               {"Man_spec": "SW13_1V8"}, {"Per_spec": "SW13_1V8"}, {"t_keeper_ns": 0.0}):
+               {"Man_spec": "SW13_1V2"}, {"Per_spec": "SW13_1V2"}, {"t_keeper_ns": 0.0},
+               # The ramp to V_OH / V_OL names its edge at these levels on exponential ramps.
+               {"V_OH_min_frac": 0.85, "V_OL_max_frac": 0.25, "Man_shape": "exp",
+                "Per_shape": "exp", "Man_ede": True, "Per_ede": True},
+               {"V_OH_min_frac": 0.85, "V_OL_max_frac": 0.25, "Man_shape": "exp",
+                "Per_shape": "exp", "Man_spec": "SW13_1V2", "Man_ede": True}):
         for b in compute(replace(CalcInputs(), **kw)).breakdowns.values():
             syms |= {t.symbol for t in b.terms}
     assert len(syms) > 30, f"the sweep stopped covering the term set: {len(syms)}"
@@ -574,15 +1007,30 @@ def test_every_printed_term_resolves_to_a_key():
         keys[sym] = key
 
     # The suffixed and bare spellings of one row are ONE key -- that is the whole point of
-    # keying on the row: `,pure` is an anchor conversion of a value, not a second parameter.
-    assert keys["Man_t_DD,pure"] == keys.get("Man_t_DD", keys["Man_t_DD,pure"]) == "Man_t_DD"
-    assert keys["Man_t_DZ,EDE"] == keys["Man_t_DZ"] == "Man_t_DZ"
+    # keying on the row: `,anchor` is a SoundWire anchor correction of a value, not a second
+    # parameter.
+    assert keys["Per_t_DD,anchor,rise"] == keys["Per_t_DD"] == "Per_t_DD"
+    assert keys["Man_t_DZ"] == "Man_t_DZ"
+    # An EDE release's parts key on the rows they read.
+    assert keys["Man_t_EDE"] == "Man_t_EDE" and keys["Per_t_EDE"] == "Per_t_EDE"
     # A crossing keys on its LANE, gathered or not: the coefficient has no row.
-    assert keys["X_MP,late · Man_t_RF,CLK"] == "t_RF Man CLK"
-    assert keys["(X_PP,A,late - X_PP,B,early) · Man_t_RF,CLK"] == "t_RF Man CLK"
-    assert keys["1.67·Man_t_RF,DATA"] == "t_RF Man DATA"
+    assert keys["X_MP,rise,late · Man_t_RF,CLK"] == "t_RF Man CLK"
+    assert keys["(X_MP,A,rise,late − X_MP,B,fall,early) · Man_t_RF,CLK"] == "t_RF Man CLK"
+    assert keys["Man_t_RF,DATA,fall"] == "t_RF Man DATA"
+    # A ramp named for its edge keys on its lane, and an anchor correction named for its edge
+    # on its row.
+    ramps = {s for s in syms if "_t_RF," in s and " · " not in s
+             and {"rise", "fall"} & set(s.split(","))}
+    anchors = {s for s in syms if ",anchor," in s}
+    edges = {(r[:3], "rise" if "rise" in r.split(",") else "fall") for r in ramps}
+    assert {("Man", "rise"), ("Man", "fall"), ("Per", "rise")} <= edges, ramps
+    assert any(s.startswith("Man_t_DD,anchor,") for s in anchors), anchors
+    for s in ramps:
+        assert keys[s] == f"t_RF {s[:3]} DATA", (s, keys[s])
+    for s in anchors:
+        assert keys[s] == s.partition(",")[0], (s, keys[s])
     # t_PD IS the bus length in ns, and the mismatch is its own row.
-    assert keys["t_PD"] == keys["2·t_PD"] == "bus length (cm)"
+    assert keys["t_PD"] == _term_key("2·t_PD") == "bus length (cm)"
     assert keys["t_PD,mis"] == "t_PD,mis fraction"
 
     # Distinct keys must give distinct CSS classes, or one term would wash another: the
@@ -640,8 +1088,9 @@ def test_clicking_a_term_highlights_it_everywhere_and_a_second_click_clears():
                      QPoint(hits["Per_t_IS"], rect.center().y()))
     assert tv._hl == {"t_RF Man CLK", "Per_t_IS"}, tv._hl
 
-    # Clicking the SAME term again removes it -- and from a different occurrence, since the
-    # toggle is on the key and not on the glyph the reader started from.
+    # A click on a highlighted term in an inequality OTHER than the one the diagram draws keeps
+    # the highlight and draws that inequality; a second click there clears the term. The
+    # highlight is keyed on the term, so it shows on every occurrence of it.
     other = None
     for i in range(tree.topLevelItemCount()):
         head = tree.topLevelItem(i)
@@ -660,13 +1109,45 @@ def test_clicking_a_term_highlights_it_everywhere_and_a_second_click_clears():
         if other:
             break
     assert other is not None, "t_RF Man CLK should appear on more than one leg"
+    first_leg = idx.data(Qt.UserRole)
+    other_leg = tree.indexAt(other).data(Qt.UserRole)
+    assert (tv._diagram_leg, tv._diagram_term) == (first_leg, "Per_t_IS")
+    assert other_leg != first_leg
+    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier, other)
+    assert tv._hl == {"t_RF Man CLK", "Per_t_IS"}, tv._hl
+    assert (tv._diagram_leg, tv._diagram_term) == (other_leg, "t_RF Man CLK")
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier, other)
     assert tv._hl == {"Per_t_IS"}, tv._hl
+    assert (tv._diagram_leg, tv._diagram_term) == (None, "")
 
     # And a click that lands on no term clears everything.
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
                      QPoint(rect.right() - 2, rect.center().y()))
     assert tv._hl == set(), tv._hl
+
+
+def test_clicking_a_parameter_row_highlights_it_and_a_second_click_clears():
+    """A click on an input row's name highlights that parameter as a click on one of its
+    terms does, the row washed and its terms with it, adding to what is highlighted; a second
+    click clears it, and the diagram drawing it."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from swi3s_studio.ui.theme import VizTheme
+
+    tv = _term_view()
+    lab, other = tv._row_labels["Per_t_IS"], tv._row_labels["t_RF Man CLK"]
+    assert lab.cursor().shape() == Qt.PointingHandCursor
+    QTest.mouseClick(lab, Qt.LeftButton)
+    assert tv._hl == {"Per_t_IS"}
+    assert VizTheme.HILITE_BG in lab.styleSheet() and other.styleSheet() == ""
+    QTest.mouseClick(other, Qt.LeftButton)
+    assert tv._hl == {"Per_t_IS", "t_RF Man CLK"}
+    tv._draw_term("Per_t_IS", "MP_setup")
+    assert tv._diagram.term == "Per_t_IS" and tv._diagram.panels
+    QTest.mouseClick(lab, Qt.LeftButton)
+    assert tv._hl == {"t_RF Man CLK"} and lab.styleSheet() == ""
+    assert tv._diagram.panels == []
 
 
 def test_a_highlight_is_a_repaint_and_not_a_recompute():
@@ -675,8 +1156,16 @@ def test_a_highlight_is_a_repaint_and_not_a_recompute():
     The margins are expensive (a corner search per leg) and the tree's width is fitted to
     its content, so a toggle that rebuilt either would both stutter and visibly reflow. The
     wash is applied by the delegate at paint time from a stylesheet, which is why the item
-    TEXT is byte-identical before and after.
+    TEXT is byte-identical before and after. No path the view evaluates the model through
+    runs: neither the corner search nor `compute`, on a term's toggle or on a click on a
+    parameter row's name.
     """
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    import swi3s_studio.ui.timing_view as view
+
     tv = _term_view()
     before = [tv._tree.topLevelItem(i).child(c).text(0)
               for i in range(tv._tree.topLevelItemCount())
@@ -686,7 +1175,26 @@ def test_a_highlight_is_a_repaint_and_not_a_recompute():
     calls = []
     real = tv._per_inequality_worst
     tv._per_inequality_worst = lambda side: (calls.append(side), real(side))[1]
-    tv._toggle_term("t_RF Man CLK")
+    patched = {name: getattr(view, name) for name in ("compute", "find_worst_corner_rows_all")}
+    for name, fn in patched.items():
+        setattr(view, name, lambda *a, _n=name, _f=fn, **k: (calls.append(_n), _f(*a, **k))[1])
+    try:
+        tv._toggle_term("t_RF Man CLK")
+        QApplication.processEvents()
+        assert calls == [], f"a toggle evaluated the model: {calls}"
+        label = tv._row_labels["t_RF Per DATA"]
+        press = QMouseEvent(QMouseEvent.Type.MouseButtonPress, QPointF(2.0, 2.0),
+                            QPointF(label.mapToGlobal(label.rect().topLeft())) + QPointF(2, 2),
+                            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(label, press)
+        QApplication.processEvents()
+        assert "t_RF Per DATA" in tv._hl, "the row click highlighted nothing"
+        assert calls == [], f"a click on a parameter row evaluated the model: {calls}"
+        tv._toggle_term("t_RF Per DATA")
+        QApplication.processEvents()
+    finally:
+        for name, fn in patched.items():
+            setattr(view, name, fn)
 
     assert calls == [], "a toggle recomputed the margins"
     after = [tv._tree.topLevelItem(i).child(c).text(0)
@@ -727,50 +1235,52 @@ def test_anchored_terms_keep_the_palette_ink_in_both_modes():
 
     _term_view()          # a QApplication must exist before QImage/QPainter
     delegate = _RichTextDelegate(keys=lambda: frozenset())
-    for mode in ("dark", "light"):
-        theme.apply_palette(mode)
-        plain = "1·UI − " + _subscript("Man_t_DZ")
-        anchored = (_anchored("UI", "1·UI") + " − "
-                    + _anchored("Man_t_DZ", _subscript("Man_t_DZ")))
+    original = theme.VizTheme.MODE
+    try:
+        for mode in ("dark", "light"):
+            theme.apply_palette(mode)
+            plain = "1·UI − " + _subscript("Man_t_DZ")
+            anchored = (_anchored("UI", "1·UI") + " − "
+                        + _anchored("Man_t_DZ", _subscript("Man_t_DZ")))
 
-        def ink(html):
-            # THROUGH THE DELEGATE'S OWN `_doc`, not a re-typed copy of its stylesheet: it
-            # is the delegate's stylesheet that is under test, so the delegate builds the
-            # document.
-            opt = QStyleOptionViewItem()
-            opt.text = html
-            opt.font = QApplication.instance().font()
-            doc = delegate._doc(opt)
-            img = QImage(int(doc.idealWidth()) + 4, int(doc.size().height()) + 4,
-                         QImage.Format_RGB32)
-            img.fill(QColor(theme.VizTheme.FRAME_BG))
-            painter = QPainter(img)
-            ctx = QAbstractTextDocumentLayout.PaintContext()
-            ctx.palette.setColor(QPalette.Text, QColor(theme.VizTheme.TEXT))
-            doc.documentLayout().draw(painter, ctx)
-            painter.end()
-            hist = collections.Counter()
-            for y in range(img.height()):
-                for x in range(img.width()):
-                    hist[QColor(img.pixel(x, y)).name()] += 1
-            return {c for c, n in hist.most_common(3)}
+            def ink(html):
+                # THROUGH THE DELEGATE'S OWN `_doc`, not a re-typed copy of its stylesheet: it
+                # is the delegate's stylesheet that is under test, so the delegate builds the
+                # document.
+                opt = QStyleOptionViewItem()
+                opt.text = html
+                opt.font = QApplication.instance().font()
+                doc = delegate._doc(opt)
+                img = QImage(int(doc.idealWidth()) + 4, int(doc.size().height()) + 4,
+                             QImage.Format_RGB32)
+                img.fill(QColor(theme.VizTheme.FRAME_BG))
+                painter = QPainter(img)
+                ctx = QAbstractTextDocumentLayout.PaintContext()
+                ctx.palette.setColor(QPalette.Text, QColor(theme.VizTheme.TEXT))
+                doc.documentLayout().draw(painter, ctx)
+                painter.end()
+                hist = collections.Counter()
+                for y in range(img.height()):
+                    for x in range(img.width()):
+                        hist[QColor(img.pixel(x, y)).name()] += 1
+                return {c for c, n in hist.most_common(3)}
 
-        want, got = ink(plain), ink(anchored)
-        bg = theme.VizTheme.FRAME_BG.lower()
+            want, got = ink(plain), ink(anchored)
+            bg = theme.VizTheme.FRAME_BG.lower()
 
-        # NOT VERIFIABLE WHERE NOTHING RASTERISES, so say so rather than passing vacuously:
-        # with no glyphs both renders are pure background, the comparison below is trivially
-        # true, and a green test would be claiming a check it never made.
-        if not (want - {bg}):
-            pytest.skip("no glyphs rasterised here — the ink is unverifiable")
+            # NOT VERIFIABLE WHERE NOTHING RASTERISES, so say so rather than passing vacuously:
+            # with no glyphs both renders are pure background, the comparison below is trivially
+            # true, and a green test would be claiming a check it never made.
+            if not (want - {bg}):
+                pytest.skip("no glyphs rasterised here — the ink is unverifiable")
 
-        # THE PROPERTY IS THAT ANCHORING CHANGES NOTHING. An anchor that changed the ink
-        # makes the two sets differ, without depending on which pixels a platform's
-        # antialiasing happens to produce.
-        assert got == want, f"{mode}: anchoring changed the ink: {sorted(want)} -> {sorted(got)}"
-
-    theme.apply_palette("dark")
-
+            # THE PROPERTY IS THAT ANCHORING CHANGES NOTHING. An anchor that changed the ink
+            # makes the two sets differ, without depending on which pixels a platform's
+            # antialiasing happens to produce.
+            assert got == want, \
+                f"{mode}: anchoring changed the ink: {sorted(want)} -> {sorted(got)}"
+    finally:
+        theme.apply_palette(original)
 
 
 def test_the_wash_is_applied_by_class_to_exactly_the_active_keys():
@@ -807,7 +1317,7 @@ def test_the_wash_is_applied_by_class_to_exactly_the_active_keys():
 def test_every_leg_reads_in_physical_time_order():
     """The terms are a NARRATIVE, and the order is part of what the page says.
 
-    Four rules:
+    Six rules:
 
       1. The receiver's window is LAST. It is the requirement the whole leg is spent
          satisfying, so it belongs at the end, not two terms in.
@@ -821,6 +1331,14 @@ def test_every_leg_reads_in_physical_time_order():
       4. The two bus traversals are separate terms bracketing that launch — one for the
          clock reaching the launcher, one for the data coming back — not a single
          `2·t_PD` off to the side.
+      5. A keeper leg reads from the edge that opens the UI: the launch and its ramp to a
+         valid level, the closing edge and the release after it, then the keeper's
+         response, the time the level held must cover. With EndDriveEarly, the EDE Delay
+         and then the response.
+      6. A contention leg reads the releaser first (a peripheral's detection, then the
+         release), then the handover UIs, then the acquirer: on M->P the clock's flight
+         out, the peripheral's detection, its turn-on and its drive's flight back, two
+         `t_PD` terms. On P->P the two detections are one gathered term, first.
 
     ORDER IS FREE TO GET WRONG: the margin is a sum, so a reordering changes no number and
     no other test would notice.
@@ -832,11 +1350,15 @@ def test_every_leg_reads_in_physical_time_order():
     PER_LAUNCHED = ("PM_setup", "PM_setup_ho", "PM_hold", "PM_hold_ho",
                     "PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho")
 
-    for kw in ({}, {"handover_UIs": 0.0}, {"pp_placement": "driver_far"}):
+    for kw in ({}, {"handover_UIs": 0.0}, {"pp_placement": "driver_far"},
+               {"Man_ede": True, "Per_ede": True},
+               {"Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2", "tRF_Man_CLK_ns": 8.3,
+                "tRF_Man_DATA_ns": 8.3, "tRF_Per_DATA_ns": 8.3},
+               {"Man_spec": "SW13_1V2", "Per_spec": "SWI3S_PHY2_EDE", "Per_ede": True}):
         b = compute(replace(CalcInputs(), **kw)).breakdowns
         for leg in INEQUALITIES:
-            if leg.startswith("keeper") or leg.endswith("contention"):
-                continue                      # their own shapes; see the trio's comment
+            if leg.endswith("contention") or leg.startswith("keeper"):
+                continue                      # rules 5 and 6, below
             syms = [t.symbol for t in b[leg].terms]
             heads = [s.split(" · ")[0].split(",")[0] for s in syms]
 
@@ -857,10 +1379,93 @@ def test_every_leg_reads_in_physical_time_order():
                 assert max(clk) < launch < min(data), (
                     f"{leg}: the launch must sit between the clock and data crossings")
                 pd = [i for i, s in enumerate(syms) if s == "t_PD"]
-                if pd:                        # zero traversals on some P->P placements
+                if pd or leg.startswith("PM_"):   # P->P may have zero traversals
                     assert len(pd) == 2, f"{leg}: two flights, two terms: {pd}"
                     assert pd[0] < launch < pd[1], (
                         f"{leg}: the traversals must bracket the launch")
+
+    # 5. a keeper leg: the launch, its crossing of the keeper's threshold, the closing edge,
+    # for a Peripheral the spacing of its two detections, the release, the response
+    # An EDE release: the anchor to the keeper's threshold, the anchor to V_OH, the EDE Delay
+    # from there, the response.
+    for kw in ({}, {"Man_spec": "SW13_1V2", "tRF_Man_CLK_ns": 8.3},
+               {"Man_ede": True, "Per_ede": True},
+               {"Man_spec": "SW13_1V2", "Per_spec": "SWI3S_PHY2_EDE", "Per_ede": True}):
+        b = compute(replace(CalcInputs(), **kw)).breakdowns
+        for leg, dev in (("keeper_Man", "Man"), ("keeper_Per", "Per")):
+            syms = [t.symbol for t in b[leg].terms]
+            # The held level's crossing names its data edge and, on the fast edge, `fast`
+            # (`CalcInputs.fast_data_edge`).
+            fast = "fast," if f"{dev} DATA" in b[leg].fast_data_edge else ""
+            (edge,) = [s.split(",")[1] for s in syms if s.startswith("X_K,")]
+            x_k = f"X_K,{edge},{fast}late"
+            if kw.get(f"{dev}_ede"):
+                ramp = f"{dev}_t_RF,DATA,{edge}" + (",fast" if fast else "")
+                assert syms == [f"{x_k} · {dev}_t_RF,DATA", ramp, f"{dev}_t_EDE",
+                                "Man_t_Keeper_Response"], (leg, syms)
+                continue
+            launch = [f"{dev}_t_DD"] + [s for s in syms if s.startswith(f"{dev}_t_DD,anchor,")]
+            ramp = f"{x_k} · {dev}_t_RF,DATA"
+            # The Peripheral detects the opening edge late and the closing edge, of the other
+            # polarity, early.
+            closing = b[leg].closing_rising
+            spacing = ([] if dev == "Man" else
+                       [f"(X_MP,{'fall' if closing else 'rise'},late − "
+                        f"X_MP,{'rise' if closing else 'fall'},early) · Man_t_RF,CLK"])
+            assert (closing is None) is (dev == "Man"), (leg, closing)
+            assert syms == launch + [ramp, "1·UI", *spacing, f"{dev}_t_DZ",
+                                     "Man_t_Keeper_Response"], (kw, leg, syms)
+
+    # 6. a contention leg: the releaser, the handover UIs, the acquirer
+    for kw in ({}, {"handover_UIs": 0.0}, {"handover_UIs": 2.0},
+               {"handover_UIs": 2.0, "Man_ede": True, "Per_ede": True},
+               {"Man_ede": True, "Per_ede": True},
+               {"Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2", "tRF_Man_CLK_ns": 8.3,
+                "tRF_Man_DATA_ns": 8.3, "tRF_Per_DATA_ns": 8.3}):
+        inp = replace(CalcInputs(), **kw)
+        b = compute(inp).breakdowns
+        ui = [f"{inp.handover_UIs:g}·UI"] if inp.handover_UIs else []
+        odd = round(inp.handover_UIs) % 2 == 1
+
+        # The closing edge is of the polarity each leg reports. The acquirer turns on N_HO UIs
+        # after it, on the other polarity at an odd count; a releasing peripheral detects it,
+        # or under EDE the edge before it, of the other polarity.
+        def acq_rise(leg):
+            return "rise," if b[leg].closing_rising != odd else "fall,"
+
+        def rel_fall(leg):
+            return "rise," if b[leg].closing_rising != inp.Per_ede else "fall,"
+
+        def zd(dev, syms):
+            return [f"{dev}_t_ZD"] + [s for s in syms if s.startswith(f"{dev}_t_ZD,anchor,")]
+
+        # An EDE release from the edge opening the driven UI: the launch, its ramp to 80 %,
+        # the EDE Delay, and the UI back to the closing edge. A conventional one is t_DZ.
+        def release(dev, syms):
+            if not getattr(inp, f"{dev}_ede"):
+                return [f"{dev}_t_DZ"]
+            (ramp,) = [s for s in syms if s.startswith(f"{dev}_t_RF,DATA,")]
+            assert ramp.split(",")[2] in ("rise", "fall"), ramp
+            return [f"{dev}_t_DD", *[s for s in syms if s.startswith(f"{dev}_t_DD,anchor,")],
+                    ramp, f"{dev}_t_EDE", "UI"]
+
+        syms = [t.symbol for t in b["MP_contention"].terms]
+        assert syms == [*release("Man", syms), *ui, "t_PD",
+                        f"X_MP,{acq_rise('MP_contention')}early · Man_t_RF,CLK",
+                        *zd("Per", syms), "t_PD"], (kw, syms)
+        syms = [t.symbol for t in b["PM_contention"].terms]
+        assert syms == [f"X_MP,{rel_fall('PM_contention')}late · Man_t_RF,CLK",
+                        *release("Per", syms), *ui,
+                        *zd("Man", syms)], (kw, syms)
+        syms = [t.symbol for t in b["PP_contention"].terms]
+        # At zero handover UIs a conventional release and the acquirer's turn-on are of one
+        # clock edge, so the acquirer's early detection is on the releaser's slow edge.
+        shared = not inp.handover_UIs and not inp.Per_ede
+        rise = acq_rise("PP_contention")
+        acq = f"X_MP,B,{rise}slow,early" if shared else f"X_MP,B,{rise}early"
+        rel = f"X_MP,A,{rel_fall('PP_contention')}late"
+        assert syms == [f"({rel} − {acq}) · Man_t_RF,CLK", *release("Per", syms), *ui,
+                        *zd("Per", syms)], (kw, syms)
 
 
 def test_the_inequalities_are_numbered_for_reference_in_display_order():
@@ -900,6 +1505,15 @@ def test_the_inequalities_are_numbered_for_reference_in_display_order():
     assert seen == list(range(1, len(INEQUALITIES) + 1)), seen
 
 
+# Buses with SoundWire Peripherals, at a Peripheral slew off the equivalents' own, so their
+# launches carry an `,anchor` term.
+_SOUNDWIRE_PERIPHERALS = (
+    {"Per_spec": "SW13_1V2", "tRF_Per_DATA_ns": 4.0},
+    {"Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2", "tRF_Per_DATA_ns": 4.0,
+     "handover_UIs": 0.0},
+)
+
+
 def test_A_drives_and_B_samples_on_every_pp_leg():
     """A is the driver and B the sampler, on all four P→P legs, and never the reverse.
 
@@ -910,19 +1524,20 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
 
     THE RULE. On every P→P leg:
       * A contributes the LAUNCH — `Per_t_DD` on the t_DD legs, `Per_t_ZD` on the `_ho`
-        ones — and its own clock detection, `X_PP,A,*`.
+        ones — and its own clock detection, `X_MP,A,*`.
       * B contributes the RECEIVER WINDOW — `Per_t_IS` for setup, `Per_t_IH` for hold —
-        and its crossing, `X_PP,B,*`.
+        its clock detection, `X_MP,B,*`, and its detection of A's data, `X_PP,B,*`.
 
-    What flips between the families is A's CORNER, not its identity: `X_PP,A,late` is
-    charged on setup (a late launch eats the setup window) and `X_PP,A,early` is credited on
-    hold (an early launch leaves the level valid longer past B's edge). A letter that
+    What flips between the families is A's CORNER, not its identity: `X_MP,A,<edge>,late` is
+    charged on setup (a late launch eats the setup window) and `X_MP,A,<edge>,early` is
+    credited on hold (an early launch leaves the level valid longer past B's edge). A letter that
     followed the corner instead of the device would look just as consistent.
 
     Note also what "A drives" does NOT settle, which the notes say per leg: on a HOLD
     leg A's launch is the aggressor, and on `PP_hold_ho` the level it destroys belongs to the
     peripheral that just released, not to A.
     """
+    import re
     from dataclasses import replace
 
     LAUNCH = {"PP_setup": "Per_t_DD", "PP_setup_ho": "Per_t_ZD",
@@ -930,11 +1545,15 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
     WINDOW = {"PP_setup": "Per_t_IS", "PP_setup_ho": "Per_t_IS",
               "PP_hold": "Per_t_IH", "PP_hold_ho": "Per_t_IH"}
 
-    for kw in ({}, {"handover_UIs": 1.0}, {"pp_placement": "driver_far"},
-               {"Man_ede": True, "Per_ede": True}):
+    for kw in ({}, {"handover_UIs": 0.0}, {"handover_UIs": 2.0}, {"pp_placement": "driver_far"},
+               {"Man_ede": True, "Per_ede": True}, *_SOUNDWIRE_PERIPHERALS):
         b = compute(replace(CalcInputs(), **kw)).breakdowns
         for leg in LAUNCH:
-            terms = {t.symbol.split(" · ")[0].split(",")[0]: t for t in b[leg].terms}
+            # A SoundWire launch's `,anchor` term is part of A's launch, and reads no row.
+            anchors = [t.symbol for t in b[leg].terms if ",anchor" in t.symbol]
+            assert all(a.startswith(f"{LAUNCH[leg]},anchor") for a in anchors), (leg, anchors)
+            terms = {t.symbol.split(" · ")[0].split(",")[0]: t for t in b[leg].terms
+                     if ",anchor" not in t.symbol}
             launch, window = terms.get(LAUNCH[leg]), terms.get(WINDOW[leg])
             assert launch is not None and window is not None, (leg, sorted(terms))
             assert launch.note.startswith("A"), \
@@ -944,14 +1563,18 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
                 f"{leg}: the receiver window ({WINDOW[leg]}) must be B's"
             # And the crossings letter the same way round, which is where a swap would
             # actually change a number: A's is the launcher's detection of the clock.
-            crossings = [t.symbol for t in b[leg].terms if "X_PP" in t.symbol]
+            crossings = [t.symbol for t in b[leg].terms if "X_" in t.symbol]
             assert crossings, leg
             joined = " ".join(crossings)
-            assert "X_PP,A" in joined and "X_PP,B" in joined, (leg, crossings)
+            assert "X_MP,A," in joined and "X_MP,B," in joined, (leg, crossings)
+            assert "X_PP,B," in joined and "X_PP,A" not in joined, (leg, crossings)
             # A's corner follows the FAMILY, not the letter: late erodes setup, early
-            # credits hold. If these ever swap, one of the two is reading the wrong end.
-            want = "X_PP,A,late" if leg.startswith("PP_setup") else "X_PP,A,early"
-            assert want in joined, (leg, crossings)
+            # credits hold. If these ever swap, one of the two is reading the wrong end. The
+            # role is the symbol's last token, after any edge qualifier.
+            want = "late" if leg.startswith("PP_setup") else "early"
+            a_roles = set(re.findall(r"X_MP,A,(?:rise|fall),(?:slow,|fast,)?(late|early)",
+                                     joined))
+            assert a_roles == {want}, (leg, crossings)
 
 
 def test_no_pp_leg_reads_one_per_row_for_both_devices():
@@ -968,14 +1591,16 @@ def test_no_pp_leg_reads_one_per_row_for_both_devices():
     from collections import Counter
     from dataclasses import replace
 
-    for kw in ({}, {"handover_UIs": 1.0}, {"Per_ede": True},
-               {"pp_placement": "driver_far"}):
+    for kw in ({}, {"handover_UIs": 0.0}, {"handover_UIs": 2.0}, {"Per_ede": True},
+               {"pp_placement": "driver_far"}, *_SOUNDWIRE_PERIPHERALS):
         for leg, b in compute(replace(CalcInputs(), **kw)).breakdowns.items():
             if not leg.startswith("PP_"):
                 continue
             rows = Counter()
             for term in b.terms:
                 head = term.symbol.split(" · ")[0]
+                if ",anchor" in head:           # a SoundWire launch's correction, no row
+                    continue
                 m = re.fullmatch(r"(Per_t_[A-Z]{2})(?:,\w+)*", head)
                 if m:
                     rows[m.group(1)] += 1
@@ -990,10 +1615,10 @@ def test_a_gathered_crossing_states_arithmetic_that_actually_adds_up():
     """A gathered term's SYMBOL, factors and note must all describe the same sum.
 
     `_gather_lane_terms` folds two crossings of one lane into
-    `(X_PP,A,late − X_PP,B,early) · Man_t_RF,CLK`, substituted as `(1.44 − 0.45)·5.00`. The
-    term's VALUE is computed from the signed total and is correct however the decomposition is
-    written, so no margin assertion can catch a wrong one: the contributions must be signed
-    relative to the operator hoisted out front.
+    `(X_MP,A,rise,late − X_MP,B,fall,early) · Man_t_RF,CLK`, substituted as
+    `(c_late − c_early)·t_RF`. The term's VALUE is computed from the signed total and is
+    correct however the decomposition is written, so no margin assertion can catch a wrong
+    one: the contributions must be signed relative to the operator hoisted out front.
 
     So the check is the arithmetic itself, three ways round: the coefficients in `factors` must
     sum to the value in force, the bracketed symbol must carry one crossing name per
@@ -1005,7 +1630,7 @@ def test_a_gathered_crossing_states_arithmetic_that_actually_adds_up():
     from swi3s_studio.timing import CalcInputs, compute
 
     seen = 0
-    for kw in ({}, {"handover_UIs": 1.0}, {"Man_ede": True, "Per_ede": True},
+    for kw in ({}, {"handover_UIs": 0.0}, {"handover_UIs": 2.0}, {"Man_ede": True, "Per_ede": True},
                {"pp_placement": "driver_far"}):
         for leg, b in compute(replace(CalcInputs(), **kw)).breakdowns.items():
             for term in b.terms:
@@ -1027,26 +1652,50 @@ def test_a_gathered_crossing_states_arithmetic_that_actually_adds_up():
                 # 2. The symbol is a bracket holding one crossing per coefficient.
                 head = term.symbol.partition(" · ")[0]
                 assert head.startswith("(") and head.endswith(")"), term.symbol
-                names = [h for h in re.split(r"[-+]", head[1:-1]) if h.strip()]
+                names = [h for h in re.split(r"[−+]", head[1:-1]) if h.strip()]
                 assert len(names) == len(coeffs), (term.symbol, coeffs)
                 # ...and the bracket's operators match the coefficients' signs.
-                ops = re.findall(r"[-+]", head)
-                assert ops == ["-" if c < 0 else "+" for c in coeffs[1:]], (head, coeffs)
+                ops = re.findall(r"[−+]", head)
+                assert ops == ["−" if c < 0 else "+" for c in coeffs[1:]], (head, coeffs)
 
                 # 3. The note states the same sum, opening on the positive contribution.
                 m = re.fullmatch(r"([\d.]+) = (.+), at t_RF ([\d.]+) ns", term.note)
                 assert m, f"{leg}: unexpected gathered note {term.note!r}"
                 assert float(m.group(1)) == pytest.approx(abs(total), abs=5e-3), term.note
                 assert float(m.group(3)) == pytest.approx(trf, abs=5e-3), term.note
-                bits = re.findall(r"([+-]?)\s*([\d.]+)\s+(\w+)", m.group(2))
+                bits = re.findall(r"([+−]?)\s*([\d.]+)\s+(\w+)", m.group(2))
                 assert len(bits) == len(coeffs), (term.note, coeffs)
                 assert not bits[0][0], f"{leg}: the note must not open with a sign: {term.note}"
-                note_total = sum(-float(v) if s == "-" else float(v) for s, v, _r in bits)
+                note_total = sum(-float(v) if s == "−" else float(v) for s, v, _r in bits)
                 assert note_total == pytest.approx(abs(total), abs=5e-3), (
                     f"{leg}: the note says {m.group(2)!r} = {note_total:.3f} but claims "
                     f"{abs(total):.3f} — its signs are not relative to the hoisted operator")
 
     assert seen, "no gathered crossing found — has _gather_lane_terms stopped running?"
+
+
+def test_a_crossing_term_shows_a_positive_coefficient_under_its_operator():
+    """A `coefficient · t_RF` term shows its coefficient positive and carries the sign in its
+    operator: the operator is `-` exactly where the value subtracts, and the value is the
+    product of the factors. At a large ground shift an early crossing's coefficient is
+    negative, its crossing before its edge's 20 % point, and its term's operator flips."""
+    from dataclasses import replace
+
+    from swi3s_studio.timing import CalcInputs, compute
+
+    flipped = 0
+    for kw in ({}, {"V_noise_pp_frac": 0.2}, {"V_noise_pp_frac": 0.2, "Per_shape": "exp"}):
+        for leg, b in compute(replace(CalcInputs(), **kw)).breakdowns.items():
+            for term in b.terms:
+                if not term.factors or len(term.factors) != 2 or " · " not in term.symbol:
+                    continue
+                coeff, trf = term.factors
+                assert coeff >= 0.0, (leg, term)
+                assert abs(term.value_ns) == pytest.approx(coeff * trf, abs=1e-12), (leg, term)
+                if term.value_ns:
+                    assert (term.op == "-") == (term.value_ns < 0), (leg, term)
+                flipped += term.symbol.startswith("X_MP,fall,early") and term.op == "-"
+    assert flipped, "the sweep must reach a negative early crossing coefficient"
 
 
 def test_the_calculator_docstring_counts_the_legs_it_evaluates():
@@ -1057,9 +1706,8 @@ def test_the_calculator_docstring_counts_the_legs_it_evaluates():
     first = doc.splitlines()[0]
     assert f"{len(INEQUALITIES)} inequalities" in first, first
     assert "`INEQUALITIES`" in doc and "ADDING AN INEQUALITY" in doc
-    assert "docs/SWI3S_Timing_Analysis.tex" not in doc.replace(
-        "timing-analysis/docs/SWI3S_Timing_Analysis.tex", ""), \
-        "the derivation lives in the sibling project, not in this repository's docs/"
+    assert "SWI3S_Timing_Analysis.tex" not in doc, \
+        "the docstring names no derivation document"
 
 
 def test_the_parameter_sections_and_where_the_ramp_models_live():
@@ -1078,8 +1726,88 @@ def test_the_parameter_sections_and_where_the_ramp_models_live():
     assert sections["System Properties"] == ["δ (V_SEOS tol)", "α (V_noise / V_SEOS)",
                                              "bus length (cm)", "t_PD,mis fraction"]
     tv = TimingView()
+    assert len(tv._section_cards) == len(SECTIONS), (len(tv._section_cards), len(SECTIONS))
     for card, (title, _rows) in zip(tv._section_cards, SECTIONS):
         assert title in [lab.text() for lab in card.findChildren(QLabel)]
     for combo in (tv._man_shape, tv._per_shape):
         assert tv._topbar.isAncestorOf(combo)
         assert not any(card.isAncestorOf(combo) for card in tv._section_cards)
+
+
+# Each crossing corner's (transmitter, receiver) device, indexing `CalcInputs.supply_corners`'s
+# (Manager, Peripheral, Peripheral B). A declared table, updated by hand with a new crossing.
+_CROSSING_DEVICES = {
+    "mp_late_rise": (0, 1), "mp_early_fall": (0, 1),
+    "mp_late_rise_b": (0, 2), "mp_early_fall_b": (0, 2), "sigma_pm_hold_rf_clk_b": (0, 2),
+    "mp_late_fall": (0, 1), "mp_late_fall_b": (0, 2), "mp_early_rise_per": (1, 2),
+    "mp_late_rise_data": (0, 1), "mp_early_fall_data": (0, 1),
+    "mp_late_rise_per": (1, 2), "mp_early_fall_per": (1, 2),
+    "sigma_pm_setup": (0, 1), "sigma_pm_setup_clk": (0, 1), "sigma_pm_setup_data": (1, 0),
+    "sigma_pm_setup_clk_dgnd_pos": (0, 1), "sigma_pm_setup_clk_dgnd_neg": (0, 1),
+    "sigma_pm_setup_data_dgnd_pos": (1, 0), "sigma_pm_setup_data_dgnd_neg": (1, 0),
+    "sigma_pm_hold_rr": (0, 1), "sigma_pm_hold_rr_clk": (0, 1), "sigma_pm_hold_rr_data": (1, 0),
+    "sigma_pm_hold_rf_clk": (0, 1), "sigma_pm_hold_rf_data": (1, 0),
+    "mp_late_fall_data": (0, 1), "mp_early_rise_data": (0, 1), "mp_late_fall_per": (1, 2),
+    "sigma_pm_setup_fall_clk_dgnd_pos": (0, 1), "sigma_pm_setup_fall_clk_dgnd_neg": (0, 1),
+    "sigma_pm_setup_fall_data_dgnd_pos": (1, 0), "sigma_pm_setup_fall_data_dgnd_neg": (1, 0),
+    "sigma_pm_hold_ff_clk": (0, 1), "sigma_pm_hold_ff_data": (1, 0),
+    "sigma_pm_hold_fr_data": (1, 0),
+}
+
+
+def test_one_device_has_one_supply_and_each_leg_reports_its_worst_assignment():
+    """A crossing takes its transmitter's supply as its rail and its receiver's for its
+    threshold; each leg's margin is its least over every assignment of V_SEOS ± tolerance to
+    the three devices, at the assignment it records, and no supply inside the tolerance
+    leaves less: none of each device's nominal, its two ends and the two points halfway to
+    them, on a linear and an exponential ramp."""
+    import itertools
+    from dataclasses import replace
+
+    from swi3s_studio.timing.calculator import _compute_at
+    supplies = (0.95, 1.0, 1.05)
+    corners = CalcInputs().crossing_corners(supplies)
+    assert set(corners) == set(_CROSSING_DEVICES)
+    for name, c in corners.items():
+        tx, rx = _CROSSING_DEVICES[name]
+        assert (c.vdd_tx, c.rx_supply) == (supplies[tx], supplies[rx]), name
+    for inp in (CalcInputs(),
+                CalcInputs(Man_shape="exp", Per_shape="exp", tRF_Man_CLK_ns=8.3,
+                           tRF_Per_DATA_ns=3.0),
+                CalcInputs(Man_spec="SW13_1V2", Per_spec="SW13_1V2")):
+        d = inp.V_SEOS_tol_frac
+        assert len(inp.supply_corners()) == 8
+        res = compute(inp)
+        # Each supply assignment at each set of fast-edge lanes (`CalcInputs.fast_data_edge`).
+        lanes = inp.fast_edge_lanes()
+        edges = [frozenset(), frozenset(lanes)]
+        runs = [_compute_at(replace(inp, fast_data_edge=e), s)
+                for e in edges for s in inp.supply_corners()]
+        inside = (1 - d, 1 - d / 2, 1.0, 1 + d / 2, 1 + d)
+        inner = [_compute_at(replace(inp, fast_data_edge=e), s) for e in edges
+                 for s in itertools.product(inside, repeat=3)]
+        for leg in INEQUALITIES:
+            b = res.breakdowns[leg]
+            # Assignments within 1e-12 ns of the least tie (`compute`).
+            assert b.margin_ns == pytest.approx(
+                min(r.breakdowns[leg].margin_ns for r in runs), rel=0.0, abs=1e-12), leg
+            at = _compute_at(replace(inp, fast_data_edge=b.fast_data_edge), b.supplies)
+            assert at.breakdowns[leg].margin_ns == b.margin_ns, leg
+            assert min(r.breakdowns[leg].margin_ns for r in inner) >= b.margin_ns - 1e-12, leg
+    nominal = compute(CalcInputs(V_SEOS_tol_frac=0.0))
+    assert {b.supplies for b in nominal.breakdowns.values()} == {(1.0, 1.0, 1.0)}
+
+
+def test_a_row_point_survives_copy_deepcopy_and_pickle():
+    """A `RowPoint` in the picks `find_worst_corner_rows_all` returns copies and pickles as a
+    `RowPoint` with its text and `at`, a slew row's and a fraction row's alike."""
+    import copy
+    import pickle
+
+    from swi3s_studio.timing.calculator import RowPoint
+    for point in (RowPoint(0.3, 7.9), RowPoint(0.25, 0.025, "at 2.50 %")):
+        picks = {"MP_setup": {"row": point}}
+        for twin in (copy.copy(point), copy.deepcopy(picks)["MP_setup"]["row"],
+                     pickle.loads(pickle.dumps(picks))["MP_setup"]["row"]):
+            assert type(twin) is RowPoint
+            assert (str(twin), twin.at) == (str(point), point.at)

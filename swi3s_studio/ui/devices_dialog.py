@@ -1,8 +1,9 @@
 """Devices dialog — per-device name, register map, and hub depth.
 
 One row per device (0–11). Lets the user name each device, assign/import/clear
-its peripheral register map, and set its hub depth (0–5). Hub depth feeds the
-decoder: a peripheral N hub levels deep has its response delayed 2·N frame rows.
+its peripheral register map, and set its hub depth (0 to session.MAX_HUB_DEPTH). Hub
+depth feeds the decoder: a peripheral N hub levels deep has its response delayed 2·N
+frame rows.
 This is the single place these per-device settings live.
 """
 
@@ -27,9 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from .. import import_notes
+from ..session import MAX_HUB_DEPTH
 from .theme import VizTheme
-
-MAX_HUB_DEPTH = 5
 
 # The per-device aspects this dialog can edit. Each Devices menu item opens it
 # focused on ONE aspect (Names / Register Maps / Hub Depth); the full set is used
@@ -45,7 +45,7 @@ class DevicesDialog(QDialog):
     hidden aspects keep the values passed in. On accept, read results from
     `.names` ({dev: str}), `.hub_depths` ({dev: int}), and `.regmaps`
     ({dev: PeripheralRegisterMap}); `.map_notes` holds, per device, the import warnings
-    (import_notes.ImportWarning) of the map imported for it here."""
+    (import_notes.ImportNote) of the map imported for it here."""
 
     def __init__(self, parent, devices, names: Dict[int, str],
                  hub_depths: Dict[int, int], regmaps: Dict[int, object],
@@ -53,7 +53,7 @@ class DevicesDialog(QDialog):
         super().__init__(parent)
         self._sections = tuple(s for s in ALL_SECTIONS if s in sections) or ALL_SECTIONS
         # Title the dialog by what it edits: the single-aspect openers read as
-        # "Device Names" / "Device Register Maps" / "Device Hub Depth".
+        # "Device Names" / "Device Register Maps" / "Device Hub Depths".
         self.setWindowTitle("Devices" if len(self._sections) > 1
                             else f"Device {_SECTION_TITLE[self._sections[0]]}s")
         self.setMinimumWidth(560 if "maps" in self._sections else 360)

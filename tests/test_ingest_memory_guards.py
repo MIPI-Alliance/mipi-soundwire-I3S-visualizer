@@ -32,6 +32,8 @@ from swi3s_studio.ingest import (
 )
 from swi3s_studio.ingest.capture import Capture
 
+pytestmark = pytest.mark.platform
+
 
 def _peak(fn):
     tracemalloc.start()
@@ -65,7 +67,7 @@ def test_a_digital_csv_peaks_within_its_prediction(tmp_path, monkeypatch, unsort
         path.write_text("\n".join(lines) + "\n")
     with open(path, "rb") as f:
         sample = f.read(64 << 10)
-    rows = digital_csv._predict_rows(str(path), 3, sample)
+    rows = digital_csv.predict_rows(str(path), sample)
     predicted = digital_csv.predict_peak_bytes(rows, 3, sample, ascending=not unsorted)
     got, peak = _peak(lambda: digital_csv.load_capture(str(path), 1, 2, max_bytes=0))
     assert np.array_equal(got.clock_edges, cap.clock_edges)
@@ -77,7 +79,7 @@ def test_the_digital_csv_probe_shows_the_loaders_figure(tmp_path):
     raw_export.export_csv(_edge_capture(5_000), path)
     with open(path, "rb") as f:
         sample = f.read(64 << 10)
-    rows = digital_csv._predict_rows(path, 3, sample)
+    rows = digital_csv.predict_rows(path, sample)
     assert probe.probe([path]).cost_all_bytes == digital_csv.predict_peak_bytes(rows, 3, sample)
     with pytest.raises(digital_csv.CsvTooLargeError):
         digital_csv.load_capture(path, 1, 2, max_bytes=probe.probe([path]).cost_all_bytes - 1)
@@ -92,7 +94,7 @@ def _scope_csv(path, n):
     clk = np.where((np.arange(n) // 4) % 2, 1.0, -1.0)
     dat = np.where((np.arange(n) // 40) % 2, 0.9, -0.9)
     with open(path, "w") as f:
-        f.write("Model,MSO58,,Model,MSO58\nSample Interval,1e-09,,Sample Interval,1e-09\n"
+        f.write("Model,SCOPE1,,Model,SCOPE1\nSample Interval,1e-09,,Sample Interval,1e-09\n"
                 "\nTIME,CH1,CH2\n")
         f.write("\n".join(f"{t[i]:.6e},{clk[i]:.4e},{dat[i]:.4e}" for i in range(n)) + "\n")
 
@@ -228,6 +230,17 @@ def test_the_analog_front_end_matches_the_whole_array_rules():
         analog._CHUNK = old_chunk
 
 
+def test_a_nan_in_the_time_axis_is_not_a_positive_step():
+    """NaN times are not positive steps, so the median step is the positive steps' median."""
+    t = np.cumsum([0.0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]) * 1e-6
+    t[[3, 6, 9]] = np.nan
+    d = np.diff(t)
+    want = float(np.median(d[d > 0]))
+    got = analog._median_positive_step(t)
+    assert np.isfinite(got) and got > 0
+    assert got == want
+
+
 # ---- Saleae .bin pair -------------------------------------------------------------------
 
 def _bin_pair(tmp_path, n):
@@ -257,16 +270,12 @@ def test_a_bin_with_a_low_header_count_is_priced_by_what_is_read(tmp_path, count
     a, b, _e = _bin_pair(tmp_path, 1_500_000)
     for path in (a, b):
         raw = bytearray(pathlib.Path(path).read_bytes())
-        struct.pack_into("<Q", raw, saleae_binary._HEADER.size - 8, count)
+        struct.pack_into("<Q", raw, saleae_binary.V0_HEADER.size - 8, count)
         pathlib.Path(path).write_bytes(bytes(raw))
     predicted = saleae_binary.predict_peak_bytes(a, b)
 
-    def load():
-        try:
-            saleae_binary.load_capture(a, b, 500_000_000, max_bytes=0)
-        except ValueError:
-            pass                                       # refused after reading: still a peak
-    _cap, peak = _peak(load)
+    _cap, peak = _peak(lambda: saleae_binary.load_capture(a, b, 500_000_000, max_bytes=0))
+    assert peak >= os.path.getsize(a) + os.path.getsize(b), "the files were not read whole"
     assert peak <= predicted, f"peak {peak / 1e6:.1f} MB over the {predicted / 1e6:.1f} MB guard"
     assert predicted >= os.path.getsize(a) + os.path.getsize(b)
 

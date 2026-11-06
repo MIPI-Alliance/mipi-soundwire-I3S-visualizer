@@ -46,9 +46,12 @@ def _fftconvolve_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
     return y[start:start + x.size]
 
 
-# Output samples computed per block. Peak memory is ~one block's zero-stuffed input
-# window + its FFT, not the whole N*L upsampled signal / convolution.
+# Output samples computed per block, at most. Peak memory is ~one block's zero-stuffed input
+# window + its FFT, not the whole N*L upsampled signal / convolution. A block spans about
+# out_block * M input positions, so a heavy decimation takes fewer outputs per block to keep
+# the window near _INPUT_WINDOW positions.
 _OUT_BLOCK = 1 << 15
+_INPUT_WINDOW = 1 << 21
 
 
 def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
@@ -64,13 +67,14 @@ def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
     n_out = -(-NL // M)                     # ceil(NL / M); == resampled_length
     out = np.empty(n_out, dtype=np.float64)
 
+    out_block = max(1, min(_OUT_BLOCK, _INPUT_WINDOW // M))
     # A full block spans this many input positions; fix its FFT size so h transforms once.
-    seg_common = (_OUT_BLOCK - 1) * M + (T - 1) + 1
+    seg_common = (out_block - 1) * M + (T - 1) + 1
     fft_common = 1 << int(np.ceil(np.log2(max(1, seg_common + T - 1))))
     Hf_common = np.fft.rfft(h, fft_common)
 
-    for k0 in range(0, n_out, _OUT_BLOCK):
-        k1 = min(k0 + _OUT_BLOCK, n_out)
+    for k0 in range(0, n_out, out_block):
+        k1 = min(k0 + out_block, n_out)
         # y-indices this block needs: k*M for k in [k0, k1). y[i] = sum_j h[j]*up[i+d-j],
         # so the up-window is [k0*M + d - (T-1), (k1-1)*M + d].
         up_lo = k0 * M + d - (T - 1)
@@ -97,24 +101,31 @@ def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
     return out
 
 
+def _ratio(ir: int, orate: int, max_denominator: int) -> Fraction:
+    """out/in as L/M. The denominator bound is raised to ceil(in/out) so a heavy
+    decimation keeps its ratio (24.576 MHz -> 48 kHz is exactly 1/512) and L stays >= 1."""
+    return Fraction(orate, ir).limit_denominator(max(max_denominator, -(-ir // orate)))
+
+
 def resample(x, in_rate: float, out_rate: float, half_width: int = 24,
              max_denominator: int = 256) -> np.ndarray:
     """Resample `x` from `in_rate` to `out_rate` (Hz). Returns float64 of length
     ≈ len(x) * out_rate / in_rate. Identity (rates equal / empty) returns a copy.
 
     `half_width` sets the filter quality (taps per polyphase branch ≈ 2*half_width);
-    `max_denominator` bounds the rational approximation of the ratio (a tiny rate
-    error in exchange for a bounded filter / upsample factor)."""
+    `max_denominator` is the smallest bound on the rational approximation of the ratio
+    (a tiny rate error in exchange for a bounded filter / upsample factor). The bound used
+    is max(max_denominator, ceil(in_rate / out_rate)), so a 1/N decimation is exact and a
+    non-integer heavy decimation stays approximate (the output length is then within about
+    1/bound of out_rate * duration)."""
     x = np.asarray(x, dtype=np.float64).ravel()
     ir = int(round(in_rate))
     orate = int(round(out_rate))
     if x.size == 0 or ir <= 0 or orate <= 0 or ir == orate:
         return x.copy()
 
-    frac = Fraction(orate, ir).limit_denominator(max_denominator)
+    frac = _ratio(ir, orate, max_denominator)
     L, M = frac.numerator, frac.denominator
-    if L < 1 or M < 1:
-        return x.copy()
 
     # Low-pass at the lower of the two Nyquists (normalised to the upsampled Nyquist),
     # gain L to compensate the zero-stuff, then keep every M-th filtered sample. The core
@@ -132,7 +143,7 @@ def resampled_length(n: int, in_rate: float, out_rate: float,
     ir, orate = int(round(in_rate)), int(round(out_rate))
     if n == 0 or ir <= 0 or orate <= 0 or ir == orate:
         return n
-    frac = Fraction(orate, ir).limit_denominator(max_denominator)
+    frac = _ratio(ir, orate, max_denominator)
     return -(-(n * frac.numerator) // frac.denominator)   # ceil(n*L/M), matches up[::M]
 
 

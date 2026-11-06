@@ -12,6 +12,8 @@ from swi3s_studio.session import Session
 from swi3s_studio.store import audio_store
 from swi3s_studio.store.audio_store import AudioStore
 
+pytestmark = pytest.mark.gui
+
 _CAP_RATE = 500_000_000.0
 _STEP = _CAP_RATE / 48_000.0          # capture samples per stream sample
 _OPP = _STEP / 2.0                    # opportunities at twice the stream rate

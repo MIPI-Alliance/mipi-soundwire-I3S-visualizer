@@ -13,24 +13,12 @@ import tempfile
 
 import numpy as np
 import pytest
+from conftest import tone_snr
 
 from swi3s_studio.model.bus_config import BusConfig
 from swi3s_studio.session import Session
 
 _SAMPLES = 6000          # deep enough that the 16-col region holds an SSPA
-
-
-def _tone_snr(a) -> float:
-    a = np.asarray(a, dtype=np.float64)
-    if a.size < 512:
-        return -99.0
-    a = a - a.mean()
-    w = np.hanning(min(4096, a.size))
-    A = np.abs(np.fft.rfft(a[:w.size] * w)) ** 2
-    A[0] = 0.0
-    k = int(np.argmax(A))
-    sig = A[max(1, k - 2):k + 3].sum()
-    return 10.0 * np.log10(sig / (A.sum() - sig + 1e-9))
 
 
 @pytest.fixture(scope="module")
@@ -110,8 +98,8 @@ def test_recovered_audio_is_clean_end_to_end(joined_late, config_csv):
     for dev, dp, ch in _pcm(store):
         a = store.samples(dev, dp, ch)
         half = len(a) // 2
-        assert _tone_snr(a[:half]) > 20.0, f"dev{dev} dp{dp} ch{ch}: first half garbled"
-        assert _tone_snr(a[half:]) > 20.0, f"dev{dev} dp{dp} ch{ch}: second half garbled"
+        assert tone_snr(a[:half]) > 20.0, f"dev{dev} dp{dp} ch{ch}: first half garbled"
+        assert tone_snr(a[half:]) > 20.0, f"dev{dev} dp{dp} ch{ch}: second half garbled"
         checked += 1
     assert checked >= 2, f"expected at least two PCM streams, checked {checked}"
 
@@ -150,20 +138,21 @@ def test_recovered_audio_matches_the_full_capture(joined_late, config_csv, full)
     assert compared >= 2, f"compared only {compared} streams"
 
 
-def test_workspace_round_trip_keeps_the_recovery(joined_late, config_csv):
-    """A join-late session is only useful if it reopens the same way: the CSV path is
-    persisted, and the SSP is re-derived from the SSPA on load."""
+def test_workspace_round_trip_keeps_the_recovery(joined_late, config_csv, tmp_path):
+    """A join-late session reopens the same way from its saved source descriptor: the capture
+    file and the CSV path are persisted, and the SSP is re-derived from the SSPA on load."""
     import json
 
-
-    s = Session(joined_late, config_csv=config_csv)
+    from swi3s_studio.ingest.sal_export import export_sal
+    path = str(tmp_path / "late.sal")
+    export_sal(joined_late, path)
+    s = Session.from_sal(path, 0, 1, config_csv=config_csv)
     assert s.ssp_locked_from_sspa
     before = {k: len(s.audio_store().samples(*k)) for k in s.audio_store()._channels}
+    assert before
 
-    # Only the descriptor round-trips; the capture itself is supplied by the caller in
-    # this synthetic case, so rebuild the session the same way and re-apply the source.
     src = json.loads(json.dumps(s.source))
     assert src.get("config_csv") == config_csv
-    s2 = Session(joined_late, config_csv=src["config_csv"])
+    s2 = Session.from_source(src)
     assert s2.ssp_locked_from_sspa
     assert {k: len(s2.audio_store().samples(*k)) for k in s2.audio_store()._channels} == before

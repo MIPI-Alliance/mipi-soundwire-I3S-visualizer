@@ -22,10 +22,9 @@ On a **Cold Start** the Manager then clocks a 4-bit PHY number on DN — sampled
 off to the selected audio PHY. A **Warm Start** carries **no** PHY number: the
 previously-selected PHY is reused (so a decoder must carry it over).
 
-All thresholds and the PHY-number→type map are draft-sourced (MIPI SWI3S v1.1
-r06) and kept as table-driven constants — notably the PHY-number *encoding*
-(Table 9) is still ``###TBD`` in the draft, so the value→PHY map is a best-effort
-1-based literal and easy to revise against the adopted spec.
+All thresholds and the PHY-number→type map are sourced from the MIPI SWI3S v1.1 r06
+draft and kept as table-driven constants. The draft leaves the PHY-number encoding
+(Table 9) as ``###TBD``, so ``PHY_NUMBER_MAP`` is a 1-based literal.
 """
 from __future__ import annotations
 
@@ -69,9 +68,8 @@ PHY_NUMBER_BITS = 4         # normative 4-bit PHY number, MSb first
 # resolves to 'none'.
 _LC_MAX_EDGES = 8192
 
-# PHY number → (name, kind). Encoding is TBD in the draft (Table 9 is ###TBD);
-# the names/order (#1 FBCSE-slow, #2 FBCSE-fast, #3 DLV) are stable, so default to
-# a 1-based literal map. Revise here when the spec fixes the encoding.
+# PHY number → (name, kind). The draft leaves the encoding undefined (Table 9 is
+# ###TBD); the map is 1-based in the order #1 FBCSE-slow, #2 FBCSE-fast, #3 DLV.
 PHY_NUMBER_MAP = {
     0b0001: ("PHY1", "FBCSE-slow"),
     0b0010: ("PHY2", "FBCSE-fast"),
@@ -102,8 +100,8 @@ MAN_TRESET10_REC_MAX_US = 2000.0     # recommended (not mandatory) upper bound
 
 def _timing_row(param: str, measured_us: float) -> dict:
     """One Link-Control timing measurement vs its §5.2.3 [min,max] limit. `ok` is
-    True/False when a bound is exceeded, or None when the parameter has no bound on
-    the relevant side (still shown, just not pass/failed)."""
+    True/False against the bounds the parameter has (a one-sided limit tests that side
+    only), or None when it has no bound at all (still shown, just not pass/failed)."""
     lo, hi, desc = LC_TIMING_LIMITS.get(param, (None, None, ""))
     ok = True
     if lo is not None and measured_us < lo:
@@ -239,10 +237,15 @@ def _start_pulse(r: LinkControlResult) -> Optional[int]:
     return next((int(sec["start"]) for sec in r.sections if sec["name"] == "Warm Start"), None)
 
 
-def decode_link_controls(capture) -> List[LinkControlResult]:
+def decode_link_controls(capture, first: Optional[LinkControlResult] = None
+                         ) -> List[LinkControlResult]:
     """Every link bring-up in the capture, in order: the first as decode_link_control finds
     it (sequence 'none' when the capture starts in audio mode), then one per later start
     sequence. A Link can go inactive (its clock stops) and be brought up again.
+
+    `first`, when given, is the first bring-up as the caller has validated it, and is used
+    in place of decoding it again: the later ones are looked for after its audio start, from
+    the start of the capture when it has none.
 
     A later one is looked for after each clock stop longer than LINK_IDLE_MIN_US past the
     previous bring-up's audio start, decoded from the stop (whose Idle section is then the
@@ -254,7 +257,8 @@ def decode_link_controls(capture) -> List[LinkControlResult]:
     rises within START_PULSE_MAX_EDGES clock edges of the clock moving again, and the clock
     then runs as audio mode does (AUDIO_MIN_EDGES_PER_MS). A Warm Start names no PHY, so it carries the
     previous bring-up's; a Cold Start whose PHY number is not recognised names none."""
-    first = decode_link_control(capture)
+    if first is None:
+        first = decode_link_control(capture)
     found = [first]
     ce = np.asarray(capture.clock_edges)
     if ce.size < 2:
@@ -427,12 +431,8 @@ def _decode_oriented(clock_edges, initial_clock, data_edges, initial_data,
     if seq_idx is None:
         return LinkControlResult(sequence="none")
 
-    # The start pulse needs its own falling edge to define PhyStart; if it's the
-    # very last edge in the capture there's nothing after it to measure.
-    if seq_idx + 1 >= clk.size:
-        return LinkControlResult(sequence="none",
-                                 note="Start pulse at the final clock edge — capture ends before PhyStart.")
-
+    # The start pulse is chosen from a measured gap (`gaps[seq_idx]`), so its falling edge
+    # `clk[seq_idx + 1]` exists.
     rise_sample = int(clk[seq_idx])
     fall_sample = int(clk[seq_idx + 1])
 
@@ -560,7 +560,8 @@ def _decode_oriented(clock_edges, initial_clock, data_edges, initial_data,
 
 def _clock_timing_rows(highs: List[float], lows: List[float]) -> List[dict]:
     """Man_tClock1/Man_tClock0 rows from the per-cycle high/low durations (µs). Each
-    reports the cycle NEAREST a limit as the measured value, passes only if EVERY
+    reports the cycle NEAREST a limit as the measured value (the shortest distance to
+    its bound, a broken bound counting as negative; the longest on a tie), passes only if EVERY
     cycle is within [5, 32] µs, and carries the observed range + cycle count in its
     description."""
     rows = []
@@ -569,9 +570,10 @@ def _clock_timing_rows(highs: List[float], lows: List[float]) -> List[dict]:
             continue
         lo, hi = min(vals), max(vals)
         b_lo, b_hi, _desc = LC_TIMING_LIMITS[param]
-        # Representative value = the extreme closest to (or past) a bound.
-        worst = hi if (b_hi is not None and hi > b_hi) else (
-            lo if (b_lo is not None and lo < b_lo) else hi)
+        # Representative value = the extreme with the least room to its bound.
+        room_lo = lo - b_lo if b_lo is not None else float("inf")
+        room_hi = b_hi - hi if b_hi is not None else float("inf")
+        worst = lo if room_lo < room_hi else hi
         row = _timing_row(param, worst)
         row["ok"] = all((b_lo is None or v >= b_lo) and (b_hi is None or v <= b_hi)
                         for v in vals)

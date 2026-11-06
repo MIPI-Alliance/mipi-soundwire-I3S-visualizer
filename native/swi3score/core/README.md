@@ -1,27 +1,24 @@
-# swi3score/core — vendored SWI3S decode core
+# swi3score/core — the SWI3S decode core
 
-These C++ sources are the **verified SWI3S decode classes** that the `swi3score`
-Python extension compiles. They are vendored here so this repository builds
-**standalone** — no sibling checkout required.
+These C++ sources are the SWI3S decode classes that the `swi3score` Python extension
+compiles. They have no SDK dependency, so the repository builds standalone.
 
-## Vendored files
+## Files
 
-Upstream is the `SwI3sAnalyzer` logic-analyzer plugin, a separate project. Only
-SDK-free sources are vendored:
+- Sources built into the extension (the list `native/CMakeLists.txt` compiles):
+  `C8b10bDecoder`, `CCommandTransportParser`, `CRegisterModel`, `CColumnDetector`,
+  `CDpConfig`, `CDataPort`, `CFlowControlPort`, `CPayloadEngine`.
+- Header-only: `CCrc16`, `CDescrambler`, `CNrzsDecoder`, `SwI3sProtocolDefs`,
+  `SwI3sResponseNames` (`IsReadDataNow` only; the token-to-name tables live in
+  `swi3s_studio/analysis/responses.py`).
 
-- `C8b10bDecoder`, `CCommandTransportParser`, `CRegisterModel`, `CColumnDetector`,
-  `CDpConfig`, `CDataPort`, `CFlowControlPort`, `CPayloadEngine`,
-  `SwI3sProtocolDefs` (+ their headers: `CCrc16`, `CDescrambler`, `CNrzsDecoder`,
-  `SwI3sResponseNames`).
+`../Decoder` and `../ISampleSource` drive the classes above from a sample source, and
+`../compat` supplies an SDK-free `<LogicPublicTypes.h>`.
 
-The SDK/GUI-coupled files (`CBitstreamDecoder`, `SwI3sAnalyzer*`,
-`SwI3sSimulationDataGenerator`) are **not** vendored: `../Decoder` +
-`../ISampleSource` take the place of `CBitstreamDecoder`/`WorkerThread`, and
-`../compat` supplies an SDK-free `<LogicPublicTypes.h>` so these build with no
-analyzer SDK linkage.
+## Maintenance
 
-## Keeping in sync
-
-If the analyzer plugin's decode logic changes, re-copy the affected files here
-(the file list is in `native/CMakeLists.txt`). Port Studio-specific fixes made here
-back to the plugin to keep the two in step.
+The sources are maintained in this repository. They carry Studio-only behaviour (register
+snapshots and overrides, reconfigure and state save/restore, CSV load warnings, hub depth),
+so a file is never replaced wholesale by a copy of a sibling project's version. A change
+made to a sibling project's copy of a decode class is merged into the file here by hand.
+A decode fix made here is applied to the sibling copy the same way.

@@ -35,6 +35,21 @@ def test_a_renamed_link_frees_its_default_number():
     assert s.add(object()).name == "Link 1"
 
 
+@pytest.mark.parametrize("odd", ["Link \u00b2", "Link \u0663", "Link \uff11", "Link 1\u00b2",
+                                 "Link " + "9" * 5000, "Link 1_0"],
+                         ids=["superscript", "arabic-indic", "fullwidth", "digit-superscript",
+                              "5000-digits", "underscore"])
+def test_a_name_that_only_looks_like_a_default_number_does_not_break_naming(odd):
+    """Only ASCII digits make a default number, so any user-chosen name is safe to keep."""
+    s = LinkSet()
+    s.add(object())
+    s.rename(0, odd)
+    assert s.add(object()).name == "Link 1"
+    s.rename(1, "Link 3")
+    assert s.add(object()).name == "Link 1"
+    assert s.add(object()).name == "Link 2"
+
+
 def test_rename_rejects_an_empty_name():
     s = LinkSet()
     s.add(object())

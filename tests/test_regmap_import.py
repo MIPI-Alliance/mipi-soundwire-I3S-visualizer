@@ -10,6 +10,8 @@ Run: python3 -m pytest tests/test_regmap_import.py
 import os
 import pathlib
 
+import pytest
+
 from swi3s_studio.model.registers import Provenance, RegisterMap, apply_commands
 from swi3s_studio.model.regmap_import import (
     PeripheralRegisterMap,
@@ -47,7 +49,7 @@ FIXTURE = """<header version="1">
   <reset hex="0x00" />
 </register>
 <register name="CTRL_B_DUP" address="0x1000010A">
-  <bit position="0" name="b" access="R" />
+  <bit position="0" name="b" access="RO" />
   <reset hex="0x00" />
 </register>
 <register name="STRAY_SPEC_REG" address="0x00001081">
@@ -385,3 +387,120 @@ def test_an_inferred_width_rounds_up_to_a_power_of_two_bytes():
     assert pmap.resolve(0x10000103).name == "R[31:24]"
     assert [pmap.resolve(0x10000204 + k).reset for k in range(4)] == [0x41, 0x00, 0x05, 0x00]
     assert not any("not aligned" in w for w in rep.warnings), rep.warnings
+
+
+def _register_with_field_address(address):
+    return ("<Registers><Register><Name>R</Name><Address>0x10000000</Address>"
+            "<DefaultValue>0x0</DefaultValue></Register></Registers>"
+            f"<Fields><Field><Name>F</Name><Address>{address}</Address></Field></Fields>")
+
+
+def test_a_field_with_a_huge_bit_index_is_skipped_and_reported_not_allocated():
+    for address in ("R[1000000000000000:0]", "R[64:0]", "R[" + "9" * 5000 + "]"):
+        pmap, report = import_text(_register_with_field_address(address), "huge")
+        assert all(not r.fields for r in pmap.registers), address
+        assert any("skipped" in w for w in report.warnings), (address, report.warnings)
+    pmap, report = import_text(_register_with_field_address("R[63:56]"), "top")
+    assert pmap.resolve(0x10000007).fields[0].name == "F" and report.warnings == []
+
+
+def test_runs_of_one_bit_and_later_runs_of_a_base_keep_their_index_in_the_name():
+    text = ('<register name="R" address="0x10000000">'
+            '<bit position="7" name="gain[7]"/><bit position="6" name="gain[6]"/>'
+            '<bit position="3" name="gain[3]"/><bit position="1" name="gain[2]"/>'
+            '<bit position="0" name="gain[1]"/><bit position="5" name="en[0]"/>'
+            '<bit position="4" name="other"/></register>')
+    pmap, _ = import_text(text, "runs")
+    names = {f.name: (f.hi, f.lo) for f in pmap.resolve(0x10000000).fields}
+    assert names == {"gain": (7, 6), "gain[3]": (3, 3), "gain[2:1]": (1, 0),
+                     "en[0]": (5, 5), "other": (4, 4)}
+
+
+def test_a_byte_order_mark_is_stripped_and_the_importer_source_holds_none():
+    pmap, _ = import_text("\ufeff" + _register_with_field_address("R[3:0]"), "bom")
+    assert pmap.resolve(0x10000000).fields[0].name == "F"
+    source = pathlib.Path(import_text.__code__.co_filename).read_bytes()
+    assert b"\xef\xbb\xbf" not in source
+
+
+def test_x_digits_are_unknown_and_other_non_digits_read_as_nothing_known():
+    from swi3s_studio.model.regmap_import import _parse_default
+    assert _parse_default("0xX1", 16) == (0x1, 0x000F)
+    assert _parse_default("0x1X", 16) == (0x10, 0xFFF0)
+    assert _parse_default("0b1X0", 8) == (0b100, 0b11111101)
+    assert _parse_default("0x-1", 16) == (0, 0)             # a sign is not a digit
+    assert _parse_default("0x+1", 16) == (0, 0)
+    assert _parse_default("0x\u0663", 16) == (0, 0)         # nor is a non-ASCII digit
+    assert _parse_default("0x1G", 16) == (0, 0)
+
+
+def test_a_very_long_default_imports_in_linear_time_masked_to_the_register():
+    """The inputs are a million digits, so a quadratic reading would not finish."""
+    from swi3s_studio.model.regmap_import import _parse_default
+    assert _parse_default("0x" + "F" * 1_000_000, 32) == (0xFFFFFFFF, 0xFFFFFFFF)
+    assert _parse_default("0b" + "1" * 1_000_000, 8) == (0xFF, 0xFF)
+    assert _parse_default("0x" + "0" * 999_999 + "5", 32) == (5, 0xFFFFFFFF)
+    text = _register_with_field_address("R[3:0]").replace(
+        "<DefaultValue>0x0</DefaultValue>", "<DefaultValue>0x" + "F" * 300_000 + "</DefaultValue>")
+    pmap, report = import_text(text, "long")
+    assert pmap.resolve(0x10000000) is not None
+
+
+def test_a_register_map_file_over_the_size_limit_is_refused_naming_it(tmp_path, monkeypatch):
+    from swi3s_studio.model import regmap_import
+    path = tmp_path / "big.xml"
+    path.write_bytes(b"x" * 100)
+    monkeypatch.setattr(regmap_import, "MAX_REGMAP_BYTES", 99)
+    with pytest.raises(ValueError, match="big.xml: too large for a register map"):
+        regmap_import.read_text(str(path))
+    with pytest.raises(ValueError, match="big.xml"):
+        regmap_import.import_file(str(path))
+    monkeypatch.setattr(regmap_import, "MAX_REGMAP_BYTES", 100)
+    assert regmap_import.read_text(str(path)) == ("x" * 100, [])
+
+
+def test_registers_sharing_a_name_do_not_each_take_all_the_fields_of_that_name():
+    regs = "".join(f"<Register><Name>A</Name><Address>0x{0x10000000 + 4 * i:08X}</Address>"
+                   f"<DefaultValue>0x0</DefaultValue><Access>R/W</Access></Register>"
+                   for i in range(300))
+    fields = "".join(f"<Field><Name>F{j}</Name><Address>A[{j % 32}]</Address>"
+                     f"<Access>R/W</Access></Field>" for j in range(300))
+    pmap, report = import_text(f"<DeviceMap><Registers>{regs}</Registers>"
+                               f"<Fields>{fields}</Fields></DeviceMap>", "dupes")
+    assert report.field_count == 300                # each field once, on the first register
+    assert sum(len(r.fields) for r in pmap.registers) == 300
+    assert any("repeats a register name" in w for w in report.warnings)
+    first = pmap.resolve(0x10000000)
+    assert first is not None and first.fields
+
+
+def test_a_name_or_access_that_is_not_text_in_a_stored_map_is_reported_not_kept():
+    from swi3s_studio import import_notes
+    doc = {"registers": [{"address": "0x10000000", "name": "R", "access": 3, "fields": [
+        {"name": 7, "bits": "[3:0]"}, {"name": ["x"], "bits": "[7:4]", "access": None}]},
+        {"address": "0x10000001", "name": None}]}
+    with import_notes.collect() as notes:
+        pmap = PeripheralRegisterMap.from_json_dict(doc, "m.json")
+    [note] = [n.message for n in notes]
+    assert note.startswith("5 part(s) of the wrong type skipped")
+    reg = pmap.resolve(0x10000000)
+    assert reg.access == "" and [f.name for f in reg.fields] == ["?", "?"]
+    assert all(isinstance(f.access, str) for f in reg.fields)
+    assert pmap.resolve(0x10000001).name == "?"
+
+
+def test_register_map_warnings_stay_short_for_a_file_of_distinct_oddities():
+    regs = "".join(f"<Register><Name>R{i}</Name><Address>0x{0x10000000 + i:08X}</Address>"
+                   f"<DefaultValue>0x0</DefaultValue><Access>X{i}</Access>"
+                   f"<Extra{i}>1</Extra{i}></Register>" for i in range(2000))
+    field = "<Field><Name>F</Name><Address>R0[0]</Address></Field>"
+    pmap, report = import_text(f"<DeviceMap><Registers>{regs}</Registers>"
+                               f"<Fields>{field}</Fields></DeviceMap>", "odd")
+    assert len(report.warnings) < 12
+    assert all(len(w) < 600 for w in report.warnings)
+    assert any("1997 more access spelling warning(s) not listed" in w for w in report.warnings)
+    bits = "".join(f'<register name="R{i}" address="0x{0x10000000 + i:08X}">'
+                   f'<bit position="0" name="b" attr{i}="1" /></register>' for i in range(2000))
+    _pmap, report = import_text(bits, "odd")
+    assert all(len(w) < 600 for w in report.warnings)
+    assert any("and 1992 more" in w for w in report.warnings)

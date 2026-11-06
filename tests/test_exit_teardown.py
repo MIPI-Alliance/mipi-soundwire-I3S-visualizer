@@ -14,10 +14,11 @@ import os
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
+
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -136,6 +137,10 @@ _POSIX_KILL = pytest.mark.skipif(sys.platform == "win32",
                                  reason="asserts the POSIX default action, killed by SIGINT")
 
 
+def _stderr_tail(path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")[-3000:]
+
+
 def _app(before: str, patch: str = "") -> str:
     return (textwrap.dedent(_IN_THE_LOOP).format(before=before) + textwrap.dedent(patch)
             + textwrap.dedent(_MAIN))
@@ -143,23 +148,47 @@ def _app(before: str, patch: str = "") -> str:
 
 @pytest.mark.skipif(sys.platform == "win32",
                     reason="Popen.send_signal cannot send SIGINT on Windows")
-def test_ctrl_c_in_the_terminal_quits_the_idle_app():
+def test_ctrl_c_in_the_terminal_quits_the_idle_app(tmp_path):
     """Ctrl+C from the terminal while the event loop waits, with no Python running, closes
     the window as File ▸ Quit does, through app.main, leaving nothing for the exit sweep."""
+    import queue
     import signal
+    import threading
     env = _env()
-    body = _PRELUDE + _app('QTimer.singleShot(0, lambda: print("READY", flush=True))')
-    proc = subprocess.Popen([sys.executable, "-c", body], cwd=_ROOT, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # READY once the loop runs (the window is shown by then); IDLE from the next pass of the
+    # loop, after the events READY left queued are served.
+    body = _PRELUDE + _app(
+        'QTimer.singleShot(0, lambda: (print("READY", flush=True), '
+        'QTimer.singleShot(0, lambda: print("IDLE", flush=True))))')
+    err_path = tmp_path / "stderr.txt"              # a file cannot fill and block the child
+    with open(err_path, "w", encoding="utf-8") as err_file:
+        proc = subprocess.Popen([sys.executable, "-c", body], cwd=_ROOT, env=env,
+                                stdout=subprocess.PIPE, stderr=err_file, text=True)
+    markers: queue.Queue = queue.Queue()
+
+    def _read_markers():
+        for _ in range(2):
+            markers.put(proc.stdout.readline())
+
+    threading.Thread(target=_read_markers, daemon=True).start()
     try:
-        assert proc.stdout.readline().strip() == "READY", "the event loop never started"
-        time.sleep(1.0)                             # the window up and idle
+        for want in ("READY", "IDLE"):
+            try:
+                line = markers.get(timeout=60)
+            except queue.Empty:
+                pytest.fail(f"the app printed no {want} for 60 s: the event loop never "
+                            f"started\n{_stderr_tail(err_path)}")
+            assert line.strip() == want, f"the app printed {line!r} for {want}\n" \
+                f"{_stderr_tail(err_path)}"
         proc.send_signal(signal.SIGINT)
-        out, err = proc.communicate(timeout=20)
+        out, _ = proc.communicate(timeout=20)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
         pytest.fail("the app was still running 20 s after Ctrl+C")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    err = err_path.read_text(encoding="utf-8", errors="replace")
     assert proc.returncode == 0, err[-3000:]
     assert "KeyboardInterrupt" not in err, err[-3000:]
     assert "PY-OWNED-AT-EXIT 0" in out, out

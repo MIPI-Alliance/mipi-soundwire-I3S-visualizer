@@ -5,8 +5,8 @@
 //
 // DRQ direction is inverted relative to the parent data port: a SINK data port
 // implies a SOURCE DRQ (the FCP drives the bus), and a SOURCE data port implies
-// a SINK DRQ (the FCP samples the bus). DRQ payload is scrambled like audio, but
-// for annotation we only locate the slot, not its value.
+// a SINK DRQ (the FCP samples the bus). This class only places the DRQ slot; the
+// payload engine reads its value and, when FCP_ScramblerEn is set, descrambles it.
 
 #ifndef SWI3S_CFLOWCONTROLPORT_H
 #define SWI3S_CFLOWCONTROLPORT_H
@@ -18,6 +18,10 @@ struct FcpEmit
 {
     SwI3sSlot slot = SwI3sSlot::Empty;   // Drq / Guard0 / Guard1 / Tail / Empty
     bool drqSamplePoint = false;         // the single UI to annotate as a DRQ event
+    // The DRQ bit's last UI on the bus, either direction: the point a decode reads the
+    // DRQ value at. A wide bit cut short by the row edge ends on the row's last column.
+    // drqSamplePoint is where a source DRQ is written; the grid and the demo wire use it.
+    bool drqObservePoint = false;
     bool isSource = false;               // DRQ direction (true = FCP drives the bus)
 };
 

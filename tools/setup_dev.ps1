@@ -45,15 +45,20 @@ $sha = [System.Security.Cryptography.SHA1]::Create()
 $key = ([System.BitConverter]::ToString($sha.ComputeHash(
     [System.Text.Encoding]::UTF8.GetBytes($repo))) -replace '-', '').Substring(0, 12).ToLower()
 $venvDir = if ($env:SWI3S_VENV) { $env:SWI3S_VENV } else { Join-Path $env:LOCALAPPDATA "swi3s-studio\venv-$key" }
+function Invoke-Checked([string]$what) {
+    if ($LASTEXITCODE -ne 0) { Write-Error "$what failed (exit $LASTEXITCODE)"; exit 1 }
+}
+
 New-Item -ItemType Directory -Force -Path (Split-Path $venvDir) | Out-Null
 if (-not (Test-Path $venvDir)) {
     Write-Host "Creating virtual environment with $pyCmd at $venvDir ..."
     & cmd /c "$pyCmd -m venv ""$venvDir"""
+    Invoke-Checked "creating the virtual environment"
 }
 $python = Join-Path $venvDir "Scripts\python.exe"
-
-function Invoke-Checked([string]$what) {
-    if ($LASTEXITCODE -ne 0) { Write-Error "$what failed (exit $LASTEXITCODE)"; exit 1 }
+if (-not (Test-Path $python)) {
+    Write-Error "$venvDir holds no Scripts\python.exe: delete the directory and re-run"
+    exit 1
 }
 
 Write-Host "Installing development dependencies (requirements-dev.txt)..."
@@ -63,7 +68,7 @@ Invoke-Checked "pip upgrade"
 Invoke-Checked "pip install -r requirements-dev.txt"
 
 Write-Host "Building the swi3score decode core..."
-# --force-reinstall: the core's version is fixed, so a plain install keeps a stale build.
+# --force-reinstall replaces the installed module even when pip would judge it current.
 & $python -m pip install --force-reinstall --no-deps .\native
 Invoke-Checked "the decode core build"
 # run.ps1's stamps: the dependencies and the core it would install are now current.
@@ -74,12 +79,14 @@ foreach ($s in ".deps-stamp", ".native-stamp") {
 $rootCore = & $python -c "import sysconfig; print('swi3score' + sysconfig.get_config_var('EXT_SUFFIX'))"
 if (Test-Path $rootCore) {
     Write-Host "Note: .\$rootCore at the checkout root is imported before the venv's build."
-    Write-Host "  Delete it to use the venv's build; tests\gate.ps1 rebuilds it."
+    Write-Host "  Delete it: tests\gate.ps1 fails while it is there, because the gate builds the core"
+    Write-Host "  into the venv, not into the checkout root."
 }
 
 Write-Host ""
 Write-Host "Ready. From the checkout root, the functional suite (perf deselected), the perf"
-Write-Host "benchmarks in their own process, and the release gate (suite, perf, ruff, mypy, ABI):"
+Write-Host "benchmarks in their own process, and the commit gate (native core and ABI, suite, perf,"
+Write-Host "ruff, mypy, leak scan, screenshots; add --release before a tag):"
 Write-Host "  & `"$venvDir\Scripts\Activate.ps1`""
 Write-Host "  python -m pytest"
 Write-Host "  python -m pytest -m perf"

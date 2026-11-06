@@ -8,9 +8,12 @@ import pathlib
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.raw_view import RawCaptureView
+
+pytestmark = pytest.mark.gui
 
 
 class _Cap:
@@ -83,8 +86,9 @@ def test_cds_manager_only_guard_splits_even_without_peripheral_cells():
     def _guard_labels(guard):
         cfg = BusConfig(num_columns=8, row_rate_khz=3072.0); cfg.cds_bit_width = 0
         cfg.cds_guard = list(guard); cfg.enforce_cds_handover = False
-        p = _tf.mktemp(suffix=".csv"); pathlib.Path(p).write_text(cfg.to_csv())
-        cells, _cl, _i, ncols, nr = viz_engine.render_payload(p); _os.remove(p)
+        with _tf.TemporaryDirectory() as d:
+            p = _os.path.join(d, "guard.csv"); pathlib.Path(p).write_text(cfg.to_csv())
+            cells, _cl, _i, ncols, nr = viz_engine.render_payload(p)
         split = any(c.get("cds_split") for c in cells)
         gv = GridView(); gv.set_bus_model(cells, {}, ncols, 1)
         # Grid cell labels are QGraphicsSimpleTextItem (.text()); a non-grid centred

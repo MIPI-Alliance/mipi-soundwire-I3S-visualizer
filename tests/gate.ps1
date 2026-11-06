@@ -5,8 +5,10 @@
     Prefers the repo's venv interpreter, because that is where ruff/mypy and the built
     swi3score .pyd live on the Windows test VM. Override with $env:PYTHON.
 
-        .\tests\gate.ps1              # full gate
-        .\tests\gate.ps1 --quick      # skip perf + the per-suite pass
+        .\tests\gate.ps1              # the commit gate
+        .\tests\gate.ps1 --guest      # a test guest, per batch
+        .\tests\gate.ps1 --release    # before a tag
+        .\tests\gate.ps1 --quick      # the commit gate without the perf ceilings
 #>
 $ErrorActionPreference = "Stop"
 Set-Location -Path (Join-Path $PSScriptRoot "..")

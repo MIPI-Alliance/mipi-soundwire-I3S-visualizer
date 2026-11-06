@@ -13,6 +13,8 @@ import pytest
 
 from swi3s_studio.store.audio_store import AudioStore
 
+pytestmark = pytest.mark.gui
+
 _CAP_RATE = 500_000_000.0      # 500 MHz capture (matches the demo/real captures)
 _AUDIO_RATE = 48000.0
 _GAP_START_S, _GAP_END_S = 103.0, 133.0
@@ -241,10 +243,9 @@ def test_gap_split_preserves_values_either_side():
 def test_gaps_are_found_on_flow_controlled_ports_too(flow_mode):
     """A dropout must be detected on EVERY flow mode, not just NORMAL.
 
-    A flow-controlled channel's `_sample_at` is replaced with a uniform de-jitter ramp
-    (mirroring a receiver FIFO clocking out at the average rate), evenly spaced BY
-    CONSTRUCTION, so gap detection reads the true transport positions stashed before
-    the ramp.
+    A flow-controlled channel's `_sample_at` is respaced evenly within each run between
+    gaps (mirroring a receiver FIFO clocking out at the average rate), so gap detection
+    reads the true transport positions kept in `_transport_at`.
     """
     spu = _CAP_RATE / _AUDIO_RATE
     n = 3000

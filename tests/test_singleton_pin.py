@@ -18,6 +18,8 @@ import pytest
 
 from swi3s_studio.ui import singleton_pin
 
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 # Far more over-releases than either object's own count, some tens of thousands: an
@@ -106,13 +108,20 @@ def test_a_pin_is_kept_whatever_other_references_do_meanwhile():
     assert not singleton_pin._landed(0) and not singleton_pin._landed(pin - 2 * slack)
 
 
+@pytest.mark.skipif(sys.version_info >= (3, 12), reason="None, True and False are immortal")
 def test_the_pin_is_made_with_the_collector_off_and_leaves_it_as_it_was():
     _alive(_child("""
-        import gc, sys
+        import ctypes, gc, sys
         import swi3s_studio.ui
-        from swi3s_studio.ui.singleton_pin import pin_singletons
+        from swi3s_studio.ui import singleton_pin
+        from swi3s_studio.ui.singleton_pin import _PIN, pin_singletons
+        during = []
+        real = singleton_pin._landed
+        singleton_pin._landed = lambda moved: during.append(gc.isenabled()) or real(moved)
         for enabled in (True, False):
+            ctypes.c_ssize_t.from_address(id(None)).value -= _PIN      # as if it never took
             (gc.enable if enabled else gc.disable)()
             assert pin_singletons() and gc.isenabled() is enabled
+        assert during == [False, False], during                        # off while it wrote
         print("ALIVE", flush=True)
     """))

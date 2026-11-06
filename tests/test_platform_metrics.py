@@ -5,6 +5,7 @@ the Timing Calculator's buttonless spin boxes keep an edit field wide enough for
 the Bus Visualizer's buttons are at least as wide as their labels, and bus grid text is centred
 vertically on its capitals.
 """
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontMetricsF
 from PySide6.QtWidgets import QApplication, QPushButton
@@ -12,6 +13,8 @@ from PySide6.QtWidgets import QApplication, QPushButton
 from swi3s_studio.ui import timing_view
 from swi3s_studio.ui.authoring.authoring_panel import AuthoringPanel
 from swi3s_studio.ui.grid_view import GridView
+
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
 _app = QApplication.instance() or QApplication([])
 

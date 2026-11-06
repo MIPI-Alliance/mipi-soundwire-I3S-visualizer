@@ -7,6 +7,8 @@ axis labels are its own capture's, moved by its Link's offset); a click, drag or
 k counts in Link k; touching a lane makes its Link active; and leaving All Links, or going
 down to one Link, gives back the pane's own view on the group's Link.
 """
+import bisect
+import contextlib
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,10 +17,13 @@ import numpy as np
 import pyqtgraph as pg
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from test_links_gui import _with_added_link
 
 from swi3s_studio.ui.eye_view import _cat_specs
+
+pytestmark = pytest.mark.gui
 
 _OFFSET_PS = 3_000_000_000          # Link 2 starts 3 ms after Link 1
 
@@ -225,13 +230,25 @@ def _tables(win):
     return win._symbol_lanes.shown(), win._sample_lanes.shown()
 
 
+def _raised(win, dock):
+    """`dock`, raised over the other tabs of its group: the cursor tick refreshes only the
+    tab on screen, and raising a tab refreshes it."""
+    dock.raise_()
+    for _ in range(3):
+        QApplication.instance().processEvents()
+
+
 def test_each_table_lane_windows_its_own_link_at_the_cursors_instant(tables):
     win, first, second = tables
     syms, smps = _tables(win)
     assert len(syms) == len(smps) == 2
+    _raised(win, win._symbol_dock)
     for k, sess in enumerate((first, second)):
         s_k = win._in_link(k, win.cursor.sample)
         assert syms[k]._symbols == sess.symbols_around(s_k)
+    _raised(win, win._sample_dock)
+    for k, sess in enumerate((first, second)):
+        s_k = win._in_link(k, win.cursor.sample)
         starts = [int(r["start_sample"]) for r in smps[k]._samples]
         assert starts and starts[0] <= s_k <= starts[-1], k     # windowed on Link k's instant
         assert smps[k]._rate == sess.sample_rate_hz
@@ -240,6 +257,7 @@ def test_each_table_lane_windows_its_own_link_at_the_cursors_instant(tables):
 def test_the_time_columns_read_global_time(tables):
     win, first, second = tables
     syms, _smps = _tables(win)
+    _raised(win, win._symbol_dock)
     for k, sess in enumerate((first, second)):
         s = syms[k]._symbols[0]
         want = s["start_sample"] / sess.sample_rate_hz * 1e6 + win.links[k].offset_ps / 1e6
@@ -249,6 +267,7 @@ def test_the_time_columns_read_global_time(tables):
 def test_a_row_picked_in_one_lane_moves_the_others_and_leaves_its_own(tables):
     win, first, second = tables
     syms, _smps = _tables(win)
+    _raised(win, win._symbol_dock)
     before = list(syms[1]._symbols)
     here = win._in_link(1, win.cursor.sample)
     later = [r for r in before if int(r["start_sample"]) > here]
@@ -259,6 +278,56 @@ def test_a_row_picked_in_one_lane_moves_the_others_and_leaves_its_own(tables):
     assert syms[1].currentRow() == idx                 # nor snapped to its command's comma
     s0 = win._in_link(0, win.cursor.sample)
     assert syms[0]._symbols == first.symbols_around(s0)
+
+
+@contextlib.contextmanager
+def _qt_messages():
+    """The messages Qt prints meanwhile, less the offscreen platform's notices."""
+    from PySide6.QtCore import qInstallMessageHandler
+    seen: list = []
+    previous = qInstallMessageHandler(
+        lambda _kind, _ctx, msg: seen.append(msg)
+        if "This plugin does not support" not in msg else None)
+    try:
+        yield seen
+    finally:
+        qInstallMessageHandler(previous)
+
+
+def _click_row(table, row):
+    """A real mouse click on `row`'s first visible cell."""
+    col = next(c for c in range(table.columnCount())
+               if not table.isColumnHidden(c) and table.columnWidth(c) > 4)
+    item = table.model().index(row, col)
+    table.scrollTo(item)
+    QTest.mouseClick(table.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     table.visualRect(item).center())
+    QApplication.instance().processEvents()
+
+
+@pytest.mark.parametrize("pane", ["cds", "samples"])
+def test_a_lane_click_selects_the_command_in_effect_on_the_commands_link(tables, pane):
+    """A row clicked in Link 1's lane while Commands shows Link 2 selects, in Commands,
+    Link 2's command in effect at the clicked instant, through Commands' own model."""
+    win, first, second = tables
+    win._errors_only_act.setChecked(False)          # every command is a row
+    assert win._pane_link["commands"] == 1
+    dock = win._symbol_dock if pane == "cds" else win._sample_dock
+    _raised(win, dock)
+    syms, smps = _tables(win)
+    lane = syms[0] if pane == "cds" else smps[0]
+    rows = lane._symbols if pane == "cds" else lane._samples
+    assert len(rows) > 10
+    with _qt_messages() as seen:
+        _click_row(lane if pane == "cds" else lane._table, len(rows) // 2 + 3)
+    assert not [m for m in seen if "wrong model" in m], seen
+    assert win.links.active_index == 0
+    s2 = win._in_link(1, win.cursor.sample)
+    starts = win.links[1].view.starts
+    want = max(0, bisect.bisect_right(starts, s2) - 1)
+    cur = win._cmd_proxy.mapToSource(win._cmd_view.currentIndex())
+    assert win._cmd_proxy.sourceModel() is win.links[1].view.cmd_model
+    assert cur.row() == want
 
 
 def test_leaving_all_links_gives_back_the_tables(tables):

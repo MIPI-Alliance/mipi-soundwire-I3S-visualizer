@@ -5,10 +5,17 @@ Channel 1, …`` then one row per sample-or-transition: an absolute time in seco
 and a 0/1 per channel. We turn two chosen channels (clock, data) into edge
 (transition) arrays and infer the sample rate from the grid the timestamps sit on
 (`timebase.rate_from_times`).
+
+The first row is the header and must not start with a number. Its first cell may name
+the Time unit in brackets (``Time [ms]``; see `_TIME_UNITS`); the times are scaled to
+seconds. A byte-order mark before the first cell is not part of it. A row is one line of at most
+`MAX_LINE_CHARS` characters, and a line whose double quotes do not all open and close a cell
+is read with them removed (`_data_lines`).
 """
 from __future__ import annotations
 
 import csv
+import re
 from operator import itemgetter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +23,22 @@ import numpy as np
 
 from .. import import_notes
 from .capture import Capture
-from .timebase import rate_from_times
+from .timebase import (
+    MAX_LINE_CHARS,
+    MAX_RATE_HZ,
+    TimeRangeError,
+    check_rate,
+    quoted,
+    rate_from_times,
+    repeats,
+    require_distinct,
+    same_sample_note,
+    text_csv,
+    to_samples,
+)
+
+# Cell texts read as level 1; any other cell is level 0.
+_TRUE = ("1", "1.0", "True")
 
 
 def _trim_header(header: List[str]) -> List[str]:
@@ -27,11 +49,103 @@ def _trim_header(header: List[str]) -> List[str]:
     return header[:n]
 
 
+# The first row of a capture CSV is at most `MAX_LINE_CHARS` characters and this many
+# cells. A longer first row (a file with no line breaks, or text that is not a capture
+# export) is refused before it is split into cells.
+_MAX_HEADER_CELLS = 1024
+
+
+def _is_number(cell: str) -> bool:
+    """True when `cell` reads as a finite number."""
+    try:
+        return bool(np.isfinite(float(cell)))
+    except ValueError:
+        return False
+
+
+def _header_row(f, path: str) -> Optional[List[str]]:
+    """The first row of the open file `f`, read as one bounded line, or None for an empty
+    file. ValueError when the row is longer than `MAX_LINE_CHARS`, has more than
+    `_MAX_HEADER_CELLS` cells, or starts with a number (a file with no header row: its first
+    data row would be read as column names). The rows after it are read from `f`."""
+    line = f.readline(MAX_LINE_CHARS + 1)
+    if len(line) > MAX_LINE_CHARS:
+        raise ValueError(f"{path}: not a capture CSV (the first row is longer than "
+                         f"{MAX_LINE_CHARS:,} characters)")
+    if not line:
+        return None
+    row = next(csv.reader([line]), [])
+    if len(row) > _MAX_HEADER_CELLS:
+        raise ValueError(f"{path}: not a capture CSV (the first row has {len(row):,} "
+                         f"columns; at most {_MAX_HEADER_CELLS:,} are read)")
+    if row and _is_number(row[0]):
+        raise ValueError(f"{path}: not a capture CSV (the first row starts with the number "
+                         f"{row[0].strip()!r}; the file needs a header row naming its columns)")
+    return row
+
+
+# Time units a header cell such as ``Time [ms]`` may name, in seconds.
+_TIME_UNITS = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "\u03bcs": 1e-6,
+               "ns": 1e-9, "ps": 1e-12}
+
+
+def time_unit(header: List[str]) -> Tuple[float, str]:
+    """(seconds per Time-column unit, the unit text when it is not recognised). The unit
+    is the bracketed text of the first header cell; a header without one is in seconds."""
+    m = re.search(r"\[([^\]]*)\]", header[0]) if header else None
+    if m is None:
+        return 1.0, ""
+    unit = m.group(1).strip()
+    scale = _TIME_UNITS.get(unit.lower())
+    return (scale, "") if scale is not None else (1.0, unit)
+
+
+def _quotes_balanced(line: str) -> bool:
+    """True when every double quote of `line` opens or closes a whole cell, so that
+    `csv` reads the line as one row and no cell stays open at its end."""
+    try:
+        for _ in csv.reader([line], strict=True):
+            pass
+    except csv.Error:
+        return False
+    return True
+
+
+def _data_lines(f, path: str, notes: Optional["_RowNotes"] = None):
+    """The lines of open file `f` after its header, for `csv.reader`, each read as one
+    bounded line: a line longer than `MAX_LINE_CHARS` raises ValueError naming `path`. A row
+    is one line: a line holding an odd number of double quotes, or one that `csv` reads
+    strictly as a cell left open or text after a closing quote, has them removed, so no
+    quote can join the lines after it into one cell; a cell quoted whole is kept. With
+    `notes`, those lines are counted there (line numbers count the header as line 1)."""
+    n = 1
+    while True:
+        line = f.readline(MAX_LINE_CHARS + 1)
+        if not line:
+            return
+        n += 1
+        if len(line) > MAX_LINE_CHARS:
+            raise ValueError(f"{path}: not a capture CSV (line {n:,} is longer than "
+                             f"{MAX_LINE_CHARS:,} characters)")
+        if '"' in line and (line.count('"') & 1 or not _quotes_balanced(line)):
+            if notes is not None:
+                if not notes.quoted[0]:
+                    notes.quoted[1] = n
+                notes.quoted[0] += 1
+            line = line.replace('"', "")
+        yield line
+
+
+@text_csv
 def read_header(path: str) -> List[str]:
     """The header row, `Time` then one name per channel column; trailing empty cells
-    (a header row ending in a comma) name no column and are dropped."""
-    with open(path, newline="", encoding="utf-8") as f:
-        return _trim_header(next(csv.reader(f)))
+    (a header row ending in a comma) name no column and are dropped. ValueError for an
+    empty file or a first row that is not a header (`_header_row`)."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        row = _header_row(f, path)
+    if row is None:
+        raise ValueError(f"{path}: the file is empty")
+    return _trim_header(row)
 
 
 # Rows per batch of `scan`: smaller than the loader's, since a probe keeps nothing per
@@ -39,24 +153,30 @@ def read_header(path: str) -> List[str]:
 _SCAN_CHUNK = 50_000
 
 # Data rows whose timestamps give the sample rate: the first this many. `scan` and
-# `load_capture` read the same rows, so the probe reports the rate the loader uses.
+# `load_capture` take the rate from the same rows of a file whose rows are all complete,
+# so the probe reports the rate the loader uses.
 _RATE_ROWS = 1 << 16
 
 
+@text_csv
 def scan(path: str, max_rows: int = 2_000_000) -> Tuple[List[int], int]:
     """(transitions per channel column, inferred rate) from ONE pass over up to `max_rows`
     data rows, read in batches, so a pre-decode look at a large export costs one bounded
-    read and a few MB. Counts are per channel column (index 0 == CSV
-    column 1), the forwarded clock toggling every UI; the rate is
-    `timebase.rate_from_times` over the first `_RATE_ROWS` timestamps, or 0. The columns
-    are the header's (`read_header`), and a row is read when it has a cell for each."""
+    read and a few MB. Counts are per channel column (index 0 == CSV column 1), the
+    forwarded clock toggling every UI. The rate is `timebase.rate_from_times` over the
+    first `_RATE_ROWS` timestamps (the Time column scaled by the header's unit,
+    `time_unit`), or 0 when there are none. The columns are the header's (`read_header`).
+    A column is counted over the rows that have a cell for it, as the loader reads the
+    rows that have a cell for its two columns; the rate is taken from the rows that have a
+    cell for a channel. A line longer than `MAX_LINE_CHARS` raises ValueError
+    (`_data_lines`)."""
     from itertools import islice
-    _TRUE = ("1", "1.0", "True")
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.reader(f)
-        header = next(r, None)
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        header = _header_row(f, path)
+        r = csv.reader(_data_lines(f, path))
         if not header or len(_trim_header(header)) < 2:
             return [], 0
+        scale = time_unit(header)[0]
         header = _trim_header(header)
         ncols = len(header) - 1                     # channel columns after Time
         counts = [0] * ncols
@@ -69,13 +189,17 @@ def scan(path: str, max_rows: int = 2_000_000) -> Tuple[List[int], int]:
             if not raw:
                 break
             left -= len(raw)
-            rows = [row for row in raw if len(row) > ncols]     # skip short rows
+            rows = [row for row in raw if len(row) > 1]         # a time and a channel cell
             del raw
             if not rows:
                 continue
+            full = all(len(row) > ncols for row in rows)
             for c in range(ncols):
-                lvl = np.fromiter((row[c + 1].strip() in _TRUE for row in rows),
-                                  dtype=np.int8, count=len(rows))
+                col = rows if full else [row for row in rows if len(row) > c + 1]
+                if not col:
+                    continue
+                lvl = np.fromiter((row[c + 1].strip() in _TRUE for row in col),
+                                  dtype=np.int8, count=len(col))
                 counts[c] += int(np.count_nonzero(np.diff(lvl)))
                 if last[c] is not None and int(lvl[0]) != last[c]:
                     counts[c] += 1                   # a transition across the batch seam
@@ -90,7 +214,7 @@ def scan(path: str, max_rows: int = 2_000_000) -> Tuple[List[int], int]:
                         t[n] = float(v)
                     except ValueError:
                         pass
-                t = t[~np.isnan(t)]
+            t = t[np.isfinite(t)] * scale                        # as `_convert` keeps rows
             if rate_left > 0 and t.size:
                 rate_times.append(t[:rate_left])
                 rate_left -= rate_times[-1].size
@@ -98,14 +222,7 @@ def scan(path: str, max_rows: int = 2_000_000) -> Tuple[List[int], int]:
     return counts, rate
 
 
-def channel_transition_counts(path: str, max_rows: int = 2_000_000) -> List[int]:
-    """Level transitions per channel column (column 0 is Time) over up to `max_rows`
-    data rows (`scan`). Used to auto-pick clock vs data: the forwarded clock toggles
-    every UI, so it has far more transitions than the NRZS data line. One count per
-    channel column (index 0 == CSV column 1)."""
-    return scan(path, max_rows)[0]
-
-
+@text_csv
 def looks_complementary(path: str, clock_col: int, data_col: int,
                         max_rows: int = 100_000) -> bool:
     """True when two channels form a DLV differential pair — always opposite
@@ -113,13 +230,12 @@ def looks_complementary(path: str, clock_col: int, data_col: int,
     cold-start (see analysis.dlv_detect). A forwarded-clock (FBCSE) pair is
     independent (~half the rows differ), so the 0.99 threshold separates them
     cleanly. `clock_col`/`data_col` are 1-based CSV columns (0 is Time)."""
-    _TRUE = ("1", "1.0", "True")
     m = max(clock_col, data_col)
     n = diff = 0
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.reader(f)
-        if not (next(r, None)):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        if not _header_row(f, path):
             return False
+        r = csv.reader(_data_lines(f, path))
         for i, row in enumerate(r):
             if i >= max_rows:
                 break
@@ -137,11 +253,6 @@ def infer_sample_rate(path: str, max_rows: int = 2_000_000) -> int:
     (`scan`, `timebase.rate_from_times`). Returns 0 if it can't be inferred."""
     return scan(path, max_rows)[1]
 
-
-
-def _channel_columns(header: List[str]) -> List[int]:
-    # Every column after the first (time) that isn't obviously a time column.
-    return [i for i in range(1, len(header))]
 
 
 # Rows converted to arrays per batch. Big enough that the per-batch NumPy calls are
@@ -218,7 +329,7 @@ class CsvTooLargeError(MemoryError):
             f"pass max_bytes=0 to override.")
 
 
-def _predict_rows(path: str, header_len: int, sample_bytes: bytes) -> int:
+def predict_rows(path: str, sample_bytes: bytes) -> int:
     """Rows in the file, estimated from its size and the width of a sampled row.
 
     Divides the file size by the mean length of the first few data rows. Row width
@@ -234,7 +345,6 @@ def _predict_rows(path: str, header_len: int, sample_bytes: bytes) -> int:
     return int(size / mean) if mean > 0 else 0
 
 
-_TRUE = ("1", "1.0", "True")
 # Level cells read as written: anything else is read as 0 and reported.
 _LEVELS = frozenset(_TRUE + ("0", "0.0", "False"))
 
@@ -242,10 +352,17 @@ _LEVELS = frozenset(_TRUE + ("0", "0.0", "False"))
 class _RowNotes:
     """What one read of a digital CSV passed over, for its import warnings: rows too
     short for the chosen columns, rows whose time is not a number, and level cells
-    that are not 0 or 1, each as [count, first line, first text]."""
+    that are not 0 or 1, each as [count, first line, first text]; rows with a
+    non-blank cell past the header's `columns` and lines with an unmatched double quote
+    (`_data_lines`), each as [count, first line]; and a Time-column unit that is not
+    recognised. `columns` 0 turns the check for cells past the header off."""
 
-    def __init__(self) -> None:
+    def __init__(self, columns: int = 0) -> None:
+        self.columns = columns
         self.short: List[int] = [0, 0]
+        self.extra: List[int] = [0, 0]
+        self.quoted: List[int] = [0, 0]
+        self.time_unit = ""
         self.bad_time: List[Any] = [0, 0, ""]
         self.bad_level: Dict[str, List[Any]] = {}
         self.rate_defaulted = False
@@ -253,20 +370,33 @@ class _RowNotes:
 
     def report(self, path: str) -> None:
         src = import_notes.source_name(path)
+        if self.time_unit:
+            import_notes.warn(src, f"the Time column's unit [{self.time_unit}] is not "
+                                   f"recognised; the times are read as seconds")
+        n, first = self.quoted
+        if n:
+            import_notes.warn(src, f"{n:,} line{'s' if n != 1 else ''} with an unmatched "
+                                   f"double quote {'were' if n != 1 else 'was'} read with the "
+                                   f"quote ignored (first at line {first:,})")
         n, first = self.short
         if n:
             import_notes.warn(src, f"{n:,} row{'s' if n != 1 else ''} too short for the "
                                    f"chosen columns {'were' if n != 1 else 'was'} skipped "
                                    f"(first at line {first:,})")
+        n, first = self.extra
+        if n:
+            import_notes.warn(src, f"{n:,} row{'s' if n != 1 else ''} with cells past the "
+                                   f"{self.columns} columns of the header: those cells are "
+                                   f"ignored (first at line {first:,})")
         n, first, text = self.bad_time
         if n:
             import_notes.warn(src, f"{n:,} row{'s' if n != 1 else ''} with a time that is "
-                                   f"not a number {'were' if n != 1 else 'was'} skipped "
-                                   f"(first at line {first:,}: {text!r})")
+                                   f"not a finite number {'were' if n != 1 else 'was'} skipped "
+                                   f"(first at line {first:,}: {quoted(text)})")
         for role, (n, first, text) in self.bad_level.items():
             import_notes.warn(src, f"{n:,} {role} cell{'s' if n != 1 else ''} not 0 or 1 "
                                    f"{'were' if n != 1 else 'was'} read as 0 (first at "
-                                   f"line {first:,}: {text!r})")
+                                   f"line {first:,}: {quoted(text)})")
         if self.unsorted:
             import_notes.warn(src, "the rows are not in time order; they are sorted by time")
         if self.rate_defaulted:
@@ -294,10 +424,11 @@ def _check_levels(batch: List[list], col: int, role: str, base: int,
 
 def _convert(batch: List[list], clock_col: int, data_col: int,
              notes: Optional[_RowNotes] = None, base: int = 0,
-             lines: Optional[List[int]] = None
+             lines: Optional[List[int]] = None, scale: float = 1.0
              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(time float64, clock int8, data int8) of one batch of rows, dropping any row
-    whose time cell is not a number.
+    """(time float64 in seconds, clock int8, data int8) of one batch of rows, dropping
+    any row whose time cell is not a finite number; a time cell is `scale` seconds per
+    unit.
 
     Levels come from `np.fromiter` over a membership test on the stripped cell. With
     `notes`, the batch's unreadable cells are counted there; a row's line number is
@@ -315,31 +446,36 @@ def _convert(batch: List[list], clock_col: int, data_col: int,
     try:
         tt = np.asarray(tcol, dtype=np.float64)        # fast path: all numeric
     except ValueError:
-        # Rare: a stray non-numeric time cell. Parse per row and drop the bad ones.
+        # Rare: a stray non-numeric time cell. Parse per row; the bad ones fail the filter.
         tt = np.full(len(tcol), np.nan, dtype=np.float64)
         for i, s in enumerate(tcol):
             try:
                 tt[i] = float(s)
             except ValueError:
                 pass
-        ok = ~np.isnan(tt)
+    ok = np.isfinite(tt)               # nan and +-inf are not times
+    if not ok.all():
         if notes is not None:
             bad = np.flatnonzero(~ok)
-            if bad.size:
-                k = int(bad[0])
-                if not notes.bad_time[0]:
-                    notes.bad_time[1] = lines[k] if lines is not None else base + k
-                    notes.bad_time[2] = tcol[k]
-                notes.bad_time[0] += int(bad.size)
+            k = int(bad[0])
+            if not notes.bad_time[0]:
+                notes.bad_time[1] = lines[k] if lines is not None else base + k
+                notes.bad_time[2] = tcol[k]
+            notes.bad_time[0] += int(bad.size)
         tt, cv, dv = tt[ok], cv[ok], dv[ok]
+    if scale != 1.0:
+        tt = tt * scale
     return tt, cv, dv
 
 
-def _batches(r, m: int, clock_col: int, data_col: int, notes: Optional[_RowNotes] = None):
+def _batches(r, m: int, clock_col: int, data_col: int, notes: Optional[_RowNotes] = None,
+             scale: float = 1.0):
     """Yield `_convert`ed batches of the rows left in reader `r` that have a cell at
-    column `m`; yields an empty batch for a batch with none, so the caller can tell
-    a file with no usable rows from one with no numeric times. With `notes`, the
-    skipped rows are counted there (line numbers count the header as line 1)."""
+    column `m`. A batch none of whose rows has a cell at `m` yields nothing; a batch whose
+    time cells are all not numbers yields empty arrays, so the caller can tell a file
+    with no usable rows from one with no numeric times. With `notes`, the skipped rows
+    and the rows with cells past the header are counted there (line numbers count the
+    header as line 1). The Time column is `scale` seconds per unit."""
     # PULL WHOLE BATCHES WITH islice, and keep the row filter a comprehension; an
     # explicit `for row in r: ... append` loop is much slower.
     from itertools import islice
@@ -360,9 +496,17 @@ def _batches(r, m: int, clock_col: int, data_col: int, notes: Optional[_RowNotes
                 if not notes.short[0]:
                     notes.short[1] = short[0]
                 notes.short[0] += len(short)
+        if notes is not None and notes.columns:
+            cols = notes.columns
+            if max(map(len, raw)) > cols:
+                for k, row in enumerate(raw):
+                    if len(row) > cols and any(c.strip() for c in row[cols:]):
+                        if not notes.extra[0]:
+                            notes.extra[1] = base + k
+                        notes.extra[0] += 1
         del raw
         if batch:
-            out = _convert(batch, clock_col, data_col, notes, base, lines)
+            out = _convert(batch, clock_col, data_col, notes, base, lines, scale)
             del batch                  # released before the next batch is read
             yield out
 
@@ -384,7 +528,7 @@ class _Line:
         else:
             change = np.flatnonzero(np.diff(levels, prepend=np.int8(self.last)))
         if change.size:
-            self.parts.append(np.rint((t[change] - origin) * rate).astype(np.uint64))
+            self.parts.append(to_samples(t[change], origin, rate))
         self.last = int(levels[-1])
 
     def edges(self) -> np.ndarray:
@@ -397,16 +541,22 @@ class _Line:
 
 def _rate_of(times: List[np.ndarray], notes: Optional[_RowNotes] = None) -> int:
     """`rate_from_times` over the first `_RATE_ROWS` of `times`, or 1 MHz if it has
-    too few distinct times to give one (noted in `notes`)."""
+    too few distinct times to give one (noted in `notes`). A rate above `MAX_RATE_HZ`
+    raises `TimeRangeError`."""
     t = np.concatenate(times)[:_RATE_ROWS] if times else np.zeros(0)
     rate = rate_from_times(t)
+    if rate > MAX_RATE_HZ:
+        raise TimeRangeError(f"the timestamps give a sample rate of {rate:.4g} Hz, above the "
+                             f"{MAX_RATE_HZ:,.0f} Hz limit; set the sample rate in the Open "
+                             f"Capture dialog")
     if not rate and notes is not None:
         notes.rate_defaulted = True
     return rate or 1_000_000
 
 
 def _read_ascending(r, m: int, clock_col: int, data_col: int,
-                    rate: Optional[int], notes: Optional[_RowNotes] = None):
+                    rate: Optional[int], notes: Optional[_RowNotes] = None,
+                    scale: float = 1.0):
     """Edges of a time-ascending file, one batch at a time: ``(clock _Line, data
     _Line, rate, numeric rows, any rows)``, or None at the first row earlier than the
     row before it.
@@ -422,7 +572,7 @@ def _read_ascending(r, m: int, clock_col: int, data_col: int,
     t_last = -np.inf
     rows = 0
     any_rows = False
-    for t, cv, dv in _batches(r, m, clock_col, data_col, notes):
+    for t, cv, dv in _batches(r, m, clock_col, data_col, notes, scale):
         any_rows = True
         if not t.size:
             continue
@@ -451,7 +601,7 @@ def _read_ascending(r, m: int, clock_col: int, data_col: int,
 
 
 def _read_unsorted(r, m: int, clock_col: int, data_col: int, rate: Optional[int],
-                   notes: Optional[_RowNotes] = None):
+                   notes: Optional[_RowNotes] = None, scale: float = 1.0):
     """Edges of a file whose rows are not in time order: every row is read into
     arrays and sorted by time (stable), then the edges are taken as for an ascending
     file. Same return shape as `_read_ascending`."""
@@ -459,7 +609,7 @@ def _read_unsorted(r, m: int, clock_col: int, data_col: int, rate: Optional[int]
     c_parts: List[np.ndarray] = []
     d_parts: List[np.ndarray] = []
     any_rows = False
-    for t, cv, dv in _batches(r, m, clock_col, data_col, notes):
+    for t, cv, dv in _batches(r, m, clock_col, data_col, notes, scale):
         any_rows = True
         t_parts.append(t)
         c_parts.append(cv)
@@ -491,6 +641,7 @@ def _read_unsorted(r, m: int, clock_col: int, data_col: int, rate: Optional[int]
     return clk, dat, int(rate), int(t.size), True
 
 
+@text_csv
 def load_capture(path: str, clock_col: int, data_col: int,
                  sample_rate_hz: Optional[int] = None,
                  max_bytes: Optional[int] = None) -> Capture:
@@ -511,33 +662,60 @@ def load_capture(path: str, clock_col: int, data_col: int,
     `max_bytes` follows the .sal convention: None/omitted uses the shared
     `memory_budget()`, a positive value overrides it, and 0 opts out of the check.
     The check compares `predict_peak_bytes` with the budget before the file is read.
+
+    A `sample_rate_hz` below 1 Hz, above `timebase.MAX_RATE_HZ` or not a number raises
+    ValueError, and so does an inferred rate above it. Transitions that the rate puts on
+    the same sample as the one before (counting both channels) are reported in an import
+    warning.
+
+    A time too far from the first one to be a sample index (beyond 2**63 samples) raises
+    ValueError naming the file; a time cell that is not finite is skipped with a warning.
+    A file that is not UTF-8 text, is empty, or has no usable header row (`_header_row`)
+    raises ValueError naming it, and so does a clock column that is also the data column.
     """
+    if sample_rate_hz:
+        check_rate(sample_rate_hz, path)
+    try:
+        return _load_capture(path, clock_col, data_col, sample_rate_hz, max_bytes)
+    except TimeRangeError as e:
+        raise ValueError(f"{path}: {e}") from None
+
+
+def _load_capture(path: str, clock_col: int, data_col: int,
+                  sample_rate_hz: Optional[int] = None,
+                  max_bytes: Optional[int] = None) -> Capture:
+    """The body of `load_capture`."""
     from .saleae_sal import memory_budget  # ONE definition of the budget
 
     with open(path, "rb") as fb:               # a raw sample, for the row-width estimate
         sample = fb.read(64 << 10)
 
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.reader(f)
-        header = next(r, None) or []         # validate the chosen columns up front
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        raw_header = _header_row(f, path)         # validate the chosen columns up front
+        if raw_header is None:
+            raise ValueError(f"{path}: the file is empty")
+        header = _trim_header(raw_header)         # the columns the probe offers
+        notes = _RowNotes(len(header))
+        r = csv.reader(_data_lines(f, path, notes))
+        scale, notes.time_unit = time_unit(header)
         for label, col in (("clock", clock_col), ("data", data_col)):
             if col < 1 or col >= len(header):
                 raise ValueError(f"{path}: {label} column {col} is out of range "
                                  f"(file has {len(header)} columns; column 0 is Time)")
+        require_distinct(path, clock_col, data_col, "column")
         m = max(clock_col, data_col)
 
         # PRE-FLIGHT, BEFORE READING. max_bytes == 0 is the documented opt-out, checked
         # here because memory_budget() has no value for "unlimited".
         rows_est = 0
-        ncols = len(_trim_header(header))      # as the probe (read_header) counts them
+        ncols = len(header)
         if max_bytes != 0:
-            rows_est = _predict_rows(path, ncols, sample)
+            rows_est = predict_rows(path, sample)
             predicted = predict_peak_bytes(rows_est, ncols, sample)
             budget = memory_budget(max_bytes)
             if predicted > budget:
                 raise CsvTooLargeError(path, rows_est, predicted, budget)
-        notes = _RowNotes()
-        got = _read_ascending(r, m, clock_col, data_col, sample_rate_hz, notes)
+        got = _read_ascending(r, m, clock_col, data_col, sample_rate_hz, notes, scale)
 
     if got is None:
         if max_bytes != 0:
@@ -545,21 +723,29 @@ def load_capture(path: str, clock_col: int, data_col: int,
             budget = memory_budget(max_bytes)
             if predicted > budget:
                 raise CsvTooLargeError(path, rows_est, predicted, budget)
-        with open(path, newline="", encoding="utf-8") as f:
-            r = csv.reader(f)
-            next(r, None)
-            notes = _RowNotes()          # the second read covers every row
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            _header_row(f, path)
+            notes = _RowNotes(len(header))   # the second read covers every row
             notes.unsorted = True
-            got = _read_unsorted(r, m, clock_col, data_col, sample_rate_hz, notes)
+            notes.time_unit = time_unit(header)[1]
+            r = csv.reader(_data_lines(f, path, notes))
+            got = _read_unsorted(r, m, clock_col, data_col, sample_rate_hz, notes, scale)
 
     clk, dat, rate, rows, any_rows = got
     if not any_rows:
-        raise ValueError(f"{path}: not enough rows to form a capture")
+        n = notes.short[0]
+        raise ValueError(f"{path}: not enough rows to form a capture" + (
+            f" ({n:,} row{'s' if n != 1 else ''} too short for the chosen columns "
+            f"{'were' if n != 1 else 'was'} skipped, the first at line {notes.short[1]:,})"
+            if n else ""))
     if rows < 2:
         raise ValueError(f"{path}: not enough numeric rows to form a capture")
     notes.report(path)
     ce = clk.edges()
     de = dat.edges()
+    same = repeats(ce) + repeats(de)
+    if same:
+        import_notes.warn(import_notes.source_name(path), same_sample_note(same, rate))
     return Capture(clock_edges=ce, data_edges=de,
                    initial_clock=clk.initial, initial_data=dat.initial,
                    sample_rate_hz=int(rate))

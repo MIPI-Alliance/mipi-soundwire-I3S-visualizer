@@ -11,8 +11,6 @@
   the platform's black, and on a selected heading it sits on the row's fill.
 - The timeline's Link-name column is as narrow as the names allow.
 - The waveform colours and line weight are reachable from the View menu.
-- In All Links, lanes of different lengths share one window and put their ticks at the
-  same global times.
 """
 import os
 
@@ -26,6 +24,8 @@ from PySide6.QtWidgets import QApplication, QCheckBox
 from test_links_gui import _win, _with_added_link
 
 from swi3s_studio.ui.audio_view import _amp_ticks
+
+pytestmark = pytest.mark.gui
 
 
 def _labels(axis):

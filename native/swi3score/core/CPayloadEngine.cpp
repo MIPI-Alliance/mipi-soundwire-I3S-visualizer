@@ -6,9 +6,41 @@
 #include <cstdint>
 #include <cstdlib>
 
-void CPayloadEngine::Configure(const SwI3sConfig& cfg)
+void CPayloadEngine::Configure(const SwI3sConfig& cfg, bool keepDrqHistory)
 {
     mCfg = cfg;
+    // The ports in force before this call: a (device,dp) port that stays enabled keeps its
+    // running sample indices and surviving scramblers (carryChannels), and at a commit its
+    // DRQ pipeline (carryDrq); its transport phase is rebuilt and re-anchored.
+    std::vector<DpRuntime> previous = std::move(mDps);
+    // The running sample index belongs to the (device, dp, channel) and continues across
+    // a re-anchor. A channel's LFSR is seeded when the channel is enabled or ScramblerEn
+    // turns on, so a channel enabled before and after, with ScramblerEn set both times,
+    // keeps its descrambler; the FCP's DRQ descrambler continues the same way under
+    // FCP_ScramblerEn.
+    // The sample being assembled is rebuilt with its port.
+    auto carryChannels = [](const DpRuntime& from, DpRuntime& to) {
+        const bool scrambled = from.scramblerEn && to.scramblerEn;
+        for (int ch = 0; ch < 16; ++ch) {
+            to.channels[ch].index = from.channels[ch].index;
+            const bool survives = (from.cfg.EnableCh & to.cfg.EnableCh & (1u << ch)) != 0;
+            if (scrambled && survives) to.channels[ch].descram = from.channels[ch].descram;
+        }
+        if (from.hasFcp && to.hasFcp && from.cfg.FCP_ScramblerEn && to.cfg.FCP_ScramblerEn)
+            to.fcpDescram = from.fcpDescram;
+    };
+    // The DRQ pipeline of a port that has an FCP before and after the commit (see the
+    // header): the history and the TxPresent interval count carry when the old port is at
+    // the start of an interval, the rule SyncToSSP applies to an SSP.
+    auto carryDrq = [](const DpRuntime& from, DpRuntime& to) {
+        if (!from.hasFcp || !to.hasFcp) return;
+        to.lastDrqSample = from.lastDrqSample;
+        if (from.port.SaveState().rowInInterval != 0) return;
+        to.drqHistory = from.drqHistory;
+        to.drqBase = from.drqBase;
+        to.drqCount = from.drqCount;
+        to.txpInterval = from.txpInterval;
+    };
     mDps.clear();
     mFcStats = FlowControlStats{};   // fresh handshake accounting per (re)configure
     // Source-port sample shift (UIs): a peripheral-SOURCED bit is read with the level
@@ -34,7 +66,15 @@ void CPayloadEngine::Configure(const SwI3sConfig& cfg)
         if (!dc.Enabled || dc.numChannels() == 0) {
             continue;
         }
-        mDps.push_back(buildRuntime(dc, static_cast<int>(i)));
+        DpRuntime rt = buildRuntime(dc, static_cast<int>(i));
+        auto it = std::find_if(previous.begin(), previous.end(), [&](const DpRuntime& old) {
+            return old.deviceNum == rt.deviceNum && old.dpIndex == rt.dpIndex;
+        });
+        if (it != previous.end()) {
+            carryChannels(*it, rt);
+            if (keepDrqHistory) carryDrq(*it, rt);
+        }
+        mDps.push_back(std::move(rt));
     }
 }
 
@@ -80,41 +120,47 @@ void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
         } else if (it->cfg.sameTransport(dc)) {
             next.push_back(std::move(*it));      // unchanged survivor: keep runtime + phase
         } else {
-            // Survivor whose config changed via an IMMEDIATE (single-ranked) write — the
-            // only fields that can change without a commit/SSP are SampleSize/SampleGrouping
-            // (0x09), ScramblerEn/PortMode (0x0B), FlowMode (0x0E), SkippingNumerator (0x0C).
-            // Re-apply the new config but RESTORE the transport phase (do NOT re-anchor):
-            // per SWI3S v1.1 §14.2.5.3/.4 the working counters (current_bit_in_sample,
-            // samples_remaining_in_sample_group) are reloaded from the registers only at
-            // sample/group/interval boundaries, and per §9.1.6.2.1 only an SSP (SSPA/SSCR) or
-            // channel enable/prepare re-anchors the interval. The preserved counters FINISH
-            // the in-flight sample under the OLD geometry, and the NEW
-            // SampleSize/SampleGrouping (now in dc/mCfg) is picked up at the next boundary
-            // reload. The data port reports the SampleSize each sample was loaded with
-            // (DpEmit::sampleSize), so the in-flight sample keeps its old MSB and width.
+            // Survivor whose config changed, by a DSCR commit (dual-ranked transport
+            // fields) or by an immediate single-ranked write (SampleSize/SampleGrouping,
+            // ScramblerEn/PortMode/PortDirection, FlowControl, Skipping registers).
+            // The new config applies from this row without re-anchoring the port
+            // (CDataPort::ApplyConfigKeepingPhase): only an SSP restarts the interval
+            // ({ASW5103}), so the interval phase and skipping accumulator carry. SSCR and
+            // DSCR generate the same Commit operation (§4.9.4), effective at the commit
+            // point (§9.1.13). If this interval's transport has not begun, the new config
+            // governs it, channel set included; otherwise the interval finishes on the
+            // channel set it began with and the new one governs from the next interval.
+            // Within a sample the working counters (current_bit_in_sample,
+            // samples_remaining_in_sample_group) reload from the registers only at
+            // sample/group/interval boundaries (§14.2.5.3/.4), so a sample in flight
+            // finishes under the old SampleSize/SampleGrouping; the data port reports the
+            // SampleSize each sample was loaded with (DpEmit::sampleSize).
             //
             // The runtime is updated in place, so the per-channel assembly (descrambler
             // LFSR, part-assembled value, start sample, running index, TX_PRESENT latch),
             // the source-shift queue and the DRQ history carry across the write. A channel
             // that the new config enables and the old one did not gets a freshly seeded
-            // descrambler and an empty accumulator; its index continues.
+            // descrambler and an empty accumulator; its index continues. ScramblerEn
+            // turning on seeds every channel's descrambler, and FCP_ScramblerEn turning on
+            // seeds the FCP's; the rest of each channel's state carries.
             DpRuntime& rt = *it;
             const std::uint32_t newlyEnabled = dc.EnableCh & ~rt.cfg.EnableCh;
+            const bool scramblerOn = dc.ScramblerEn && !rt.scramblerEn;
             for (int ch = 0; ch < 16; ++ch) {
                 if (newlyEnabled & (1u << ch)) {
                     const U64 index = rt.channels[ch].index;
                     rt.channels[ch] = ChannelRuntime{};
                     rt.channels[ch].index = index;
+                } else if (scramblerOn) {
+                    rt.channels[ch].descram = CDescrambler{};
                 }
             }
             const bool hadFcp = rt.hasFcp;
+            const bool fcpScramblerOn = dc.FCP_ScramblerEn && !rt.cfg.FCP_ScramblerEn;
             rt.scramblerEn = dc.ScramblerEn;
             rt.cfg = dc;
             rt.isSource = dc.isSource();
-            CDataPort::State phase = rt.port.SaveState();
-            rt.port.Configure(dc, mCfg.columnCount(), mCfg.SkippingDenominator);
-            rt.port.Initialize(mStartColumn);
-            rt.port.RestoreState(phase);
+            rt.port.ApplyConfigKeepingPhase(dc, mCfg.columnCount(), mCfg.SkippingDenominator);
             rt.hasFcp = dc.drqEnabled();
             if (rt.hasFcp) {
                 // CFlowControlPort::Configure binds the config without touching the row /
@@ -123,6 +169,7 @@ void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
                 rt.fcp.Configure(dc, mCfg.columnCount());
                 if (!hadFcp) rt.fcp.Initialize(rt.port.Column(), rt.port.RowInInterval());
             }
+            if (rt.hasFcp && (!hadFcp || fcpScramblerOn)) rt.fcpDescram = CDescrambler{};
             if (!rt.hasFcp || !hadFcp) {
                 rt.drqHistory.clear();
                 rt.drqBase = 0;
@@ -138,6 +185,7 @@ void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
 
 void CPayloadEngine::Reset()
 {
+    mDps.clear();
     Configure(mCfg);
 }
 
@@ -186,11 +234,10 @@ void CPayloadEngine::RestoreState(const SwI3sConfig& cfg, int startColumn,
                                   const std::vector<CDataPort::State>& ports)
 {
     mStartColumn = startColumn;
+    mDps.clear();
     Configure(cfg);   // rebuilds mDps for the enabled ports in the saved order
     for (std::size_t i = 0; i < mDps.size() && i < ports.size(); ++i)
         mDps[i].port.RestoreState(ports[i]);
-    // Descrambler LFSRs are intentionally left reset: a windowed re-decode using this
-    // path reads only bit SAMPLE POINTS (schedule), never assembled values.
 }
 
 void CPayloadEngine::TickScheduleOnly()
@@ -290,17 +337,20 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
         // Flow control (RxControlled / Async): re-drive the FCP in lockstep so we can
         // read the DRQ bit off the bus and validate the DRQ<->TxPresent handshake
         // (SWI3S §14.2.2 {ASW5205}). The FCP for a SOURCE data port is a SINK DRQ
-        // (the manager drives it; we sample it). Each DRQ is recorded by its interval
+        // (the manager drives it; we sample it). Each DRQ is read at its bit's last UI
+        // (FcpEmit::drqObservePoint), either direction, and recorded by its interval
         // NUMBER (drqCount), so the handshake lookback is correct regardless of whether
         // the DRQ column falls before or after the data window within an interval.
         if (rt.hasFcp) {
             FcpEmit fe = rt.fcp.clock_tick(rt.port.IntervalSkipped());
-            if (fe.slot == SwI3sSlot::Drq && fe.drqSamplePoint) {
-                // DRQ is not scrambled by the audio LFSR (separate FCP scrambler,
-                // off in the flow-control demo); read the raw level.
+            if (fe.slot == SwI3sSlot::Drq && fe.drqObservePoint) {
+                // The DRQ bit is recovered by the FCP's own descrambler when
+                // FCP_ScramblerEn is set (one LFSR step per DRQ bit), else read raw.
+                const bool drq = rt.cfg.FCP_ScramblerEn ? rt.fcpDescram.Descramble(level)
+                                                        : level;
                 rt.lastDrqSample = sampleNumber;
                 ++mFcStats.drqBits;
-                rt.drqHistory.push_back(level ? 1 : 0);
+                rt.drqHistory.push_back(drq ? 1 : 0);
                 ++rt.drqCount;
                 // Bound the window: only the last d+2 intervals are ever read back.
                 int keep = rt.cfg.FlowControlDelay + 1 + 2;
@@ -324,7 +374,15 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
                 if (want >= rt.drqBase && (want - rt.drqBase) < rt.drqHistory.size())
                     earlier = rt.drqHistory[static_cast<size_t>(want - rt.drqBase)];
             }
-            char txp = level ? 1 : 0;                            // unscrambled TxPresent
+            // TxPresent is scrambled like the channel's data: the check reads the
+            // recovered bit, from a copy of the channel descrambler so the state the
+            // sample assembly steps below is untouched.
+            bool recoveredTxp = level;
+            if (rt.scramblerEn && e.channel >= 0 && e.channel < 16) {
+                CDescrambler peek = rt.channels[e.channel].descram;
+                recoveredTxp = peek.Descramble(level);
+            }
+            char txp = recoveredTxp ? 1 : 0;
             ++mFcStats.checked;
             bool fail = (rt.cfg.FlowMode == kFlowRxControlled)
                             ? (txp != earlier)          // RX: bijective

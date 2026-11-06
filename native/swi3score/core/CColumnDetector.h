@@ -37,9 +37,11 @@ public:
     // Best Column-0 phase offset for a KNOWN column count (e.g. supplied by a
     // config CSV or forced), scored like Detect over even offsets. The count
     // alone doesn't locate Column 0 when >2 columns fall on rising edges, so the
-    // phase must still be searched. Returns 0 if none validate.
+    // phase must still be searched. Returns 0 if none validate; 'found', when non-null,
+    // receives whether an offset validated, so a caller can tell offset 0 from "nothing
+    // validated" and keep its own phase for the latter.
     static int BestOffset(const std::vector<bool>& levels, int columnCount,
-                          int minValidPhases = 1);
+                          int minValidPhases = 1, bool* found = nullptr);
 };
 
 #endif // SWI3S_CCOLUMNDETECTOR_H

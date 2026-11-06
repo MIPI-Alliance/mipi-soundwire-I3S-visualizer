@@ -9,8 +9,6 @@ from .constants import (
     Colors,
     CSVFields,
     DataPortRanges,
-    DebugFlags,
-    FeatureFlags,
     InterfaceRanges,
     SlotTypeStrings,
     SpecialDevices,
@@ -22,8 +20,6 @@ __all__ = [
     'SlotTypeStrings',
     'CanvasColors',
     'Colors',
-    'FeatureFlags',
     'InterfaceRanges',
     'DataPortRanges',
-    'DebugFlags',
 ]

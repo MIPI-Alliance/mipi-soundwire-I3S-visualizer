@@ -9,11 +9,14 @@ demo must decode to the SAME audio as the PHY2 demo (identical content, differen
 Run: PYTHONPATH=. python3 -m pytest tests/test_phy3_demo.py
 """
 import numpy as np
+import pytest
 import swi3score
 
 from swi3s_studio.analysis.link_control import decode_link_control
 from swi3s_studio.ingest import transitions
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 def test_phy3_cold_start_selects_dlv():
@@ -80,8 +83,8 @@ def test_phy3_audio_bit_exact_with_phy2():
         a2, a3 = vals(s2, 0, dp), vals(s3, 0, dp)
         n = min(len(a2), len(a3))
         assert n > 0 and a2[:n] == a3[:n], f"DP{dp} audio differs between PHY2 and PHY3"
-        # PCM (dp 0/1) samples/channel match exactly; PDM (dp 2/3) may differ by a
-        # trailing sample or two at the capture end (edge truncation), which is fine.
+        # The streams may differ by a trailing sample or two at the capture end (edge
+        # truncation); the shared prefix is bit-exact.
         assert abs(len(a2) - len(a3)) <= 2, (dp, len(a2), len(a3))
 
 
@@ -109,7 +112,7 @@ def test_phy3_windowed_bit_samples_resolve():
 
 def test_phy3_virtual_pll_recovers_clock():
     """The virtual PLL holds a CONSTANT row period across the Safe-Lock-4 -> 16 commit, so
-    the recovered UI rises 4x (Safe-Lock -> operational) as the row subdivides into more
+    the recovered UI shrinks 4x (the bit rate rises 4x, Safe-Lock -> operational) as the row subdivides into more
     columns. Seeded with the Safe-Lock nominal UI so it locks to the once-per-row reference;
     it ends at the operational UI = sample_rate / 49.152 MHz (non-integer at the 500 MHz
     analyzer rate: ~10.17 samples)."""
@@ -151,7 +154,7 @@ def test_phy3_grid_layout_s1_cds_s0():
     # PHY2 (FBCSE) keeps CDS at Column 0 and emits no S0/S1.
     s2 = Session.from_demo(400, cold_start=True, phy=2)
     fr2 = frame(s2.grid_cells_at(int(s2.audio_end_sample) - 1, 16))
-    assert fr2.get(0) == "CDS" and 8 not in fr2.values() and "S0" not in fr2.values()
+    assert fr2.get(0) == "CDS" and 'S1' not in fr2.values() and "S0" not in fr2.values()
 
 
 def test_phy3_rsp_marks_are_periodic():
@@ -388,7 +391,7 @@ def test_phy3_dlv_timing_polarity_and_per_region_ui():
     t4 = measure_bus_timing(s.capture, segments=s.segments, start_sample=int(seg4["start_sample"]),
                             end_sample=int(seg16["start_sample"]), recovered_clock=s.recovered_clock())
     assert abs(t4.ui_ns / t16.ui_ns - 4.0) < 0.2, (t4.ui_ns, t16.ui_ns)
-    assert t16.ui_ns * 0.35 < np.median(t4.tr_setup_ns) < t4.ui_ns, np.median(t4.tr_setup_ns)
+    assert t4.ui_ns * 0.35 < np.median(t4.tr_setup_ns) < t4.ui_ns * 0.65, np.median(t4.tr_setup_ns)
 
 
 def test_phy3_recovered_clock_draw_is_bounded():

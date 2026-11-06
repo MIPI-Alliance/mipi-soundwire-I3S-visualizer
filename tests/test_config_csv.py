@@ -15,12 +15,15 @@ import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 import swi3score
 
 from swi3s_studio.model import Provenance
 from swi3s_studio.model.bus_config import BusConfig, demo_config
 from swi3s_studio.session import Session
 from swi3s_studio.workspace import session_from_source
+
+pytestmark = pytest.mark.gui
 
 
 def _config_csv(d: str) -> str:
@@ -110,9 +113,9 @@ def test_a_malformed_column_count_cannot_reach_the_decoder_as_a_modulus():
     clock = np.arange(0, 4000, 10, dtype=np.uint64)
     data = np.arange(5, 4000, 40, dtype=np.uint64)
     # (NumColumns_REG in the CSV, the column count the decoder must end up using)
-    cases = ((7, 8), (31, 32),           # legal: unchanged
-             (0, 2), (-1, 2), (-100, 2),  # below the protocol minimum -> kMinColumnCount
-             (32, 32), (5000, 32))        # above the maximum -> kMaxColumnCount
+    cases = ((7, 8), (31, 32),           # legal: excess-1, count = REG + 1
+             (0, 2), (-1, 2), (-100, 2),  # below the protocol minimum: count = kMinColumnCount
+             (32, 32), (5000, 32))        # above the maximum: count = kMaxColumnCount
     with tempfile.TemporaryDirectory() as d:
         for num_columns, expected in cases:
             path = os.path.join(d, f"nc{num_columns}.csv")
@@ -175,8 +178,25 @@ def test_config_csv_drives_decode_and_persists():
         # descriptor (not the normalized temp path).
         assert sess._config_csv, "config path not applied to the decode"
         assert sess.source.get("config_csv") == csv, sess.source
-        # Audio still reconstructs with the config applied from row 0.
-        assert {(a["device"], a["dp"], a["channel"]) for a in (sess.audio or [])}
+
+
+def test_config_csv_decodes_a_capture_that_starts_after_the_commit():
+    """A capture cut after the setup commit has no config on the wire and decodes no audio
+    on its own; the same capture with the operational config as a CSV decodes the ports the
+    CSV describes."""
+    full = Session.from_demo(6000, phy=2, cold_start=True)
+    t0 = int(full.segments[-1]["start_sample"]) + 20000
+    late = full.capture.subcapture(t0, int(full.capture.clock_edges[-1]))
+    assert not [c for c in Session(late).commands if c.get("command") == "WriteA32"]
+    assert Session(late).audio_store().streams() == []
+    cfg, _n = BusConfig.from_decoder_config(
+        full.config_dataports_at(int(full.segments[-1]["start_sample"]) + 60000))
+    with tempfile.TemporaryDirectory() as d:
+        path = cfg.to_csv_file(os.path.join(d, "late.csv"))
+        csv_ports = {(dp.device_number, dp.number(i)) for i, dp in enumerate(cfg.dataports)
+                     if dp.enabled and dp.num_channels()}
+        streams = set(Session(late, config_csv=path).audio_store().streams())
+    assert csv_ports and streams == csv_ports == set(full.audio_store().streams())
 
 
 def test_config_csv_survives_workspace_reload():
@@ -199,6 +219,7 @@ def test_gui_capture_open_actions():
     assert not hasattr(win, "open_capture_with_config")
     assert hasattr(win, "open_visualizer_csv")        # File (Visualizer) ▸ Open Visualizer CSV
     assert hasattr(win, "open_visualizer_config")     # Decode ▸ Import Visualizer CSV
+    assert hasattr(Session, "apply_config_csv")
     # The Analyzer file submenu (held on the window, so its actions survive multi-window
     # GC in the same process — see the shiboken caveat).
     texts = [a.text().replace("&", "") for a in win._file_analyzer_menu.actions()]
@@ -278,20 +299,6 @@ def test_apply_config_csv_persists_across_reload():
         assert reloaded._csv_replay, "CSV baseline not rebuilt on reload"
 
 
-def test_gui_exposes_open_visualizer_config():
-    from PySide6.QtWidgets import QApplication
-    QApplication.instance() or QApplication([])
-    from swi3s_studio.ui.main_window import MainWindow
-    win = MainWindow()
-    win.load_demo()                                # the demo is not preloaded in __init__
-    # open_visualizer_config is the GUI entry point; the session method it drives is
-    # exercised by the tests above.
-    assert hasattr(win, "open_visualizer_config")
-    assert hasattr(win._session, "apply_config_csv")
-    labels = [a.text() for a in win._decode_menu.actions()]
-    assert any("Import Visualizer CSV" in t for t in labels), labels
-
-
 def test_open_visualizer_config_routes_update_vs_compare(monkeypatch):
     """Open Visualizer Config routes to the right action per the dialog result:
     file+compare → _run_compare, file+update → _apply_config_csv_path, authoring →
@@ -347,7 +354,8 @@ def test_open_visualizer_csv_switches_mode_and_loads():
         finally:
             QFileDialog.getOpenFileName = orig
     assert win._mode_mgr.current() == VISUALIZATION     # switched to Visualizer
-    assert len(win._authoring.config().dataports) == 12
+    enabled = [dp for dp in win._authoring.config().dataports if dp.enabled]
+    assert [dp.enable_ch for dp in enabled] == [0b11], "the CSV's one stereo port is loaded"
 
 
 def test_visualizer_file_dir_memory_independent_of_analyzer():

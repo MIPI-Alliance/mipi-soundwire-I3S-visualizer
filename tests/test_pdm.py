@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import pytest
 
 from swi3s_studio.dsp import pdm_to_pcm
 from swi3s_studio.store.audio_store import AudioStore, decode_pdm, sign_extend
@@ -161,7 +162,7 @@ def test_a_pdm_stream_at_full_scale_is_kept_unclipped(monkeypatch):
 def test_wav_export_clips_rather_than_wraps(tmp_path):
     """A sample past the container's range clips at full scale: assigned into int16 it
     would wrap round to the other end."""
-    import wave
+    import wav_reader
 
     from swi3s_studio.store.audio_store import AudioStore
     vals = np.array([40000, -40000, 1000, 0], dtype=np.int64)
@@ -172,6 +173,95 @@ def test_wav_export_clips_rather_than_wraps(tmp_path):
     store._channels[(0, 1, 0)] = vals            # past 16 bits, as a full-scale PDM can be
     path = str(tmp_path / "a.wav")
     store.export_wav(0, 1, path)
-    with wave.open(path) as w:
+    with wav_reader.open(path) as w:
         got = np.frombuffer(w.readframes(4), dtype="<i2")
     assert got.tolist() == [32767, -32768, 1000, 0]
+
+
+def _audio_rows(sizes, values, starts):
+    return [dict(device=0, dp=1, channel=0, sample_size=int(sz), value=int(v), index=i,
+                 start_sample=int(at))
+            for i, (sz, v, at) in enumerate(zip(sizes, values, starts))]
+
+
+def test_sample_size_change_sign_extends_each_run_by_its_own_size():
+    """A 16-bit run followed by a 24-bit run: each run is two's complement at its own
+    width, and the 16-bit run is MSB-aligned to the channel's 24-bit full scale."""
+    rows = _audio_rows([16, 16, 24, 24], [0x8000, 0x7FFF, 0x7FFFFF, 0x008000],
+                       [0, 100, 200, 300])
+    st = AudioStore.from_audio(rows, {(0, 1): 48000.0})
+    assert st.samples(0, 1, 0).tolist() == [-0x800000, 0x7FFF00, 0x7FFFFF, 0x008000]
+    assert st.sample_bits(0, 1, 0) == 24
+    assert st.native_sample_bits(0, 1, 0) == 24
+    assert st.sample_positions(0, 1, 0).tolist() == [0, 100, 200, 300]
+
+
+def test_pdm_run_then_pcm_run_decodes_each_by_its_own_size():
+    """A 1-bit PDM run followed by a 24-bit PCM run: only the PDM run goes through the
+    PDM decoder; the PCM run is sign-extended at 24 bits."""
+    cap = 12_288_000.0
+    pdm_rate = 3_072_000.0
+    step = int(cap / pdm_rate)
+    t = np.arange(int(pdm_rate * 0.05)) / pdm_rate
+    bits = _sigma_delta_1bit(0.5 * np.sin(2 * np.pi * 1000.0 * t))
+    pcm = [0xC00000] * 16                          # -0x400000 at 24 bits
+    pdm_end = bits.size * step
+    starts = list(range(0, pdm_end, step)) + [pdm_end + 256 * k for k in range(16)]
+    rows = _audio_rows([1] * bits.size + [24] * 16, list(bits) + pcm, starts)
+    st = AudioStore.from_audio(rows, {}, capture_rate_hz=cap)
+    out = st.samples(0, 1, 0)
+    assert st.sample_bits(0, 1, 0) == 24
+    assert out[-16:].tolist() == [-0x400000] * 16
+    head = out[:-16].astype(np.float64) / (1 << 23)
+    assert head.size == bits.size // 64            # decimated 3.072 MHz -> 48 kHz
+    assert abs(_dominant_hz(head[200:], 48000.0) - 1000.0) < 50.0
+    assert 0.35 < np.abs(head[200:]).max() < 0.65
+    pos = st.sample_positions(0, 1, 0)
+    assert np.all(np.diff(pos) >= 0)
+    assert pos[-16:].tolist() == starts[-16:]
+
+
+def test_sign_extend_2bit_is_twos_complement_not_a_density_code():
+    assert list(sign_extend(np.array([0, 1, 2, 3]), 2)) == [0, 1, -2, -1]
+
+
+def test_a_native_rate_just_above_the_target_decimates_by_at_least_two():
+    """60 kHz to 48 kHz rounds to a factor of 1; the decimation is never below 2."""
+    bits = (np.arange(6000) % 3 == 0).astype(np.uint8)
+    signed, out_rate, M = decode_pdm(bits, 60_000.0)
+    assert M == 2 and out_rate == 30_000.0
+    assert abs(signed.size - bits.size // 2) <= 1
+
+
+def test_a_native_rate_equal_to_the_target_is_not_decimated():
+    bits = np.array([1, 0, 0, 1, 1, 0], dtype=np.uint8)
+    signed, out_rate, M = decode_pdm(bits, 48_000.0)
+    assert (M, out_rate) == (1, 48_000.0)
+    assert signed.tolist() == [1, -1, -1, 1, 1, -1]
+
+
+def test_playback_scales_a_2bit_channel_from_its_own_width():
+    store = AudioStore()
+    store._channels[(0, 0, 0)] = np.array([-2, -1, 0, 1], dtype=np.int64)
+    store._sample_bits[(0, 0, 0)] = 2
+    store._rates[(0, 0)] = 48000.0
+    inter, _rate, nch = store.pcm_int16(0, 0)
+    assert nch == 1 and inter.tolist() == [-32768, -16384, 0, 16384]
+    raw, _rate, nch, fmt = store.pcm_play(0, 0, depth=16)
+    assert fmt == "Int16" and np.frombuffer(raw, dtype=np.int16).tolist() == inter.tolist()
+
+
+def test_a_pcm_channel_with_a_pdm_run_plays_at_the_decimated_rate():
+    """The PDM run's decimated rate is the port's rate, with the bit rate kept as the
+    native rate, so playback pitch and the WAV header are not the bit rate."""
+    cap = 12_288_000.0
+    step = 4
+    t = np.arange(int(3_072_000.0 * 0.02)) / 3_072_000.0
+    bits = _sigma_delta_1bit(0.5 * np.sin(2 * np.pi * 1000.0 * t))
+    pdm_end = bits.size * step
+    starts = list(range(0, pdm_end, step)) + [pdm_end + 256 * k for k in range(16)]
+    rows = _audio_rows([1] * bits.size + [24] * 16, list(bits) + [0xC00000] * 16, starts)
+    for known in ({(0, 1): 3_072_000.0}, {}):
+        st = AudioStore.from_audio(rows, known, capture_rate_hz=cap)
+        assert st.rate(0, 1) == pytest.approx(48000.0)
+        assert st.native_rate(0, 1) == pytest.approx(3_072_000.0, rel=0.01)

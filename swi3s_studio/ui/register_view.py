@@ -3,12 +3,15 @@
 For the chosen device it shows SLC + every data-port block that has activity,
 each register's current value (as-of the time cursor) and a field breakdown,
 colour-coded by provenance: Cold Reset / Bus Write / Bus Read / CSV Import. An
-optional CSV "expected config" overlay (Compare) shows expected values in the
-CSV-Import colour alongside the values snooped from the bus.
+optional CSV "expected config" overlay (Compare) shows the expected value of each register
+the CSV names, in the CSV-Import colour, in place of its staged value; the row's tooltip
+says what the register held without the overlay and where that came from (a bus write or
+read, its reset value, a CSV import or a manual edit).
 """
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Dict, List
 
 from PySide6.QtCore import QPoint, Qt, Signal
@@ -22,10 +25,12 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +48,7 @@ from ..model.registers import (
 )
 from .click_label import KeyToggle
 from .theme import VizTheme, analyzer_stylesheet
+from .view_state import valid_width
 
 # The three selectable PHYs (the spec's "Properties Associated With PHY Number" table):
 # block name, region base, and the short kind. The active one is set from the §5.1.2
@@ -80,9 +86,34 @@ _PROV_ROLE = Qt.UserRole + 1
 _BLOCK_ROLE = Qt.UserRole + 2
 
 
+def _underlying_text(dev_file: DeviceRegisterFile, abs_addr: int) -> str:
+    """What the register held before an expected-config overlay, by its provenance: the bus
+    is named as its source only for a value the bus wrote or read back."""
+    value = f"0x{dev_file.value(abs_addr):02X}"
+    return {Provenance.DEFAULT: f"never written on the bus (reset {value})",
+            Provenance.WRITTEN: f"the bus wrote {value}",
+            Provenance.READ: f"the bus read back {value}",
+            Provenance.CSV: f"a config CSV import set {value}",
+            Provenance.UI: f"a manual edit forced {value}"}[dev_file.provenance(abs_addr)]
+
+
 def _is_reserved(name) -> bool:
     n = str(name).strip().lower()
     return n.startswith(("reserved", "rsv", "rsvd")) or "reserv" in n
+
+
+def _register_byte(text: str):
+    """`text` as a register value 0..0xFF, or None when it does not read as a whole number
+    or is outside that range. Decimal digits read as decimal, leading zeros included; a 0x,
+    0o or 0b prefix reads hex, octal or binary. Only ASCII digits read, with no `_`."""
+    t = (text or "").strip()
+    if not t.isascii() or "_" in t:
+        return None
+    try:
+        val = int(t, 10) if t.lstrip("+-").isdigit() else int(t, 0)
+    except ValueError:
+        return None
+    return val if 0 <= val <= 0xFF else None
 
 
 def _field_value_max(field, current: int) -> int:
@@ -94,6 +125,22 @@ def _field_value_max(field, current: int) -> int:
     while top > 0 and top in field.enum and _is_reserved(field.enum[top]):
         top -= 1
     return max(top, int(current))
+
+
+def _field_tooltip(field, vmax: int) -> str:
+    """The tooltip of a numeric field's editor. An excess-1 field stored whole counts its
+    value + 1; one split over registers (a name ending in `[hi:lo]`) carries the flag on
+    its least-significant part, and it is the whole assembled value that is stored + 1."""
+    width = field.hi - field.lo + 1
+    tip = f"bits [{field.hi}:{field.lo}], {width}-bit — enter 0..{vmax}"
+    if field.excess1:
+        if re.search(r"\[\d+:\d+\]$", field.name):
+            tip += " · excess-1: the whole assembled value is stored + 1"
+        else:
+            tip += " · excess-1: actual count = value + 1"
+    if field.enum:
+        tip += " · named: " + ", ".join(f"{v}={field.enum[v]}" for v in sorted(field.enum))
+    return tip
 
 
 def _enum_covers(field) -> bool:
@@ -133,13 +180,9 @@ class RegisterView(QWidget):
         self._device_names: Dict[int, str] = {}          # device -> display name
         self._csv_expected: Dict[tuple, int] = {}  # (device, address) -> CSV expected value
         self._active_phy: str | None = None      # 'PHY1'|'PHY2'|'PHY3' from §5.1.2 decode
-        # Column widths depend on the (fixed) register names + short hex values, not on
-        # WHICH rows a given cursor shows — so measure once and skip the resize on the
-        # per-cursor set_files() rebuilds. Reset only on structural changes (device /
-        # peripheral map / PHY / CSV-overlay), which re-measure on their next rebuild.
-        self._cols_sized = False
-        # Widths by column title that every fit puts back over the fitted ones
-        # (set_column_widths: a workspace's). Empty: the columns are fitted to their content.
+        # Widths by column title that set_column_widths (a workspace's) puts over
+        # DEFAULT_WIDTHS. Empty: the columns take DEFAULT_WIDTHS. A rebuild keeps the
+        # widths the columns have, a user's drag included.
         self._kept_widths: Dict[str, int] = {}
         # The value provenances whose rows are hidden (the legend's toggles), and while any
         # are, the blocks (by id) the user has open: those open when filtering began, with
@@ -170,6 +213,7 @@ class RegisterView(QWidget):
         self._tree = _RegisterTree()
         self._tree.setColumnCount(4)
         self._tree.setHeaderLabels(["Register", "Addr", "Value", "Fields"])
+        self._size_columns()
         self._tree.setAlternatingRowColors(True)
         self._tree.setIndentation(10)      # horizontal space is precious here (default ~20)
         from .copyable import enable_copy
@@ -180,10 +224,9 @@ class RegisterView(QWidget):
         self._tree.itemExpanded.connect(lambda it: self._on_block_toggled(it, True))
         self._tree.itemCollapsed.connect(lambda it: self._on_block_toggled(it, False))
         self._tree.contextRequested.connect(self._on_context_menu)
-        # The Fields column holds every decoded field and is often wider than the
-        # pane — let it size to its full content and scroll horizontally rather than
-        # stretch+elide, so all fields are readable by scrolling right.
-        self._tree.setTextElideMode(Qt.ElideNone)
+        # The Fields column keeps its width (DEFAULT_WIDTHS, or the workspace's); a field
+        # list wider than it is elided and shown in full in the cell's tooltip.
+        self._tree.setTextElideMode(Qt.ElideRight)
         self._tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._tree.header().setStretchLastSection(False)
         # Blank the scroll-area corner (where the H/V scrollbars meet) so it doesn't
@@ -275,8 +318,8 @@ class RegisterView(QWidget):
 
     def set_expanded_blocks(self, blocks) -> None:
         """Open exactly the blocks named in `blocks`, by id or by title (as a workspace
-        saved them)."""
-        wanted = set(blocks)
+        saved them). An entry that is not text names no block."""
+        wanted = {b for b in blocks if isinstance(b, str)}
         root = self._tree.invisibleRootItem()
         self._open_only({b.data(0, _BLOCK_ROLE) for b in map(root.child, range(root.childCount()))
                          if b.data(0, _BLOCK_ROLE) in wanted or b.text(0) in wanted})
@@ -362,7 +405,6 @@ class RegisterView(QWidget):
         }
         self.setStyleSheet(analyzer_stylesheet())
         self._update_legend()
-        self._cols_sized = False          # font/metrics may change with the theme
         self._rebuild()
 
     def set_files(self, files: Dict[int, DeviceRegisterFile]) -> None:
@@ -387,27 +429,19 @@ class RegisterView(QWidget):
         self._device.blockSignals(False)
 
     def _on_device_changed(self, _index: int) -> None:
-        # A different device can carry a wider peripheral-register block, so re-measure
-        # columns on the next rebuild (per-cursor set_files rebuilds keep the cached widths).
-        self._cols_sized = False
         self._rebuild()
 
     def set_peripheral_maps(self, maps: Dict[int, object]) -> None:
         """Bind per-device vendor register maps (device -> PeripheralRegisterMap),
         rendered as a 'Peripheral Registers' block under their device."""
         self._peripheral_maps = maps or {}
-        self._cols_sized = False          # vendor names can widen the Name column
         self._rebuild()
 
     def set_device_names(self, names: Dict[int, str]) -> None:
         """Per-device display names, shown in the device dropdown."""
         self._device_names = names or {}
-        cur = self._device.currentData()
         for i in range(self._device.count()):
-            d = self._device.itemData(i)
-            self._device.setItemText(i, self._device_label(d))
-        # itemText change doesn't alter selection; keep current device.
-        _ = cur
+            self._device.setItemText(i, self._device_label(self._device.itemData(i)))
 
     def _device_label(self, dev: int) -> str:
         name = self._device_names.get(dev)
@@ -421,7 +455,6 @@ class RegisterView(QWidget):
         if phy_name == self._active_phy:
             return
         self._active_phy = phy_name
-        self._cols_sized = False          # ACTIVE tag / bold header can shift the Name column width
         self._rebuild()
 
     def _on_double_click(self, item: QTreeWidgetItem, _col: int) -> None:
@@ -446,24 +479,39 @@ class RegisterView(QWidget):
         (raw byte), and 'Clear all manual edits'. Split out from _on_context_menu so it's
         testable without popping a modal menu."""
         menu = QMenu(self._tree)
-        editable = bool(item is not None and item.data(0, Qt.UserRole))
+        key = item.data(0, Qt.UserRole) if item is not None else None
+        editable = bool(key)
+        # A rebuild while the menu is open deletes the row, so an action finds its row again
+        # by its (device, address) key when chosen.
         act_history = QAction("History…", menu)
         act_history.setEnabled(editable)
-        act_history.triggered.connect(lambda: self._request_history(item))
+        act_history.triggered.connect(lambda: self._request_history(self._row_for(key)))
         menu.addAction(act_history)
         menu.addSeparator()
         act_fields = QAction("Edit fields…", menu)
         act_fields.setEnabled(bool(self._editable_fields(item)))
-        act_fields.triggered.connect(lambda: self._edit_fields(item))
+        act_fields.triggered.connect(lambda: self._edit_fields(self._row_for(key)))
         menu.addAction(act_fields)
         act_force = QAction("Force value…", menu)
         act_force.setEnabled(editable)
-        act_force.triggered.connect(lambda: self._prompt_edit(item))
+        act_force.triggered.connect(lambda: self._prompt_edit(self._row_for(key)))
         menu.addAction(act_force)
         act_clear = QAction("Clear all manual edits", menu)
         act_clear.triggered.connect(lambda: self.overridesCleared.emit())
         menu.addAction(act_clear)
         return menu
+
+    def _row_for(self, key) -> "QTreeWidgetItem | None":
+        """The register row keyed (device, address) `key` in the tree, or None."""
+        if not key:
+            return None
+        it = QTreeWidgetItemIterator(self._tree)
+        while it.value():
+            row = it.value()
+            if tuple(row.data(0, Qt.UserRole) or ()) == tuple(key):
+                return row
+            it += 1
+        return None
 
     def _request_history(self, item) -> None:
         key = item.data(0, Qt.UserRole) if item is not None else None
@@ -538,7 +586,6 @@ class RegisterView(QWidget):
         editors = []                       # (FieldSpec, widget, kind)
         for f in fields:
             raw = f.extract(current)
-            width = f.hi - f.lo + 1
             if _enum_covers(f):
                 # Every value is named → a true enumerated field: pick from a dropdown.
                 cb = QComboBox()
@@ -555,11 +602,7 @@ class RegisterView(QWidget):
                 vmax = _field_value_max(f, raw)
                 sb.setRange(0, vmax)
                 sb.setValue(min(raw, vmax))
-                tip = f"bits [{f.hi}:{f.lo}], {width}-bit — enter 0..{vmax}"
-                if f.excess1:
-                    tip += " · excess-1: actual count = value + 1"
-                if f.enum:
-                    tip += " · named: " + ", ".join(f"{v}={f.enum[v]}" for v in sorted(f.enum))
+                tip = _field_tooltip(f, vmax)
                 sb.setToolTip(tip)
                 editors.append((f, sb, "int"))
                 form.addRow(f"{f.name}  [{f.hi}:{f.lo}]", sb)
@@ -576,22 +619,31 @@ class RegisterView(QWidget):
 
     def _prompt_edit(self, item: "QTreeWidgetItem | None") -> None:
         """Prompt for a raw byte and emit a what-if override (device, address, value)
-        for the given editable register row. No-op for non-editable rows (block
-        headers, _CURR peers)."""
+        for the given editable register row. No-op for a row that carries no key (a block
+        header). A value that does not read as a whole number, or is outside the register's
+        0..0xFF, is refused with a message naming that range and the prompt opens again
+        with the text typed; nothing is emitted until a value reads or the prompt is
+        cancelled. The row is read once, before the first prompt: a rebuild while a prompt
+        is open deletes it."""
         key = item.data(0, Qt.UserRole) if item is not None else None
         if not key:
             return
         dev, addr = int(key[0]), int(key[1])
-        text, ok = QInputDialog.getText(
-            self, "Manual register edit",
-            f"{item.text(0)}  @ 0x{addr:04X}\nForce value (hex or decimal byte):",
-            text=item.text(2))
-        if not ok:
-            return
-        try:
-            val = int(text.strip(), 0) & 0xFF
-        except ValueError:
-            return
+        name, text = item.text(0), item.text(2)
+        while True:
+            text, ok = QInputDialog.getText(
+                self, "Manual register edit",
+                f"{name}  @ 0x{addr:04X}\nForce value (decimal, or a 0x, 0o or 0b prefix):",
+                text=text)
+            if not ok:
+                return
+            val = _register_byte(text)
+            if val is not None:
+                break
+            QMessageBox.warning(
+                self, "Manual register edit",
+                f"“{text.strip()}” does not read as a byte: use decimal (255) or a "
+                f"0x (0xFF), 0o (0o377) or 0b (0b11111111) prefix; the register holds 0..255.")
         self.registerEdited.emit(dev, addr, val)
 
     def _effective(self, dev: int, addr: int, dev_file: DeviceRegisterFile):
@@ -603,19 +655,18 @@ class RegisterView(QWidget):
 
     # ---- compare: expected config from a CSV ----
     def set_expected(self, expected_writes) -> None:
-        """Overlay an expected register config (from a CSV) in the CSV-Import colour,
-        so the expected config is visible alongside the values snooped from the bus.
-        (device, address, value) triples. Persists across cursor moves until
-        cleared."""
+        """Overlay an expected register config, given as (device, address, value) triples
+        from a CSV: each register it names shows the expected value in the CSV-Import colour
+        in place of its staged value, and its tooltip gives what the register held without
+        the overlay and where that came from (a bus write or read, the reset value, a CSV
+        import or a manual edit). The overlay persists across cursor moves until cleared."""
         self._csv_expected = {(int(d), int(a)): int(v) for d, a, v in expected_writes}
         self._rebuild_device_combo()          # a CSV-only device must appear in the picker
-        self._cols_sized = False              # overlay adds an Expected value column-width
         self._rebuild()
 
     def clear_expected(self) -> None:
         self._csv_expected = {}
         self._rebuild_device_combo()          # drop any CSV-only device from the picker
-        self._cols_sized = False
         self._rebuild()
 
     def has_expected(self) -> bool:
@@ -633,7 +684,8 @@ class RegisterView(QWidget):
                   edit_key: "tuple | None" = None) -> QTreeWidgetItem:
         """One register row: name / 0xADDR / 0xVV / decoded fields, coloured by
         provenance. `edit_key` (device, address) marks the row as double-click
-        editable for a what-if override."""
+        editable for a what-if override. The Addr and Fields cells carry their full text as
+        a tooltip, since their columns elide a long address, a range or a long list."""
         fields = ", ".join(f"{n}={f.value_label(v)}" for n, v, f in spec.decode(value)
                            if not n.lower().startswith("reserved"))
         # A spec spanning several addresses is a Reserved / ImpDef filler run, shown as the
@@ -648,8 +700,12 @@ class RegisterView(QWidget):
                 item.setForeground(c, QBrush(_PROV_COLOR[Provenance.DEFAULT]))
             item.setData(0, _PROV_ROLE, Provenance.DEFAULT)   # reset-coloured: Cold Reset
             item.setToolTip(0, f"{tip}; {span} bytes")
+            item.setToolTip(1, item.text(1))
             return item
         item = QTreeWidgetItem(parent, [name, f"0x{addr:04X}", f"0x{value:02X}", fields])
+        item.setToolTip(1, item.text(1))
+        if fields:
+            item.setToolTip(3, fields)                # the column elides a long list
         item.setData(0, _PROV_ROLE, prov)             # the legend's filter reads it
         brush = QBrush(_PROV_COLOR[prov])
         for c in range(4):
@@ -669,8 +725,9 @@ class RegisterView(QWidget):
         tip = f"{block} {spec.name} — provenance: {prov.value}"
         if spec.dual_ranked:
             tip += "; staged _NEXT value (reaches _CURR on a matching Commit)"
-        if prov == Provenance.CSV:                # expected (from the config file)
-            tip += "; from the expected config CSV"
+        if (dev, abs_addr) in self._csv_expected:    # Compare overlay (expected config)
+            tip += (f"; from the expected config CSV "
+                    f"({_underlying_text(dev_file, abs_addr)})")
         # The main (NEXT / single) row is the double-click editable one; the override
         # targets its NEXT-base address, so a what-if edit here forces the _NEXT rank
         # only (edit the CURR peer below to force the committed value / the decode).
@@ -782,22 +839,15 @@ class RegisterView(QWidget):
         if self._prov_hidden:
             self._apply_filter()
 
-        if not self._cols_sized:                     # per-cursor rebuilds keep the widths
-            self._size_columns()
-
-    # Default column widths in px, by column title; a column not named here fits its content.
+    # The column widths in px, by column title: every column is named.
     DEFAULT_WIDTHS = {"Register": 258, "Addr": 63, "Value": 52, "Fields": 407}
 
     def _size_columns(self) -> None:
-        """Size every column to its content, then give the columns DEFAULT_WIDTHS and
-        _kept_widths name those widths (_kept_widths wins)."""
-        for c in range(self._tree.columnCount()):
-            self._tree.resizeColumnToContents(c)
+        """Give each column its DEFAULT_WIDTHS width, or the _kept_widths one where that
+        names it."""
         widths = {**self.DEFAULT_WIDTHS, **self._kept_widths}
         for c, title in enumerate(self.column_titles()):
-            if title in widths:
-                self._tree.setColumnWidth(c, widths[title])
-        self._cols_sized = True
+            self._tree.setColumnWidth(c, widths[title])
 
     def column_titles(self) -> List[str]:
         head = self._tree.headerItem()
@@ -810,11 +860,11 @@ class RegisterView(QWidget):
     def set_column_widths(self, widths) -> None:
         """Give the columns `widths` names ({column title: px}) those widths, kept over the
         default widths from now on; {} goes back to the default widths. A
-        title that is not a column, or a width that is not a positive int, is left out."""
+        title that is not a column, or a width that is not a view_state.valid_width, is left
+        out."""
         titles = set(self.column_titles())
         self._kept_widths = {str(t): int(w) for t, w in dict(widths or {}).items()
-                             if str(t) in titles and isinstance(w, int)
-                             and not isinstance(w, bool) and w > 0}
+                             if str(t) in titles and valid_width(w)}
         self._size_columns()
 
     @property

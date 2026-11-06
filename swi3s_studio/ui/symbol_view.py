@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..analysis.cds_meaning import annotate
+from .quiet_focus import QuietFocusMixin
 from .row_origin import RowOriginMixin
 from .theme import VizTheme, analyzer_stylesheet
 
@@ -61,7 +62,7 @@ def _decoded(kind: int, value: int) -> str:
     return "—"
 
 
-class SymbolView(RowOriginMixin, QTableWidget):
+class SymbolView(QuietFocusMixin, RowOriginMixin, QTableWidget):
     # Emitted with a symbol's start sample when the user selects a row, so the
     # shared cursor (and the command table) can follow. 64-bit: samples > 2**31.
     sampleSelected = Signal('qlonglong')
@@ -184,7 +185,7 @@ class SymbolView(RowOriginMixin, QTableWidget):
         self.blockSignals(True)               # repopulating shouldn't emit selection
         try:
             self.setRowCount(len(symbols))
-            rd = -1                                   # running disparity sign (start assume RD-)
+            rd = 0                                    # running disparity sign; 0 = not yet known
             for r, s in enumerate(symbols):
                 kind = s["kind"]
                 start = int(s["start_sample"])
@@ -194,7 +195,9 @@ class SymbolView(RowOriginMixin, QTableWidget):
                 # negative (#ones 4), positive (#ones 6) or neutral (#ones 5, RD
                 # unchanged). A ±2 symbol sent when RD already has that sign is a
                 # disparity violation (suffix "!"); an illegal-disparity codeword (e.g.
-                # undriven all-ones NO_RESPONSE) has no valid RD → "?".
+                # undriven all-ones NO_RESPONSE) has no valid RD → "?". A window starts
+                # mid-stream, so the RD is unknown (shown "?", never flagged) until the
+                # first ±2 symbol sets it.
                 d = _disparity(s["raw"])
                 disp_txt = f"{d:+d}" if d else "0"    # this codeword's own disparity (−2/0/+2; other = illegal)
                 viol = False
@@ -202,7 +205,7 @@ class SymbolView(RowOriginMixin, QTableWidget):
                     viol = rd > 0; rd = 1
                 elif d == -2:
                     viol = rd < 0; rd = -1
-                if d in (-2, 0, 2):
+                if d in (-2, 0, 2) and rd:
                     rd_txt = ("+1" if rd > 0 else "-1") + ("!" if viol else "")
                 else:
                     rd_txt = "?"                      # not a legal 8b/10b disparity
@@ -232,8 +235,9 @@ class SymbolView(RowOriginMixin, QTableWidget):
     def _on_current_cell(self, row: int, _col: int, _prev_row: int, _prev_col: int) -> None:
         # A programmatic select_bus_row() / repopulate must not echo back out as a user
         # selection: currentCellChanged fires even under blockSignals() in the live
-        # widget, so gate on an explicit flag (see decoded_sample_view._on_select).
-        if self._suppress_select:
+        # widget, so gate on an explicit flag (see decoded_sample_view._on_select). A
+        # current cell Qt picks on a focus-in is not a selection either (quiet_focus.py).
+        if self._suppress_select or self.focus_changing:
             return
         if 0 <= row < len(self._symbols):
             self.sampleSelected.emit(int(self._symbols[row]["start_sample"]))

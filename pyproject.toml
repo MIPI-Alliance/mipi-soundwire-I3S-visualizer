@@ -1,23 +1,44 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.1.0"
+version = "3.2.0"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE.md"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: System :: Hardware",
+]
 requires-python = ">=3.11"
+# The C++ decode core, swi3score, is NOT listed: it is not published to any package index, and
+# a listed name would be resolved from one. Install it from the checkout first
+# (`python3 -m pip install ./native`); the app checks the core's ABI version when a session opens.
+# Keep these floors the same as requirements.txt.
 dependencies = [
-    "swi3score>=0.1.0",   # the C++ decode core (build from ./native)
     "PySide6>=6.6",
     "pyqtgraph>=0.13",
-    "numpy>=1.23",
-    "pyarrow>=12",
+    "numpy>=1.24",
+    "pyarrow>=14.0",
     "psutil>=5.9",     # actual-free-memory for the large-capture open guard
 ]
 
+[project.urls]
+Repository = "https://github.com/MIPI-Alliance/mipi-soundwire-I3S-visualizer"
+Issues = "https://github.com/MIPI-Alliance/mipi-soundwire-I3S-visualizer/issues"
+
+# A GUI launcher on Windows has no console: it prints nothing and returns no exit code to the
+# shell. `swi3s-studio-cli` is the same program as a console script, for the headless
+# `-c config.csv -o model.json` mode and its 0/1/2 exit codes.
 [project.gui-scripts]
 swi3s-studio = "swi3s_studio.app:main"
+
+[project.scripts]
+swi3s-studio-cli = "swi3s_studio.app:main"
 
 [tool.setuptools]
 packages = [
@@ -31,7 +52,7 @@ packages = [
     "swi3s_studio.timing",
     "swi3s_studio.ui",
     "swi3s_studio.ui.authoring",
-    "swi3s_studio.swviz",            # first-party SWI3S Visualizer engine (was vendored)
+    "swi3s_studio.swviz",            # SWI3S Visualizer engine; swviz/models/dataport.py and flow_control_port.py are vendored (docs/DEVELOPMENT.md)
     "swi3s_studio.swviz.config",
     "swi3s_studio.swviz.core",
     "swi3s_studio.swviz.drawing",
@@ -43,14 +64,16 @@ packages = [
 # The register map (data/registers.json) is installed alongside the app and located at
 # runtime via sys.prefix/share (see model/registers.py _default_registers_json).
 # Bundled peripheral register-map examples ship under share/swi3s-studio/regmaps
-# (see model/regmap_import.py library_dir), and the demo workspaces under
-# share/swi3s-studio/demos (see workspace.py demo_dir).
+# (see model/regmap_import.py library_dir), the demo workspaces under
+# share/swi3s-studio/demos (see workspace.py demo_dir), and the User Guide under
+# share/swi3s-studio/docs.
 # (init.csv is a user-supplied local file, not packaged.)
 [tool.setuptools.data-files]
 "share/swi3s-studio" = ["data/registers.json"]
 "share/swi3s-studio/regmaps" = ["data/regmaps/example_amp.json"]
 "share/swi3s-studio/demos" = ["data/demos/phy1.swi3s", "data/demos/phy2.swi3s",
                               "data/demos/phy2_flow_control.swi3s", "data/demos/phy3.swi3s"]
+"share/swi3s-studio/docs" = ["docs/USER_GUIDE.md"]
 
 # The theme's icons are read from beside ui/theme.py, so they ship inside the package.
 [tool.setuptools.package-data]
@@ -61,7 +84,7 @@ testpaths = ["tests"]
 # A bare `pytest` is the functional suite. The perf ceilings are wall clocks and are only
 # meaningful in their own process (`pytest -m perf`, as the gate and CI run them). An explicit
 # -m on the command line overrides this.
-addopts = ["-m", "not perf"]
+addopts = ["-m", "not perf", "--strict-markers"]
 # Warnings from this project's own modules are errors (scoped by module, so a dependency's
 # warnings stay warnings). A ResourceWarning is raised from a finalizer, so pytest reports it
 # as an unraisable-exception warning.
@@ -70,7 +93,12 @@ filterwarnings = [
     "error::ResourceWarning",
     "error::pytest.PytestUnraisableExceptionWarning",
 ]
+# What a test protects (docs/TESTING.md §1.1). A test with none of gui, platform or perf is
+# core (tests/conftest.py adds it), and --strict-markers refuses a marker not listed here.
 markers = [
+    "core: depends on nothing platform-specific: decode, timing, parsers, goldens, tools",
+    "gui: builds widgets: a view, a dialog or the main window",
+    "platform: depends on the OS, filesystem, encodings, subprocesses, Qt style or DPI, or the Python version",
     "perf: performance-regression benchmark with a wall-clock ceiling (run: -m perf)",
 ]
 
@@ -84,10 +112,10 @@ extend-exclude = ["native/build", "build", "dist", "scratch"]
 
 
 [tool.ruff.lint]
-# The ruleset covers real errors (F) and import hygiene (I), not layout preferences.
-# Ignored: E501 (long lines), E402 (guarded imports), E741 (ambiguous names), E701/E702
-# (colon / semicolon one-liners) and E731 (assigned lambda); the tree uses compact
-# one-liners for Qt setup and short test fixtures.
+# The ruleset is pycodestyle's errors (E) and warnings (W), which include the blank-line and
+# whitespace rules, real errors (F) and import order (I). Ignored: E501 (long lines), E402
+# (guarded imports), E741 (ambiguous names), E701/E702 (colon / semicolon one-liners) and E731
+# (assigned lambda); the tree uses compact one-liners for Qt setup and short test fixtures.
 select = ["E", "F", "W", "I"]
 ignore = ["E501", "E402", "E741", "E701", "E702", "E731"]
 
@@ -101,8 +129,12 @@ warn_unused_ignores = false
 exclude = ["native/build", "build", "dist", "scratch"]
 
 [tool.coverage.run]
-source = ["swi3s_studio"]
+# The package and the tools the gate and the publish run. Branches are measured, and a
+# subprocess a test starts (the CLI, the tools, a clean-process memory check) is measured too.
+source = ["swi3s_studio", "tools"]
 omit = ["*/tests/*"]
+branch = true
+patch = ["subprocess"]
 
 [tool.coverage.report]
 show_missing = true

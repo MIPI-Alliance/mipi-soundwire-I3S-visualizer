@@ -1,6 +1,6 @@
 """The Import warnings window: what an import skipped, clamped, defaulted or ignored.
 
-One window per import that raised warnings (import_notes.ImportWarning), titled with the
+One window per import that raised warnings (import_notes.ImportNote), titled with the
 file(s) it read and listing every warning as `file: message`. Not modal: the main window
 stays usable while it is open, and the list can be selected and copied.
 """
@@ -18,12 +18,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..import_notes import ImportWarning
+from ..import_notes import ImportNote
 from .copyable import enable_copy
 from .theme import analyzer_stylesheet
 
 
-def sources_of(notes: Sequence[ImportWarning]) -> List[str]:
+def sources_of(notes: Sequence[ImportNote]) -> List[str]:
     """The distinct sources of `notes`, in first-seen order."""
     out: List[str] = []
     for n in notes:
@@ -32,7 +32,7 @@ def sources_of(notes: Sequence[ImportWarning]) -> List[str]:
     return out
 
 
-def warnings_title(notes: Sequence[ImportWarning], what: str = "") -> str:
+def warnings_title(notes: Sequence[ImportNote], what: str = "") -> str:
     """'Import warnings — <file>' (several files are joined; `what` stands in when the
     warnings name no file)."""
     names = sources_of(notes)
@@ -44,9 +44,9 @@ def warnings_title(notes: Sequence[ImportWarning], what: str = "") -> str:
 class ImportWarningsDialog(QDialog):
     """Lists `notes`; `warnings` holds them for a caller (or a test) to read back."""
 
-    def __init__(self, notes: Sequence[ImportWarning], what: str = "", parent=None) -> None:
+    def __init__(self, notes: Sequence[ImportNote], what: str = "", parent=None) -> None:
         super().__init__(parent)
-        self.warnings: List[ImportWarning] = list(notes)
+        self.warnings: List[ImportNote] = list(notes)
         self.setWindowTitle(warnings_title(self.warnings, what))
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setWindowModality(Qt.NonModal)

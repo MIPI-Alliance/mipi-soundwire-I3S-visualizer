@@ -1,0 +1,232 @@
+{
+ "reference": {
+  "module": "swtiming.emit_ede",
+  "revision": "f3a8b72",
+  "uncommitted_files": [
+   "swtiming/emit_inequalities.py"
+  ],
+  "regenerate": "PYTHONPATH=. python3 tests/test_timing_vs_reference.py --regenerate"
+ },
+ "values": {
+  "ALPHA": 0.1,
+  "BUS_CM": 30.0,
+  "DELTA": 0.05,
+  "DUTY_MIN": 0.45,
+  "F_CLK": 12.288,
+  "MAN_ANALOG_MAX": 23.0,
+  "MAN_ANALOG_MIN": 9.0,
+  "MAN_DZ_MAX_T129": 10.0,
+  "MAN_DZ_PROP": 0.0,
+  "MAN_IH_MAX": 0.0,
+  "MAN_IS_MAX": 3.0,
+  "PER_DD_MAX": 9.0,
+  "PER_DD_MIN": 2.0,
+  "PER_DZ_MAX": 9.0,
+  "PER_DZ_MAX_T129": 10.0,
+  "PER_HOLD_MAX": 9.0,
+  "PER_IH_MAX": 1.5,
+  "PER_IS_MAX": 4.0,
+  "PER_ZD_MAX": 9.0,
+  "PER_ZD_MIN": 2.0,
+  "TAU": 0.05,
+  "T_KEEPER": 3.0,
+  "T_RF_FAST": 3.0,
+  "T_RF_SLOW": 8.3,
+  "UI": 36.62109375,
+  "V_PCB": 15.0,
+  "hold_mp()": 4.844047619047618,
+  "hold_pm()": -0.8944298245614091,
+  "hold_pp()": -3.5954814118629956,
+  "keeper_man(forced=False)": -3.212239583333332,
+  "keeper_per_conventional(forced=False)": 10.787760416666668,
+  "man_release(10.0)": 46.62109375,
+  "nc_mp()": 10.098948412698412,
+  "nc_mp(release=46.62109375)": 0.09894841269841237,
+  "nc_pm(ede=False)": -11.96401315789474,
+  "nc_pm(ede=True)": 1.823747258771931,
+  "nc_pp(ede=False)": -18.482465538847123,
+  "nc_pp(ede=True)": -3.6947051221804514,
+  "nc_pp(ede=True, trf_acq=8.3)": -1.0773043285296566,
+  "setup_mp()": -0.24903782894737603,
+  "setup_pm()": 1.2266639254385918,
+  "setup_pp()": -0.5373492324561511
+ },
+ "parameters": {
+  "audited_keeper_man": [],
+  "audited_nc_mp": [],
+  "audited_nc_pm": [],
+  "bus_ceiling_cm": [
+   "leg"
+  ],
+  "calc_keeper_man": [],
+  "calc_keeper_per": [],
+  "calc_nc_mp": [],
+  "calc_nc_pm": [],
+  "calc_nc_pp": [],
+  "calc_per_release_vs_edge": [],
+  "calc_release_diff": [],
+  "detect": [
+   "trf",
+   "role"
+  ],
+  "fclk_ceiling": [
+   "leg"
+  ],
+  "fmt": [
+   "x",
+   "nd"
+  ],
+  "grid_pairs": [
+   "grid"
+  ],
+  "hold_floor": [
+   "trf"
+  ],
+  "hold_mp": [
+   "trf",
+   "t_pd",
+   "t_zd_min",
+   "n_ho"
+  ],
+  "hold_pm": [
+   "trf",
+   "ui",
+   "t_zd_min",
+   "n_ho"
+  ],
+  "hold_pp": [
+   "trf",
+   "t_zd_min",
+   "n_ho"
+  ],
+  "keeper_man": [
+   "trf",
+   "ui",
+   "forced",
+   "launch",
+   "release"
+  ],
+  "keeper_man_retired_launch": [],
+  "keeper_per_conventional": [
+   "trf",
+   "ui",
+   "forced"
+  ],
+  "keeper_per_ede": [
+   "forced"
+  ],
+  "keeper_response_man": [
+   "trf",
+   "ui",
+   "launch",
+   "release"
+  ],
+  "keeper_window_opens": [
+   "trf"
+  ],
+  "main": [],
+  "man_dd_max_ceiling": [
+   "trf",
+   "ui",
+   "forced",
+   "release"
+  ],
+  "man_dz_max_ceiling": [
+   "trf",
+   "t_pd",
+   "ui"
+  ],
+  "man_launch": [
+   "ui"
+  ],
+  "man_release": [
+   "past_edge",
+   "ui"
+  ],
+  "man_release_ede": [
+   "ui"
+  ],
+  "nc_mp": [
+   "trf",
+   "t_pd",
+   "ui",
+   "release"
+  ],
+  "nc_mp_at": [
+   "release_ui"
+  ],
+  "nc_pm": [
+   "trf",
+   "t_pd",
+   "ui",
+   "ede",
+   "past_edge",
+   "man_on"
+  ],
+  "nc_pm_at": [
+   "launch_ui"
+  ],
+  "nc_pp": [
+   "trf",
+   "t_pd",
+   "ui",
+   "ede",
+   "past_edge",
+   "trf_acq"
+  ],
+  "per_launch": [
+   "t_pd",
+   "trf",
+   "corner"
+  ],
+  "per_ref": [
+   "t_pd",
+   "trf",
+   "role"
+  ],
+  "per_release_conventional": [
+   "past_edge",
+   "t_pd",
+   "trf",
+   "ui"
+  ],
+  "per_release_ede": [
+   "t_pd",
+   "trf",
+   "corner"
+  ],
+  "per_zd_min_needed": [
+   "trf"
+  ],
+  "setup_mp": [
+   "trf",
+   "t_pd",
+   "ui",
+   "t_zd_max"
+  ],
+  "setup_pm": [
+   "trf",
+   "ui",
+   "t_zd_max"
+  ],
+  "setup_pp": [
+   "trf",
+   "t_pd",
+   "ui",
+   "t_zd_max"
+  ],
+  "sigma_pp_hold": [
+   "trf"
+  ],
+  "sigma_pp_setup": [
+   "trf"
+  ],
+  "signed": [
+   "x",
+   "nd"
+  ],
+  "swing": [
+   "trf"
+  ]
+ }
+}

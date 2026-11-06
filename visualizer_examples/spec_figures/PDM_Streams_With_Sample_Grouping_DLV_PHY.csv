@@ -1,4 +1,4 @@
-AppVersion,3.1.0
+AppVersion,3.2.0
 NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -8,7 +8,7 @@ EnforceS1Handover,True
 CDS_BitWidth_REG,0
 EnforceCDSHandover,True
 RowRate,3072.0
-Description,"This example illustrates another Transport Pattern for transporting PDM data streams, which uses sample grouping to make more efficient use of the bus than the "PDM Streams Without Sample Grouping DLV PHY" example at the cost of a small increase in latency."
+Description,"This example illustrates another Transport Pattern for transporting PDM data streams, which uses sample grouping to make more efficient use of the bus than the ""PDM Streams Without Sample Grouping DLV PHY"" example at the cost of a small increase in latency."
 RowsToDraw,6
 CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
 CDS_GuardPolarityPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0

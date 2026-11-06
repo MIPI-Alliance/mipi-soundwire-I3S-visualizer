@@ -9,7 +9,8 @@ from its root first, while Qt can still order the destructors, leaves the sweep 
 to visit.
 
 Join the worker threads before calling this: a QThread destroyed while running aborts the
-process, and a running one is left alone here rather than destroyed.
+process, and a tree holding a running QThread, at any depth, is left alone here rather than
+destroyed.
 """
 from __future__ import annotations
 
@@ -27,8 +28,8 @@ def python_owned_qobjects() -> list:
 
 def release_python_owned_qobjects() -> int:
     """Delete the root of every object tree holding a Python-owned QObject, the application
-    excepted, and return how many Python-owned objects are left (0 unless a thread was
-    still running)."""
+    excepted, and return how many Python-owned objects are left (0 unless a tree held a
+    running thread)."""
     app = QCoreApplication.instance()
     roots = {}
     for o in python_owned_qobjects():
@@ -37,7 +38,8 @@ def release_python_owned_qobjects() -> int:
             top = up
         roots[Shiboken.getCppPointer(top)[0]] = top
     for top in roots.values():
-        if isinstance(top, QThread) and top.isRunning():
+        threads = ([top] if isinstance(top, QThread) else []) + top.findChildren(QThread)
+        if any(t.isRunning() for t in threads):
             continue
         top.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

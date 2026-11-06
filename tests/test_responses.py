@@ -3,6 +3,7 @@
 Run: python3 -m pytest tests/test_responses.py
 """
 from swi3s_studio.analysis.responses import (
+    command_payload,
     manager_response_name,
     peripheral_response_name,
     response_summary,
@@ -17,6 +18,28 @@ def test_peripheral_names_by_phase():
     assert peripheral_response_name("ReadSetup", 5) == "REMOTE_READ_DEFERRED"
     assert peripheral_response_name("Write", 13) == "COMMAND_ERROR"
     assert peripheral_response_name("Write", -1) == ""
+
+
+def test_token_6_is_busy_for_a_ping_and_a_remote_write_otherwise():
+    assert peripheral_response_name("GetStatus", 6) == "PING_ATTACHED_BUSY"
+    for phase in ("Write", "ReadSetup", "Commit"):
+        assert peripheral_response_name(phase, 6) == "REMOTE_WRITE_BUSY"
+
+
+def test_the_ping_tokens_are_named_only_for_the_ping_phase():
+    names = {t: peripheral_response_name("GetStatus", t) for t in (0, 6, 8, 10)}
+    assert names == {0: "PING_ATTACHED", 6: "PING_ATTACHED_BUSY", 8: "PING_ALERT",
+                     10: "PING_ALERT_BUSY"}
+    assert all(peripheral_response_name("Write", t) in ("RT8", "RT10") for t in (8, 10))
+
+
+def test_a_reads_data_column_shows_the_returned_bytes():
+    read = {"has_read_data": True, "read_data": b"\x01\x02", "data": b"\xff"}
+    assert command_payload(read) == b"\x01\x02"
+    # Without a decoded read reply the Manager packet's payload shows.
+    assert command_payload({"has_read_data": False, "read_data": b"\x01", "data": b"\xff"}) == b"\xff"
+    assert command_payload({"has_read_data": True, "read_data": b"", "data": b"\xff"}) == b"\xff"
+    assert command_payload({}) == b""
 
 
 def test_manager_names_by_phase():

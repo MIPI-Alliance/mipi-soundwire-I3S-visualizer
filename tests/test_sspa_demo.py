@@ -13,11 +13,12 @@ post-commit capture has. So the demo picks the target SSP row first (aligned to 
 of the enabled ports' interval periods) and back-computes where the command must start.
 A one-row misplacement is not subtle: it drops the decoded tone SNR from ~33 dB to ~13 dB.
 """
-import numpy as np
 import pytest
-from conftest import demo_transported_samples
+from conftest import demo_transported_samples, tone_snr
 
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 # Demo variants and the number of audio regions each has (regions with active data
 # ports — the Safe-Lock bring-up region carries none and must NOT get an SSPA).
@@ -39,25 +40,21 @@ def _sspas(session):
     return [c for c in session.commands if c.get("command") == "SSPA"]
 
 
-def _tone_snr(a) -> float:
-    """Crude single-tone SNR (dB) of a decoded PCM stream: dominant FFT bin vs the rest.
-    A cleanly decoded sine reads well above 0; a phase-shifted one collapses."""
-    a = np.asarray(a, dtype=np.float64)
-    if a.size < 512:
-        return -99.0
-    a = a - a.mean()
-    w = np.hanning(min(4096, a.size))
-    A = np.abs(np.fft.rfft(a[:w.size] * w)) ** 2
-    A[0] = 0.0
-    k = int(np.argmax(A))
-    sig = A[max(1, k - 2):k + 3].sum()
-    return 10.0 * np.log10(sig / (A.sum() - sig + 1e-9))
-
-
 @pytest.mark.parametrize("name,_kw,_n", _DEMOS, ids=[d[0] for d in _DEMOS])
 def test_demo_emits_sspas(sessions, name, _kw, _n):
     """Every demo with active data ports carries at least one SSPA."""
     assert _sspas(sessions[name]), f"{name}: no SSPA emitted"
+
+
+@pytest.mark.parametrize("name,_kw,n_regions", _DEMOS, ids=[d[0] for d in _DEMOS])
+def test_every_audio_region_holds_an_sspa(sessions, name, _kw, n_regions):
+    """Each region with active data ports holds an SSPA, and the bring-up region holds none."""
+    s = sessions[name]
+    regions = {s.segment_index_for_sample(int(c["start_sample"])) for c in _sspas(s)}
+    carrying_audio = {s.segment_index_for_sample(int(a["start_sample"])) for a in s.audio}
+    assert len(carrying_audio) == n_regions, f"{name}: audio in regions {sorted(carrying_audio)}"
+    assert regions == carrying_audio, (
+        f"{name}: SSPAs in regions {sorted(regions)}, audio in {sorted(carrying_audio)}")
 
 
 @pytest.mark.parametrize("name,_kw,_n", _DEMOS, ids=[d[0] for d in _DEMOS])
@@ -116,7 +113,7 @@ def test_audio_survives_the_sspa_reanchor(sessions, name, _kw, _n):
             else:
                 assert len(a) == _SAMPLES, (
                     f"{name} dev{dev} dp{dp} ch{ch}: {len(a)} samples, expected {_SAMPLES}")
-            snr = _tone_snr(a)
+            snr = tone_snr(a)
             assert snr > 20.0, f"{name} dev{dev} dp{dp} ch{ch}: tone SNR {snr:.1f} dB"
             checked += 1
     assert checked > 0, "no PCM stream checked"

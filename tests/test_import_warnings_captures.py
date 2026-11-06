@@ -9,7 +9,9 @@ import struct
 import zipfile
 
 import numpy as np
+import pytest
 import swi3score
+from test_ingest_damaged_files import _v0_sal
 
 from swi3s_studio import import_notes
 from swi3s_studio.analysis import dlv_detect
@@ -24,6 +26,8 @@ from swi3s_studio.ingest import (
 )
 from swi3s_studio.ingest.transitions import build_capture_from_levels
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 def _messages(notes, source):
@@ -74,6 +78,16 @@ def test_a_vcd_reports_rounding_xz_backwards_time_and_a_bare_hash(tmp_path):
     ]
 
 
+def test_a_vcd_whose_time_goes_backwards_onto_an_edge_reports_the_shared_sample(tmp_path):
+    p = _vcd(tmp_path, "#0\n0!\n0\"\n#5\n1!\n#7\n0!\n#5\n1!\n")
+    with import_notes.collect() as notes:
+        cap = vcd.load_capture(p, "!", '"')
+    assert list(cap.clock_edges) == [5, 5, 7]
+    assert _messages(notes, "cap.vcd")[-1] == (
+        "1 transition lands on the same sample as the one before at 1,000,000,000 Hz (the "
+        "rate is coarser than the transitions)")
+
+
 def test_a_vcd_signal_with_no_value_is_reported_as_constant(tmp_path):
     p = _vcd(tmp_path, "#0\n0!\n#10\n1!\n")
     with import_notes.collect() as notes:
@@ -117,9 +131,29 @@ def test_a_digital_csv_reports_short_rows_bad_times_and_bad_levels(tmp_path):
         digital_csv.load_capture(str(p), 1, 2)
     assert _messages(notes, "d.csv") == [
         "1 row too short for the chosen columns was skipped (first at line 6)",
-        "1 row with a time that is not a number was skipped (first at line 9: 'abc')",
+        "1 row with a time that is not a finite number was skipped (first at line 9: 'abc')",
         "2 data cells not 0 or 1 were read as 0 (first at line 11: 'x')",
     ]
+
+
+def test_a_digital_csv_nan_and_inf_times_are_skipped_and_reported(tmp_path):
+    rows = _digital_rows()
+    rows[4] = "nan,1,0"
+    rows[6] = "-inf,0,1"
+    p = tmp_path / "d.csv"
+    p.write_text("\n".join(rows) + "\n")
+    clean = tmp_path / "clean.csv"
+    clean.write_text("\n".join(r for k, r in enumerate(rows) if k not in (4, 6)) + "\n")
+    with import_notes.collect() as notes:
+        cap = digital_csv.load_capture(str(p), 1, 2)
+        want = digital_csv.load_capture(str(clean), 1, 2)
+    assert _messages(notes, "d.csv") == [
+        "2 rows with a time that is not a finite number were skipped "
+        "(first at line 5: 'nan')"]
+    assert np.array_equal(cap.clock_edges, want.clock_edges)
+    assert np.array_equal(cap.data_edges, want.data_edges)
+    assert cap.sample_rate_hz == want.sample_rate_hz
+    assert digital_csv.scan(str(p))[1] == digital_csv.scan(str(clean))[1] == cap.sample_rate_hz
 
 
 def test_a_digital_csv_out_of_time_order_is_reported_sorted(tmp_path):
@@ -142,6 +176,24 @@ def test_a_digital_csv_with_no_rate_in_its_timestamps_reports_the_default(tmp_pa
     assert cap.sample_rate_hz == 1_000_000
     assert _messages(notes, "d.csv") == [
         "the timestamps do not give a sample rate; 1 MHz is assumed"]
+
+
+def test_a_digital_csv_rate_coarser_than_its_transitions_reports_the_merged_edges(tmp_path):
+    p = tmp_path / "d.csv"
+    p.write_text("\n".join(_digital_rows()) + "\n")
+    with import_notes.collect() as notes:
+        digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=100_000)
+    assert _messages(notes, "d.csv") == [
+        "42 transitions land on the same sample as the one before at 100,000 Hz (the rate "
+        "is coarser than the transitions)"]
+
+
+@pytest.mark.parametrize("rate", [-5, 0.5, float("nan")])
+def test_a_digital_csv_rate_below_1_hz_is_refused_by_file(tmp_path, rate):
+    p = tmp_path / "d.csv"
+    p.write_text("\n".join(_digital_rows()) + "\n")
+    with pytest.raises(ValueError, match=r"d\.csv: the sample rate must be at least 1 Hz"):
+        digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=rate)
 
 
 def test_a_complementary_csv_whose_rate_is_snapped_reports_it(tmp_path):
@@ -197,7 +249,7 @@ def test_an_analog_csv_reports_dropped_rows_extra_cells_and_a_rate_mismatch(tmp_
     with import_notes.collect() as notes:
         analog_csv.read_analog_csv(str(p))
     assert _messages(notes, "a.csv") == [
-        "the last data row (200 after the TIME header) is not all numbers and was dropped "
+        "the last data row (201 after the TIME header) is not all numbers and was dropped "
         "(the file may be partly written): '2.5e-7,1.0,'",
         "1 row with fewer cells than the 3 columns of the TIME header was skipped (first: "
         "row 7 after the TIME header)",
@@ -205,6 +257,37 @@ def test_an_analog_csv_reports_dropped_rows_extra_cells_and_a_rate_mismatch(tmp_
         "(first: row 17 after the TIME header)",
         "the TIME column's spacing gives 1000 MHz and the preamble's Sample Interval 500 "
         "MHz; the TIME column's is used",
+    ]
+
+
+def test_a_csv_cell_in_a_note_is_quoted_to_sixty_characters(tmp_path):
+    """A digital or analog CSV cell an import note quotes is quoted whole up to 60
+    characters, and a longer one as its first 59 and an ellipsis, as the native config CSV
+    loader quotes one."""
+    rows = _digital_rows()
+    rows[8] = "t" * 60 + ",1,0"
+    rows[10] = rows[10].rsplit(",", 1)[0] + "," + "v" * 61
+    p = tmp_path / "d.csv"
+    p.write_text("\n".join(rows) + "\n")
+    with import_notes.collect() as notes:
+        digital_csv.load_capture(str(p), 1, 2)
+    assert _messages(notes, "d.csv") == [
+        f"1 row with a time that is not a finite number was skipped (first at line 9: "
+        f"'{'t' * 60}')",
+        f"1 data cell not 0 or 1 was read as 0 (first at line 11: '{'v' * 59}\u2026')",
+    ]
+    rows = _analog_rows()
+    rows[1] = "Sample Interval," + "s" * 70
+    rows.append("2.5e-7,1.0," + "w" * 100)
+    p = tmp_path / "a.csv"
+    p.write_text("\n".join(rows) + "\n")
+    with import_notes.collect() as notes:
+        analog_csv.read_analog_csv(str(p))
+    assert _messages(notes, "a.csv") == [
+        "the last data row (201 after the TIME header) is not all numbers and was dropped "
+        f"(the file may be partly written): '2.5e-7,1.0,{'w' * 48}\u2026'",
+        f"the preamble's Sample Interval '{'s' * 59}\u2026' is not a positive time that gives "
+        "a rate from 1 Hz to 1,000,000,000,000,000 Hz; it is not used",
     ]
 
 
@@ -225,9 +308,18 @@ def test_the_analog_front_end_reports_sorting_default_rate_flat_and_nan():
         analog.capture_from_analog(np.zeros(100), clk, dat, None, source="s.csv")
     assert _messages(notes, "s.csv") == [
         "the time axis does not give a sample rate; 1 MHz is assumed",
+        "1 data sample is not a number; each holds the level before it",
+        "194 transitions land on the same sample as the one before at 1,000,000 Hz "
+        "(the rate is coarser than the transitions)",
+    ]
+    # A channel with no number in it has no rails to detect; the fallback is reported.
+    with import_notes.collect() as notes:
+        analog.capture_from_analog(np.arange(100, dtype=np.float64) * 1e-9, clk,
+                                   np.full(100, np.nan), None, source="s.csv")
+    assert _messages(notes, "s.csv") == [
         "the data channel's thresholds could not be detected (it is flat or holds "
         "non-numbers); 0.6 V / 0.4 V are used",
-        "1 data sample is not a number; each holds the level before it",
+        "100 data samples are not a number; each holds the level before it",
     ]
 
 
@@ -354,7 +446,7 @@ def test_a_well_formed_sal_reports_nothing_whole_or_windowed(tmp_path):
 
 def test_a_sal_window_past_the_capture_end_is_reported(tmp_path):
     p, cap = _sal(tmp_path)
-    span = saleae_sal.capture_span_samples(p, [0, 1])
+    span = saleae_sal.window_model(p, channels=[0, 1]).span_samples
     rate = cap.sample_rate_hz
     with import_notes.collect() as notes:
         saleae_sal.load_capture(p, 0, 1, window=(10, 2 * span))
@@ -413,6 +505,134 @@ def test_opening_a_malformed_capture_shows_the_import_warnings_window(tmp_path):
     assert len(dlgs) == 1
     assert dlgs[0].windowTitle() == "Import warnings — broken.csv"
     assert dlgs[0].lines() == [
-        "broken.csv: 1 row with a time that is not a number was skipped (first at line "
+        "broken.csv: 1 row with a time that is not a finite number was skipped (first at line "
         "101: 'not-a-time')"]
 
+
+
+# ------------------------------------------- times that are not finite are skipped
+
+def _with_bad_times(t):
+    bad = t.copy()
+    bad[10], bad[50] = np.nan, np.inf
+    return bad
+
+
+def test_a_bin_pair_skips_and_reports_transition_times_that_are_not_finite(tmp_path):
+    t = np.arange(1, 200) / _RATE
+    (tmp_path / "clean").mkdir()
+    c, d = _bin_pair(tmp_path, _with_bad_times(t), t[::7])
+    c0, d0 = _bin_pair(tmp_path / "clean", np.delete(t, [10, 50]), t[::7])
+    clean = saleae_binary.load_capture(c0, d0, _RATE)
+    with import_notes.collect() as notes:
+        cap = saleae_binary.load_capture(c, d, _RATE)
+    assert [str(n) for n in notes] == [
+        "clk.bin: 2 transition times that are not a finite number (the first is "
+        "transition 11) were skipped; each skipped transition inverts the channel's level "
+        "from there on, so its decode is unreliable"]
+    assert np.array_equal(cap.clock_edges, clean.clock_edges)
+    assert np.array_equal(cap.data_edges, clean.data_edges)
+
+
+def test_a_sal_v0_channel_reports_what_the_bin_loader_reports_for_the_same_times(tmp_path):
+    """A v0 channel inside a .sal gets the order, grid, same-sample and begin-time checks
+    of a .bin pair, and the same edges."""
+    t = np.arange(1, 200) / _RATE
+    bad = t.copy()
+    bad[5], bad[6] = bad[6], bad[5]
+    bad[50] += 0.4 / _RATE
+    data = t[::7].copy()
+    data[3] = data[2] + 0.1 / _RATE
+    c, d = _bin_pair(tmp_path, bad, data, data_begin=-5e-6)
+    with import_notes.collect() as bin_notes:
+        want = saleae_binary.load_capture(c, d, _RATE)
+    p = _v0_sal(tmp_path, bad, data, data_begin=-5e-6)
+    with import_notes.collect() as notes:
+        cap = saleae_sal.load_capture(p, 0, 1, max_bytes=0)
+    # The same messages, each naming its channel in the .sal as the .bin names its file.
+    prefixes = (("clk.bin + dat.bin: ", "v0.sal: digital ch0 + digital ch1: "),
+                ("clk.bin: ", "v0.sal: digital ch0: "), ("dat.bin: ", "v0.sal: digital ch1: "))
+    named = []
+    for n in bin_notes:
+        text = str(n)
+        for old, new in prefixes:
+            if text.startswith(old):
+                text = new + text[len(old):]
+                break
+        named.append(text)
+    assert sorted(named) == sorted(str(n) for n in notes)
+    assert [str(n) for n in notes] == [
+        "v0.sal: digital ch0: the transition times step back at 1 place; they are sorted "
+        "into time order",
+        "v0.sal: digital ch0: the transition times do not sit on the 1,000,000 Hz sample "
+        "grid (up to 0.40 of a sample off in the first 199); each is rounded to the "
+        "nearest sample",
+        "v0.sal: digital ch0 + digital ch1: the two files start at different times "
+        "(-1e-06 s and -5e-06 s); both are read on one timeline from the earlier start",
+        "v0.sal: digital ch1: 1 transition lands on the same sample as the one before at "
+        "1,000,000 Hz (the rate is coarser than the transitions)",
+    ]
+    assert np.array_equal(cap.clock_edges, want.clock_edges)
+    assert np.array_equal(cap.data_edges, want.data_edges)
+    assert np.all(np.diff(cap.clock_edges.astype(np.int64)) > 0)
+
+
+def test_a_sal_v0_window_cuts_a_channel_whose_times_were_out_of_order(tmp_path):
+    """The two swapped times lie inside the window, so the cut differs from the in-order
+    one unless the times are sorted before the window is applied."""
+    t = np.arange(1, 200) / _RATE
+    shuffled = t.copy()
+    shuffled[[50, 51]] = shuffled[[51, 50]]               # samples 51 and 52, inside (20, 120)
+    plain = saleae_sal.load_capture(_v0_sal(tmp_path, t, t[::7]), 0, 1, window=(20, 120),
+                                    max_bytes=0)
+    with import_notes.collect():
+        cut = saleae_sal.load_capture(_v0_sal(tmp_path, shuffled, t[::7], name="s.sal"), 0,
+                                      1, window=(20, 120), max_bytes=0)
+    assert plain.clock_edges.size > 0
+    assert np.array_equal(cut.clock_edges, plain.clock_edges)
+    assert np.array_equal(cut.data_edges, plain.data_edges)
+
+
+def test_a_sal_v0_reports_transitions_on_one_sample(tmp_path):
+    t = np.arange(1, 200) / _RATE
+    p = _v0_sal(tmp_path, t, t[::7])
+    with import_notes.collect() as notes:
+        saleae_sal.load_capture(p, 0, 1, sample_rate_hz=_RATE // 4, max_bytes=0)
+    msgs = [str(n) for n in notes]
+    assert ("v0.sal: digital ch0: 148 transitions land on the same sample as the one "
+            "before at 250,000 Hz (the rate is coarser than the transitions)") in msgs
+
+
+def test_a_sal_v0_skips_and_reports_transition_times_that_are_not_finite(tmp_path):
+    t = np.arange(1, 200) / _RATE
+    clean = saleae_sal.load_capture(
+        _v0_sal(tmp_path, np.delete(t, [10, 50]), t[::7], name="clean.sal"), 0, 1,
+        max_bytes=0)
+    p = _v0_sal(tmp_path, _with_bad_times(t), t[::7])
+    with import_notes.collect() as notes:
+        cap = saleae_sal.load_capture(p, 0, 1, max_bytes=0)
+    assert _messages(notes, "v0.sal") == [
+        "digital ch0: 2 transition times that are not a finite number (the first is "
+        "transition 11) were skipped; each skipped transition inverts the channel's level "
+        "from there on, so its decode is unreliable"]
+    assert np.array_equal(cap.clock_edges, clean.clock_edges)
+    assert np.array_equal(cap.data_edges, clean.data_edges)
+
+
+def test_an_analog_capture_skips_and_reports_samples_whose_time_is_not_finite():
+    from swi3s_studio.ingest.analog import capture_from_analog
+    n = 400
+    t = np.arange(n) * 1e-6
+    clock = np.where((np.arange(n) // 5) % 2 == 0, 0.0, 1.0)
+    data = np.where((np.arange(n) // 11) % 2 == 0, 0.0, 1.0)
+    keep = np.ones(n, dtype=bool)
+    keep[[100, 200]] = False
+    clean = capture_from_analog(t[keep], clock[keep], data[keep], sample_rate_hz=_RATE)
+    bad = t.copy()
+    bad[100], bad[200] = np.nan, -np.inf
+    with import_notes.collect() as notes:
+        cap = capture_from_analog(bad, clock, data, sample_rate_hz=_RATE, source="s.csv")
+    assert _messages(notes, "s.csv") == [
+        "2 samples with a time that is not a finite number were skipped"]
+    assert np.array_equal(cap.clock_edges, clean.clock_edges)
+    assert np.array_equal(cap.data_edges, clean.data_edges)

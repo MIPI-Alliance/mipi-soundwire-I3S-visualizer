@@ -1,11 +1,10 @@
-// Human-readable names for SWI3S Command Transport response tokens.
+// Response-token predicate for the SWI3S Command Transport.
 //
-// Peripheral Response tokens (the "Assignment of Robust Token Numbers (Peripheral)"
-// table) and the Manager Response HD10 tokens (the "Assignment of Robust Token Numbers
-// (Manager)" table and the "Manager Response in ..." tables) are Robust Token numbers
-// (0..15) whose MEANING depends on the PhaseID. Token 0 in particular resolves to
-// WRITE_OK / READ_DATA_NOW / COMMIT_READY / CALIBRATE_NOW by phase; tokens 4 and 5
-// likewise. -1 = no (recognised) token / no response.
+// Peripheral and Manager response tokens are Robust Token numbers (0..15) whose meaning
+// depends on the PhaseID: token 0 resolves to WRITE_OK, READ_DATA_NOW, COMMIT_READY or
+// CALIBRATE_NOW by phase. This header holds only the one predicate the decode needs,
+// IsReadDataNow; the token-to-name tables are in swi3s_studio/analysis/responses.py, the
+// only table.
 
 #ifndef SWI3S_RESPONSENAMES_H
 #define SWI3S_RESPONSENAMES_H
@@ -13,54 +12,6 @@
 #include "SwI3sProtocolDefs.h"
 
 namespace swi3s {
-
-// Peripheral Response token -> name, resolved within the phase (the "Assignment of Robust
-// Token Numbers (Peripheral)" table and the per-phase "Peripheral Responses Specific to
-// ..." and "Peripheral Responses to GetStatus Phase" tables).
-inline const char* PeripheralResponseName(PhaseId phase, int token)
-{
-    switch (token) {
-    case -1: return "";              // no response / unrecognised
-    case 0:
-        switch (phase) {
-        case kPhaseWrite:        return "WRITE_OK";
-        case kPhaseReadSetup:    return "READ_DATA_NOW";
-        case kPhaseReadData:     return "READ_DATA_NOW";
-        case kPhaseCommit:       return "COMMIT_READY";
-        case kPhaseCalibratePhy: return "CALIBRATE_NOW";
-        case kPhaseGetStatus:    return "PING_ATTACHED";
-        default:                 return "RT0";
-        }
-    case 2:  return (phase == kPhaseCommit) ? "COMMIT_NOT_READY"
-                  : (phase == kPhaseGetStatus) ? "?" : "RT2";
-    case 4:  return (phase == kPhaseWrite) ? "WRITE_FAILED"
-                  : (phase == kPhaseReadSetup || phase == kPhaseReadData) ? "READ_FAILED" : "RT4";
-    case 5:  return (phase == kPhaseWrite) ? "REMOTE_WRITE_BUFFERED"
-                  : (phase == kPhaseReadSetup || phase == kPhaseReadData) ? "REMOTE_READ_DEFERRED" : "RT5";
-    case 6:  return (phase == kPhaseGetStatus) ? "PING_ATTACHED_BUSY" : "REMOTE_WRITE_BUSY";
-    case 7:  return "REMOTE_ACCESS_DISABLED";
-    case 8:  return (phase == kPhaseGetStatus) ? "PING_ALERT" : "RT8";
-    case 10: return (phase == kPhaseGetStatus) ? "PING_ALERT_BUSY" : "RT10";
-    case 12: return "PROTOCOL_ERROR";
-    case 13: return "COMMAND_ERROR";
-    case 14: return "TRANSPORT_ERROR";
-    case 15: return "COMMANDS_BLOCKED";
-    default: return "RESERVED";       // 1,3,9,11 -> UnexpectedRobustToken
-    }
-}
-
-// Manager Response (HD10) token -> name. Only tokens 0/15 are valid; meaning is
-// per phase (ReadSetup/ReadData vs Commit).
-inline const char* ManagerResponseName(PhaseId phase, int token)
-{
-    if (token == 0) {
-        return (phase == kPhaseCommit) ? "CONFIRM_COMMIT" : "READ_DATA_OK";
-    }
-    if (token == 15) {
-        return (phase == kPhaseCommit) ? "CANCEL_COMMIT" : "READ_DATA_ERROR";
-    }
-    return "";
-}
 
 // True if a peripheral response token indicates the read data follows in this
 // phase (READ_DATA_NOW = token 0 for ReadSetup/ReadData).

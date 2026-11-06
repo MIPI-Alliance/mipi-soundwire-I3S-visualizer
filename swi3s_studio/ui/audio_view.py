@@ -9,6 +9,7 @@ one per track. X axes are linked across tracks; Y is fit to the data explicitly.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -114,21 +115,15 @@ def _transport_icon(kind: str, color: str = "#ffffff", px: int = 13) -> QIcon:
 class _PcmSource(QIODevice):
     """Pull-mode audio source for QAudioSink.
 
-    It serves the decoded PCM and then *silence forever*, so it never returns a
-    short read. Two consequences make playback clean:
+    It serves the decoded PCM and then silence indefinitely, never a short read and never
+    end-of-data, so the sink does not stop itself. Playback ends only when the owner calls
+    stop() while the source is emitting silence (a cut at zero).
 
-      * The sink can never underrun -> no glitches.
-      * The sink never hits end-of-data -> it never goes Idle, so macOS never runs
-        its "repeat the last buffer" loop. Playback ends only when the owner calls
-        stop() deliberately while the source is emitting silence (a cut at zero, so
-        no click).
-
-    stop_fade() ramps the audio handed to the sink from unity to zero over
-    `fade_frames` (continuing the real samples as it ramps, then silence). Because
-    the ramp lives in the sample stream -- not the sink's mixer volume, which lags
-    badly on macOS -- the fade is smooth, reaches true zero, and is exactly
-    `fade_frames` long. readData runs on the sink's audio thread; the only field it
-    shares with the GUI thread is `_fade_at` (one idempotent int assignment)."""
+    stop_fade() ramps the audio handed to the sink from unity to zero over `fade_frames`
+    (continuing the real samples as it ramps, then silence). The ramp is applied in the
+    sample stream; the sink's mixer volume is not used. readData runs on the sink's audio
+    thread; the only field it shares with the GUI thread is `_fade_at` (one idempotent int
+    assignment)."""
 
     def __init__(self, pcm: bytes, channels: int, sample_bytes: int, fade_frames: int):
         super().__init__()
@@ -189,11 +184,10 @@ class _PcmSource(QIODevice):
 
 class _TimeAxis(pg.AxisItem):
     """Bottom axis that displays the audio-sample-index coordinate as time. The plot's
-    internal x stays in sample index (so zoom/link/export are unchanged); only the tick
-    labels are converted via the stream's sample rate. The UNIT adapts to the tick
-    spacing — seconds when coarse, else milliseconds or microseconds — so a zoomed-in
-    view reads as comma-separated `6,268,390 µs` instead of a tiny fractional second.
-    The unit is shown per tick, so the axis label carries no fixed unit."""
+    internal x stays in sample index; only the tick labels are converted via the stream's
+    sample rate. The unit adapts to the tick spacing: seconds when coarse, else
+    milliseconds or microseconds, with thousands separated (`6,268,390 µs`). The unit is
+    shown per tick, so the axis label carries no fixed unit."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
@@ -423,6 +417,7 @@ class AudioView(QWidget):
         lay.addWidget(self._splitter, 1)
 
         self._store = None
+        self.shown_state = None   # the Link state this view's zoom and channels belong to
         self._vzoom = False       # Vertical Zoom: fit Y to visible data vs full-scale ±1
         self._plots: list[tuple] = []            # (plotitem, curve, dev, dp, ch, n)
         # Channels drawn as a spectrogram instead of a waveform, (dev, dp, ch). Their
@@ -463,6 +458,7 @@ class AudioView(QWidget):
         self._play_dev = self._play_dp = None
         self._play_chan0 = None
         self._play_start_idx = 0
+        self._play_lead_frames = 0       # frames before the swept stream's first sample
         self._play_rate = 0
         self._play_nframes = 0
         self._play_fade_frames = 1       # frames in the de-click / stop ramp
@@ -555,7 +551,7 @@ class AudioView(QWidget):
         self._row_label = fn
 
     def set_store(self, store) -> None:
-        self._hard_stop()                          # don't play across a capture swap
+        self.hard_stop()                          # don't play across a capture swap
         self._store = store
         # A fresh capture starts at full-scale amplitude (Vertical Zoom off).
         self._vzoom = False
@@ -625,9 +621,10 @@ class AudioView(QWidget):
         self._fit_width = int(self._splitter.sizes()[0])
 
     def _label_check(self, cb, dev: int, dp: int, ch: int) -> None:
-        """The channel's checkbox: an asterisk when the stream has a high-pass or gain (what
-        is drawn and played is then not the decoded samples), with the setting in its
-        tooltip. The track's title spells it out; the list is too narrow to."""
+        """The channel's checkbox: an asterisk when the stream has a DC blocker, high-pass
+        or gain (what is drawn and played is then not the decoded samples), with the
+        setting in its tooltip. The track's title spells it out; the list is too narrow
+        to."""
         proc = self._store.processing(dev, dp) if self._store is not None else None
         cb.setText(f"{port_label(self._stream_names, dev, dp)} CH{ch}" + (" *" if proc else ""))
         tips = [port_identity(self._stream_names, dev, dp)] if (dev, dp) in self._stream_names \
@@ -688,6 +685,7 @@ class AudioView(QWidget):
         colour for the (device, dp) stream in the current theme; Reset Color goes back to
         the palette."""
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         key = (dev, dp, ch)
         wave = menu.addAction("Waveform")
         spec = menu.addAction("Spectrogram")
@@ -1225,9 +1223,13 @@ class AudioView(QWidget):
         return float(x0) / rate, float(x1) / rate
 
     def set_x_range_seconds(self, t0: float, t1: float) -> None:
+        """Show t0..t1 seconds of the capture; a range whose samples are not finite numbers
+        is not applied."""
         if self._link is not None:
             rate = self._capture_rate or 1.0
-            self._link.setXRange(t0 * rate, t1 * rate, padding=0)
+            lo, hi = t0 * rate, t1 * rate
+            if math.isfinite(lo) and math.isfinite(hi):
+                self._link.setXRange(lo, hi, padding=0)
 
     def _x_extent(self):
         """The X range the tracks may show, in capture samples: the capture, or in All
@@ -1346,13 +1348,27 @@ class AudioView(QWidget):
         QToolTip.showText(QCursor.pos(), text)
 
     # ---- playback ----
+    def _lead_frames(self, d: int, p: int, ch: int, i0: int, rate: int) -> int:
+        """Frames, at `rate`, from the cursor to the sample index `i0` of a stream: zero for
+        a stream already running at the cursor, and when the capture rate is unknown."""
+        if self._store is None or not self._capture_rate:
+            return 0
+        first = self._store.sample_at_index(d, p, ch, i0)
+        if first is None:
+            return 0
+        gap = int(first) - int(self._cursor_sample)
+        return int(round(gap * float(rate) / self._capture_rate)) if gap > 0 else 0
+
     def _mix_selected(self, sel, dps):
         """Mono mix of every selected (dev, dp)'s channels at a common 48 kHz rate,
         attenuated by 1/N so summed full-scale tones don't clip. Each data port's selected
         channels are averaged to mono, then the port monos are summed and scaled. From the
-        shared cursor. Returns (bytes, rate, 1, "Int16"); (b"", 0, 0, "Int16") if empty."""
+        shared cursor; a port whose first sample after the cursor comes later starts that
+        much later in the mix. Returns (bytes, rate, 1, "Int16"); (b"", 0, 0, "Int16") if
+        empty."""
         target = 48000
         monos = []
+        leads = []
         for (d, p) in dps:
             chans = [c for (dd, pp, c) in sel if dd == d and pp == p]
             if not chans:
@@ -1366,26 +1382,24 @@ class AudioView(QWidget):
             arr = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
             if nch > 1:
                 arr = arr.reshape(-1, nch).mean(axis=1)   # this DP's channels -> mono
-            # pcm_play is asked for `target` but reports back the RATE IT ACTUALLY
-            # PRODUCED (e.g. it falls back to 48 kHz itself when the port's native
-            # rate is 0/unknown, without resampling to `target`). Trust that returned
-            # rate, not the request: resample explicitly whenever it differs, so every
-            # port lands on the same clock and stays time-aligned in the mix.
+            # pcm_play reports the rate it produced, which can differ from `target` (a port
+            # of unknown rate is not resampled). Resample to `target` whenever it differs,
+            # so every port is on one clock.
             if r and int(r) != target:
                 from swi3s_studio.dsp import resample
                 arr = resample(arr, int(r), target).astype(np.float32)
             monos.append(arr)
+            leads.append(self._lead_frames(d, p, chans[0], i0, target))
         if not monos:
             return b"", 0, 0, "Int16"
-        # Zero-fill shorter data ports to the LONGEST (matching pcm_play / export_wav):
-        # a data port that ends early (e.g. disabled part-way) must not truncate the whole
-        # mix -- playback should run to the end of the longest selected stream.
-        n = max(a.size for a in monos)
+        # The mix runs to the end of the longest selected stream, zero-filled where a port
+        # has not started or has ended.
+        n = max(lead + a.size for lead, a in zip(leads, monos))
         if n == 0:
             return b"", 0, 0, "Int16"
         mix = np.zeros(n, dtype=np.float32)
-        for a in monos:
-            mix[:a.size] += a
+        for lead, a in zip(leads, monos):
+            mix[lead:lead + a.size] += a
         mix *= 1.0 / len(monos)                            # anti-clip: average, don't sum
         out = np.clip(np.rint(mix), -32768, 32767).astype("<i2")
         return out.tobytes(), target, 1, "Int16"
@@ -1406,7 +1420,8 @@ class AudioView(QWidget):
                 d, p, c0, self._cursor_sample, self._cursor_sample)
             nat = int(round(self._store.rate(d, p))) or int(rate)
             remaining = max(0, self._store.samples(d, p, c0)[j0:].size)
-            reach = remaining * (float(rate) / float(max(1, nat)))   # frames in the play-rate domain
+            reach = (remaining * (float(rate) / float(max(1, nat)))   # frames in the play-rate domain
+                     + self._lead_frames(d, p, c0, j0, int(rate)))
             if reach > best:
                 best = reach
                 ref = (d, p, c0, j0, nat)
@@ -1444,7 +1459,7 @@ class AudioView(QWidget):
         device = self._selected_device()
         if device is None or device.isNull():
             return
-        self._hard_stop()
+        self.hard_stop()
         pcm = self._declick(pcm, int(rate), int(nch), qfmt)
         fmt = QAudioFormat()
         fmt.setSampleRate(int(rate))
@@ -1454,7 +1469,7 @@ class AudioView(QWidget):
         sample_bytes = 4 if qfmt == "Int32" else 2
         fade_frames = max(1, int(rate * _FADE_MS / 1000.0))
         # Feed from a never-short-reading source (see _PcmSource): no underrun
-        # glitches, no end-of-data Idle/repeat, and stop() fades in software.
+        # glitches, no end-of-data, and stop() fades in software.
         self._source = _PcmSource(pcm, int(nch), sample_bytes, fade_frames)
         self._sink.start(self._source)
         self.playStarted.emit()
@@ -1470,6 +1485,8 @@ class AudioView(QWidget):
         ref_dev, ref_dp, ref_ch, ref_i0, ref_native = ref
         self._play_dev, self._play_dp, self._play_chan0 = ref_dev, ref_dp, ref_ch
         self._play_start_idx = int(ref_i0)
+        self._play_lead_frames = (self._lead_frames(ref_dev, ref_dp, ref_ch, ref_i0, int(rate))
+                                  if len(dps) > 1 else 0)
         self._play_rate = int(rate)
         self._play_idx_per_frame = (ref_native / float(rate)) if rate else 1.0
         self._play_nframes = len(pcm) // (nch * sample_bytes)
@@ -1489,7 +1506,7 @@ class AudioView(QWidget):
 
     def stop_and_rewind(self) -> None:
         """Stop button: fade out cleanly, then return the playhead to the start of
-        the decoded audio once the fade has released (see _hard_stop)."""
+        the decoded audio once the fade has released (see hard_stop)."""
         self._want_play = False
         self._set_play_button(False)
         self._rewind_on_stop = True
@@ -1518,39 +1535,43 @@ class AudioView(QWidget):
     def _on_play_tick(self) -> None:
         """Map the sink's processed audio time to a capture sample and drive the
         shared cursor, so the play head sweeps every pane. Also ends playback: the
-        source feeds silence forever (never Idle/repeat), so we stop the sink here
-        once the *output* has passed the clip end -- or, after a stop-fade, once the
-        ramp has fully played out. Either way the cut lands in silence, so no click."""
+        source never reports end-of-data (_PcmSource), so the sink does not stop itself;
+        this stops it once the *output* has passed the clip end -- or, after a stop-fade,
+        once the ramp has fully played out. Either way the cut lands in silence."""
         if self._sink is None or self._source is None or self._store is None:
             self._play_timer.stop()
             return
         from PySide6.QtMultimedia import QAudio
         if self._sink.state() == QAudio.State.StoppedState:   # external stop
-            self._hard_stop()
+            self.hard_stop()
             return
         # Frames the sink has actually output so far (= processedUSecs * rate).
         out_frames = int(self._sink.processedUSecs() * self._play_rate // 1_000_000)
         fa = self._source.fade_at
         if fa is not None:
             if out_frames >= fa + self._play_fade_frames:     # stop-fade fully played
-                self._hard_stop()
+                self.hard_stop()
             return                                            # freeze the cursor while fading
         if out_frames >= self._play_nframes:                  # clip end (incl. baked fade)
             # Land the cursor exactly on the final sample: the last sweep tick can be up
             # to one timer interval short of the end.
-            end_idx = self._play_start_idx + int(max(0, self._play_nframes - 1) * self._play_idx_per_frame)
+            end_idx = self._play_start_idx + int(
+                max(0, self._play_nframes - 1 - self._play_lead_frames) * self._play_idx_per_frame)
             end_samp = self._store.sample_at_index(self._play_dev, self._play_dp,
                                                     self._play_chan0, end_idx)
             if end_samp is not None:
                 self._cursor_sample = int(end_samp)
                 self._apply_cursor()
                 self.playCursorMoved.emit(int(end_samp))
-            self._hard_stop()
+            self.hard_stop()
             return
         # Scale resampled output frames back to the native audio-sample index, then
         # to the capture sample the shared cursor expects.
         frames = max(0, min(out_frames, max(0, self._play_nframes - 1)))
-        idx = self._play_start_idx + int(frames * self._play_idx_per_frame)
+        if frames < self._play_lead_frames:      # before the swept stream's first sample
+            return
+        idx = self._play_start_idx + int(
+            (frames - self._play_lead_frames) * self._play_idx_per_frame)
         samp = self._store.sample_at_index(self._play_dev, self._play_dp,
                                            self._play_chan0, idx)
         if samp is not None:
@@ -1576,20 +1597,24 @@ class AudioView(QWidget):
         return np.rint(block).astype(dtype).tobytes()
 
     def stop(self) -> None:
-        """User-initiated stop/pause: ask the source to ramp to silence over 50 ms
-        (a software fade in the sample stream -- see _PcmSource -- not the mixer
-        volume, which lags on macOS), then let the sweep timer release the sink once
-        the ramp has played out. Both the Pause toggle and the Stop button route
-        here. (The natural end-of-clip is de-clicked by the fade-out baked into the
-        playback copy and likewise released by the sweep timer.)"""
+        """User-initiated stop/pause: ask the source to ramp to silence over 50 ms (a fade in
+        the sample stream, see _PcmSource; the sink volume is not used), then let the sweep
+        timer release the sink once the ramp has played out. Both the Pause toggle and the
+        Stop button route here. The natural end of a clip is de-clicked by the fade-out in
+        the playback copy and released by the sweep timer."""
         if self._source is not None and _HAVE_AUDIO:
             self._source.stop_fade()
             if not self._play_timer.isActive():
                 self._play_timer.start()         # ensure the release tick is running
             return
-        self._hard_stop()
+        self.hard_stop()
 
-    def _hard_stop(self) -> None:
+    @property
+    def store(self):
+        """The audio store shown, or None."""
+        return self._store
+
+    def hard_stop(self) -> None:
         """Stop playback immediately and release the sink/source. If a Stop (rewind)
         is pending, snap the shared cursor to the start of the audio now that the
         fade has played out."""
@@ -1617,11 +1642,8 @@ class AudioView(QWidget):
     def is_playing(self) -> bool:
         if self._sink is None or not _HAVE_AUDIO:
             return False
-        # Treat anything but a stopped sink as "playing". A pull-mode QAudioSink
-        # oscillates between Active and Idle on macOS as it pulls buffers, so
-        # checking == ActiveState is flaky and would intermittently let the heavy
-        # cursor-follow work run mid-playback (glitching audio). The sink is set to
-        # None on a real stop (_hard_stop), so this is False once playback ends.
+        # Any state but Stopped is playing: Active and Idle both count, whichever the sink
+        # reports between buffers. The sink is None once playback has stopped (hard_stop).
         from PySide6.QtMultimedia import QAudio
         return self._sink.state() != QAudio.State.StoppedState
 

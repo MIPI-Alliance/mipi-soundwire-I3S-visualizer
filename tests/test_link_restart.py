@@ -29,6 +29,8 @@ from swi3s_studio.ingest.capture import Capture
 from swi3s_studio.model import Provenance
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 _GAP_S = 0.005
 
 
@@ -174,6 +176,67 @@ def test_every_bring_up_is_found(two):
     assert found[1].sections[0]["start"] < shift < found[1].sections[0]["end"]
 
 
+def test_the_later_search_starts_from_the_first_bring_up_it_is_given(two):
+    """`decode_link_controls(first=...)` uses the caller's first bring-up instead of decoding
+    it again, and looks for later ones after ITS audio start: from the capture's start when
+    it has none (a first rejected as a phantom), and past a later stop when it ends there."""
+    s, _alone, _shift = two
+    found = decode_link_controls(s.capture)
+    given = decode_link_controls(s.capture, first=found[0])
+    assert given[0] is found[0]
+    assert [r.audio_start_sample for r in given] == [r.audio_start_sample for r in found]
+    none = LinkControlResult()
+    from_start = decode_link_controls(s.capture, first=none)
+    assert from_start[0] is none
+    # From the capture's start: every clock stop counts, the second bring-up's included.
+    assert found[1].audio_start_sample in [r.audio_start_sample for r in from_start[1:]]
+    late = LinkControlResult(sequence="cold", audio_start_sample=found[1].audio_start_sample)
+    assert decode_link_controls(s.capture, first=late) == [late]
+
+
+def test_the_session_searches_later_bring_ups_from_its_validated_first(monkeypatch):
+    """`Session.link_controls` hands the validated first bring-up to the later search."""
+    import swi3s_studio.session as session_mod
+    seen = []
+    real = session_mod.decode_link_controls
+
+    def spy(capture, first=None):
+        seen.append(first)
+        return real(capture, first=first)
+
+    monkeypatch.setattr(session_mod, "decode_link_controls", spy)
+    s = _session(_cold())
+    assert seen and all(f is not None for f in seen)
+    assert seen[-1] is s.link_control
+
+
+def test_a_rejected_first_bring_up_reopens_the_later_search(monkeypatch):
+    """A first bring-up rejected as a phantom hands the later search the capture's start, so
+    a real bring-up before the phantom's audio start is found, and the decode restarts there.
+    The phantom names no PHY and no Safe-Lock width, so it steered nothing: the decode runs
+    again because the later bring-ups changed. The result is the decode of the same capture
+    with no first bring-up detected at all."""
+    import swi3s_studio.session as session_mod
+    a, b = _plain(), _cold()
+    cap, shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+    clean = _session(cap)
+    real = clean.link_controls[1]
+    assert real.sequence == "cold" and int(real.audio_start_sample) > shift
+    audio = int(real.audio_start_sample) + 500_000
+    phantom = LinkControlResult(sequence="cold", audio_start_sample=audio,
+                                sections=[{"name": "Bus Reset", "start": 10, "end": audio}])
+    monkeypatch.setattr(session_mod, "decode_link_control", lambda c: phantom)
+    s = _session(cap)
+    assert not s.has_bringup and "CRC-valid command" in s.link_control.note
+    assert [r.audio_start_sample for r in s.link_controls[1:]] == [real.audio_start_sample]
+    restarts = [g for g in s.segments if g["restart"]]
+    assert len(restarts) == 1 and restarts[0]["cold_start"]
+    assert int(restarts[0]["start_sample"]) >= shift
+    assert [(g["start_sample"], g["column_count"], g["restart"]) for g in s.segments] == \
+        [(g["start_sample"], g["column_count"], g["restart"]) for g in clean.segments]
+    assert _signature(_after(s, shift)) == _signature(_after(clean, shift))
+
+
 def test_three_bring_ups_each_restart_the_decode():
     parts = [_cold(), _cold(), _cold()]
     cap, shifts = _chain(parts, [int(_GAP_S * parts[0].sample_rate_hz)] * 2)
@@ -291,6 +354,30 @@ def test_a_clean_pause_decodes_on_as_if_nothing_happened():
     assert [g["column_count"] for g in s.segments] == [
         g["column_count"] for g in whole.segments]
     assert len(s.audio_columns()["start_sample"]) == len(whole.audio_columns()["start_sample"])
+
+
+@pytest.mark.parametrize("column_step", [0, 2, 4])
+def test_a_clean_pause_with_no_command_after_it_keeps_the_phase(column_step):
+    """A pause after the last command: the window after it has no CRC-valid command to
+    place Column 0 by, so the decode carries on in phase, on any column of the row."""
+    a = _cold()
+    ce = np.asarray(a.clock_edges, dtype=np.int64)
+    de = np.asarray(a.data_edges, dtype=np.int64)
+    whole = _session(a)
+    after_last = max(int(c["end_sample"]) for c in whole.commands) + 20_000
+    cut = int(ce[int(np.searchsorted(ce, after_last)) + column_step])
+    pause = int(_GAP_S * a.sample_rate_hz)
+    cap = Capture(np.where(ce > cut, ce + pause, ce).astype(np.uint64),
+                  np.where(de > cut, de + pause, de).astype(np.uint64),
+                  a.initial_clock, a.initial_data, a.sample_rate_hz)
+    s = _session(cap)
+    assert len(clock_resumes(cap, s.link_controls)) == 1
+    assert [g["column_count"] for g in s.segments] == [
+        g["column_count"] for g in whole.segments]
+    live, ref = s.audio_columns(), whole.audio_columns()
+    for key in ref:
+        if key not in ("start_sample", "end_sample"):
+            assert np.array_equal(np.asarray(live[key]), np.asarray(ref[key])), key
 
 
 def test_no_resume_inside_a_start_sequence():
@@ -518,10 +605,9 @@ def test_the_dlv_bit_sample_replay_follows_the_restart():
     bit-sample replay follows the recovered clock's row log across the stretch and the new
     session's first commit, where its ports begin. From the row the stop cut short on it is
     the live decode exactly (that row keeps the UI it had and ends where the re-acquired one
-    begins, which takes the UI it locked with); further back to a sample, where a seek
-    restores a row's UI from its logged span rather than the loop's running estimate. The
-    analyzer's clock runs 3% off nominal, so the UI the loop tracks is not the one it is
-    seeded with."""
+    begins, which takes the UI it locked with), and so it is from further back, where a
+    seek restores each row's UI from its logged span. The analyzer's clock runs 3% off
+    nominal, so the UI the loop tracks is not the one it is seeded with."""
     a = _stopped_mid_row()
     joined, _shift = _relinked(a, _cold(3), int(_GAP_S * a.sample_rate_hz))
 
@@ -552,8 +638,7 @@ def test_the_dlv_bit_sample_replay_follows_the_restart():
     assert np.array_equal(window, live)
     window, live = replay(cut - 2000)
     assert window.size == live.size
-    assert np.array_equal(window[window >= restart], live[live >= restart])
-    assert np.abs(window - live).max() <= 1
+    assert np.array_equal(window, live)
 
 
 def test_a_dlv_restart_frames_at_the_safe_lock_count_under_a_config_csv(tmp_path):
@@ -665,7 +750,7 @@ def test_a_paused_clock_is_not_a_restart(monkeypatch):
                   {"name": "Warm Start", "start": resume, "end": resume + 1000},
                   {"name": "PhyStart", "start": resume + 1000, "end": resume + 2000}])
     monkeypatch.setattr(session_mod, "decode_link_controls",
-                        lambda c: [decode_link_control(c), phantom])
+                        lambda c, first=None: [first or decode_link_control(c), phantom])
     s = _session(cap)
     assert len(s.link_controls) == 1 and s._restart_points() == []
     assert not any(g["restart"] for g in s.segments)

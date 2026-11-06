@@ -6,10 +6,13 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.session import Session
 from swi3s_studio.ui.main_window import _SAMPLE_CHUNK, _SAMPLE_HALF_WINDOW, MainWindow
+
+pytestmark = pytest.mark.gui
 
 _app = QApplication.instance() or QApplication([])
 

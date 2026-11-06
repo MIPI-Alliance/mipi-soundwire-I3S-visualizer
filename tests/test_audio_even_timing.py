@@ -14,6 +14,8 @@ from PySide6.QtWidgets import QApplication, QMenu
 from swi3s_studio.session import Session
 from swi3s_studio.store.audio_store import AudioStore, _even_runs
 
+pytestmark = pytest.mark.gui
+
 _SKIPPING = (0, 0)          # the demo's 44.1 kHz port
 
 

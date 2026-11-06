@@ -34,15 +34,6 @@ class Capture:
             last = max(last, int(self.data_edges[-1]))
         return last / self.sample_rate_hz if self.sample_rate_hz else 0.0
 
-    def samples_per_ui(self) -> int:
-        """Samples between consecutive clock edges (one edge per UI). Estimated
-        from the first two edges; used to map a sample number to a UI index."""
-        if self.clock_edges.size >= 2:
-            d = int(self.clock_edges[1]) - int(self.clock_edges[0])
-            if d > 0:
-                return d
-        return 1
-
     def sample_source(self) -> "swi3score.TransitionSampleSource":
         """Build the C++ ISampleSource that walks these edges at native speed."""
         return swi3score.TransitionSampleSource(

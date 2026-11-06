@@ -5,7 +5,9 @@ Visualization-mode authoring renders it from the Python `swviz` engine (via
 `model/viz_engine.py::render_payload`). Their §14.2.5 placement is held equal
 transitively through the golden suite, but this asserts it DIRECTLY: for each data
 port (solo-placed to avoid clash-interaction differences), the two engines put the
-same DP-owned cells at the same (row, col, slot).
+same DP-owned cells at the same (row, col, slot), except a Sink port's wide bit: the
+core places every UI of the bit (the marker on the last), swviz only the last UI
+(`test_a_sink_wide_bit_differs_by_declaration`).
 
 If one engine's cascade changes without the other, this fails. The
 `test_cross_engine_all_configs_*` sweep runs EVERY example config (all flow modes), so a
@@ -25,6 +27,7 @@ import tempfile
 
 import swi3score
 
+from swi3s_studio import import_notes
 from swi3s_studio.model import viz_engine
 from swi3s_studio.model.bus_config import BusConfig, demo_config
 from swi3s_studio.model.grid_slots import GridSlot
@@ -101,6 +104,25 @@ def test_cross_engine_all_configs_data_placement():
     assert not fails, "cross-engine DATA/TX_PRESENT mismatches:\n  " + "\n  ".join(fails)
 
 
+def test_a_sink_wide_bit_differs_by_declaration(tmp_path):
+    """Each enabled demo port as a solo Sink at BitWidth_REG 1: the core places both UIs of
+    each wide bit and swviz only the last, so the core's DATA cells are swviz's plus the UI
+    before each."""
+    cfg = demo_config()
+    for dp in cfg.dataports:
+        dp.port_direction = bool(dp.enabled)
+        dp.bit_width = 1 if dp.enabled else dp.bit_width
+    checked = 0
+    for i, path in _solo_paths(cfg, str(tmp_path)):
+        cpp = _owned(swi3score.grid_from_csv(path, 16), _DP_ONLY_KINDS)
+        viz = _owned(viz_engine.render_payload(path, 16)[0], _DP_ONLY_KINDS)
+        assert viz and viz < cpp, f"DP{i}: swviz does not place a subset of the core's cells"
+        assert cpp == viz | {(dp, row, col - 1, slot) for dp, row, col, slot in viz}, (
+            f"DP{i}: the core's extra cells are not the UI before each swviz bit")
+        checked += 1
+    assert checked, "demo config has no enabled data ports"
+
+
 def test_txpresent_present_iff_flow_controlled():
     """{ASW5203}: TX_PRESENT is placed iff the DP is flow-controlled (TX_CONTROLLED,
     RX_CONTROLLED, or ASYNC) and never in NORMAL — asserted for BOTH engines. This is a
@@ -142,7 +164,8 @@ def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
     """
     csv = os.path.join(_HERE, "fixtures", "flow_control_demo.csv")
     assert os.path.isfile(csv), f"missing fixture {csv}"
-    cfg = BusConfig.from_csv(csv)
+    with import_notes.collect():               # the fixture's missing CDS rows are noted
+        cfg = BusConfig.from_csv(csv)
     rows = max(1, min(int(cfg.rows_to_draw), 64))
 
     declared = {i: (dp.device_number, dp.dp_number)

@@ -23,6 +23,3 @@ psutil>=5.9
 # Keep this in step with pyproject.toml.
 PySide6>=6.6
 pyqtgraph>=0.13
-
-# Build — native swi3score decode core (pybind11); required by `pip install ./native`
-pybind11>=2.11

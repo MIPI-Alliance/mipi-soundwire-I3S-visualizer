@@ -1,12 +1,11 @@
-"""Reader for a Tektronix ``.wfm`` waveform file (one analog channel per file).
+"""Reader for a scope ``.wfm`` waveform file (one analog channel per file).
 
-Tek scopes (e.g. the MSO5 series) export each analog channel as a self-
-describing binary waveform: a fixed-layout header (endianness + version tag,
-then a "static" description block and a "frame" curve-object block whose *field
-offsets* depend on the file version) followed by the raw sample codes. Voltages
-are ``code * v_scale + v_offset``; the time axis is ``t0 + arange(n) * dt``. Only
-version 3 (the format Tek scopes currently write) is implemented — see
-`read_wfm` for the guard.
+A scope exports each analog channel as a self-describing binary waveform: a
+fixed-layout header (endianness + version tag, then a "static" description block and
+a "frame" curve-object block whose *field offsets* depend on the file version)
+followed by the raw sample codes. Voltages are ``code * v_scale + v_offset``; the time
+axis is ``t0 + arange(n) * dt``. Only version 3 is implemented — see `read_wfm` for
+the guard.
 
 Layout reference (little-endian byte offsets, version 3)::
 
@@ -29,6 +28,8 @@ Layout reference (little-endian byte offsets, version 3)::
 """
 from __future__ import annotations
 
+import math
+import re
 import struct
 import weakref
 from typing import Dict, Optional, Tuple
@@ -36,6 +37,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from . import analog
+from .timebase import MAX_RATE_HZ
 
 _BOM_LE = 0x0F0F
 _BOM_BE = 0xF0F0
@@ -71,23 +73,26 @@ _V_FORMAT_CODES = {
 }
 
 
-def _endianness(data: bytes) -> str:
+def _endianness(data: bytes, path: str) -> str:
+    """The struct byte-order prefix of a .wfm header; ValueError naming `path` otherwise."""
     tag = struct.unpack_from("<H", data, 0x000)[0]
     if tag == _BOM_LE:
         return "<"
     if tag == _BOM_BE:
         return ">"
-    raise ValueError(f".wfm: unrecognised byte-order tag 0x{tag:04x} at offset 0x000")
+    raise ValueError(f"{path}: .wfm unrecognised byte-order tag 0x{tag:04x} at offset 0x000")
 
 
-def _version(data: bytes, endian: str) -> int:
+def _version(data: bytes, path: str) -> int:
+    """The .wfm format version; ValueError naming `path` for a tag that is not one."""
     tag = data[_VERSION_OFF:_VERSION_OFF + _VERSION_LEN]
     # ":WFM#00x" — the version digit is the last of the 8 ASCII bytes.
     try:
         text = tag.decode("ascii")
         return int(text[5:8])
     except (UnicodeDecodeError, ValueError) as exc:
-        raise ValueError(f".wfm: unrecognised version tag {tag!r} at offset 0x{_VERSION_OFF:03x}") from exc
+        raise ValueError(f"{path}: .wfm unrecognised version tag {tag!r} at offset "
+                         f"0x{_VERSION_OFF:03x}") from exc
 
 
 # Bytes the header fields read_wfm parses span: every one sits below 0x340.
@@ -106,8 +111,8 @@ _LAST_TIME: Dict[Tuple[int, float, float], "weakref.ref[np.ndarray]"] = {}
 
 def predict_pair_peak_bytes(n_points: int) -> int:
     """Predicted peak of reading a pair of `n_points`-point .wfm files and thresholding
-    them with analog.capture_from_analog. Measured with tracemalloc at about 33 bytes
-    per point on a 10M-point pair, against 44 here."""
+    them with analog.capture_from_analog: `_PAIR_READ_BYTES_PER_POINT` per point plus
+    `analog.front_end_bytes`. It stays above the peak tracemalloc measures for a pair."""
     n = int(n_points)
     return n * _PAIR_READ_BYTES_PER_POINT + analog.front_end_bytes(n)
 
@@ -128,16 +133,32 @@ def _time_axis(n: int, dt: float, t0: float) -> np.ndarray:
     return time
 
 
+def _check_interval(path: str, dt: float) -> None:
+    """ValueError naming `path` unless the sample interval `dt` (s) is a positive number
+    giving a rate of at most `MAX_RATE_HZ`."""
+    if not (math.isfinite(dt) and dt > 0):
+        raise ValueError(f"{path}: .wfm sample interval {dt!r} s is not a positive number")
+    if not 1.0 / dt <= MAX_RATE_HZ:
+        raise ValueError(f"{path}: .wfm sample interval {dt!r} s gives a sample rate "
+                         f"above {MAX_RATE_HZ:,.0f} Hz")
+
+
+def _base_name(path: str) -> str:
+    """The last component of `path` under either separator."""
+    return re.split(r"[\\/]", str(path))[-1]
+
+
 def read_header(path: str) -> Dict[str, float]:
     """What a .wfm is, from its first kilobyte: ``{"sample_rate_hz", "n_points", "t0",
     "duration_s"}``. Every field read_wfm takes before the curve sits below 0x340, so the
-    Open Capture dialog learns a pair's length without reading either record."""
+    Open Capture dialog learns a pair's length without reading either record. A sample
+    interval that read_wfm refuses is refused here with the same ValueError."""
     with open(path, "rb") as f:
         data = f.read(_HEADER_BYTES)
     if len(data) < 0x340:
         raise ValueError(f"{path}: too short for a .wfm header ({len(data)} bytes)")
-    endian = _endianness(data)
-    version = _version(data, endian)
+    endian = _endianness(data, path)
+    version = _version(data, path)
     if version != 3:
         raise NotImplementedError(f"{path}: .wfm version {version} is not supported")
     bytes_per_point = struct.unpack_from(f"{endian}B", data, _BYTES_PER_POINT_OFF)[0]
@@ -146,7 +167,9 @@ def read_header(path: str) -> Dict[str, float]:
     data_start = struct.unpack_from(f"{endian}I", data, _DATA_START_OFF_V3)[0]
     postcharge_start = struct.unpack_from(f"{endian}I", data, _POSTCHARGE_START_OFF_V3)[0]
     n = max(0, (postcharge_start - data_start) // max(1, bytes_per_point))
-    return {"sample_rate_hz": (1.0 / dt) if dt else 0.0, "n_points": float(n),
+    _check_interval(path, dt)
+    return {"sample_rate_hz": 1.0 / dt,
+            "n_points": float(n),
             "t0": float(t0), "duration_s": float(n * dt)}
 
 
@@ -166,7 +189,7 @@ def read_wfm_pair(clock_path: str, data_path: str, max_bytes: Optional[int] = No
 
 
 def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
-    """Parse a Tektronix .wfm file into ``{"time", "volts", "sample_rate_hz",
+    """Parse a scope .wfm file into ``{"time", "volts", "sample_rate_hz",
     "label", "version"}``. `time` is seconds (may start negative, pre-trigger),
     READ-ONLY, and the same array for two files with the same record length,
     interval and start (the two channels of one acquisition); `volts` is the decoded
@@ -186,8 +209,8 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     if len(data) < 0x340:
         raise ValueError(f"{path}: too short for a .wfm header ({len(data)} bytes)")
 
-    endian = _endianness(data)
-    version = _version(data, endian)
+    endian = _endianness(data, path)
+    version = _version(data, path)
     if version != 3:
         # Only version 3 field offsets are implemented. Earlier/later versions move
         # the static/horizontal/curve-object field offsets used below, so bail
@@ -218,6 +241,7 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
 
     dt = struct.unpack_from(f"{endian}d", data, _DT_OFF_V3)[0]
     t0 = struct.unpack_from(f"{endian}d", data, _T0_OFF_V3)[0]
+    _check_interval(path, dt)
 
     data_start = struct.unpack_from(f"{endian}I", data, _DATA_START_OFF_V3)[0]
     postcharge_start = struct.unpack_from(f"{endian}I", data, _POSTCHARGE_START_OFF_V3)[0]
@@ -229,6 +253,9 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     analog.check_budget(path, n, predict_pair_peak_bytes(n), max_bytes)
 
     curve_off = curve_buffer_start + data_start
+    if curve_off < 0:
+        raise ValueError(f"{path}: .wfm curve offset {curve_off} is negative "
+                         f"(malformed header)")
     dtype = np.dtype(f"{endian}{fmt_char}")
     if dtype.itemsize != struct.calcsize(f"{endian}{fmt_char}"):
         raise AssertionError(f"{path}: dtype/struct size mismatch for format '{fmt_char}'")
@@ -246,12 +273,12 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     volts *= v_scale
     volts += v_offset
     time = _time_axis(n, dt, t0)
-    sample_rate_hz = 1.0 / dt if dt else 0.0
+    sample_rate_hz = 1.0 / dt
 
     return {
         "time": time,
         "volts": volts,
         "sample_rate_hz": sample_rate_hz,
-        "label": path.rsplit("/", 1)[-1],
+        "label": _base_name(path),
         "version": version,
     }

@@ -1,6 +1,9 @@
 // SWI3S Command Transport Protocol parser. See CCommandTransportParser.h.
 
 #include "CCommandTransportParser.h"
+
+#include <cstdio>
+
 #include "CCrc16.h"
 #include "SwI3sResponseNames.h"
 
@@ -42,6 +45,7 @@ void SwI3sCommand::clear()
 
 const char* SwI3sCommand::PhaseName() const
 {
+    if (!headerValid) return "?";
     switch (phase) {
     case swi3s::kPhaseGetStatus:    return "GetStatus";
     case swi3s::kPhaseWrite:        return "Write";
@@ -56,16 +60,43 @@ const char* SwI3sCommand::PhaseName() const
 
 const char* SwI3sCommand::CommandName() const
 {
+    // A name only for a defined opcode of the phase; any other value is labelled with its
+    // number so a reserved or corrupt opcode is never shown as a real command. A phase whose
+    // header did not read is "Bad header", whatever its PhaseID and opcode fields hold.
+    if (!headerValid) return "Bad header";
+    const char* name = nullptr;
     switch (phase) {
-    case swi3s::kPhaseGetStatus: return "Ping";
-    case swi3s::kPhaseWrite:     return (opcode == swi3s::kOpUnblock) ? "Unblock" : "WriteA32";
-    case swi3s::kPhaseReadSetup: return "ReadA32";
-    case swi3s::kPhaseReadData:  return "ReadData";
-    case swi3s::kPhaseCommit:    return (opcode == swi3s::kOpDscr) ? "DSCR" : "SSCR";
-    case swi3s::kPhaseAnnounce:  return (opcode == swi3s::kOpExitDormant) ? "ExitDormant" : "SSPA";
-    case swi3s::kPhaseCalibratePhy: return (opcode == swi3s::kOpTrimCal) ? "TrimCal" : "InitCal";
-    default: return "?";
+    case swi3s::kPhaseGetStatus:
+        name = (opcode == swi3s::kOpPing) ? "Ping" : nullptr;
+        break;
+    case swi3s::kPhaseWrite:
+        name = (opcode == swi3s::kOpWriteA32) ? "WriteA32"
+             : (opcode == swi3s::kOpUnblock) ? "Unblock" : nullptr;
+        break;
+    case swi3s::kPhaseReadSetup:
+        name = (opcode == swi3s::kOpReadA32) ? "ReadA32" : nullptr;
+        break;
+    case swi3s::kPhaseReadData:
+        return "ReadData";
+    case swi3s::kPhaseCommit:
+        name = (opcode == swi3s::kOpSscr) ? "SSCR"
+             : (opcode == swi3s::kOpDscr) ? "DSCR" : nullptr;
+        break;
+    case swi3s::kPhaseAnnounce:
+        name = (opcode == swi3s::kOpSspa) ? "SSPA"
+             : (opcode == swi3s::kOpExitDormant) ? "ExitDormant" : nullptr;
+        break;
+    case swi3s::kPhaseCalibratePhy:
+        name = (opcode == swi3s::kOpInitCal) ? "InitCal"
+             : (opcode == swi3s::kOpTrimCal) ? "TrimCal" : nullptr;
+        break;
+    default:
+        return "?";
     }
+    if (name) return name;
+    static thread_local char label[16];
+    std::snprintf(label, sizeof label, "Op0x%02X", static_cast<unsigned>(opcode));
+    return label;
 }
 
 void CCommandTransportParser::Reset()
@@ -95,7 +126,7 @@ void CCommandTransportParser::SetHubDepths(const int depths[swi3s::kMaxPeriphera
     for (int i = 0; i < swi3s::kMaxPeripherals; ++i) {
         int d = depths[i];
         if (d < 0) d = 0;
-        if (d > 5) d = 5;
+        if (d > swi3s::kMaxHubDepth) d = swi3s::kMaxHubDepth;
         mHubDepth[i] = d;
     }
 }
@@ -126,6 +157,7 @@ bool CCommandTransportParser::PushCdsBit(bool bit, U64 sampleNumber)
 
     C8b10bDecoder::Symbol sym;
     if (mDecoder.PushBit(bit, sym)) {
+        if (mSymbolSink) mSymbolSink->push_back(sym);
         onSymbol(sym, sampleNumber);
     }
     return mCommandReady;
@@ -206,24 +238,32 @@ void CCommandTransportParser::onSymbol(const C8b10bDecoder::Symbol& sym, U64 sam
         if (--mSpacerSymbolsRemaining <= 0) {
             mState = eCommitPeriphResp;
             mCommitRespRemaining = swi3s::kMaxPeripherals;
+            mSkipBitsRemaining = 2 * mHubDepth[0];   // device 0's hub delay
         }
         break;
 
     case eCommitPeriphResp: {
-        // 12 peripheral response tokens (one per device), not surfaced per device.
-        // The FIRST real (driven) token is captured as the commit's representative
-        // peripheral response (COMMIT_READY = 0 / COMMIT_NOT_READY = 2), which the
-        // command table shows as an SSCR's Peripheral Response. Undriven (all-ones)
-        // devices decode to -1 and are skipped.
+        // 12 peripheral response tokens (one per device). The commit's representative
+        // peripheral response is the first non-zero driven token (COMMIT_NOT_READY = 2
+        // outranks COMMIT_READY = 0), else COMMIT_READY when any device drove one, so a
+        // multicast commit shows a device that is not ready. Undriven (all-ones) devices
+        // decode to -1 and are skipped.
         int tok = C8b10bDecoder::RobustToken(sym.raw);
-        if (tok >= 0 && mCmd.peripheralResponse < 0)
+        if (tok >= 0 && (mCmd.peripheralResponse < 0 ||
+                         (mCmd.peripheralResponse == 0 && tok != 0)))
             mCmd.peripheralResponse = tok;
-        if (--mCommitRespRemaining <= 0) {
+        --mCommitRespRemaining;
+        if (mCommitRespRemaining <= 0) {
             mState = eCommitPmSpacer;
             // PM spacer: 20 bits (ShortProtocolSpacer=0) or 10 bits (=1).
             int pm = mShortSpacer ? swi3s::kSpacerBitsMP : swi3s::kSpacerBitsPM;
             mSpacerSymbolsRemaining = pm / swi3s::kSymbolBits;
             if (mSpacerSymbolsRemaining < 1) mSpacerSymbolsRemaining = 1;
+        } else {
+            // Incremental hub-delay gap before the next device's token, as for a Ping.
+            const int next = swi3s::kMaxPeripherals - mCommitRespRemaining;
+            const int delta = mHubDepth[next] - mHubDepth[next - 1];
+            if (delta > 0) mSkipBitsRemaining = 2 * delta;
         }
         break;
     }
@@ -350,6 +390,15 @@ void CCommandTransportParser::finishHeader()
         t0 = 0;
     }
     mCmd.phase = static_cast<swi3s::PhaseId>(t0);
+    if (!mCmd.headerValid) {
+        // A garbled header selects no device and carries no trustworthy length: the
+        // phase is reported with headerValid false and no Manager Packet, and the parser
+        // re-hunts the next comma.
+        mCmd.deviceMask = 0;
+        mCmd.packetLength = 0;
+        emitAndReset();
+        return;
+    }
     mCmd.deviceMask = static_cast<U16>(
         ((mHeaderTokens[1] & 0xF) << 8) |
         ((mHeaderTokens[2] & 0xF) << 4) |
@@ -424,7 +473,9 @@ void CCommandTransportParser::parseManagerPacket()
         // SSP is generated by SSPA (Announce/0x00) and SSCR (Commit/0x00); not
         // by ExitDormant (Announce/0x01) or DSCR (Commit/0x01).
         mCmd.hasSyncPoint = (mCmd.opcode == 0x00);
-        mCmd.isCommit = (mCmd.phase == swi3s::kPhaseCommit);
+        // Only SSCR and DSCR commit; a reserved Commit opcode is decoded but applies nothing.
+        mCmd.isCommit = (mCmd.phase == swi3s::kPhaseCommit) &&
+                        (mCmd.opcode == swi3s::kOpSscr || mCmd.opcode == swi3s::kOpDscr);
     }
 
     // Route to the per-phase response stage.

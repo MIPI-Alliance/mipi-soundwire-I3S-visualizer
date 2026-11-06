@@ -13,8 +13,7 @@ from typing import List
 
 from ..models.enums import DisplayField
 
-# Number of data ports per interface (matches Interface.NUM_DATA_PORTS)
-# Defined here to avoid circular import with src.models.interface
+# Number of data ports per interface; must equal Interface.NUM_DATA_PORTS.
 NUM_DATA_PORTS = 12
 
 
@@ -23,7 +22,7 @@ class DataPortVizConfig:
     """Per-data-port visualization configuration.
 
     These settings affect how the data port is displayed in the visualizer
-    but have no effect on the actual SoundWire frame content.
+    but have no effect on the actual SWI3S frame content.
 
     Attributes:
         name: Display name for the data port (default: "DP0", "DP1", etc.)
@@ -32,7 +31,7 @@ class DataPortVizConfig:
         display_fields: Which label fields to show (sample, channel, bit)
     """
     name: str = ""
-    dp_number: int = -1   # logical DP number 0-31 (v3.0.0); -1 = unset (= column index)
+    dp_number: int = -1   # logical DP number 0-31; -1 = unset (= column index)
     enabled: bool = False
     enable_handover: bool = True
     display_fields: DisplayField = field(default_factory=lambda: DisplayField.SAMPLE | DisplayField.CHANNEL)

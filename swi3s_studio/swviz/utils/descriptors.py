@@ -5,6 +5,7 @@ This module provides descriptor classes that reduce boilerplate in property
 definitions while maintaining type safety and range validation.
 """
 
+import math
 from typing import Any, Optional, Type, TypeVar, Union, overload
 
 T = TypeVar('T')
@@ -72,10 +73,10 @@ class ValidatedInt:
             value: The value to set
 
         Raises:
-            TypeError: If value is not an int
+            TypeError: If value is not an int (a bool is not)
             ValueError: If value is outside the allowed range
         """
-        if not isinstance(value, int):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f'{self.friendly_name} must be int, got {type(value).__name__}')
         if value > self.max_val:
             raise ValueError(f'{self.friendly_name} must be <= {self.max_val}')
@@ -146,13 +147,19 @@ class ValidatedFloat:
             value: The value to set (int or float)
 
         Raises:
-            TypeError: If value is not an int or float
-            ValueError: If value is outside the allowed range
+            TypeError: If value is not an int or float (a bool is not)
+            ValueError: If value is outside the allowed range, not finite, or too large
+                to convert to a float
         """
-        if not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise TypeError(f'{self.friendly_name} must be int or float, got {type(value).__name__}')
         # Convert int to float for consistency
-        float_value = float(value)
+        try:
+            float_value = float(value)
+        except OverflowError:
+            raise ValueError(f'{self.friendly_name} must be a finite number') from None
+        if not math.isfinite(float_value):
+            raise ValueError(f'{self.friendly_name} must be a finite number')
         if float_value > self.max_val:
             raise ValueError(f'{self.friendly_name} must be <= {self.max_val}')
         if float_value < self.min_val:
@@ -217,104 +224,3 @@ class ValidatedBool:
         elif not isinstance(value, bool):
             raise TypeError(f'{self.friendly_name} must be bool, got {type(value).__name__}')
         setattr(obj, self.private_name, value)
-
-
-class ValidatedString:
-    """Descriptor for validated string properties.
-
-    Example usage:
-        class MyClass:
-            name: str = ValidatedString('name')  # type: ignore[assignment]
-
-            def __init__(self):
-                self.name = "test"  # Uses the descriptor
-    """
-
-    def __init__(self, name: str, friendly_name: Optional[str] = None) -> None:
-        """Initialize the descriptor.
-
-        Args:
-            name: The attribute name (used for storage as _name)
-            friendly_name: Human-readable name for error messages (defaults to name)
-        """
-        self.name = name
-        self.private_name = f'_{name}'
-        self.friendly_name = friendly_name or name
-
-    @overload
-    def __get__(self, obj: None, objtype: Type[Any]) -> 'ValidatedString': ...
-    @overload
-    def __get__(self, obj: object, objtype: Optional[Type[Any]] = None) -> str: ...
-
-    def __get__(self, obj: Optional[object], objtype: Optional[Type[Any]] = None) -> Union['ValidatedString', str]:
-        """Get the attribute value."""
-        if obj is None:
-            return self
-        return getattr(obj, self.private_name)  # type: ignore[no-any-return]
-
-    def __set__(self, obj: object, value: str) -> None:
-        """Set the attribute value with validation.
-
-        Args:
-            obj: The instance to set the attribute on
-            value: The value to set
-
-        Raises:
-            TypeError: If value is not a string
-        """
-        if not isinstance(value, str):
-            raise TypeError(f'{self.friendly_name} must be a string, got {type(value).__name__}')
-        setattr(obj, self.private_name, value)
-
-
-class ValidatedIntWithCallback(ValidatedInt):
-    """Descriptor for validated integer properties with a post-set callback.
-
-    Useful when setting a property needs to trigger side effects, like
-    invalidating a cache.
-
-    Example usage:
-        class MyClass:
-            MIN_VALUE = 0
-            MAX_VALUE = 0xFFFF
-
-            def _invalidate_cache(self):
-                self._cache = None
-
-            bitmask: int = ValidatedIntWithCallback(  # type: ignore[assignment]
-                'bitmask', MIN_VALUE, MAX_VALUE,
-                on_set='_invalidate_cache'
-            )
-    """
-
-    def __init__(self, name: str, min_val: int, max_val: int,
-                 friendly_name: Optional[str] = None,
-                 on_set: Optional[str] = None) -> None:
-        """Initialize the descriptor with optional callback.
-
-        Args:
-            name: The attribute name (used for storage as _name)
-            min_val: Minimum allowed value (inclusive)
-            max_val: Maximum allowed value (inclusive)
-            friendly_name: Human-readable name for error messages (defaults to name)
-            on_set: Name of method to call after setting value (optional)
-        """
-        super().__init__(name, min_val, max_val, friendly_name)
-        self.on_set = on_set
-
-    def __set__(self, obj: object, value: int) -> None:
-        """Set the attribute value with validation and callback.
-
-        Args:
-            obj: The instance to set the attribute on
-            value: The value to set
-
-        Raises:
-            TypeError: If value is not an int
-            ValueError: If value is outside the allowed range
-        """
-        super().__set__(obj, value)
-        if self.on_set:
-            callback = getattr(obj, self.on_set, None)
-            if callback:
-                callback()

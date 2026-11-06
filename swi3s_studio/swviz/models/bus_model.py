@@ -38,7 +38,7 @@ class BitInfo:
         bit_index: Global sequential index (0 to N-1)
         slot: Type of slot (DATA, CDS, S0, S1, GUARD, TAIL, etc.)
         direction: SOURCE (write) or SINK (read)
-        device: Device number (-1=manager, -2=universal, -3=viz, 0-11=peripheral)
+        device: Device number (-1=manager, -2=universal, 0-11=peripheral)
         dp: Data port number (None for system slots)
         channel: Channel within data port
         sample: Global sample number (None for non-payload slots: guard, tail,
@@ -47,7 +47,7 @@ class BitInfo:
             see `sample` for the exhaustive list)
         clash: Type of clash at this position (if any)
         display_fields: Optional display field flags for label generation
-        port_mode: Port mode (0=Normal, 1=Reserved, 2=Test Ones, 3=Test Zeros)
+        port_mode: Port mode (0=Normal, 1=Reserved, 2=Test0 (all 0), 3=Test1 (all 1))
         scrambler_enabled: Whether scrambler is enabled for this data port
     """
     bit_index: int
@@ -60,7 +60,7 @@ class BitInfo:
     bit: Optional[int] = None
     clash: ClashType = ClashType.NONE
     display_fields: Optional[DisplayField] = None  # For viz label generation
-    port_mode: int = 0  # 0=Normal, 2=Test Ones (c0t1), 3=Test Zeros (c0t0)
+    port_mode: int = 0  # 0=Normal, 2=Test0 (all 0), 3=Test1 (all 1)
     scrambler_enabled: bool = False  # Scrambler enabled for this data port
 
     # Store num_columns for row/column derivation (set by BusModel)
@@ -186,7 +186,7 @@ class BusModel:
         """Convert sequential index to (row, column)."""
         return (bit_index // self.num_columns, bit_index % self.num_columns)
 
-    def add_bit(self, bit: BitInfo) -> None:
+    def add_bit(self, bit: BitInfo, track_clashes: bool = True) -> None:
         """Add a bit to the bus model.
 
         Multiple bits at the same position are allowed (e.g., when multiple
@@ -194,6 +194,10 @@ class BusModel:
 
         Args:
             bit: BitInfo object to add
+            track_clashes: List the bit's index in bus_clashes / device_clashes when its
+                clash says so (each index once). A producer that assigns both lists
+                itself once it knows every clash passes False and skips the membership
+                scans.
         """
         # Bounds check: an out-of-bounds index would derive a bogus (row, column)
         # via the BitInfo properties, so skip it rather than place a phantom bit.
@@ -208,13 +212,13 @@ class BusModel:
         self.bits.append(bit)
         self._bits_by_index.setdefault(bit.bit_index, []).append(bit)
 
-        # Track clashes
-        if bit.clash == ClashType.DIFFERENT_DEVICE:
-            if bit.bit_index not in self.bus_clashes:
-                self.bus_clashes.append(bit.bit_index)
-        elif bit.clash == ClashType.SAME_DEVICE:
-            if bit.bit_index not in self.device_clashes:
-                self.device_clashes.append(bit.bit_index)
+        if track_clashes:
+            if bit.clash == ClashType.DIFFERENT_DEVICE:
+                if bit.bit_index not in self.bus_clashes:
+                    self.bus_clashes.append(bit.bit_index)
+            elif bit.clash == ClashType.SAME_DEVICE:
+                if bit.bit_index not in self.device_clashes:
+                    self.device_clashes.append(bit.bit_index)
 
     def get_bits_at(self, bit_index: int) -> List[BitInfo]:
         """Get all bits at the specified index.
@@ -303,15 +307,6 @@ class BusModel:
         self._removed_ids.update(id(b) for b in matched)
         return len(matched)
 
-    def add_read_overlap(self, bit_index: int) -> None:
-        """Record a read overlap at the specified bit index.
-
-        Args:
-            bit_index: Index where multiple readers overlap
-        """
-        if bit_index not in self.read_overlaps:
-            self.read_overlaps.append(bit_index)
-
 
 class BusModelJSONEncoder(json.JSONEncoder):
     """JSON encoder for BusModel and related classes.
@@ -326,26 +321,43 @@ class BusModelJSONEncoder(json.JSONEncoder):
                 "row": 0,
                 "column": 0,
                 "slots": [
-                    { "slot_type": "CDS", "direction": "SOURCE", ... }
+                    { "slot": "CDS", "direction": "SOURCE", "device": -2, "dp": null,
+                      "sample": null, "channel": 0, "bit": null, "clash": "NONE" }
                 ]
             },
             "1": {
                 "row": 0,
                 "column": 1,
                 "slots": [
-                    { "slot_type": "DATA", "direction": "SOURCE", "dp_num": 0, ... },
-                    { "slot_type": "DATA", "direction": "SOURCE", "dp_num": 1, ... }
+                    { "slot": "DATA", "direction": "SOURCE", "device": 0, "dp": 0,
+                      "sample": 0, "channel": 0, "bit": 0, "clash": "SAME_DEVICE" },
+                    { "slot": "DATA", "direction": "SOURCE", "device": 0, "dp": 1,
+                      "sample": 0, "channel": 0, "bit": 0, "clash": "SAME_DEVICE" }
                 ]
             }
         },
         "bus_clashes": [],
-        "device_clashes": [],
-        "read_overlaps": []
+        "device_clashes": [1],
+        "read_overlaps": [],
+        "warnings": { "truncation": [0, 1], "validation": [2] }
     }
+
+    "slot", "direction" and "clash" are enum member names. "warnings" lists, per
+    category, the data-port numbers named by interval-overflow warnings
+    ("truncation") and by validation issues whose name is "DPn" ("validation");
+    empty categories are omitted. The export is a summary, not the whole model: it
+    carries each bit's position, slot, direction, device, port, sample, channel,
+    bit and clash, the clash and read-overlap index lists, and those port lists.
+    It does not carry a bit's port mode, scrambler flag or display fields, nor any
+    warning other than the two port lists above: the display-truncation, DRQ-truncation,
+    scrambler, test-mode, sample/bit, TxP, handover and no-channel warnings, the clash
+    details, and validation issues not named "DPn" are left out.
+    `JSONHandler.load_bus_model` reads exactly this set back.
     """
 
     def default(self, o):
         if isinstance(o, BusModel):
+            o.compact()
             # Group bits by bit_index
             bits_by_index: Dict[int, List[BitInfo]] = {}
             for bit in o.bits:

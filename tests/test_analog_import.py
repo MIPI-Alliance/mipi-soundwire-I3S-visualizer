@@ -64,16 +64,14 @@ def _square_wave_codes(n: int, period: int, hi: int = 1000, lo: int = -1000):
 
 
 def test_capture_from_analog_rejects_mismatched_lengths():
-    """Session.from_wfm reads the clock/data .wfm files independently, so a
-    record-length mismatch is a real input error; it must raise a clear
-    ValueError up front rather than silently misalign timestamps (data
-    shorter than time) or crash deep in a closure (data longer)."""
+    """capture_from_analog takes time, clock and data arrays of one length; any other
+    combination (data or clock shorter or longer than time) raises a clear ValueError up
+    front rather than misaligning timestamps or crashing deep in a closure."""
     from swi3s_studio.ingest.analog import capture_from_analog
     time = np.linspace(0.0, 1.0, 100)
-    clock_v = np.zeros(100)
-    data_v = np.zeros(50)                            # deliberately short
-    with pytest.raises(ValueError, match=r"length mismatch"):
-        capture_from_analog(time, clock_v, data_v)
+    for n_clock, n_data in ((100, 50), (100, 150), (50, 100), (150, 100)):
+        with pytest.raises(ValueError, match=r"length mismatch"):
+            capture_from_analog(time, np.zeros(n_clock), np.zeros(n_data))
 
 
 def test_from_wfm_rejects_mismatched_record_length():
@@ -166,7 +164,7 @@ def test_is_analog_csv_decides_by_values_not_header():
     # non-'Time' header, it must read as digital.
     digital = _write_csv("Time,D0,D1\n-1.0e-06,0,1\n-9.0e-07,1,0\n-8.0e-07,1,1\n")
     # Analog: Tek preamble + TIME header + float volts.
-    analog = _write_csv("Model,MSO58,,Model,MSO58\nSample Interval,1.6e-10\n\n"
+    analog = _write_csv("Model,SCOPE1,,Model,SCOPE1\nSample Interval,1e-7\n\n"
                         "TIME,CH1,CH2\n-1e-6,0.023,-0.5\n-9e-7,1.02,0.98\n")
     # A digital-looking header but analog values -> analog (values win).
     disguised = _write_csv("Time [s], Channel 0, Channel 1\n0.0,0.5,0.25\n1e-6,0.9,0.1\n")
@@ -199,6 +197,83 @@ def test_read_analog_csv_truncates_ragged_trailing_comma_row():
         os.remove(path)
 
 
+@pytest.mark.platform
+def test_an_analog_csv_with_a_byte_order_mark_reads_as_one_without():
+    """A spreadsheet's BOM is not part of the first cell: with the BOM on the TIME row
+    itself, TIME is still the header row."""
+    from swi3s_studio.ingest import analog_csv
+    body = "TIME,CH1,CH2\n-1e-6,0.023,-0.5\n-9e-7,1.02,0.98\n"
+    plain, bom = _write_csv(body), _write_csv(body)
+    with open(bom, "w", encoding="utf-8-sig") as f:
+        f.write(body)
+    try:
+        with open(bom, "rb") as f:
+            assert f.read(3) == b"\xef\xbb\xbf"
+        want = analog_csv.read_analog_csv(plain)
+        got = analog_csv.read_analog_csv(bom)
+        assert list(got["channels"]) == list(want["channels"]) == ["CH1", "CH2"]
+        assert list(got["time"]) == list(want["time"])
+        assert analog_csv.channel_names(bom) == ["CH1", "CH2"]
+    finally:
+        os.remove(plain)
+        os.remove(bom)
+
+
+def test_a_first_line_over_the_line_limit_is_not_an_analog_csv():
+    """A first line longer than the limit (a file with no line breaks) is not a row of a
+    scope export: the analog row after it does not make the file an analog CSV."""
+    from swi3s_studio.ingest import analog_csv, timebase
+    long_line = "x" * (timebase.MAX_LINE_CHARS + 10)
+    plain = _write_csv("0,0.5,0.7\n")
+    long_first = _write_csv(long_line + "\n0,0.5,0.7\n")
+    no_breaks = _write_csv("0," + ",".join(["0.5"] * (timebase.MAX_LINE_CHARS // 3)))
+    try:
+        assert analog_csv.is_analog_csv(plain) is True
+        assert analog_csv.is_analog_csv(long_first) is False
+        assert analog_csv.is_analog_csv(no_breaks) is False
+    finally:
+        os.remove(plain)
+        os.remove(long_first)
+        os.remove(no_breaks)
+
+
+def test_a_preamble_cell_over_the_csv_field_limit_is_no_header_row():
+    """The preamble is bounded by its byte count and by the csv module's field limit: a
+    cell under the limit is read, a cell over it leaves no TIME header row."""
+    import csv
+
+    from swi3s_studio.ingest import analog_csv
+    saved = csv.field_size_limit(1000)               # process-global: set here, restored below
+    try:
+        under = _write_csv("Note," + "y" * 999 + "\nTIME,CH1\n0,0.5\n")
+        over = _write_csv("Note," + "y" * 1001 + "\nTIME,CH1\n0,0.5\n")
+        try:
+            assert analog_csv.channel_names(under) == ["CH1"]
+            with pytest.raises(ValueError, match="no TIME header row"):
+                analog_csv.channel_names(over)
+        finally:
+            os.remove(under)
+            os.remove(over)
+    finally:
+        csv.field_size_limit(saved)
+
+
+def test_the_no_header_error_of_every_analog_reader_names_the_file():
+    """A CSV with no TIME header row is refused by name, whichever reader meets it."""
+    from swi3s_studio.ingest import analog_csv
+    path = _write_csv("a,b\n1,2\n")
+    try:
+        for call in (lambda: analog_csv.channel_names(path), lambda: analog_csv.scan_header(path),
+                     lambda: analog_csv.predict_peak_bytes(path),
+                     lambda: analog_csv.read_analog_csv(path),
+                     lambda: analog_csv.read_analog_csv(path, max_bytes=0)):
+            with pytest.raises(ValueError, match="no TIME header row") as err:
+                call()
+            assert str(err.value).startswith(f"{path}: ")
+    finally:
+        os.remove(path)
+
+
 def test_is_analog_csv_detects_analog_past_a_long_railed_lead_in():
     """A capture with a long railed/saturated lead-in — many rows all exactly
     0/1 — before the real analog data begins must still classify as analog.
@@ -221,7 +296,7 @@ def test_channel_names_matches_read_analog_csv_without_full_parse():
     """channel_names(path) is a cheap header-only read; it must agree with the
     keys read_analog_csv derives from a full parse of the same file."""
     from swi3s_studio.ingest import analog_csv
-    path = _write_csv("Model,MSO58\nSample Interval,1.6e-10\n\n"
+    path = _write_csv("Model,SCOPE1\nSample Interval,1e-7\n\n"
                       "TIME,CH1,CH2\n-1e-6,0.023,-0.5\n-9e-7,1.02,0.98\n")
     try:
         assert analog_csv.channel_names(path) == list(
@@ -229,6 +304,63 @@ def test_channel_names_matches_read_analog_csv_without_full_parse():
         )
     finally:
         os.remove(path)
+
+
+def test_duplicate_and_blank_header_names_keep_every_column_under_unique_names(tmp_path):
+    """Two columns named CH1 are two channels (the later one ``CH1 (2)``) and a blank
+    header cell between named ones is called ``Column N``; the import notes say so, and
+    channel_names agrees with the parse."""
+    from swi3s_studio import import_notes
+    from swi3s_studio.ingest import analog_csv
+    p = tmp_path / "dup.csv"
+    p.write_text("TIME,CH1,CH1,,CH1 (2),CH1\n0,1,2,3,4,5\n1e-9,6,7,8,9,10\n")
+    with import_notes.collect() as notes:
+        parsed = analog_csv.read_analog_csv(str(p))
+    names = ["CH1", "CH1 (3)", "Column 4", "CH1 (2)", "CH1 (4)"]
+    assert list(parsed["channels"]) == names == analog_csv.channel_names(str(p))
+    assert [list(parsed["channels"][n]) for n in names] == [
+        [1, 6], [2, 7], [3, 8], [4, 9], [5, 10]]
+    msgs = [str(n) for n in notes]
+    assert any("no name for column 4; read as 'Column 4'" in m for m in msgs), msgs
+    assert any("repeats the name 'CH1'" in m for m in msgs), msgs
+
+
+def test_a_header_of_unique_names_makes_no_header_note(tmp_path):
+    from swi3s_studio import import_notes
+    from swi3s_studio.ingest import analog_csv
+    p = tmp_path / "ok.csv"
+    p.write_text("TIME,CH1,CH2,\n0,1,2\n1e-9,3,4\n")
+    with import_notes.collect() as notes:
+        parsed = analog_csv.read_analog_csv(str(p))
+    assert list(parsed["channels"]) == ["CH1", "CH2"] and not notes
+
+
+def test_from_analog_csv_selects_a_repeated_name_by_position(tmp_path):
+    """With two columns named CH1, clock=0 and data=1 read the first and the second."""
+    n = 400
+    k = np.arange(n)
+    fast, slow = (k // 5) % 2, (k // 50) % 2
+    p = tmp_path / "two.csv"
+    p.write_text("TIME,CH1,CH1\n" + "".join(
+        f"{i * 1e-9:.9g},{float(fast[i])},{float(slow[i])}\n" for i in range(n)))
+    from swi3s_studio import import_notes
+    with import_notes.collect() as notes:
+        s = Session.from_analog_csv(str(p), clock=0, data=1, auto_clock=False)
+        swapped = Session.from_analog_csv(str(p), clock="CH1 (2)", data="CH1",
+                                          auto_clock=False)
+    assert notes and all("repeats the name 'CH1'" in str(m) for m in notes)
+    assert (s.source["clock"], s.source["data"]) == ("CH1", "CH1 (2)")
+    assert s.capture.clock_edges.size > s.capture.data_edges.size > 0
+    assert swapped.capture.clock_edges.size < swapped.capture.data_edges.size
+
+
+def test_a_threshold_pair_with_high_equal_to_low_is_accepted():
+    from swi3s_studio.ingest.analog import capture_from_analog
+    t, clk, dat = _square_pair()
+    want = capture_from_analog(t, clk, dat, clock_thresh=(0.6, 0.4))
+    got = capture_from_analog(t, clk, dat, clock_thresh=(0.5, 0.5))
+    assert got.clock_edges.size > 0
+    assert np.array_equal(got.clock_edges, want.clock_edges)
 
 
 def test_from_wfm_auto_clock_is_order_independent():
@@ -329,3 +461,59 @@ def test_decoder_ready_defaults_to_none_without_error():
     # Backward-compatible: omitting decoder_ready must not change behaviour.
     s = Session.from_demo(64)
     assert s.decoder is not None
+
+
+def _square_pair(n: int = 2000):
+    t = np.arange(n) * 1e-9
+    clk = np.where((np.arange(n) // 5) % 2 == 1, 1.0, 0.0)
+    dat = np.where((np.arange(n) // 50) % 2 == 1, 1.0, 0.0)
+    return t, clk, dat
+
+
+@pytest.mark.parametrize("bad", [(5, 6), (float("nan"), float("nan")), (float("inf"), 0.0),
+                                 ("a", "b"), (1,), (1, 2, 3), 1e300, "hi"])
+@pytest.mark.parametrize("field", ["clock_thresh", "data_thresh"])
+def test_a_threshold_pair_that_is_not_two_finite_numbers_high_over_low_is_refused(bad, field):
+    """A given pair is checked before use: ValueError naming the field, never TypeError
+    or IndexError, and never an empty channel."""
+    from swi3s_studio.ingest.analog import capture_from_analog
+    t, clk, dat = _square_pair()
+    with pytest.raises(ValueError, match=field):
+        capture_from_analog(t, clk, dat, **{field: bad})
+
+
+def test_a_threshold_pair_that_no_sample_reaches_is_reported():
+    """A finite, ordered pair above every sample gives a channel with no transitions; the
+    import warning names the channel and its span."""
+    from swi3s_studio import import_notes
+    from swi3s_studio.ingest.analog import capture_from_analog
+    t, clk, dat = _square_pair()
+    with import_notes.collect() as notes:
+        cap = capture_from_analog(t, clk, dat, clock_thresh=(6.0, 5.0), source="s.csv")
+    assert cap.clock_edges.size == 0 and cap.data_edges.size > 0
+    msgs = [str(n) for n in notes]
+    assert any("s.csv: the clock channel never crosses its thresholds 6 V / 5 V "
+               "(its samples span 0 V to 1 V)" in m for m in msgs), msgs
+    assert not any("data channel never crosses" in m for m in msgs)
+
+
+def test_a_flat_channel_is_not_reported_as_never_crossing():
+    from swi3s_studio import import_notes
+    from swi3s_studio.ingest.analog import capture_from_analog
+    t, clk, _dat = _square_pair()
+    with import_notes.collect() as notes:
+        capture_from_analog(t, clk, np.full(t.size, 0.5), source="s.csv")
+    assert not any("never crosses" in str(n) for n in notes)
+
+
+def test_a_channel_that_holds_only_noise_is_flat_not_thresholded_on_its_own_band():
+    """A swing under 1 microvolt is noise: the channel takes the fallback thresholds,
+    gives no edges and is reported as undetectable."""
+    from swi3s_studio import import_notes
+    from swi3s_studio.ingest.analog import capture_from_analog
+    t, clk, _dat = _square_pair()
+    noise = 0.5 + np.random.default_rng(1).normal(0.0, 1e-9, t.size)
+    with import_notes.collect() as notes:
+        cap = capture_from_analog(t, clk, noise, source="s.csv")
+    assert cap.data_edges.size == 0 and cap.clock_edges.size > 0
+    assert any("data channel's thresholds could not be detected" in str(n) for n in notes)

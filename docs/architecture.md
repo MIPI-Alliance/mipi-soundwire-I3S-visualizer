@@ -4,7 +4,7 @@ A desktop **MIPI SoundWire I3S (SWI3S)** bus analyzer. It decodes captured PHY1 
 PHY2 traffic (forwarded clock + bidirectional data) and PHY3 / DLV traffic (recovered
 clock), reconstructs the control protocol and audio
 payload, and visualizes the 2D bus structure, the per-device register maps, and the
-decoded audio, out-of-core over large captures.
+decoded audio, streaming over large captures.
 
 It has two engines, complementary and non-overlapping:
 
@@ -28,10 +28,8 @@ directly). Each drives one mode:
   validation warnings the C++ decode path doesn't (scrambler/test-mode/interval/
   sample-bit mismatches, sink-handover, enabled-no-channel).
 
-Planned: the C++ core drives *both* grids, leaving `swviz` as the authoring **validator**
-and the test oracle only. That move also has to carry the authoring validators and the
-baked-in S0/S1/CDS/handover system-slot handling; it is tracked in the maintainers'
-tech-debt register.
+The two engines are live by design: they differ on full authoring output, and the golden
+suite (`test_visualizer_engine`, `test_visualizer_placement`) holds them together.
 
 ---
 
@@ -43,12 +41,12 @@ tech-debt register.
 | Decode engine | **Reuse the verified C++ decode** via a **pybind11** module (`swi3score`); the per-UI hot loop stays in C++ |
 | Column-count / CDS alignment | **Not signalled on the wire** — recovered by *hypothesize-and-validate* (`CColumnDetector`): score each candidate (even count 2–32 × Column-0 phase) by CRC-valid CDS command phases; best wins. **Commit-independent** — needs only some CRC-valid CDS traffic. |
 | Inputs | **Logic 2 `.sal` project**, **per-channel `<SALEAE>` binary** pair (`.bin`), **Saleae digital CSV** (`Time,Clock,Data`), **VCD**, **`.wfm` analog pair**, **analog scope CSV**, **visualizer CSV/JSON config**. (`.sal` is wired to Open via `ingest/saleae_sal` — pick the clock/data channels; v0, single-/multi-chunk v3 and v4 digital blobs decode, with v0 pre-trigger times rebased so they don't wrap. Analog inputs are thresholded to edges in `ingest/analog`.) |
-| Capture scale | **Minutes / multi-GB** — out-of-core: memory-map inputs, streaming decode, on-disk indexed results, render from pyramids |
+| Capture scale | **Minutes / multi-GB** — streaming decode, audio rendered from pyramids, results held in memory (the status note in §4 says what is built and what is the design target) |
 | Live capture | **Offline first**, architected live-ready (streaming decode, bounded buffers, partial results) |
 | Platforms | **macOS-first, fully cross-platform** (Qt + portable pybind11 build); packaged with PyInstaller |
 | Register map | **Extracted from the SWI3S spec** → structured JSON; single source of truth for the register view *and* address→field-name resolution |
-| Results store | **Apache Arrow/Parquet** (commands) + **`np.memmap`** arrays with **min/max pyramids** (audio) + an **event log with checkpoints** (register state) |
-| Saleae plugin | **Kept**, as a separate build target sharing the same core lib |
+| Results store | In-memory results; an **Apache Arrow** command cache for display and export; audio with **min/max pyramids** (an optional `np.memmap` backend that tests use). Register state at the cursor is replayed from the in-memory command list |
+| Analyzer plugin | Not part of this repository: it builds only the `swi3score` module |
 
 ---
 
@@ -57,11 +55,11 @@ tech-debt register.
 ```
 ┌────────────┐   ┌─────────────────────────┐   ┌──────────────────┐   ┌────────────────┐
 │  ingest    │──►│  swi3score (C++/pybind11)│──►│  results store   │──►│  UI (PySide6)  │
-│  (python)  │   │  decode loop (verbatim,  │   │  (python)        │   │  dockable      │
-│  .sal      │   │   Saleae deps removed)   │   │  Arrow + memmap  │   │  panels +      │
-│  CSV       │   │  register model, SSP,    │   │  pyramids +      │   │  one shared    │
-│  config    │   │  descramble, audio       │   │  time index +    │   │  time cursor   │
-│            │   │  via ISampleSource       │   │  reg-event log   │   │                │
+│  (python)  │   │  decode loop, one pass   │   │  (python)        │   │  dockable      │
+│  .sal      │   │   no SDK dependency      │   │  Arrow cache     │   │  panels +      │
+│  CSV       │   │  register model, SSP,    │   │  audio min/max   │   │  one shared    │
+│  config    │   │  descramble, audio       │   │  pyramids        │   │  time cursor   │
+│            │   │  via ISampleSource       │   │                  │   │                │
 └────────────┘   └─────────────────────────┘   └──────────────────┘   └────────────────┘
 ```
 
@@ -74,6 +72,7 @@ swi3s_studio/
   links.py         # LinkSet: the open Links, the active one, offsets and the time mapping
   workspace.py     # the .swi3s workspace: read, write, migrate; capture paths kept relative
   cli.py, app.py   # command line (headless -o model dump) and the GUI entry point
+  fsutil.py        # write_whole: the atomic file writer the exporters share (a new file beside the target, moved into place once complete)
   ingest/          # capture files -> Capture (clock/data edge arrays) -> TransitionSampleSource:
                    #   saleae_sal (.sal), saleae_binary (.bin pair), digital_csv, vcd,
                    #   wfm / analog_csv / analog (scope exports, thresholded to logic),
@@ -99,7 +98,8 @@ swi3s_studio/
                    # zero-phase Butterworth high-pass and DC blocker for per-stream processing
                    # (filters.py); the spectrogram lane's short-time spectrum (spectrogram.py)
   timing/          # SWI3S PHY timing calculator (calculator.py: compute + worst-corner),
-                   #   the crossing envelope (delta_tpd.py), per-spec presets (spec_source.py)
+                   #   the crossing envelope (delta_tpd.py), per-spec presets (spec_source.py),
+                   #   per-leg event timelines (timeline.py)
   export/          # commands_csv: the decoded commands as CSV
   ui/
     main_window.py # dockable layout, menus, the load queue, the Links' views
@@ -109,9 +109,11 @@ swi3s_studio/
     command_table.py
     register_view.py, register_history_dialog.py
     audio_view.py  # pyqtgraph waveforms / spectrograms + QAudioSink playback
+    save_path.py   # a save dialog's result: the format's suffix added, a replacement confirmed
     port_names.py  # how a data port is labelled: the user's name, else Dev/DP numbers
     eye_view.py    # measured setup/hold + eye histograms
     timeline.py    # whole-capture overview ribbon
+    timing_view.py, timing_diagram.py  # the Timing Calculator and its term diagram
     cursor.py      # shared TimeCursor (synchronized navigation)
     theme.py       # VizTheme palettes (dark / light) and the stylesheet helpers
     authoring/     # the Visualization mode's authoring panel and notifications
@@ -121,27 +123,24 @@ data/
   regmaps/         # bundled example peripheral register map
 native/
   swi3score/       # pybind11 bindings + ISampleSource/Decoder
-    core/          # vendored SWI3S decode core — standalone
+    core/          # the SWI3S decode core, maintained here — standalone
   CMakeLists.txt   # builds the python module (scikit-build-core)
   build_local.sh   # offline build: the module at the repository root
 tests/
 ```
 
-The time index, register timeline and register event log described in §4 are not built;
-see the note there.
-
 ---
 
 ## 3. Shared decode core
 
-The decode classes are **vendored** in `native/swi3score/core/` (so the repo builds
-standalone; see that folder's README for provenance + the file list). They are
-almost SDK-free — they use `LogicPublicTypes.h` only for `U8`/`U16`/`BitState`.
-The *single* coupling to Saleae is `CBitstreamDecoder`, which pulls bits from
-`AnalyzerChannelData` (not vendored; replaced by `ISampleSource`).
+The decode classes are in `native/swi3score/core/` (see that folder's README for the file
+list), so the repository builds standalone. They are SDK-free: they use `LogicPublicTypes.h`
+only for `U8`/`U16`/`BitState`, which `native/swi3score/compat/` supplies. The `Decoder`
+reads its input from an abstract sample source.
 
-`CBitstreamDecoder` reads from an abstract sample source, `ISampleSource`
-(`native/swi3score/ISampleSource.h`):
+The sample source is `ISampleSource` (`native/swi3score/ISampleSource.h`); the Python ingest
+readers hand it edge arrays through `TransitionSampleSource` or `DlvSampleSource`, and
+`MemorySampleSource` is the in-memory source of the tests and the demos:
 
 ```cpp
 class ISampleSource {
@@ -172,15 +171,10 @@ public:
 Every method but the two core ones is defaulted, so a pure streaming reader satisfies the
 interface with only `NextUi` and `SampleRateHz`.
 
-**Everything downstream of `CBitstreamDecoder` is shared verbatim** with the Saleae plugin:
-`CNrzsDecoder`, `C8b10bDecoder`, `CColumnDetector`,
-`CCommandTransportParser`, `CRegisterModel`, `CDataPort`, `CFlowControlPort`,
-`CPayloadEngine`, `CDescrambler`, `CCrc16`, `SwI3sProtocolDefs`.
-
-The core is built **twice** from one source tree:
-- **`swi3score`** — pybind11 python module for Studio (no Saleae SDK).
-- **`SwI3sAnalyzer`** — the Saleae plugin (adds the `AnalyzerChannelData` sample
-  source + FrameV2 emission).
+The `Decoder` drives these classes from the sample source: `CNrzsDecoder`, `C8b10bDecoder`,
+`CColumnDetector`, `CCommandTransportParser`, `CRegisterModel`, `CDataPort`,
+`CFlowControlPort`, `CPayloadEngine`, `CDescrambler`, `CCrc16`, `SwI3sProtocolDefs`. This
+repository builds one target, the `swi3score` pybind11 module.
 
 ### Column-count / CDS-column detection
 
@@ -209,26 +203,38 @@ opens one too (§6), so there is one segment per column count or link restart.
 
 ### pybind11 surface
 
-The per-UI loop must **not** cross the Python boundary. The core runs the whole
-decode and emits results in **batches** (or writes the results store directly
-from C++ via Arrow C-data / memmap buffers). Sketch:
+The per-UI loop must **not** cross the Python boundary. The core runs the whole decode in
+one call and the results are read back in bulk:
 
 ```python
 import swi3score
-dec = swi3score.Decoder(source, settings)     # source = ingest.ISampleSource impl
-dec.on_commands(callback_or_arrow_sink)        # batched
-dec.on_register_events(sink)
-dec.on_audio(sink)                             # per-(dp,channel) arrays
-dec.run()                                      # streaming, single pass
+dec = swi3score.Decoder(source, settings)     # source = a swi3score.ISampleSource
+                                               # (TransitionSampleSource, DlvSampleSource;
+                                               # MemorySampleSource for tests and demos)
+dec.run()                                      # streaming, single pass, GIL released
+dec.commands()                                 # the decoded commands
+dec.audio_columns()                            # per-(dp,channel) arrays
+dec.segments()                                 # one per column count or link restart
+dec.bit_samples_window(...)                    # windowed bit-sample replay
 ```
 
-Settings mirror the plugin: column-count (auto/forced), config CSV (mid-stream),
-decode-audio, PHY mode (PHY1, PHY2, PHY3). Some are scoped to one config section (an index
+Settings: column-count (auto/forced), config CSV (mid-stream), decode-audio, `dlv` (a
+recovered-clock PHY3 source), `cds_horizontal_start`. Some are scoped to one config section (an index
 into `segments()`): what-if register overrides, a forced column count, and
 `imported_config_sections`, whose port config is built from that section's overrides
 alone rather than over the snoop. A config CSV imported into one region of a multi-region
 capture is those three together (`Session.apply_config_csv_at`); the global config CSV
 would frame every region at its width.
+
+The native config-CSV loader reads cells as Python's csv reader with newline='' does: a line
+ends at LF, CR LF or a lone CR outside a quoted cell, a quoted cell is
+unquoted, a doubled quote reads as one, and a ',' or line break inside it is part of the cell.
+RowRate is decimal only, with a '.' decimal point whatever the process locale. A path that is
+a directory, or a read that fails, reports 'Cannot open config CSV' and loads nothing. A row the
+decode reads that the file does not carry takes its default and is reported by name (one
+warning). A CDS per-source row given by its legacy scalar spelling counts as present. A warning
+lists at most 3 items and counts the rest, and quotes a cell or key of up to 60 characters
+whole, a longer one as its first 59 and an ellipsis.
 
 ### Performance & language choice
 
@@ -257,45 +263,42 @@ The design principle: **no view cost scales with capture size.**
 
 1. **Inputs are edge-based, not per-sample.** A `.sal` stores per-channel
    *transition* lists; the decoder consumes clock edges + data level, which *is*
-   the transition data. We memory-map the transition arrays and stream them — a
+   the transition data. The decoder streams the transition arrays — a
    full raw-sample buffer never exists. (CSV is parsed streaming into the same
    edge form.)
 
-2. **Decode is single-pass and streaming**, writing typed event streams to an
-   **out-of-core results store**:
+2. **Decode is single-pass and streaming**, writing typed event streams to the
+   results store:
 
    > **Status — partially realized; the rest is the design target.** What
    > ships: the single-pass streaming decode; the CDS-symbol and data-bit
-   > windowed re-decode (rows 4–5 below, fully realized — see §6/§7); and audio
+   > windowed re-decode (items 6–7 below, fully realized); and audio
    > min/max pyramids for the timeline. What is *scaffolded but not on the hot
    > path*: `store/audio_store.py` has a working `np.memmap` backend, but every
    > production caller uses the in-RAM branch (`mmap_dir` is only passed in tests),
    > because the decoder hands its results to `Session` as in-memory
    > Python/NumPy structures rather than to a persistent store. `store/command_store.py`
-   > (Arrow/Parquet) is a display/export cache, not fed back into replay. The
-   > `TimeIndex` / `RegisterTimeline` / register event-log-with-checkpoints named
-   > below are **not yet built** — register-at-cursor is replayed from the in-memory
-   > command list. Wiring the persistent store is tracked in the maintainers' tech-debt
-   > register.
+   > (Arrow/Parquet) is a display/export cache, not fed back into replay. Register state
+   > at the cursor is replayed from the in-memory command list.
 
    | Stream | Volume | Storage |
    |---|---|---|
-   | Commands (phases) | sparse (thousands–millions) | **Arrow/Parquet**, memory-mapped, filterable |
-   | Audio samples | large | per-`(dp,channel)` **`np.memmap`** + **min/max pyramid** |
-   | Register events (writes/commits) | sparse | event log + **periodic state checkpoints** |
+   | Commands (phases) | sparse (thousands–millions) | in-memory arrays; an **Arrow/Parquet** cache for display and export |
+   | Audio samples | large | per-`(dp,channel)` arrays in RAM (an optional **`np.memmap`** backend) + **min/max pyramid** |
+   | Register events (writes/commits) | sparse | the in-memory command list; register state at a sample is replayed from it |
    | CDS symbols | enormous | **not persisted** — re-decoded per visible window on demand, cached |
-   | Data-bit sample points | enormous | **not persisted** — re-decoded per visible window from **transport-phase checkpoints** (see §6) |
+   | Data-bit sample points | enormous | **not persisted** — re-decoded per visible window from **transport-phase checkpoints** (item 7 below) |
 
-3. **Time index.** A `sample → file offset` index per stream gives O(log n) range
-   queries, so every panel pulls only what's on screen.
+3. **Range queries.** Every panel pulls only what is on screen: commands by binary search
+   on start sample over the in-memory command list, audio from the pyramids.
 
 4. **Waveform pyramids (mip-maps).** For audio, precompute min/max per bin at
    several zoom levels; pan/zoom renders from pre-binned data and never touches
    the full array.
 
-5. **Register state at time T.** Reconstructed by replaying register events from
-   the nearest checkpoint up to T — powering the "register map at the cursor"
-   view and dual-rank staged/committed display in O(checkpoint interval).
+5. **Register state at time T.** Reconstructed by replaying the register events of the
+   command list up to T — powering the "register map at the cursor" view and dual-rank
+   staged/committed display.
 
 6. **Symbol viewer.** Persisting every 8b/10b symbol is infeasible at multi-GB.
    Instead, the core can **seek the sample source and re-decode a window** on
@@ -305,8 +308,9 @@ The design principle: **no view cost scales with capture size.**
    Also infeasible to persist whole — but a bit's *sample position* is a pure function
    of the transport **schedule** (config + SSP phase), independent of the descrambler.
    So the streaming decode records a light **transport event log** (each payload
-   (re)Configure / SSP re-anchor) plus **periodic transport-phase checkpoints**; a
-   windowed request (`Decoder::bitSamplesInWindow`) restores the nearest checkpoint,
+   (re)Configure / SSP re-anchor) plus **periodic checkpoints** of each port's transport
+   phase (the window needs no descrambler state); a windowed request
+   (`Decoder::bitSamplesInWindow`) restores the nearest checkpoint,
    fast-forwards the schedule to the window (bounded by the checkpoint interval), then
    ticks the window reading the wire to stamp each sampled bit. No re-decode of the
    whole capture, no descramble — enabling the overlay and navigating are cheap and
@@ -317,7 +321,7 @@ The design principle: **no view cost scales with capture size.**
 
 ## 5. UI
 
-Dockable panels (IDE / Saleae style) bound by **one shared time cursor +
+Dockable panels (IDE style) bound by **one shared time cursor +
 visible-range model** (`ui/cursor.py`). Selecting an item in any panel drives the
 others — Wireshark-style linked navigation.
 
@@ -364,8 +368,7 @@ others — Wireshark-style linked navigation.
   waveform, playback and WAV export all read the same samples with no change of their own.
   The filter is `dsp/filters.py`: SciPy's Butterworth design and `sosfiltfilt` algorithm in
   numpy, padded by three periods of the corner, with the per-sample recursion in the native
-  core (`swi3score.sosfilt`, `score_abi` 11) because numpy cannot vectorise it; a
-  10M-sample channel filters in about 0.13 s on the development Mac. The setting is the Link's
+  core (`swi3score.sosfilt`) because numpy cannot vectorise it. The setting is the Link's
   (`LinkPanelState.stream_processing`), re-applied to every new store a re-decode builds,
   and saved per Link in the workspace.
 - **Timing** pane (pyqtgraph): measured **setup/hold** timing straight off the
@@ -508,7 +511,9 @@ one bus). Links are independent buses, so nothing is decoded across them. Each i
   restart it is called again with the restart's column count, and the DLL locks there as at
   the first bring-up, at the seeded Safe-Lock row period over that count (a bring-up does
   not change the row rate). Column 0 is the row it locked on (no phase search), the CDS is
-  at Column 2, and a config CSV does not set the count, as at the first bring-up. A row the
+  at CDS_HorizontalStart (Column 2, its reset value, after a Cold Start; a Warm Start keeps
+  the registers and their column), and a config CSV does not set the count, as at the first
+  bring-up. A row the
   stop cut short keeps its bus row, so the restart opens the next: DLV rows are numbered by
   their Row Sync Points (`Session.bus_row_for_sample`). The stretch has no UIs, so a sample
   in it maps to the restart's (`Session._ui_for_sample`). The row log stays in UI order: the
@@ -533,6 +538,17 @@ one bus). Links are independent buses, so nothing is decoded across them. Each i
   through a pause and the decode runs on.
 - **PHY1, PHY2 and PHY3 (DLV)** all decode: PHY3's bit clock is recovered from the row
   edges by a virtual PLL, through the same `ISampleSource` + PHY state machine.
+- **The PHY3 CDS column is CDS_HorizontalStart[4:0]** (reset value 2; Column 0 is Sync1,
+  the last column Sync0). The decode reads the CDS at Column 2 until a commit makes a
+  CDS_HorizontalStart current, and at that column from the row the commit takes effect. A
+  move opens a new segment, which records its `cds_column`; the Session's symbol viewer, TX
+  raster and bus rows read each region's column from its segment. An authored PHY3 config
+  places the CDS as the visualizer does: S1 at Column 0, then S1's tail, its handover, then
+  the CDS (`SwI3sConfig::CdsHorizontalStart`).
+- **A write that changes a running port's single-ranked control register is flagged** as a
+  programming error, not a protocol error (`running_port_write_error`): SampleSizeGrouping,
+  PortControl, SkippingNumerator and FlowControl take effect at once, so they are set while
+  the port's channels are disabled. The decode follows the write.
 
 ---
 
@@ -563,12 +579,12 @@ the r06 → r08 field deltas that were applied.
 
 | From | Reused as |
 |---|---|
-| C++ analyzer decode (all of `source/*` except the Saleae glue) | the `swi3score` core, verbatim behind `ISampleSource` |
-| `CWavWriter`, `SampleRateHz` | audio export + sample-rate math |
+| the C++ decode classes | `native/swi3score/core/`, the `swi3score` core behind `ISampleSource` |
+| `SampleRateHz` (native), `store/audio_store.py` (`export_wav` writes the WAVE_FORMAT_EXTENSIBLE integer-PCM header and data) | sample-rate math, audio export |
 | Visualizer `models/` (DataPort, FCP, Device, BusModel, Interface, bit_slot) | `swviz/models/`, read by `model/viz_engine` for the authored grid |
 | Visualizer CSV/JSON schema (`config/constants.py` CSVFields) | `swviz/io/csv_handler`, `model/bus_config` and the core's config-CSV reader (mid-stream config) |
 | Visualizer `drawing/clash_detector`, slot/color semantics, `theme.py` | grid rendering on QGraphics |
-| Plugin test vectors / `model_dump.py` cross-checks | golden tests |
+| Reference model output (golden JSON) | golden tests (`tests/visualizer/golden_json`) |
 
 The DataPort placement cascade runs in the C++ core (Analysis mode) and in the Python `swviz`
 engine (Visualization mode, and the cross-check oracle in tests); see the introduction.
@@ -585,7 +601,7 @@ engine (Visualization mode, and the cross-check oracle in tests); see the introd
   bandwidth / slot utilization.
 - A dedicated **error lane**: CRC, disparity, unexpected-token, device-mask
   cardinality violations — flagged on the timeline + table.
-- **Config-vs-decoded overlay** and **capture diff**.
+- **Config-vs-decoded overlay** and **register diff**.
 - **Session/workspace save** (loaded capture source + view state) as a `.swi3s` JSON file.
 - **Exports**: WAV (audio), CSV/Arrow (commands), SVG/PNG (grid).
 - A **synthetic `.sal` generator** to test the whole pipeline, including large files.
@@ -596,8 +612,8 @@ engine (Visualization mode, and the cross-check oracle in tests); see the introd
 ## 10. Build & packaging
 
 - `native/CMakeLists.txt` builds `swi3score` as a pybind11 module via
-  **scikit-build-core**, producing a wheel, with no Saleae SDK dependency for the core.
-  The Saleae plugin stays a separate CMake target over the same sources.
+  **scikit-build-core**, producing a wheel, with no SDK dependency for the core.
+  It is the only target this repository builds.
 - The app is packaged with PyInstaller (see [`PACKAGING.md`](PACKAGING.md));
   macOS-first, cross-platform CI builds the native module per OS.
 
@@ -613,8 +629,8 @@ conventions. In brief:
 - **Placement cross-check**: the C++ grid output is compared against the Python
   placement model across the directed-test configs.
 - **Performance**: decode throughput, engine-build time, and digital-CSV import
-  ceilings on synthetic captures (`tests/test_perf.py`), including cursor-move, zoom/pan
-  and Link-switch interaction budgets, and a `.sal` load's peak memory against the
+  ceilings on synthetic captures (`tests/test_perf.py`), including cursor-move, zoom/pan,
+  Link-switch and Timing-recompute budgets, and a `.sal` load's peak memory against the
   guard's prediction.
 
 ---
@@ -641,14 +657,19 @@ and dock set per mode; all three share one workspace file.
   readout. **17 inequalities**, numbered in display order: setup and hold for MP, PM and
   PP, each in both launch forms (`t_DD` and the handover's `t_ZD`); the three Handover
   Contention legs (`MP/PM/PP_contention`); and the bus keeper once per releasing device (one keeper, two legs —
-  a min over the pair is not affine, which the corner search needs). Every leg is evaluated
+  a min over the pair does not move in one direction per row, which the corner search needs:
+  `calculator.py` checklist rule 4), each counting the keeper's response at the Manager from the
+  releasing data's crossing of the Manager's V_IH,max / V_IL,min (`calculator.keeper_corners`). Every leg is evaluated
   at **its own** worst PVT corner by `find_worst_corner_rows`, which is why each row can
   read a different end of the same input row. `spec_source.py` holds the per-side spec
   presets — SWI3S PHY1/PHY2, two proposed PHY2 revisions, SoundWire 1.3 — plus the
   normalisation that puts a mixed bus on one timing graph, and the divergences it declines
   to reconcile. Terms are ordered as a physical time trace and each is clickable: the view
   keys a term to the **input row** it reads (`_term_key`) and washes every occurrence.
-  No plots.
+  `timeline.py` places every leg's events (setup, hold, contention and keeper) on one time axis at its corner, each on
+  its ramp with its threshold corner (`delta_tpd.crossing_corners`), and one span per term,
+  each naming the ramps it is drawn with. `ui/timing_diagram.py` draws the clicked term from
+  it, in each column.
 - **Analysis** — the protocol analyzer.
 
 The bus-grid renderer (`ui/grid_view.py`) is shared between the authored (planned) and
@@ -659,13 +680,19 @@ The renderer has two input paths. **Analysis mode** feeds it the C++ core's grid
 `GridView.set_cells`: each data row split into a **Source half (top)** / **Sink half
 (bottom)**, multi-emit `GridCell`s (`isSource`), samples merged across bit columns and
 labelled per display fields (`C<ch>B<bit>` default; `S<sample>C<channel>` when
-Sample+Channel; `T1`/`T0` in PortMode test modes), TxPresent `TxP<ch>`, DRQ, guards
-`G0`/`G1`, tail squiggles, scrambler corner squares, full-height CDS, the Source/Sink
+Sample+Channel; the Bit field reads `T0` in PortMode 2 (Test0) and `T1` in PortMode 3
+(Test1)), TxPresent `TxP<ch>`, DRQ, guards `G0`/`G1`, tail squiggles, scrambler corner squares, full-height CDS, the Source/Sink
 key column, and handover arrows. **Visualization mode** feeds it the Visualizer
 engine's `BusModel` via `GridView.set_bus_model`: the model supplies the
 CDS/S0/S1/guard/tail/handover system bits with device, and the renderer draws those and
 overlays clash X-markers (bus red / device yellow / read blue) from the model's clash
 lists. Analysis-mode decode keeps the C++ core for throughput.
+
+A wide data bit (BitWidth > 0) occupies the bus on every one of its UIs, whichever side
+drives it, and is sampled on its last UI. The analyzer's grid (native `layoutGrid`) draws a
+sink port's wide bit on every UI, with the sample marker on the last. The vendored swviz model
+draws a sink port's wide bit only on its last UI. That difference between the two engines is
+declared, not a defect.
 
 One label does NOT come through the bit model. The CDS cell reads **`CDS` over a flags line**
 carrying the two per-source settings the grid can show — `SP`/`SPx` for a drive type of Special
@@ -684,7 +711,7 @@ flags, so those keep the uniform width.
 
 ### The CDS across the CSV ↔ register boundary
 
-The CDS crosses in **both** directions (`score_abi` 10):
+The CDS crosses in **both** directions:
 
 | direction | path | what carries |
 |---|---|---|

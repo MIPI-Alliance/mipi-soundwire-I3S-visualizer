@@ -5,8 +5,8 @@ edges, framing) without any protocol interpretation.
 
 Edges are stored as sample numbers, so the level at any sample is the initial
 level XORed with the parity of the edges before it. To stay light on multi-GB
-captures we only build the step arrays for the currently visible sample window
-(re-centered on the shared cursor), not the whole capture.
+captures we only build the step arrays for the sample window in view, re-rendered
+as the view is zoomed or panned, not the whole capture.
 
 Optionally the view overlays a marker at every Column-0 (the CDS column) — the
 rising clock edge (Row Sync Point) that opens each frame column — supplied per
@@ -65,7 +65,6 @@ _COMMIT_RING_MIN, _COMMIT_RING_MAX = 10.8, 16.2
 # y at which its down-pointing arrow head sits, in the plot's 0..2.8 trace space.
 _CDS_Y_BOT, _CDS_Y_TOP, _CDS_Y_ARROW = -0.1, 2.5, 2.62
 _DP_BAND_LO, _DP_BAND_HI = 1.6, 2.4        # DP trace band (port dots stack within it)
-_DN_BAND_LO, _DN_BAND_HI = 0.1, 0.9        # DN trace band
 _BIT_DOT, _MSB_DOT = 6, 9                   # bit-sample dot px size; larger for the MSB (interval start)
 _MAX_CH_LABELS = 48                          # per-lane cap: label MSBs with CHn only when few
 #                                              enough are in view to be legible (else too dense)
@@ -137,16 +136,6 @@ class _RawTimeAxis(pg.AxisItem):
         return [f"{v * mul:,.{dec}f} {unit}" for v in values]
 
 
-class _RoundedLegend(pg.LegendItem):
-    """LegendItem with rounded corners — the Capture pane's symbol-key box."""
-    def paint(self, p, *args):
-        if self.frame:
-            p.setRenderHint(p.RenderHint.Antialiasing, True)
-            p.setPen(self.opts['pen'])
-            p.setBrush(self.opts['brush'])
-            p.drawRoundedRect(self.boundingRect(), 6, 6)
-
-
 class RawCaptureView(QWidget):
     """Two stacked digital traces (DP above DN) over a sample window, with a cursor
     line that tracks the shared time cursor. Wheel/drag zoom & pan the X axis."""
@@ -179,7 +168,6 @@ class RawCaptureView(QWidget):
         self._show_ports = False                     # off until the user asks (bit collection is lazy)
         self._cursor_sample = 0                       # last shared-cursor sample
         self._bm_lines: dict[str, Any] = {}      # label -> draggable bookmark InfiniteLine
-        self._dp_is_data = False                     # which physical band the data line is drawn in
         self._top_name = "DP"                        # label for the top (data) trace; set per capture
         self._bot_name = "DN"                        # label for the bottom (clock) trace
         self._row_samples = 0.0                      # nominal samples per bus row (zoom-to-row hint)
@@ -192,6 +180,7 @@ class RawCaptureView(QWidget):
         self._stream_overrides: line_style.Overrides = {}   # the shown Link's stream colours
         self._stream_names: dict = {}            # the shown Link's data-port names (port_names)
 
+        self.shown_state = None   # the Link state this view's zoom and channels belong to
         self._plot = pg.PlotWidget(background=VizTheme.PLOT_BG, viewBox=XWheelViewBox(),
                                    axisItems={"bottom": _RawTimeAxis(orientation="bottom")})
         self._plot.getPlotItem().hideButtons()   # drop the corner auto-range "A" button
@@ -231,7 +220,7 @@ class RawCaptureView(QWidget):
                                               brush=pg.mkBrush(VizTheme.TEXT), pen=None)
         self._plot.addItem(self._cds_lines)
         self._plot.addItem(self._cds_arrows)
-        # Commit Row-Sync-Point markers: a bolder SOLID full-height gold vertical + a
+        # Commit Row-Sync-Point markers: a bolder SOLID full-height SEM_SYNC vertical + a
         # HOLLOW circle that rings the RSP's down-triangle at that column (a Commit Sync
         # Point is coincident with a Row Sync Point per spec), so it reads as "this RSP
         # is also where a confirmed commit takes effect".
@@ -262,9 +251,9 @@ class RawCaptureView(QWidget):
         self._pll_warn.setZValue(20)
         self._plot.addItem(self._pll_warn)
         self._pll_warn.setVisible(False)
-        # A fixed-size hollow ring JUST for the legend swatch: the plotted ring scales
-        # with zoom (12–18 px), which would otherwise blow up the key's circle; this keeps
-        # the legend marker small, matching the CDS triangle's scale.
+        # A fixed-size hollow ring JUST for the legend swatch: the plotted ring scales with
+        # zoom (_COMMIT_RING_MIN.._COMMIT_RING_MAX px), and the legend's ring stays small,
+        # at the CDS triangle's scale.
         self._commit_legend_marker = pg.ScatterPlotItem(
             symbol="o", size=9.9, pxMode=True, brush=None,
             pen=pg.mkPen(VizTheme.SEM_SYNC, width=2))
@@ -415,16 +404,13 @@ class RawCaptureView(QWidget):
         self._clock_btn.setChecked(bool(on))
 
     def _apply_clock_visibility(self) -> None:
-        """Show/hide whichever physical trace (DP or DN) carries the clock. The data
-        line is on DP when _dp_is_data, so the clock is the OTHER trace. Always re-show
-        the data curve: an FBCSE flip between captures swaps which curve is the clock.
-        When the clock is hidden, collapse the Y range/axis to just the data band so the
-        data fills the pane (like AudioView), instead of leaving a blank half where the
-        clock was."""
-        clock_curve = self._dn_curve if self._dp_is_data else self._dp_curve
-        data_curve = self._dp_curve if self._dp_is_data else self._dn_curve
-        clock_curve.setVisible(self._show_clock)
-        data_curve.setVisible(True)
+        """Show/hide the clock trace. The data is always the top curve (`_dp_curve`) and
+        the clock the bottom one (`_dn_curve`); the data curve is always shown, and the
+        axis labels come from `_top_name` / `_bot_name`. When the clock is hidden, collapse
+        the Y range/axis to just the data band so the data fills the pane (like
+        AudioView), instead of leaving a blank half where the clock was."""
+        self._dn_curve.setVisible(self._show_clock)
+        self._dp_curve.setVisible(True)
         # DLV: the recovered bit clock shares the bottom (clock) band, so it hides with
         # the clock toggle too.
         self._rec_clk_curve.setVisible(self._show_clock and self._dlv)
@@ -531,13 +517,13 @@ class RawCaptureView(QWidget):
         self._plot.setXRange((lo - pad) * to_s, (hi + pad) * to_s, padding=0.0)
 
     def zoom_to_row(self) -> None:
-        """Zoom to a single bus row around the cursor (the "1 Row" button)."""
+        """Zoom to a single bus row around the cursor."""
         self.zoom_to_rows(1)
 
     def center_on_sample(self, sample: int, n_rows: int = 2) -> None:
         """Zoom to ~`n_rows` bus rows CENTERED on `sample`. Unlike zoom_to_rows (which
-        snaps to the row boundaries at/after the cursor, leaving the event at the row's
-        left edge), this puts `sample` in the middle — used by the Timing pane's 'jump to
+        snaps to the Row-Sync-Point edges around the cursor, so the event sits wherever it
+        falls in that span), this puts `sample` in the middle — used by the Timing pane's 'jump to
         tightest margin' so the event's clock edge sits at the center of the pane."""
         if self._total <= 1:
             return
@@ -649,7 +635,7 @@ class RawCaptureView(QWidget):
 
     def _refresh_commits(self) -> None:
         """Query the commit provider for the visible window and redraw commit RSP
-        markers (solid blue verticals + larger arrows). Gated by the CDS toggle."""
+        markers (SEM_SYNC verticals + a hollow ring). Gated by the CDS toggle."""
         if not (self._show_cds and self._commit_provider is not None) or self._total <= 1:
             self._commit_lines.setData([], [])
             self._commit_arrows.setData([], [])
@@ -805,7 +791,7 @@ class RawCaptureView(QWidget):
     def _lane_y(self, key) -> float:
         """Centre height for a lane's dots: lanes are stacked evenly inside the data
         trace band so each (device, dp, channel) is visually separate."""
-        lo, hi = (_DP_BAND_LO, _DP_BAND_HI) if self._dp_is_data else (_DN_BAND_LO, _DN_BAND_HI)
+        lo, hi = _DP_BAND_LO, _DP_BAND_HI
         n = max(1, len(self._lanes))
         try:
             i = self._lanes.index(key)
@@ -1007,7 +993,6 @@ class RawCaptureView(QWidget):
             self._top_name = "DP" if dp_is_data_line else "DN"   # data line's physical name
             self._bot_name = "DN" if dp_is_data_line else "DP"   # clock line's physical name
         # Data is always the top band, so the per-port dots stack there.
-        self._dp_is_data = True
         self._apply_clock_visibility()       # keep the clock hidden/shown per the toggle
         prev_total, prev_rate = self._total, self._rate
         prev_x0, prev_x1 = self._plot.getViewBox().viewRange()[0]
@@ -1146,8 +1131,8 @@ class RawCaptureView(QWidget):
 
     def _on_xrange(self, _vb, rng) -> None:
         self.viewRangeChanged.emit(float(rng[0]), float(rng[1]))
-        # Coalesce a burst of range changes: (re)arm the timer and render the LATEST
-        # range when it fires, instead of rebuilding synchronously on every event.
+        # Coalesce a burst of range changes: start the timer if it is not running and
+        # render the LATEST range when it fires, instead of rebuilding synchronously on every event.
         if self._total <= 1:
             return
         if not self._render_timer.isActive():

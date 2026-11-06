@@ -188,3 +188,41 @@ def test_a_capture_that_polls_nothing_gets_no_section():
         commands = [{"command": "Ping", "phase": "GetStatus", "device_mask": 0xFFF}]
 
     assert _peripheral_report_rows(FakeSession()) == []
+
+
+def test_a_calibration_request_is_a_lifecycle_event_not_a_fault():
+    """A PHY3 peripheral latches IntStat_CalibrationReq during bring-up; reading it back is
+    not a command error."""
+    cmd = _read(_SLC + 0x22, bytes([0x04]))
+    r = port_status.reports_for(cmd)[0]
+    assert r.events == (("IntStat_CalibrationReq", 1),) and not r.faults
+    assert errors.command_error(cmd) is None
+    ssp = port_status.reports_for(_read(_DP0 + 0x04, bytes([0x01])))[0]
+    assert ssp.events == (("DevStat_ReceivedSSP", 1),) and not ssp.faults
+
+
+def test_the_ssp_counter_is_live_state_and_is_decoded():
+    """COUNT_ReceivedSSP is a counter by prefix but not a fault: reported, never judged."""
+    cmd = _read(_DP0 + 0x3F, bytes([9]))
+    r = port_status.reports_for(cmd)[0]
+    assert r.register == "COUNT_ReceivedSSP" and r.state == (("COUNT_ReceivedSSP", 9),)
+    assert not r.faults and r.label() == "Dev7 DP0 COUNT_ReceivedSSP: COUNT_ReceivedSSP=9"
+    assert port_status.summarize([cmd]).state == {"Dev7 DP0": {"COUNT_ReceivedSSP": 9}}
+    assert errors.command_error(cmd) is None
+
+
+def test_a_counter_polled_up_and_down_reports_its_highest_value():
+    s = port_status.summarize([_read(_DP0 + 0x30, bytes([v]), row=r)
+                               for r, v in ((10, 3), (20, 9), (30, 2))])
+    seen, first_row, highest = s.faults[("Dev7 DP0", "EC_UnexpectedSSP")]
+    assert (seen, first_row, highest) == (3, 10, 9)        # polls, first bus row, highest value
+
+
+def test_a_register_label_lists_every_state_field_up_to_four_and_only_set_ones_beyond():
+    def report(n):
+        state = tuple((f"F{i}", int(i == 1)) for i in range(n))
+        return port_status.Report(device=3, dp=None, register="R", address=0, value=0,
+                                  bus_row=0, start_sample=0, faults=(), vendor=(),
+                                  events=(), state=state)
+    assert report(4).label() == "Dev3 R: F0=0, F1=1, F2=0, F3=0"
+    assert report(5).label() == "Dev3 R: F1=1"

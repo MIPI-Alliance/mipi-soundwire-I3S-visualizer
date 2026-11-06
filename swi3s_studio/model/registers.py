@@ -20,24 +20,33 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 
-def _default_registers_json() -> str:
-    """Locate data/registers.json across dev, installed, and PyInstaller layouts."""
-    env = os.environ.get("SWI3S_REGISTERS")
-    if env and os.path.exists(env):
-        return env
-    here = os.path.dirname(os.path.dirname(__file__))            # swi3s_studio/
+def bundled_data_path(name: str) -> str:
+    """Path of the bundled data file or folder `name` (``registers.json``, ``regmaps``,
+    ``demos``), across the PyInstaller, repo (``data/``), packaged and pip data-files
+    (``<prefix>/share/swi3s-studio/``) layouts. The first that exists is returned, else the
+    first layout's path (the bundle's when frozen, else the repo's)."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # swi3s_studio/
     candidates = [
-        os.path.join(os.path.dirname(here), "data", "registers.json"),  # repo layout
-        os.path.join(here, "data", "registers.json"),                   # packaged in pkg
-        os.path.join(sys.prefix, "share", "swi3s-studio", "registers.json"),  # pip data-files
+        os.path.join(os.path.dirname(here), "data", name),               # repo layout
+        os.path.join(here, "data", name),                                # packaged in pkg
+        os.path.join(sys.prefix, "share", "swi3s-studio", name),         # pip data-files
     ]
-    base = getattr(sys, "_MEIPASS", None)                        # PyInstaller bundle
+    base = getattr(sys, "_MEIPASS", None)                                # PyInstaller bundle
     if base:
-        candidates.insert(0, os.path.join(base, "data", "registers.json"))
+        candidates.insert(0, os.path.join(base, "data", name))
     for c in candidates:
         if os.path.exists(c):
             return c
     return candidates[0]
+
+
+def _default_registers_json() -> str:
+    """Locate data/registers.json across dev, installed, and PyInstaller layouts;
+    $SWI3S_REGISTERS overrides it when that file exists."""
+    env = os.environ.get("SWI3S_REGISTERS")
+    if env and os.path.exists(env):
+        return env
+    return bundled_data_path("registers.json")
 
 
 DEFAULT_REGISTERS_JSON = _default_registers_json()
@@ -56,6 +65,8 @@ PHY1_BASE = 0x100
 PHY2_BASE = 0x200
 PHY3_BASE = 0x300
 CDS_BASE = 0x1100
+CDS_BLOCK_SIZE = 0x100
+CDS_CURR_BASE = CDS_BASE + 0xC0       # the CDS block's _CURR aliases: Dual-CURR-RO
 
 # SWI3S peripheral address-region map (the spec's "Peripheral Top-Level Address Map",
 # "Peripheral Address Map Regions for Local SWI3S Registers" and "Peripheral Address Map
@@ -145,12 +156,15 @@ def _parse_offset_span(value) -> Tuple[Optional[int], int]:
 
 
 def _parse_bits(bits: str) -> Tuple[int, int]:
-    """'[7:5]' -> (7, 5); '[3]' -> (3, 3)."""
-    m = re.match(r"\[(\d+)(?::(\d+))?\]", bits.strip())
+    """'[7:5]' -> (7, 5); '[3]' -> (3, 3). A register is one byte, so a range is 7 >= hi >= lo >= 0;
+    anything else raises ValueError."""
+    m = re.match(r"\[([0-9]{1,9})(?::([0-9]{1,9}))?\]", bits.strip())
     if not m:
         raise ValueError(f"bad bit range {bits!r}")
     hi = int(m.group(1))
     lo = int(m.group(2)) if m.group(2) is not None else hi
+    if not 0 <= lo <= hi <= 7:
+        raise ValueError(f"bit range {bits!r} is not within a byte, high bit first")
     return hi, lo
 
 
@@ -386,7 +400,7 @@ class RegisterMap:
         """Resolve a 32-bit (within-device) address to its register + rank."""
         if SLC_BASE <= address < SLC_BASE + DP_STRIDE:
             return self._resolve_in_block("SLC", address - SLC_BASE)
-        if CDS_BASE <= address < CDS_BASE + DP_STRIDE:
+        if CDS_BASE <= address < CDS_BASE + CDS_BLOCK_SIZE:
             return self._resolve_in_block("CDS", address - CDS_BASE)
         for name, base in (("PHY1", PHY1_BASE), ("PHY2", PHY2_BASE), ("PHY3", PHY3_BASE)):
             if base <= address < base + DP_STRIDE:
@@ -399,6 +413,28 @@ class RegisterMap:
                 res.dp_index = dp
             return res
         return None
+
+    def read_only(self, address: int) -> bool:
+        """Whether a write to `address` changes nothing because the byte is read-only: a
+        single-ranked register of access RO (every field RO), or an address in the CDS
+        block's _CURR window (offsets 0xC0-0xFF), whose aliases are Dual-CURR-RO. Such a
+        write is a programming error, as C++ CRegisterModel::IsReadOnly flags it."""
+        if CDS_CURR_BASE <= address < CDS_BASE + CDS_BLOCK_SIZE:
+            return True
+        res = self.resolve(address)
+        return res is not None and res.rank == "single" and res.register.access == "RO"
+
+    def rw1c_mask(self, address: int) -> int:
+        """The write-1-to-clear bits of the single-ranked register at `address`: the fields
+        of access RW1C, 0 when it has none."""
+        res = self.resolve(address)
+        if res is None or res.rank != "single":
+            return 0
+        mask = 0
+        for f in res.register.fields:
+            if f.access == "RW1C":
+                mask |= f.mask
+        return mask & 0xFF
 
     def _resolve_in_block(self, block: str, offset: int) -> Optional[ResolveResult]:
         nxt = self._by_next.get(block, {})
@@ -457,9 +493,6 @@ class DeviceRegisterFile:
         self._cells: Dict[int, _Cell] = {}      # NEXT/staged (or single-ranked) by addr
         self._curr: Dict[int, _Cell] = {}       # committed _CURR by NEXT-base addr
 
-    def seed_reset(self) -> None:
-        """No-op: reset values are served lazily from the spec (see value())."""
-
     def _reset_byte(self, address: int) -> int:
         res = self.rmap.resolve(address)
         if res:
@@ -473,26 +506,33 @@ class DeviceRegisterFile:
     def _set(self, address: int, value: int, prov: Provenance) -> None:
         self._cells[address] = _Cell(value & 0xFF, prov)
 
-    def apply_write(self, address: int, data: bytes, prov: Provenance = Provenance.WRITTEN) -> None:
-        """Apply a WriteA32: consecutive bytes from `address`. A byte at a dual-ranked
-        register's _NEXT alias stages there and reaches _CURR via commit(). A byte at its
-        _CURR alias sets _CURR and _NEXT both, by the _NEXT-base address, with no Commit
-        (Dual-Curr-is-RW, "Register Access Type" table), and a byte at a read-only _CURR alias
-        (Dual-CURR-RO) changes nothing, as C++ CRegisterModel::applyWrite does."""
+    def apply_write(self, address: int, data: bytes,
+                    prov: Provenance = Provenance.WRITTEN) -> List[int]:
+        """Apply a WriteA32: consecutive bytes from `address`, as C++
+        CRegisterModel::applyWrite does. A byte at a dual-ranked register's _NEXT alias stages
+        there and reaches _CURR via commit(). A byte at its _CURR alias sets _CURR and _NEXT
+        both, by the _NEXT-base address, with no Commit (Dual-Curr-is-RW, "Register Access
+        Type" table). A byte at a read-only address (`RegisterMap.read_only`: an RO register
+        or a Dual-CURR-RO _CURR alias) changes nothing. An RW1C bit written 1 clears and
+        written 0 keeps its value; the register's other bits take the written byte.
+
+        Returns the read-only addresses the write covered: each is a programming error."""
+        read_only: List[int] = []
         for i, b in enumerate(data):
             addr = address + i
-            base = self._next_base_of_curr(addr)
-            if base is not None and self._curr_read_only(addr):
+            if self.rmap.read_only(addr):
+                read_only.append(addr)
                 continue
+            base = self._next_base_of_curr(addr)
             if base is None:
+                rw1c = self.rmap.rw1c_mask(addr)
+                if rw1c:
+                    b = (self.value(addr) & rw1c & ~int(b)) | (int(b) & ~rw1c)
                 self._set(addr, int(b), prov)
             else:
                 self._set(base, int(b), prov)
                 self._curr[base] = _Cell(int(b) & 0xFF, prov)
-
-    def _curr_read_only(self, address: int) -> bool:
-        res = self.rmap.resolve(address)
-        return res is not None and res.register.access == "Dual-CURR-RO"
+        return read_only
 
     def _next_base_of_curr(self, address: int) -> Optional[int]:
         """The _NEXT-base address of the dual-ranked register whose _CURR alias holds
@@ -544,15 +584,6 @@ class DeviceRegisterFile:
             if memb & group_mask:
                 self._curr[addr] = _Cell(cell.value, cell.provenance)
 
-    def force_ui(self, address: int, value: int) -> None:
-        """Debug what-if: force a register byte to `value` with UI provenance, in
-        BOTH ranks — so a dual-ranked register's committed (_CURR) geometry, which
-        the bus grid renders, reflects the override too (not just the staged _NEXT).
-        Single-ranked registers keep only _cells; the extra _curr entry is unused."""
-        cell = _Cell(int(value) & 0xFF, Provenance.UI)
-        self._cells[address] = cell
-        self._curr[address] = cell
-
     def seed(self, address: int, cur: int, has_cur: bool, cur_prov: Provenance,
              next_val: int, has_next: bool, next_prov: Provenance) -> None:
         """Seed this file from the C++ decode authority's register snapshot for one
@@ -576,7 +607,10 @@ class DeviceRegisterFile:
     def get(self, address: int) -> _Cell:
         c = self._cells.get(address)
         return c if c else _Cell(self._reset_byte(address), Provenance.DEFAULT)
-    def value(self, address: int, default: int = 0) -> int:
+
+    def value(self, address: int) -> int:
+        """The register byte at `address`: its set value, else its reset byte (0 when the
+        address has no register)."""
         c = self._cells.get(address)
         return c.value if c else self._reset_byte(address)
 
@@ -597,7 +631,8 @@ class DeviceRegisterFile:
         return c.provenance if c else Provenance.DEFAULT
 
     def items(self):
-        """(address, value) for every explicitly-set register (written / UI / CSV)."""
+        """(address, value) for every register with a stored byte, whatever its
+        provenance (written, read, UI)."""
         return [(addr, cell.value) for addr, cell in self._cells.items()]
 
 

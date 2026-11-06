@@ -14,7 +14,10 @@ rebuild=0
 for a in "$@"; do
     case "$a" in
         --rebuild) rebuild=1; continue ;;
-        -o|--output|-o=*|--output=*|-h|--help) headless=1 ;;
+        # Every spelling argparse accepts: -o FILE, -oFILE, -o=FILE and an unambiguous prefix
+        # of --output or --help, with or without =VALUE.
+        -o|-o*|--o|--ou|--out|--outp|--outpu|--output|--o=*|--ou=*|--out=*|--outp=*|--outpu=*|--output=*) headless=1 ;;
+        -h|--h|--he|--hel|--help) headless=1 ;;
     esac
     app_args+=("$a")
 done
@@ -35,6 +38,8 @@ has_headers() {
 # Printed whenever a build is needed but the headers are missing. Lists the options that
 # need no root and no other interpreter first.
 header_help() {
+    local ver
+    ver="$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo X.Y)"
     cat >&2 <<EOF
 
 The decode core is C++ and needs the Python development headers (Python.h).
@@ -56,8 +61,8 @@ Without root — try in this order:
        PYTHON="\$(uv python find 3.12)" ./run.sh
   3. Keep this Python and extract the headers into \$HOME:
        mkdir -p ~/pyhdr && cd ~/pyhdr
-       rpm2cpio python3-devel-\$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')*.rpm | cpio -idmv
-       export SKBUILD_CMAKE_DEFINE="Python_INCLUDE_DIR=\$HOME/pyhdr/usr/include/pythonX.Y"
+       rpm2cpio python3-devel-$ver*.rpm | cpio -idmv
+       export SKBUILD_CMAKE_DEFINE="Python_INCLUDE_DIR=\$HOME/pyhdr/usr/include/python$ver"
      then re-run ./run.sh
 
 With root:  sudo dnf install python3-devel   (or: apt install python3-dev)
@@ -90,7 +95,7 @@ fi
 
 # Keep the venv OFF any cloud-synced folder (iCloud Drive / OneDrive). Qt cannot
 # enumerate its plugin directories on those file systems, so the GUI dies with
-# "Could not find the Qt platform plugin cocoa" even though the plugins are present.
+# "Could not find the Qt platform plugin" even though the plugins are present.
 # Put it in a local cache dir keyed to this checkout's path (override: SWI3S_VENV=...).
 REPO="$(pwd)"
 KEY="$(printf '%s' "$REPO" | (shasum 2>/dev/null || sha1sum) | cut -c1-12)"
@@ -145,8 +150,8 @@ if [ "$need_native" = 1 ]; then
         exit 1
     fi
     echo "Building the swi3score decode core..."
-    # --force-reinstall because the native version is a fixed 0.1.0, so a plain install
-    # no-ops and keeps a stale .so. --no-deps skips re-resolving the app deps.
+    # --force-reinstall replaces the installed module even when pip would judge it current.
+    # --no-deps skips re-resolving the app deps.
     if ! python -m pip install --force-reinstall --no-deps ./native; then
         # List the usual causes; do not assert one.
         echo "swi3score build failed; not stamping - will retry next run." >&2

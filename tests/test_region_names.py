@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 
 def test_a_region_name_is_kept_in_the_source_and_survives_a_reopen():
     s = Session.from_demo(300, phy=2, cold_start=True)
@@ -67,7 +69,9 @@ def test_right_click_on_a_band_asks_for_its_menu_and_does_not_seek(win, monkeypa
 
 def test_rename_names_the_band_and_keeps_the_zoom(win, monkeypatch):
     ribbon = win._timeline
+    ribbon.set_view(ribbon._total * 0.25, ribbon._total * 0.5)         # a zoomed view
     lo, hi = ribbon._view_lo, ribbon._view_lo + ribbon._view_span()
+    assert hi - lo < ribbon._total
     monkeypatch.setattr(QMenu, "exec", lambda self, *_a: next(
         a for a in self.actions() if a.text() == "Rename…"))
     monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("Playback", True)))

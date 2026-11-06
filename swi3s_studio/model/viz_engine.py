@@ -1,7 +1,7 @@
 """Bus-Visualizer engine adapter.
 
-Bus-Visualizer mode is driven by the **SWI3S Visualizer engine** — the first-party,
-non-UI placement / clash / validation engine in `swi3s_studio.swviz` — so placement,
+Bus-Visualizer mode is driven by the **SWI3S Visualizer engine** — the non-UI
+placement / clash / validation engine in `swi3s_studio.swviz` — so placement,
 clash detection, and validation match the Visualizer bit-for-bit. This module is the
 single seam: it builds a `BusModel` from a
 v2.0 CSV exactly the way the engine's headless batch path does (`num_rows =
@@ -20,6 +20,11 @@ import tempfile
 # Quiet the engine's console logging (clash / CSV-field chatter); all its loggers are
 # children of 'swi3s_visualizer'.
 logging.getLogger("swi3s_visualizer").setLevel(logging.ERROR)
+
+# The most rows an authored model builds: the UI's Bus Grid and JSON export
+# (ui.main_window._authored_rows) and the headless `--config` export (cli) both clamp
+# RowsToDraw to 1..MAX_AUTHORED_ROWS and report the clamp.
+MAX_AUTHORED_ROWS = 1024
 
 
 def build_bus_model(csv_path: str, num_rows: int | None = None):
@@ -181,7 +186,7 @@ def render_payload(csv_path: str, num_rows: int | None = None):
     for i, dpv in enumerate(_viz.data_ports):
         try:
             dev = _iface.get_dp_device(i)
-        except Exception:
+        except ValueError:                       # a port no device carries
             dev = None
         dev_str = "Mgr" if dev == -1 else (f"Dev{dev}" if dev is not None else "")
         label = f"{dev_str} DP{_dp_of(i)}".strip()

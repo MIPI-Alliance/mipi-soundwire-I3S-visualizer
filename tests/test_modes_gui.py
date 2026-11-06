@@ -1,5 +1,5 @@
-"""Three-mode shell test: the top mode switcher swaps the central page and the
-visible dock set per mode, Analysis-only menus gate by mode, and the active mode
+"""Three-mode shell test: the mode controller (_mode_mgr.switch_to) swaps the central
+page and the visible dock set per mode, Analysis-only menus gate by mode, and the active mode
 round-trips through the workspace JSON.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_modes_gui.py
@@ -9,11 +9,14 @@ import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.main_window import MainWindow
 from swi3s_studio.ui.mode_controller import ANALYSIS, MODES, TIMING, VISUALIZATION
 from swi3s_studio.workspace import Workspace, session_from_source
+
+pytestmark = pytest.mark.gui
 
 
 def _win():
@@ -23,7 +26,7 @@ def _win():
     return win
 
 
-def test_commands_menu_filter_sscr_and_shortcuts():
+def test_commands_menu_filter_sscr_and_shortcuts(monkeypatch):
     """Commands ▸ Filter has an 'All excl. Ping' quick action; the SSCR/DSCR jump
     actions move the cursor; the shortcuts help exists."""
     win = _win()
@@ -39,7 +42,12 @@ def test_commands_menu_filter_sscr_and_shortcuts():
     assert pts, "demo has an SSCR commit"
     win.cursor.set_sample(0); win.next_sscr()
     assert win.cursor.sample in pts
-    assert hasattr(win, "show_keyboard_shortcuts")
+    from PySide6.QtWidgets import QMessageBox
+    opened = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: opened.append(self.text()) or 0)
+    win.show_keyboard_shortcuts()
+    assert len(opened) == 1, "the shortcuts help did not open"
+    assert "Maximize the selected pane" in opened[0] and "Next cursor" in opened[0]
     # ⌘/Ctrl + Right in the timeline jumps to a commit (plain Right steps commands).
     from PySide6.QtCore import QEvent, Qt
     from PySide6.QtGui import QKeyEvent
@@ -261,11 +269,14 @@ def test_authoring_arrow_nav():
     assert {c for _, c, _ in ap._nav_list} == set(range(12))
     # Down from DP0's name cell (row 0, col 0) lands on the next col-0 entry below
     name0 = ap._dp_name[0]
+    ap.window().show()
+    QApplication.processEvents()
     assert ap._nav_move(name0, "v", 1) is True
     foc = ap.focusWidget()
-    if foc is not None:
-        assert ap._nav_pos[foc] == (1, 0)
+    assert foc is not None and ap._nav_pos[foc] == (1, 0)
     # Left from DP1's name (col 1), cursor at the edge, jumps to col 0
     name1 = ap._dp_name[1]
     name1.setText(""); name1.setCursorPosition(0)
     assert ap._nav_move(name1, "h", -1) is True
+    foc = ap.focusWidget()
+    assert foc is not None and ap._nav_pos[foc] == (0, 0)

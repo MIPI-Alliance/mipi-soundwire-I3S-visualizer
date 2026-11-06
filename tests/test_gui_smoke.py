@@ -21,6 +21,8 @@ from swi3s_studio.model import Provenance
 from swi3s_studio.ui.command_table import _COL, _collapse_ranges
 from swi3s_studio.ui.main_window import MainWindow
 
+pytestmark = pytest.mark.gui
+
 # The demo loads a single device with four data ports, all mono: DP0 (PCM) and DP2
 # (PDM) run UNSCRAMBLED, DP1/DP3 scrambled. See native/swi3score/Demo.cpp.
 _STREAMS = [(0, 0), (0, 1), (0, 2), (0, 3)]
@@ -34,7 +36,10 @@ def win():
     """One MainWindow with the demo loaded, shared across the walkthrough (ordered)."""
     w = MainWindow()
     w.load_demo()
-    return w
+    yield w
+    w.join_worker_threads()
+    w.close()
+    w.deleteLater()
 
 
 def test_command_table(win):
@@ -160,25 +165,39 @@ def test_audio_cursor_line(win):
 
 def test_symbol_viewer(win):
     assert win._symbol_view.symbol_count > 0
-    # Follows the cursor via windowed (seeked) re-decode: jumping to a later command
-    # shows fewer symbols than the from-start full decode.
+    # Follows the cursor via windowed (seeked) re-decode: the from-start decode holds the
+    # first segment's `len(full)` symbols; a cursor inside the decoded window keeps it, and
+    # a cursor past it re-decodes the window around the cursor.
     win._symbol_dock.show()
-    full_syms = win._symbol_view.symbol_count
-    win.cursor.set_sample(win._session.commands[2]["start_sample"])
-    assert 0 < win._symbol_view.symbol_count <= full_syms
-    win.cursor.set_sample(0)                       # back to start -> full window again
-    assert win._symbol_view.symbol_count >= full_syms
+    win._symbol_dock.raise_()                      # the tick refreshes the tab on screen
+    for _ in range(3):
+        QApplication.instance().processEvents()
+    sv = win._symbol_view
+    sess = win._session
+    full = sess.symbols()
+    assert len(full) > 0
+    win.cursor.set_sample(sess.commands[2]["start_sample"])
+    assert sv.symbol_count == len(full)
+    past = next(int(c["start_sample"]) for c in sess.commands
+                if c["start_sample"] > full[-1]["start_sample"])
+    win.cursor.set_sample(past)
+    assert sv.symbol_count == len(sess.symbols_around(past)) > 0
+    assert sv._symbols[0]["start_sample"] > full[0]["start_sample"]
+    win.cursor.set_sample(0)                       # back to start -> the window opens on the first symbol
+    assert sv._symbols[0]["start_sample"] == full[0]["start_sample"]
+
+    # A late command re-windows the pane: it opens past everything the from-start decode held.
+    win.cursor.set_sample(win._session.commands[-1]["start_sample"])
+    assert sv._symbols[0]["start_sample"] > full[-1]["start_sample"]
 
     # Decode-on-scroll back-history: prepending earlier symbols grows the list above.
-    sv = win._symbol_view
-    win.cursor.set_sample(win._session.commands[-1]["start_sample"])
     n0 = sv.symbol_count
-    if n0 and sv._symbols:
-        earlier = win._session.symbols_before(int(sv._symbols[0]["start_sample"]))
-        sv.prepend_symbols(earlier)
-        assert sv.symbol_count == n0 + len(earlier), (sv.symbol_count, n0, len(earlier))
-        sv.prepend_symbols([])                 # nothing more above
-        assert sv._at_start
+    assert n0 and sv._symbols, "the symbol list is empty at the last command"
+    earlier = win._session.symbols_before(int(sv._symbols[0]["start_sample"]))
+    sv.prepend_symbols(earlier)
+    assert sv.symbol_count == n0 + len(earlier), (sv.symbol_count, n0, len(earlier))
+    sv.prepend_symbols([])                 # nothing more above
+    assert sv._at_start
     win.cursor.set_sample(0)
 
 
@@ -475,7 +494,7 @@ def test_studio_ui_batch(win):
     from swi3s_studio import __version__ as _ver
     assert "Demo" in win.windowTitle() and _ver in win.windowTitle(), win.windowTitle()
     assert win._reg_view._tree.indentation() <= 12
-    # Eye Diagram renamed to Timing; per-section UI loaded.
+    # The Timing dock is titled Timing; per-section UI loaded.
     assert win._eye_dock.windowTitle() == "Timing"
     assert win._eye_view._sections, "timing view got no per-section UI stats"
     assert all("ui_ns" in s for s in win._eye_view._sections)
@@ -707,6 +726,114 @@ def test_locate_subcapture_does_not_start_while_closing(monkeypatch):
     w._session = None
 
 
+def test_an_audio_view_with_no_decimation_restores_without_a_warning():
+    """An empty decimation list is a valid saved entry; restoring the view's own state
+    under a workspace file name reports nothing."""
+    from swi3s_studio import import_notes
+    from swi3s_studio.ui import view_state
+    w = MainWindow()
+    try:
+        w.load_demo()
+        view = w._audio_view
+        entry = view_state.audio_state(view)
+        assert entry["decimation"] == []
+        with import_notes.collect() as notes:
+            view_state.restore_audio(view, entry, source="ws.swi3s")
+        assert [n.message for n in notes] == []
+    finally:
+        w.join_worker_threads()
+
+
+def test_a_workspace_cursor_past_the_capture_opens_at_its_end_and_authoring_notes_name_the_file(
+        tmp_path, monkeypatch):
+    """The saved cursor is clamped into the active capture; a per-source authoring list of
+    the wrong length is reported under the workspace file's name."""
+    import json
+
+    from conftest import pump_loads
+    from PySide6.QtWidgets import QFileDialog
+
+    w0 = MainWindow()
+    w0.load_demo()
+    src = dict(w0._session.source)
+    last = int(w0._session.last_sample())
+    w0.join_worker_threads()
+    d = {"active_link": 0, "cursor": last + 10_000,
+         "authoring": {"cds_tail": [1, 2, 3]},
+         "links": [{"source": src, "name": "Link 1"}]}
+    path = tmp_path / "far.swi3s"
+    path.write_text(json.dumps(d), encoding="utf-8")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    win = MainWindow()
+    win.open_workspace()
+    pump_loads(win)
+    try:
+        assert win.cursor.sample == last
+        lines = [line for dlg in win.import_warning_dialogs() for line in dlg.lines()]
+        assert any(line.startswith("far.swi3s: cds_tail has 3 values") for line in lines), lines
+    finally:
+        win.join_worker_threads()
+
+
+def test_rebuilding_the_eye_filter_menu_does_not_accumulate_submenus():
+    """Each rebuild deletes the previous Columns submenu and its actions."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QMenu
+
+    from swi3s_studio.session import Session
+    from swi3s_studio.ui.eye_view import EyeView
+    ev = EyeView()
+    s = Session.from_demo(64)
+    ev.set_capture(s.capture)
+    ev.set_analysis_context(s.segments, s.timing_regions(), s.timing_column_roles)
+    ev._render()
+
+    def counts():
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        return (len(ev._filter_menu.findChildren(QMenu)),
+                len(ev._filter_menu.findChildren(QAction)))
+
+    ev._rebuild_filter()
+    base = counts()
+    assert base[0] >= 1 and base[1] > 0, base         # the Columns submenu and its actions exist
+    for _ in range(3):
+        ev._rebuild_filter()
+    assert counts() == base
+
+
+def test_the_register_map_dialog_names_the_encoding_it_read_an_xml_file_as(tmp_path):
+    """The dialog reads a file as the importer does: a non-UTF-8 XML file says which
+    encoding it was read as, and a byte-order-marked file reads clean."""
+    from swi3s_studio.ui.regmap_import_dialog import RegisterMapImportDialog
+    xml = ('<register name="Gain \u00b5s" address="0x10000000"><bit position="0" name="x"/>'
+           '<reset hex="01"/></register>')
+    dlg = RegisterMapImportDialog()
+    path = tmp_path / "amp.xml"
+    path.write_bytes(xml.encode("cp1252"))
+    dlg._path = str(path)
+    dlg._reimport()
+    assert dlg.report is not None
+    assert dlg.report.warnings == ["the file is not UTF-8: read as cp1252"]
+    path.write_bytes(xml.encode("utf-16"))
+    dlg._reimport()
+    assert dlg.report is not None and dlg.report.warnings == []
+    assert dlg.pmap.registers[0].name == "Gain \u00b5s"
+
+
+def test_an_excess_one_field_tooltip_says_whether_the_value_is_the_whole_stored_value():
+    from swi3s_studio.model.registers import RegisterMap
+    from swi3s_studio.ui.register_view import _field_tooltip
+    rm = RegisterMap.load()
+    lo = next(f for f in rm.resolve(0x2083).register.fields if f.name == "Interval[3:0]")
+    assert lo.excess1
+    assert "the whole assembled value is stored + 1" in _field_tooltip(lo, 15)
+    whole = next(f for f in rm.resolve(0x1081).register.fields if f.name == "NumColumns")
+    assert whole.excess1
+    tip = _field_tooltip(whole, 31)
+    assert "actual count = value + 1" in tip and "assembled" not in tip
+
+
 def test_rebuilding_the_playback_menus_does_not_accumulate_action_groups():
     """QMenu.clear() destroys the actions, NOT the groups — those are children of the WINDOW.
 
@@ -770,7 +897,7 @@ def test_the_rows_to_draw_field_fits_its_widest_value_at_a_wider_font():
                 f"'10240' needs {need} px but the field's minimum is "
                 f"{edit.minimumWidth()} px — it would clip")
             assert edit.maximumWidth() > need, \
-                "the field is still capped, which is what caused the clipping"
+                "the field has a maximum width at or below its content width"
         finally:
             w.join_worker_threads()
             w.close()

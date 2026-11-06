@@ -5,7 +5,13 @@
 // descrambles per channel (when ScramblerEn), and assembles MSB-first samples
 // into values. TX_PRESENT bits are passed through the channel descrambler to
 // keep its LFSR in step (they are scrambled too) but are not placed into a
-// sample. Guard/Tail are not scrambled and carry no audio.
+// sample. Guard/Tail are not scrambled and carry no audio. A flow-control port's DRQ
+// bit is descrambled by the port's own FCP descrambler when FCP_ScramblerEn is set.
+//
+// A channel's or FCP's scrambler LFSR is seeded when the channel or port is enabled, or
+// when its scrambler enable (ScramblerEn, FCP_ScramblerEn) turns on, on every path, and
+// runs on across intervals and SSPs; Configure and Reconfigure state which reconfigures
+// carry it.
 
 #ifndef SWI3S_CPAYLOADENGINE_H
 #define SWI3S_CPAYLOADENGINE_H
@@ -71,12 +77,30 @@ public:
     // so the FILE* isn't leaked for the engine's lifetime.
     ~CPayloadEngine() { if (mDumpFile) { std::fclose(mDumpFile); mDumpFile = nullptr; } }
 
-    void Configure(const SwI3sConfig& cfg);
+    // Rebuilds and re-Initializes every enabled port. Each surviving (device,dp) channel
+    // carries its running sample index, and its descrambler when the channel is enabled
+    // with ScramblerEn set both before and after; a surviving FCP carries its descrambler
+    // when FCP_ScramblerEn is set both times. The sample being assembled and the interval
+    // phase are rebuilt; every other descrambler is seeded.
+    //
+    // `keepDrqHistory` is set for a commit (an SSCR, or a DSCR that changes the column
+    // count), which changes a port's config while the port stays enabled. A surviving port
+    // with an FCP before and after then carries its DRQ pipeline (the DRQ history, the
+    // TxPresent interval count and the last DRQ's sample): the startup intervals, whose
+    // TX_PRESENT takes DRQ 1, are counted from when the Source DP was enabled ({ASW5204},
+    // Table 160 (v1.1 r10)). The history is carried only when the port is at the start of
+    // an interval, where the rebuild leaves the interval numbering unchanged; SyncToSSP
+    // keeps it there by the same rule. A port that is (re-)enabled, or whose FlowMode gains
+    // the DRQ (FlowMode 0 or 1 has no FCP_DRQ, {ASW5201}), starts with an empty history.
+    // Without `keepDrqHistory` every port's DRQ pipeline starts empty.
+    void Configure(const SwI3sConfig& cfg, bool keepDrqHistory = false);
     // Phase-preserving reconfigure for a DSCR (a synced commit that changes config but
     // does NOT re-anchor the SSP): drop ports no longer enabled, add newly enabled ones
     // (Initialized fresh), and carry surviving (device,dp) ports over with their interval
-    // phase + descrambler state INTACT. Unlike Configure (which rebuilds and re-Initializes
-    // EVERY port), so a mid-stream enable/disable doesn't glitch the ports that stayed up.
+    // phase + descrambler state intact, so a mid-stream enable/disable does not glitch the
+    // ports that stayed up. A newly enabled channel or FCP is seeded, and so is every
+    // channel's descrambler when ScramblerEn turns on, and the FCP's when FCP_ScramblerEn
+    // turns on.
     void Reconfigure(const SwI3sConfig& cfg);
     // Set the bus column the next tick lands on (the capture's Column-0 phase, as
     // found from the differential CDS). A truncated/mid-stream capture starts partway
@@ -105,11 +129,12 @@ public:
     // record it and a windowed re-decode can rebuild the same port phase.
     int StartColumn() const { return mStartColumn; }
 
-    // Snapshot / restore the transport phase of every port (NOT the descrambler
-    // LFSRs — bit SAMPLE POINTS are level-independent, so a windowed re-decode that
-    // only needs where bits are sampled can restore the schedule and skip values).
-    // RestoreState re-Configures for `cfg` (rebuilding the same enabled-port set in
-    // the same order the states were saved) then overwrites each port's phase.
+    // Snapshot / restore the transport phase of every port. Bit SAMPLE POINTS do not
+    // depend on the levels, so a windowed re-decode that collects only where bits are
+    // sampled restores the schedule and not the descrambler LFSRs, which RestoreState
+    // leaves seeded: values a restored engine assembles are not the live decode's.
+    // RestoreState re-Configures for `cfg` from an empty engine (the same enabled-port
+    // set, in the order the states were saved) then overwrites each port's phase.
     std::vector<CDataPort::State> SaveState() const;
     void RestoreState(const SwI3sConfig& cfg, int startColumn,
                       const std::vector<CDataPort::State>& ports);
@@ -124,10 +149,11 @@ public:
     // for this UI (true = high). Appends any completed samples to 'out'.
     void Tick(bool level, U64 sampleNumber, std::vector<AudioSample>& out);
 
-    // Flow-control handshake validation (SWI3S §14.2.2 {ASW5205}). Accumulated across
-    // the whole decode: how many transported samples were checked against their
-    // Earlier_FCP_DRQ, and how many violated the mode's rule (RX: TxPresent must EQUAL
-    // Earlier_DRQ; ASYNC: TxPresent=1 requires Earlier_DRQ=1). 0 fails = a clean
+    // Flow-control handshake validation (SWI3S §14.2.2 {ASW5205}). Accumulated since the
+    // last full Configure(), each of which starts the accounting afresh whether or not it
+    // carries the DRQ history the check reads: how many transported samples were checked
+    // against their Earlier_FCP_DRQ, and how many violated the mode's rule (RX: TxPresent
+    // must EQUAL Earlier_DRQ; ASYNC: TxPresent=1 requires Earlier_DRQ=1). 0 fails = a clean
     // handshake. Only RxControlled/Async ports contribute.
     struct FlowControlStats {
         U64 checked = 0;    // transport opportunities validated against a DRQ
@@ -160,6 +186,7 @@ private:
         bool isSource = false;           // peripheral drives this port onto the bus
         CDataPort port;
         CFlowControlPort fcp;
+        CDescrambler fcpDescram;         // the DRQ bit's LFSR (cfg.FCP_ScramblerEn)
         // One runtime per channel number (0..15). Flat array (not a map) so the
         // per-bit assembly in Tick is an O(1) index, not a red-black-tree lookup in
         // the innermost decode loop. Disabled channels are simply never ticked.
@@ -175,8 +202,9 @@ private:
         // interval. `drqHistory[i - drqBase]` is interval i's DRQ; the window is bounded
         // (only the last d+2 intervals are ever read). `txpInterval` counts validated
         // TxPresent intervals so Earlier_FCP_DRQ = interval (txpInterval - d), with
-        // d = FlowControlDelay+1. Startup assumes DRQ=1 for the first d intervals
-        // (SWI3S §14.2.2, the "Selection of FCP_DRQ Bit in Source DP" table).
+        // d = FlowControlDelay+1. Startup assumes DRQ=1 for the first d intervals after
+        // the Source DP's enable ({ASW5204}, Table 160 (v1.1 r10)); Configure, Reconfigure
+        // and SyncToSSP state when the history carries.
         std::deque<char> drqHistory;
         U64 drqBase = 0;               // interval index of drqHistory.front()
         U64 drqCount = 0;              // total DRQ intervals seen (next interval index)

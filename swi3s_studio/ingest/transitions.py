@@ -9,6 +9,8 @@ capture, and as the reference for the digital-CSV reader.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 import swi3score
 
@@ -42,7 +44,7 @@ PHY1_SAMPLE_RATE_HZ = 196_608_000                 # 32 * 6.144 MHz UI @ 4 cols -
 # this rate.
 ANALYZER_SAMPLE_RATE_HZ = 500_000_000             # 2 ns period — the analyzer's fixed max rate
 FBCSE_UI_RATE_HZ = 24_576_000                     # PHY2 UI (12.288 MHz DDR clock)
-DLV_ROW_RATE_HZ = 3_072_000                       # PHY3 recovered-clock row reference
+DLV_ROW_RATE_HZ = 3_072_000.0                     # PHY3 recovered-clock row reference rate
 PHY1_UI_RATE_HZ = 6_144_000                       # PHY1 UI (4 cols @ 1.536 MRows/s)
 
 # Nominal DP-low after the PhyStart falling edge before audio mode (Man_tPhyStart,
@@ -82,7 +84,8 @@ def build_capture_from_levels(levels, samples_per_ui: float = DEFAULT_SAMPLES_PE
     )
 
 
-def build_dlv_capture_from_levels(levels, row_columns, samples_per_ui: int = DEFAULT_SAMPLES_PER_UI,
+def build_dlv_capture_from_levels(levels, row_columns,
+                                  samples_per_ui: float = DEFAULT_SAMPLES_PER_UI,
                                   sample_rate_hz: int = DLV_SAMPLE_RATE_HZ) -> Capture:
     """Inverse edge-builder for a PHY3 (DLV) per-UI LOGICAL differential level plan.
 
@@ -207,8 +210,8 @@ def prepend_cold_start(capture: Capture, phy_number: int = 2) -> Capture:
 
 
 def demo_capture(audio_samples_per_channel: int = 32,
-                 samples_per_ui: int = DEFAULT_SAMPLES_PER_UI,
-                 sample_rate_hz: int = DEFAULT_SAMPLE_RATE_HZ,
+                 samples_per_ui: Optional[float] = None,
+                 sample_rate_hz: Optional[int] = None,
                  cold_start: bool = False, phy: int = 2,
                  variant: str = "") -> Capture:
     """Synthetic capture: config + commit + scrambled audio. ``phy`` selects the
@@ -226,9 +229,14 @@ def demo_capture(audio_samples_per_channel: int = 32,
     All three demos sample at ANALYZER_SAMPLE_RATE_HZ (500 MHz / 2 ns) — a real analyzer's
     fixed max, NOT a multiple of the SWI3S UI — so the number of samples per UI is
     NON-integer and edges land on a jittered grid. A caller can pin a specific
-    ``sample_rate_hz`` (+ ``samples_per_ui``) to override this, e.g. for the fine-eye tests."""
-    pinned = sample_rate_hz != DEFAULT_SAMPLE_RATE_HZ     # caller chose a custom rate/eye
-    rate = sample_rate_hz if pinned else ANALYZER_SAMPLE_RATE_HZ
+    ``sample_rate_hz`` and/or ``samples_per_ui`` to override this, e.g. for the fine-eye
+    tests: giving either pins both, the other taking ``DEFAULT_SAMPLE_RATE_HZ`` or
+    ``DEFAULT_SAMPLES_PER_UI``."""
+    pinned = sample_rate_hz is not None or samples_per_ui is not None
+    rate = ((DEFAULT_SAMPLE_RATE_HZ if sample_rate_hz is None else sample_rate_hz)
+            if pinned else ANALYZER_SAMPLE_RATE_HZ)
+    if samples_per_ui is None:
+        samples_per_ui = DEFAULT_SAMPLES_PER_UI
     if variant == "flow_control":
         # PHY2 framing (FBCSE, 16 columns): same edge builder as make_demo_levels.
         levels = swi3score.make_demo_levels_flow_control(audio_samples_per_channel)

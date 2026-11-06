@@ -1,12 +1,10 @@
-// SWI3S PHY2 protocol constants.
+// SWI3S (PHY1, PHY2, PHY3) protocol constants.
 //
-// Values follow the MIPI SoundWire I3S (SWI3S) Specification v1.1r06. Items not
-// yet transcribed from the spec are marked "TODO(spec)".
+// Values follow the MIPI SoundWire I3S (SWI3S) Specification v1.1r06.
 
 #ifndef SWI3S_PROTOCOL_DEFS_H
 #define SWI3S_PROTOCOL_DEFS_H
 
-#include <vector>
 #include <LogicPublicTypes.h>
 
 namespace swi3s {
@@ -16,35 +14,24 @@ namespace swi3s {
 // ---------------------------------------------------------------------------
 // "Column Count" is the number of UIs per row. The NumColumns register field
 // holds Column Count - 1 (excess-1). Generic range is 2..32 columns; PHY2
-// (FBCSE) additionally requires an EVEN column count.
+// (FBCSE) additionally requires an EVEN column count, which the blind column
+// detector (CColumnDetector) hypothesizes alone. A forced or pinned count is not
+// checked for parity.
 static const int kMinColumnCount   = 2;
 static const int kMaxColumnCount   = 32;
-
-// All legal PHY2 column counts (even, 2..32), in ascending order. Used by the
-// hypothesize-and-validate column detector and by the settings UI.
-extern const std::vector<int> kPhy2ColumnCounts;
-
-inline bool IsLegalPhy2ColumnCount(int columnCount)
-{
-    return (columnCount >= kMinColumnCount) && (columnCount <= kMaxColumnCount) &&
-           ((columnCount & 1) == 0);
-}
 
 // Cold/warm-start fixed CDS placement for PHY1 & PHY2 ({ASW3707}).
 static const int kColdStartColumnCount = 2;
 static const int kCdsColumn            = 0;  // CDS_HorizontalStart is RO 0 on PHY1/PHY2
-static const int kDlvCdsColumn         = 2;  // PHY3 (DLV) frames S1 at col 0, CDS at col 2
+static const int kDlvCdsColumn         = 2;  // PHY3 (DLV): CDS_HorizontalStart's reset value
 
 // ---------------------------------------------------------------------------
 // CDS line coding (Section 11.1.1.7, "PHY1 & PHY2: NRZS Decoding for CDS" table, {ASW4108})
 // ---------------------------------------------------------------------------
 // PHY1 & PHY2 line-code the CDS as NRZS relative to the immediately preceding
 // UI: a physical TOGGLE decodes to 0, no toggle decodes to 1. (This is the
-// inverse sense of classic SoundWire NRZI, where a change means 1.)
-inline bool NrzsDecode(BitState previousUi, BitState thisUi)
-{
-    return previousUi == thisUi;  // same level -> 1, toggled -> 0
-}
+// inverse sense of classic SoundWire NRZI, where a change means 1.) CNrzsDecoder
+// implements the rule.
 
 // ---------------------------------------------------------------------------
 // 8b/10b comma (Section 7.1.1.2, "K.28.y Comma Symbols" table)
@@ -68,18 +55,6 @@ static const unsigned kScramblerResetState = 0b101010100;
 static const unsigned kScramblerTap0 = 5;   // Y^-5
 static const unsigned kScramblerTap1 = 9;   // Y^-9
 static const unsigned kNoToggleLimit = 16;
-
-// ---------------------------------------------------------------------------
-// System & Link Control register offsets (Section 15.2; the "Peripheral Register Map for
-// System and Link Control Dual-Ranked Registers (SLC_*_NEXT)" and "System and Link Control
-// Register Fields (SLC_*)" tables)
-// ---------------------------------------------------------------------------
-// Dual-ranked: _CURR = _NEXT + 0x40. A WriteA32 to a _NEXT register followed
-// by a Commit (SSCR/DSCR) at an SSP applies the new value.
-static const U32 kRegUiRateRange_Next   = 0x80;
-static const U32 kRegNumColumns_Next    = 0x81;  // Column Count = field + 1
-static const U32 kRegRowRateRange_Next  = 0x82;
-static const U32 kRegCurrRankOffset     = 0x40;
 
 // ---------------------------------------------------------------------------
 // Command Transport Protocol (Section 8.1; the "Assignment of Robust Token Numbers
@@ -125,6 +100,7 @@ static const int kSpacerBitsPP = 10;  // Peripheral -> Peripheral
 static const int kSpacerBitsPM = 20;  // Peripheral -> Manager (default)
 
 static const int kMaxPeripherals = 12;  // 12-bit Device Mask
+static const int kMaxHubDepth = 5;      // hub levels in front of a peripheral, 0..5
 
 // CRC-16 over the Manager Packet (see CCrc16.h): poly 0xA2EB, init 0.
 
@@ -191,7 +167,7 @@ static const U32 kDpCommitGroupMemb    = 0x0A;  // [3:0] = membership of CG0..CG
 static const U32 kDpScramDirMode       = 0x0B;  // bit3=ScramblerEn, bit2=PortDirection, [1:0]=PortMode
 static const U32 kDpSkipNumLo          = 0x0C;  // [7:0]   (LSB-first)
 static const U32 kDpSkipNumHi          = 0x0D;  // [3:0] -> [11:8]
-static const U32 kDpFlowMode           = 0x0E;  // [1:0]
+static const U32 kDpFlowMode           = 0x0E;  // [7] FlowControlDelay, [3] FCP_ScramblerEn, [1:0] FlowMode
 static const U32 kDpBitWidthHStart_N   = 0x80;  // [7:6]=BitWidth(ex-1), [4:0]=HorizontalStart
 static const U32 kDpEnableCh0HCount_N  = 0x81;  // bit7=EnableCh0, [4:0]=HorizontalCount(ex-1)
 static const U32 kDpTailSubSpacing_N   = 0x82;  // [7:6]=TailWidth, bit5=SubRowInterval, [3:0]=Spacing
@@ -236,9 +212,6 @@ inline bool IsEnableChCurrOffset(U32 off)
 static const U8  kSspRowDelayMin = 14;
 static const U8  kSspRowDelayMax = 15;
 static const int kSspDefaultSyncPointOffset = 0;
-
-// TODO(spec): transcribe the §14.2.5 within-sample bit / channel ordering notes
-// already captured in CDataPort; nothing further outstanding here.
 
 } // namespace swi3s
 

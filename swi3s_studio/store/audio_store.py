@@ -9,18 +9,23 @@ it is decoded to PCM at build time (map {0,1}->±1 and band-limit + decimate, se
 decode_pdm). The per-dataport sample rate comes from the C++ core's verified
 SampleRateHz (and is replaced by the decimated rate for PDM streams).
 
+A channel whose sample_size changes mid-capture is decoded run by run, each run by its
+own size, and MSB-aligned to the channel's widest decoded width (_decode_mixed_sizes). A
+channel with a decimated PDM run plays and exports at that run's decimated rate.
+
 Each channel has a lazily built min/max render pyramid that serves the waveform
 envelope (see `AudioStore.envelope`).
 """
 from __future__ import annotations
 
 import os
-import wave
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..fsutil import write_whole
 from ..nputil import searchsorted as _ss
 
 
@@ -46,6 +51,51 @@ def container_bits(sample_bits: int) -> int:
     return 32
 
 
+def _playback_scale(sample_bits: int, out_bits: int) -> float:
+    """The factor taking a `sample_bits` stream to `out_bits` playback PCM: a power of two, so a
+    stream of the output width plays unchanged and a wider or narrower one is left-justified
+    exactly as export_wav writes it (a stream of one bit or an unknown size is left as is)."""
+    return 2.0 ** (out_bits - sample_bits) if sample_bits and sample_bits > 1 else 1.0
+
+
+# KSDATAFORMAT_SUBTYPE_PCM, the SubFormat GUID of a WAVE_FORMAT_EXTENSIBLE integer-PCM stream.
+_KSDATAFORMAT_SUBTYPE_PCM = bytes.fromhex("0100000000001000800000aa00389b71")
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+_WAV_MAX_U32 = 0xFFFFFFFF                        # the largest value of a WAV header field
+_WAV_MAX_DATA_BYTES = _WAV_MAX_U32 - 80          # the RIFF size field is 32 bits
+
+
+def _check_wav_format(n_channels: int, rate: int, container: int) -> None:
+    """Raise ValueError unless `rate` is 1..2**32-1 Hz and `rate` times the block size of
+    `n_channels` channels of `container` bits fits the header's 32-bit byte-rate field."""
+    if not 1 <= rate <= _WAV_MAX_U32 or rate * n_channels * (container // 8) > _WAV_MAX_U32:
+        raise ValueError(f"a WAV file cannot carry {rate} Hz in {n_channels} channels of "
+                         f"{container} bits: the rate must be 1..{_WAV_MAX_U32} Hz and the "
+                         f"byte rate must fit 32 bits")
+
+
+def wav_header(n_channels: int, rate: int, container: int, valid_bits: int,
+               data_bytes: int) -> bytes:
+    """RIFF header and `fmt ` chunk (WAVE_FORMAT_EXTENSIBLE, integer PCM) plus the `data`
+    chunk header, for `data_bytes` of interleaved little-endian samples.
+
+    `container` is the width each sample occupies (wBitsPerSample), `valid_bits` the
+    sample size in it (wValidBitsPerSample); the samples are left-justified in the
+    container. The channel mask is 0: the channels name no speaker positions. `rate` must be
+    1..2**32-1 and `rate` times the block size must fit the 32-bit byte-rate field, else
+    ValueError."""
+    _check_wav_format(n_channels, rate, container)
+    block_align = n_channels * container // 8
+    fmt = struct.pack(
+        "<HHIIHHHHI16s", _WAVE_FORMAT_EXTENSIBLE, n_channels, rate, rate * block_align,
+        block_align, container, 22, valid_bits, 0, _KSDATAFORMAT_SUBTYPE_PCM)
+    riff_size = 4 + 8 + len(fmt) + 8 + data_bytes + (data_bytes & 1)
+    return (b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"data" + struct.pack("<I", data_bytes))
+
+
+_INT32_MIN, _INT32_MAX = -(1 << 31), (1 << 31) - 1
 _PDM_PCM_RATE = 48000   # 1-bit PDM streams are decimated to this PCM rate at build
 
 
@@ -165,6 +215,21 @@ def _gap_indices(sample_at: np.ndarray, flow: bool,
     return np.flatnonzero(d > nominal * tol).astype(np.int64)
 
 
+def _flow_avg_rate(true_at: np.ndarray, capture_rate_hz: float) -> float:
+    """Average sample rate (Hz) of a flow-controlled stream's transport positions:
+    (samples - runs) / (sum of run spans) x capture rate, between transport gaps; 0 when it
+    cannot be measured."""
+    if true_at.size < 2 or capture_rate_hz <= 0.0:
+        return 0.0
+    gaps = _gap_indices(true_at, flow=True)
+    d_gap = (true_at[gaps + 1] - true_at[gaps]) if gaps.size else true_at[:0]
+    run_span = int(true_at[-1]) - int(true_at[0]) - int(d_gap.sum())
+    run_steps = true_at.size - 1 - gaps.size
+    if run_span <= 0 or run_steps <= 0:
+        return 0.0
+    return run_steps / run_span * capture_rate_hz
+
+
 def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
     """Recover a port's native rate (a PDM port's bit rate, a PCM port's sample rate)
     from its own per-sample capture-sample anchors, for use when the core reported no
@@ -206,6 +271,54 @@ def _recover_rate(sample_at: np.ndarray, capture_rate_hz: float) -> float:
 # never scans the full per-channel array.
 _PYRAMID_FACTOR = 8
 _PYRAMID_MIN_LEN = 1024
+
+
+def _decode_pdm_run(bits: np.ndarray, sample_at: np.ndarray, native_rate: float,
+                    dc_block: bool):
+    """Decode one 1-bit PDM run with decode_pdm and rebase its capture anchors onto
+    the decimated grid. Returns (pcm, sample_at, out_rate_hz, M)."""
+    signed, out_rate, M = decode_pdm(bits, native_rate, dc_block=dc_block)
+    n = bits.size
+    if M > 1 and signed.size:
+        ratio = n / signed.size
+        sat_idx = np.clip(np.rint(np.arange(signed.size) * ratio),
+                          0, n - 1).astype(np.int64)
+        sample_at = sample_at[sat_idx]
+    return signed, sample_at, out_rate, M
+
+
+def _decode_mixed_sizes(values: np.ndarray, sample_at: np.ndarray, sizes: np.ndarray,
+                        cuts: np.ndarray, native_rate: float, capture_rate_hz: float,
+                        dc_block: bool):
+    """Decode a channel whose sample_size changes between runs.
+
+    Each run of equal sample_size is decoded by its own size: a 1-bit run is PDM,
+    decoded to 16-bit-scale PCM at the bit rate recovered from its own spacing
+    (`native_rate` when that cannot be measured); a wider run is sign-extended at its
+    width. Every run is then shifted left to the widest decoded width, so a sample at
+    its run's full scale stays at the channel's full scale. Returns
+    (signed, sample_at, width, pdm_rate, pdm_native): the decimated and the bit rate of the
+    first PDM run that was decimated (0.0, 0.0 when none was)."""
+    pdm_rate = pdm_native = 0.0
+    bounds = np.concatenate(([0], cuts, [values.size])).tolist()
+    pieces = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        size = int(sizes[a])
+        v, at = values[a:b], sample_at[a:b]
+        if size == 1:
+            rate = native_rate
+            if capture_rate_hz > 0.0 and at.size > 1:
+                rate = _recover_rate(at, capture_rate_hz) or native_rate
+            dec, at, out_rate, m = _decode_pdm_run(v, at, rate, dc_block)
+            if m > 1 and not pdm_rate:
+                pdm_rate, pdm_native = float(out_rate), float(rate)
+            pieces.append((dec, at, 16))
+        else:
+            pieces.append((sign_extend(v, size), at, size))
+    width = max(w for _, _, w in pieces)
+    signed = np.concatenate([np.left_shift(d, width - w) for d, _, w in pieces])
+    at_all = np.concatenate([at for _, at, _ in pieces])
+    return signed, at_all, width, pdm_rate, pdm_native
 
 
 def _build_pyramid(raw: np.ndarray) -> List[Tuple[int, np.ndarray, np.ndarray]]:
@@ -360,9 +473,7 @@ class AudioStore:
             "value": np.fromiter((a["value"] for a in audio), np.uint32, n),
             "index": np.fromiter((a["index"] for a in audio), np.uint64, n),
             "start_sample": np.fromiter((a["start_sample"] for a in audio), np.uint64, n),
-            # flow_mode (ABI 7) drives the de-jitter in from_audio_columns; default 0
-            # (NORMAL) if a pre-ABI-7 dict list lacks it, so this path matches the
-            # columnar one instead of silently skipping de-jitter for flow-controlled ports.
+            # A missing flow_mode reads as 0 (NORMAL).
             "flow_mode": np.fromiter((a.get("flow_mode", 0) for a in audio), np.int32, n),
         }
         return cls.from_audio_columns(cols, rates, mmap_dir=mmap_dir,
@@ -397,7 +508,7 @@ class AudioStore:
         # Per-sample flow mode (0 NORMAL, 1 TX / 2 RX / 3 ASYNC). Flow-controlled ports
         # transport on a jittered schedule, so their samples arrive at irregular
         # capture times; the display de-jitters them to the measured average rate (see
-        # the loop below). Absent on pre-ABI-7 cores -> treat everything as NORMAL.
+        # the loop below). A missing column reads as NORMAL for every sample.
         flow_mode = cols.get("flow_mode")
         flow_mode = np.asarray(flow_mode) if flow_mode is not None else None
         total = device.shape[0]
@@ -423,17 +534,34 @@ class AudioStore:
             r0 = rows[0]
             key = (int(device[r0]), int(dp[r0]), int(channel[r0]))
             devp = (int(device[r0]), int(dp[r0]))
-            bits = int(sample_size[r0])
             dense_val = value[rows].astype(np.int64, copy=False)
             dense_sat = start_sample[rows].astype(np.int64, copy=False)   # already non-decreasing
             n = dense_val.size
+            sizes = sample_size[rows]
+            size_cuts = np.flatnonzero(np.diff(sizes)) + 1
+            bits = int(sizes.max())
 
-            if bits == 1:
+            pdm_at = None
+            if size_cuts.size:
+                # The port's SampleSize changed mid-capture: each run of equal
+                # sample_size is decoded by its own size (1 -> PDM to 16-bit PCM,
+                # else two's complement), then MSB-aligned to the channel's widest
+                # decoded width so one full scale serves display, playback and export.
+                signed, dense_sat, sbits, pdm_rate, pdm_native = _decode_mixed_sizes(
+                    dense_val, dense_sat, sizes, size_cuts,
+                    native_rates.get(devp, 0.0), capture_rate_hz, pdm_dc_block)
+                if pdm_rate:
+                    # A channel with a PDM run plays at the decimated rate, as a
+                    # single-size PDM port does; the bit rate stays the native rate.
+                    store._rates[devp] = pdm_rate
+                    if native_rates.get(devp, 0.0) <= 0.0 and pdm_native > 0.0:
+                        store._native_rates[devp] = pdm_native
+            elif bits == 1:
+                pdm_at = dense_sat                  # the bits' own transport positions
                 # 1-bit PDM density stream: decode to PCM here so the rest of the
                 # app (display/cursor/playback/export) sees a uniform signed-PCM
                 # channel. Decimation collapses the bit stream toward ~48 kHz and
                 # rebases the per-sample capture anchors onto the decimated grid.
-                devp = (int(device[r0]), int(dp[r0]))
                 native = native_rates.get(devp, 0.0)
                 if native <= 0.0 and capture_rate_hz > 0.0 and n > 1:
                     # The core reported no verified rate for this port (e.g. a capture
@@ -448,27 +576,26 @@ class AudioStore:
                         # on-bus rate instead of the original 0; matches how a
                         # core-verified rate is exposed for every other port.
                         store._native_rates[devp] = native
-                signed, out_rate, M = decode_pdm(dense_val, native, dc_block=pdm_dc_block)
+                signed, dense_sat, out_rate, M = _decode_pdm_run(
+                    dense_val, dense_sat, native, pdm_dc_block)
                 sbits = 16
-                if M > 1 and signed.size:
-                    ratio = n / signed.size
-                    sat_idx = np.clip(np.rint(np.arange(signed.size) * ratio),
-                                      0, n - 1).astype(np.int64)
-                    dense_sat = dense_sat[sat_idx]
+                if M > 1:
                     store._rates[devp] = float(out_rate)
             else:
                 signed = sign_extend(dense_val, bits)
                 sbits = bits
-                if (native_rates.get(devp, 0.0) <= 0.0 and store._rates.get(devp, 0.0) <= 0.0
-                        and capture_rate_hz > 0.0 and n > 1):
-                    # No verified rate from the core, as for the PDM case above: measure it
-                    # from the samples' own spacing. The rate drives the high-pass (Nyquist),
-                    # playback pitch and the rate label; the waveform is drawn at each
-                    # sample's capture position and does not use it.
-                    measured = _recover_rate(dense_sat, capture_rate_hz)
-                    if measured > 0.0:
-                        store._rates[devp] = measured
-                        store._native_rates[devp] = measured
+            if (int(sizes.min()) > 1 and native_rates.get(devp, 0.0) <= 0.0
+                    and store._rates.get(devp, 0.0) <= 0.0
+                    and capture_rate_hz > 0.0 and n > 1):
+                # A PCM channel with no verified rate from the core, as for the PDM case
+                # above: measure it from the samples' own spacing. The rate drives the
+                # high-pass (Nyquist), playback pitch and the rate label; the waveform is
+                # drawn at each sample's capture position and does not use it.
+                measured = _recover_rate(start_sample[rows].astype(np.int64, copy=False),
+                                         capture_rate_hz)
+                if measured > 0.0:
+                    store._rates[devp] = measured
+                    store._native_rates[devp] = measured
 
             # Flow-controlled ports (TX/RX/ASYNC) transport on a jittered schedule, so
             # dense_sat lands the samples at irregular capture times and a bit-exact sine
@@ -490,29 +617,31 @@ class AudioStore:
                 store._flow.add(key)
                 gaps = _gap_indices(true_at, flow=True)
                 dense_sat = _even_runs(true_at, gaps)
-                d_gap = (true_at[gaps + 1] - true_at[gaps]) if gaps.size else true_at[:0]
-                run_span = int(true_at[-1]) - int(true_at[0]) - int(d_gap.sum())
-                run_steps = true_at.size - 1 - gaps.size
-                if run_span > 0 and run_steps > 0 and capture_rate_hz > 0.0:
-                    avg = run_steps / run_span * capture_rate_hz
-                    # Both the playback rate and the native rate: native_rate() feeds
-                    # the plot title and the Statistics bandwidth.
+                avg = _flow_avg_rate(true_at, capture_rate_hz)
+                if avg > 0.0:
+                    # The playback rate; native_rate() feeds the plot title and the
+                    # Statistics bandwidth, so a PDM port's is the bit rate measured on the
+                    # bits' own positions, not the decimated rate.
                     store._rates[devp] = avg
-                    store._native_rates[devp] = avg
+                    native_avg = (_flow_avg_rate(pdm_at, capture_rate_hz)
+                                  if pdm_at is not None else 0.0)
+                    store._native_rates[devp] = native_avg or avg
 
             store._sample_at[key] = dense_sat
             if mmap_dir is not None:
                 dev, p, ch = key
                 path = os.path.join(mmap_dir, f"dev{dev}_dp{p}_ch{ch}.i32")
                 mm = np.memmap(path, dtype=np.int32, mode="w+", shape=(max(signed.size, 1),))
-                mm[:signed.size] = signed.astype(np.int32)
+                # An unclipped PDM overshoot left-shifted into a wider channel can pass the
+                # int32 range: hold it at full scale rather than wrap.
+                mm[:signed.size] = np.clip(signed, _INT32_MIN, _INT32_MAX).astype(np.int32)
                 mm.flush()
                 arr = mm
             else:
                 arr = signed
             store._channels[key] = arr
             store._sample_bits[key] = sbits
-            store._native_bits[key] = bits          # on-bus size (1 for PDM), for bandwidth
+            store._native_bits[key] = bits          # widest on-bus size (1 for PDM), for bandwidth
             # Render pyramid is built LAZILY on first envelope() — most channels are
             # never viewed, so building all of them at load is wasted work + memory on
             # wide (mic-array) captures.
@@ -943,7 +1072,7 @@ class AudioStore:
         if not chans:
             return b"", native, 0, "Int16"
         wide = (depth >= 24)
-        full = float((1 << 31) - 1) if wide else 32767.0
+        out_bits = 32 if wide else 16
         dt = np.int32 if wide else np.int16
         lo, hi = (-(1 << 31), (1 << 31) - 1) if wide else (-32768, 32767)
         out_rate = native
@@ -955,8 +1084,7 @@ class AudioStore:
         for ch in chans:
             s = self.samples(device, dp, ch)[start:stop].astype(np.float64)
             bits = self.sample_bits(device, dp, ch)
-            scale = full / float(1 << (bits - 1)) if bits and bits > 1 else 1.0
-            s = s * scale
+            s = s * _playback_scale(bits, out_bits)
             if do_resample:
                 s = resample(s, native, out_rate)
             cols.append(np.clip(np.round(s), lo, hi).astype(dt))
@@ -969,13 +1097,13 @@ class AudioStore:
             out[i::nch][:c.size] = c                # interleave channel-major, zero-fill tail
         return out.tobytes(), out_rate, len(cols), ("Int32" if wide else "Int16")
 
-    # ---- WAV export ----
+    # ---- Playback PCM and WAV export ----
     def pcm_int16(self, device: int, dp: int, channels: Optional[List[int]] = None,
                   start: int = 0, stop: Optional[int] = None):
-        """Interleaved 16-bit PCM for a (device, dataport), normalised to full
-        scale, for in-app playback. Returns (np.int16 interleaved, sample_rate_hz,
-        n_channels). Each channel is scaled from its own bit width so all play at
-        comparable loudness; `start`/`stop` window by sample index."""
+        """Interleaved 16-bit PCM for a (device, dataport), for in-app playback. Returns
+        (np.int16 interleaved, sample_rate_hz, n_channels). Each channel is left-justified
+        from its own bit width (`_playback_scale`: a 16-bit stream plays unchanged) so all
+        play at comparable loudness; `start`/`stop` window by sample index."""
         chans = [c for c in (channels if channels is not None
                              else self.channels(device, dp))
                  if (device, dp, c) in self._channels]
@@ -985,8 +1113,7 @@ class AudioStore:
         for ch in chans:
             s = self.samples(device, dp, ch)[start:stop]
             bits = self.sample_bits(device, dp, ch)
-            scale = 32767.0 / float(1 << (bits - 1)) if bits and bits > 1 else 1.0
-            cols.append(np.clip(np.round(s.astype(np.float64) * scale),
+            cols.append(np.clip(np.round(s.astype(np.float64) * _playback_scale(bits, 16)),
                                 -32768, 32767).astype(np.int16))
         # Zero-fill shorter channels to the longest (matches export_wav / pcm_play).
         n = max((c.size for c in cols), default=0)
@@ -1005,7 +1132,15 @@ class AudioStore:
 
         `target_rate` (Hz) resamples every channel to that rate before writing
         (band-limited; see dsp.resample) — e.g. decimate a PDM/odd-rate stream to
-        48 kHz. None keeps the native rate."""
+        48 kHz. None keeps the native rate.
+
+        The file is WAVE_FORMAT_EXTENSIBLE integer PCM. The container is 16, 24 or 32 bits
+        (the widest channel's size, `container_bits`) and wValidBitsPerSample is that size.
+        Each sample is its signed value left-justified in the container by its OWN channel's
+        size, so a channel narrower than the widest reads at its true level, as in-app
+        playback (`pcm_int16`) plays it. A value past a channel's size (resampling overshoots,
+        and a PDM stream at full scale is kept unclipped, see decode_pdm) is clipped to it,
+        not wrapped. The file is complete before it replaces an existing `path`."""
         chans = channels if channels is not None else self.channels(device, dp)
         chans = [c for c in chans if (device, dp, c) in self._channels]
         if not chans:
@@ -1018,26 +1153,36 @@ class AudioStore:
         native = int(round(self.rate(device, dp))) or 48000
         out_rate = native
         if target_rate and int(round(target_rate)) != native:
-            from ..dsp import resample
             out_rate = int(round(target_rate))
+        bits = max(self.sample_bits(device, dp, ch) for ch in chans)
+        cbits = container_bits(bits)
+        try:                                    # before any resampling work
+            _check_wav_format(len(chans), out_rate, cbits)
+        except ValueError as exc:
+            raise ValueError(f"device {device} dp {dp}: {exc}") from None
+        if out_rate != native:
+            from ..dsp import resample
             slices = {ch: np.rint(resample(s, native, out_rate)).astype(np.int64)
                       for ch, s in slices.items()}
 
         length = max((s.size for s in slices.values()), default=0)
-        bits = max(self.sample_bits(device, dp, ch) for ch in chans)
-        cbits = container_bits(bits)
+        data_bytes = length * len(chans) * (cbits // 8)
+        if data_bytes > _WAV_MAX_DATA_BYTES:
+            raise ValueError(f"{data_bytes} bytes of audio exceed the 4 GiB a WAV file holds; "
+                             "export a narrower range or fewer channels")
 
         # Build the interleave buffer at the CONTAINER width (little-endian) directly, not
         # int64 then downcast, using 2-4x less memory. 24-bit builds in int32 and packs the
-        # low 3 bytes. CLIPPED to the container first: assigning a value past it wraps round
-        # instead, and a sample can pass it — resampling overshoots, and a PDM stream at full
-        # scale is kept unclipped (decode_pdm).
+        # low 3 bytes. Each value is clipped to its channel's size, then shifted up to the
+        # container's top bit.
         dt = np.dtype("<i2") if cbits == 16 else np.dtype("<i4")
-        top = (1 << (cbits - 1)) - 1
         frames = np.zeros((length, len(chans)), dtype=dt)
         for col, ch in enumerate(chans):
             s = slices[ch]
-            frames[: s.size, col] = np.clip(s, -top - 1, top)
+            own = self.sample_bits(device, dp, ch)
+            top = (1 << (own - 1)) - 1
+            frames[: s.size, col] = np.left_shift(np.clip(s, -top - 1, top).astype(np.int64),
+                                                  cbits - own)
         interleaved = frames.reshape(-1)
 
         if cbits == 24:  # low 3 little-endian bytes of the int32 two's complement
@@ -1046,11 +1191,13 @@ class AudioStore:
         else:
             raw = interleaved.tobytes()
 
-        with wave.open(path, "wb") as w:
-            w.setnchannels(len(chans))
-            w.setsampwidth(cbits // 8)
-            w.setframerate(out_rate)
-            w.writeframes(raw)
+        def write(f) -> None:
+            f.write(wav_header(len(chans), out_rate, cbits, bits, len(raw)))
+            f.write(raw)
+            if len(raw) & 1:
+                f.write(b"\0")                 # chunks are word-aligned
+
+        write_whole(path, write)
         return path
 
     def export_all(self, directory: str, prefix: str = "swi3s",

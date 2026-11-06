@@ -27,13 +27,17 @@ NFFT = 1024
 # a glitch shows from that far before it: 2.7 ms at 256 and 48 kHz, 21 ms at 2048, with
 # bins of 188 Hz and 23 Hz. Time against frequency resolution is the trade.
 FRAME_SIZES = (256, 512, 1024, 2048)
-# The smallest frame worth drawing; a shorter stream gets one frame of its own length.
+# The smallest frame worth drawing. A stream shorter than the frame length uses the largest
+# power of two that fits; a stream under this many samples has no spectrum.
 _MIN_NFFT = 16
 # dB below full scale treated as silence, so log10 never sees zero.
 FLOOR_DB = -140.0
-# 4-term Blackman-Harris coefficients: sidelobes at -92 dB. A full-scale tone's leakage is
-# under -90 dB beyond 5 bins and under -100 dB beyond 10; it stays above the Audio pane's
-# -120 dB colour floor for about 70 bins either side. Scalloping loss is at most 0.83 dB.
+# 4-term Blackman-Harris coefficients: sidelobes at -92 dB. A full-scale tone's leakage,
+# worst for a tone half a bin off a bin centre, is under -92 dB beyond 5 bins and under
+# -98 dB beyond 10 (the window's own response, 10.5 bins from the tone, is -99.3 dB). Over
+# the frames of a sustained 1 kHz tone (a third of a bin off) the skirt stays above the
+# Audio pane's -120 dB colour floor for about 70 bins either side. Scalloping loss is at
+# most 0.83 dB.
 _BH4 = (0.35875, 0.48829, 0.14128, 0.01168)
 
 

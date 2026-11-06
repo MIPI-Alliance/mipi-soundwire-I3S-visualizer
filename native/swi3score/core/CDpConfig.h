@@ -64,6 +64,7 @@ struct SwI3sDpConfig
     int  FCP_Offset = 0;
     bool FCP_GuardEnable = false;
     bool FCP_GuardPolarity = false;
+    bool FCP_ScramblerEn = true;  // the DRQ bit is scrambled (0x0E bit 3; FlowMode 2/3). Reset 1.
 
     // --- Derived (mirror DataPortConfig properties) ---
     int numChannels() const
@@ -98,11 +99,20 @@ struct SwI3sDpConfig
         return -1;
     }
 
-    // Same transport/decode-relevant config? (Ignores derived helpers and FCP electricals
-    // not used by the payload engine's sample assembly.) Used to decide whether a mid-
-    // stream reconfigure must re-apply a surviving port or can carry it over untouched.
+    // Same transport/decode-relevant config? Compares every field the payload engine
+    // reads: the data port's placement and sample assembly, and, for a port with a DRQ
+    // (drqEnabled), the FCP placement CFlowControlPort reads (FCP_HorizontalStart,
+    // FCP_Offset, FCP_BitWidth, FCP_TailWidth, FCP_GuardEnable, FCP_GuardPolarity) and the
+    // DRQ descrambling (FCP_ScramblerEn). Used to decide whether a mid-stream reconfigure
+    // must re-apply a surviving port or can carry it over untouched.
     bool sameTransport(const SwI3sDpConfig& o) const
     {
+        if (drqEnabled() &&
+            (FCP_HorizontalStart != o.FCP_HorizontalStart || FCP_Offset != o.FCP_Offset ||
+             FCP_BitWidth != o.FCP_BitWidth || FCP_TailWidth != o.FCP_TailWidth ||
+             FCP_GuardEnable != o.FCP_GuardEnable || FCP_GuardPolarity != o.FCP_GuardPolarity ||
+             FCP_ScramblerEn != o.FCP_ScramblerEn))
+            return false;
         return deviceNum == o.deviceNum && dpNumber == o.dpNumber &&
                EnableCh == o.EnableCh && ChannelGrouping == o.ChannelGrouping &&
                Spacing == o.Spacing && SampleSize == o.SampleSize &&
@@ -124,6 +134,14 @@ struct SwI3sConfig
     int  SkippingDenominator = 1;
     bool PHY3Enabled = false;
     double RowRateKHz = 0.0;          // rows per second, in kHz (CSV "RowRate")
+    // PHY3: the CDS column, CDS_HorizontalStart[4:0] (Column 0 is Sync1, the last column
+    // Sync0). -1 = not set by this config; cdsColumn() then gives the caller's column.
+    // BuildConfig reads the committed register; LoadCsv derives it as the visualizer does:
+    // S1 at Column 0, then its tail (S1TailWidth_REG), its handover (EnforceS1Handover),
+    // then the CDS.
+    int  CdsHorizontalStart = -1;
+    int  S1TailWidth = 0;
+    bool S1Handover = true;
     std::string description;
 
     // --- Control Data Stream, PER SOURCE ---
@@ -146,7 +164,8 @@ struct SwI3sConfig
     static const int kCdsSources = 13;               // Manager + Device 0..11
     int  CdsBitWidth = 0;                            // excess-1: UIs per CDS bit - 1
     std::vector<int>  CdsGuard;                      // 0 off, 1 G0, 2 G1
-    std::vector<int>  CdsTailWidth;                  // 0..3 UIs
+    std::vector<int>  CdsTailWidth;                  // 0..2 UIs defined; the 2-bit field
+                                                     // also holds the Reserved 3
     std::vector<int>  CdsDriveType;                  // 0 Special, 1 Normal
     std::vector<int>  CdsEndDriveEarly;              // 0 full UI, 1 stop early
 
@@ -154,7 +173,15 @@ struct SwI3sConfig
         : CdsGuard(kCdsSources, 0), CdsTailWidth(kCdsSources, 0),
           CdsDriveType(kCdsSources, 1), CdsEndDriveEarly(kCdsSources, 0) {}
 
-    std::vector<SwI3sDpConfig> dps;   // index = dataport number
+    std::vector<SwI3sDpConfig> dps;   // positional; a port's number is its dpNumber
+
+    // The PHY3 CDS column for a `columns`-wide row: CdsHorizontalStart when it is set and
+    // lies between Sync1 and Sync0 (1 .. columns - 2), else `fallback`.
+    int cdsColumn(int columns, int fallback) const
+    {
+        if (CdsHorizontalStart >= 1 && CdsHorizontalStart <= columns - 2) return CdsHorizontalStart;
+        return fallback;
+    }
 
     // Column count (NumColumns + 1), CLAMPED to [kMinColumnCount, kMaxColumnCount]. It is
     // used as a MODULUS and as an array bound, and NumColumns arrives unvalidated from an
@@ -162,7 +189,7 @@ struct SwI3sConfig
     // undefined behaviour. The raw register value stays in NumColumns for reporting and
     // round-trip; everything that computes with the count reads it through here —
     // Decoder::run(), CPayloadEngine::buildRuntime (which hands it to
-    // CDataPort/CFlowControlPort::Configure) and configsEqual.
+    // CDataPort/CFlowControlPort::Configure) and sameEnabledConfig.
     int columnCount() const
     {
         const int c = NumColumns + 1;
@@ -178,14 +205,19 @@ struct SwI3sConfig
     // (Section 4.2.3.1), and therefore the spacing of the only rows an SSP may legally
     // land on. Mirrors the visualizer's Interface.interval_lcm; a Numerator at or above
     // the Denominator skips everything and has no pattern, so it falls back to Interval.
-    long patternRows(const SwI3sDpConfig& d) const
+    long long patternRows(const SwI3sDpConfig& d) const
     {
-        long rows = static_cast<long>(d.Interval) + 1;
+        long long rows = static_cast<long long>(d.Interval) + 1;
         if (d.SkippingNumerator > 0 && d.SkippingNumerator < SkippingDenominator)
             rows *= SkippingDenominator;
         return rows;
     }
 
+    // The LCM of patternRows over the enabled ports that carry a channel and whose Interval
+    // is 0 or more (1 when there is none): the row period after which every port is back
+    // at the same point of its transport pattern. An LCM above `cap` (at least 1) returns
+    // `cap`, so the fold never overflows; a caller passes a cap above every row it reduces.
+    long long patternPeriod(long long cap) const;
     // Audio sample rate (Hz) for a dataport, derived from RowRate + the port's
     // Interval / SampleGrouping / Skipping / SubRowInterval. Mirrors the
     // visualizer's _calculate_sample_rate. Returns 0 if it cannot be computed
@@ -201,12 +233,15 @@ struct SwI3sConfig
 
     // What LoadCsv did not read as written, one line per field: a port disabled for its
     // DeviceNumber_REG, a value masked or clamped to its register field, a cell that is
-    // not a number or a boolean, values beyond the last data-port column. Cleared and
-    // filled by every LoadCsv; empty for a config built any other way.
+    // not a number or a boolean, values beyond the last data-port column, a key that is not
+    // a config field, a file that cannot be opened. Cleared and filled by every LoadCsv;
+    // empty for a config built any other way.
     std::vector<std::string> warnings;
 
-    // Load a visualizer-format CSV. Returns false (and sets 'error') on a
-    // malformed file. Missing optional fields fall back to defaults.
+    // Load a visualizer-format CSV. Returns false (and sets 'error') only when the file
+    // cannot be opened. Any other content loads: a leading UTF-8 byte-order mark is
+    // dropped, a key it does not recognise is ignored (reported in `warnings` unless it is
+    // a visualizer-only field), and a field it does not carry takes its default.
     bool LoadCsv(const std::string& path, std::string& error);
 
 private:

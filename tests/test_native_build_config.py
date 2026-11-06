@@ -6,8 +6,14 @@ locates the interpreter and the shared library but never checks for Python.h, so
 configuration must use CMake's FindPython with Development.Module. The launchers and README
 must name the headers as the prerequisite.
 
-These tests parse CMakeLists and the launchers rather than running CMake, so they work on
-any machine (CMake isn't a test dependency).
+The swi3score distribution's minor version is its score_abi, and the distribution carries
+the repository's licence.
+
+CMakeLists sets CMake 3.18 as its floor, stops on a missing interpreter with a message, and
+keeps -O3 off MSVC; it and build_local.sh compile the same sources, every .cpp of the core.
+
+These tests parse CMakeLists, the launchers and native/pyproject.toml rather than running
+CMake, so they work on any machine (CMake isn't a test dependency).
 """
 import os
 import re
@@ -25,7 +31,7 @@ def test_uses_the_modern_findpython():
     """PYBIND11_FINDPYTHON must be ON before find_package(pybind11).
 
     pybind11 only defaults to CMake's FindPython when policy CMP0148 is NEW, which our
-    cmake_minimum_required(3.15) leaves unset; without this it uses the legacy shim that
+    cmake_minimum_required(3.18) leaves unset; without this it uses the legacy shim that
     skips the header check."""
     text = _cmake_text()
     assert re.search(r"^\s*set\(PYBIND11_FINDPYTHON ON\)", text, re.M), \
@@ -34,6 +40,29 @@ def test_uses_the_modern_findpython():
     find_pybind = text.index("find_package(pybind11")
     assert find_flag < find_pybind, \
         "PYBIND11_FINDPYTHON must be set BEFORE find_package(pybind11) to take effect"
+
+
+def test_cmake_sets_its_floor_and_guards():
+    """CMake 3.18 is the floor FindPython's Development.Module needs; a missing interpreter
+    stops configure with a message naming the fix; -O3 is passed to every compiler but
+    MSVC, which has no such flag."""
+    text = _cmake_text()
+    m = re.search(r"cmake_minimum_required\(VERSION (\d+)\.(\d+)", text)
+    assert m and (int(m.group(1)), int(m.group(2))) >= (3, 18), m and m.group(0)
+    assert re.search(r'FATAL_ERROR "No Python interpreter found', text)
+    assert "$<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O3>" in text
+    assert text.count("-O3>") == 1, "-O3 appears outside the MSVC guard"
+
+
+def test_both_builds_compile_the_same_sources():
+    """CMakeLists and the offline build_local.sh compile the same .cpp files, and every
+    .cpp under native/swi3score is one of them."""
+    with open(os.path.join(_ROOT, "native", "build_local.sh"), encoding="utf-8") as f:
+        local = {os.path.basename(m) for m in re.findall(r'[\w/$"{}]+\.cpp', f.read())}
+    cmake = {os.path.basename(m) for m in re.findall(r"[\w/${}]+\.cpp", _cmake_text())}
+    tree = {name for _dir, _sub, files in os.walk(os.path.join(_ROOT, "native", "swi3score"))
+            for name in files if name.endswith(".cpp")}
+    assert local == cmake == tree, (local ^ tree, cmake ^ tree)
 
 
 def test_requires_the_development_headers():
@@ -65,7 +94,7 @@ def test_launchers_do_not_blame_the_compiler():
             text = f.read()
         # The unconditional compiler claim, in either launcher's phrasing.
         assert "a C++ compiler is required)" not in text, \
-            f"{name} still asserts a missing compiler as the cause"
+            f"{name} must not name a missing compiler as the cause"
         assert "Python.h" in text, \
             f"{name} should point at the Python headers as a likely cause"
 
@@ -87,7 +116,7 @@ def test_readme_has_a_no_root_recipe():
     with open(os.path.join(_ROOT, "README.md"), encoding="utf-8") as f:
         text = f.read()
     assert "No root / no sudo" in text, "no no-root section"
-    assert "SWI3S_PYTHON" not in text, "SWI3S_PYTHON is not a real variable"
+    assert "SWI3S_PYTHON" not in text, "the README must name PYTHON, not SWI3S_PYTHON"
     # The interpreter override run.sh actually reads, and both header overrides.
     assert "PYTHON=" in text
     assert "SKBUILD_CMAKE_DEFINE" in text, "no override for the pip/scikit-build path"
@@ -100,7 +129,7 @@ def test_launcher_interpreter_override_is_named_correctly():
     with open(os.path.join(_ROOT, "run.sh"), encoding="utf-8") as f:
         run_sh = f.read()
     assert 'PY="${PYTHON:-}"' in run_sh, \
-        "run.sh no longer reads PYTHON; update the README's no-root recipe too"
+        "run.sh must read PYTHON, the variable the README's no-root recipe names"
 
 
 def test_offline_builder_honours_a_header_override_and_checks_the_headers():
@@ -248,6 +277,38 @@ def test_readme_does_not_claim_windows_has_no_header_check():
     with open(os.path.join(_ROOT, "README.md"), encoding="utf-8") as f:
         text = f.read()
     assert "no equivalent check" not in text, \
-        "README still says run.ps1 has no header check; it does"
+        "the README must describe run.ps1's header check"
     assert "run.ps1" in text.split("No root / no sudo", 1)[1].split("</details>", 1)[0], \
         "the no-root section should say what the Windows launcher does"
+
+
+# ---- the swi3score distribution's metadata ------------------------------------------
+
+def _native_project() -> dict:
+    import tomllib
+    with open(os.path.join(_ROOT, "native", "pyproject.toml"), "rb") as f:
+        return tomllib.load(f)
+
+
+def test_the_core_version_minor_is_the_score_abi():
+    """native/pyproject.toml's minor version, the `score_abi` literal in bindings.cpp and
+    session._REQUIRED_SCORE_ABI are one number, so a pip install of a changed core is a new
+    version and the app refuses the old one."""
+    from swi3s_studio import session
+    version = _native_project()["project"]["version"]
+    with open(os.path.join(_ROOT, "native", "swi3score", "bindings.cpp"), encoding="utf-8") as f:
+        m = re.search(r'm\.attr\("score_abi"\)\s*=\s*(\d+);', f.read())
+    assert m, "bindings.cpp sets no score_abi literal"
+    assert int(version.split(".")[1]) == int(m.group(1)) == session._REQUIRED_SCORE_ABI, \
+        (version, m.group(1), session._REQUIRED_SCORE_ABI)
+
+
+def test_the_core_distribution_carries_the_licence():
+    """The swi3score wheel and sdist are built from native/ alone, so native/ holds the
+    repository's LICENSE.md byte for byte and its pyproject names it."""
+    project = _native_project()["project"]
+    assert project["license"] == "BSD-3-Clause"
+    assert project["license-files"] == ["LICENSE.md"]
+    with open(os.path.join(_ROOT, "LICENSE.md"), "rb") as a, \
+            open(os.path.join(_ROOT, "native", "LICENSE.md"), "rb") as b:
+        assert a.read() == b.read(), "native/LICENSE.md differs from LICENSE.md"

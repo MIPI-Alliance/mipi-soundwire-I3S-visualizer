@@ -30,6 +30,7 @@ the offscreen platform and says so in the report.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 
@@ -41,6 +42,14 @@ CLIP_SLACK = 2            # px of a widget's text it may not show before that is
 _TILE = 16
 _SIZE = (1400, 900)
 _STATES = ("start-light", "start-dark", "switched-to-dark", "switched-to-light")
+
+
+def _sheet_order(path: str) -> tuple[str, int]:
+    """The contact sheet's sort key for an image: its mode, then its state. Both are read
+    from the file name alone, never from the directory it is in."""
+    name = os.path.basename(path)
+    return (name.split("_start")[0].split("_switched")[0],
+            [s in name for s in _STATES].index(True))
 
 
 def _luminance(rgb):
@@ -98,9 +107,9 @@ def text_contrast(rgb) -> float:
 def _text_widgets(window):
     """(widget, its text, the inset that leaves out its frame) for every widget the text
     checks read: wholly on screen, enabled, showing text."""
-    from PySide6.QtWidgets import QAbstractButton, QComboBox, QLabel, QLineEdit
+    from PySide6.QtWidgets import QAbstractButton, QComboBox, QLabel, QLineEdit, QWidget
     out = []
-    for wdg in window.findChildren(QWidget_types()):
+    for wdg in window.findChildren(QWidget):
         if isinstance(wdg, QComboBox):
             text, inset = wdg.currentText(), 3
         elif isinstance(wdg, QLineEdit):
@@ -122,15 +131,10 @@ def _text_widgets(window):
     return out
 
 
-def QWidget_types():      # noqa: N802 - names the classes findChildren matches
-    from PySide6.QtWidgets import QWidget
-    return QWidget
-
-
 def clipped_by(wdg, text: str) -> int:
     """How many px of `text` `wdg` cannot show: a button, check box or single-line label
-    narrower than its size hint, or a glyph button or line edit narrower than its text. 0 when it fits, or
-    when the widget wraps or elides by design (a word-wrapped label, a combo box)."""
+    narrower than its size hint, or a glyph button or line edit narrower than its text. 0 when
+    it fits, or when the widget wraps or elides by design (a word-wrapped label, a combo box)."""
     from PySide6.QtWidgets import QAbstractButton, QLabel, QLineEdit, QToolButton
     if isinstance(wdg, QToolButton):        # a glyph button: the glyph itself must fit
         return max(0, wdg.fontMetrics().horizontalAdvance(text) - wdg.width())
@@ -171,10 +175,11 @@ def widget_tones(window, img) -> dict:
         QComboBox,
         QLineEdit,
         QRadioButton,
+        QWidget,
     )
     rgb = image_array(img)
     tones = {}
-    for wdg in window.findChildren(QWidget_types()):
+    for wdg in window.findChildren(QWidget):
         if not isinstance(wdg, (QLineEdit, QComboBox, QAbstractButton, QAbstractSpinBox)):
             continue
         if isinstance(wdg, (QCheckBox, QRadioButton)) or not wdg.isVisible():
@@ -228,8 +233,11 @@ def check_window(window, img, mode: str) -> tuple[list[str], str]:
     return found, summary
 
 
-def _contact_sheet(paths: list[str], out: str) -> None:
+def _contact_sheet(paths: list[str], out: str) -> list[str]:
+    """Lay the images at `paths` out on one sheet saved as `out`. Returns the findings: an
+    image that could not be read back, and a sheet that could not be written."""
     from PySide6.QtGui import QColor, QFont, QImage, QPainter
+    found = []
     cols, w, h, label = 4, 700, 450, 24
     rows = (len(paths) + cols - 1) // cols
     sheet = QImage(cols * w, rows * (h + label), QImage.Format_RGB32)
@@ -240,9 +248,14 @@ def _contact_sheet(paths: list[str], out: str) -> None:
         x, y = (i % cols) * w, (i // cols) * (h + label)
         p.drawText(x + 4, y + 18, os.path.basename(path))
         img = QImage(path)
+        if img.isNull():
+            found.append(f"could not read {path} for the contact sheet")
+            continue
         p.drawImage(x + 3, y + label, img.scaled(w - 6, h - 6))
     p.end()
-    sheet.save(out)
+    if not sheet.save(out):
+        found.append(f"could not write the contact sheet {out}")
+    return found
 
 
 def _platform() -> str:
@@ -254,9 +267,32 @@ def _platform() -> str:
     return ""
 
 
+def render_state(win, theme: str, name: str, out: str) -> tuple[str, list[str], str, dict]:
+    """Grab `win` as it stands, save it as `out/<name>.png`, and check it against `theme`.
+    Returns (path, findings, summary, widget tones). render() calls it once per mode and
+    state, so a test can replace it and read the names render() asks for."""
+    img = win.grab().toImage()
+    path = os.path.join(out, name + ".png")
+    saved = img.save(path)
+    found, summary = check_window(win, img, theme)
+    if not saved:
+        found = [*found, f"could not write {path}"]
+    return path, found, summary, widget_tones(win, img)
+
+
 def render(out: str) -> int:
-    """Render every mode in every state into `out` and check each; 0 when nothing is found."""
+    """Render every mode in every state into `out` and check each; 0 when nothing is found.
+    The settings the renders write go to a temporary directory, removed when they end."""
+    settings = tempfile.mkdtemp(prefix="swi3s_screenshots_")
+    try:
+        return _render(out, settings)
+    finally:
+        shutil.rmtree(settings, ignore_errors=True)
+
+
+def _render(out: str, settings: str) -> int:
     plat = _platform()
+    asked = os.environ.get("QT_QPA_PLATFORM")
     if plat:
         os.environ["QT_QPA_PLATFORM"] = plat
     else:
@@ -266,8 +302,7 @@ def render(out: str) -> int:
     QCoreApplication.setOrganizationName("MIPI SWI3S Screenshots")
     QCoreApplication.setApplicationName("SWI3S Studio Screenshots")
     QSettings.setDefaultFormat(QSettings.IniFormat)
-    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope,
-                      tempfile.mkdtemp(prefix="swi3s_screenshots_"))
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, settings)
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     from swi3s_studio.ui.singleton_pin import pin_singletons
@@ -285,6 +320,10 @@ def render(out: str) -> int:
                          f"python {sys.version.split()[0]}"]
     if plat:
         report.append("NOTE: no display, so the offscreen platform and its style were used")
+    if asked and asked != app.platformName():
+        report.append(f"NOTE: QT_QPA_PLATFORM={asked} was set and "
+                      f"{'is not used' if plat else 'is cleared'}: the renders run on "
+                      f"{app.platformName()}")
     failed = 0
     tones = {}
     for start in ("light", "dark"):
@@ -306,13 +345,9 @@ def render(out: str) -> int:
             for mode in MODES:
                 win._mode_mgr.switch_to(mode)
                 settle()
-                img = win.grab().toImage()
                 name = f"{MODE_LABELS[mode].replace(' ', '_')}_{state}"
-                path = os.path.join(out, name + ".png")
-                img.save(path)
+                path, found, summary, tones[name] = render_state(win, theme, name, out)
                 paths.append(path)
-                found, summary = check_window(win, img, theme)
-                tones[name] = widget_tones(win, img)
                 failed += len(found)
                 verdict = "ok" if not found else f"{len(found)} finding(s)"
                 report.append(f"{name}: {verdict} ({summary})")
@@ -331,11 +366,12 @@ def render(out: str) -> int:
                 report.append(f"{name}: {len(stale)} widget(s) not re-themed")
                 report.extend(f"    THEME not re-applied — {k[0]} {k[1]} \"{k[2][:40]}\" "
                               f"at ({k[3]}, {k[4]})".replace("  ", " ") for k in stale)
-    paths.sort(key=lambda p: (os.path.basename(p).split("_start")[0].split("_switched")[0],
-                              [s in p for s in _STATES].index(True)))
+    paths.sort(key=_sheet_order)
     sheet = os.path.join(out, "contact_sheet.png")
-    _contact_sheet(paths, sheet)
+    sheet_found = _contact_sheet(paths, sheet)
+    failed += len(sheet_found)
     report.append(f"contact sheet: {sheet}")
+    report.extend(f"    {f}" for f in sheet_found)
     with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(report) + "\n")
     print("\n".join(report), flush=True)
@@ -343,9 +379,11 @@ def render(out: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    out = os.path.join(_ROOT, "build", "screenshots")
-    if "--out" in argv:
-        out = os.path.abspath(argv[argv.index("--out") + 1])
+    if argv and not (len(argv) == 2 and argv[0] == "--out" and argv[1]
+                     and not argv[1].startswith("-")):
+        print("usage: python3 tools/screenshots.py [--out DIR]", file=sys.stderr)
+        return 2
+    out = os.path.abspath(argv[1]) if argv else os.path.join(_ROOT, "build", "screenshots")
     return render(out)
 
 

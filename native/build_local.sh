@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Offline build of the swi3score pybind11 module (no PyPI / scikit-build-core).
 #
-# Compiles the vendored C++ decode core + the ISampleSource/Decoder/Demo +
+# Compiles the C++ decode core + the ISampleSource/Decoder/Demo +
 # pybind11 bindings straight into an importable extension. The normal build path
 # is `pip install ./native` (scikit-build-core); use this when PyPI is
 # unreachable. Requires a C++ compiler (clang++ preferred, g++ accepted, $CXX
-# honoured), Python dev headers, and pybind11 headers (auto-discovered, incl. the
-# copy bundled with torch).
+# honoured), Python dev headers, and pybind11 headers: $PYBIND11_INCLUDE, else those of
+# the pybind11 package installed for the interpreter.
 #
-# Usage:  ./build_local.sh   then   PYTHONPATH=.. python3 -c "import swi3score"
+# Usage:  bash native/build_local.sh   then   PYTHONPATH=. python3 -c "import swi3score"
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# Decode core is vendored in-repo (see CMakeLists.txt / swi3score/core/README.md).
-PLUGIN_SRC="$HERE/swi3score/core"
+# The decode core sources in swi3score/core are compiled directly (see CMakeLists.txt).
+CORE_SRC="$HERE/swi3score/core"
 
 # Every Python fact below comes from ONE interpreter, the one that imports the result:
 # pybind11 from one Python and EXT_SUFFIX from another name the module for an interpreter
@@ -22,16 +22,7 @@ PLUGIN_SRC="$HERE/swi3score/core"
 PY="${PYTHON:-python3}"
 
 PYBIND="${PYBIND11_INCLUDE:-$("$PY" -c 'import pybind11; print(pybind11.get_include())' 2>/dev/null || true)}"
-if [ -z "${PYBIND}" ] || [ ! -f "${PYBIND}/pybind11/pybind11.h" ]; then
-    # Fall back to the pybind11 headers bundled inside an installed torch.
-    PYBIND="$("$PY" - <<'PYEOF' 2>/dev/null || true
-import os, importlib.util
-s = importlib.util.find_spec("torch")
-print(os.path.join(os.path.dirname(s.origin), "include") if s else "")
-PYEOF
-)"
-fi
-[ -f "${PYBIND}/pybind11/pybind11.h" ] || { echo "pybind11 headers not found; set PYBIND11_INCLUDE" >&2; exit 1; }
+[ -f "${PYBIND}/pybind11/pybind11.h" ] || { echo "pybind11 headers not found; pip install pybind11 or set PYBIND11_INCLUDE" >&2; exit 1; }
 
 PYINC="${PYTHON_INCLUDE:-$("$PY" -c 'import sysconfig; print(sysconfig.get_path("include"))')}"
 # Check for Python.h, not just the directory: sysconfig reports the BASE prefix's include
@@ -50,14 +41,17 @@ A virtualenv does NOT supply them — it inherits its base prefix.
                    uv python install 3.12   (or miniforge/conda)
                  or extract them from the matching RPM into your home dir and point
                  this script at them:
-                   PYTHON_INCLUDE=\$HOME/pyhdr/usr/include/python3.12 ./build_local.sh
+                   PYTHON_INCLUDE=\$HOME/pyhdr/usr/include/python3.12 bash native/build_local.sh
 
-See the README ("No root / no sudo") for the full recipe.
+See the repository-root README.md ("No root / no sudo") for the full recipe.
 EOF
     exit 1
 fi
 SUFFIX="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
-OUT="$HERE/../swi3score${SUFFIX}"
+# $SWI3S_NATIVE_OUT names another output path, and $SWI3S_NATIVE_FLAGS replaces the
+# optimisation flags (tools/native_coverage.py builds an instrumented core this way).
+OUT="${SWI3S_NATIVE_OUT:-$HERE/../swi3score${SUFFIX}}"
+OPT_FLAGS="${SWI3S_NATIVE_FLAGS:--O3 -flto}"
 
 # The compiler and the link flags are platform-specific: take clang++ or g++ (Debian/Ubuntu
 # build-essential installs only g++), and pass `-undefined dynamic_lookup` on macOS only
@@ -82,21 +76,20 @@ echo "output   : $OUT"
 
 # -O3 + LTO: decode is per-clock-edge (millions of UIs), and the hot loop spans
 # several .cpp files, so cross-TU inlining matters. Portable (no -march=native).
-"$CXX" -O3 -flto -std=c++17 -shared -fPIC $LINK_FLAGS -fvisibility=hidden \
+"$CXX" $OPT_FLAGS -std=c++17 -shared -fPIC $LINK_FLAGS -fvisibility=hidden \
     -I"$PYBIND" -I"$PYINC" \
-    -I"$HERE/swi3score/compat" -I"$HERE/swi3score" -I"$PLUGIN_SRC" \
+    -I"$HERE/swi3score/compat" -I"$HERE/swi3score" -I"$CORE_SRC" \
     "$HERE/swi3score/bindings.cpp" \
     "$HERE/swi3score/Decoder.cpp" \
     "$HERE/swi3score/Demo.cpp" \
-    "$PLUGIN_SRC/C8b10bDecoder.cpp" \
-    "$PLUGIN_SRC/CCommandTransportParser.cpp" \
-    "$PLUGIN_SRC/CRegisterModel.cpp" \
-    "$PLUGIN_SRC/CColumnDetector.cpp" \
-    "$PLUGIN_SRC/CDpConfig.cpp" \
-    "$PLUGIN_SRC/CDataPort.cpp" \
-    "$PLUGIN_SRC/CFlowControlPort.cpp" \
-    "$PLUGIN_SRC/CPayloadEngine.cpp" \
-    "$PLUGIN_SRC/SwI3sProtocolDefs.cpp" \
+    "$CORE_SRC/C8b10bDecoder.cpp" \
+    "$CORE_SRC/CCommandTransportParser.cpp" \
+    "$CORE_SRC/CRegisterModel.cpp" \
+    "$CORE_SRC/CColumnDetector.cpp" \
+    "$CORE_SRC/CDpConfig.cpp" \
+    "$CORE_SRC/CDataPort.cpp" \
+    "$CORE_SRC/CFlowControlPort.cpp" \
+    "$CORE_SRC/CPayloadEngine.cpp" \
     -o "$OUT"
 
 echo "built $(basename "$OUT")"

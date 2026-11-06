@@ -68,7 +68,7 @@ def test_the_skipped_intervals_are_the_ones_the_accumulator_names():
     skipped = [g for g in gaps if g > 1.5 * one]
     assert all(abs(g - 2 * one) < 0.1 * one for g in skipped), \
         f"a gap that is neither one interval nor two: {sorted(set(gaps))}"
-    # 13 skips per 147 transported samples, +-1 for where the capture happens to end.
+    # 13 skips per 147 transported samples, within 2 for where the capture happens to end.
     want = len(gaps) * 13 / 147
     assert abs(len(skipped) - want) <= 2, \
         f"{len(skipped)} skipped intervals in {len(gaps)}; want ~{want:.0f}"

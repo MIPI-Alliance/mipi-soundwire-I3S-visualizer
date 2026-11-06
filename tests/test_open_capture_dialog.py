@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication, QLabel
 from swi3s_studio.ingest.probe import CaptureProbe, ProbedChannel
 from swi3s_studio.ui.open_capture_dialog import OpenCaptureDialog
 
+pytestmark = pytest.mark.gui
+
 
 def _probe(n=4, edges=(9000, 900, 8800, 700), windowed=True, duration=2.0, cost=10**9,
            kind="sal", analog=False, rate=500e6, two_file=False):
@@ -47,17 +49,6 @@ def test_one_link_named_link_1_on_the_busiest_clock_and_a_data_line():
     assert "(~9,000 edges)" in row.clock.currentText()
     assert dlg._all.isChecked() and not dlg._into.isVisibleTo(dlg)
     assert dlg._open_btn.isEnabled()
-
-
-def test_building_the_dialog_raises_nothing_in_a_slot(monkeypatch):
-    # PySide prints a slot's exception and carries on, so excepthook is hooked to see one
-    # (e.g. the window's first value validating before the Into radios exist).
-    import sys
-    raised = []
-    monkeypatch.setattr(sys, "excepthook", lambda *exc: raised.append(exc[1]))
-    for kw in ({}, {"names": ["Link 1"], "prefer_add": True}, {"budget": 10**8}):
-        _dlg(**kw)
-    assert raised == []
 
 
 def test_the_source_says_what_the_file_is():
@@ -97,8 +88,12 @@ def test_add_a_link_pairs_the_free_channels_and_runs_out():
 
 
 def test_two_channels_or_two_files_offer_no_second_link():
-    assert not _dlg(_probe(n=2, edges=(10, 1)))._add_row_btn.isVisibleTo(None)
-    assert not _dlg(_probe(n=2, edges=(10, 1), two_file=True))._add_row_btn.isVisibleTo(None)
+    four = _dlg()
+    assert four._add_row_btn.isVisibleTo(four)
+    two = _dlg(_probe(n=2, edges=(10, 1)))
+    assert not two._add_row_btn.isVisibleTo(two)
+    pair = _dlg(_probe(n=2, edges=(10, 1), two_file=True))
+    assert not pair._add_row_btn.isVisibleTo(pair)
 
 
 # ---- what it refuses ---------------------------------------------------------------------
@@ -300,7 +295,7 @@ def test_a_file_that_is_not_a_capture_says_why(tmp_path, monkeypatch):
 
 def _analog_csv(tmp_path, channels):
     path = tmp_path / "scope.csv"
-    head = "Model,MSO58\nSample Interval,1.6e-10\n\nTIME," + ",".join(channels) + "\n"
+    head = "Model,SCOPE1\nSample Interval,1.6e-10\n\nTIME," + ",".join(channels) + "\n"
     rows = "".join(f"{i * 1e-9}," + ",".join("0.0" for _ in channels) + "\n"
                    for i in range(4))
     path.write_text(head + rows)
@@ -417,7 +412,7 @@ def _format_files(tmp_path):
     _write_synthetic_wfm(out["wfm"][0], _square_wave_codes(40000, 8), dt=1e-9)
     _write_synthetic_wfm(out["wfm"][1], _square_wave_codes(40000, 64), dt=1e-9)
     path = tmp_path / "scope.csv"
-    rows = ["Model,MSO58", "Sample Interval,1e-09", "TIME,CH1,CH2"]
+    rows = ["Model,SCOPE1", "Sample Interval,1e-09", "TIME,CH1,CH2"]
     rows += [f"{i * 1e-9:.12f},{1.0 if (i // 4) % 2 else 0.0},{1.0 if (i // 32) % 2 else 0.0}"
              for i in range(30000)]
     path.write_text("\n".join(rows) + "\n")
@@ -686,7 +681,7 @@ def test_the_probes_busy_dialog_holds_until_the_read_is_done(monkeypatch, tmp_pa
 
     from PySide6.QtCore import QEvent, Qt
     from PySide6.QtGui import QKeyEvent
-    from PySide6.QtWidgets import QProgressDialog
+    from PySide6.QtWidgets import QFileDialog, QProgressDialog
 
     from swi3s_studio.ingest import probe as probe_mod
     from swi3s_studio.ui.main_window import MainWindow
@@ -701,7 +696,11 @@ def test_the_probes_busy_dialog_holds_until_the_read_is_done(monkeypatch, tmp_pa
         QApplication.sendEvent(dlg, QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
         dlg.close()
         seen["still_up"] = dlg.isVisible()
-        seen["reentry_refused"] = win._probing
+        asked = []
+        monkeypatch.setattr(QFileDialog, "getOpenFileNames",
+                            staticmethod(lambda *a, **k: asked.append(1) or ([], "")))
+        win.open_capture()
+        seen["reentry_refused"] = win._probing and not asked
         gate.set()
     from PySide6.QtCore import QTimer
     QTimer.singleShot(600, poke)

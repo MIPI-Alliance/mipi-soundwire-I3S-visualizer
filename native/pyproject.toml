@@ -1,12 +1,18 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+# 0.11 is the first release that reads an SPDX `license` string and `license-files`.
+requires = ["scikit-build-core>=0.11", "pybind11>=2.12"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "swi3score"
-version = "0.1.0"
-description = "SWI3S PHY2 decode core (pybind11) — shared with the Saleae plugin"
-requires-python = ">=3.9"
+# The minor version is the module's score_abi (bindings.cpp); bump both together.
+version = "0.18.0"
+description = "SWI3S decode core (pybind11): PHY1, PHY2 and PHY3/DLV"
+readme = "README.md"
+# LICENSE.md is the repository root's LICENSE.md, copied so the wheel and sdist carry it.
+license = "BSD-3-Clause"
+license-files = ["LICENSE.md"]
+requires-python = ">=3.11"
 
 [tool.scikit-build]
 minimum-version = "0.10"

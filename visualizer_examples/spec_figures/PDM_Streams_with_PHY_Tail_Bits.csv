@@ -1,4 +1,4 @@
-AppVersion,3.1.0
+AppVersion,3.2.0
 NumColumns_REG,15
 SkippingDenominator_REG,16
 PHY3Enabled,True
@@ -8,7 +8,7 @@ EnforceS1Handover,True
 CDS_BitWidth_REG,0
 EnforceCDSHandover,True
 RowRate,3072.0
-Description,"This example shows an example Transport Pattern similar to that in the "PDM Streams With Sample Grouping DLV PHY" example, but including Tail bits. A Tail bit is inserted after the block of all bits transmitted from each Device before the subsequent HandOver UI (i.e., in Columns 1, 4 and 12 in this example). The Sample Grouping has been increased to 6 to reduce the number of UIs
+Description,"This example shows an example Transport Pattern similar to that in the ""PDM Streams With Sample Grouping DLV PHY"" example, but including Tail bits. A Tail bit is inserted after the block of all bits transmitted from each Device before the subsequent HandOver UI (i.e., in Columns 1, 4 and 12 in this example). The Sample Grouping has been increased to 6 to reduce the number of UIs
 used for Tail bits."
 RowsToDraw,7
 CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0

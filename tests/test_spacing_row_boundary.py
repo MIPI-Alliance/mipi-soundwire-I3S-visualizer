@@ -12,9 +12,12 @@ directly with the same registers (note 1.74 encodes channels_REG as N-1).
 """
 import os
 import tempfile
+import warnings
 
 import pytest
 import swi3score
+
+from swi3s_studio.import_notes import ImportIssueWarning
 
 _SLOT = list(swi3score.SLOT_NAMES)
 
@@ -39,6 +42,7 @@ def _csv(tmpdir, **over):
         "EnforceCDSHandover,False", "RowRate,3072.0", "Description,", "RowsToDraw,64",
         row("DeviceNumber_REG", 0),
         row("ManagerDataport", "False", "False"),
+        "DataPortNumber," + ",".join(str(i) for i in range(n)),
     ]
     for k, v in reg.items():
         lines.append(row(k, v))
@@ -103,7 +107,8 @@ def test_spacing_does_not_leak_into_the_next_row(engine, place):
 
     1.74 golden: {0: [1, 2], 1: [1, 2]}. Run against BOTH placement engines.
     """
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, warnings.catch_warnings():
+        warnings.simplefilter("error", ImportIssueWarning)      # the fixture is complete
         got = place(_csv(td), 4)
     assert got == {0: [1, 2], 1: [1, 2]}, (
         f"spacing leaked across the row boundary: {got}")

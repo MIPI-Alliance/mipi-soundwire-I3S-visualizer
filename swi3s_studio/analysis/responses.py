@@ -1,8 +1,9 @@
 """Symbolic names for SWI3S Command Transport response tokens.
 
-Python port of native/swi3score (SwI3sResponseNames.h): a Robust-Token number's
-meaning depends on the PhaseID, so token 0 resolves to WRITE_OK / READ_DATA_NOW /
-COMMIT_READY / … by phase. Used by the command table + CSV export.
+The one token-to-name table for the Robust Token numbers the Command Transport carries
+(the native core keeps no copy): a token's meaning depends on the PhaseID, so token 0
+resolves to WRITE_OK / READ_DATA_NOW / COMMIT_READY / … by phase. Used by the Commands
+table, the CSV export, the symbol pane and the register history.
 """
 from __future__ import annotations
 
@@ -56,11 +57,6 @@ def manager_response_name(phase: str, token: int) -> str:
     return ""
 
 
-def ping_name(token: int) -> str:
-    """Per-device PingInfo token ("Assignment of Robust Token Numbers (Peripheral)" table)."""
-    return {0: "ATTACHED", 6: "ATTACHED_BUSY", 8: "ALERT", 10: "ALERT_BUSY"}.get(token, "")
-
-
 def _group_devices(names) -> str:
     """Collapse a per-device name list into 'dev: NAME' entries, merging runs of
     consecutive devices that share a name: e.g. ['PING_ATTACHED','NO_RESPONSE',
@@ -75,6 +71,15 @@ def _group_devices(names) -> str:
         out.append(f"{dev}: {names[i]}")
         i = j + 1
     return ", ".join(out)
+
+
+def command_payload(cmd: dict) -> bytes:
+    """The bytes the Data column shows: a read's returned bytes (`read_data`), else the
+    Manager packet's write payload (`data`). A read carries no Manager-packet data, so it
+    would otherwise show blank. The Commands table and the CSV export share this rule."""
+    if cmd.get("has_read_data") and cmd.get("read_data"):
+        return cmd.get("read_data") or b""
+    return cmd.get("data") or b""
 
 
 def response_summary(cmd: dict) -> str:

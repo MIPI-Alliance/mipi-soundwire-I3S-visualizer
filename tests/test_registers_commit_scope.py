@@ -17,6 +17,8 @@ from swi3s_studio.analysis.register_history import register_history
 from swi3s_studio.model.registers import RegisterMap, apply_commands
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 NEXT, CURR = 0x1081, 0x10C1
 
 
@@ -136,6 +138,32 @@ def test_a_bus_reset_drops_what_was_staged_before_it():
     ev = register_history(cmds, 0, 0x21C0, resets=[100])
     assert [(e.access, e.value, e.applied) for e in ev] == [
         ("Write (NEXT)", 7, True), ("Commit", None, False)]
+
+
+def test_a_command_starting_exactly_at_a_bus_reset_sees_the_bus_since_it():
+    """A Commit that starts at the reset sample has nothing staged: the write before it was
+    staged on the far side of the reset."""
+    cmds = [_write(0x2180, [7], sample=10), _commit(0b0001, sample=100)]
+    ev = register_history(cmds, 0, 0x21C0, resets=[100])
+    assert [(e.access, e.value, e.applied) for e in ev] == [
+        ("Write (NEXT)", 7, True), ("Commit", None, False)]
+    assert _commits_in(register_history(cmds, 0, 0x21C0, resets=[101])) == [(1, True)]
+
+
+def test_the_grid_replay_since_a_bus_reset_keeps_a_write_starting_at_the_reset():
+    sess = Session.from_demo(8)
+
+    def write(sample, value):
+        return {"command": "WriteA32", "crc_valid": True, "has_address": True,
+                "device_mask": 0b1, "address": 0x2081, "data": bytes([value]),
+                "start_sample": sample}
+    sess._rel_cmds = [write(100, 0x81), write(200, 0x82), write(300, 0x83)]
+    sess._eff_sorted = None
+    sess._replay_resets = [200]
+    got = [r["data"][0] for r in sess._grid_replay_in_effect(250) if r.get("is_write")]
+    assert got == [0x82]                                   # not the write before the reset
+    got = [r["data"][0] for r in sess._grid_replay_in_effect(150) if r.get("is_write")]
+    assert got == [0x81]                                   # before the reset: all since 0
 
 
 def test_a_bus_reset_drops_the_pending_deferred_read():

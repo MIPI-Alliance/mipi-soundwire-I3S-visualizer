@@ -60,14 +60,16 @@ public:
     // Returns the token number 0..15, or -1 if it is not a (near) token.
     static int RobustToken(U16 rawSymbol);
 
-    // Decode a raw symbol as a standard 8b/10b code. Returns false if the
-    // codeword is not a legal D-code or the K.28.7 comma.
+    // Decode a raw symbol as a standard 8b/10b code. Returns false unless the codeword is
+    // a legal D-code or the K.28.7 comma; a 6b and a 4b sub-block that lean the same way
+    // (a total of fewer than 4 or more than 6 ones) is rejected.
     static bool DecodeSymbol(U16 rawSymbol, U8& value, bool& isControl, bool& isComma);
 
     // --- Encoding (for the simulator and round-trip tests) ---
-    // Produces valid codewords the decoder above accepts. Running disparity is
-    // not tracked: the RD- D-code variant is emitted (both variants decode to
-    // the same value), which is sufficient for stimulus generation.
+    // Produces legal codewords the decoder above accepts. Running disparity is not
+    // tracked across symbols: the 5b/6b sub-block takes its RD- form, and the 3b/4b
+    // sub-block takes its RD+ form after a non-neutral 6b sub-block. A run of +2 symbols
+    // therefore breaks running disparity across symbols.
     static U16 EncodeByte(U8 value);     // D-code 10-bit symbol (a@bit9..j@bit0)
     static U16 EncodeToken(int token);   // Robust Token symbol, token 0..15
     static U16 CommaSymbol();            // K.28.7 SPM

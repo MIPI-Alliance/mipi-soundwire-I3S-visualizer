@@ -25,16 +25,25 @@ import subprocess
 import sys
 
 import pytest
+from conftest import commit_files, git_in, symlink_or_skip
+
+# Every git the scanner runs on a throwaway tree works on that tree, whatever repository
+# the environment points at.
+pytestmark = [pytest.mark.platform, pytest.mark.usefixtures("isolated_git")]
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _patterns():
+def _load():
     spec = importlib.util.spec_from_file_location(
         "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod._STRUCTURAL
+    return mod
+
+
+def _patterns():
+    return _load()._STRUCTURAL
 
 
 def _hits(text: str) -> bool:
@@ -46,7 +55,7 @@ def _hits(text: str) -> bool:
 # by a port, and ending a sentence.
 @pytest.mark.parametrize("text", [
     "ssh user@10.0.1.42",
-    "the lab host is 10.1.4.4 today",
+    "the host is 10.1.4.4 today",
     "10.20.30.40",
     "192.168.1.1",
     "172.16.5.9",
@@ -135,10 +144,7 @@ def test_the_scanner_scans_its_own_prose_for_site_patterns():
     as literal source. They must NOT skip the site-specific ones, which cannot self-match
     because they live outside the repository, so both files stay in the scanned list.
     """
-    spec = importlib.util.spec_from_file_location(
-        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _load()
 
     assert "tools/leak_scan.py" in mod._SELF and "tests/test_leak_scan.py" in mod._SELF
     # Both are in the scanned file list; exemption happens per pattern, not by omission.
@@ -153,10 +159,7 @@ def test_a_tree_that_is_not_a_checkout_skips_the_core_its_gate_built(tmp_path, m
     """A gate guest scans an exported tree with the native core built into its top level;
     that file is gitignored, never published, and named for its platform, so the walk leaves
     it out (top level only, as .gitignore has it) and keeps everything else."""
-    spec = importlib.util.spec_from_file_location(
-        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _load()
     for name in ("swi3score.cpython-312-someplatform.so", "swi3score.cp312-win_amd64.pyd",
                  "README.md", "native/swi3score_notes.so", "docs/swi3score.so.md"):
         path = tmp_path / name
@@ -167,31 +170,16 @@ def test_a_tree_that_is_not_a_checkout_skips_the_core_its_gate_built(tmp_path, m
 
 
 def test_the_working_tree_scan_includes_untracked_files_and_skips_ignored_ones(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, isolated_git):
     """The gate runs before committing, so a file not yet added is part of what it scans;
     a file .gitignore excludes is not."""
-    spec = importlib.util.spec_from_file_location(
-        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-    (tmp_path / ".gitignore").write_text("*.log\n", encoding="utf-8")
-    (tmp_path / "tracked.txt").write_text("x", encoding="utf-8")
-    for cmd in (["git", "init", "-q"], ["git", "add", "-A"], ["git", "commit", "-q", "-m", "b"]):
-        subprocess.run(cmd, cwd=tmp_path, check=True, env=env, capture_output=True)
+    mod = _load()
+    git_in(tmp_path, "init", "-q")
+    commit_files(tmp_path, {".gitignore": "*.log\n", "tracked.txt": "x"}, "b")
     (tmp_path / "new_fixture.json").write_text("{}", encoding="utf-8")
     (tmp_path / "run.log").write_text("x", encoding="utf-8")
     monkeypatch.setattr(mod, "_ROOT", str(tmp_path))
     assert mod._files(None) == [".gitignore", "new_fixture.json", "tracked.txt"]
-
-
-def _load():
-    spec = importlib.util.spec_from_file_location(
-        "leak_scan", os.path.join(_ROOT, "tools", "leak_scan.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 @pytest.mark.parametrize("pad", [0, 1])
@@ -303,9 +291,9 @@ def test_a_symlink_to_a_directory_is_listed_and_scanned_by_its_target(tmp_path, 
     outside = tmp_path / "outside"
     (outside / "inner").mkdir(parents=True)
     (outside / "inner" / "b.txt").write_text("x\n", encoding="utf-8")
-    os.symlink(str(dest / "elsewhere"), dest / "data" / "captures")
     (dest / "elsewhere").mkdir()
-    os.symlink(str(outside), dest / "data" / "linked")
+    symlink_or_skip(str(dest / "elsewhere"), dest / "data" / "captures")
+    symlink_or_skip(str(outside), dest / "data" / "linked")
     monkeypatch.setattr(mod, "_ROOT", str(dest))
     files = mod._files(None)
     assert files == ["data/a.txt", "data/captures", "data/linked", "tools/leak_scan.py"]
@@ -336,7 +324,67 @@ def test_tree_scans_a_directory_with_this_checkouts_patterns(tmp_path):
 
 @pytest.mark.parametrize("args", [("--tree=/nonexistent/tree/dir",),
                                   ("--tree=.", "HEAD"),
-                                  ("--tree=.", "--text=README.md")])
+                                  ("--tree=.", "--text=README.md"),
+                                  ("HEAD", "other"), ("HEAD", "--text=README.md")])
 def test_a_tree_option_that_cannot_be_honoured_is_refused(args):
     r = _run(*args)
     assert r.returncode == 2 and "no leaks found" not in r.stdout, r.stdout
+
+
+def test_a_tree_with_no_files_is_not_a_clean_scan(tmp_path):
+    r = _run(f"--tree={tmp_path}")
+    assert r.returncode == 2 and "no leaks found" not in r.stdout, r.stdout
+
+
+def test_a_directory_the_scan_cannot_list_is_a_failure(tmp_path):
+    if sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("permissions do not hide a directory here")
+    (tmp_path / "ok.md").write_text("clean\n", encoding="utf-8")
+    (tmp_path / "sealed").mkdir()
+    (tmp_path / "sealed" / "inside.md").write_text("clean\n", encoding="utf-8")
+    (tmp_path / "sealed").chmod(0)
+    try:
+        r = _run(f"--tree={tmp_path}")
+    finally:
+        (tmp_path / "sealed").chmod(0o700)
+    assert r.returncode == 1 and "COULD NOT BE READ" in r.stdout and "sealed/" in r.stdout, r.stdout
+    assert "no leaks found" not in r.stdout
+
+
+# UTF-16 without a byte-order mark is accepted only when the NULs of ASCII-range text fall
+# on one side of the pairs, in at least 40% of them (and few on the other side).
+def _pairs(n, nul_odd=0, nul_even=0):
+    """`n` byte pairs: the first `nul_odd` end in a NUL, the next `nul_even` start with one,
+    the rest hold two printable bytes."""
+    return b"".join(b"A\0" if i < nul_odd else b"\0A" if i < nul_odd + nul_even else b"AB"
+                    for i in range(n))
+
+
+@pytest.mark.parametrize("sample, codec", [
+    (_pairs(100, nul_odd=40), "utf-16-le"), (_pairs(100, nul_odd=39), None),
+    (_pairs(100, nul_even=40), "utf-16-be"), (_pairs(100, nul_even=39), None),
+    (_pairs(100, nul_odd=45, nul_even=5), "utf-16-le"),
+    (_pairs(100, nul_odd=45, nul_even=6), None),
+    (_pairs(100, nul_even=45, nul_odd=5), "utf-16-be"),
+    (_pairs(100, nul_even=45, nul_odd=6), None),
+    (b"\xff\xfe" + "世界世界".encode("utf-16-le"), "utf-16"),
+    (b"\xfe\xff" + "世界世界".encode("utf-16-be"), "utf-16"),
+    (b"", None)])
+def test_the_utf16_detection_thresholds(sample, codec):
+    assert _load()._utf16_codec(sample) == codec
+
+
+@pytest.mark.parametrize("printable, text", [(95, True), (91, True), (90, False), (85, False),
+                                             (50, False)])
+def test_utf16_is_text_only_when_nearly_all_of_it_is_printable(printable, text):
+    chars = "A" * printable + "\x01" * (100 - printable)
+    decoded, is_binary = _load().decode_bytes(chars.encode("utf-16-le"))
+    assert is_binary is (not text)
+    assert (decoded == chars) is text       # text is the decoded characters, not byte runs
+
+
+def test_a_binary_yields_its_printable_runs_of_four_or_more_bytes_only():
+    raw = (b"\x01abc\x02" + b"\x01abcd\x02") * 20 + b"\0" * 4
+    decoded, is_binary = _load().decode_bytes(raw)
+    assert is_binary
+    assert "abcd" in decoded and "abc\n" not in decoded.replace("abcd", "")

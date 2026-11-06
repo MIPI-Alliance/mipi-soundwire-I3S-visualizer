@@ -13,6 +13,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.analysis.register_history import RegisterEvent
 
+pytestmark = pytest.mark.gui
+
 
 def _app():
     return QApplication.instance() or QApplication([])
@@ -169,16 +171,15 @@ def test_an_open_history_window_re_reads_its_link_after_a_re_decode(three):
     dev, addr, w = _first_write(sess)
     dlg = win.show_register_history(dev, addr, "label")
     before = dlg._table.rowCount()
-    assert before >= 1 and dlg.event_at(0).start_sample == int(w["start_sample"])
+    assert before >= 2 and dlg.event_at(0).start_sample == int(w["start_sample"])
     sess.commands = [c for c in sess.commands if c is not w]    # the new decode lacks it
     win.load_session(sess)                                      # the re-decode path
     assert dlg.isVisible()
     assert dlg._table.rowCount() == before - 1
     assert all(dlg.event_at(r).start_sample != int(w["start_sample"])
                for r in range(dlg._table.rowCount()))
-    if dlg._table.rowCount():
-        dlg._on_double_click(0, 0)
-        assert win.cursor.sample == sess.row_sync_sample(int(dlg.event_at(0).start_sample))
+    dlg._on_double_click(0, 0)
+    assert win.cursor.sample == sess.row_sync_sample(int(dlg.event_at(0).start_sample))
 
 
 def test_a_re_decode_of_another_link_leaves_the_window_as_it_is(three):
@@ -189,6 +190,7 @@ def test_a_re_decode_of_another_link_leaves_the_window_as_it_is(three):
     before = dlg._table.rowCount()
     b.commands = [c for c in b.commands if c.get("command") != "WriteA32"]
     win.load_session(b)
+    assert dlg.isVisible()
     assert dlg._table.rowCount() == before
 
 

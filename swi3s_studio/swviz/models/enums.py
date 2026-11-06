@@ -1,6 +1,7 @@
 """Enumeration types for the SWI3S visualizer frame model"""
 
 from enum import Enum, Flag, IntEnum, auto
+from typing import Optional
 
 
 class DirectionType(Enum):
@@ -22,14 +23,21 @@ class FlowMode(IntEnum):
 
 
 class PortMode(IntEnum):
-    """Port mode for data ports.
+    """DPn_PortMode (the "Effect of DPn_PortMode" table).
 
-    Determines the operational mode of the data port.
+    In a test mode every Channel, TxPresentCh and FCP DRQ bit carries one fixed raw value,
+    before scrambling: 0 in Test0, 1 in Test1.
     """
-    NORMAL = 0        # Normal operation - data bits
+    NORMAL = 0        # Normal operation - payload data bits
     RESERVED = 1      # Reserved - not used
-    TEST_ONES = 2     # Test Mode - all ones (c0t1)
-    TEST_ZEROS = 3    # Test Mode - all zeros (c0t0)
+    TEST0 = 2         # Test0 - every bit raw 0
+    TEST1 = 3         # Test1 - every bit raw 1
+
+
+def port_mode_bit(port_mode: int) -> Optional[int]:
+    """The raw value every Channel, TxPresentCh and FCP DRQ bit carries in `port_mode`:
+    0 for Test0, 1 for Test1, None for Normal, Reserved or an out-of-range value."""
+    return {int(PortMode.TEST0): 0, int(PortMode.TEST1): 1}.get(int(port_mode))
 
 
 class TransportPhase(Enum):

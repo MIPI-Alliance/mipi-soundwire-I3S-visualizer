@@ -1,10 +1,14 @@
 // Abstract source of decoded UIs for the SWI3S decode core.
 //
-// The decode pipeline is driven from an ISampleSource backed by a .sal/CSV
-// reader. Each NextUi() advances to the next forwarded-clock edge (one edge per
-// UI) and reports the data-line level for the UI it ends, plus the absolute
-// sample number, matching the plugin's CBitstreamDecoder. Returns false at end
-// of capture.
+// The decode pipeline is driven from an ISampleSource. Each NextUi() delivers one UI: its
+// data level, the absolute sample number it is read at, and whether it is the UI's
+// "rising" mark. Returns false at end of capture. The sources are:
+//   - forwarded-clock captures (transition lists from CSV, binary and VCD readers): one
+//     UI per forwarded-clock edge, rising = a rising clock edge, the data level read at
+//     the edge;
+//   - a recovered-clock capture (DlvSampleSource): one UI per recovered column, read at
+//     its middle, rising = Column 0 of a row;
+//   - MemorySampleSource: an in-memory level plan for tests and the synthetic demo.
 
 #ifndef SWI3SCORE_ISAMPLESOURCE_H
 #define SWI3SCORE_ISAMPLESOURCE_H
@@ -20,8 +24,9 @@ class ISampleSource
 public:
     virtual ~ISampleSource() = default;
 
-    // Advance one UI. 'rising' = the clock edge that bounds this UI was rising;
-    // 'dataHigh' = data-line level for this UI; 'sampleNumber' = absolute sample.
+    // Advance one UI. 'rising' = the mark that bounds this UI is rising (a forwarded-clock
+    // rising edge; for a recovered clock, Column 0); 'dataHigh' = data-line level for this
+    // UI; 'sampleNumber' = absolute sample.
     virtual bool NextUi(bool& rising, bool& dataHigh, std::uint64_t& sampleNumber) = 0;
 
     // Capture sample rate (Hz), used to derive UI / row rate.
@@ -61,7 +66,7 @@ public:
 // In-memory source for tests and the synthetic demo: replays an absolute
 // per-UI data-level plan. It emits one leading rising "alignment" UI (data low)
 // so that, after the decoder aligns to the first rising edge, plan element 0 is
-// Column 0 of Row 0 -- matching the plugin's alignToColumnZero semantics.
+// Column 0 of Row 0.
 class MemorySampleSource : public ISampleSource
 {
 public:

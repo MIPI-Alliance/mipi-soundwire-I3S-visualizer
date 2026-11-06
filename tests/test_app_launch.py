@@ -11,9 +11,12 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from swi3s_studio import app as _app
+
+pytestmark = pytest.mark.gui
 
 
 def test_activate_is_import_safe():

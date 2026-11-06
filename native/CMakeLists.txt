@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.18)
 project(swi3score LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -20,12 +20,16 @@ check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg)
 # missing -devel package fails at configure time with a message naming it.
 #
 # pybind11 defaults to FindPython only when policy CMP0148 is NEW, which
-# cmake_minimum_required(3.15) leaves unset, so request it explicitly. scikit-build-core
+# cmake_minimum_required(3.18) leaves unset, so request it explicitly. FindPython's
+# Development.Module component needs CMake 3.18. scikit-build-core
 # passes Python_EXECUTABLE/Python_ROOT_DIR, which select the interpreter.
 set(PYBIND11_FINDPYTHON ON)
 find_package(Python QUIET COMPONENTS Interpreter Development.Module)
 if(NOT Python_Development.Module_FOUND)
     # Name the missing piece: the -devel package, not the interpreter.
+    if(NOT Python_Interpreter_FOUND)
+        message(FATAL_ERROR "No Python interpreter found. Pass one with -DPython_EXECUTABLE=...")
+    endif()
     message(FATAL_ERROR
         "Python development HEADERS not found (Python.h).\n"
         "  Interpreter: ${Python_EXECUTABLE}\n"
@@ -44,39 +48,40 @@ if(NOT Python_Development.Module_FOUND)
 endif()
 find_package(pybind11 CONFIG REQUIRED)
 
-# The verified decode classes (8b/10b, command/transport parser, register model,
-# column detector, data-port / flow-control / payload engines) are vendored into
-# swi3score/core/ so this project builds standalone. ISampleSource + Decoder take the
-# place of the analyzer plugin's CBitstreamDecoder/WorkerThread, and compat/ supplies
-# an SDK-free <LogicPublicTypes.h>. See swi3score/core/README.md for the file list.
-set(PLUGIN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/swi3score/core")
+# The decode classes (8b/10b, command/transport parser, register model, column detector,
+# data-port / flow-control / payload engines) live in swi3score/core/ and are compiled
+# directly, so the project builds standalone. ISampleSource + Decoder drive them, and
+# compat/ supplies an SDK-free <LogicPublicTypes.h>. See swi3score/core/README.md for the
+# file list.
+set(CORE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/swi3score/core")
 
 pybind11_add_module(swi3score
     swi3score/bindings.cpp
     swi3score/Decoder.cpp
     swi3score/Demo.cpp
-    ${PLUGIN_SRC}/C8b10bDecoder.cpp
-    ${PLUGIN_SRC}/CCommandTransportParser.cpp
-    ${PLUGIN_SRC}/CRegisterModel.cpp
-    ${PLUGIN_SRC}/CColumnDetector.cpp
-    ${PLUGIN_SRC}/CDpConfig.cpp
-    ${PLUGIN_SRC}/CDataPort.cpp
-    ${PLUGIN_SRC}/CFlowControlPort.cpp
-    ${PLUGIN_SRC}/CPayloadEngine.cpp
-    ${PLUGIN_SRC}/SwI3sProtocolDefs.cpp
+    ${CORE_SRC}/C8b10bDecoder.cpp
+    ${CORE_SRC}/CCommandTransportParser.cpp
+    ${CORE_SRC}/CRegisterModel.cpp
+    ${CORE_SRC}/CColumnDetector.cpp
+    ${CORE_SRC}/CDpConfig.cpp
+    ${CORE_SRC}/CDataPort.cpp
+    ${CORE_SRC}/CFlowControlPort.cpp
+    ${CORE_SRC}/CPayloadEngine.cpp
 )
 
 # compat/ provides the SDK-free <LogicPublicTypes.h> and must precede any SDK
-# include dir (none is added), so the vendored sources build with no SDK linkage.
+# include dir (none is added), so the sources build with no SDK linkage.
 target_include_directories(swi3score PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/swi3score/compat"
     "${CMAKE_CURRENT_SOURCE_DIR}/swi3score"
-    "${PLUGIN_SRC}"
+    "${CORE_SRC}"
 )
 
-# Force -O3 even if the toolchain's Release default is -O2, and enable LTO when the
-# toolchain supports it (cross-TU inlining of the per-edge decode path).
-target_compile_options(swi3score PRIVATE $<$<CONFIG:Release>:-O3>)
+# Force -O3 on GCC/Clang even if the toolchain's Release default is -O2 (MSVC has no -O3
+# and optimises Release with /O2), and enable LTO when the toolchain supports it
+# (cross-TU inlining of the per-edge decode path).
+target_compile_options(swi3score PRIVATE
+    $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O3>)
 if(_ipo_ok)
     set_target_properties(swi3score PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 endif()

@@ -8,25 +8,10 @@ Classes:
     BitSlotState: Complete state of a bit slot
 """
 
-import re
 from dataclasses import dataclass
 from typing import Optional
 
 from .enums import DirectionType, DisplayField, SlotType
-
-# =============================================================================
-# Pattern Constants
-# =============================================================================
-
-# Pre-compiled regex patterns for label parsing
-PATTERN_CB = re.compile(r"^C(\d+)B(-?\d+)$")      # CXbY format
-PATTERN_SC = re.compile(r"^S(\d+)C(\d+)$")       # SXcY format
-PATTERN_SB = re.compile(r"^S(\d+)B(-?\d+)$")     # SXbY format
-PATTERN_SCB = re.compile(r"^S(\d+)C(\d+)B(-?\d+)$")  # SXcYbZ format
-PATTERN_C = re.compile(r"^C(\d+)$")              # CX format (channel only, for merged bits)
-PATTERN_S = re.compile(r"^S(\d+)$")              # SX format (sample only, for merged bits)
-PATTERN_TXP = re.compile(r"^TxP(\d+)$")          # TxPn format (TxPresent bit with channel)
-
 
 # =============================================================================
 # BitSlotData Class
@@ -76,71 +61,6 @@ class BitSlotData:
 
         return "".join(parts)  # Returns empty string if no fields selected
 
-    @classmethod
-    def from_label(cls, label: str) -> Optional['BitSlotData']:
-        """Parse label back to BitSlotData.
-
-        Args:
-            label: String in format "CXBY", "SXCY", "SXBY", or "SXCYBZ"
-
-        Returns:
-            BitSlotData instance, or None if label doesn't match format
-        """
-        # Try all supported formats using pre-compiled patterns
-        # Format: cXbY
-        match = PATTERN_CB.fullmatch(label)
-        if match:
-            return cls(
-                channel=int(match.group(1)),
-                bit=int(match.group(2))
-            )
-
-        # Format: sXcY (sample + channel)
-        match = PATTERN_SC.fullmatch(label)
-        if match:
-            return cls(
-                channel=int(match.group(2)),
-                bit=0,
-                sample_in_group=int(match.group(1))
-            )
-
-        # Format: sXbY (sample + bit)
-        match = PATTERN_SB.fullmatch(label)
-        if match:
-            return cls(
-                channel=0,
-                bit=int(match.group(2)),
-                sample_in_group=int(match.group(1))
-            )
-
-        # Format: sXcYbZ (all three)
-        match = PATTERN_SCB.fullmatch(label)
-        if match:
-            return cls(
-                channel=int(match.group(2)),
-                bit=int(match.group(3)),
-                sample_in_group=int(match.group(1))
-            )
-
-        # Format: cX (channel only, for merged bits)
-        match = PATTERN_C.fullmatch(label)
-        if match:
-            return cls(
-                channel=int(match.group(1)),
-                bit=0
-            )
-
-        # Format: sX (sample only, for merged bits)
-        match = PATTERN_S.fullmatch(label)
-        if match:
-            return cls(
-                channel=0,
-                bit=0,
-                sample_in_group=int(match.group(1))
-            )
-
-        return None
-
 
 # =============================================================================
 # BitSlotState Class
@@ -167,14 +87,6 @@ class BitSlotState:
             True if slot_type is DATA
         """
         return self.slot_type == SlotType.DATA
-
-    def is_control_slot(self) -> bool:
-        """Check if this is a control slot (CDS, S0, S1).
-
-        Returns:
-            True if slot_type is CDS, S0, or S1
-        """
-        return self.slot_type in (SlotType.CDS, SlotType.S0, SlotType.S1)
 
     def is_owned(self) -> bool:
         """Check if this slot is owned by a data port.
@@ -223,16 +135,3 @@ class BitSlotState:
             return ""
         else:
             return "not owned"
-
-
-# =============================================================================
-# Sentinel Values
-# =============================================================================
-
-# Sentinel value for empty positions (DataPort returns this when not active at current position)
-EMPTY_SLOT = BitSlotState(
-    slot_type=SlotType.EMPTY,
-    direction=DirectionType.SOURCE,
-    device_num=-1,
-    dp_num=-1
-)

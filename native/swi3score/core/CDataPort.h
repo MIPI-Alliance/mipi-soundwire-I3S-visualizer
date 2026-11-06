@@ -13,6 +13,8 @@
 
 #include "CDpConfig.h"
 
+#include <cstdint>
+
 enum class SwI3sSlot { Empty, Data, TxPresent, Guard0, Guard1, Tail, Drq };
 
 struct DpEmit
@@ -38,6 +40,22 @@ public:
     // Bind configuration. 'numColumns' and 'skippingDenominator' are the
     // shared bus geometry / interface registers.
     void Configure(const SwI3sDpConfig& cfg, int numColumns, int skippingDenominator);
+
+    // Apply a committed config to a running port without re-anchoring it: the column,
+    // interval phase and skipping accumulator are kept (only an SSP restarts the interval,
+    // {ASW5103}). The channel set that governs transport follows these rules:
+    //   * The channels sent in an interval are exactly one channel set, in channel order.
+    //   * If this interval's transport has not begun (the channel walk is at its start:
+    //     the commit point is an interval boundary, a row before Offset, a skipped
+    //     interval, or between sub-row intervals), the new config governs this interval:
+    //     a disabled channel sends nothing in it and an enabled one sends its first sample.
+    //   * Otherwise the interval finishes on the channel set it began with, and the new
+    //     set governs from the next interval. The specification states no rule for a
+    //     commit point after transport has begun; this is the rule the decoder applies.
+    // The decoder's DSCR / immediate-write reconfigure and every generator that mirrors it
+    // call this one function.
+    void ApplyConfigKeepingPhase(const SwI3sDpConfig& cfg, int numColumns,
+                                 int skippingDenominator);
 
     // Initialize transport state. 'startColumn' is the bus column the FIRST tick
     // lands on (default 0). A truncated/mid-stream capture starts partway into a
@@ -68,6 +86,10 @@ public:
              bitInChannel, wideBitRemaining;
         bool txpPending;
         int  sampleSizeLoaded;
+        // The channel set the current interval's walk runs on (EnableCh mask and effective
+        // ChannelGrouping); it becomes the configured set at the next walk start.
+        std::uint32_t walkEnableCh;
+        int  walkEffChannelGrouping;
     };
     State SaveState() const;
     void  RestoreState(const State& s);
@@ -92,6 +114,9 @@ private:
 
     void initializeTransport();
     void startInterval();
+    void loadChannelSet();
+    void setWalkChannels(std::uint32_t enableCh, int effChannelGrouping);
+    bool walkAtStart() const;
     bool advanceSkippingAccumulator();
     void advanceColumn();
     void advanceRow();
@@ -108,9 +133,15 @@ private:
     int mNumColumns = 2;
     int mSkippingDenominator = 1;
 
-    // Derived config, precomputed once in Configure() so the per-UI hot path doesn't
-    // re-scan the EnableCh bitmask every tick: channel count, effective channel
-    // grouping, and channel NUMBER for each enabled ordinal (index -> channel).
+    // The configured channel set, derived in Configure(): EnableCh and the effective
+    // channel grouping.
+    std::uint32_t mCfgEnableCh = 0;
+    int mCfgEffChannelGrouping = 1;
+    // The channel set the walk runs on, loaded from the configured set at each walk start
+    // (initializeTransport), so the per-UI hot path reads these instead of re-scanning the
+    // mask: channel count, effective channel grouping, and the channel NUMBER for each
+    // enabled ordinal (index -> channel; entries at and above the count are 0).
+    std::uint32_t mWalkEnableCh = 0;
     int mNumChannels = 0;
     int mEffChannelGrouping = 0;
     int mChannelOfIndex[16] = {0};

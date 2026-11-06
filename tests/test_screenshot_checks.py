@@ -7,7 +7,9 @@ screenshots check, on each platform's own style.
 """
 import importlib.util
 import os
+import types
 
+import conftest
 import numpy as np
 import pytest
 from PySide6.QtWidgets import (
@@ -18,6 +20,8 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
+
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _app = QApplication.instance() or QApplication([])
@@ -129,7 +133,89 @@ def test_the_tone_of_a_widget_is_read_from_its_inside():
     window.close()
 
 
-@pytest.mark.parametrize("state", ["start-light", "start-dark", "switched-to-dark",
-                                   "switched-to-light"])
-def test_every_state_is_rendered(state):
-    assert state in S._STATES
+def test_the_contact_sheet_orders_every_state():
+    """Each state render() names sorts by its place in _STATES, within its mode."""
+    for rank, state in enumerate(S._STATES):
+        assert S._sheet_order(f"/out/Bus_Grid_{state}.png") == ("Bus_Grid", rank), state
+
+
+def test_a_contact_sheet_that_cannot_be_written_or_an_image_it_cannot_read_is_a_finding(
+        tmp_path):
+    shot = tmp_path / "Mode_start-light.png"
+    window = QWidget()
+    window.setFixedSize(40, 30)
+    assert window.grab().toImage().save(str(shot))
+    window.close()
+    missing = tmp_path / "Mode_start-dark.png"
+    assert S._contact_sheet([str(shot)], str(tmp_path / "sheet.png")) == []
+    sheet = tmp_path / "absent" / "sheet.png"
+    assert S._contact_sheet([str(shot), str(missing)], str(sheet)) == [
+        f"could not read {missing} for the contact sheet",
+        f"could not write the contact sheet {sheet}"]
+
+
+@pytest.mark.parametrize("native, asked, note", [
+    (False, "minimal", "is not used"),
+    (True, "minimal", "is cleared"),
+    (False, "same", None),
+    (True, "same", None),
+    (False, None, None),
+])
+def test_render_asks_for_every_state_of_every_mode(tmp_path, monkeypatch, native, asked, note):
+    """render() visits each mode in exactly the four named states, and the contact sheet
+    orders by those names, so a state renamed in one place and not the other fails here.
+    A QT_QPA_PLATFORM that differs from the platform the renders run on is named, as
+    "is not used" when a platform was forced and "is cleared" when the native one ran; one
+    equal to it, or none, is not named."""
+    from PySide6.QtCore import QCoreApplication, QSettings
+
+    from swi3s_studio.ui.mode_controller import MODE_LABELS, MODES
+    org, name = QCoreApplication.organizationName(), QCoreApplication.applicationName()
+    fmt = QSettings.defaultFormat()
+    from swi3s_studio.ui.theme import VizTheme, apply_palette
+    mode, palette, sheet = VizTheme.MODE, _app.palette(), _app.styleSheet()
+    seen = []
+
+    def fake_state(win, theme, state_name, out):
+        seen.append(state_name)
+        return os.path.join(out, state_name + ".png"), [], "stub", {}
+
+    monkeypatch.setattr(S, "render_state", fake_state)
+    monkeypatch.setattr(S, "_contact_sheet", lambda paths, out: [])
+    monkeypatch.setattr(S, "_platform", lambda: "" if native else "offscreen")
+    if asked is None:
+        monkeypatch.delenv("QT_QPA_PLATFORM", raising=False)
+    else:
+        monkeypatch.setenv("QT_QPA_PLATFORM", _app.platformName() if asked == "same" else asked)
+    made = []
+
+    def mkdtemp(prefix):
+        made.append(tmp_path / f"{prefix}settings")
+        made[-1].mkdir()
+        return str(made[-1])
+
+    monkeypatch.setattr(S, "tempfile", types.SimpleNamespace(mkdtemp=mkdtemp))
+    out = tmp_path / "out"
+    try:
+        assert S.render(str(out)) == 0
+    finally:
+        QCoreApplication.setOrganizationName(org)
+        QCoreApplication.setApplicationName(name)
+        QSettings.setDefaultFormat(fmt)
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, conftest._SETTINGS_DIR)
+        apply_palette(mode)
+        _app.setPalette(palette)
+        _app.setStyleSheet(sheet)
+    assert (VizTheme.MODE, _app.palette(), _app.styleSheet()) == (mode, palette, sheet)
+    # The settings directory is removed, and the platform the caller asked for is named.
+    assert len(made) == 1 and not made[0].exists()
+    report = (out / "report.txt").read_text(encoding="utf-8")
+    if note:
+        assert (f"NOTE: QT_QPA_PLATFORM=minimal was set and {note}: the renders run on "
+                f"{_app.platformName()}") in report
+    else:
+        assert "QT_QPA_PLATFORM" not in report
+    labels = [MODE_LABELS[m].replace(" ", "_") for m in MODES]
+    states = {st for n in seen for st in S._STATES if n.endswith("_" + st)}
+    assert states == set(S._STATES)
+    assert sorted(seen) == sorted(f"{lb}_{st}" for lb in labels for st in S._STATES)

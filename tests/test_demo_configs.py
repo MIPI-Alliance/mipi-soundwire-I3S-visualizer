@@ -10,9 +10,12 @@ row rate, and cursor-aware config export.
   clock PLL's stable reference), using one capture sample rate throughout.
 """
 
+import pytest
 from conftest import demo_skipped_rate_hz
 
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 def _seg(s, cols):

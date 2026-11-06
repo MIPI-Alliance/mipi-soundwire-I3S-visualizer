@@ -7,25 +7,75 @@ void CDataPort::Configure(const SwI3sDpConfig& cfg, int numColumns, int skipping
     mCfg = cfg;
     mNumColumns = numColumns;
     mSkippingDenominator = skippingDenominator;
-    // Precompute the EnableCh-derived values once (the per-UI hot path reads these
-    // instead of re-scanning the 16-bit mask on every tick — see clock_tick).
-    mNumChannels = 0;
+    mCfgEnableCh = cfg.EnableCh & 0xFFFFu;
+    int nch = 0;
     for (int i = 0; i < 16; ++i)
-        if (cfg.EnableCh & (1u << i)) mChannelOfIndex[mNumChannels++] = i;
-    mEffChannelGrouping = (cfg.ChannelGrouping == 0) ? mNumChannels : cfg.ChannelGrouping;
+        if (mCfgEnableCh & (1u << i)) ++nch;
+    int ecg = (cfg.ChannelGrouping == 0) ? nch : cfg.ChannelGrouping;
     // A channel group can't hold more channels than are enabled. Clamp here so the
     // per-UI channel walk (advanceChannel) can never index mChannelOfIndex[16] past
-    // its mNumChannels populated entries -- a config CSV can supply an unbounded
-    // ChannelGrouping (the CSV path doesn't mask it, unlike the &0xF register path).
-    if (mEffChannelGrouping > mNumChannels) mEffChannelGrouping = mNumChannels;
+    // its populated entries -- a config CSV can supply an unbounded ChannelGrouping
+    // (the CSV path doesn't mask it, unlike the &0xF register path).
+    if (ecg > nch) ecg = nch;
     // Keep it >= 1 so initializeTransport's `mEffChannelGrouping - 1` can't go
-    // negative when no channels are enabled (mNumChannels == 0). Such a port never
-    // ticks a data slot (inWindow requires base < nch), but keep the state sane.
-    if (mEffChannelGrouping < 1) mEffChannelGrouping = 1;
+    // negative when no channels are enabled. Such a port never ticks a data slot
+    // (inWindow requires base < nch), but keep the state sane.
+    if (ecg < 1) ecg = 1;
+    mCfgEffChannelGrouping = ecg;
+    loadChannelSet();
+}
+
+void CDataPort::setWalkChannels(std::uint32_t enableCh, int effChannelGrouping)
+{
+    mWalkEnableCh = enableCh;
+    mNumChannels = 0;
+    for (int i = 0; i < 16; ++i)
+        if (enableCh & (1u << i)) mChannelOfIndex[mNumChannels++] = i;
+    for (int i = mNumChannels; i < 16; ++i) mChannelOfIndex[i] = 0;
+    mEffChannelGrouping = effChannelGrouping;
+}
+
+void CDataPort::loadChannelSet()
+{
+    setWalkChannels(mCfgEnableCh, mCfgEffChannelGrouping);
+}
+
+bool CDataPort::walkAtStart() const
+{
+    // The state initializeTransport leaves: no bit of this interval's transport has been
+    // ticked yet.
+    return mChannelGroupBaseChannel == 0
+        && mChannelIndex == 0
+        && mChannelsInGroupRemaining == mEffChannelGrouping - 1
+        && mSampleInGroup == 0
+        && mSamplesInGroupRemaining == mCfg.SampleGrouping
+        && mBitInChannel == mCfg.SampleSize
+        && mSampleSizeLoaded == mCfg.SampleSize
+        && mWideBitRemaining == mCfg.BitWidth
+        && mTxpPending == mCfg.txpEnabled();
+}
+
+void CDataPort::ApplyConfigKeepingPhase(const SwI3sDpConfig& cfg, int numColumns,
+                                        int skippingDenominator)
+{
+    const bool atStart = walkAtStart();      // judged under the config in force
+    const State s = SaveState();
+    Configure(cfg, numColumns, skippingDenominator);
+    RestoreState(s);
+    if (atStart) {
+        // Reload the walk under the new config. The phase (a sub-row interval's Spacing
+        // gap) and the skipping accumulator are kept: startInterval is not called.
+        const Phase phase = mPhase;
+        const int spacing = mSpacingSlotsRemaining;
+        initializeTransport();
+        mPhase = phase;
+        mSpacingSlotsRemaining = spacing;
+    }
 }
 
 void CDataPort::initializeTransport()
 {
+    loadChannelSet();
     mPhase = kActive;
     mSpacingSlotsRemaining = 0;
     mSampleInGroup = 0;
@@ -76,7 +126,8 @@ CDataPort::State CDataPort::SaveState() const
              mGuardPending, mTailRemaining, static_cast<int>(mPhase),
              mSpacingSlotsRemaining, mSampleInGroup, mSamplesInGroupRemaining,
              mChannelGroupBaseChannel, mChannelIndex, mChannelsInGroupRemaining,
-             mBitInChannel, mWideBitRemaining, mTxpPending, mSampleSizeLoaded };
+             mBitInChannel, mWideBitRemaining, mTxpPending, mSampleSizeLoaded,
+             mWalkEnableCh, mEffChannelGrouping };
 }
 
 void CDataPort::RestoreState(const State& s)
@@ -99,6 +150,7 @@ void CDataPort::RestoreState(const State& s)
     mWideBitRemaining = s.wideBitRemaining;
     mTxpPending = s.txpPending;
     mSampleSizeLoaded = s.sampleSizeLoaded;
+    setWalkChannels(s.walkEnableCh, s.walkEffChannelGrouping);
 }
 
 bool CDataPort::advanceSkippingAccumulator()

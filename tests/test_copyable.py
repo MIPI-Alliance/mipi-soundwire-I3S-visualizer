@@ -1,8 +1,9 @@
 """Clipboard copy for the read-only data views (ui/copyable.enable_copy).
 
 ⌘/Ctrl+C copies the selected rows as TSV so decoded data can be pasted elsewhere; the
-views stay read-only. Command table is single-select (its selection drives the shared
-cursor); the register map, CDS symbols and decoded samples allow multi-row range copy.
+views stay read-only. The command table allows per-cell extended selection (the cursor
+follows its current cell); the register map, CDS symbols and decoded samples allow multi-row
+range copy.
 
 Run: QT_QPA_PLATFORM=offscreen PYQTGRAPH_QT_LIB=PySide6 PYTHONPATH=. python3 -m pytest tests/test_copyable.py
 """
@@ -10,10 +11,13 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 from swi3s_studio.ui.copyable import copy_selection
+
+pytestmark = pytest.mark.gui
 
 
 def _win():
@@ -35,7 +39,11 @@ def test_command_table_copies_selected_row_as_tsv():
     QGuiApplication.clipboard().clear()
     copy_selection(cv)
     text = QGuiApplication.clipboard().text()
-    assert text.strip() and "\t" in text, repr(text)                 # a full row, tab-separated
+    model = cv.model()
+    want = [str(model.index(0, c).data() or "") for c in range(model.columnCount())
+            if not cv.isColumnHidden(c)]
+    assert len(want) > 1 and any(want)
+    assert text.split("\n") == ["\t".join(want)], repr(text)        # row 0, every shown column
 
 
 def test_command_current_cell_drives_cursor():
@@ -66,11 +74,11 @@ def test_multi_row_views_copy_ranges():
     assert win._sample_view._table.selectionMode() == QAbstractItemView.ExtendedSelection
     tree = win._reg_view._tree
     assert tree.selectionMode() == QAbstractItemView.ExtendedSelection
-    if tree.topLevelItemCount():
-        tree.setCurrentItem(tree.topLevelItem(0))
-        QGuiApplication.clipboard().clear()
-        copy_selection(tree)
-        assert QGuiApplication.clipboard().text().strip()
+    assert tree.topLevelItemCount(), "demo populated no register blocks"
+    tree.setCurrentItem(tree.topLevelItem(0))
+    QGuiApplication.clipboard().clear()
+    copy_selection(tree)
+    assert QGuiApplication.clipboard().text().strip()
 
 
 def test_copy_empty_selection_is_noop():
@@ -90,8 +98,7 @@ def test_cds_pane_copies_a_single_cell():
     win = _win()
     sv = win._symbol_view
     assert sv.selectionBehavior() == QAbstractItemView.SelectItems
-    if sv.rowCount() < 3 or sv.columnCount() < 2:
-        return
+    assert sv.rowCount() >= 3 and sv.columnCount() >= 2, "demo populated no CDS symbols"
     sv.clearSelection()
     sv.setCurrentCell(2, 1)
     sv.item(2, 1).setSelected(True)
@@ -111,8 +118,7 @@ def test_cds_pane_copies_a_cell_block_as_tsv():
     win = _win()
     sv = win._symbol_view
     assert sv.selectionBehavior() == QAbstractItemView.SelectItems
-    if sv.rowCount() < 3 or sv.columnCount() < 2:
-        return
+    assert sv.rowCount() >= 3 and sv.columnCount() >= 2, "demo populated no CDS symbols"
     sv.clearSelection()
     for r in (1, 2):
         for c in (0, 1):
@@ -131,8 +137,7 @@ def test_cds_cell_selection_still_drives_the_cursor():
     win = _win()
     sv = win._symbol_view
     assert sv.selectionBehavior() == QAbstractItemView.SelectItems
-    if sv.rowCount() < 4:
-        return
+    assert sv.rowCount() >= 4, "demo populated no CDS symbols"
     seen = []
     sv.sampleSelected.connect(lambda s: seen.append(s))
     sv.setCurrentCell(3, 2)                      # a cell in the MIDDLE of the row
@@ -145,8 +150,7 @@ def test_cds_programmatic_select_highlights_the_whole_row():
     not the single current cell — otherwise the match reads as a stray dot."""
     win = _win()
     sv = win._symbol_view
-    if not sv._symbol_rows:
-        return
+    assert sv._symbol_rows, "demo populated no CDS symbols"
     sv.select_bus_row(sv._symbol_rows[min(5, len(sv._symbol_rows) - 1)])
     rows = sv.selectionModel().selectedRows()
     assert rows, "programmatic select did not select a full row"

@@ -42,7 +42,7 @@ class BusTiming:
     tr_hold_clk_rising: np.ndarray   # bool: the previous edge (hold) is a rising clock edge
     tr_sample: np.ndarray            # capture sample number of each transition
     tr_column: np.ndarray            # frame column of each transition (-1 if geometry unknown)
-    n_clock_edges: int          # clock edges in the region
+    n_clock_edges: int          # clock edges in the region (PHY3: mid-UI sample points)
     n_data_edges: int           # data transitions measured
 
 
@@ -55,7 +55,7 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
     Every data transition in the range is measured. The §5.1.2 link-control / cold-start
     region (long idle gaps, not sampled UIs) is excluded: it precedes the audio start.
     Only the clock duty / UI period is estimated, from a window of up to `max_edges`
-    clock gaps within the region.
+    clock gaps (PHY3: row periods) within the region.
 
     `segments` (a list of {start_ui, column_count}, from the decode) lets each
     transition be tagged with its frame column (`tr_column`) so the caller can filter
@@ -134,7 +134,7 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
         tr_setup_ns=setup, tr_hold_ns=hold, tr_data_rising=data_rising,
         tr_setup_clk_rising=setup_pol, tr_hold_clk_rising=hold_pol,
         tr_sample=d, tr_column=tr_column,
-        n_clock_edges=int(n), n_data_edges=int(d.size),
+        n_clock_edges=max(0, min(c1, n) - c0), n_data_edges=int(d.size),
     )
 
 
@@ -176,13 +176,14 @@ def _measure_dlv_timing(capture, segments, start_sample, end_sample, recovered_c
         cols_per_row = np.full(starts.shape,
                                max(1, int(round((ends[0] - starts[0]) / ui))) if ends.size else 1,
                                dtype=np.int64)
-    sample_pts, sample_cols = [], []
-    for s0, s1, c in zip(starts, ends, cols_per_row):
-        w = (s1 - s0) / c                                    # this row's UI (row_period / cols)
-        sample_pts.append(s0 + (np.arange(int(c)) + 0.5) * w)   # mid-UI latch points
-        sample_cols.append(np.arange(int(c), dtype=np.int64))   # their column within the row
-    sp = np.concatenate(sample_pts) if sample_pts else np.zeros(0)
-    spc = np.concatenate(sample_cols) if sample_cols else np.zeros(0, dtype=np.int64)
+    # One mid-UI latch point per column of every row, built without a per-row loop:
+    # `row_of` names each point's row and `spc` its column within that row.
+    n_rows = cols_per_row.size
+    row_of = np.repeat(np.arange(n_rows), cols_per_row)
+    first_of_row = np.cumsum(cols_per_row) - cols_per_row
+    spc = (np.arange(row_of.size) - first_of_row[row_of]).astype(np.int32)
+    row_ui = (ends - starts) / cols_per_row                  # each row's UI (row_period / cols)
+    sp = starts[row_of] + (spc + 0.5) * row_ui[row_of]
     if sp.size < 2:
         return None
     # Each DP transition d in [lo, hi] sits between two mid-UI sample points; both must
@@ -194,9 +195,8 @@ def _measure_dlv_timing(capture, segments, start_sample, end_sample, recovered_c
     setup = (sp[j] - d) * to_ns                              # value stable before it was latched
     hold = (d - sp[j - 1]) * to_ns                           # value held after the previous latch
     # UI period of THIS region (row period / its columns), from the region's own rows, not
-    # the global operational UI.
-    row_periods = (ends - starts)
-    ui_samps = float(np.median(row_periods / cols_per_row.astype(np.float64))) if starts.size else float(ui)
+    # the global operational UI; estimated from the first `max_edges` rows of the region.
+    ui_samps = float(np.median(row_ui[:max_edges])) if row_ui.size else float(ui)
     ui_ns = ui_samps * to_ns
     # Frame column = the column of the mid-UI sample point that latches the new value. It
     # must be a real column index (not -1): the Timing pane's column filter drops -1.

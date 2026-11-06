@@ -20,6 +20,8 @@ from swi3s_studio.ingest import probe as probe_mod
 from swi3s_studio.ingest import saleae_binary
 from swi3s_studio.session import Session
 
+pytestmark = [pytest.mark.gui, pytest.mark.platform]
+
 
 @pytest.fixture(scope="module")
 def demo():
@@ -80,6 +82,35 @@ def test_digital_csv(demo, tmp_path):
     assert _same_capture(loaded, cap)
 
 
+@pytest.mark.parametrize("unit, scale", [("s", 1.0), ("ms", 1e-3), ("us", 1e-6),
+                                         ("ns", 1e-9), ("ps", 1e-12)])
+def test_a_digital_csv_duration_is_in_seconds_whatever_its_time_unit(tmp_path, unit, scale):
+    """The Time column's bracketed unit scales the duration as it scales the loaded
+    edges, so the probe's length is the loaded capture's."""
+    from swi3s_studio.ingest import digital_csv
+    path = tmp_path / "u.csv"
+    step = 1e-6 / scale                                  # 1 us per row, in the file's unit
+    path.write_text(f"Time [{unit}],Channel 0,Channel 1\n" + "".join(
+        f"{i * step:.9g},{i % 2},{(i // 3) % 2}\n" for i in range(2000)))
+    pr = probe_mod.probe([str(path)])
+    cap = digital_csv.load_capture(str(path), 1, 2)
+    assert pr.sample_rate_hz == cap.sample_rate_hz == 1_000_000
+    assert pr.duration_s == pytest.approx(1999e-6, rel=1e-6)
+    assert pr.duration_s == pytest.approx(cap.duration_s, rel=1e-3)
+
+
+def test_a_digital_csv_with_a_byte_order_mark_probes_as_one_without(tmp_path):
+    body = "Time [s],Channel 0,Channel 1\n" + "".join(
+        f"{i * 1e-6:.6f},{i % 2},{(i // 3) % 2}\n" for i in range(500))
+    plain, bom = tmp_path / "plain.csv", tmp_path / "bom.csv"
+    plain.write_text(body, encoding="utf-8")
+    bom.write_text(body, encoding="utf-8-sig")
+    a, b = probe_mod.probe([str(plain)]), probe_mod.probe([str(bom)])
+    assert [c.label for c in b.channels] == ["Channel 0", "Channel 1"]
+    assert (b.kind, b.sample_rate_hz, b.duration_s) == (a.kind, a.sample_rate_hz, a.duration_s)
+    assert [c.edges for c in b.channels] == [c.edges for c in a.channels]
+
+
 def test_vcd(demo, tmp_path):
     path = str(tmp_path / "c.vcd")
     _write_vcd(path, demo.capture, timescale="2ns")
@@ -90,6 +121,15 @@ def test_vcd(demo, tmp_path):
     assert pr.channels[0].edges == cap.clock_edges.size
     assert pr.sample_rate_hz == pytest.approx(500e6)
     assert pr.duration_s == pytest.approx(cap.duration_s * cap.sample_rate_hz * 2e-9, rel=1e-3)
+
+
+def test_a_vcd_signal_without_a_change_counts_zero_edges(tmp_path):
+    path = tmp_path / "stuck.vcd"
+    path.write_text("$timescale 1ns $end\n$scope module t $end\n"
+                    "$var wire 1 ! clk $end\n$var wire 1 \" stuck $end\n$upscope $end\n"
+                    "$enddefinitions $end\n#0\n0!\n0\"\n#5\n1!\n#10\n0!\n", encoding="ascii")
+    pr = probe_mod.probe([str(path)])
+    assert {c.label.split(".")[-1]: c.edges for c in pr.channels} == {"clk": 2, "stuck": 0}
 
 
 def test_wfm_pair(tmp_path):
@@ -104,7 +144,7 @@ def test_wfm_pair(tmp_path):
 
 def test_analog_csv(tmp_path):
     path = tmp_path / "scope.csv"
-    rows = ["Model,MSO58", "Sample Interval,1e-09", "TIME,CH1,CH2"]
+    rows = ["Model,SCOPE1", "Sample Interval,1e-09", "TIME,CH1,CH2"]
     rows += [f"{i * 1e-9:.12f},{1.0 if (i // 4) % 2 else 0.0},{1.0 if (i // 32) % 2 else 0.0}"
              for i in range(3000)]
     path.write_text("\n".join(rows) + "\n")
@@ -332,3 +372,20 @@ def test_an_odd_channel_out_means_the_file_is_not_wired_in_pairs():
     pr = _counts(4, 20_000, 3_000)
     assert pr.busiest_pair() == (1, 2)
     assert _counts(9_000, 900, 8_800, 700, 5).busiest_pair() in ((0, 1),)
+
+
+@pytest.mark.parametrize("content", [
+    b"",
+    b"x" * 300_000,
+    b"a," * 100_000 + b"\n1,2\n",
+    b",".join(b"c%d" % i for i in range(2000)) + b"\n",
+    b"\xff\xfe\x00\x01" * 100,
+], ids=["empty", "one_long_line", "a_wide_first_row", "2000_names", "binary"])
+def test_a_csv_that_is_not_a_capture_is_refused_with_a_message_not_offered_as_channels(
+        tmp_path, content):
+    """An empty, over-long, over-wide or non-text first row raises ValueError naming the
+    file (the dialog shows it); a bare csv.Error never escapes the probe."""
+    p = tmp_path / "x.csv"
+    p.write_bytes(content)
+    with pytest.raises(ValueError, match=r"x\.csv"):
+        probe_mod.probe([str(p)])

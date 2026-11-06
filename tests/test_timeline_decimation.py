@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ui.timeline import TimelineRibbon
 
+pytestmark = pytest.mark.gui
+
 _KINDS = [
     {"command": "Ping", "has_manager_packet": True, "crc_valid": True},
     {"command": "WriteA32", "has_manager_packet": True, "crc_valid": True},
@@ -99,7 +101,7 @@ def _same(r):
 
 
 @pytest.mark.parametrize("seed", range(6))
-def test_the_decimation_equals_the_old_loop(seed):
+def test_the_decimation_equals_the_reference_loop(seed):
     r, _cmds, rng = _ribbon(seed, n=3000, total=5_000_000)
     for lo, hi in _views(rng, 0.0, 5_000_000.0):
         r.set_view(lo, hi)
@@ -107,7 +109,7 @@ def test_the_decimation_equals_the_old_loop(seed):
 
 
 @pytest.mark.parametrize("seed", range(3))
-def test_the_decimation_equals_the_old_loop_under_a_filter(seed):
+def test_the_decimation_equals_the_reference_loop_under_a_filter(seed):
     r, cmds, rng = _ribbon(100 + seed, n=3000, total=5_000_000)
     shown = [c.get("start_sample", 0) for c in cmds if rng.random() < 0.3]
     r.set_draw_filter(shown)
@@ -121,7 +123,7 @@ def test_the_decimation_equals_the_old_loop_under_a_filter(seed):
     _same(r)
 
 
-def test_the_decimation_equals_the_old_loop_in_a_negative_domain():
+def test_the_decimation_equals_the_reference_loop_in_a_negative_domain():
     """A stack of Links gives a later Link's ribbon a domain starting below its sample 0."""
     r, _cmds, rng = _ribbon(7, n=2000, total=2_000_000)
     r.set_domain(-1_500_000, 2_000_000)

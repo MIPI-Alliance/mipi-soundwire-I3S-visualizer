@@ -7,7 +7,8 @@ in `../registers.json`.
 
 ## Using a map
 
-In SWI3S Studio: **Registers ▸ Import Peripheral Register Map…**, then either
+In SWI3S Studio: **Devices ▸ Register Maps…**, then **Set…** on the device's row (it opens
+*Import Peripheral Register Map*); then either
 
 - browse to a vendor `.xml` file — rootless `<register>`/`<bit>` lists, or a `<Registers>` list of
   wide registers with a separate `<Fields>` list (split into byte registers) — the import assistant
@@ -15,7 +16,7 @@ In SWI3S Studio: **Registers ▸ Import Peripheral Register Map…**, then eithe
   anything that looked off), or
 - browse to a normalized `.json` in this folder.
 
-Pick the target device and accept. The map is decoded from the same captured
+Accept. The map is decoded from the same captured
 writes and shown as a *Peripheral Registers* block under that device in the
 Register Map pane. The chosen map is embedded in the saved workspace, so a
 shared workspace carries its register maps with it.

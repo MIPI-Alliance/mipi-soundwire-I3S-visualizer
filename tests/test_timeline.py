@@ -8,8 +8,12 @@ without relying on fragile offscreen pixel rendering.
 
 Run: python3 -m pytest tests/test_timeline.py
 """
+import pytest
+
 from swi3s_studio.ui import timeline as tl
 from swi3s_studio.ui.timeline import _kind_color, tick_rank
+
+pytestmark = pytest.mark.gui
 
 _PING = {"command": "Ping", "has_manager_packet": True, "crc_valid": True}
 _WRITE = {"command": "WriteA32", "has_manager_packet": True, "crc_valid": True}
@@ -48,6 +52,20 @@ def test_colors_distinct():
     assert _kind_color(_PING) is tl._C_PING
     assert _kind_color(_WRITE) is tl._C_OTHER
     assert _kind_color(_ERROR) is tl._C_ERROR
+
+
+@pytest.mark.parametrize("mode", ["light", "dark"])
+def test_the_tick_colours_of_the_three_kinds_differ(mode):
+    """Pings, other commands and errors are three different colours in each palette."""
+    from swi3s_studio.ui.theme import VizTheme, apply_palette
+    keep = VizTheme.MODE
+    try:
+        apply_palette(mode)
+        names = [str(getattr(VizTheme, k)).lower()
+                 for k in ("SEM_PING", "SEM_OTHER", "SEM_ERROR")]
+        assert len(set(names)) == 3, names
+    finally:
+        apply_palette(keep)
 
 
 def test_legend_tick_heights_match_what_the_painter_draws():

@@ -138,10 +138,11 @@ def test_saleae_binary_clock_autodetect():
         assert nclk == cap.clock_edges.size and ndat == cap.data_edges.size
         assert nclk > ndat                       # clock has more transitions
         # Whichever order the user picks, the higher-count file is the clock.
-        for first, second in ((clk, dat), (dat, clk)):
-            na, nb = saleae_binary.transition_count(first), saleae_binary.transition_count(second)
-            chosen = second if (nb > na) else first
-            assert chosen == clk
+        from swi3s_studio.ingest import probe
+        for order in ((clk, dat), (dat, clk)):
+            pr = probe.probe(list(order))
+            ci, di = pr.busiest_pair()
+            assert pr.channels[ci].value == clk and pr.channels[di].value == dat, order
         assert saleae_binary.transition_count(os.path.join(d, "nope.bin")) == -1
         # The .bin has no rate field; infer it from the timestamp granularity.
         # (Real captures have sub-UI edge spacing -> exact rate; this synthetic

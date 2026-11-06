@@ -2,8 +2,9 @@ name: CI
 
 # Enforce the quality floor on every push + PR: build the native decode core and run
 # the full pytest suite (goldens included) across the supported OS/Python range, plus a
-# lint/type pass, a coverage floor and a perf-regression gate. Mirrors the local flow
-# (conftest sets the offscreen Qt platform + short demo). See docs/DEVELOPMENT.md.
+# lint/type pass, a leak scan, an installed-package smoke test, a coverage floor and a
+# perf-regression gate. Mirrors the local flow (conftest sets the offscreen Qt platform
+# + short demo). See docs/DEVELOPMENT.md.
 # quoted so YAML doesn't coerce the bareword `on` to boolean true.
 "on":
   push:
@@ -12,6 +13,10 @@ name: CI
     branches: ["main", "v[0-9]*", "feature/**", "fix/**", "sprint/**"]
   pull_request:
   workflow_dispatch:
+
+# No job writes to the repository.
+permissions:
+  contents: read
 
 env:
   PYTHONUTF8: "1"                 # suites print ▸/→; avoids cp1252 errors on Windows
@@ -23,6 +28,7 @@ jobs:
   test:
     name: test ${{ matrix.os }} py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       # The matrix:
@@ -39,8 +45,8 @@ jobs:
           - { os: windows-latest, python: "3.14" }
           - { os: macos-latest, python: "3.12" }
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
           # setup-python installs x64 on the windows runner -> pyarrow/PySide6 wheels
@@ -60,16 +66,17 @@ jobs:
       - name: Build the native decode core
         shell: bash
         run: python -m pip install ./native      # scikit-build-core fetches cmake/ninja
-      - name: Run tests (excludes perf)
+      - name: Run tests (excludes perf), one file per worker
         shell: bash
-        run: python -m pytest -q -m "not perf"
+        run: python -m pytest -q -m "not perf" -n auto --dist loadfile
 
   perf:
     name: perf regression gate
     runs-on: ubuntu-latest       # one consistent runner — perf ceilings are cliff detectors
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: "3.12" }
       - name: Install Qt runtime deps
         run: |
@@ -83,12 +90,35 @@ jobs:
       - name: Run perf benchmarks
         run: python -m pytest -q -m perf
 
+  package:
+    name: installed package ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # The wheel installed into a clean environment and run from outside the checkout, so the
+    # installed-layout lookups (sys.prefix/share/swi3s-studio) and the console script are
+    # exercised, not the repository layout the other jobs run from. Windows installs the
+    # console script and the layout under Scripts/ and its own prefix, so it runs too.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      PYTHONPATH: ""
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: { python-version: "3.12" }
+      - name: Install into a clean environment and run from outside the checkout
+        shell: bash
+        run: python tools/package_smoke.py
+
   coverage:
     name: coverage floor
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: "3.12" }
       - name: Install Qt runtime deps
         run: |
@@ -99,20 +129,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt ./native
-      # Coverage is environment-sensitive (platform-guarded branches and GUI paths differ
-      # between hosts). Raise the floor once this job has reported its own number over a
-      # few runs.
-      - name: Coverage (floor 80%)
-        run: python -m pytest -q -m "not perf" --cov=swi3s_studio --cov-report=term-missing:skip-covered --cov-fail-under=80
+      # Lines and branches of swi3s_studio and tools/, subprocesses included
+      # (pyproject.toml, [tool.coverage.run]). The floor is the measured figure less a margin
+      # (docs/TESTING.md §1.1).
+      - name: Coverage (floor 82%, lines and branches)
+        run: python -m pytest -q -m "not perf" -n auto --dist loadfile --cov --cov-report=term-missing:skip-covered --cov-fail-under=82
 
   lint:
     name: lint + type
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Blocking: a ruff finding, a mypy regression, or a mypy run that cannot be compared
     # with the baseline fails the job.
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: "3.12" }
       - name: Install linters
         # requirements-dev.txt pins mypy to the version tools/mypy_baseline.json records
@@ -123,6 +154,11 @@ jobs:
           python -m pip install -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
+      # Home paths, host names, addresses and the like (CONTRIBUTING.md). Without
+      # $SWI3S_LEAK_PATTERNS only the structural patterns run; a maintainer's site patterns
+      # run in the local gate.
+      - name: Leak scan (structural patterns)
+        run: python3 tools/leak_scan.py
       - name: Mypy (must not regress vs tools/mypy_baseline.json)
         # Exit 1 (a regression), 2 (mypy could not run) and 3 (NOT COMPARABLE: this mypy is
         # not the baseline's) all fail the job. Do not append `|| true`, which discards the

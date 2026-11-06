@@ -1,8 +1,8 @@
 """SWI3S Studio application entry point.
 
     python3 -m swi3s_studio.app                          # empty window (File > Load Demo)
-    python3 -m swi3s_studio.app --demo                   # open the synthetic demo capture
-    python3 -m swi3s_studio.app --demo-bringup           # demo with a §5.1.2 Cold Start
+    python3 -m swi3s_studio.app --demo                   # open the synthetic PHY2 demo capture
+    python3 -m swi3s_studio.app --demo-bringup           # same as --demo
     python3 -m swi3s_studio.app -c cfg.csv               # open a Visualizer config CSV
     python3 -m swi3s_studio.app -c cfg.csv -o model.json # headless: write the bus model
 
@@ -32,7 +32,7 @@ def _centered_tab_style():
     Center tab-bar tabs so tabbed docks match macOS. The Windows/Fusion styles left-align a
     QTabBar's tabs; SH_TabBar_Alignment is the single style hint that controls this, and it
     governs QMainWindow's dock tab bars (the bottom pane group + the
-    Registers/Statistics/Bookmarks group) too. macOS already returns AlignCenter, so this proxy
+    Registers/Statistics/Cursors group) too. macOS already returns AlignCenter, so this proxy
     is only installed off-darwin (leaving the native Mac style intact).
 
     (The dock close/float button chrome is handled by a custom title-bar widget in main_window,

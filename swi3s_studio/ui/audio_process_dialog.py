@@ -36,7 +36,7 @@ _GAIN_LIMIT_DB = 100.0      # the field's range; the slider covers the common ±
 _SLIDER_DB = 50.0
 _LOG_STEPS = 1000           # corner slider resolution, log-spaced from 1 Hz to the maximum
 _DEFAULT_CORNER_HZ = 20.0
-_CLIP_EPS_DB = 1e-6         # a normalising gain lands exactly on 0 dB, not just above it
+_CLIP_EPS_DB = 1e-6         # a peak at 0 dB is not clipping; float noise stays below this
 
 
 class StreamProcessingDialog(QDialog):
@@ -204,7 +204,9 @@ class StreamProcessingDialog(QDialog):
         self._peak = self._store.peak_db(self._dev, self._dp, highpass_hz=hp,
                                          dc_block=self._dc.isChecked())
         if self._peak is not None and not self._gain_touched:
-            self._set_gain(-self._peak)             # normalise to 0 dBFS
+            # Normalise to 0 dBFS, rounded down to the field's 0.1 dB so the result never
+            # exceeds it.
+            self._set_gain(math.floor(-self._peak * 10 + 1e-6) / 10)
         self._sync_new_peak()
         self._update_state()
 

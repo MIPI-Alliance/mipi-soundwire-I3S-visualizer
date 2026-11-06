@@ -11,6 +11,8 @@ import pytest
 
 from swi3s_studio.dsp.spectrogram import FLOOR_DB, FRAME_SIZES, spectrogram
 
+pytestmark = pytest.mark.gui
+
 _RATE = 48_000
 
 
@@ -39,8 +41,9 @@ def test_a_tone_between_bins_reads_within_the_windows_scalloping():
 
 
 def test_an_off_bin_tone_leaks_neither_across_the_spectrum_nor_into_dc():
-    """A full-scale tone between bins stays under -90 dB beyond 5 bins and -100 dB beyond 10,
-    and the bottom bins carry no DC term, in every column alike."""
+    """A full-scale 1 kHz tone, a third of a bin off a bin centre, stays under -90 dB beyond
+    5 bins and -100 dB beyond 10, and the bottom bins carry no DC term, in every column
+    alike."""
     s = spectrogram(_tone(1000.0, 1.0), 0, _RATE * 2, 40, 32768)
     k = int(s.db[0].argmax())
     away = np.abs(np.arange(s.db.shape[1]) - k)
@@ -49,9 +52,28 @@ def test_an_off_bin_tone_leaks_neither_across_the_spectrum_nor_into_dc():
     assert s.db[:, :5].max() < -110
 
 
+def test_a_tone_half_a_bin_off_leaks_within_the_windows_worst_case():
+    """The worst case for the 4-term window is a tone half a bin off a bin centre: an
+    unquantised full-scale one stays under -90 dB beyond 5 bins and under -98 dB beyond 10,
+    and its leakage there is the window's own response 10.5 bins from the tone."""
+    from swi3s_studio.dsp.spectrogram import _blackman_harris
+    hz = (100 + 0.5) * _BIN
+    x = 32768 * np.sin(2 * np.pi * hz * np.arange(_RATE * 2) / _RATE)
+    s = spectrogram(x, 0, _RATE * 2, 40, 32768)
+    away = np.abs(np.arange(s.db.shape[1]) - int(s.db[0].argmax()))
+    assert s.db[:, away > 5].max() < -90
+    leak = s.db[:, away > 10].max()
+    assert leak < -98
+    w = _blackman_harris(1024)
+    response = np.abs(np.fft.rfft(w, 1024 * 64)) / w.sum()          # 64 points per bin
+    window_db = 20 * np.log10(response[int(10.5 * 64)])
+    assert leak == pytest.approx(window_db, abs=0.5)
+
+
 def test_a_full_scale_tones_skirt_reaches_the_colour_floor_about_70_bins_away():
-    """The 4-term window's leakage from an unquantised full-scale tone stays above the Audio
-    pane's -120 dB colour floor out to about 70 bins, and is below it beyond 80."""
+    """For the unquantised full-scale 1 kHz tone (a third of a bin off a bin centre), the
+    4-term window's leakage stays above the Audio pane's -120 dB colour floor out to about
+    70 bins, and is below it beyond 80. The figure is that tone's, not the window's."""
     x = 32768 * np.sin(2 * np.pi * 1000.0 * np.arange(_RATE * 2) / _RATE)
     s = spectrogram(x, 0, _RATE * 2, 40, 32768)
     away = np.abs(np.arange(s.db.shape[1]) - int(s.db[0].argmax()))

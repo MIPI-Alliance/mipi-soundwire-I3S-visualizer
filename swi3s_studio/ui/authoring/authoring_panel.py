@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ...analysis.issues import Issue
 from ...model.bus_config import NUM_DATA_PORTS, BusConfig
+from ...swviz.config.constants import InterfaceRanges
 from .. import timers
 from ..theme import VizTheme, authoring_stylesheet
 from .dialogs import (
@@ -52,11 +53,14 @@ from .dialogs import (
     GuardSelectorDialog,
     PortModeSelectorDialog,
     cds_summary,
+    plain_validator,
 )
 from .notifications import NotificationsPanel
 
-# Action buttons — the Visualizer's customtkinter blue (from the shared theme).
-_BTN_CSS = (f"QPushButton {{ background:{VizTheme.ACCENT}; color:white; border:none; "
+
+def _action_button_css() -> str:
+    """An action button: the theme's accent colour, in the current theme."""
+    return (f"QPushButton {{ background:{VizTheme.ACCENT}; color:white; border:none; "
             f"border-radius:{VizTheme.CORNER_RADIUS}px; padding:5px; }} "
             f"QPushButton:hover {{ background:{VizTheme.ACCENT_HOVER}; }}")
 
@@ -92,14 +96,15 @@ _DP_COLORS = ["#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
 
 
 # Data-port numeric rows: (label, attr, min, max). "num_channels" is special
-# (the channel count → low-N-bits of EnableCh).
+# (the channel count → low-N-bits of EnableCh). A row that sets a register field allows
+# only what that field holds (data/registers.json).
 _NUMERIC_ROWS = [
     ("Device (0-11,Manager)", "device_number", 0, 11),
     ("Num Channels (0-16)", "num_channels", 0, 16),
     ("Sample Size (0-31)", "sample_size", 0, 31),
     ("Sample Grouping (0-7)", "sample_grouping", 0, 7),
     ("Channel Grouping (0-15)", "channel_grouping", 0, 15),
-    ("Spacing (0-16)", "spacing", 0, 16),
+    ("Spacing (0-15)", "spacing", 0, 15),
     ("Interval (0-4095)", "interval", 0, 4095),
     ("Offset (0-4095)", "offset", 0, 4095),
     ("Horizontal Start (0-31)", "horizontal_start", 0, 31),
@@ -126,7 +131,8 @@ _CHECK_ROWS = [
 # Data-port cells that open a picker dialog instead of being typed in.
 _CLICK_NUMERIC = {"device_number", "num_channels"}
 
-# Interface ("Other Parameters") rows: (label, attr, kind, min, max, phy3_only).
+# Interface ("Other Parameters") rows: (label, attr, kind, min, max, phy3_only). A row
+# that sets a register field allows only what that field holds (data/registers.json).
 #
 # The CDS settings (bit width, guard, tail, handover, CDS_DriveType) are one row: a
 # "CDS Settings" button opening CdsSettingsDialog, which owns all five and reaches the
@@ -135,14 +141,15 @@ _CLICK_NUMERIC = {"device_number", "num_channels"}
 # on BusConfig answers to — see _on_iface_edit's skip list).
 _IFACE_ROWS = [
     ("Num Columns (1-31)", "num_columns", "int", 1, 31, False),
-    ("Skipping Denominator (1-4096)", "skipping_denominator", "int", 1, 4096, False),
+    ("Skipping Denominator (1-4095)", "skipping_denominator", "int", 1, 4095, False),
     ("PHY3 Enabled", "phy3_enabled", "bool", 0, 0, False),
     ("S0 Width (1-8)", "s0_width", "int", 1, 8, True),
     ("S1 Tail Width (0-2)", "s1_tail_width", "int", 0, 2, True),
     ("Enforce S1 Handover", "enforce_s1_handover", "bool", 0, 0, True),
     ("CDS Settings", "cds_settings", "dialog", 0, 0, False),
     ("Row Rate [kHz] (1-48000)", "row_rate_khz", "float", 1, 48000, False),
-    ("Rows To Draw (1-10240)", "rows_to_draw", "int", 1, 10240, False),
+    (f"Rows To Draw ({InterfaceRanges.MIN_ROWS}-{InterfaceRanges.MAX_ROWS})", "rows_to_draw",
+     "int", InterfaceRanges.MIN_ROWS, InterfaceRanges.MAX_ROWS, False),
 ]
 
 # Interface rows that are NOT a BusConfig attribute — a button that opens a dialog. Kept
@@ -183,6 +190,7 @@ class AuthoringPanel(QWidget):
         self._dp_check: Dict[str, List[QCheckBox]] = {m: [] for _, m in _CHECK_ROWS}
         self._dp_rate: List[QLabel] = []
         self._iface: Dict[str, QWidget] = {}
+        self._iface_typed: set = set()   # interface boxes typed in since the last commit or populate
         self._action_btns: List[QPushButton] = []   # re-styled on theme switch
         self._dialog_btns: List[QPushButton] = []   # re-styled on theme switch
         # arrow-key navigation grid: widget -> (row, col) + the reverse list
@@ -306,7 +314,7 @@ class AuthoringPanel(QWidget):
                     e = QLineEdit()
                     e.setAlignment(Qt.AlignCenter)
                     e.setFixedWidth(_ENTRY_W)
-                    e.setValidator(QIntValidator(lo, hi, self))
+                    e.setValidator(plain_validator(QIntValidator(lo, hi, self)))
                     e.editingFinished.connect(self._on_edit)
                 e.setFixedHeight(_ROW_H)
                 entry_grid.addWidget(e, r, c)
@@ -426,9 +434,11 @@ class AuthoringPanel(QWidget):
                 w = QLineEdit()
                 w.setAlignment(Qt.AlignCenter)
                 w.setFixedWidth(64)
-                w.setValidator(QDoubleValidator(float(lo), float(hi), 3, self)
-                               if kind == "float" else QIntValidator(lo, hi, self))
+                w.setValidator(plain_validator(
+                    QDoubleValidator(float(lo), float(hi), 3, self) if kind == "float"
+                    else QIntValidator(lo, hi, self)))
                 w.editingFinished.connect(self._on_iface_edit)
+                w.textEdited.connect(lambda _t, a=attr: self._iface_typed.add(a))
                 form.addWidget(w, i, 1, alignment=Qt.AlignRight)
             self._iface[attr] = (lab, w)
         # Derived readouts share the form's value column so the numbers line up
@@ -466,7 +476,7 @@ class AuthoringPanel(QWidget):
                            ("Maximize Frame", self.maximizeRequested)):
             b = QPushButton(label)
             b.clicked.connect(sig.emit)
-            b.setStyleSheet(_BTN_CSS)
+            b.setStyleSheet(_action_button_css())
             self._action_btns.append(b)
             btns.addWidget(b, alignment=Qt.AlignHCenter)
         # One width for the column: 180 px, or the widest label where the platform font
@@ -513,8 +523,10 @@ class AuthoringPanel(QWidget):
             notif.setFixedHeight(needed)
 
     def commit_edits(self) -> None:
-        """Flush all in-progress widget edits into the config (e.g. a DP name still
-        focused when Save is clicked — a styled button may not fire editingFinished)."""
+        """Flush every data-port, interface and description entry into the config, as Save
+        needs (an entry still focused when a styled button is clicked may not have fired
+        editingFinished). A blank interface entry commits its row minimum and a blank
+        data-port entry 0; an entry outside its range reverts to the model's value."""
         self._on_edit()
         self._on_iface_edit()
         self._cfg.description = self._desc.toPlainText()
@@ -586,10 +598,6 @@ class AuthoringPanel(QWidget):
         few widgets with their own inline style (the DP-name colour chips, the action
         buttons, the dialog buttons, the description's pinned viewport/palette, the file-status note) and
         the Notifications sub-panel are refreshed explicitly."""
-        global _BTN_CSS
-        _BTN_CSS = (f"QPushButton {{ background:{VizTheme.ACCENT}; color:white; border:none; "
-                    f"border-radius:{VizTheme.CORNER_RADIUS}px; padding:5px; }} "
-                    f"QPushButton:hover {{ background:{VizTheme.ACCENT_HOVER}; }}")
         self.setStyleSheet(authoring_stylesheet())
         for c, e in enumerate(self._dp_name):
             e.setStyleSheet(
@@ -597,7 +605,7 @@ class AuthoringPanel(QWidget):
                 f"border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER}; "
                 f"border-radius:{VizTheme.CORNER_RADIUS}px;")
         for b in self._action_btns:
-            b.setStyleSheet(_BTN_CSS)
+            b.setStyleSheet(_action_button_css())
         for b in self._dialog_btns:
             b.setStyleSheet(_dialog_button_css())
         self._desc.viewport().setStyleSheet(f"background:{VizTheme.ENTRY_BG};")
@@ -639,6 +647,7 @@ class AuthoringPanel(QWidget):
                 w.setText(str(int(val)))
         self._update_cds_settings_row()
         self._desc.setPlainText(self._cfg.description)
+        self._iface_typed.clear()
         self._loading = False
         self._update_phy3_enabled()
         self._update_derived()
@@ -673,7 +682,14 @@ class AuthoringPanel(QWidget):
             for _, attr, _, _ in _NUMERIC_ROWS:
                 if attr in _CLICK_NUMERIC:           # set via picker dialogs
                     continue
-                setattr(dp, attr, int(self._dp_num[attr][c].text() or 0))
+                w = self._dp_num[attr][c]
+                if not w.text():                     # a blank commits 0, and shows it
+                    setattr(dp, attr, 0)
+                    w.setText("0")
+                elif w.hasAcceptableInput():
+                    setattr(dp, attr, int(w.text()))
+                else:                                # out of range: keep the model's value
+                    w.setText(str(int(getattr(dp, attr))))
             for _, mode in _CHECK_ROWS:
                 if mode.startswith("dialog:"):       # set via dialogs
                     continue
@@ -690,9 +706,9 @@ class AuthoringPanel(QWidget):
 
     def _open_dp_dialog(self, kind: str, c: int, checked: bool | None = None) -> None:
         """Open the per-DP picker dialog for the Visualizer-style controls
-        (Device, Num Channels, Guard, Flow Control, Port Test Mode, Draw). For the
-        Draw checkbox, the click also sets `enabled` from the checkbox state (the
-        Visualizer's checkbox is bound to `enabled` and opens the dialog on top)."""
+        (Device, Num Channels, Guard, Flow Control, Port Test Mode, Draw). A click on the
+        Draw checkbox enables the port and opens the dialog on top; turning Draw off is
+        done in the dialog, and Cancel keeps the port enabled."""
         dp = self._cfg.dataports[c]
         if kind == "identity":
             dlg = DataPortIdentityDialog(self, dp.number(c), dp.name, c)
@@ -752,8 +768,8 @@ class AuthoringPanel(QWidget):
             if dlg.exec():
                 dp.enabled = dlg.enabled
                 dp.display_fields = dlg.display_fields
-        # Re-sync widgets to the model (reverts the checkbox toggle if cancelled)
-        # and re-render.
+        # Re-sync the widgets to the model (the Draw box shows the port's enabled state) and
+        # re-render.
         self._populate()
         self.configChanged.emit()
 
@@ -809,18 +825,25 @@ class AuthoringPanel(QWidget):
                 continue          # CDS Settings: a dialog button, owns no attr
             if isinstance(w, QCheckBox):
                 setattr(self._cfg, attr, w.isChecked())
-            elif attr == "row_rate_khz":
-                txt = w.text()
-                try:
-                    setattr(self._cfg, attr, float(txt) if txt else float(mins.get(attr, 0)))
-                except ValueError:
-                    pass
             else:
                 txt = w.text()
-                try:
-                    setattr(self._cfg, attr, int(txt) if txt else int(mins.get(attr, 0)))
-                except ValueError:
-                    pass                              # ignore a QIntValidator 'Intermediate' value
+                is_float = attr == "row_rate_khz"
+                if not txt:                           # the minimum, shown in the box
+                    minimum = mins.get(attr, 0)
+                    setattr(self._cfg, attr, float(minimum) if is_float else int(minimum))
+                    w.setText(f"{float(minimum):g}" if is_float else str(int(minimum)))
+                elif w.hasAcceptableInput():
+                    # A box the user has not typed in, still showing the model's own
+                    # display text, is unedited: the display rounds (6 digits), so it is
+                    # never the source of a commit. A typed entry always commits.
+                    held = getattr(self._cfg, attr)
+                    if attr in self._iface_typed or txt != (
+                            f"{held:g}" if is_float else str(int(held))):
+                        setattr(self._cfg, attr, float(txt) if is_float else int(txt))
+                else:                                 # out of range: keep the model's value
+                    val = getattr(self._cfg, attr)
+                    w.setText(f"{val:g}" if is_float else str(int(val)))
+        self._iface_typed.clear()
         self._update_phy3_enabled()
         self._update_derived()
         self.configChanged.emit()
@@ -843,9 +866,13 @@ class AuthoringPanel(QWidget):
         # Raw bus bandwidth [Mbps] = row rate (kHz) × columns / 1000.
         self._bw_value.setText(
             f"{self._cfg.row_rate_khz * self._cfg.column_count() / 1000:g}")
-        # System SSP interval [rows] = LCM of each enabled DP's interval (rows).
-        intervals = [dp.interval + 1 for dp in self._cfg.dataports if dp.enabled]
-        ssp = reduce(math.lcm, intervals, 1) if intervals else 1
+        # System SSP interval [rows] = LCM of each enabled DP's pattern period: its
+        # interval, times SkippingDenominator for a skipping port (Section 4.2.3.1; the
+        # core's SwI3sConfig::patternRows, the visualizer's Interface.interval_lcm).
+        den = self._cfg.skipping_denominator
+        periods = [(dp.interval + 1) * (den if 0 < dp.skipping_numerator < den else 1)
+                   for dp in self._cfg.dataports if dp.enabled and dp.num_channels() > 0]
+        ssp = reduce(math.lcm, periods, 1)
         self._ssp_value.setText(str(ssp))
         # Per-DP sample rate.
         for c in range(NUM_DATA_PORTS):
@@ -855,13 +882,14 @@ class AuthoringPanel(QWidget):
         rr = self._cfg.row_rate_khz
         if not dp.sub_row_interval:
             base = (dp.sample_grouping + 1) * rr / (dp.interval + 1)
-            if dp.skipping_numerator and self._cfg.skipping_denominator:
-                base *= (self._cfg.skipping_denominator - dp.skipping_numerator) \
-                        / self._cfg.skipping_denominator
+            den = self._cfg.skipping_denominator
+            if dp.skipping_numerator and den:
+                # A numerator at or above the denominator skips every interval.
+                base *= max(0, den - dp.skipping_numerator) / den
             return f"{base:.1f}"
         # SRI: transports repeat within the horizontal window each row.
         nch = dp.num_channels()
-        txp = 1 if dp.flow_mode in (1, 3) else 0
+        txp = 1 if dp.flow_mode in (1, 2, 3) else 0     # Tx, Rx controlled, Async
         tw = nch * (dp.sample_size + 1 + txp) * (dp.sample_grouping + 1) * (dp.bit_width + 1)
         avail = dp.horizontal_count + 1
         if tw == 0 or avail < tw:

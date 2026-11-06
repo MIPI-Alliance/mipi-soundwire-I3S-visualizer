@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 from swi3s_studio.session import Session
 from swi3s_studio.ui.port_names import port_identity, port_label, with_name
 
+pytestmark = pytest.mark.gui
+
 
 def test_a_port_is_labelled_by_its_name_or_its_numbers():
     names = {(1, 2): "Mic L"}

@@ -4,7 +4,19 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
+
+pytestmark = pytest.mark.gui
+
+
+def _ctrl_b_action(win):
+    """The menu action bound to Ctrl+B: the shortcut's own path to toggle_bookmark."""
+    from PySide6.QtGui import QAction, QKeySequence
+    found = [a for a in win.findChildren(QAction)
+             if a.shortcut() == QKeySequence("Ctrl+B")]
+    assert len(found) == 1
+    return found[0]
 
 
 def _win():
@@ -19,8 +31,8 @@ def test_toggle_pairs_and_populates_measurement_pane():
     win = _win()
     s1 = int(win._session.commands[1]["start_sample"])
     s2 = int(win._session.commands[3]["start_sample"])
-    win.cursor.set_sample(s1); win.toggle_bookmark()
-    win.cursor.set_sample(s2); win.toggle_bookmark()
+    win.cursor.set_sample(s1); _ctrl_b_action(win).trigger()
+    win.cursor.set_sample(s2); _ctrl_b_action(win).trigger()
 
     assert [b.display() for b in win._bookmarks] == ["A1", "A2"]
     # one complete pair -> three Measurements rows (A1, A2, A1-A2), propagated to every pane
@@ -53,7 +65,7 @@ def test_drag_moves_bookmark_and_snaps_to_edge():
     # nearest clock edge, and the model must reflect the move.
     ce = win._session.capture.clock_edges
     target_edge = int(ce[len(ce) // 2])
-    win._on_bookmark_moved("A2", target_edge + 1, True)   # 1 sample off an edge
+    win._ribbons[0].bookmarkMoved.emit("A2", target_edge + 1, True)   # 1 sample off an edge
     a2 = next(b for b in win._bookmarks if b.display() == "A2")
     assert a2.sample == target_edge                        # snapped onto the edge
     win.close()
@@ -62,8 +74,11 @@ def test_drag_moves_bookmark_and_snaps_to_edge():
 def test_clear_bookmarks_empties_all_panes():
     win = _win()
     win.cursor.set_sample(int(win._session.commands[1]["start_sample"])); win.toggle_bookmark()
+    assert len(win._raw_view._bm_lines) == 1 and len(win._audio_view._bm_marks) == 1
     win.clear_bookmarks()
     assert len(win._bookmarks) == 0
     assert win._pair_view.rowCount() == 0
     assert win._timeline._bookmarks == []
+    assert len(win._raw_view._bm_lines) == 0
+    assert len(win._audio_view._bm_marks) == 0
     win.close()

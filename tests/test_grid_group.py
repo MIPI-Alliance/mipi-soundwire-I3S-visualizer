@@ -12,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from test_links_gui import _with_added_link
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture
 def two():

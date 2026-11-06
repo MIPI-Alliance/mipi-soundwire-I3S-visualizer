@@ -13,6 +13,8 @@ import pytest
 
 from swi3s_studio.session import Session
 
+pytestmark = pytest.mark.gui
+
 SAMPLE, CHANNEL, BIT = 1, 2, 4
 DEFAULT = 6                      # Channel|Bit — the Visualizer default
 
@@ -124,6 +126,30 @@ def test_label_honours_each_field_combination(session, qapp):
     assert GridView._data_label(cell, SAMPLE | CHANNEL, 1) == "S1C2"
     assert GridView._data_label(cell, SAMPLE | CHANNEL | BIT, 1) == "S1C2B3"
     assert GridView._data_label(cell, 0, 1) == ""
+
+
+def test_the_grid_label_is_the_visualizer_label_for_every_field_combination(session, qapp):
+    """GridView._data_label ports the Visualizer's own labels: BitSlotData.to_label for
+    data bits, BitSlotState.get_label for TX_PRESENT and DRQ."""
+    from swi3s_studio.swviz.models.bit_slot import BitSlotData, BitSlotState
+    from swi3s_studio.swviz.models.enums import DisplayField, SlotType
+    from swi3s_studio.ui.grid_view import _DRQ, _TXP, GridView
+
+    data = BitSlotData(channel=2, bit=13, sample_in_group=1)
+    cell = {"slot": 1, "sample": 1, "channel": 2, "bit": 13, "port_mode": 0}
+    for df in range(8):
+        flags = DisplayField(0)
+        for bit, flag in ((SAMPLE, DisplayField.SAMPLE), (CHANNEL, DisplayField.CHANNEL),
+                          (BIT, DisplayField.BIT)):
+            if df & bit:
+                flags |= flag
+        assert GridView._data_label(cell, df, 1) == data.to_label(flags), df
+    assert data.to_label() == GridView._data_label(cell, DEFAULT, 1)
+    txp = BitSlotState(SlotType.TX_PRESENT, data=BitSlotData(channel=3, bit=0))
+    assert GridView._data_label({**cell, "slot": _TXP, "channel": 3}, DEFAULT, 1) == \
+        txp.get_label()
+    assert GridView._data_label({**cell, "slot": _DRQ}, DEFAULT, 1) == \
+        BitSlotState(SlotType.DRQ).get_label()
 
 
 def test_chosen_fields_reach_the_rendered_label(session, qapp):
@@ -283,13 +309,22 @@ def test_cancelling_the_dialog_changes_nothing(qapp, monkeypatch):
     try:
         w.load_session(Session.from_demo(48, phy=2, cold_start=True))
         qapp.processEvents()
+        w.cursor.set_sample(_sample(w._session))
+        qapp.processEvents()
+        opened = []
 
         class _Reject(dialogs.GridLabelFieldsDialog):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.fields = SAMPLE | CHANNEL            # edited, then cancelled
+
             def exec(self):
+                opened.append(1)
                 return 0
 
         monkeypatch.setattr(dialogs, "GridLabelFieldsDialog", _Reject)
         w._on_dp_key_clicked(0, 2)
+        assert opened == [1], "the dialog was not opened exactly once"
         assert w._session.label_fields == {}
     finally:
         w.join_worker_threads()

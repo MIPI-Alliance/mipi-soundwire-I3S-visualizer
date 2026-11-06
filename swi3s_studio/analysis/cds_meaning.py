@@ -12,15 +12,28 @@ grammar — e.g. "PhaseID: GET_STATUS", "Device Mask_H = 0x3", "Opcode: WRITEA32
 Data-carrying fields include the decoded nibble/byte value.
 
 This mirrors CCommandTransportParser's state machine but is display-only and runs
-on the windowed symbol list. It re-syncs on every comma, so a window that starts
-mid-stream simply shows blanks until the first SPM, then labels normally.
+on the windowed symbol list. Each per-device response slot is one symbol: decode_symbols,
+given the session's hub depths, frames a hub-delayed device's token after its gap bits, as
+the parser reads it. It re-syncs on every comma, so a window that starts
+mid-stream simply shows blanks until the first SPM, then labels normally. A Phase Header
+holding a symbol that is not a Robust Token, or a PhaseID above 6, is a bad header, as
+the core reads it: its six tokens are labelled, the last one marked "(Bad header)", and
+the phase ends there with no packet or response labels.
 
-Symbol dict fields used: kind (0 invalid,1 comma,2 robust token,3 D-code,
-4 K-code) and value (token number for kind 2; byte for kind 3/4; else -1).
+Symbol dict fields used: kind (0 invalid, 1 comma, 2 robust token, 3 D-code, 4 K-code,
+5 undriven all-ones response field), value (token number for kind 2; byte for kind 3/4;
+else -1), and raw (the 10-bit codeword, read to label the idle pattern between
+phases). A symbol without raw never gets an "Idle Pattern" label. A Manager Packet or
+Read Data byte whose codeword is also a Robust Token (kind 2) shows the byte its 8b/10b
+decode of raw gives, as the core's parser reads it; without raw it shows the value.
 """
 from __future__ import annotations
 
+import functools
+import re
 from typing import List
+
+from . import responses
 
 _KIND_COMMA = 1
 _KIND_RT = 2
@@ -45,10 +58,14 @@ _MAX_PERIPHERALS = 12
 _SPACER_MP = _SYMBOL_BITS // _SYMBOL_BITS          # 10-bit Manager->Peripheral = 1 symbol
 _SPACER_PM = 20 // _SYMBOL_BITS                    # 20-bit Peripheral->Manager (default) = 2
 
-_PHASE_NAMES = {
-    0: "GET_STATUS", 1: "WRITE", 2: "READ_SETUP", 3: "READ_DATA",
-    4: "COMMIT", 5: "ANNOUNCE", 6: "CALIBRATE_PHY",
-}
+# PhaseID -> the phase name the Commands table and `responses` use (the core's spelling).
+_RESPONSE_PHASE = {0: "GetStatus", 1: "Write", 2: "ReadSetup", 3: "ReadData",
+                   4: "Commit", 5: "Announce", 6: "CalibratePhy"}
+# The symbol pane shows the specification's upper-case protocol names, derived from the
+# same table so a phase is defined once.
+_PHASE_NAMES = {k: re.sub(r"(?<!^)(?=[A-Z])", "_", v).upper()
+                for k, v in _RESPONSE_PHASE.items()}
+# Upper-case protocol names, matching the core's command names up to case and underscores.
 _OPCODES = {
     0: {0: "PING"},
     1: {0: "WRITEA32", 1: "UNBLOCK"},
@@ -61,50 +78,25 @@ _ADDR_BITS = [(31, 24), (23, 16), (15, 8), (7, 0)]
 
 
 def _opcode_name(phase: int, op: int) -> str:
-    return _OPCODES.get(phase, {}).get(op, f"0x{op & 0xFF:02X}")
+    return _OPCODES.get(phase, {}).get(op, f"Op0x{op & 0xFF:02X}")
 
 
 def _peripheral_response(phase: int, token: int) -> str:
-    """Peripheral Response token name, resolved within the phase ("Assignment of Robust
-    Token Numbers (Peripheral)" table)."""
+    """Peripheral Response token name, resolved within the phase by
+    `responses.peripheral_response_name` (the one table, shared with the Commands table
+    and the CSV export)."""
     if token < 0:
         return "?"
-    if token == 0:
-        return {1: "WRITE_OK", 2: "READ_DATA_NOW", 3: "READ_DATA_NOW",
-                4: "COMMIT_READY", 6: "CALIBRATE_NOW",
-                0: "PING_ATTACHED"}.get(phase, "RT0")
-    if token == 2:
-        return "COMMIT_NOT_READY" if phase == 4 else "RT2"
-    if token == 4:
-        return "WRITE_FAILED" if phase == 1 else ("READ_FAILED" if phase in (2, 3) else "RT4")
-    if token == 5:
-        return "REMOTE_WRITE_BUFFERED" if phase == 1 else (
-            "REMOTE_READ_DEFERRED" if phase in (2, 3) else "RT5")
-    if token == 6:
-        return "PING_ATTACHED_BUSY" if phase == 0 else "REMOTE_WRITE_BUSY"
-    if token == 7:
-        return "REMOTE_ACCESS_DISABLED"
-    if token == 8:
-        return "PING_ALERT" if phase == 0 else "RT8"
-    if token == 10:
-        return "PING_ALERT_BUSY" if phase == 0 else "RT10"
-    if token == 12:
-        return "PROTOCOL_ERROR"
-    if token == 13:
-        return "COMMAND_ERROR"
-    if token == 14:
-        return "TRANSPORT_ERROR"
-    if token == 15:
-        return "COMMANDS_BLOCKED"
-    return f"RT{token}"
+    return responses.peripheral_response_name(_RESPONSE_PHASE.get(phase, ""), token)
 
 
 def _manager_response(phase: int, token: int) -> str:
-    if token == 0:
-        return "CONFIRM_COMMIT" if phase == 4 else "READ_DATA_OK"
-    if token == 15:
-        return "CANCEL_COMMIT" if phase == 4 else "READ_DATA_ERROR"
-    return f"RT{token}" if token >= 0 else "?"
+    """Manager Response token name from `responses.manager_response_name`; a token the
+    table leaves unnamed shows as its number."""
+    if token < 0:
+        return "?"
+    return responses.manager_response_name(_RESPONSE_PHASE.get(phase, ""), token) \
+        or f"RT{token}"
 
 
 def _packet_field(phase: int, opcode: int, idx: int, pktlen: int) -> str:
@@ -138,6 +130,14 @@ def _packet_field(phase: int, opcode: int, idx: int, pktlen: int) -> str:
     return f"MP Byte {idx}"
 
 
+@functools.lru_cache(maxsize=1024)
+def _dcode_byte(raw: int) -> int:
+    """The data byte 10-bit codeword `raw` decodes to, or -1 when it is not a D-code."""
+    import swi3score
+    d = swi3score.decode_codeword(raw & 0x3FF)
+    return int(d["value"]) if d["valid"] and not d["is_control"] else -1
+
+
 class _Annotator:
     """Walks the symbol stream, tracking the Command Transport phase grammar."""
 
@@ -153,16 +153,20 @@ class _Annotator:
         self.read_bytes = 0     # remaining read-data bytes (ReadSetup-with-data)
         self._rd_idx = 0        # index within the Read Data field
         self._after = "idle"    # state to enter when the current spacer ends
+        self.header_ok = True   # every Phase Header token so far read, PhaseID defined
         self.raw = -1           # last symbol's raw 10-bit codeword (idle-pattern detect)
+        self.codeword = None    # last symbol's raw, None when it carries none
 
     def feed(self, sym: dict) -> str:
         kind = sym.get("kind", 0)
         val = sym.get("value", -1)
         self.raw = int(sym.get("raw", -1)) & 0x3FF     # for idle-pattern detection
+        self.codeword = sym.get("raw")
 
         if kind == _KIND_COMMA:                    # SPM resets the phase, anywhere
             self.state = "header"
             self.hidx = 0
+            self.header_ok = True
             return "SPM (Start of Phase)"
 
         handler = getattr(self, f"_st_{self.state}", None)
@@ -182,17 +186,31 @@ class _Annotator:
     def _st_header(self, kind, val) -> str:
         i = self.hidx
         self.hidx += 1
-        v = val if (val is not None and val >= 0) else 0
+        readable = kind == _KIND_RT and val is not None and val >= 0
+        v = val if readable else 0
+        if not readable:
+            self.header_ok = False
         if i == 0:
             self.phase = v
-            return f"PhaseID: {_PHASE_NAMES.get(self.phase, '?')}"
+            if not readable:
+                return "PhaseID: unreadable"
+            if v not in _PHASE_NAMES:
+                self.header_ok = False
+                return f"PhaseID: undefined ({v})"
+            return f"PhaseID: {_PHASE_NAMES[v]}"
         if i in (1, 2, 3):
-            return f"Device Mask_{'HML'[i - 1]} = 0x{v:X}"     # 4-bit nibble
+            field = f"Device Mask_{'HML'[i - 1]}"
+            return f"{field} = 0x{v:X}" if readable else f"{field}: unreadable"   # 4-bit nibble
         if i == 4:
             self._plen_hi = v & 0xF                # Packet Length high nibble
-            return f"Packet Length_H = 0x{v:X}"
+            return f"Packet Length_H = 0x{v:X}" if readable else "Packet Length_H: unreadable"
         # i == 5: low nibble completes Packet Length; decide what follows.
         self.pktlen = (getattr(self, "_plen_hi", 0) << 4) | (v & 0xF)
+        if not self.header_ok:
+            self.state = "idle"                    # the core re-hunts the next comma
+            label = (f"Packet Length_L = 0x{v:X}" if readable
+                     else "Packet Length_L: unreadable")
+            return f"{label}  (Bad header)"
         self._begin_after_header()
         return f"Packet Length_L = 0x{v:X}  (len {self.pktlen})"
 
@@ -205,7 +223,15 @@ class _Annotator:
         else:
             self.state = "idle"                    # zero-length phase ends
 
+    def _byte(self, kind, val):
+        """The byte a Manager Packet or Read Data symbol carries: a Robust Token's codeword
+        read as the D-code it also is, any other kind's value."""
+        if kind == _KIND_RT and self.codeword is not None:
+            return _dcode_byte(int(self.codeword))
+        return val
+
     def _st_packet(self, kind, val) -> str:
+        val = self._byte(kind, val)
         idx = self.pidx
         self.pidx += 1
         if idx == 0:
@@ -270,6 +296,7 @@ class _Annotator:
         # encoded in _st_packet, and _st_read_resp transitions here only when
         # read_bytes > 0). The first call takes the data branch and sets count=2
         # before the CRC branch runs.
+        val = self._byte(kind, val)
         if self.read_bytes > 0:
             label = f"Read Data[{self._rd_idx}] = 0x{(val & 0xFF):02X}" if (val is not None and val >= 0) else f"Read Data[{self._rd_idx}]"
             self._rd_idx += 1

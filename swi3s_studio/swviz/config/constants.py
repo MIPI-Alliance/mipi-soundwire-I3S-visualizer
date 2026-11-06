@@ -34,7 +34,7 @@ class CSVFields:
 
     # Data port parameters (DP_ prefix distinguishes from interface fields)
     DP_NAME = 'Name'
-    DP_DATAPORT_NUMBER = 'DataPortNumber'   # logical DP number 0-31 (v3.0.0)
+    DP_DATAPORT_NUMBER = 'DataPortNumber'   # logical DP number 0-31
     DP_DEVICE_NUMBER_REG = 'DeviceNumber_REG'
     DP_NUM_CHANNELS = 'NumChannels'
     DP_CHANNEL_GROUPING_REG = 'ChannelGrouping_REG'
@@ -56,10 +56,10 @@ class CSVFields:
     DP_MANAGER_DATAPORT = 'ManagerDataport'
     DP_SUB_ROW_INTERVAL_REG = 'SubRowInterval_REG'
     DP_ENABLE_CH_REG = 'EnableCh_REG'
-    DP_DISPLAY_FIELDS = 'DisplayFields'  # Display field selection: "sc", "sb", "cb" (default)
+    DP_DISPLAY_FIELDS = 'DisplayFields'  # Display field selection: "sc" (default), "sb", "cb"
     DP_FLOW_MODE_REG = 'FlowMode_REG'  # Flow mode: 0=Normal, 1=Tx, 2=Rx, 3=Async
-    DP_PORT_MODE_REG = 'PortMode_REG'  # Port mode: 0=Normal, 1=Reserved, 2=Test Ones, 3=Test Zeros
-    DP_SCRAMBLER_EN_REG = 'ScramblerEn_REG'  # Scrambler enabled (True/False)
+    DP_PORT_MODE_REG = 'PortMode_REG'  # Port mode: 0=Normal, 1=Reserved, 2=Test0 (all 0), 3=Test1 (all 1)
+    DP_SCRAMBLER_EN_REG = 'ScramblerEn_REG'  # Scrambler enabled (true/false, yes/no or 1/0)
 
     # Flow Control Port (FCP) parameters for DRQ bits (Rx Controlled/Async modes)
     DP_FCP_HORIZONTAL_START_REG = 'FCP_HorizontalStart_REG'
@@ -74,10 +74,6 @@ class SpecialDevices:
     """Special device numbers for JSON export and clash detection"""
     MANAGER = -1      # S0, S1, their handovers, manager data ports
     UNIVERSAL = -2    # CDS bit + CDS turnaround handover (any device may drive it)
-    VISUALIZER = -3   # deprecated; handovers carry their real device
-                      # (Manager -1 or peripheral 0-11) + the HANDOVER slot
-    MIN_REGULAR = 0   # Regular device numbers: 0-11
-    MAX_REGULAR = 11
 
 
 class SlotTypeStrings:
@@ -128,13 +124,6 @@ class Colors:
     )
 
 
-class FeatureFlags:
-    """Feature flags for optional behavior"""
-    SRI_USES_SAMPLE_COUNT = True
-    FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = False
-    UI_IS_EXCESS_1 = True
-
-
 class InterfaceRanges:
     """Validation ranges for Interface parameters.
 
@@ -150,17 +139,14 @@ class InterfaceRanges:
     MIN_ROW_RATE = 1.0
     MAX_ROW_RATE = 48000.0
     MIN_SKIPPING_DENOMINATOR = 1
-    MAX_SKIPPING_DENOMINATOR = 4096
+    MAX_SKIPPING_DENOMINATOR = 4095  # 12-bit SkippingDenominator_H[3:0] + _L
     MIN_S0_WIDTH = 1
     MAX_S0_WIDTH = 8
-    MIN_S1_WIDTH = 1
-    MAX_S1_WIDTH = 8
-    MIN_CDS_S0_HANDOVER_WIDTH = 0
-    MAX_CDS_S0_HANDOVER_WIDTH = 8
     MIN_CDS_WIDTH = 0
     MAX_CDS_WIDTH = 7
     MIN_CDS_TAIL_WIDTH = 0
     MAX_CDS_TAIL_WIDTH = 3
+    RESERVED_CDS_TAIL_WIDTH = 3  # CDS_TailWidth defines 0..2 UI; a 3 loads as written
     MIN_TAIL_WIDTH = 0
     MAX_TAIL_WIDTH = 2
 
@@ -186,11 +172,9 @@ class DataPortRanges:
     MIN_CHANNEL_GROUPING = 0
     MAX_CHANNEL_GROUPING = 15  # ChannelGrouping_REG is 4-bit (0-15)
     MIN_CHANNEL_GROUP_SPACING = 0
-    MAX_CHANNEL_GROUP_SPACING = MAX_CHANNELS
+    MAX_CHANNEL_GROUP_SPACING = 15  # Spacing_REG is 4-bit (0-15)
     MIN_SKIPPING_NUMERATOR = 0
-    MAX_SKIPPING_NUMERATOR = InterfaceRanges.MAX_SKIPPING_DENOMINATOR - 1
-    MIN_SKIPPING_DENOMINATOR = 0
-    MAX_SKIPPING_DENOMINATOR = InterfaceRanges.MAX_SKIPPING_DENOMINATOR - 1
+    MAX_SKIPPING_NUMERATOR = 4095  # 12-bit field
     MIN_H_START = 0
     MAX_H_START = InterfaceRanges.MAX_COLUMNS_PER_ROW
     MIN_H_COUNT = 0
@@ -205,8 +189,6 @@ class DataPortRanges:
     MAX_FLOW_MODE = 3
     MIN_PORT_MODE = 0
     MAX_PORT_MODE = 3
-    MIN_FRAME_COLUMNS = 2
-    MAX_FRAME_COLUMNS = InterfaceRanges.MAX_COLUMNS_PER_ROW + 1  # Actual column count
 
     # Flow Control Port (FCP) parameter ranges for DRQ bits
     MIN_FCP_H_START = 0
@@ -217,23 +199,4 @@ class DataPortRanges:
     MAX_FCP_TAIL_WIDTH = MAX_TAIL_WIDTH
     MIN_FCP_OFFSET = 0
     MAX_FCP_OFFSET = MAX_INTERVAL
-    MIN_FCP_GUARD_POLARITY = 0
-    MAX_FCP_GUARD_POLARITY = 1
 
-
-class DebugFlags:
-    """Debug flags for development"""
-    DRAWING = False
-    FILE_IO = False
-    CLASH = False
-
-
-# Convenience exports for feature flags
-SRI_USES_SAMPLE_COUNT = FeatureFlags.SRI_USES_SAMPLE_COUNT
-FRACTION_IS_DITHERED_TRANSPORT_INTERVAL = FeatureFlags.FRACTION_IS_DITHERED_TRANSPORT_INTERVAL
-UI_IS_EXCESS_1 = FeatureFlags.UI_IS_EXCESS_1
-
-# Convenience exports for debug flags
-Debug_Drawing = DebugFlags.DRAWING
-Debug_FileIO = DebugFlags.FILE_IO
-Debug_Clash = DebugFlags.CLASH

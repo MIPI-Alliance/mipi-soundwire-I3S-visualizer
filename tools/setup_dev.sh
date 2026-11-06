@@ -56,7 +56,7 @@ echo "Installing development dependencies (requirements-dev.txt)..."
 "$VPY" -m pip install -r requirements-dev.txt
 
 echo "Building the swi3score decode core..."
-# --force-reinstall: the core's version is fixed, so a plain install keeps a stale build.
+# --force-reinstall replaces the installed module even when pip would judge it current.
 "$VPY" -m pip install --force-reinstall --no-deps ./native
 # run.sh's stamps: the dependencies and the core it would install are now current.
 touch "$VENV/.deps-stamp" "$VENV/.native-stamp"
@@ -77,7 +77,8 @@ fi
 cat <<EOT
 
 Ready. From the checkout root, the functional suite (perf deselected), the perf benchmarks
-in their own process, and the release gate (suite, perf, ruff, mypy, ABI):
+in their own process, and the commit gate (native core and ABI, suite, perf, ruff, mypy,
+leak scan, screenshots; add --release before a tag):
   source "$VENV/bin/activate"
   python -m pytest
   python -m pytest -m perf

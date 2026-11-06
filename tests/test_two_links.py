@@ -2,17 +2,18 @@
 exactly as it does alone, one file-wide timeline, and File ▸ Open taking both Links from the
 same file through the real async load queue. Offscreen Qt for the GUI half."""
 import os
-import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
-from conftest import TWO_LINK_SHIFT_SAMPLES, export_sal_links, two_link_captures
+from conftest import TWO_LINK_SHIFT_SAMPLES, export_sal_links, pump_loads, two_link_captures
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio.ingest import saleae_sal
 from swi3s_studio.session import Session
+
+pytestmark = pytest.mark.gui
 
 
 @pytest.fixture(scope="module")
@@ -52,21 +53,13 @@ def test_links_from_one_file_share_its_timeline(two_link_sal):
     assert int(link2.capture.clock_edges[0]) >= TWO_LINK_SHIFT_SAMPLES
 
 
-def test_the_multi_link_export_refuses_mixed_rates():
+def test_the_multi_link_export_refuses_mixed_rates(tmp_path):
     from dataclasses import replace
     a, b = two_link_captures()
-    with pytest.raises(ValueError):
-        export_sal_links([a, replace(b, sample_rate_hz=a.sample_rate_hz // 2)], "/dev/null")
-
-
-def _pump(win, seconds=120.0):
-    app = QApplication.instance()
-    deadline = time.time() + seconds
-    while (getattr(win, "_load_thread", None) is not None or win._load_pending) \
-            and time.time() < deadline:
-        app.processEvents()
-        time.sleep(0.005)
-    assert getattr(win, "_load_thread", None) is None, "the loads never finished"
+    path = tmp_path / "mixed.sal"
+    with pytest.raises(ValueError, match=r"one \.sal has one sample rate"):
+        export_sal_links([a, replace(b, sample_rate_hz=a.sample_rate_hz // 2)], str(path))
+    assert not path.exists()
 
 
 def test_open_takes_both_links_from_one_sal(two_link_sal, monkeypatch):
@@ -88,7 +81,7 @@ def test_open_takes_both_links_from_one_sal(two_link_sal, monkeypatch):
         r2.name.textEdited.emit("Speaker bus")
     open_via_dialog(monkeypatch, [path], edit)
     win.open_capture()
-    _pump(win)
+    pump_loads(win)
     assert len(win.links) == 2
     assert [(e.session.source["clock_channel"], e.session.source["data_channel"])
             for e in win.links] == [(0, 1), (2, 3)]
@@ -109,7 +102,7 @@ def test_one_row_opens_one_link(two_link_sal, monkeypatch):
     win = MainWindow()
     shown = open_via_dialog(monkeypatch, [path])
     win.open_capture()
-    _pump(win)
+    pump_loads(win)
     assert len(win.links) == 1
     # The four-channel file holds two Links; the default pairs a clock with a data line,
     # not the two busiest (both clocks).
@@ -132,11 +125,11 @@ def test_add_link_from_another_file_keeps_the_first(two_link_sal, tmp_path, monk
     win = MainWindow()
     open_via_dialog(monkeypatch, [p1])
     win.open_capture()
-    _pump(win)
+    pump_loads(win)
     first = win._session
     shown = open_via_dialog(monkeypatch, [p2])
     win.add_link()                                     # the dialog opens on Add
-    _pump(win)
+    pump_loads(win)
     assert shown[0]._add.isChecked()
     assert [e.session.source["path"] for e in win.links] == [p1, p2]
     assert [e.name for e in win.links] == ["Link 1", "Link 2"]
@@ -168,10 +161,10 @@ def test_align_recovers_a_known_offset_between_two_files(tmp_path, monkeypatch):
     win = MainWindow()
     open_via_dialog(monkeypatch, [p1])
     win.open_capture()
-    _pump(win)
+    pump_loads(win)
     open_via_dialog(monkeypatch, [p2])
     win.add_link()
-    _pump(win)
+    pump_loads(win)
     assert win.links[1].offset_ps == 0                  # nothing known yet
     s1 = TWO_LINK_SHIFT_SAMPLES + 250_000               # one instant, on Link 1 ...
     win._bookmarks.add(s1, link=0)
@@ -230,7 +223,9 @@ def test_the_two_link_demo_loads_through_the_async_queue(monkeypatch):
     win = MainWindow()
     monkeypatch.setattr(MainWindow, "_event_loop_live", True)
     win.load_demo_links()
-    _pump(win)
+    assert win._load_thread is not None or win._load_pending   # queued, not loaded inline
+    assert len(win.links) == 0
+    pump_loads(win)
     assert [e.session.source.get("variant") for e in win.links] == ["", "flow_control"]
 
 
@@ -249,7 +244,7 @@ def test_the_two_link_demo_reopens_from_a_workspace(tmp_path, monkeypatch):
     win2 = MainWindow()
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
     win2.open_workspace()
-    _pump(win2)
+    pump_loads(win2)
     assert len(win2.links) == 2
     for a, b in zip(win.links, win2.links):
         assert a.session.source == b.session.source

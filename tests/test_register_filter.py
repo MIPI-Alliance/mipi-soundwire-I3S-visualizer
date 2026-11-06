@@ -25,6 +25,8 @@ from swi3s_studio.model.registers import SLC_BASE
 from swi3s_studio.ui.register_view import _BLOCK_ROLE, _PROV_LABEL, _PROV_ROLE, RegisterView
 from swi3s_studio.ui.theme import VizTheme
 
+pytestmark = pytest.mark.gui
+
 _NUM_COLUMNS = SLC_BASE + 0x81        # dual-ranked: NEXT here, CURR at its alias
 _MANUFACTURER_H = SLC_BASE + 0x01     # single rank
 _MANUFACTURER_L = SLC_BASE + 0x02
@@ -39,13 +41,15 @@ def view():
     f = DeviceRegisterFile(rmap, 0)
     f.apply_write(_NUM_COLUMNS, bytes([0x0F]))         # staged in NEXT, no commit: CURR is reset
     f.apply_read(_MANUFACTURER_H, bytes([0x01]))
-    f.force_ui(_MANUFACTURER_L, 0x5A)
+    f.seed(_MANUFACTURER_L, 0, False, Provenance.DEFAULT, 0x5A, True, Provenance.UI)
     v = RegisterView(rmap)
     v.set_files({0: f})
     v.resize(900, 700)
     v.show()
     QApplication.processEvents()
-    return v
+    yield v
+    v.close()
+    v.deleteLater()
 
 
 def _rows(v):

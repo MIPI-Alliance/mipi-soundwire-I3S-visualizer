@@ -21,13 +21,21 @@
 // bring-up does not change, over its column count). The stretch between is skipped, not
 // tracked: it has no rows, and the start sequence's link-control pulses are single-ended
 // edges the loop would snap to.
+//
+// The clock needs at least kMinUiSamples samples per UI: a lock, re-acquisition or row
+// whose UI is shorter ends the source. A stretch whose next rising edge lies more than
+// kMaxCoastRows row periods past the predicted Sync1 holds no rows (every row opens on a
+// rising edge), so the clock relocks at that edge without coasting through it; with no
+// rising edge left and the capture running on further, the source ends.
 
 #ifndef SWI3SCORE_DLVSAMPLESOURCE_H
 #define SWI3SCORE_DLVSAMPLESOURCE_H
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -39,27 +47,41 @@ namespace swi3score {
 class DlvSampleSource final : public ISampleSource
 {
 public:
-    // dpEdges: sorted DP-wire transition samples. initialDp: DP level before edge 0.
+    // Non-owning (zero-copy): dpEdges[0..dpCount) are the sorted DP-wire transition
+    // samples, viewed in place. They must outlive this object, either because the caller
+    // guarantees it or because `owner` (released when this object is destroyed) keeps
+    // them alive. initialDp: DP level before edge 0.
     // initialColumns: Safe-Lock column count to start with (snoop updates it later).
     // nominalUiSamples: expected UI period in samples for the INITIAL geometry (the PLL's
     // free-running estimate to acquire from). >0 seeds the loop so it locks to the once-
     // per-row reference edge instead of guessing the period from the first two rising edges
     // (which grabs an intra-row CDS/data edge when the first CDS bit is 1). 0 = auto.
+    DlvSampleSource(const std::uint64_t* dpEdges, std::size_t dpCount, bool initialDp,
+                    std::uint64_t sampleRateHz, int initialColumns,
+                    double nominalUiSamples = 0.0,
+                    std::shared_ptr<const void> owner = nullptr)
+        : mOwner(std::move(owner)), mEdges(dpEdges), mEdgeN(dpCount),
+          mInitialDp(initialDp), mRate(sampleRateHz),
+          mColumns(validColumns(initialColumns)),
+          mNominalUi(nominalUiSamples), mNominalRow(nominalUiSamples * mColumns)
+    {
+        init();
+    }
+
+    // Owning convenience (copies) for C++ callers/tests.
     DlvSampleSource(std::vector<std::uint64_t> dpEdges, bool initialDp,
                     std::uint64_t sampleRateHz, int initialColumns,
                     double nominalUiSamples = 0.0)
-        : mEdges(std::move(dpEdges)), mInitialDp(initialDp), mRate(sampleRateHz),
-          mColumns(initialColumns >= swi3s::kMinColumnCount ? initialColumns : swi3s::kColdStartColumnCount),
+        : mEdgesOwned(std::move(dpEdges)), mEdges(mEdgesOwned.data()),
+          mEdgeN(mEdgesOwned.size()), mInitialDp(initialDp), mRate(sampleRateHz),
+          mColumns(validColumns(initialColumns)),
           mNominalUi(nominalUiSamples), mNominalRow(nominalUiSamples * mColumns)
     {
-        // Precompute the 0->1 (rising) edge samples the DLL locks to. With DP low before
-        // edge 0, even-indexed edges are rising; with DP high, odd-indexed. (A rising
-        // edge is a transition whose post-edge level is high.)
-        const std::size_t firstRising = mInitialDp ? 1u : 0u;
-        for (std::size_t i = firstRising; i < mEdges.size(); i += 2)
-            mRising.push_back(mEdges[i]);
-        mLastSample = mEdges.empty() ? 0 : mEdges.back();
+        init();
     }
+
+    DlvSampleSource(const DlvSampleSource&) = delete;
+    DlvSampleSource& operator=(const DlvSampleSource&) = delete;
 
     bool NextUi(bool& rising, bool& dataHigh, std::uint64_t& sampleNumber) override
     {
@@ -73,14 +95,15 @@ public:
             mAlignmentEmitted = true;
             rising = true;
             dataHigh = false;                       // pre-Sync1 (Sync0) level
-            sampleNumber = mRowStart;
+            sampleNumber = mRowSyncs[mRow];         // the row's edge, exact
             return true;
         }
 
         if (mCol >= mColumns && !advanceRow()) return false;
 
         double mid = mRowStart + (mCol + 0.5) * mUiSamples;
-        std::uint64_t s = (mid <= 0.0) ? 0 : static_cast<std::uint64_t>(mid + 0.5);
+        if (!(mid + 0.5 < kSampleLimit)) return false;   // past every sample number
+        std::uint64_t s = toSample(mid + 0.5);
         if (s > mLastSample) return false;          // ran past the capture
         rising = (mCol == 0);                        // Column 0 = Sync1 (row start)
         dataHigh = levelAt(s);                       // mid-UI differential level = the bit
@@ -98,10 +121,10 @@ public:
     // speeds up as the row subdivides into more columns, while the row rate holds), so a
     // seek cannot step uiIndex*mUiSamples from row 0. Seek binary-searches the row log
     // (mRowSyncs / mRowStartUi, recorded as the DLL runs) for the row containing `uiIndex`,
-    // restores that row's start edge + per-row UI width, and sets the column within it.
-    // O(log rows); NextUi then produces the same (sample, level) as the full decode: past
-    // the row it takes each logged row's edge (replayRow), so a window reaches across a
-    // re-acquisition too.
+    // restores that row's start edge + the UI width the live decode used for it (mRowUi),
+    // and sets the column within it. O(log rows); NextUi then produces the same (sample,
+    // level) as the full decode: past the row it takes each logged row's edge and UI
+    // (replayRow), so a window reaches across a re-acquisition too.
     bool CanSeek() const override { return true; }
 
     void Seek(std::uint64_t uiIndex) override
@@ -124,17 +147,14 @@ public:
         mRow = r;
         mRowStart = static_cast<double>(mRowSyncs[r]);
         mCol = static_cast<int>(uiIndex - mRowStartUi[r]);
-        // Per-row UI width and column count from the recorded row spans (row rate constant,
-        // so this row's period / its column count = that row's UI). Fall back to the live
-        // values for the final (still-open) row. The span of the row a stop cut short runs
-        // to the re-acquired row, so that row takes the UI it had (see Reacquired).
+        // The column count comes from the row's UI span in the log, the UI width from the
+        // value the live decode used for the row. The final (still-open) row keeps the live
+        // values. The row a stop cut short takes the UI it had (see Reacquired).
         if (r + 1 < mRowSyncs.size()) {
             int colsInRow = static_cast<int>(mRowStartUi[r + 1] - mRowStartUi[r]);
-            if (colsInRow > 0) {
-                mColumns = colsInRow;
-                mUiSamples = static_cast<double>(mRowSyncs[r + 1] - mRowSyncs[r]) / colsInRow;
-            }
+            if (colsInRow > 0) mColumns = colsInRow;
         }
+        if (r < mRowUi.size()) mUiSamples = mRowUi[r];
         if (const Reacquired* k = reacquiredAt(r + 1)) mUiSamples = k->cutUiSamples;
     }
     // Approximate (progress only): the UIs already produced plus the rest of the capture
@@ -147,7 +167,7 @@ public:
         if (ui <= 0.0 || mLastSample == 0) return 0;
         const double at = mLocked ? mRowStart + mCol * ui : 0.0;
         const double rest = static_cast<double>(mLastSample) - at;
-        return mUi + ((rest > 0.0) ? static_cast<std::uint64_t>(rest / ui) : 0);
+        return mUi + toSample(rest / ui);
     }
 
     // Snoop pushes a committed NumColumns change at a row boundary; the DLL re-subdivides
@@ -155,7 +175,7 @@ public:
     // lands on a row boundary in the decoder's feed loop).
     void SetColumns(int n) override
     {
-        if (n < swi3s::kMinColumnCount || n == mColumns) return;
+        if (n < swi3s::kMinColumnCount || n > swi3s::kMaxColumnCount || n == mColumns) return;
         // The decoder pushes a column change at a row boundary (it fires the commit when
         // its own column counter wraps), so the current row is fully emitted and mCol sits
         // at the old column count, awaiting the next row. The row RATE (reference) is
@@ -182,14 +202,15 @@ public:
     {
         if (!mLocked && !lock()) return;
         if (columns < swi3s::kMinColumnCount || columns > swi3s::kMaxColumnCount) columns = mColumns;
-        auto it = std::lower_bound(mRising.begin(), mRising.end(), sample);
-        const std::uint64_t edge = (it == mRising.end()) ? UINT64_MAX : *it;
+        const std::size_t at = risingAtOrAfter(sample);
+        const std::uint64_t edge = (at < mEdgeN) ? mEdges[at] : UINT64_MAX;
         double cutUi = mUiSamples;
         if (!mReacquired.empty() && mRowStartUi[mReacquired.back().row] >= mUi)
             cutUi = mReacquired.back().cutUiSamples;
         while (!mRowStartUi.empty() && mRowStartUi.back() >= mUi) {
             mRowStartUi.pop_back();
             mRowSyncs.pop_back();
+            mRowUi.pop_back();
         }
         while (!mReacquired.empty() && mReacquired.back().row >= mRowSyncs.size())
             mReacquired.pop_back();
@@ -197,12 +218,14 @@ public:
         mEnded = (edge == UINT64_MAX);
         if (mEnded) return;
         const double row = (mNominalRow > 0.0) ? mNominalRow : mUiSamples * mColumns;
+        if (!(row / columns >= kMinUiSamples)) { mEnded = true; return; }
         mColumns = columns;
         mUiSamples = row / columns;
         mRowStart = static_cast<double>(edge);
         mCol = 0;
         mRowSyncs.push_back(edge);
         mRowStartUi.push_back(mUi);
+        mRowUi.push_back(mUiSamples);
         mLoggedThroughUi = mUi;
         mRow = mRowSyncs.size() - 1;
         mReacquired.push_back({mRow, mUiSamples, cutUi, columns});
@@ -213,7 +236,30 @@ public:
     const std::vector<std::uint64_t>& RecoveredRowSyncs() const { return mRowSyncs; }
     double RecoveredUiSamples() const { return mUiSamples; }
 
+    // The fewest samples per UI the recovered clock decodes (swi3score.dlv_min_ui_samples).
+    static constexpr double kMinUiSamples = 1.0;
+
 private:
+    static constexpr double kMaxCoastRows = 64.0;
+    static constexpr double kSampleLimit = 18446744073709551616.0;   // 2^64
+
+    // `x` truncated to a sample number, saturating: 0 at or below 0 and for NaN,
+    // UINT64_MAX at or past 2^64. Every double-to-sample conversion goes through it, since
+    // converting a double outside the uint64 range is undefined and compilers differ on it.
+    static std::uint64_t toSample(double x)
+    {
+        if (!(x > 0.0)) return 0;
+        if (x >= kSampleLimit) return UINT64_MAX;
+        return static_cast<std::uint64_t>(x);
+    }
+
+    // The Safe-Lock count to start with: `columns` when legal, else the cold-start count.
+    static int validColumns(int columns)
+    {
+        return (columns >= swi3s::kMinColumnCount && columns <= swi3s::kMaxColumnCount)
+                   ? columns : swi3s::kColdStartColumnCount;
+    }
+
     // A re-acquisition (Reacquire), for a windowed decode to follow: the row it opened, the
     // UI and column count it locked with, and the UI of the row before it, which the stop
     // cut short.
@@ -224,6 +270,25 @@ private:
         int columns = 0;
     };
 
+    // The rising (0->1) edges, the row-sync candidates, are the edges whose post-edge
+    // level is high: with DP low before edge 0 the even-indexed ones, with DP high the
+    // odd-indexed ones. They are addressed in place by that parity, not copied.
+    std::size_t firstRising() const { return mInitialDp ? 1u : 0u; }
+
+    // Index of the first rising edge at or after `sample`, or >= mEdgeN when none.
+    std::size_t risingAtOrAfter(std::uint64_t sample) const
+    {
+        std::size_t i = static_cast<std::size_t>(
+            std::lower_bound(mEdges, mEdges + mEdgeN, sample) - mEdges);
+        if ((i & 1u) != firstRising()) ++i;
+        return i;
+    }
+
+    void init()
+    {
+        mLastSample = (mEdgeN == 0) ? 0 : mEdges[mEdgeN - 1];
+    }
+
     // DP logical level at `sample`: initial level XOR parity of edges at/before it.
     // NextUi queries strictly-increasing samples, so a forward cursor (count of edges
     // <= sample) is O(1) amortized instead of an O(log m) upper_bound PER UI — this is
@@ -232,7 +297,7 @@ private:
     // upper_bound: mEdgeCursor lands on the first edge index > sample either way.
     bool levelAt(std::uint64_t sample) const
     {
-        while (mEdgeCursor < mEdges.size() && mEdges[mEdgeCursor] <= sample) ++mEdgeCursor;
+        while (mEdgeCursor < mEdgeN && mEdges[mEdgeCursor] <= sample) ++mEdgeCursor;
         while (mEdgeCursor > 0 && mEdges[mEdgeCursor - 1] > sample) --mEdgeCursor;
         return mInitialDp ^ ((mEdgeCursor & 1u) != 0);
     }
@@ -240,12 +305,14 @@ private:
     // Nearest rising edge to `predicted` within +/- `window` samples, or UINT64_MAX.
     std::uint64_t nearestRising(std::uint64_t predicted, std::uint64_t window) const
     {
-        auto it = std::lower_bound(mRising.begin(), mRising.end(), predicted);
+        const std::size_t at = risingAtOrAfter(predicted);
         std::uint64_t best = UINT64_MAX, bestDist = window + 1;
-        for (auto cand : {it, (it == mRising.begin() ? it : std::prev(it))}) {
-            if (cand == mRising.end()) continue;
-            std::uint64_t d = (*cand > predicted) ? (*cand - predicted) : (predicted - *cand);
-            if (d <= window && d < bestDist) { best = *cand; bestDist = d; }
+        const std::size_t prev = (at >= firstRising() + 2) ? at - 2 : at;
+        for (std::size_t cand : {at, prev}) {
+            if (cand >= mEdgeN) continue;
+            const std::uint64_t e = mEdges[cand];
+            std::uint64_t d = (e > predicted) ? (e - predicted) : (predicted - e);
+            if (d <= window && d < bestDist) { best = e; bestDist = d; }
         }
         return best;
     }
@@ -256,18 +323,20 @@ private:
     // back to guessing it from the first two rising edges / columns.
     bool lock()
     {
-        if (mRising.empty()) return false;
-        mRowStart = mRising[0];
-        mRowStart0 = static_cast<double>(mRising[0]);   // fixed row-0 anchor for Seek()
+        const std::size_t r0 = firstRising();
+        if (r0 >= mEdgeN) return false;
+        mRowStart = static_cast<double>(mEdges[r0]);
+        mRowStart0 = static_cast<double>(mEdges[r0]);   // fixed row-0 anchor for Seek()
         if (mNominalUi > 0.0) {
             mUiSamples = mNominalUi;
         } else {
-            if (mRising.size() < 2) return false;
-            mUiSamples = static_cast<double>(mRising[1] - mRising[0]) / mColumns;
+            if (r0 + 2 >= mEdgeN) return false;
+            mUiSamples = static_cast<double>(mEdges[r0 + 2] - mEdges[r0]) / mColumns;
         }
-        if (mUiSamples <= 0.0) return false;
-        mRowSyncs.push_back(mRowStart);
+        if (!(mUiSamples >= kMinUiSamples) || !std::isfinite(mUiSamples)) return false;
+        mRowSyncs.push_back(mEdges[r0]);
         mRowStartUi.push_back(0);          // row 0's Column 0 is source UI 0 (Seek row lookup)
+        mRowUi.push_back(mUiSamples);
         mRow = 0;
         mLocked = true;
         mCol = 0;
@@ -277,27 +346,44 @@ private:
     // End of a row: predict the next Sync1 (rowStart + columns*UI), snap to the nearest
     // observed rising edge (tracks jitter/drift; coasts on the prediction if none is within
     // half a UI — a missing Row Sync, which the spec tolerates), and refine the UI estimate.
+    // A next rising edge more than kMaxCoastRows rows on is relocked to directly, with the
+    // UI unchanged; none at all, with the capture running on further, ends the source, as
+    // does a UI under kMinUiSamples or a row that does not advance.
     bool advanceRow()
     {
         if (mRow + 1 < mRowSyncs.size()) return replayRow(mRow + 1);
+        if (!(mUiSamples >= kMinUiSamples)) return false;
         double period = mColumns * mUiSamples;
         double predicted = mRowStart + period;
         if (predicted > static_cast<double>(mLastSample) + mUiSamples) return false;
-        std::uint64_t window = static_cast<std::uint64_t>(mUiSamples * 0.5 + 0.5);
-        std::uint64_t snap = nearestRising(static_cast<std::uint64_t>(predicted + 0.5), window);
-        std::uint64_t newStart = (snap != UINT64_MAX) ? snap
-                                                      : static_cast<std::uint64_t>(predicted + 0.5);
+        const std::uint64_t at = toSample(predicted + 0.5);
+        std::uint64_t window = toSample(mUiSamples * 0.5 + 0.5);
+        std::uint64_t snap = nearestRising(at, window);
+        bool relocked = false;
+        std::uint64_t newStart = (snap != UINT64_MAX) ? snap : at;
+        if (snap == UINT64_MAX) {
+            const std::size_t next = risingAtOrAfter(at);
+            const double limit = predicted + kMaxCoastRows * period;
+            if (next >= mEdgeN) {
+                if (static_cast<double>(mLastSample) > limit) return false;
+            } else if (static_cast<double>(mEdges[next]) > limit) {
+                newStart = mEdges[next];
+                relocked = true;
+            }
+        }
+        if (static_cast<double>(newStart) <= mRowStart) return false;
         // Refine UI from the measured row period (light EMA); guard against a bad snap.
-        double measured = static_cast<double>(newStart - mRowStart) / mColumns;
-        if (measured > 0.0) mUiSamples = 0.75 * mUiSamples + 0.25 * measured;
+        double measured = (static_cast<double>(newStart) - mRowStart) / mColumns;
+        if (!relocked && measured > 0.0) mUiSamples = 0.75 * mUiSamples + 0.25 * measured;
         mRowStart = newStart;
         // Log this row's (edge, Column-0 UI) — but only the FIRST time we advance through it.
         // A windowed re-decode (Seek + NextUi, e.g. the CDS symbol viewer or the bit-sample
         // overlay) walks rows already logged; re-appending would corrupt the recovered-clock
         // marks and the Seek row lookup itself. Only genuinely new (higher-UI) rows are logged.
         if (mUi > mLoggedThroughUi || mRowSyncs.empty()) {
-            mRowSyncs.push_back(mRowStart);
+            mRowSyncs.push_back(newStart);
             mRowStartUi.push_back(mUi);        // source UI of this row's Column 0 (Seek row lookup)
+            mRowUi.push_back(mUiSamples);      // the UI the row's samples are placed with
             mLoggedThroughUi = mUi;
         }
         mRow = mRowSyncs.size() - 1;
@@ -307,10 +393,10 @@ private:
 
     // Row `n` of the log, reached again by a windowed decode (after Seek). It opens on the
     // edge the live decode logged, with the column count the log gives it (a commit's
-    // SetColumns, which nothing pushes to a replay) and the UI the loop refines as it did
-    // live. A re-acquired row takes the UI and column count it locked with, so from one on
-    // a replay is the live decode exactly; the row a stop cut short takes the UI it had and
-    // ends where the re-acquired row begins.
+    // SetColumns, which nothing pushes to a replay) and the UI the live decode placed the
+    // row's samples with (mRowUi). A re-acquired row takes the UI and column count it
+    // locked with; the row a stop cut short takes the UI it had and ends where the
+    // re-acquired row begins. A replay is the live decode exactly.
     bool replayRow(std::size_t n)
     {
         const double start = static_cast<double>(mRowSyncs[n]);
@@ -320,13 +406,9 @@ private:
         } else {
             if (n + 1 < mRowStartUi.size() && !reacquiredAt(n + 1)) {
                 const int cols = static_cast<int>(mRowStartUi[n + 1] - mRowStartUi[n]);
-                if (cols >= swi3s::kMinColumnCount && cols != mColumns) {
-                    mUiSamples = mUiSamples * static_cast<double>(mColumns) / static_cast<double>(cols);
-                    mColumns = cols;
-                }
+                if (cols >= swi3s::kMinColumnCount) mColumns = cols;
             }
-            double measured = (start - mRowStart) / mColumns;
-            if (measured > 0.0) mUiSamples = 0.75 * mUiSamples + 0.25 * measured;
+            mUiSamples = mRowUi[n];
         }
         if (const Reacquired* k = reacquiredAt(n + 1)) {
             mUiSamples = k->cutUiSamples;
@@ -346,11 +428,14 @@ private:
         return (it != mReacquired.end() && it->row == n) ? &*it : nullptr;
     }
 
-    std::vector<std::uint64_t> mEdges;      // DP wire transitions
-    std::vector<std::uint64_t> mRising;     // 0->1 edges (row-sync candidates)
+    std::shared_ptr<const void> mOwner;     // holds the viewed buffer (zero-copy path)
+    std::vector<std::uint64_t> mEdgesOwned; // empty in the zero-copy path
+    const std::uint64_t* mEdges;            // DP wire transitions
+    std::size_t mEdgeN;
     mutable std::size_t mEdgeCursor = 0;    // levelAt forward cursor: #edges <= last sample
     std::vector<std::uint64_t> mRowSyncs;   // recovered Sync1 samples (bit-clock reference)
     std::vector<std::uint64_t> mRowStartUi; // source UI index at each row's Column 0 (Seek)
+    std::vector<double> mRowUi;             // UI width (samples) each row's samples were placed with
     std::uint64_t mLoggedThroughUi = 0;     // highest row-Column-0 UI logged (no re-append on replay)
     bool mInitialDp;
     std::uint64_t mRate;

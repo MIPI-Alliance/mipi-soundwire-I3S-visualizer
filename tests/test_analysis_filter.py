@@ -6,6 +6,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from swi3s_studio import decode_capture
@@ -13,6 +14,8 @@ from swi3s_studio.analysis import command_error, count_errors, is_error
 from swi3s_studio.ingest import transitions
 from swi3s_studio.model import RegisterMap
 from swi3s_studio.ui.command_table import CommandFilterProxy, CommandTableModel
+
+pytestmark = pytest.mark.gui
 
 
 def _cmd(**kw):
@@ -84,9 +87,12 @@ def test_filter_proxy():
     # Parentheses + precedence: (ping or sscr) and getstatus -> only the Ping.
     proxy.set_text("(ping or sscr) and getstatus")
     assert proxy.rowCount() == 1
-    # Without parens, AND binds tighter: ping or (sscr and getstatus) -> just Ping.
-    proxy.set_text("ping or sscr and getstatus")
+    # Without parens, AND binds tighter: ping or (sscr and commit) -> the Ping and the
+    # SSCR; read left to right it would be (ping or sscr) and commit -> only the SSCR.
+    proxy.set_text("(ping or sscr) and commit")
     assert proxy.rowCount() == 1
+    proxy.set_text("ping or sscr and commit")
+    assert proxy.rowCount() == 2
     proxy.set_text("")
 
     proxy.set_text("ping")
@@ -270,12 +276,13 @@ def test_the_expression_filter_is_debounced_and_applies_on_demand():
 
         win._expr_edit.setText("wri")                 # three chars in one burst
         assert win._expr_timer.isActive(), "textChanged must debounce, not apply"
-        assert win._cmd_proxy.describe_active() == "" or "wri" not in win._cmd_proxy.describe_active(), \
+        assert "expr" not in win._cmd_proxy.describe_active(), \
             "the filter applied before the debounce elapsed"
 
         win._apply_expr_filter()                      # what the timer (or Enter) does
         assert not win._expr_timer.isActive(), "an immediate apply must cancel the pending tick"
-        assert win._cmd_proxy.rowCount() <= win._cmd_model.rowCount()
+        assert "expr" in win._cmd_proxy.describe_active(), "the immediate apply did not filter"
+        assert win._cmd_proxy.rowCount() < win._cmd_model.rowCount()
 
         win._clear_all_filters()                      # must take effect at once, not in 200 ms
         assert not win._expr_timer.isActive()

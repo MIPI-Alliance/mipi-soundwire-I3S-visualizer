@@ -73,8 +73,11 @@ struct SwI3sCommand
     U64    endSample = 0;
 
     void clear();
+    // "?" and "Bad header" for a phase whose header did not read (headerValid false).
     const char* PhaseName() const;
-    const char* CommandName() const;  // resolves opcode within the phase
+    // Resolves the opcode within the phase. A reserved opcode is named by its number in a
+    // per-thread buffer, valid until the next CommandName() call on the same thread.
+    const char* CommandName() const;
 
     // Device Mask cardinality rules (Section 8.1.2.2): GetStatus, Announce and
     // Commit may be multicast; Write / ReadSetup / ReadData / CalibratePhy must
@@ -111,11 +114,17 @@ public:
     // 0 (20-bit PM spacer) per reset.
     void SetShortProtocolSpacer(bool on) { mShortSpacer = on; }
 
-    // Per-device hub depth (0..5). A peripheral behind N hub levels has its
-    // response delayed by 2*N frame rows (i.e. 2*N CDS bits), so its response
+    // Per-device hub depth, held to 0..kMaxHubDepth. A peripheral behind N hub levels has
+    // its response delayed by 2*N frame rows (i.e. 2*N CDS bits), so its response
     // token is read that many bits later. Addresses are assigned so deeper
     // devices respond later, so tokens never overlap. Persists across Reset().
     void SetHubDepths(const int depths[swi3s::kMaxPeripherals]);
+
+    // Appends every symbol the parser frames to `sink` (nullptr: none), in order. Hub-delay
+    // gap bits frame no symbol.
+    void SetSymbolSink(std::vector<C8b10bDecoder::Symbol>* sink) { mSymbolSink = sink; }
+    // True when the next pushed bit is a hub-delay gap bit.
+    bool InHubGap() const { return mSkipBitsRemaining > 0; }
 
     // Feed one NRZS-decoded CDS bit captured at the given sample. Returns true
     // when a command phase has completed; read it via Command().
@@ -187,6 +196,7 @@ private:
     // delayed device's response token.
     int mHubDepth[swi3s::kMaxPeripherals] = {0};
     int mSkipBitsRemaining = 0;
+    std::vector<C8b10bDecoder::Symbol>* mSymbolSink = nullptr;
 };
 
 #endif // SWI3S_CCOMMANDTRANSPORTPARSER_H

@@ -7,7 +7,8 @@ authoring (in-memory), and the action is one of:
   * Update grid & registers — impose the config on the decode from row 0
     (Provenance.CSV), so a post-commit capture matches the config.
   * Compare against decoded — overlay the config's expected registers in the
-    Register Map (blue) beside the snooped values (green) and report the diff.
+    Register Map (blue) in place of the staged values; a row's tooltip says what the
+    register held without the overlay and where that came from. The diff is reported.
 
 The caller is MainWindow.open_visualizer_config.
 """

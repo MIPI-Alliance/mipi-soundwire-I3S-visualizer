@@ -46,7 +46,9 @@ QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _SETTINGS_DIR)
 # app uses is replaced for every test with one that answers "cancel" and records the call,
 # and a test that opened one it did not patch FAILS at teardown, naming the dialog. A test
 # that means to drive a dialog patches the entry point itself; its monkeypatch lands after
-# this one.
+# this one. The guard holds its stubs in a MonkeyPatch of its own, undone at its own teardown,
+# so an undo of the test's `monkeypatch` (by the test, or by the window teardown) leaves them
+# in place.
 # The static helpers run in C++, so patching exec() alone would not catch them.
 _MODAL_CANCEL = {
     ("QMessageBox", "question"): None, ("QMessageBox", "information"): None,
@@ -63,21 +65,27 @@ _MODAL_CANCEL = {
 }
 
 
-def _dialog_title(args) -> str:
+def _dialog_title(args, instance: bool = False) -> str:
+    """The title of the dialog a stub was called for. A static helper's first argument is
+    the PARENT window, so its title comes from the first string argument; an exec() call
+    on an instance carries the dialog itself."""
     for a in args:
         if isinstance(a, str):
             return a
-        for attr in ("windowTitle", "text", "labelText", "title"):   # a box's title is not kept
-            get = getattr(a, attr, None)                     # on every platform
-            if callable(get) and get():
-                return get()
+    if instance:
+        for a in args:
+            for attr in ("windowTitle", "text", "labelText", "title"):   # a box's title is
+                get = getattr(a, attr, None)                  # not kept on every platform
+                if callable(get) and get():
+                    return get()
     return "?"
 
 
 @pytest.fixture(autouse=True)
-def _no_unexpected_modal(monkeypatch):
+def _no_unexpected_modal():
     from PySide6 import QtWidgets
     from PySide6.QtWidgets import QMessageBox
+    monkeypatch = pytest.MonkeyPatch()
     opened = []
     for (cls_name, meth), value in _MODAL_CANCEL.items():
         if cls_name == "QMessageBox" and meth == "question":
@@ -87,7 +95,7 @@ def _no_unexpected_modal(monkeypatch):
             value = QColor()
 
         def stub(*args, _where=f"{cls_name}.{meth}", _value=value, **_kw):
-            opened.append(f"{_where}({_dialog_title(args)!r})")
+            opened.append(f"{_where}({_dialog_title(args, _where.endswith('.exec'))!r})")
             return _value
         monkeypatch.setattr(getattr(QtWidgets, cls_name), meth, stub)
     # QMenu.exec also has a STATIC overload, exec(actions, pos), and PySide 6.11 resolves
@@ -103,6 +111,7 @@ def _no_unexpected_modal(monkeypatch):
         return menu_getattr(self, name)
     monkeypatch.setattr(QtWidgets.QMenu, "__getattribute__", _menu_getattr)
     yield opened                          # the guard's own test reads (and clears) this
+    monkeypatch.undo()
     assert not opened, (
         "the test opened a modal it did not patch (answered 'cancel'; offscreen it would "
         "have hung): " + ", ".join(opened))
@@ -122,10 +131,34 @@ def _fresh_settings():
     line_style.reset_cache()
 
 
+# The free memory every test sees unless it asks for the machine's own reading.
+AMPLE_FREE_MEMORY = 64 << 30
+
+
+@pytest.fixture
+def real_free_memory():
+    """Request it to read the machine's own free memory (saleae_sal.available_memory_bytes)
+    instead of `AMPLE_FREE_MEMORY`."""
+
+
 @pytest.fixture(autouse=True)
-def _no_swallowed_slot_exception(monkeypatch):
+def _ample_free_memory(request, monkeypatch):
+    """Every test reads `AMPLE_FREE_MEMORY` as the free memory, so the decode's memory
+    watchdog and the load guards act the same on every machine and under any number of
+    parallel test processes. A test of those rules sets its own reading with monkeypatch;
+    a test of the reading itself requests `real_free_memory`."""
+    if "real_free_memory" in request.fixturenames:
+        return
+    from swi3s_studio.ingest import saleae_sal
+    monkeypatch.setattr(saleae_sal, "available_memory_bytes", lambda: AMPLE_FREE_MEMORY)
+
+
+@pytest.fixture(autouse=True)
+def _no_swallowed_slot_exception():
     """An exception raised in a Qt slot fails the test that raised it. PySide only
-    prints it and carries on."""
+    prints it and carries on. The hook is held in a MonkeyPatch of its own, undone at this
+    fixture's teardown, so it stays in place while the window teardown undoes the test's
+    patches, empties the windows and collects them."""
     import sys
     import traceback
     raised = []
@@ -133,13 +166,15 @@ def _no_swallowed_slot_exception(monkeypatch):
     def hook(etype, value, tb):
         raised.append("".join(traceback.format_exception(etype, value, tb)))
         sys.__excepthook__(etype, value, tb)
+    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(sys, "excepthook", hook)
     yield raised
+    monkeypatch.undo()
     assert not raised, "an exception in a Qt slot (PySide printed it and went on):\n" + raised[0]
 
 
 @pytest.fixture(autouse=True)
-def _close_the_tests_windows(monkeypatch):
+def _close_the_tests_windows(_no_unexpected_modal, _no_swallowed_slot_exception, monkeypatch):
     """Close, after each test, the MainWindows it built, joining their workers, so they
     do not pile up under every later test that runs the event loop. A window from a
     wider-scoped fixture was built before the test, so it is left to its fixture.
@@ -148,7 +183,14 @@ def _close_the_tests_windows(monkeypatch):
     application's top-level widgets wraps every one of them, a half-destroyed one
     included, which can segfault. And they are DELETED, not just closed: a closed window
     is kept alive by its own Qt connections to its methods, with every Link it decoded.
-    The window's timers have it as their context, so they die with it.
+    The window's timers have it as their context, so they die with it. The test's
+    `monkeypatch` is undone here, after the windows close and before they are emptied, so
+    the fixtures torn down after this one see the unpatched classes. This fixture requests
+    the modal and slot-exception guards, so both are set up before it and torn down after it,
+    and they hold their patches apart from the test's `monkeypatch`: both are in place while
+    the windows close and are emptied and collected, and a test's patch of a guarded entry
+    point is undone onto the guard's stub, which the guard's own undo then replaces with the
+    original.
 
     A TimingView a test built on its own, with no parent, is deleted here too, the way Qt
     deletes a child; left to the collector below, one the test had clicked can segfault
@@ -184,6 +226,9 @@ def _close_the_tests_windows(monkeypatch):
     views.clear()
     from PySide6.QtCore import QEvent
     QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    # The test's patches are undone before the windows are emptied: undoing one set on a
+    # window's instance deletes that attribute, which must still be there.
+    monkeypatch.undo()
     # PySide keeps a cancelled singleShot's callable (a bound method of the window) after
     # the window is deleted, so the Python object outlives it; emptied, it holds nothing.
     for w in made:
@@ -206,6 +251,16 @@ def _no_modifier_left_held():
         assert held == Qt.KeyboardModifier.NoModifier, (
             f"the test left {held} held: QTest.keyRelease it (QTest keeps a sequence's "
             "modifier pressed)")
+
+
+@pytest.fixture
+def no_toggle_ceiling(monkeypatch):
+    """Lift the timing calculator's toggle ceiling (`toggle_ceiling_MHz`), for tests of the
+    rate solver at rates past it."""
+    import math
+
+    from swi3s_studio.timing import calculator
+    monkeypatch.setattr(calculator, "toggle_ceiling_MHz", lambda inp: math.inf)
 
 
 def pump_loads(win, seconds: float = 120.0) -> None:
@@ -276,12 +331,23 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
 
 
 def _join_all_main_windows() -> None:
+    import sys
+
     from PySide6.QtWidgets import QApplication
 
-    app = QApplication.instance()
-    if app is None:
+    # A process that never imported the main window built none.
+    module = sys.modules.get("swi3s_studio.ui.main_window")
+    if QApplication.instance() is None or module is None:
         return
-    for w in app.topLevelWidgets():
+    # The windows come from the collector's list of Python objects: listing the
+    # application's top-level widgets wraps every one of them, a half-destroyed one
+    # included, which can segfault.
+    import gc
+
+    from shiboken6 import isValid
+    for w in [o for o in gc.get_objects() if isinstance(o, module.MainWindow)]:
+        if not isValid(w):
+            continue
         join = getattr(w, "join_worker_threads", None)
         if callable(join):
             try:
@@ -382,3 +448,155 @@ def open_via_dialog(monkeypatch, paths, edit=None) -> list:
         return QDialog.Rejected if ok is False else QDialog.Accepted
     monkeypatch.setattr(OpenCaptureDialog, "exec", run)
     return shown
+
+
+# ---------------------------------------------------------------- the tools under test
+def symlink_or_skip(target, link) -> None:
+    """os.symlink(target, link), or skip the test where the platform or the account refuses
+    symlinks (a Windows account without the symlink privilege)."""
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks are not available here: {exc}")
+
+
+def load_tool(name: str):
+    """tools/<name>.py, imported by path as a fresh module named `name`."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "tools", name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------- throwaway git repositories
+# The environment under which git reads none of the machine's own configuration (signing,
+# hooks, line-end conversion, default branch, path quoting).
+ISOLATED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+# The variables that point git at a repository other than the one its directory is in, which
+# a git hook running the suite sets. Each is removed, so git works on the throwaway one.
+_GIT_REPOSITORY_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE")
+
+
+@pytest.fixture
+def isolated_git(monkeypatch, tmp_path_factory):
+    """Every git the test runs, a tool's own included, reads none of the machine's
+    configuration and works on the repository of the directory it runs in. Every test that
+    builds a git repository, or runs git in a directory that is not one, requests it, and
+    builds a repository with `git_in` and `commit_files`. Git looks for a repository no
+    higher than pytest's base temporary directory, so a test directory that is not a
+    repository is not read as part of one enclosing it."""
+    for key, value in ISOLATED_GIT_ENV.items():
+        monkeypatch.setenv(key, value)
+    for key in _GIT_REPOSITORY_VARS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
+
+
+def isolated_git_env() -> dict:
+    """This process's environment with git isolated as `isolated_git` isolates it."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REPOSITORY_VARS}
+    env.update(ISOLATED_GIT_ENV)
+    return env
+
+
+def git_in(repo, *args) -> str:
+    """git `args` in `repo`, isolated (`isolated_git_env`), which must exit 0; its output,
+    stripped."""
+    import subprocess
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                          text=True, env=isolated_git_env()).stdout.strip()
+
+
+def commit_files(repo, files, message: str = "change") -> str:
+    """Write `files` into `repo` and commit everything, returning the commit. `files` maps a
+    path to its content (str, written as UTF-8 with its line ends as given, or bytes), or to
+    None to delete the file."""
+    for rel, data in files.items():
+        full = repo / rel
+        if data is None:
+            full.unlink()
+            continue
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+    git_in(repo, "add", "-A")
+    git_in(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message)
+    return git_in(repo, "rev-parse", "HEAD")
+
+
+def publish_release_repo(repo, tool, app: dict) -> tuple[str, str, str]:
+    """A new repository at `repo` standing in for this one to tools/publish_tree.py (`tool`,
+    the loaded module): (up, rel, pub), where `up` holds the upstream-owned files, `rel` the
+    release tree, `app` beside the maintainers' tier the tool prunes, and `pub` the publish
+    branch as the tool builds it from the two."""
+    repo.mkdir()
+    git_in(repo, "init", "-q", "-b", "main")
+    owned = {rel: f"owned: {rel}\n" for rel in tool._UPSTREAM_OWNED}
+    up = commit_files(repo, owned, "upstream")
+    tier = {tool._INTERNAL + "notes.md": "A note of the maintainers' tier.\n",
+            **{rel: "A file of the maintainers' tier.\n" for rel in tool._INTERNAL_FILES}}
+    rel = commit_files(repo, {**app, **tier, **{r: None for r in owned}}, "release")
+    pub = commit_files(repo, {**owned, **{r: None for r in tier}}, "publish")
+    return up, rel, pub
+
+
+_PROTECTS = {"gui", "platform", "perf"}
+
+
+# The longest test id the suite accepts. pytest puts the id in the PYTEST_CURRENT_TEST
+# environment variable, which Windows refuses above 32767 characters; a parametrized case
+# whose value is large data names itself with `ids=`.
+MAX_TEST_ID = 1000
+
+
+def pytest_collection_modifyitems(config, items):
+    """A test marked none of gui, platform or perf is core (docs/TESTING.md §1.1), so
+    `-m core` selects it. A test id longer than `MAX_TEST_ID` stops the run at collection,
+    naming the test."""
+    long_ids = [item.nodeid for item in items if len(item.nodeid) > MAX_TEST_ID]
+    if long_ids:
+        raise pytest.UsageError(
+            f"{len(long_ids)} test id(s) longer than {MAX_TEST_ID} characters; give the "
+            "parametrized values short ids=: " + ", ".join(i[:120] for i in long_ids[:5]))
+    for item in items:
+        if not _PROTECTS & {m.name for m in item.iter_markers()}:
+            item.add_marker(pytest.mark.core)
+
+
+_SNR_WINDOW = 4096
+
+
+def tone_snr(a) -> float:
+    """Single-tone SNR (dB) of a decoded PCM stream: the dominant FFT bin against the rest,
+    over its first `_SNR_WINDOW` samples. A cleanly decoded sine reads well above 0; one
+    decoded at the wrong interval phase collapses below it. Fewer than 512 samples read -99."""
+    import numpy as np
+    a = np.asarray(a, dtype=np.float64)
+    if a.size < 512:
+        return -99.0
+    a = a - a.mean()
+    w = np.hanning(min(_SNR_WINDOW, a.size))
+    A = np.abs(np.fft.rfft(a[:w.size] * w)) ** 2
+    A[0] = 0.0
+    k = int(np.argmax(A))
+    sig = A[max(1, k - 2):k + 3].sum()
+    return 10.0 * np.log10(sig / (A.sum() - sig + 1e-9))
+
+
+def worst_snr(a, window: int = _SNR_WINDOW) -> float:
+    """The lowest `tone_snr` over `window`-sample windows tiling `a`, the last one ending at
+    the final sample (a stream of `window` samples or fewer is one window), so a phase slip
+    anywhere in the stream shows, not only one at its start. A window is at most the
+    `_SNR_WINDOW` samples `tone_snr` reads."""
+    import numpy as np
+    a = np.asarray(a)
+    window = min(window, _SNR_WINDOW)
+    if a.size <= window:
+        return tone_snr(a)
+    starts = list(range(0, a.size - window + 1, window))
+    if starts[-1] + window < a.size:
+        starts.append(a.size - window)
+    return min(tone_snr(a[i:i + window]) for i in starts)

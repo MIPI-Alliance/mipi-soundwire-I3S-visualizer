@@ -1,68 +1,18 @@
-"""Config-vs-decoded comparison test.
+"""Config-vs-decoded comparison: the expected-config register encoder and its inverse
+(`registers_from_csv` / `grid_from_registers`), `_NEXT` staging in `grid_from_commands`, the
+register diff and its report text (`register_diff`, `register_diff_report`), the grid placed
+from a directed-test CSV, and the legacy and v2.0 config CSV upgrade to the current format.
 
 Run: python3 -m pytest tests/test_compare.py
 """
-import glob
 import os
 
 import swi3score
 
-from swi3s_studio.analysis import grid_diff, grid_diff_report, register_diff
-from swi3s_studio.ingest import transitions
+from swi3s_studio.analysis import register_diff
+from swi3s_studio.analysis.compare import register_diff_report
 
-_VIZ = os.path.join(os.path.dirname(__file__), "..", "..",
-                    "mipi-soundwire-I3S-visualizer", "examples", "directed_tests")
-
-
-def _cell(row, col, slot, ch, cds=False):
-    return {"row": row, "col": col, "slot": slot, "channel": ch, "dp": 0, "is_cds": cds}
-
-
-def test_grid_diff_classes():
-    decoded = [
-        _cell(0, 0, 0, -1, cds=True),
-        _cell(0, 1, 1, 0),            # same
-        _cell(0, 2, 1, 1),            # changed (channel differs)
-        _cell(0, 4, 1, 0),            # decoded_only
-    ]
-    expected = [
-        _cell(0, 0, 0, -1, cds=True),
-        _cell(0, 1, 1, 0),
-        _cell(0, 2, 1, 0),            # vs decoded ch1 -> changed
-        _cell(0, 3, 1, 0),            # expected_only
-    ]
-    cells, n_diff = grid_diff(decoded, expected)
-    by = {(c["row"], c["col"]): c["diff"] for c in cells}
-    assert by[(0, 0)] == "same"
-    assert by[(0, 1)] == "same"
-    assert by[(0, 2)] == "changed"
-    assert by[(0, 3)] == "expected_only"
-    assert by[(0, 4)] == "decoded_only"
-    assert n_diff == 3
-
-
-def test_identical_grids_have_no_diff():
-    decoded = swi3score.Decoder(transitions.demo_capture(8).sample_source(),
-                                swi3score.DecoderSettings())
-    decoded.run()
-    g = decoded.grid_cells(16)
-    cells, n_diff = grid_diff(g, g)             # compare with itself
-    assert n_diff == 0
-    assert all(c["diff"] == "same" for c in cells)
-
-
-def test_grid_diff_report_text():
-    decoded = [_cell(0, 1, 1, 0), _cell(0, 2, 1, 1), _cell(0, 4, 1, 0)]
-    expected = [_cell(0, 1, 1, 0), _cell(0, 2, 1, 0), _cell(0, 3, 1, 0)]
-    cells, _ = grid_diff(decoded, expected)
-    summary, detail = grid_diff_report(cells)
-    assert "3 differing grid cell(s)" in summary
-    assert "1 changed" in summary and "1 only-on-bus" in summary and "1 only-in-config" in summary
-    assert "→" in detail                         # changed cell shows bus -> config
-    # An all-same grid reports a clean match with no detail.
-    same_cells, _ = grid_diff([_cell(0, 1, 1, 0)], [_cell(0, 1, 1, 0)])
-    s2, d2 = grid_diff_report(same_cells)
-    assert "matches" in s2 and d2 == ""
+_VIZ = os.path.join(os.path.dirname(__file__), "..", "visualizer_examples", "directed_tests")
 
 
 def test_registers_from_csv_roundtrip():
@@ -129,14 +79,73 @@ def test_register_diff_finds_mismatch():
     assert d["expected"] == 0x00 and d["decoded"] == 0x08
 
 
-def test_grid_from_csv_optional():
-    csvs = sorted(glob.glob(os.path.join(_VIZ, "*.csv")))
-    if not csvs:
-        print("   (skipped grid_from_csv: visualizer examples not found)")
-        return
-    cells = swi3score.grid_from_csv(csvs[0], 16)
-    assert isinstance(cells, list)
-    print(f"   grid_from_csv({os.path.basename(csvs[0])}) -> {len(cells)} cells")
+def _diffs(*rows):
+    return [{"device": d, "address": a, "label": f"R{a:X}", "decoded": dec, "expected": exp}
+            for d, a, dec, exp in rows]
+
+
+def test_register_diff_report_says_a_match_and_groups_a_mismatch_by_device():
+    summary, detail = register_diff_report([], 7)
+    assert summary == "Config matches the decoded registers — 0 of 7 register(s) differ."
+    assert detail == ""
+    summary, detail = register_diff_report(
+        _diffs((1, 0x2009, 0x17, 0x18), (0, 0x200B, 0x08, 0x00), (0, 0x2001, 0x01, 0x02)), 9)
+    assert summary == ("3 of 9 register(s) differ between the expected config and the "
+                       "decoded bus.")
+    assert detail.splitlines() == [
+        "Device 0:",
+        "  0x2001 R2001: decoded 0x01  →  expected 0x02",
+        "  0x200B R200B: decoded 0x08  →  expected 0x00",
+        "",
+        "Device 1:",
+        "  0x2009 R2009: decoded 0x17  →  expected 0x18"]
+
+
+def test_register_diff_report_counts_only_the_registers_past_the_cap():
+    four = _diffs(*[(0, 0x2000 + i, 0, 1) for i in range(4)])
+    # The header and three registers fill four lines: one register is left over.
+    _s, detail = register_diff_report(four, 4, max_lines=4)
+    assert detail.splitlines()[-1] == "  … (+1 more)"
+    assert sum(1 for ln in detail.splitlines() if ln.startswith("  0x")) == 3
+    _s, detail = register_diff_report(four, 4, max_lines=3)
+    assert detail.splitlines()[-1] == "  … (+2 more)"
+    # The last register landing exactly on the cap leaves nothing to count.
+    _s, detail = register_diff_report(four, 4, max_lines=5)
+    assert "more" not in detail and detail.count("  0x") == 4
+    _s, detail = register_diff_report(four[:2], 2, max_lines=3)
+    assert "more" not in detail and detail.count("  0x") == 2
+    # Across devices the cap counts every line, headers included.
+    two_dev = _diffs((0, 0x2000, 0, 1), (1, 0x2000, 0, 1))
+    _s, detail = register_diff_report(two_dev, 2, max_lines=3)
+    assert detail.splitlines() == ["Device 0:", "  0x2000 R2000: decoded 0x00  →  expected 0x01",
+                                   "  … (+1 more)"]
+
+
+def test_register_diff_report_never_ends_on_a_device_header_with_nothing_under_it():
+    three_dev = _diffs(*[(d, 0x2000 + i, 0, 1) for d in range(3) for i in range(2)])
+    for cap in range(1, 12):
+        _s, detail = register_diff_report(three_dev, 6, max_lines=cap)
+        lines = detail.splitlines()
+        listing = [ln for ln in lines if "more)" not in ln]
+        assert len(listing) <= cap, (cap, lines)
+        for i, ln in enumerate(lines):
+            if ln.startswith("Device "):
+                assert lines[i + 1].startswith("  0x"), (cap, lines)
+        shown = sum(1 for ln in lines if ln.startswith("  0x"))
+        left = 6 - shown
+        assert (f"  … (+{left} more)" in lines) == (left > 0)
+    _s, detail = register_diff_report(three_dev, 6, max_lines=5)
+    assert detail.splitlines() == [
+        "Device 0:", "  0x2000 R2000: decoded 0x00  →  expected 0x01",
+        "  0x2001 R2001: decoded 0x00  →  expected 0x01", "  … (+4 more)"]
+
+
+def test_grid_from_csv_places_data_ports_for_a_directed_example():
+    """The bundled directed-test CSV exists and places at least one non-CDS cell."""
+    path = os.path.join(_VIZ, "Contrived_PDM_sample_grouping_with_channel_grouping.csv")
+    assert os.path.isfile(path), path
+    cells = swi3score.grid_from_csv(path, 16)
+    assert isinstance(cells, list) and sum(1 for c in cells if not c.get("is_cds")) > 0
 
 
 # Old human-readable visualizer export (v1.73). Two enabled DPs at HStart 5 / 2.

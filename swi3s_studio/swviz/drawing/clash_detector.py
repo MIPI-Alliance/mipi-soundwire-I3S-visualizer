@@ -45,16 +45,11 @@ class SlotOccupancyType(Enum):
     DRQ_SINK = "drq_sink"
 
 
-# Backward compatibility alias
-ClashType = SlotClashCategory
-
-
 @dataclass
 class BitSlotOccupancy:
     """Tracks occupancy for a single bit slot."""
     device: int
     slot_type: SlotOccupancyType
-    canvas_ids: List[int] = field(default_factory=list)  # For handover arrows
 
 
 @dataclass
@@ -95,13 +90,13 @@ class ClashDetector:
     Occupancy is tracked per bit slot in a dictionary.
     """
 
-    def __init__(self, NumColumns_REG: int):
+    def __init__(self, num_columns: int):
         """Initialize clash detector.
 
         Args:
-            NumColumns_REG: Number of columns in each row of the frame
+            num_columns: Number of columns in each row of the frame
         """
-        self.NumColumns_REG = NumColumns_REG
+        self.num_columns = num_columns
         self.logger = get_logger('clash_detector')
 
         # Main tracking dictionary: bit_slot -> list of occupancies
@@ -146,7 +141,7 @@ class ClashDetector:
         Returns:
             Bit slot index
         """
-        return column + row * self.NumColumns_REG
+        return column + row * self.num_columns
 
     def _has_occupancy(self, bit_slot: int, slot_type: SlotOccupancyType,
                        device: Optional[int] = None) -> bool:
@@ -213,23 +208,18 @@ class ClashDetector:
         return [occ.device for occ in self.occupancies[bit_slot] if occ.slot_type == slot_type]
 
     def _add_occupancy(self, bit_slot: int, device: int,
-                       slot_type: SlotOccupancyType, canvas_ids: Optional[List[int]] = None) -> None:
+                       slot_type: SlotOccupancyType) -> None:
         """Add an occupancy to a bit slot.
 
         Args:
             bit_slot: Bit slot index
             device: Device number
             slot_type: Type of occupancy (enum)
-            canvas_ids: Optional canvas IDs for rendering
         """
         if bit_slot not in self.occupancies:
             self.occupancies[bit_slot] = []
 
-        occ = BitSlotOccupancy(
-            device=device,
-            slot_type=slot_type,
-            canvas_ids=canvas_ids or []
-        )
+        occ = BitSlotOccupancy(device=device, slot_type=slot_type)
         self.occupancies[bit_slot].append(occ)
 
     def record_clash(self, bit_slot: int, category: SlotClashCategory,
@@ -273,8 +263,8 @@ class ClashDetector:
             slot_type_b=slot_type_b
         )
         # Store row/column for convenience
-        clash_info._row = bit_slot // self.NumColumns_REG
-        clash_info._column = bit_slot % self.NumColumns_REG
+        clash_info._row = bit_slot // self.num_columns
+        clash_info._column = bit_slot % self.num_columns
 
         self.clash_details.append(clash_info)
 
@@ -285,27 +275,23 @@ class ClashDetector:
     # -------------------------------------------------------------------------
 
     def _remove_occupancy(self, bit_slot: int, slot_type: SlotOccupancyType,
-                         device: int) -> Optional[List[int]]:
+                         device: int) -> None:
         """Remove an occupancy from a bit slot.
 
         Args:
             bit_slot: Bit slot index
             slot_type: Type of occupancy to remove (enum)
             device: Device number
-
-        Returns:
-            Canvas IDs that were removed, or None
         """
         if bit_slot not in self.occupancies:
-            return None
+            return
 
         for i, occ in enumerate(self.occupancies[bit_slot]):
             if occ.slot_type == slot_type and occ.device == device:
-                removed = self.occupancies[bit_slot].pop(i)
-                return removed.canvas_ids
-        return None
+                del self.occupancies[bit_slot][i]
+                return
 
-    def check_write_clash(self, row: int, column: int, device: int) -> Tuple[bool, bool, Set[str]]:
+    def check_write_clash(self, row: int, column: int, device: int) -> Tuple[bool, Set[str]]:
         """Check for write clash at the given position.
 
         Args:
@@ -314,16 +300,14 @@ class ClashDetector:
             device: Device number attempting to write
 
         Returns:
-            Tuple of (has_clash, should_remove_handover, suppress_same_device_slots)
+            Tuple of (has_clash, suppress_same_device_slots)
             - has_clash: True if there's a write clash
-            - should_remove_handover: True if handover from same device should be removed
             - suppress_same_device_slots: set containing 'guard' and/or 'tail' for each
               same-device slot the data bit should override (a single column can carry
               both a same-device guard and tail), empty set otherwise
         """
         bit_slot = self._get_bit_slot(row, column)
         has_clash = False
-        should_remove_handover = False
         suppress_same_device_slots: Set[str] = set()
 
         # Check if slot is already driven - same-level writes always clash (even same device)
@@ -343,9 +327,10 @@ class ClashDetector:
                 'same_device': write_device == device
             })
 
-        # Check handover - a CDS handover column may have several occupants
-        # (one per driving source). Same-device occupants are removed
-        # (reconciled); a different-device occupant clashes.
+        # Check handover - a handover is a device's request to hand the bus over at
+        # this slot, and a CDS handover column may hold one request per driving
+        # source. A write by the requesting device itself is not a clash and leaves
+        # its request in place; a write by any other device clashes with it.
         for handover_device in self._get_devices_for_type(bit_slot, SlotOccupancyType.HANDOVER):
             if handover_device != device:
                 has_clash = True
@@ -359,9 +344,6 @@ class ClashDetector:
                     'device': device,
                     'handover_device': handover_device
                 })
-            else:
-                # Same device - remove handover (but still check tail/guard below)
-                should_remove_handover = True
 
         # Check guard - a CDS guard column may have several occupants (one
         # per driving source). Same-device occupants are suppressed (data bit
@@ -395,24 +377,10 @@ class ClashDetector:
 
         # Note: We don't add the write occupancy here - caller uses add_write()
 
-        return has_clash, should_remove_handover, suppress_same_device_slots
-
-    def remove_handover(self, row: int, column: int, device: int) -> Optional[List[int]]:
-        """Remove a handover occupancy.
-
-        Args:
-            row: Row number
-            column: Column number
-            device: Device number
-
-        Returns:
-            Canvas IDs that were removed, or None
-        """
-        bit_slot = self._get_bit_slot(row, column)
-        return self._remove_occupancy(bit_slot, SlotOccupancyType.HANDOVER, device)
+        return has_clash, suppress_same_device_slots
 
     def add_write(self, row: int, column: int, device: int) -> None:
-        """Add a write occupancy after removing handover.
+        """Record a write occupancy.
 
         Args:
             row: Row number
@@ -447,7 +415,7 @@ class ClashDetector:
             - should_draw: 1 if guard should be drawn, 0 if it should be suppressed
             - suppress_same_device_tail: True if a same-device tail should be removed
 
-        The caller's draw condition is typically: `should_draw or not has_clash`
+        The caller draws the guard if and only if `should_draw`.
         - (False, 1): No clash, draw guard
         - (False, 0): No clash but suppress guard (data bit has priority)
         - (True, 0): Clash detected, don't draw
@@ -457,13 +425,13 @@ class ClashDetector:
         suppress_same_device_tail = False
 
         # Check handover from same/different device. A CDS handover column may
-        # have several occupants (one per driving source): a same-device
-        # occupant will be removed by the caller (guard takes its place); a
-        # different-device occupant clashes.
+        # have several occupants (one per driving source): the requesting device's
+        # own guard is not a clash and its request stays; a different-device
+        # occupant clashes.
         handover_devices = self._get_devices_for_type(bit_slot, SlotOccupancyType.HANDOVER)
         if handover_devices:
             if device in handover_devices:
-                # Same device - handover will be removed by caller, guard takes its place
+                # Same device - its own handover request stays; the guard is drawn
                 self._add_occupancy(bit_slot, device, SlotOccupancyType.GUARD)
                 return False, 1, False  # No clash, draw guard
             else:
@@ -562,7 +530,7 @@ class ClashDetector:
         handover_devices = self._get_devices_for_type(bit_slot, SlotOccupancyType.HANDOVER)
         if handover_devices:
             if device in handover_devices:
-                # Same device - handover will be removed by caller, tail takes its place
+                # Same device - its own handover request stays; the tail is drawn
                 self._add_occupancy(bit_slot, device, SlotOccupancyType.TAIL)
                 return False, 1  # No clash, draw tail
             else:
@@ -628,7 +596,8 @@ class ClashDetector:
 
         Read overlaps are flagged regardless of device - even same-device reads
         from different data ports are visual warnings since they indicate
-        multiple data ports reading the same slot.
+        multiple data ports reading the same slot. A handover is not a reader,
+        so a handover occupancy in the slot is never a read overlap.
 
         Args:
             row: Row number
@@ -660,23 +629,6 @@ class ClashDetector:
             self._add_occupancy(bit_slot, device, SlotOccupancyType.READ)
             return True
 
-        # Check if handover from a different device
-        if self._has_occupancy(bit_slot, SlotOccupancyType.HANDOVER):
-            handover_device = self._get_device_for_type(bit_slot, SlotOccupancyType.HANDOVER)
-            if handover_device is not None and handover_device != device:
-                self.read_clashes.add(bit_slot)
-                # Record with device type distinction
-                self.record_clash(bit_slot, SlotClashCategory.READ_CLASH,
-                                  handover_device, device, 'handover', 'read')
-                self.logger.warning('Read overlap detected (vs handover)', extra={
-                    'row': row,
-                    'column': column,
-                    'device': device,
-                    'existing_device': handover_device
-                })
-                self._add_occupancy(bit_slot, device, SlotOccupancyType.READ)
-                return True
-
         self._add_occupancy(bit_slot, device, SlotOccupancyType.READ)
         return False
 
@@ -685,14 +637,16 @@ class ClashDetector:
     # -------------------------------------------------------------------------
 
     def add_handover(self, row: int, column: int, device: int,
-                     canvas_ids: List[int], is_cds: bool = False) -> Tuple[bool, bool, bool]:
+                     is_cds: bool = False) -> Tuple[bool, bool]:
         """Add a handover occupancy.
+
+        A handover is a device's request, not a reader: a read in the slot is never an
+        overlap with it, whichever was recorded first.
 
         Args:
             row: Row number
             column: Column number
             device: Device number
-            canvas_ids: Canvas IDs for the handover arrows
             is_cds: True when this handover is a CDS (Column-0) system turnaround.
                 The CDS is time-multiplexed: a guard-only source hands the bus over
                 right after its own guard, in a column where a *different* source may
@@ -703,25 +657,12 @@ class ClashDetector:
                 still suppresses the handover.
 
         Returns:
-            Tuple of (has_read_clash, has_write_clash, should_suppress)
+            Tuple of (has_write_clash, should_suppress)
             - should_suppress: True if handover should be deleted (real slot exists)
         """
         bit_slot = self._get_bit_slot(row, column)
-        has_read_clash = False
         has_write_clash = False
         should_suppress = False
-
-        # Check read clash (all read overlaps are flagged, regardless of device)
-        if self._has_occupancy(bit_slot, SlotOccupancyType.READ):
-            read_device = self._get_device_for_type(bit_slot, SlotOccupancyType.READ)
-            self.read_clashes.add(bit_slot)
-            self.logger.warning('Read overlap detected (handover)', extra={
-                'row': row,
-                'column': column,
-                'device': device,
-                'existing_device': read_device
-            })
-            has_read_clash = True
 
         # Check write - if same device, suppress handover (real slot takes precedence)
         if self._has_occupancy(bit_slot, SlotOccupancyType.WRITE):
@@ -791,27 +732,8 @@ class ClashDetector:
                 should_suppress = True
 
         # Add handover regardless of clash (for tracking)
-        self._add_occupancy(bit_slot, device, SlotOccupancyType.HANDOVER, canvas_ids)
-        return has_read_clash, has_write_clash, should_suppress
-
-    def get_handover_canvas_ids(self, row: int, column: int) -> Optional[List[int]]:
-        """Get canvas IDs for a handover at the given position.
-
-        Args:
-            row: Row number
-            column: Column number
-
-        Returns:
-            List of canvas IDs, or None if no handover exists
-        """
-        bit_slot = self._get_bit_slot(row, column)
-        if bit_slot not in self.occupancies:
-            return None
-
-        for occ in self.occupancies[bit_slot]:
-            if occ.slot_type == SlotOccupancyType.HANDOVER:
-                return occ.canvas_ids
-        return None
+        self._add_occupancy(bit_slot, device, SlotOccupancyType.HANDOVER)
+        return has_write_clash, should_suppress
 
     def get_write_clashes(self) -> List[int]:
         """Get list of bit slots with write clashes.
@@ -890,8 +812,8 @@ class ClashDetector:
 
         results = []
         for bit_slot in sorted(unmatched):
-            row = bit_slot // self.NumColumns_REG
-            column = bit_slot % self.NumColumns_REG
+            row = bit_slot // self.num_columns
+            column = bit_slot % self.num_columns
             results.append((row, column))
             self.logger.warning(msg, extra={
                 'row': row,

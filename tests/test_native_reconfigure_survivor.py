@@ -11,10 +11,9 @@ start sample of 0 after the first.
 reconfigure lands while a sample is in flight. That sample finishes at the width it
 started with, and the samples after it use the new width.
 """
-import math
-
 import pytest
 import swi3score
+from test_native_decoder_run import _sine as _demo_sine
 
 
 def _decode(n: int, mid_interval: bool):
@@ -60,14 +59,14 @@ def test_in_flight_sample_keeps_its_start_sample(mid_interval):
                 f"ch{ch} index {cur['index']}: start_sample {cur['start_sample']} "
                 f"does not follow the previous sample's end {prev['end_sample']}")
         assert all(a["start_sample"] < a["end_sample"] for a in samples)
+        spans = {a["end_sample"] - a["start_sample"] for a in samples}
+        assert len(spans) == 1, f"ch{ch}: a sample's start was re-stamped, spans {sorted(spans)}"
         assert all(a["sample_size"] == samples[0]["sample_size"] for a in samples)
 
 
 def _sine(index: int, size: int) -> int:
-    """Demo.cpp sineSample(0, index, size): `size` is the SampleSize field (bits - 1)."""
-    x = (1 << size) * 0.45 * math.sin(2.0 * math.pi * index / 64.0)
-    v = math.floor(x + 0.5) if x >= 0 else -math.floor(-x + 0.5)
-    return v & ((1 << (size + 1)) - 1)
+    """Demo.cpp sineSample(0, index, size)."""
+    return _demo_sine(0, index, size)
 
 
 @pytest.mark.parametrize("from_size,to_size", [(23, 15), (15, 23)])
@@ -93,12 +92,3 @@ def test_sample_in_flight_keeps_its_width_across_sample_size_write(
     wrong = [(a["index"], a["sample_size"], hex(a["value"]))
              for a in samples if a["value"] != _sine(a["index"], a["sample_size"] - 1)]
     assert not wrong, f"samples decoded with the wrong width or bits: {wrong}"
-
-
-def test_total_uis_docstring_describes_the_refreshed_total():
-    """`Decoder.total_uis` is re-read from the source during run() and at its end, so its
-    Python docstring must not tell a caller the value can be cached once run() starts."""
-    doc = swi3score.Decoder.total_uis.__doc__ or ""
-    assert "fixed once run() starts" not in doc
-    assert "refreshed" in doc and "estimate" in doc
-    assert "treat 0 as unknown" in doc

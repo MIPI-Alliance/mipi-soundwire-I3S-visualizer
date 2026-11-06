@@ -7,6 +7,8 @@ export reopened without a rate gives back the same rate and the same edges.
 
 Everything here is synthetic: the demo capture and generated timestamps.
 """
+import warnings
+
 import numpy as np
 import pytest
 
@@ -121,3 +123,85 @@ def test_a_capture_with_one_sample_gaps_is_unchanged(tmp_path):
     raw_export.export_csv(c, path)
     got = digital_csv.load_capture(path, 1, 2)
     assert got.sample_rate_hz == 250_000_000 and _same_edges(got, c)
+
+
+def test_a_subnormal_spacing_gives_a_rate_above_the_limit_not_an_overflow(tmp_path):
+    path = tmp_path / "tiny.csv"
+    path.write_text("Time,A,B\n0,0,0\n5e-324,1,0\n1e-323,0,1\n")
+    assert digital_csv.infer_sample_rate(str(path)) > timebase.MAX_RATE_HZ
+    assert digital_csv.scan(str(path))[1] > timebase.MAX_RATE_HZ
+    with pytest.raises(ValueError, match=r"tiny\.csv: the timestamps give a sample rate of"):
+        digital_csv.load_capture(str(path), 1, 2)
+
+
+def _grid_csv(path, first_rows, later_rows):
+    """Rows on a 100 MHz grid, then rows half a sample off it, so a rate taken from every
+    row (200 MHz) differs from the rate of the first rows."""
+    lines = ["Time [s],A,B"]
+    for i in range(first_rows):
+        lines.append(f"{i * 1e-8:.10f},{i & 1},{(i >> 1) & 1}")
+    for i in range(later_rows):
+        lines.append(f"{1e-5 + i * 1e-8 + 5e-9:.10f},{i & 1},{(i >> 1) & 1}")
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+def test_the_probe_and_the_loader_take_the_rate_from_the_same_first_rows(tmp_path,
+                                                                        monkeypatch):
+    monkeypatch.setattr(digital_csv, "_RATE_ROWS", 1000)
+    monkeypatch.setattr(digital_csv, "_SCAN_CHUNK", 400)       # several batches past the limit
+    path = _grid_csv(tmp_path / "g.csv", 1000, 3000)
+    assert digital_csv.scan(path)[1] == 100_000_000
+    assert digital_csv.load_capture(path, 1, 2).sample_rate_hz == 100_000_000
+
+
+@pytest.mark.parametrize("share, complementary", [(1.0, True), (0.995, True), (0.99, True),
+                                                  (0.985, False), (0.95, False),
+                                                  (0.5, False)])
+def test_a_pair_is_dlv_only_when_nearly_every_row_is_opposite(tmp_path, share, complementary):
+    n = 2000
+    lines = ["Time [s],A,B"]
+    for i in range(n):
+        a = i & 1
+        b = (1 - a) if i < share * n else a
+        lines.append(f"{i * 1e-8:.10f},{a},{b}")
+    path = tmp_path / "d.csv"
+    path.write_text("\n".join(lines) + "\n")
+    assert digital_csv.looks_complementary(str(path), 1, 2) is complementary
+
+
+def test_the_memory_prediction_prices_the_join_when_the_rows_outweigh_a_batch():
+    sample = b"Time [s],A,B\n0.000000000,0,0\n0.000000010,1,0\n"
+    rows = 10 ** 9
+    reading = rows * digital_csv._READ_BYTES_PER_ROW + digital_csv.predict_peak_bytes(0, 3, sample)
+    joining = rows * digital_csv._BYTES_PER_ROW
+    assert joining > reading
+    assert digital_csv.predict_peak_bytes(rows, 3, sample) == joining
+
+
+def test_the_row_estimate_counts_each_rows_newline(tmp_path):
+    n = 1000
+    path = tmp_path / "w.csv"
+    path.write_bytes(b"Time [s],A,B\n" + b"0.000000000,0,0\n" * n)       # every row 16 bytes
+    sample = path.read_bytes()[:64 << 10]
+    assert digital_csv.predict_rows(str(path), sample) == n
+
+
+def test_a_time_out_of_range_names_the_first_one_that_is():
+    with pytest.raises(timebase.TimeRangeError) as caught:
+        timebase.to_samples(np.array([0.0, 1.0, -5.0, -7.0]), 0.0, 10.0)
+    assert "-5 s" in str(caught.value) and "-7" not in str(caught.value)
+
+
+def test_a_time_whose_product_with_the_rate_overflows_raises_the_range_error_quietly(tmp_path):
+    """The overflow to infinity is the range error's business: no numpy RuntimeWarning
+    comes first, so a warnings-as-errors run still gets the error naming the file."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(timebase.TimeRangeError, match="too far from the capture start"):
+            timebase.to_samples(np.array([0.0, 1e300]), 0.0, 1e9)
+        p = tmp_path / "huge.csv"
+        p.write_text("Time,A,B\n" + "".join(
+            f"{t!r},{i % 2},{(i // 2) % 2}\n" for i, t in enumerate([0.0, 1e-9, 2e-9, 1e300])))
+        with pytest.raises(ValueError, match=r"huge\.csv: the time 1e\+300 s is too far"):
+            digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=1_000_000_000)

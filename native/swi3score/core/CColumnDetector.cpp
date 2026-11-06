@@ -59,8 +59,9 @@ int CColumnDetector::Detect(const std::vector<bool>& levels, int* offset,
 }
 
 int CColumnDetector::BestOffset(const std::vector<bool>& levels, int columnCount,
-                                int minValidPhases)
+                                int minValidPhases, bool* found)
 {
+    if (found) *found = false;
     if (columnCount < swi3s::kMinColumnCount) return 0;
     int bestOff = 0, bestScore = 0;
     // Column 0 begins on a rising clock edge (index 0 is rising, edges alternate),
@@ -69,5 +70,7 @@ int CColumnDetector::BestOffset(const std::vector<bool>& levels, int columnCount
         int s = Score(levels, columnCount, off);
         if (s > bestScore) { bestScore = s; bestOff = off; }
     }
-    return (bestScore >= minValidPhases) ? bestOff : 0;
+    if (bestScore < minValidPhases) return 0;
+    if (found) *found = true;
+    return bestOff;
 }

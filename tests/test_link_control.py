@@ -6,6 +6,7 @@ Run: PYTHONPATH=. python3 -m pytest tests/test_link_control.py
 import numpy as np
 
 from swi3s_studio.analysis import decode_link_control
+from swi3s_studio.analysis.link_control import LC_TIMING_LIMITS
 from swi3s_studio.ingest import transitions
 from swi3s_studio.ingest.capture import Capture
 
@@ -27,9 +28,9 @@ def test_cold_start_recovers_phy_number():
         assert r.safe_lock_columns == safelock, (name, r.safe_lock_columns)
         assert r.bus_reset_sample is not None and r.bus_reset_sample < r.phy_select_sample
         assert r.phystart_sample is not None
-        # audio starts after PhyStart, near the end of the synthesized preamble.
+        # audio starts after PhyStart, at the end of the synthesized preamble.
         assert r.audio_start_sample > r.phystart_sample
-        assert abs(r.audio_start_sample - end) < RATE // 1000   # within ~1 ms
+        assert r.audio_start_sample == end
 
 
 def test_warm_start_has_no_phy_number():
@@ -91,21 +92,24 @@ def test_real_world_cold_start_quirks():
     clk += [t]; t += us(305)        # inter-reset low
     clk += [t]; t += us(1600)       # Bus Reset high #2
     clk += [t]; t += us(75)         # recovery low (> PhyStart gap — must not trip)
-    # 4 clock cycles (bits 3..0). Insert a sub-sample glitch (a +1-sample pip) at
-    # the start of the 3rd low.
+    # 4 clock cycles (bits 3..0). Insert a sub-sample glitch (a +1-sample pip) inside
+    # the 2nd low.
     bit_edges = []
     for k in range(4):
         clk += [t]; t += us(30)     # rising
         clk += [t]; bit_edges.append(t); t += us(30)   # falling (bit sampled)
-        if k == 1:                  # glitch: two extra coincident-ish edges
-            clk += [t, t + 1]       # +1-sample pip → must be coalesced away
+        if k == 1:                  # glitch: a 1-sample pip strictly inside the low
+            pip = bit_edges[-1] + us(5)
+            clk += [pip, pip + 1]   # must be coalesced away
     clk += [t]; t += us(30)         # final clock high
     clk += [t]; t += us(80)         # PhyStart falling → long low
     # DN: a single high pulse covering ONLY the 3rd bit falling edge (value 0b0010).
     third = bit_edges[2]
     dat = [third - us(5), third + us(5)]
 
-    cap = Capture(clock_edges=np.asarray(sorted(clk), np.uint64),
+    edges = np.asarray(sorted(clk), np.uint64)
+    assert np.all(np.diff(edges) > 0), "clock edges must be strictly ascending"
+    cap = Capture(clock_edges=edges,
                   data_edges=np.asarray(dat, np.uint64),
                   initial_clock=False, initial_data=False, sample_rate_hz=250_000_000)
     r = decode_link_control(cap)
@@ -169,14 +173,17 @@ def _joined_late(cut: int = 1_500_000) -> Session:
                    source={"type": "fixture"})
 
 
-@pytest.mark.parametrize("phy, variant", [(1, ""), (2, ""), (2, "flow_control")])
-def test_a_capture_without_a_bringup_has_none(phy, variant):
+@pytest.mark.parametrize("phy, variant, edges_fooled",
+                         [(1, "", True), (2, "", True), (2, "flow_control", False)])
+def test_a_capture_without_a_bringup_has_none(phy, variant, edges_fooled):
+    """With or without an edge-only phantom, the Session reports no bring-up; when it
+    drops a phantom, the note says why."""
     s = Session.from_demo(300, phy=phy, variant=variant)
-    assert decode_link_control(s.capture).sequence != "none"     # the edges alone: fooled
+    assert (decode_link_control(s.capture).sequence != "none") == edges_fooled
     lc = s.link_control
     assert not s.has_bringup and lc.sequence == "none"
     assert not lc.lc_on_data_line and lc.sections == [] and s.audio_start_sample == 0
-    assert "CRC-valid command" in lc.note                       # says why
+    assert ("CRC-valid command" in lc.note) == edges_fooled
 
 
 def test_a_capture_joined_after_audio_began_has_no_bringup():
@@ -259,3 +266,142 @@ def test_rate_regions_need_no_guard_against_the_phantom():
     regions = [r for r in s.rate_regions() if r[2] is not None]
     assert regions[0][0] == int(s.segments[0]["start_sample"])
     assert regions[0][3] == pytest.approx(12_288_000, rel=1e-3)   # 2 columns at 24.576 MHz
+
+
+def test_a_clock_row_reports_the_cycle_nearest_a_limit():
+    from swi3s_studio.analysis.link_control import _clock_timing_rows
+    rows = {r["param"]: r for r in _clock_timing_rows([5.1, 20.0], [20.0, 31.9])}
+    assert rows["Man_tClock1"]["measured_us"] == 5.1       # 0.1 us above the 5 us minimum
+    assert rows["Man_tClock0"]["measured_us"] == 31.9      # 0.1 us below the 32 us maximum
+    assert rows["Man_tClock1"]["ok"] is True
+    broken = {r["param"]: r for r in _clock_timing_rows([4.0, 33.0], [4.5])}
+    assert broken["Man_tClock1"]["measured_us"] == 33.0    # equal overshoot: the longer cycle
+    assert broken["Man_tClock1"]["ok"] is False
+    assert broken["Man_tClock0"]["measured_us"] == 4.5
+
+
+def test_a_limit_with_no_maximum_has_none_to_exceed():
+    """The bounds themselves are pinned by test_a_timing_limit_includes_both_of_its_bounds; a
+    limit with no maximum passes however long the measurement."""
+    from swi3s_studio.analysis.link_control import _timing_row
+    assert LC_TIMING_LIMITS["Man_tReset10"][1] is None
+    assert _timing_row("Man_tReset10", 5000.0)["ok"] is True
+    assert _timing_row("Man_tReset10", 1e9)["ok"] is True
+
+
+def test_a_parameter_with_no_bound_is_shown_and_not_judged(monkeypatch):
+    from swi3s_studio.analysis import link_control
+    from swi3s_studio.analysis.link_control import _timing_row
+    assert _timing_row("Not_aParameter", 12.0)["ok"] is None
+    monkeypatch.setitem(link_control.LC_TIMING_LIMITS, "Man_tNoBound", (None, None, ""))
+    row = _timing_row("Man_tNoBound", 1e6)
+    assert row["ok"] is None and row["min_us"] is None and row["max_us"] is None
+
+
+@pytest.mark.parametrize("param", sorted(LC_TIMING_LIMITS))
+def test_a_timing_limit_includes_both_of_its_bounds(param):
+    """[min-max] is inclusive: a measurement exactly on a bound passes, one just outside fails."""
+    from swi3s_studio.analysis.link_control import _timing_row
+    lo, hi, _desc = LC_TIMING_LIMITS[param]
+    if lo is not None:
+        assert _timing_row(param, lo)["ok"] is True
+        assert _timing_row(param, lo - 0.01)["ok"] is False
+    if hi is not None:
+        assert _timing_row(param, hi)["ok"] is True
+        assert _timing_row(param, hi + 0.01)["ok"] is False
+
+
+def test_clock_cycles_exactly_on_a_limit_pass():
+    from swi3s_studio.analysis.link_control import _clock_timing_rows
+    rows = {r["param"]: r for r in _clock_timing_rows([5.0, 32.0], [5.0, 32.0])}
+    assert rows["Man_tClock1"]["ok"] is True and rows["Man_tClock0"]["ok"] is True
+
+
+def test_the_manager_timing_limits_are_the_specified_numbers():
+    """The (min, max) microsecond pairs of the §5.2.3 table; the descriptions are prose."""
+    assert {k: v[:2] for k, v in LC_TIMING_LIMITS.items()} == {
+        "Man_tReset00": (212.0, 236.0),
+        "Man_tReset10": (1569.0, None),
+        "Man_tResetRecovery": (72.5, 80.0),
+        "Man_tClock1": (5.0, 32.0),
+        "Man_tClock0": (5.0, 32.0),
+        "Man_tWarmStart10": (436.0, 482.0),
+        "Man_tPhyStart": (64.0, 96.0),
+    }
+
+
+def test_one_out_of_range_clock_cycle_fails_the_whole_row():
+    """A row passes only if EVERY cycle of the PHY-number burst is within [5, 32] us."""
+    from swi3s_studio.analysis.link_control import _clock_timing_rows
+    rows = {r["param"]: r for r in _clock_timing_rows([10.0, 10.0, 40.0, 10.0],
+                                                      [10.0, 4.0, 10.0, 10.0])}
+    assert rows["Man_tClock1"]["ok"] is False and rows["Man_tClock1"]["measured_us"] == 40.0
+    assert rows["Man_tClock0"]["ok"] is False and rows["Man_tClock0"]["measured_us"] == 4.0
+    assert "4 cycles" in rows["Man_tClock1"]["desc"]
+    good = {r["param"]: r for r in _clock_timing_rows([10.0, 12.0], [10.0, 12.0])}
+    assert good["Man_tClock1"]["ok"] is True and good["Man_tClock0"]["ok"] is True
+
+
+def _start_pulse_capture(pulse_us):
+    """A DP-high pulse of `pulse_us` after 50 us idle, then a low and one later edge, at
+    1 GS/s so a whole number of microseconds is a whole number of samples."""
+    spp = 1000.0
+    us = lambda x: int(round(x * spp))
+    t = us(50)
+    clk = [t]
+    t += us(pulse_us)
+    clk.append(t)
+    t += us(200)
+    clk.append(t)
+    return Capture(clock_edges=np.asarray(clk, np.uint64), data_edges=np.asarray([], np.uint64),
+                   initial_clock=False, initial_data=False, sample_rate_hz=1_000_000_000)
+
+
+def test_warm_start_pulses_are_judged_against_the_482_us_limit():
+    def row(pulse_us):
+        r = decode_link_control(_start_pulse_capture(pulse_us))
+        assert r.sequence == "warm", (pulse_us, r.sequence)
+        return next(t for t in r.timing if t["param"] == "Man_tWarmStart10")
+    assert row(482.0)["ok"] is True
+    assert row(483.0)["ok"] is False
+    assert row(436.0)["ok"] is True
+    assert row(435.0)["ok"] is False
+
+
+def test_the_150_and_500_us_pulses_fall_on_the_warm_side_of_their_boundary():
+    """Warm Start is [150, 500) us of DP high; below is LC_Acknowledge, from 500 a Bus Reset."""
+    assert decode_link_control(_start_pulse_capture(149.0)).sequence == "none"
+    assert decode_link_control(_start_pulse_capture(150.0)).sequence == "warm"
+    assert decode_link_control(_start_pulse_capture(499.0)).sequence == "warm"
+    assert decode_link_control(_start_pulse_capture(500.0)).sequence == "cold"
+
+
+def _us_capture(edges_us):
+    """A clock-only capture at 1 GS/s with edges at the given microsecond times, DP low first."""
+    return Capture(clock_edges=np.asarray([int(round(x * 1000)) for x in edges_us], np.uint64),
+                   data_edges=np.asarray([], np.uint64), initial_clock=False,
+                   initial_data=False, sample_rate_hz=1_000_000_000)
+
+
+def test_a_capture_that_ends_on_or_just_after_the_start_pulse_decodes_without_error():
+    """A start pulse is found from a measured gap, so it always has its falling edge: a capture
+    ending right after the pulse takes that edge as PhyStart, one ending on the next rising
+    edge has none, and a lone edge has no sequence."""
+    assert decode_link_control(_us_capture([50])).sequence == "none"
+    for edges, sequence, phystart in (([50, 650], "cold", 650_000),
+                                      ([50, 650, 1300], "cold", None),
+                                      ([50, 200], "warm", 200_000),
+                                      ([50, 200, 400], "warm", 200_000)):
+        r = decode_link_control(_us_capture(edges))
+        assert (r.sequence, r.phystart_sample) == (sequence, phystart), edges
+
+
+def test_a_dp_low_longer_than_48_us_after_a_falling_edge_is_phystart_and_exactly_48_is_not():
+    """A burst-terminating falling edge is PhyStart when the DP-low after it exceeds 48 us;
+    exactly 48 us still clocks a PHY-number bit."""
+    base = [50, 650, 670, 700]                       # Bus Reset pulse, then burst pulses
+    for low_us, phystart in ((47.9, False), (48.0, False), (48.1, True), (60.0, True)):
+        r = decode_link_control(_us_capture(base + [700 + low_us]))
+        assert r.sequence == "cold"
+        assert (r.phystart_sample == 700_000) is phystart, (low_us, r.phystart_sample)
+        assert (r.audio_start_sample is not None) is phystart
