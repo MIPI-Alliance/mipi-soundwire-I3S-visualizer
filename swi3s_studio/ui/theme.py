@@ -9,6 +9,8 @@ their palette from this module.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from typing import Iterator
 
 _ASSETS = os.path.join(os.path.dirname(__file__), "assets")
 _CHECK_SVG = os.path.join(_ASSETS, "check.svg").replace("\\", "/")
@@ -34,6 +36,7 @@ class VizTheme:
     theme-independent."""
     BORDER_WIDTH = 1
     CORNER_RADIUS = 6
+    SMALL_RADIUS = 4                                  # a short single-row control
     HEADER_CSS = "font-size:15px; font-weight:600;"   # panel-name headers
     TITLE_CSS = "font-size:18px; font-weight:600;"    # page / mode titles
     MODE = "dark"
@@ -89,6 +92,8 @@ class VizTheme:
     HILITE_BG: str
     DIAG_CLOCK: str
     DIAG_DATA: str
+    DIAG_DATA_PER: str
+    DIAG_DATA_PER_B: str
     DIAG_LEVEL: str
     DIAG_GROUND: str
     DIAG_TEXT: str
@@ -133,11 +138,13 @@ _DARK = {
     "SYM_KCODE": "#aa78d2", "SYM_UNKNOWN": "#c8c8c8",
     "SCROLL_HANDLE": "#5a6068", "SCROLL_HANDLE_HOVER": "#6f7680",
     "HILITE_BG": "#6f5410",
-    # The Timing page's term diagram: clock and data edges, a receiver's threshold, its offset
-    # ground, the text and the rails, the guides, a margin met and missed, a ramp's 80 % point
+    # The Timing page's term diagram: clock and data edges (the data by the device driving
+    # it: the Manager, a Peripheral or Peripheral A, Peripheral B), a receiver's threshold,
+    # its offset ground, the text and the rails, the guides, a margin met and missed, a ramp's 80 % point
     # and the keeper. Saturated and brighter than the shared marks, for a diagram read at a
     # distance.
-    "DIAG_CLOCK": "#5aa2ff", "DIAG_DATA": "#3ddc84", "DIAG_LEVEL": "#a9bdff",
+    "DIAG_CLOCK": "#5aa2ff", "DIAG_DATA": "#3ddc84",
+    "DIAG_DATA_PER": "#ff8a3d", "DIAG_DATA_PER_B": "#ff6ad5", "DIAG_LEVEL": "#a9bdff",
     "DIAG_GROUND": "#2fb866", "DIAG_TEXT": "#f2f5f8", "DIAG_DIM": "#c3cad2",
     "DIAG_GUIDE": "#9aa3ac", "DIAG_OK": "#8be05a", "DIAG_BAD": "#ff5c66",
     "DIAG_VALID": "#ffc940", "DIAG_KEEPER": "#d59bff",
@@ -170,7 +177,8 @@ _LIGHT = {
     "SYM_KCODE": "#7d52b8", "SYM_UNKNOWN": "#888888",
     "SCROLL_HANDLE": "#b8bdc4", "SCROLL_HANDLE_HOVER": "#a0a6ad",
     "HILITE_BG": "#ffe7a3",
-    "DIAG_CLOCK": "#0050d8", "DIAG_DATA": "#007f37", "DIAG_LEVEL": "#0b2a7a",
+    "DIAG_CLOCK": "#0050d8", "DIAG_DATA": "#007f37",
+    "DIAG_DATA_PER": "#d35400", "DIAG_DATA_PER_B": "#c2187a", "DIAG_LEVEL": "#0b2a7a",
     "DIAG_GROUND": "#005c28", "DIAG_TEXT": "#111111", "DIAG_DIM": "#3a3a3a",
     "DIAG_GUIDE": "#555555", "DIAG_OK": "#2a7a00", "DIAG_BAD": "#c00018",
     "DIAG_VALID": "#9a6400", "DIAG_KEEPER": "#7b1fa2",
@@ -188,6 +196,18 @@ def apply_palette(mode: str) -> str:
     VizTheme.SYM_COMMA = VizTheme.SEM_SSP      # comma reuses the gold SSP colour
     VizTheme.MODE = mode
     return mode
+
+
+@contextmanager
+def palette_applied(mode: str) -> Iterator[str]:
+    """`apply_palette(mode)` for the block, and the palette VizTheme held before it after
+    the block, however it ends. Yields the resolved mode. No widget is restyled: a paint inside
+    the block reads `mode`'s colours."""
+    before = VizTheme.MODE
+    try:
+        yield apply_palette(mode)
+    finally:
+        apply_palette(before)
 
 
 PREF_KEY = "appearance/mode"        # QSettings key
@@ -251,6 +271,58 @@ def scrollbar_qss() -> str:
 
 apply_palette("dark")   # default until app.py applies the saved preference
 
+
+# The contrast a text drawn in a data colour (a trace, a data port, a cursor pair) keeps
+# against the background it is drawn on: the 3:1 large-text floor and a margin, so the
+# anti-aliased glyphs still read at 3:1 or more.
+TEXT_ON_DATA_CONTRAST = 3.2
+
+
+def _luminance(color) -> float:
+    """WCAG relative luminance of a colour (a QColor or anything QColor reads)."""
+    from PySide6.QtGui import QColor
+    q = QColor(color)
+    out = 0.0
+    for w, v in zip((0.2126, 0.7152, 0.0722), (q.redF(), q.greenF(), q.blueF())):
+        out += w * (v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4)
+    return out
+
+
+def contrast(a, b) -> float:
+    """WCAG contrast ratio of two colours."""
+    hi, lo = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def legible_text_color(color, bg, floor: float = TEXT_ON_DATA_CONTRAST) -> str:
+    """The "#rrggbb" to draw text in `color` on `bg`. A colour with at least `floor`:1
+    against `bg` is returned as it is. Otherwise its HSL lightness moves, hue and saturation
+    kept, towards black on a background closer to white (towards white on one closer to
+    black) to the nearest 8-bit colour with at least `floor`:1; black or white when none has.
+    A line or fill keeps `color` itself; only its text takes this shade."""
+    import colorsys
+
+    from PySide6.QtGui import QColor
+    q = QColor(color)
+    if contrast(q, bg) >= floor:
+        return q.name()
+    h, light, s = colorsys.rgb_to_hls(q.redF(), q.greenF(), q.blueF())
+    end = 0.0 if contrast("#000000", bg) >= contrast("#ffffff", bg) else 1.0
+
+    def at(lightness: float) -> QColor:
+        r, g, b = colorsys.hls_to_rgb(h, lightness, s)
+        return QColor(round(r * 255), round(g * 255), round(b * 255))
+
+    # Every RGB channel is monotonic in lightness at a fixed hue and saturation, so the
+    # contrast is too: bisect between the colour (short of the floor) and the end.
+    short, enough = light, end
+    for _ in range(24):
+        mid = (short + enough) / 2
+        if contrast(at(mid), bg) >= floor:
+            enough = mid
+        else:
+            short = mid
+    return at(enough).name()
 
 
 

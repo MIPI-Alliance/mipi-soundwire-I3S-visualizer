@@ -9,6 +9,8 @@ with the same hues darkened for light mode. The grid keeps its fills. These pin:
   colour in the grid and the waveforms, and no two line colours are closer than the fills;
 - the panes read the palette at use: a pane built in light mode draws light, and a live
   switch recolours pens and the cached bookmark lines;
+- the audio channel labels, in the legible shade of their trace's colour, clear 3:1 on the
+  channel list in both themes and after a live switch, and the traces keep the colour;
 - the plot gridlines are at least as visible in light mode as in dark. They are the axis
   grey at the theme's PLOT_GRID_ALPHA opacity.
 """
@@ -211,7 +213,7 @@ def _bookmark_line_colours(lines):
 def test_a_live_switch_recolours_the_waveforms_and_bookmark_lines(win, monkeypatch):
     from swi3s_studio.ui import theme as theme_mod
     monkeypatch.setattr(theme_mod, "save_preference", lambda _p: None)
-    monkeypatch.setattr("swi3s_studio.ui.main_window.save_preference", lambda _p: None)
+    monkeypatch.setattr("swi3s_studio.ui.theme_controller.save_preference", lambda _p: None)
     assert win._audio_view._plots and win._raw_view._bm_lines and win._audio_view._bm_lines
     for mode in ("light", "dark"):
         win.apply_theme(mode)
@@ -220,7 +222,8 @@ def test_a_live_switch_recolours_the_waveforms_and_bookmark_lines(win, monkeypat
             assert colour == dp_line_color(dev, dp).name(), (mode, dev, dp)
             assert colour in [c.lower() for c in pal]
         for (dev, dp, ch), cb in win._audio_view._checks.items():
-            assert dp_line_color(dev, dp).name() in cb.styleSheet()
+            assert t.legible_text_color(dp_line_color(dev, dp), t.VizTheme.FRAME_BG) \
+                in cb.styleSheet()
         for label, (pen, text) in _bookmark_line_colours(win._raw_view._bm_lines).items():
             assert pen == text == bookmark_pair_color(label).name(), (mode, label)
         for (_pid, label), (pen, text) in _bookmark_line_colours(win._audio_view._bm_lines).items():
@@ -235,5 +238,76 @@ def test_a_live_switch_recolours_the_waveforms_and_bookmark_lines(win, monkeypat
         assert pv.rowCount()
         for r in range(pv.rowCount()):
             label = pv.item(r, 0).text()
-            assert pv.item(r, 0).foreground().color().name() == \
-                bookmark_pair_color(label[:1]).name(), (mode, label)
+            assert pv.item(r, 0).foreground().color().name() == t.legible_text_color(
+                bookmark_pair_color(label[:1]), t.VizTheme.FRAME_BG), (mode, label)
+
+
+@pytest.mark.parametrize("start", ["light", "dark"])
+def test_the_audio_channel_labels_read_at_3_to_1_and_the_traces_keep_their_colour(
+        start, monkeypatch):
+    """The Bus Analyzer's audio channel checkboxes, started in either theme and switched live
+    to the other: each label, read from the rendered window to the right of its indicator as
+    the screenshots check reads it, clears 3:1; its text is the legible shade of its trace's
+    colour, and the trace's pen keeps the colour itself."""
+    import conftest
+    from PySide6.QtCore import Qt
+
+    from swi3s_studio.ui.main_window import MainWindow
+    from swi3s_studio.ui.mode_controller import ANALYSIS
+    shots = conftest.load_tool("screenshots")
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("swi3s_studio.ui.theme_controller.save_preference", lambda _p: None)
+    monkeypatch.setattr("swi3s_studio.ui.theme_controller.saved_preference", lambda: start)
+
+    def settle():
+        for _ in range(30):
+            app.processEvents()
+
+    apply_palette(start)
+    w = MainWindow()
+    try:
+        w.setAttribute(Qt.WA_DontShowOnScreen, True)
+        w.resize(*shots._SIZE)
+        w.show()
+        settle()
+        w._mode_mgr.switch_to(ANALYSIS)
+        w.open_demo("phy1")
+        settle()
+        for mode in (start, "dark" if start == "light" else "light"):
+            if mode != start:
+                w.apply_theme(mode)
+                settle()
+            av = w._audio_view
+            assert t.VizTheme.MODE == mode and av._checks
+            rgb = shots.image_array(w.grab().toImage())
+            shaded = 0
+            for (dev, dp, ch), cb in av._checks.items():
+                trace = dp_line_color(dev, dp, av._stream_overrides)
+                text = t.legible_text_color(trace, t.VizTheme.FRAME_BG)
+                assert f"color: {text};" in cb.styleSheet(), (mode, cb.text())
+                shaded += text != trace.name()
+                assert cb.visibleRegion().boundingRect().size() == cb.size(), cb.text()
+                crop = shots._crop(rgb, w, cb, 0, shots._label_left(cb))
+                assert shots.text_contrast(crop) >= shots.MIN_CONTRAST, (mode, cb.text())
+            for _p, curve, dev, dp, _ch, _n in av._plots:
+                pen = curve.opts["pen"].color().name()
+                assert pen == dp_line_color(dev, dp, av._stream_overrides).name(), (mode, dp)
+            # The demo's light-theme line colours fall short of the floor on the list.
+            assert (shaded > 0) == (mode == "light"), (mode, shaded)
+    finally:
+        w.close()
+        w.deleteLater()
+        settle()
+        apply_palette("dark")
+
+
+def test_the_authoring_panel_names_a_data_port_in_the_grids_palette():
+    """One palette: a DP name chip is the colour of its grid cells, and the Visualizer config
+    carries no copy of it."""
+    from swi3s_studio.swviz import config
+    from swi3s_studio.ui.authoring import authoring_panel
+    assert authoring_panel._DP_PALETTE is _DP_PALETTE
+    assert not hasattr(authoring_panel, "_DP_COLORS")
+    for c in range(len(_DP_PALETTE)):
+        assert f"background:{_DP_PALETTE[c]};" in authoring_panel._chip_css(c)
+    assert not hasattr(config, "Colors") and not hasattr(config.constants, "Colors")

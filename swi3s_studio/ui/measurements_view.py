@@ -2,7 +2,7 @@
 
 Rows come from `analysis.capture_measurements` as `(metric, value)` or
 `(metric, value, kind)`. A `kind == "header"` row starts a collapsible SECTION
-(Link Control / Regions / Commands / Peripheral Reports / Data Ports); clicking it folds the rows
+(Link Control / Regions / Commands / Devices / Peripheral Reports / Data Ports); clicking it folds the rows
 beneath it away, so a long capture's Statistics pane stays scannable. 'pass'/'fail'
 colour the value green/red.
 
@@ -14,7 +14,7 @@ group's details stay hidden while its section is folded.
 """
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
@@ -50,13 +50,23 @@ class MeasurementsView(QTableWidget):
         self._groups: dict = {}
         self._group_owner: dict = {}
         self._expanded_groups: set = set()
+        self._shown_region: Optional[int] = None   # the region show_region last selected
+        self._kinds: dict = {}                     # row -> 'header' / 'pass' / 'fail' (retheme)
         self.cellClicked.connect(self._on_cell_clicked)
         from .copyable import enable_copy
         enable_copy(self, cells=True)          # ⌘/Ctrl+C copies selected cells (TSV)
 
     def retheme(self) -> None:
-        """Re-apply the item-view stylesheet after a theme switch."""
+        """Re-apply the item-view stylesheet and recolour the header, pass and fail rows
+        after a theme switch."""
         self.setStyleSheet(analyzer_stylesheet())
+        for r, kind in self._kinds.items():
+            if kind == "header":
+                self.item(r, 0).setForeground(QColor(VizTheme.ACCENT))
+            elif kind == "fail":
+                self.item(r, 1).setForeground(QColor(VizTheme.SEM_ERROR))
+            elif kind == "pass":
+                self.item(r, 1).setForeground(QColor(VizTheme.SEM_OTHER))
 
     def set_rows(self, rows: Sequence[Tuple]) -> None:
         """Populate the table. Each row is (metric, value) or (metric, value, kind)
@@ -66,11 +76,14 @@ class MeasurementsView(QTableWidget):
         children of the enclosing group when there is one (see _GROUPED_KINDS); a
         'header' or a plain row ends the group."""
         self.setRowCount(len(rows))
+        self._shown_region = None
         for r in range(len(rows)):
             self.setRowHidden(r, False)       # a row index keeps its hidden flag across a refill
         self._sections = {}
         self._groups = {}
         self._group_owner = {}
+        self._kinds = {r: row[2] for r, row in enumerate(rows)
+                       if len(row) > 2 and row[2] in ("header", "pass", "fail")}
         cur_header = None
         cur_group = None
         header_font = QFont(self.font()); header_font.setBold(True)
@@ -165,6 +178,25 @@ class MeasurementsView(QTableWidget):
             else:
                 self._expanded_groups.add(title)
             self._apply_folds()
+
+    def show_region(self, section: int) -> None:
+        """Select config region `section`'s row ("Region n", n = section + 1) and scroll it
+        to the top, or its section's title when the section is folded. Does nothing for a
+        capture with one region, or when `section` is the region it last selected, so the
+        pane moves only when the playhead enters another region."""
+        if section == self._shown_region:
+            return
+        want = f"Region {int(section) + 1}"
+        for hr, children in self._sections.items():
+            row = next((r for r in children if self._title_of(r) == want), None)
+            if row is None:
+                continue
+            if self._title_of(hr) in self._collapsed_titles:
+                row = hr
+            self._shown_region = section
+            self.selectRow(row)
+            self.scrollTo(self.model().index(row, 0), QAbstractItemView.ScrollHint.PositionAtTop)
+            return
 
     @property
     def metric_count(self) -> int:

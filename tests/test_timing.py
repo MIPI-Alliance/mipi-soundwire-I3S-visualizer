@@ -10,10 +10,12 @@
 - One supply per device, each leg at its worst assignment; the F_max column, and the toggle
   ceiling no UI-scaled leg's F_max passes (`toggle_ceiling_MHz`).
 - A Manager that forces its keeper leaves keeper_Man not applicable and moves no other leg.
+- A keeper leg's timeline draws the keeper's threshold at the corner the leg is priced on.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_timing.py
 """
 import os
+import re
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,7 +24,7 @@ import pytest
 from swi3s_studio.timing import INEQUALITIES, CalcInputs, compute
 from swi3s_studio.timing.spec_source import LaunchMode
 
-pytestmark = pytest.mark.gui
+pytestmark = pytest.mark.usefixtures("shared_compute")
 
 
 def test_compute_defaults_shape():
@@ -137,6 +139,7 @@ def test_the_lane_decomposition_check_scales_with_the_slews():
     assert set(r.breakdowns) == set(INEQUALITIES)
 
 
+@pytest.mark.gui
 def test_view_renders_and_roundtrips():
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
@@ -144,13 +147,19 @@ def test_view_renders_and_roundtrips():
     tv = TimingView()
     # The summary names the setup and hold directions.
     txt = tv.summary_text()
-    for label in ("MP setup", "MP hold", "PM setup", "PM hold"):
+    for label in ("1) Manager Setup for Peripheral", "3) Manager Holding for Peripheral",
+                  "5) Peripheral Setup for Manager", "7) Peripheral Holding for Manager"):
         assert label in txt, label
     # Eleven headings over the 17 inequalities (blank spacer rows sit between them). The
     # setup and hold headings carry two inequalities — the normal one and the handover
     # (t_ZD) variant — stacked under one title, each with an equation + Spec/Example rows.
     tops = [tv._tree.topLevelItem(i) for i in range(tv._tree.topLevelItemCount())]
     heads = [it for it in tops if it.text(0)]        # spacers have empty text
+
+    def _plain(item):
+        """A heading's title: its text less the span that washes it."""
+        return re.sub(r"<[^>]+>", "", item.text(0))
+
     # SIX setup/hold headings — Manager/Peripheral, Peripheral/Manager and the two
     # peripherals, setup and hold each — then the three handover ones, then ONE
     # BUS KEEPER HEADING PER RELEASING DEVICE: the same single keeper (it is in the Manager,
@@ -162,31 +171,31 @@ def test_view_renders_and_roundtrips():
     # than the mechanism — "Setup", not "Launching", since the launch is a step on the way.
     # The P->P pair carries the same letters its terms do (A drives, B samples — see
     # test_A_drives_and_B_samples_on_every_pp_leg).
-    assert [it.text(0) for it in heads if "Peripheral A" in it.text(0)] == \
+    assert [_plain(it) for it in heads if "Peripheral A" in _plain(it)] == \
         ["Peripheral A Setup for Peripheral B",
          "Peripheral A Holding for Peripheral B"]
-    assert [it.text(0) for it in heads if it.text(0).startswith("Manager ")] == \
+    assert [_plain(it) for it in heads if _plain(it).startswith("Manager ")] == \
         ["Manager Setup for Peripheral", "Manager Holding for Peripheral"]
-    assert [it.text(0) for it in heads
-            if it.text(0).endswith("for Manager")] == \
+    assert [_plain(it) for it in heads
+            if _plain(it).endswith("for Manager")] == \
         ["Peripheral Setup for Manager", "Peripheral Holding for Manager"]
-    keeper_heads = [it.text(0) for it in heads if "Bus Keeper" in it.text(0)]
+    keeper_heads = [_plain(it) for it in heads if "Bus Keeper" in _plain(it)]
     assert keeper_heads == ["Bus Keeper — Manager Releasing",
                             "Bus Keeper — Peripheral Releasing"], keeper_heads
-    setup_head = next(it for it in heads if "Setup" in it.text(0))
-    assert setup_head.text(0) == "Manager Setup for Peripheral"
+    setup_head = next(it for it in heads if "Setup" in _plain(it))
+    assert _plain(setup_head) == "Manager Setup for Peripheral"
     assert setup_head.isExpanded()
     kids = [setup_head.child(c) for c in range(setup_head.childCount())]
     # Handover variant present (its equation swaps in t_ZD).
     assert any("ZD" in k.text(0) for k in kids)
     spec_rows = [k for k in kids if "Specification" in k.text(0)]
-    assert len(spec_rows) == 2 and all(r.text(2) not in ("", "—") for r in spec_rows)
+    assert len(spec_rows) == 2 and all(_fmax_shown(r) not in ("", "—") for r in spec_rows)
 
     # Corners are auto-selected (no pick UI); inputs() is the nominal midpoint, so
     # pin min == max to make the round-trip assertion exact.
-    tv._min[("spec", "bus length (cm)")].setValue(60.0)
-    tv._max[("spec", "bus length (cm)")].setValue(60.0)
-    assert tv.inputs("spec").bus_length_cm == 60.0
+    tv._min[("proposed", "bus length (cm)")].setValue(60.0)
+    tv._max[("proposed", "bus length (cm)")].setValue(60.0)
+    assert tv.inputs("proposed").bus_length_cm == 60.0
     # workspace round-trip
     # The P→P placement is a control-bar selector (not a corner row), so it needs its own
     # key; a workspace without the key falls back to "unknown" — each P→P leg at its own
@@ -200,7 +209,7 @@ def test_view_renders_and_roundtrips():
     tv3 = TimingView()
     tv3.set_from_dict({k: v for k, v in d.items() if k != "pp_placement"})
     assert tv3.inputs("spec").pp_placement == "unknown"
-    assert tv2.inputs("spec").bus_length_cm == 60.0
+    assert tv2.inputs("proposed").bus_length_cm == 60.0
     # Ramp models are shared across Spec/Example (one key each), and drive both.
     assert tv2.to_dict()["man_shape"] == d["man_shape"]
     assert tv2.inputs("spec").Man_shape == tv2.inputs("proposed").Man_shape
@@ -243,6 +252,62 @@ def test_no_ui_scaled_leg_reports_an_fmax_past_the_toggle_ceiling(mode):
     if mode is LaunchMode.ANALOG:
         assert res.breakdowns["MP_hold_ho"].F_max_MHz == pytest.approx(ceiling)
     assert res.breakdowns["PM_hold"].F_max_MHz == math.inf
+
+
+@pytest.mark.parametrize("hi, quoted", [(100.0, "100 %"), (10000.0, "10000 %")])
+def test_a_row_end_the_model_refuses_is_quoted_as_typed(hi, quoted):
+    """The corner search checks each row's two ends first: a τ row of 0 % to `hi` is
+    refused naming τ at `hi`, the value the row holds, not its midpoint, and not as a
+    division by zero."""
+    from swi3s_studio.timing.calculator import (
+        INEQUALITIES,
+        CalcRow,
+        ParamRange,
+        apply_row_picks,
+        default_swi3s_rows,
+        find_worst_corner_rows_all,
+    )
+    rows = [CalcRow(r.name, r.binds, ParamRange(0.0, hi / 200.0, hi / 100.0), r.linked_to,
+                    r.is_window)
+            if r.binds == ("tRF_tolerance_frac",) else r
+            for r in default_swi3s_rows(lock_mgr_lanes=True)]
+    base = apply_row_picks(CalcInputs(), rows,
+                           {r.name: "typ" for r in rows if r.linked_to is None})
+    with pytest.raises(ValueError, match=f"τ is {quoted};"):
+        find_worst_corner_rows_all(INEQUALITIES, rows, base)
+
+
+def test_every_corner_of_a_set_of_slew_rows_has_the_ceiling_of_their_slowest_edge():
+    """With the three t_RF rows at 3-12 ns, every leg evaluated at its own worst corner,
+    whatever slews that corner picks, has F_max at most 1000 × 0.45 / 12 = 37.5 MHz, and a
+    leg stopped there says so with 12.00 ns."""
+    import math
+
+    from swi3s_studio.timing.calculator import (
+        INEQUALITIES,
+        CalcRow,
+        ParamRange,
+        apply_row_picks,
+        default_swi3s_rows,
+        find_worst_corner_rows_all,
+        toggle_ceiling_MHz,
+    )
+    rows = [CalcRow(r.name, r.binds, ParamRange(3.0, 7.5, 12.0), r.linked_to, r.is_window)
+            if r.name.startswith("t_RF") else r
+            for r in default_swi3s_rows(lock_mgr_lanes=True)]
+    base = apply_row_picks(CalcInputs(), rows,
+                           {r.name: "typ" for r in rows if r.linked_to is None})
+    picks = find_worst_corner_rows_all(INEQUALITIES, rows, base)
+    stopped = []
+    for leg in INEQUALITIES:
+        inp = apply_row_picks(base, rows, picks[leg])
+        assert toggle_ceiling_MHz(inp) == pytest.approx(37.5), leg
+        b = compute(inp).breakdowns[leg]
+        assert b.F_max_MHz <= 37.5 + 1e-9 or math.isinf(b.F_max_MHz), (leg, b.F_max_MHz)
+        if math.isclose(b.F_max_MHz, 37.5, rel_tol=1e-12):
+            stopped.append(leg)
+            assert "/ 12.00 ns = 37.50 MHz" in b.F_max_note, (leg, b.F_max_note)
+    assert {"PM_hold_ho", "MP_contention"} <= set(stopped), stopped
 
 
 @pytest.mark.parametrize("kw", [{}, {"Man_ede": True, "Per_ede": True},
@@ -295,42 +360,52 @@ def test_a_forced_keeper_moves_the_binding_rate_off_keeper_man_where_it_binds(mo
     assert forced.F_max_binding_MHz == pytest.approx(16.09, abs=0.01)
 
 
-def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
-    """F_max is shown for hold, contention and keeper legs too, wherever the margin has a
-    UI-scaled part; "—" only where no rate bounds the leg.
+def test_the_binding_rate_at_own_corners_reads_each_leg_from_its_own_result():
+    """`binding_at_own_corners` reads each leg from the result at its own corner, over the
+    legs `F_max_binding_MHz` reads: given one result for every leg it is that result's
+    `F_max_binding_MHz` and `binding_inequality`; given a leg a result where it binds lower,
+    that leg and its rate; a Peripheral-to-Peripheral data leg or a leg that does not apply
+    never binds, whatever its rate."""
+    from dataclasses import replace
 
-    The summary and the results tree both print the worst-corner breakdown's own F_max, and
-    on the default page every leg with a UI-scaled part has a finite one in both columns: the
-    hold legs with a handover UI, the contention legs and the keeper legs (the closing UI).
-    """
-    import math
+    from swi3s_studio.timing.calculator import binding_at_own_corners
+    inp = CalcInputs(Man_t_DZ_max_ns=0.0, Man_t_DD_min_ns=12.0, Man_t_DD_max_ns=21.0,
+                     Per_t_DD_max_ns=6.0, Per_t_IS_max_ns=2.0, t_keeper_ns=4.0,
+                     F_CLK_target_MHz=12.288)
+    free, forced = compute(inp), compute(replace(inp, Man_keeper_forced=True))
+    assert binding_at_own_corners({leg: forced for leg in INEQUALITIES}) == (
+        forced.F_max_binding_MHz, forced.binding_inequality)
+    # keeper_Man binds lower in the free result than MP_setup does in the forced one.
+    mixed = {leg: forced for leg in INEQUALITIES} | {"keeper_Man": free}
+    assert binding_at_own_corners(mixed) == (free.breakdowns["keeper_Man"].F_max_MHz,
+                                             "keeper_Man")
+    # Read from the forced result, keeper_Man does not apply, so it does not bind.
+    assert forced.breakdowns["keeper_Man"].not_applicable
+    low = replace(free, breakdowns=free.breakdowns | {
+        "PP_hold": replace(free.breakdowns["PP_hold"], F_max_MHz=0.0)})
+    assert binding_at_own_corners(mixed | {"PP_hold": low}) == binding_at_own_corners(mixed)
+    assert binding_at_own_corners({}) is None
 
-    from PySide6.QtWidgets import QApplication
-    QApplication.instance() or QApplication([])
-    from swi3s_studio.ui.timing_view import TimingView
-    tv = TimingView()
-    spec_w = tv._per_inequality_worst("spec")
-    prop_w = tv._per_inequality_worst("proposed")
-    # The margin table runs from the header to the first blank line; the "Terms" block follows.
-    table = tv.summary_text().split("\n\n", 1)[0].splitlines()[1:]
-    rows = {line.split(" | ")[0].split(") ", 1)[1].replace(" ", "_"): line.split(" | ")
-            for line in table}
-    for ineq in INEQUALITIES:
-        cells = rows[ineq]
-        assert cells[4] == tv._fmt_fmax(spec_w[ineq].F_max_MHz), (ineq, cells)
-        assert cells[5] == tv._fmt_fmax(prop_w[ineq].F_max_MHz), (ineq, cells)
-    scaled = {"MP_hold_ho", "PP_hold_ho", "MP_contention", "PM_contention", "PP_contention",
-              "keeper_Man", "keeper_Per"}
-    for side in (spec_w, prop_w):
-        finite = {i for i in INEQUALITIES if not side[i].is_setup
-                  and 0.0 < side[i].F_max_MHz < math.inf}
-        assert scaled <= finite, sorted(scaled - finite)
 
-    # The tree's F_max cell says the same in both columns, with its unit, and "—" where no
-    # rate bounds the leg.
-    def cell(x):
-        return "—" if not math.isfinite(x) else ("FAIL" if x <= 0 else f"{x:.3f} MHz")
+def _fmax_shown(item) -> str:
+    """The F_max a substitution row shows after its margin ("(F<sub>MAX</sub> …)"), or ""; the
+    row's
+    `_FMAX_ROLE` holds the same."""
+    import re
 
+    from swi3s_studio.ui.timing_view import _FMAX_ROLE
+    assert "F_max" not in item.text(0), item.text(0)
+    m = re.search(r" \(F<sub>MAX</sub> (.*)\)</td>", item.text(0))
+    shown = re.sub(r"<[^>]+>", "", m.group(1)) if m else ""
+    assert (item.data(0, _FMAX_ROLE) or "") == shown, (item.text(0), item.data(0, _FMAX_ROLE))
+    return shown
+
+
+def _shown_fmaxes(tv):
+    """{(inequality, column): the F_max its substitution row shows, or ""} and {inequality:
+    the summary's margin-table cells}."""
+    from swi3s_studio.ui.timing_view import _heading_title
+    tv.flush_recompute()
     shown: dict[tuple[str, str], str] = {}
     for i in range(tv._tree.topLevelItemCount()):
         head = tv._tree.topLevelItem(i)
@@ -342,19 +417,130 @@ def test_the_fmax_column_reports_every_leg_that_scales_with_ui():
             elif current:
                 for col in ("Specification", "Example"):
                     if f"{col}:" in kid.text(0):
-                        shown[current, col] = kid.text(2)
-    for ineq in INEQUALITIES:
-        for col, worst in (("Specification", spec_w), ("Example", prop_w)):
-            assert shown.get((ineq, col)) == cell(worst[ineq].F_max_MHz), \
-                (ineq, col, shown.get((ineq, col)))
-    unbounded = [i for i in INEQUALITIES if math.isinf(spec_w[i].F_max_MHz)]
-    assert unbounded and all(shown[i, "Specification"] == "—" for i in unbounded), unbounded
+                        shown[current, col] = _fmax_shown(kid)
+    # The margin table runs from the header to the first blank line; the "Terms" block follows.
+    table = tv.summary_text().split("\n\n", 1)[0].splitlines()[1:]
+    rows = {line.split(" | ")[0]: line.split(" | ") for line in table}
+    return shown, {ineq: rows[_heading_title(ineq)] for ineq in INEQUALITIES}
 
 
+@pytest.mark.gui
+def test_f_max_shows_only_where_the_inequality_holds_a_ui_term():
+    """A substitution row shows its column's worst-corner F_max only where that column's
+    inequality holds a UI term with a nonzero coefficient (UI, or N·UI with N > 0); the
+    summary's F_max cells read "—" where it does not, and so does their difference.
+
+    On the default PHY2 page, whose Handover UI box is ticked, every inequality but the three
+    plain holds (MP_hold, PM_hold, PP_hold) holds one and shows its F_max, among them
+    MP_hold_ho's 1·UI; with the box cleared the six handover legs lose their 1·UI and MP_hold_ho
+    and the other two handover holds show none.
+    """
+    import math
+
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.timing_view import TimingView
+    tv = TimingView()
+    assert tv._ho_ui_check.isChecked()
+
+    def cell(x):
+        return "" if not math.isfinite(x) else ("FAIL" if x <= 0 else f"{x:.3f} MHz")
+
+    plain = {"MP_hold", "PM_hold", "PP_hold"}
+    for ticked, without in ((True, plain),
+                            (False, plain | {"MP_hold_ho", "PM_hold_ho", "PP_hold_ho"})):
+        tv._ho_ui_check.setChecked(ticked)
+        spec_w = tv._per_inequality_worst("spec")
+        prop_w = tv._per_inequality_worst("proposed")
+        shown, rows = _shown_fmaxes(tv)
+        for ineq in INEQUALITIES:
+            cells = rows[ineq]
+            for col, worst, k in (("Specification", spec_w, 4), ("Example", prop_w, 5)):
+                b = worst[ineq]
+                has_ui = any(t.symbol == "UI" or t.symbol.endswith("·UI") for t in b.terms)
+                if ineq in without:
+                    assert not has_ui, (ticked, ineq, col)
+                    assert shown[ineq, col] == "" and cells[k] == "—", (ticked, ineq, col)
+                    assert cells[6] == "—", (ticked, ineq, cells)
+                elif has_ui:
+                    assert shown[ineq, col] == cell(b.F_max_MHz), (ticked, ineq, col)
+                    assert cells[k] == tv._fmt_fmax(b.F_max_MHz), (ticked, ineq, cells)
+        if ticked:
+            assert {i for i in INEQUALITIES if shown[i, "Specification"]} \
+                == set(INEQUALITIES) - plain
+        else:
+            assert shown["MP_hold_ho", "Specification"] == ""
+    tv._ho_ui_check.setChecked(True)
+    shown, _ = _shown_fmaxes(tv)
+    assert shown["MP_hold_ho", "Specification"].endswith(" MHz"), shown["MP_hold_ho",
+                                                                       "Specification"]
+
+
+@pytest.mark.gui
+def test_f_max_shows_where_a_clocked_manager_timing_makes_the_margin_rate_dependent():
+    """A clocked Manager launch places Man_t_DD, Man_t_ZD and Man_t_DZ at a fraction of the
+    UI, so a column whose inequality holds one of them at its corner shows its F_max as it
+    would for a UI term, in the substitution row and the copied summary.
+
+    Example column, 4x CLK at 12.288 MHz: with the Handover UI box ticked MP_hold shows
+    "12.167 MHz" with its note as the tooltip, PM_hold and PP_hold none; with it cleared
+    MP_hold_ho (Man_t_ZD) shows 12.167 MHz and PM_contention (Man_t_ZD) 6.310 MHz, while
+    PP_contention, which reads no Manager timing, shows none. The Specification column is
+    analog, so its plain holds still show none.
+    """
+    import math
+
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.timing_view import TimingView
+    tv = TimingView()
+    tv._launch_combo.setCurrentIndex(tv._launch_combo.findData("4x"))
+    assert tv._fclk.value() == pytest.approx(12.288)
+    clocked = {"Man_t_DD", "Man_t_ZD", "Man_t_DZ"}
+
+    def cell(x):
+        return "" if not math.isfinite(x) else ("FAIL" if x <= 0 else f"{x:.3f} MHz")
+
+    for ticked, shows, none in (
+            (True, {"MP_hold": "12.167 MHz"}, {"PM_hold", "PP_hold"}),
+            (False, {"MP_hold": "12.167 MHz", "MP_hold_ho": "12.167 MHz",
+                     "PM_contention": "6.310 MHz"},
+             {"PM_hold", "PP_hold", "PM_hold_ho", "PP_hold_ho", "PP_contention"})):
+        tv._ho_ui_check.setChecked(ticked)
+        prop_w = tv._per_inequality_worst("proposed")
+        shown, rows = _shown_fmaxes(tv)
+        for ineq in INEQUALITIES:
+            b = prop_w[ineq]
+            rate_dependent = any(
+                (t.symbol == "UI" or t.symbol.endswith("·UI") or t.symbol in clocked)
+                and t.value_ns != 0.0 for t in b.terms)
+            want = cell(b.F_max_MHz) if rate_dependent else ""
+            assert shown[ineq, "Example"] == want, (ticked, ineq, shown[ineq, "Example"])
+            assert rows[ineq][5] == (tv._fmt_fmax(b.F_max_MHz) if rate_dependent else "—"), \
+                (ticked, ineq, rows[ineq])
+        for ineq, f_max in shows.items():
+            assert shown[ineq, "Example"] == f_max, (ticked, ineq, shown[ineq, "Example"])
+            assert rows[ineq][5] == f_max.removesuffix(" MHz"), (ticked, ineq, rows[ineq])
+        for ineq in none:
+            assert shown[ineq, "Example"] == "" and rows[ineq][5] == "—", (ticked, ineq)
+        for ineq in ("MP_hold", "PM_hold", "PP_hold"):
+            assert shown[ineq, "Specification"] == "" and rows[ineq][4] == "—", (ticked, ineq)
+    tv._ho_ui_check.setChecked(True)
+    tv.flush_recompute()
+    note = tv._worst["proposed"]["MP_hold"].breakdowns["MP_hold"].F_max_note
+    assert note
+    tips = [kid.toolTip(0) for i in range(tv._tree.topLevelItemCount())
+            for head in [tv._tree.topLevelItem(i)]
+            for kid in (head.child(c) for c in range(head.childCount()))
+            if "Example:" in kid.text(0) and _fmax_shown(kid) == "12.167 MHz"]
+    assert any(note in tip for tip in tips), tips
+
+
+@pytest.mark.gui
 def test_phy1_selector_reseeds_spec_and_persists():
     """PHY1 is chosen per side, via the spec selector — there is no PHY picker.
 
-    PHY1 (SWI3S v1.1r06 §11.2, the "PHY1 & PHY2 Output Timing" table) has slower
+    PHY1 (the SWI3S specification §11.2, the "PHY1 & PHY2 Output Timing" table) has slower
     Peripheral output / high-Z timing and a lower F_CLK target; the shared PHY1&2 values
     (Man_t_DD, V thresholds, t_IS/t_IH) are unchanged. The selection round-trips via
     to_dict.
@@ -365,7 +551,7 @@ def test_phy1_selector_reseeds_spec_and_persists():
     tv = TimingView()
     # Defaults to PHY2 on both sides, with the PHY2 spec values.
     assert tv._man_spec_combo.currentData() == "SWI3S_PHY2"
-    assert "PHY2" in tv._subtitle.text()
+    assert "PHY2" in tv._title.toolTip()
     assert (tv._min[("spec", "Per_t_DD")].value(),
             tv._max[("spec", "Per_t_DD")].value()) == (2.0, 20.0)
 
@@ -377,7 +563,7 @@ def test_phy1_selector_reseeds_spec_and_persists():
     # F_CLK change. (Per-side mixing is covered in test_timing_cross_spec.)
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY1"))
-    assert "PHY1" in tv._subtitle.text()
+    assert "PHY1" in tv._title.toolTip()
     assert tv._fclk.value() == 6.6                                   # clock target
     for name, lo, hi in [("Per_t_DD", 14.0, 50.0),                   # output timing, PHY1
                          ("Per_t_ZD", 14.0, 50.0),
@@ -394,7 +580,7 @@ def test_phy1_selector_reseeds_spec_and_persists():
     assert d["man_spec"] == "SWI3S_PHY1" and d["per_spec"] == "SWI3S_PHY1"
     tv2 = TimingView()
     tv2.set_from_dict(d)
-    assert "PHY1" in tv2._subtitle.text()
+    assert "PHY1" in tv2._title.toolTip()
     assert tv2._max[("spec", "Per_t_DD")].value() == 50.0
     # A legacy dict with no spec keys predates the selector → PHY2 both sides.
     for k in ("man_spec", "per_spec"):
@@ -403,6 +589,7 @@ def test_phy1_selector_reseeds_spec_and_persists():
     assert tv3._man_spec_combo.currentData() == "SWI3S_PHY2"
 
 
+@pytest.mark.gui
 def test_every_displayed_symbol_follows_one_naming_scheme():
     """The vocabulary on the page, pinned.
 
@@ -447,6 +634,8 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
         (`calculator.anchor_symbol`): a Peripheral's data edge, `<device>_t_<DD|ZD>,anchor,rise`
         / `,fall`, a Manager's clock then data edge with the case letters, `,anchor,rr` /
         `,rf` / `,fr` / `,ff`, then `,fast` where it is priced on the fast data edge.
+      * A SoundWire receive-row correction names its sampling clock edge
+        (`calculator.receive_symbol`): `<device>_t_<IS|IH>,ref,rise` / `,fall`.
       * Every symbol subscripts. The underscore before a token is the marker, so a symbol
         rendering with a bare `_` left in it is misspelled (the spec writes `Man_tDD`; this
         file writes `Man_t_DD`).
@@ -517,6 +706,10 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
                     "then `,rr` / `,rf` / `,fr` / `,ff` on a Manager or `,rise` / `,fall` on a " \
                     "Peripheral, then `,fast`"
                 anchor_seen.add(f"{sym[:3]}:{m.group(2)}{m.group(3) or ''}")
+            if ",ref" in sym:
+                assert re.fullmatch(r"(Man|Per)_t_(IS|IH),ref,(rise|fall)", sym), \
+                    f"{sym!r}: a receive-row correction reads `<device>_t_<IS|IH>,ref`, " \
+                    "then its sampling clock edge, `,rise` / `,fall`"
             if "_t_RF," in sym:
                 m = re.fullmatch(r"(Man|Per)_t_RF,DATA,(rise|fall)(,fast)?", sym)
                 assert m, f"{sym!r}: the ramp to V_OH / V_OL reads " \
@@ -608,12 +801,14 @@ def test_every_displayed_symbol_follows_one_naming_scheme():
     assert checked, "no term names a lane's t_RF"
 
 
+@pytest.mark.gui
 def test_every_crossing_and_ramp_symbol_names_its_edge():
     """No polarity is implied by an unqualified symbol. Every crossing `X_…` names its edge,
     `rise` or `fall`, or on a Sigma_cross,PM sum's addend the sum's case letters, clock edge
     then data edge, `rr` / `rf` / `fr` / `ff`; every ramp from a launch's anchor to V_OH /
     V_OL is `<device>_t_RF,DATA,rise` or `,fall`, then `,fast`; every SoundWire anchor term
-    names its edges; and no detection of the Manager's clock is `X_PP`, which is A's data at
+    names its edges, and every SoundWire receive-row correction its sampling clock edge; and
+    no detection of the Manager's clock is `X_PP`, which is A's data at
     B alone.
 
     Swept over every pairing of the spec sources, EndDriveEarly on either side and zero, one
@@ -636,7 +831,8 @@ def test_every_crossing_and_ramp_symbol_names_its_edge():
     ramp = re.compile(r"(Man|Per)_t_RF,DATA,(rise|fall)(,fast)?")
     anchor = re.compile(r"Man_t_(DD|ZD),anchor,(rr|rf|fr|ff)(,fast)?"
                         r"|Per_t_(DD|ZD),anchor,(rise|fall)(,fast)?")
-    seen: dict[str, set[str]] = {"X": set(), "ramp": set(), "anchor": set()}
+    receive = re.compile(r"(Man|Per)_t_(IS|IH),ref,(rise|fall)")
+    seen: dict[str, set[str]] = {"X": set(), "ramp": set(), "anchor": set(), "ref": set()}
 
     def check(breakdowns, where):
         for leg, b in breakdowns.items():
@@ -659,6 +855,10 @@ def test_every_crossing_and_ramp_symbol_names_its_edge():
                     m = anchor.fullmatch(sym)
                     assert m, f"{where} {leg}: {sym!r} names no edge"
                     seen["anchor"].add(sym)
+                elif ",ref" in sym:
+                    m = receive.fullmatch(sym)
+                    assert m, f"{where} {leg}: {sym!r} names no edge"
+                    seen["ref"].add(sym)
                 elif "_t_RF," in sym:
                     m = ramp.fullmatch(sym)
                     assert m, f"{where} {leg}: {sym!r} names no edge"
@@ -714,6 +914,8 @@ def test_every_crossing_and_ramp_symbol_names_its_edge():
             for f in ("", ",fast")} <= seen["ramp"], seen["ramp"]
     assert {"Per_t_DD,anchor,rise", "Per_t_DD,anchor,fall", "Man_t_DD,anchor,rr",
             "Man_t_ZD,anchor,ff"} <= seen["anchor"], seen["anchor"]
+    assert {f"{d}_t_IS,ref,{e}" for d in ("Man", "Per") for e in ("rise", "fall")} | {
+        "Man_t_IH,ref,rise", "Man_t_IH,ref,fall"} <= seen["ref"], seen["ref"]
 
 
 # Which t_RF lanes each leg is ALLOWED to read, declared per leg. Wrong-lane bugs are
@@ -783,8 +985,9 @@ def test_no_leg_reads_a_lane_it_has_no_business_reading():
 _LEGAL_LANES_MAN_EDE = {"MP_contention": {"Man DATA"}}
 _LEGAL_LANES_PER_EDE = {"PM_contention": {"Per DATA"}, "PP_contention": {"Per DATA"}}
 # A SoundWire side's launch carries its anchor correction (`sw13_anchor_correction`), which
-# places the 20 % point by the side's data slew and, for a Manager, its clock slew: a turn-on
-# at t_ZD + q·k + z·s, a t_OV at t_OV + p·k − s.
+# places the 20 % point by the side's data slew and the clock slew: a Manager's turn-on at
+# t_ZD + q·k + z·s and t_OV at t_OV + p·k − s, a Peripheral's turn-on at t_ZD + e·k + z·s and
+# t_OV at t_OV − s.
 _LEGAL_LANES_SW_MAN = {"PM_contention": {"Man DATA"}, "keeper_Man": {"Man CLK"}}
 _LEGAL_LANES_SW_PER = {"MP_contention": {"Per DATA"}, "PP_contention": {"Per DATA"}}
 
@@ -844,7 +1047,8 @@ def test_no_leg_shows_a_structurally_zero_term():
     from swi3s_studio.timing.spec_source import SPEC_SOURCES
 
     # A SoundWire anchor correction of zero is no term (`_launch_terms`), so none is here.
-    may_read_zero = {"Man_t_IH", "t_PD,mis", "t_PD", "Man_t_DZ", "Per_t_DZ"}
+    may_read_zero = {"Man_t_IH", "t_PD,mis", "t_PD,mis,AB", "t_PD", "Man_t_DZ", "Per_t_DZ",
+                     "Man_t_Keeper_Response"}
     rows = default_swi3s_rows()
     for spec in SPEC_SOURCES:
         for kw in ({}, {"Man_ede": True, "Per_ede": True}, {"handover_UIs": 0.0},
@@ -875,10 +1079,12 @@ def _term_view():
     tv = TimingView()
     tv.resize(1500, 1200)
     tv.show()
+    tv.flush_recompute()
     QApplication.processEvents()
     return tv
 
 
+@pytest.mark.gui
 def test_the_click_regions_line_up_with_the_painted_glyphs():
     """Where the terms are DRAWN and where they are CLICKABLE must be the same places.
 
@@ -927,6 +1133,7 @@ def test_the_click_regions_line_up_with_the_painted_glyphs():
     assert rows > 40 and samples > 5000, (rows, samples)
 
 
+@pytest.mark.gui
 def test_a_click_between_terms_is_inert_and_only_empty_space_clears():
     """A 2-pixel miss must not throw away the reader's work.
 
@@ -968,6 +1175,7 @@ def test_a_click_between_terms_is_inert_and_only_empty_space_clears():
     assert tv._hl == set(), tv._hl
 
 
+@pytest.mark.gui
 def test_every_printed_term_resolves_to_a_key():
     """Every term the model can print must map to an input row, or be declared row-less.
 
@@ -1010,6 +1218,9 @@ def test_every_printed_term_resolves_to_a_key():
     # keying on the row: `,anchor` is a SoundWire anchor correction of a value, not a second
     # parameter.
     assert keys["Per_t_DD,anchor,rise"] == keys["Per_t_DD"] == "Per_t_DD"
+    # So is `,ref`, a SoundWire receive-row correction of a value.
+    assert keys["Per_t_IS,ref,fall"] == keys["Per_t_IS"] == "Per_t_IS"
+    assert keys["Man_t_IS,ref,rise"] == keys["Man_t_IS"] == "Man_t_IS"
     assert keys["Man_t_DZ"] == "Man_t_DZ"
     # An EDE release's parts key on the rows they read.
     assert keys["Man_t_EDE"] == "Man_t_EDE" and keys["Per_t_EDE"] == "Per_t_EDE"
@@ -1040,6 +1251,7 @@ def test_every_printed_term_resolves_to_a_key():
         "two keys collapsed to one CSS class"
 
 
+@pytest.mark.gui
 def test_clicking_a_term_highlights_it_everywhere_and_a_second_click_clears():
     """The whole feature, end to end, through real mouse events.
 
@@ -1126,6 +1338,7 @@ def test_clicking_a_term_highlights_it_everywhere_and_a_second_click_clears():
     assert tv._hl == set(), tv._hl
 
 
+@pytest.mark.gui
 def test_clicking_a_parameter_row_highlights_it_and_a_second_click_clears():
     """A click on an input row's name highlights that parameter as a click on one of its
     terms does, the row washed and its terms with it, adding to what is highlighted; a second
@@ -1150,6 +1363,7 @@ def test_clicking_a_parameter_row_highlights_it_and_a_second_click_clears():
     assert tv._diagram.panels == []
 
 
+@pytest.mark.gui
 def test_a_highlight_is_a_repaint_and_not_a_recompute():
     """Toggling must not re-evaluate the model or re-lay-out the tree.
 
@@ -1204,6 +1418,7 @@ def test_a_highlight_is_a_repaint_and_not_a_recompute():
     assert tv._tree.columnWidth(0) == width, "a toggle moved the fitted width"
 
 
+@pytest.mark.gui
 def test_anchored_terms_keep_the_palette_ink_in_both_modes():
     """An anchor must not change the colour of the text it wraps.
 
@@ -1283,6 +1498,7 @@ def test_anchored_terms_keep_the_palette_ink_in_both_modes():
         theme.apply_palette(original)
 
 
+@pytest.mark.gui
 def test_the_wash_is_applied_by_class_to_exactly_the_active_keys():
     """The mechanism, at the level where it can silently stop working.
 
@@ -1338,7 +1554,9 @@ def test_every_leg_reads_in_physical_time_order():
       6. A contention leg reads the releaser first (a peripheral's detection, then the
          release), then the handover UIs, then the acquirer: on M->P the clock's flight
          out, the peripheral's detection, its turn-on and its drive's flight back, two
-         `t_PD` terms. On P->P the two detections are one gathered term, first.
+         `t_PD` terms. On P->P the two detections are one gathered term, first. The trace
+         mismatch is last, after the acquirer's drive: `t_PD,mis`, and on P->P
+         `t_PD,mis,AB`.
 
     ORDER IS FREE TO GET WRONG: the margin is a sum, so a reordering changes no number and
     no other test would notice.
@@ -1452,11 +1670,11 @@ def test_every_leg_reads_in_physical_time_order():
         syms = [t.symbol for t in b["MP_contention"].terms]
         assert syms == [*release("Man", syms), *ui, "t_PD",
                         f"X_MP,{acq_rise('MP_contention')}early · Man_t_RF,CLK",
-                        *zd("Per", syms), "t_PD"], (kw, syms)
+                        *zd("Per", syms), "t_PD", "t_PD,mis"], (kw, syms)
         syms = [t.symbol for t in b["PM_contention"].terms]
         assert syms == [f"X_MP,{rel_fall('PM_contention')}late · Man_t_RF,CLK",
                         *release("Per", syms), *ui,
-                        *zd("Man", syms)], (kw, syms)
+                        *zd("Man", syms), "t_PD,mis"], (kw, syms)
         syms = [t.symbol for t in b["PP_contention"].terms]
         # At zero handover UIs a conventional release and the acquirer's turn-on are of one
         # clock edge, so the acquirer's early detection is on the releaser's slow edge.
@@ -1465,9 +1683,10 @@ def test_every_leg_reads_in_physical_time_order():
         acq = f"X_MP,B,{rise}slow,early" if shared else f"X_MP,B,{rise}early"
         rel = f"X_MP,A,{rel_fall('PP_contention')}late"
         assert syms == [f"({rel} − {acq}) · Man_t_RF,CLK", *release("Per", syms), *ui,
-                        *zd("Per", syms)], (kw, syms)
+                        *zd("Per", syms), "t_PD,mis,AB"], (kw, syms)
 
 
+@pytest.mark.gui
 def test_the_inequalities_are_numbered_for_reference_in_display_order():
     """1) … 17), one numbering, shared by the tree and the summary.
 
@@ -1491,8 +1710,9 @@ def test_the_inequalities_are_numbered_for_reference_in_display_order():
     from swi3s_studio.ui.timing_view import TimingView
     tv = TimingView()
     txt = tv.summary_text()
-    assert "1) MP setup" in txt and "17) keeper Per" in txt, txt.splitlines()[:3]
-    assert "1. MP setup" not in txt, "a period would read as part of the arithmetic"
+    assert "1) Manager Setup for Peripheral" in txt, txt.splitlines()[:3]
+    assert "17) Bus Keeper — Peripheral Releasing" in txt, txt.splitlines()[:3]
+    assert "1. Manager" not in txt, "a period would read as part of the arithmetic"
 
     # And on screen: every equation row is numbered, in order, once each.
     seen = []
@@ -1549,11 +1769,16 @@ def test_A_drives_and_B_samples_on_every_pp_leg():
                {"Man_ede": True, "Per_ede": True}, *_SOUNDWIRE_PERIPHERALS):
         b = compute(replace(CalcInputs(), **kw)).breakdowns
         for leg in LAUNCH:
-            # A SoundWire launch's `,anchor` term is part of A's launch, and reads no row.
+            # A SoundWire launch's `,anchor` term is part of A's launch, and a SoundWire
+            # receive-row correction's `,ref` term part of B's window; neither reads a row.
             anchors = [t.symbol for t in b[leg].terms if ",anchor" in t.symbol]
             assert all(a.startswith(f"{LAUNCH[leg]},anchor") for a in anchors), (leg, anchors)
+            for t in b[leg].terms:
+                if ",ref," in t.symbol:
+                    assert t.symbol.startswith(f"{WINDOW[leg]},ref,"), (leg, t.symbol)
+                    assert t.note.startswith("B") and "sampler" in t.note, (leg, t.note)
             terms = {t.symbol.split(" · ")[0].split(",")[0]: t for t in b[leg].terms
-                     if ",anchor" not in t.symbol}
+                     if ",anchor" not in t.symbol and ",ref," not in t.symbol}
             launch, window = terms.get(LAUNCH[leg]), terms.get(WINDOW[leg])
             assert launch is not None and window is not None, (leg, sorted(terms))
             assert launch.note.startswith("A"), \
@@ -1599,7 +1824,7 @@ def test_no_pp_leg_reads_one_per_row_for_both_devices():
             rows = Counter()
             for term in b.terms:
                 head = term.symbol.split(" · ")[0]
-                if ",anchor" in head:           # a SoundWire launch's correction, no row
+                if ",anchor" in head or ",ref," in head:    # a SoundWire correction, no row
                     continue
                 m = re.fullmatch(r"(Per_t_[A-Z]{2})(?:,\w+)*", head)
                 if m:
@@ -1710,6 +1935,7 @@ def test_the_calculator_docstring_counts_the_legs_it_evaluates():
         "the docstring names no derivation document"
 
 
+@pytest.mark.gui
 def test_the_parameter_sections_and_where_the_ramp_models_live():
     """Rise/Fall Times holds the t_RF rows and the per-edge slew; System Properties holds the
     V_SEOS tolerance, the noise fraction, the bus length and the length mismatch. Each card
@@ -1811,3 +2037,34 @@ def test_a_row_point_survives_copy_deepcopy_and_pickle():
                      pickle.loads(pickle.dumps(picks))["MP_setup"]["row"]):
             assert type(twin) is RowPoint
             assert (str(twin), twin.at) == (str(point), point.at)
+
+
+@pytest.mark.parametrize("ede", [False, True])
+def test_a_keeper_timeline_draws_the_corner_its_leg_is_priced_on(ede, monkeypatch):
+    """Each keeper leg's timeline draws the keeper's threshold at the corner
+    `calculator._keeper_case` returns for the leg's supplies, the one the leg prices: with
+    `_keeper_case` returning a corner whose threshold is moved 1 % of nominal, the timeline's
+    threshold is that corner, on a conventional and on an EndDriveEarly release."""
+    from dataclasses import replace
+
+    from swi3s_studio.timing import calculator, timeline
+    real = calculator._keeper_case
+    returned = []
+
+    def moved(*args, **kwargs):
+        corner, coef, note = real(*args, **kwargs)
+        corner = replace(corner, rx_threshold=corner.rx_threshold + 0.01)
+        returned.append(corner)
+        return corner, coef, note
+
+    monkeypatch.setattr(calculator, "_keeper_case", moved)
+    inp = CalcInputs(Man_ede=ede, Per_ede=ede, handover_UIs=0.0)
+    for leg in ("keeper_Man", "keeper_Per"):
+        returned.clear()
+        b = compute(inp).breakdowns[leg]
+        at = replace(inp, fast_data_edge=b.fast_data_edge)
+        tl = timeline.leg_timeline(at, leg)
+        drawn = [t.corner for t in tl.thresholds if t.receiver == "Manager"
+                 and t.corner.bound in calculator.keeper_threshold_names(at)]
+        assert drawn and all(any(d is c for c in returned) for d in drawn), \
+            (leg, drawn, returned)

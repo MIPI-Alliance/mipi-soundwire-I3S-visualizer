@@ -122,3 +122,34 @@ def test_a_clash_over_a_widened_cds_column_spans_the_columns_width():
     assert len(lines) == 2
     x = view._cx(0)
     assert all(pair == [x + 2, x + view._colw(0) - 2] for pair in lines)
+
+
+def _decoded_cell(device, dp, row):
+    return {"row": row, "col": 3, "is_cds": False, "slot": _DATA, "dp": dp, "device": device,
+            "channel": 0, "sample": 0, "bit": 0, "is_source": True, "port_mode": 0}
+
+
+def test_a_manager_port_has_a_colour_of_its_own_beside_the_same_number_on_device_0():
+    for dp in range(32):
+        assert grid_view.dp_stream_color(-1, dp) != grid_view.dp_stream_color(0, dp), dp
+        assert grid_view.dp_stream_color(-2, dp) != grid_view.dp_stream_color(0, dp), dp
+        assert grid_view.dp_stream_color(-1, dp) != grid_view.dp_stream_color(-2, dp), dp
+    for dev in range(12):                               # a device's colours do not move
+        for dp in (0, 5, 31):
+            assert grid_view._dp_index(dev, dp) == (dev * 32 + dp) % 12
+
+
+def test_a_manager_data_port_is_coloured_and_keyed_on_the_decoded_grid():
+    """A data cell owned by the Manager (device -1) takes its stream colour, has a key
+    swatch labelled with the Manager, and its channels are counted."""
+    QApplication.instance() or QApplication([])
+    view = GridView()
+    cells = [_decoded_cell(-1, 0, 0), _decoded_cell(1, 2, 1)]
+    view.set_cells(cells, 4)
+    assert view._color(cells[0]) == grid_view.dp_stream_color(-1, 0)
+    assert view._color(cells[0]) != grid_view._CDS_FILL
+    assert view._stream_channels[(-1, 0)] == {0}
+    assert (-1, 0) in view._stream_colors
+    assert any(hit == (-1, 0) for _rect, hit in view._key_hits)
+    texts = [it.text() for it in view._scene.items() if hasattr(it, "text")]
+    assert "Mgr·DP0" in texts and "D-1·DP0" not in texts

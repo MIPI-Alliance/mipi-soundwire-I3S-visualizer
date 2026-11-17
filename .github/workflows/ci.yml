@@ -1,16 +1,17 @@
 name: CI
 
-# Enforce the quality floor on every push + PR: build the native decode core and run
-# the full pytest suite (goldens included) across the supported OS/Python range, plus a
-# lint/type pass, a leak scan, an installed-package smoke test, a coverage floor and a
-# perf-regression gate. Mirrors the local flow (conftest sets the offscreen Qt platform
-# + short demo). See docs/DEVELOPMENT.md.
+# Enforce the quality floor on every push to main or a release branch, and on every PR:
+# build the native decode core and run the full pytest suite (goldens included) once, under
+# coverage, on the reference configuration; run the platform scope (gui, platform and the
+# core smoke files) across the rest of the supported OS/Python range; plus a lint/type pass,
+# a leak scan, an installed-package smoke test and a perf-regression gate. Mirrors the local
+# flow (conftest sets the offscreen Qt platform + short demo). See docs/DEVELOPMENT.md.
 # quoted so YAML doesn't coerce the bareword `on` to boolean true.
 "on":
   push:
-    # main, the vX.Y release branches, and the work branches (docs/DEVELOPMENT.md, Branch
-    # model); a pull request runs it whatever its branch is called.
-    branches: ["main", "v[0-9]*", "feature/**", "fix/**", "sprint/**"]
+    # main and the vX.Y release branches (docs/DEVELOPMENT.md, Branch model); a work branch
+    # runs through its pull request, or by hand through workflow_dispatch.
+    branches: ["main", "v[0-9]*"]
   pull_request:
   workflow_dispatch:
 
@@ -25,17 +26,48 @@ env:
   QT_QPA_PLATFORM: "offscreen"    # headless Qt (conftest also sets this defensively)
 
 jobs:
-  test:
-    name: test ${{ matrix.os }} py${{ matrix.python }}
+  core:
+    name: full suite + coverage ubuntu-latest py3.14
+    runs-on: ubuntu-latest       # the reference configuration: the one run of every test
+    timeout-minutes: 180
+    # Python 3.14, where coverage measures lines and branches through sys.monitoring at about
+    # the cost of an uncovered run; on 3.11-3.13 branch measurement needs the trace function,
+    # which runs the suite several times slower.
+    env:
+      COVERAGE_CORE: "sysmon"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with: { python-version: "3.14" }
+      - name: Install Qt runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+      - name: Install deps + native core
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt ./native
+      # Every test but perf, one file per worker. Lines and branches of swi3s_studio and
+      # tools/, subprocesses included (pyproject.toml, [tool.coverage.run]). The floor is the
+      # measured figure less a margin (docs/TESTING.md §1.1).
+      - name: Full suite with coverage (floor 82%, lines and branches)
+        run: python -m pytest -q -m "not perf" -n auto --dist loadfile --cov --cov-report=term-missing:skip-covered --cov-fail-under=82
+
+  platform:
+    name: platform scope ${{ matrix.os }} py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    # The limit must exceed the slowest platform-scope configuration's run, with headroom;
+    # windows-latest is the slowest runner.
     timeout-minutes: 150
     strategy:
       fail-fast: false
-      # The matrix:
-      #   * 3.11 is the floor the README promises; 3.13 is the ceiling run.ps1 will select.
-      #   * windows 3.14 matches the release gate's hand-run Windows venv (3.14).
-      #   * Linux 3.14 is absent: the PySide6/pyarrow wheels there are unverified. Add it
-      #     when the wheels are confirmed.
+      # The configurations besides the reference one (the core job). Each runs the platform
+      # scope, tools/gate.py's _GUEST_SCOPE: a core test reads the same source everywhere, so
+      # it runs once, in the core job.
+      #   * ubuntu runs the README's 3.11 floor, 3.12 and 3.13; the core job runs Linux 3.14.
+      #   * windows runs two interpreters (3.12, 3.14) and macOS one (3.12). The release gate
+      #     matrix runs every Python from 3.11 to 3.15 on each platform (docs/DEVELOPMENT.md).
       matrix:
         include:
           - { os: ubuntu-latest, python: "3.11" }
@@ -45,8 +77,8 @@ jobs:
           - { os: windows-latest, python: "3.14" }
           - { os: macos-latest, python: "3.12" }
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           # setup-python installs x64 on the windows runner -> pyarrow/PySide6 wheels
@@ -66,17 +98,17 @@ jobs:
       - name: Build the native decode core
         shell: bash
         run: python -m pip install ./native      # scikit-build-core fetches cmake/ninja
-      - name: Run tests (excludes perf), one file per worker
+      - name: Run the platform scope, one file per worker
         shell: bash
-        run: python -m pytest -q -m "not perf" -n auto --dist loadfile
+        run: python -m pytest -q -m "(gui or platform or smoke) and not perf" -n auto --dist loadfile
 
   perf:
     name: perf regression gate
     runs-on: ubuntu-latest       # one consistent runner — perf ceilings are cliff detectors
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with: { python-version: "3.12" }
       - name: Install Qt runtime deps
         run: |
@@ -105,35 +137,12 @@ jobs:
     env:
       PYTHONPATH: ""
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with: { python-version: "3.12" }
       - name: Install into a clean environment and run from outside the checkout
         shell: bash
         run: python tools/package_smoke.py
-
-  coverage:
-    name: coverage floor
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with: { python-version: "3.12" }
-      - name: Install Qt runtime deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
-      - name: Install deps + native core
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt ./native
-      # Lines and branches of swi3s_studio and tools/, subprocesses included
-      # (pyproject.toml, [tool.coverage.run]). The floor is the measured figure less a margin
-      # (docs/TESTING.md §1.1).
-      - name: Coverage (floor 82%, lines and branches)
-        run: python -m pytest -q -m "not perf" -n auto --dist loadfile --cov --cov-report=term-missing:skip-covered --cov-fail-under=82
 
   lint:
     name: lint + type
@@ -142,8 +151,8 @@ jobs:
     # Blocking: a ruff finding, a mypy regression, or a mypy run that cannot be compared
     # with the baseline fails the job.
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with: { python-version: "3.12" }
       - name: Install linters
         # requirements-dev.txt pins mypy to the version tools/mypy_baseline.json records

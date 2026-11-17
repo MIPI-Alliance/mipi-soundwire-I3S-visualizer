@@ -50,6 +50,60 @@ def test_locate_progress_survives_reentrant_teardown():
     win._on_locate_progress(75, "later")
 
 
+def test_a_dialog_torn_down_under_nested_progress_ticks_outlives_every_set_value():
+    """setValue() re-enters the event loop, so a second progress tick can run inside the
+    first and the search's end inside that. The dialog the end tears down is deleted only
+    once the outermost setValue() has returned, never while one is still running on it."""
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    ctl = win._locate_ctl
+    events = []
+
+    class _Stub:
+        def __init__(self, name):
+            self.name = name
+
+        def quit(self):
+            pass
+
+        def wait(self):
+            pass
+
+        def deleteLater(self):
+            events.append(f"delete {self.name}")
+
+    class _NestingDlg(_Stub):
+        depth = 0
+
+        def maximum(self):
+            return 100
+
+        def setLabelText(self, text):
+            pass
+
+        def close(self):
+            pass
+
+        def setValue(self, v):
+            _NestingDlg.depth += 1
+            events.append(f"enter {_NestingDlg.depth}")
+            if _NestingDlg.depth == 1:
+                ctl._on_progress(60, "")        # a second tick dispatched by this setValue
+            else:
+                ctl.teardown()                  # the search's end dispatched by the second
+            events.append(f"leave {_NestingDlg.depth}")
+            _NestingDlg.depth -= 1
+
+    ctl.dlg = _NestingDlg("dlg")
+    ctl.search_thread = _Stub("thread")
+    ctl.worker = _Stub("worker")
+    ctl._on_progress(50, "")
+    assert ctl.dlg is None
+    assert events.index("delete dlg") > events.index("leave 1"), events
+    assert events.count("delete dlg") == 1
+
+
 def _locate_with(monkeypatch, tmp_path, reference):
     """File ▸ Locate Sub-Capture answered with a real .sal, the reference read by
     `reference(pr, req)`; the message boxes shown are returned as (kind, text)."""
@@ -108,4 +162,5 @@ def test_locate_reports_a_reference_that_cannot_be_read(monkeypatch, tmp_path):
     assert started
     assert boxes == [("Locate failed", "ref.sal: not a capture")]
     assert win._locate_dlg is None and win._locate_worker is None
+    assert win._locate_session is None                  # the failed search holds no Session
     assert len(win._bookmarks) == 0

@@ -121,6 +121,23 @@ def test_without_allow_clipping_a_gain_past_full_scale_cannot_be_applied():
     assert dlg._apply_btn.isEnabled() and dlg.processing().allow_clipping
 
 
+def test_apply_or_preview_before_the_peak_is_remeasured_still_guards_clipping():
+    """An edit to the filters remeasures the peak after a pause; Apply or Preview (Enter)
+    inside that pause measures first, so a gain that now clips is refused."""
+    store = _store([_tone()])                  # a 4000 offset: the peak rises without the HPF
+    seen = []
+    dlg = _dialog(store, seen)
+    dlg._new_peak.setValue(-0.5)               # gain chosen against the high-passed peak
+    assert dlg._apply_btn.isEnabled()
+    dlg._hp_on.setChecked(False)
+    assert dlg._remeasure.isActive() and dlg._apply_btn.isEnabled()
+    dlg.preview()
+    assert seen == [] and not dlg._apply_btn.isEnabled()
+    dlg._dc.setChecked(False)                  # restarts the timer, peak unchanged
+    dlg.accept()
+    assert dlg.result() != QDialog.Accepted and not dlg._remeasure.isActive()
+
+
 def test_preview_shows_it_and_cancel_puts_back_what_was_there():
     store = _store([_tone()])
     decoded = np.array(store.samples(1, 2, 0))
@@ -303,8 +320,32 @@ def test_a_saved_workspace_reopens_with_the_setting(win, tmp_path, monkeypatch):
     assert _marked(again, dev, dp, "HPF 20 Hz, +12.5 dB")
 
 
+def test_a_setting_that_only_allows_clipping_is_saved_and_reopens_the_dialog_with_it(
+        win, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.ui.main_window import MainWindow
+    from swi3s_studio.ui.workspace_controller import processing_from_json
+    dev, dp = _stream(win)
+    only = StreamProcessing(allow_clipping=True)
+    win.set_stream_processing(dev, dp, only)
+    assert win._links[0].view.stream_processing == {(dev, dp): only}
+    assert win._audio_store.processing(dev, dp) is None             # the samples as decoded
+    assert all(not t.endswith("*") for t, _tip in _labels(win, dev, dp))
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win.save_workspace()
+    again = MainWindow()
+    again.open_workspace()
+    pump_loads(again)
+    assert again.links[0].view.stream_processing == {(dev, dp): only}
+    assert _dialog_for(again._audio_store, dev, dp)._clip.isChecked()
+    assert processing_from_json([[1, 2, {"allow_clipping": True}]]) == {(1, 2): only}
+
+
 def test_a_damaged_setting_in_a_workspace_is_skipped():
-    from swi3s_studio.ui.main_window import _processing_from_json
+    from swi3s_studio.ui.workspace_controller import processing_from_json as _processing_from_json
     rows = [[1, 2, {"gain_db": 3}], ["x", 2, {}], [1, 3, {"highpass_hz": -1}], [4, 0],
             [5, 1, {"gain_db": 0}]]
     assert _processing_from_json(rows) == {(1, 2): StreamProcessing(gain_db=3.0)}
@@ -340,3 +381,36 @@ def test_the_audio_menu_says_when_there_is_no_audio():
     w._build_processing_menu()
     acts = w._process_menu.actions()
     assert len(acts) == 1 and not acts[0].isEnabled()
+
+
+def test_apply_measures_an_edit_still_waiting_for_its_pause():
+    """An untouched gain follows the fields as they stand when Apply is pressed, not the
+    peak measured before the last edit."""
+    store = _store([_tone(dc=4000.0, amp=1000.0)])
+    dlg = _dialog(store)
+    dlg._hp_on.setChecked(False)                         # no _measure(): the timer is pending
+    assert dlg._remeasure.isActive()
+    dlg.accept()
+    assert dlg.result() == QDialog.Accepted
+    proc = dlg.chosen()
+    assert proc.highpass_hz is None
+    assert proc.gain_db == pytest.approx(-store.peak_db(1, 2), abs=0.05)
+
+
+def test_apply_and_preview_refuse_a_gain_that_clips_after_an_edit_still_waiting():
+    """A gain the user set clips once the pending edit is measured: neither Apply nor
+    Preview acts on the earlier peak."""
+    store = _store([_tone(dc=4000.0, amp=1000.0)])
+    previews = []
+    dlg = _dialog(store, previews)
+    dlg._gain.setValue(30.0)                             # fits the 20 Hz high-pass's peak
+    dlg._measure()
+    assert dlg._apply_btn.isEnabled()
+    dlg._hp_on.setChecked(False)                         # the offset's peak is higher
+    dlg.preview()
+    assert previews == [] and not dlg._apply_btn.isEnabled()
+    dlg._hp_on.setChecked(True)
+    dlg._measure()
+    dlg._hp_on.setChecked(False)
+    dlg.accept()
+    assert dlg.result() != QDialog.Accepted

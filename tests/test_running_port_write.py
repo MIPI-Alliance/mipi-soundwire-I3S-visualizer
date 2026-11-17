@@ -16,10 +16,10 @@ read-only register before it runs.
 Every input is synthetic: make_running_port_write_levels (one running 16-bit PCM port, one
 WriteA32 mid-stream or among the setup writes) and the demos.
 """
-import math
 
 import pytest
 import swi3score
+from demo_samples import sine_sample
 
 from swi3s_studio.analysis.errors import command_error
 
@@ -27,8 +27,7 @@ N = 32
 
 
 def _sine(index: int) -> int:
-    v = int(round((1 << 15) * 0.45 * math.sin(2 * math.pi * index / 64)))
-    return v & 0xFFFF
+    return sine_sample(0, index, 15)
 
 
 def _decode(levels):
@@ -145,3 +144,59 @@ def test_a_read_only_write_before_the_port_runs_is_flagged():
     assert w["read_only_write_error"] and not w["running_port_write_error"]
     assert not any(c["read_only_write_error"] for c in d.commands()
                    if c["start_sample"] != w["start_sample"])
+
+
+def _scrambler_off_stream(write_at, data):
+    """Port DP0 of device 0 running on an 8-column bus whose payload column holds a constant
+    level, so the decoded audio varies only through descrambling; then a WriteA32 of `data`
+    at `write_at`, then 40 Pings."""
+    from test_native_command_parser import (
+        COMMIT,
+        SPACER,
+        _bus,
+        _header,
+        _idle,
+        _ping,
+        _symbol_bits,
+        _tok,
+    )
+    from test_native_command_parser import _write as _raw_write
+
+    def write(addr, payload):
+        return _raw_write(0x001, [0, *addr.to_bytes(4, "big"), *payload])
+
+    sscr = _symbol_bits(_header(COMMIT, 0x001, [0x00, 0x01, 14]) + [SPACER]
+                        + [_tok(0)] * 12 + [SPACER, SPACER, _tok(0)])
+    cds = _idle(4)
+    for _ in range(3):
+        cds += _ping() + _idle(2)
+    for addr, payload in [(0x1081, [7]), (0x2009, [0x0F]), (0x2080, [1, 0x80, 0, 0x0F, 3, 0]),
+                          (0x2087, [0])]:
+        cds += write(addr, payload) + _idle(2)
+    cds += _ping() + _idle(2) + sscr + _idle(2)
+    for _ in range(40):
+        cds += _ping() + _idle(2)
+    cds += write(write_at, data) + _idle(2)
+    for _ in range(40):
+        cds += _ping() + _idle(2)
+    settings = swi3score.DecoderSettings()
+    settings.forced_column_count = 8
+    d = swi3score.Decoder(swi3score.MemorySampleSource(_bus(8, {0: cds + _idle(4)}),
+                                                       98_304_000, 4), settings)
+    d.run()
+    return d
+
+
+def test_a_write_from_a_read_only_byte_that_covers_an_immediate_one_reconfigures():
+    """A 5-byte WriteA32 at 0x2007 (read-only) covering PortControl at 0x200B clears
+    ScramblerEn there, and the decode stops descrambling as for the same write from 0x2008:
+    the audio after it is the same."""
+    tail = []
+    # The same values at 0x2008-0x200B (0x2009 keeps its setup value 0x0F).
+    for start, data in ((0x2007, [0, 0, 0x0F, 0, 0]), (0x2008, [0, 0x0F, 0, 0, 0])):
+        d = _scrambler_off_stream(start, data)
+        w = _write_at(d, start)
+        assert w["read_only_write_error"] is (start == 0x2007)
+        audio = sorted((a for a in d.audio() if a["dp"] == 0), key=lambda a: a["start_sample"])
+        tail.append([a["value"] for a in audio if a["start_sample"] > w["end_sample"]][-100:])
+    assert tail[0] == tail[1] and len(tail[0]) == 100

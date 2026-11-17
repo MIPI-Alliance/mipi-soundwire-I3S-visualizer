@@ -59,10 +59,10 @@ python3 tools/csv_converter/convert_174.py old_configs/ -v
 | `Columns per Row` | `NumColumns_REG` | subtract 1 (excess-1) |
 | `S0 S1 Enabled` | `PHY3Enabled` | direct |
 | `S0 Width` | `S0Width` | direct |
-| `CDS Guard Enabled` | `CDS_GuardEnabledPerSource` | written to every CDS source |
-| `CDS Tail Width` | `CDS_TailWidthPerSource` | written to every CDS source |
+| `CDS Guard Enabled` | `CDS_GuardEnable_REG_PerSource` | written to every CDS source |
+| `CDS Tail Width` | `CDS_TailWidth_REG_PerSource` | written to every CDS source |
 | `Skipping Denominator` (or `Interval Denominator`; the first wins) | `SkippingDenominator_REG` | direct |
-| `CDS Guard Polarity` | `CDS_GuardPolarityPerSource` | written to every CDS source with its guard, when present; kept only while the guard is enabled |
+| `CDS Guard Polarity` | `CDS_GuardPolarity_REG_PerSource` | written to every CDS source, whether or not the guard is enabled |
 | `CDS/S0 Handover Width` | `EnforceCDSHandover` + `S1TailWidth_REG` | split: `EnforceCDSHandover = (width >= 1)`; `S1TailWidth_REG = 0` if width≤1, `1` if width=2, `2` if width≥3 |
 | `Draw S0 Handover` | `EnforceS1Handover` | direct |
 | `Row Rate [kHz]` | `RowRate` | direct, clamped to 1–48000 |
@@ -109,7 +109,6 @@ Each change below is warned to stderr, naming the field and the data port.
 
 - `Row Rate [kHz]` outside 1–48000 is clamped to that range.
 - `Rows to Draw` outside 1–10240 is clamped to that range.
-- `CDS Guard Polarity` true while `CDS Guard Enabled` is false is read as false (Guard 0).
 - `CDS/S0 Handover Width` outside 0–3 is read as the nearest width: a handover with an S1 tail
   width of 2 above 3, none below 0.
 - `Data Port Channels` above 16 enables 16 channels; below 1 enables none.
@@ -125,7 +124,7 @@ Review them after conversion if you need non-default behavior.
 
 **Interface:**
 - `CDS_BitWidth_REG = 0`
-- `CDS_GuardPolarityPerSource` = Guard 0 when the file has no `CDS Guard Polarity`
+- `CDS_GuardPolarity_REG_PerSource` = polarity 0 when the file has no `CDS Guard Polarity`
 - `S1TailWidth_REG = 0` when the file has no `CDS/S0 Handover Width`
 - `Description` = conversion note (overwrites any legacy description)
 

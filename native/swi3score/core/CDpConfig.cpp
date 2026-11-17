@@ -278,11 +278,11 @@ const ReadRow kReadRows[] = {
     {"NumColumns_REG", nullptr}, {"SkippingDenominator_REG", nullptr},
     {"PHY3Enabled", nullptr}, {"S1TailWidth_REG", nullptr}, {"EnforceS1Handover", nullptr},
     {"CDS_BitWidth_REG", nullptr}, {"RowRate", nullptr},
-    {"CDS_GuardEnabledPerSource", "CDS_GuardEnabled_REG"},
-    {"CDS_GuardPolarityPerSource", "CDS_GuardPolarity_REG"},
-    {"CDS_TailWidthPerSource", "CDS_TailWidth_REG"},
-    {"CDS_DriveTypePerSource", "CDS_DriveType"},
-    {"CDS_EndDriveEarlyPerSource", nullptr},
+    {"CDS_GuardEnable_REG_PerSource", "CDS_GuardEnabled_REG"},
+    {"CDS_GuardPolarity_REG_PerSource", "CDS_GuardPolarity_REG"},
+    {"CDS_TailWidth_REG_PerSource", "CDS_TailWidth_REG"},
+    {"CDS_DriveType_REG_PerSource", "CDS_DriveType"},
+    {"CDS_EndDriveEarly_REG_PerSource", nullptr},
     {"Enabled", nullptr}, {"DeviceNumber_REG", nullptr}, {"PortDirection_REG", nullptr},
     {"EnableCh_REG", nullptr}, {"SampleSize_REG", nullptr}, {"SampleGrouping_REG", nullptr},
     {"ChannelGrouping_REG", nullptr}, {"Spacing_REG", nullptr}, {"Interval_REG", nullptr},
@@ -295,6 +295,26 @@ const ReadRow kReadRows[] = {
     {"FCP_GuardEnable_REG", nullptr}, {"FCP_GuardPolarity_REG", nullptr},
     {"DataPortNumber", nullptr}, {"ManagerDataport", nullptr},
 };
+
+// The older spelling of each per-source CDS row and its name. A row is read under its name,
+// so a file carrying both spellings repeats the row. BusConfig (_CDS_ROW_ALIASES) and the
+// swviz CSVHandler hold the same table.
+struct RowAlias { const char* older; const char* name; };
+const RowAlias kCdsRowAliases[] = {
+    {"CDS_GuardEnabledPerSource", "CDS_GuardEnable_REG_PerSource"},
+    {"CDS_GuardPolarityPerSource", "CDS_GuardPolarity_REG_PerSource"},
+    {"CDS_TailWidthPerSource", "CDS_TailWidth_REG_PerSource"},
+    {"CDS_DriveTypePerSource", "CDS_DriveType_REG_PerSource"},
+    {"CDS_EndDriveEarlyPerSource", "CDS_EndDriveEarly_REG_PerSource"},
+};
+
+// `key` under its current name: an older spelling (kCdsRowAliases) maps to its name.
+std::string rowName(const std::string& key)
+{
+    for (const RowAlias& a : kCdsRowAliases)
+        if (key == a.older) return a.name;
+    return key;
+}
 
 // "low bit" for a 1-bit field, else "low N bits".
 std::string lowBits(int bits)
@@ -444,11 +464,12 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
     std::vector<int> rawEnableCh(swi3s::kMaxPeripherals, 0);
     std::vector<int> rawDpNumber(swi3s::kMaxPeripherals, 0);
     std::vector<bool> gotDpNumber(swi3s::kMaxPeripherals, false);
-    bool gotDeviceRow = false;
 
     dps.assign(swi3s::kMaxPeripherals, SwI3sDpConfig());
     for (size_t i = 0; i < dps.size(); ++i) {
         dps[i].dpNumber = static_cast<int>(i);   // CSV column index = DP number
+        dps[i].deviceNum = 0;    // Device 0 when DeviceNumber_REG is absent or short, as
+                                 // BusConfig and the swviz CSVHandler read it
     }
 
     // Records the non-empty cells of row `v` past column `last` (1-based value columns).
@@ -482,8 +503,8 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         tlWhere.clear();
         noteExtra(v, SwI3sConfig::kCdsSources);
     };
-    // The guard arrives as two rows mirroring its two registers; recombined after the loop
-    // into CdsGuard (0 off, 1 G0, 2 G1).
+    // The guard arrives as two rows mirroring its two register fields, read into
+    // CdsGuardEnable and CdsGuardPolarity independently after the loop.
     std::vector<int> guardEn, guardPol;
     // Legacy pre-per-source scalars, broadcast to every source only if no per-source row
     // appeared. Every device may use the CDS regardless of its data ports, so a global
@@ -497,7 +518,7 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
     // Visualizer-only fields the decode does not read; any other unrecognised key is
     // reported.
     static const std::set<std::string> kIgnoredFields = {
-        "AppVersion", "Name", "RowsToDraw", "S0Width", "EnforceHandover",
+        "AppVersion", "Name", "RowsToDraw", "EnforceHandover",
         "EnforceCDSHandover", "DisplayFields", "Save file using excess one"};
     std::vector<std::string> unknownFields;          // in file order, each once
     std::unordered_set<std::string> unknownSeen;
@@ -538,6 +559,7 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
 
         std::vector<std::string> v = splitCsv(line);
         if (v.empty()) continue;
+        v[0] = rowName(v[0]);
         const std::string& key = v[0];
         const std::string val = (v.size() > 1) ? v[1] : "";
         tlField = key;
@@ -555,6 +577,15 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         else if (key == "PHY3Enabled")          PHY3Enabled = parseBool(val);
         else if (key == "S1TailWidth_REG")      S1TailWidth = parseInt(val);
         else if (key == "EnforceS1Handover")    S1Handover = parseBool(val);
+        else if (key == "S0Width") {
+            // Visualizer-level: read for the authored grid only, and never reported here
+            // (BusConfig reports a value outside 1..8). A cell that is not a whole number
+            // reads as 1; a value outside 1..8 is held in that range.
+            const std::string t = trim(val);
+            char* end = nullptr;
+            const long w = t.empty() ? 1 : std::strtol(t.c_str(), &end, 10);
+            S0Width = (end == t.c_str()) ? 1 : static_cast<int>(std::clamp(w, 1L, 8L));
+        }
         else if (key == "RowRate") {
             // Each row sets the rate, so a repeated row's last one is used. A blank cell,
             // one that is not a number, a non-finite or negative rate, or one outside the
@@ -590,11 +621,11 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         // Control Data Stream. CDS_BitWidth is bus-wide; the rest are per source because
         // each register lives in that source's own CDS block (0x1100).
         else if (key == "CDS_BitWidth_REG")     CdsBitWidth = parseInt(val);
-        else if (key == "CDS_GuardEnabledPerSource")  { guardEn.assign(SwI3sConfig::kCdsSources, 0);  setCds(v, guardEn);  gotGuard = true; }
-        else if (key == "CDS_GuardPolarityPerSource") { guardPol.assign(SwI3sConfig::kCdsSources, 0); setCds(v, guardPol); }
-        else if (key == "CDS_TailWidthPerSource")     { setCds(v, CdsTailWidth); gotTail = true; }
-        else if (key == "CDS_DriveTypePerSource")     { setCds(v, CdsDriveType); gotDrive = true; }
-        else if (key == "CDS_EndDriveEarlyPerSource") setCds(v, CdsEndDriveEarly);
+        else if (key == "CDS_GuardEnable_REG_PerSource")   { guardEn.assign(SwI3sConfig::kCdsSources, 0);  setCds(v, guardEn);  gotGuard = true; }
+        else if (key == "CDS_GuardPolarity_REG_PerSource") { guardPol.assign(SwI3sConfig::kCdsSources, 0); setCds(v, guardPol); }
+        else if (key == "CDS_TailWidth_REG_PerSource")     { setCds(v, CdsTailWidth); gotTail = true; }
+        else if (key == "CDS_DriveType_REG_PerSource")     { setCds(v, CdsDriveType); gotDrive = true; }
+        else if (key == "CDS_EndDriveEarly_REG_PerSource") setCds(v, CdsEndDriveEarly);
         // Legacy scalars from a pre-per-source file.
         else if (key == "CDS_GuardEnabled_REG")  legacyGuardEn  = parseBool(val) ? 1 : 0;
         else if (key == "CDS_GuardPolarity_REG") legacyGuardPol = parseBool(val) ? 1 : 0;
@@ -634,7 +665,7 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         else if (key == "PortMode_REG")         setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.PortMode = parseInt(s); });
         else if (key == "ScramblerEn_REG")      setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.ScramblerEn = parseBool(s); });
         else if (key == "Enabled")              setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.Enabled = parseBool(s); });
-        else if (key == "DeviceNumber_REG")     { gotDeviceRow = true; setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.deviceNum = parseInt(s); }); }
+        else if (key == "DeviceNumber_REG")     setDp(v, [](SwI3sDpConfig& d, const std::string& s){ d.deviceNum = parseInt(s); });
         // Explicit logical DP number 0-31; overrides the column-index default only when
         // the cell carries a non-negative value.
         else if (key == "DataPortNumber")       setDp(v, [&](SwI3sDpConfig& d, const std::string& s){ if (!s.empty()) { int n = parseInt(s); rawDpNumber[dpIndex(d)] = n; gotDpNumber[dpIndex(d)] = true; if (n >= 0) d.dpNumber = n; } });
@@ -662,9 +693,11 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
         return false;
     }
 
-    // Recombine the split guard rows (0 off, 1 G0, 2 G1); a missing polarity row leaves the
-    // enabled entries at G0. Each row is a 1-bit register field: a value other than 0 or 1
-    // reads as 1 and is reported.
+    // The enable comes from the per-source row, else from the scalar CDS_GuardEnabled_REG
+    // broadcast to every source; the polarity, independently, from the per-source row, else
+    // from the scalar CDS_GuardPolarity_REG broadcast to every source, whatever the enables.
+    // Each row is a 1-bit register field: a value other than 0 or 1 reads as 1 and is
+    // reported.
     std::vector<std::string> guardWide;
     auto noteGuardWidth = [&](const char* name, const std::vector<int>& values) {
         std::vector<std::string> over;
@@ -677,16 +710,12 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
                                 "(0..1) for " + joinList(over) + "; a value other than 0 reads as 1.");
         }
     };
-    noteGuardWidth("CDS_GuardEnabledPerSource", guardEn);
-    noteGuardWidth("CDS_GuardPolarityPerSource", guardPol);
-    if (gotGuard) {
-        for (int i = 0; i < SwI3sConfig::kCdsSources; ++i) {
-            const bool en = guardEn[i] != 0;
-            const bool pol = (i < static_cast<int>(guardPol.size())) && guardPol[i] != 0;
-            CdsGuard[i] = en ? (pol ? 2 : 1) : 0;
-        }
-    } else if (legacyGuardEn > 0) {
-        CdsGuard.assign(SwI3sConfig::kCdsSources, legacyGuardPol > 0 ? 2 : 1);
+    noteGuardWidth("CDS_GuardEnable_REG_PerSource", guardEn);
+    noteGuardWidth("CDS_GuardPolarity_REG_PerSource", guardPol);
+    const bool gotGuardPol = !guardPol.empty();
+    for (int i = 0; i < SwI3sConfig::kCdsSources; ++i) {
+        CdsGuardEnable[i] = (gotGuard ? guardEn[i] != 0 : legacyGuardEn > 0) ? 1 : 0;
+        CdsGuardPolarity[i] = (gotGuardPol ? guardPol[i] != 0 : legacyGuardPol > 0) ? 1 : 0;
     }
     // A negative legacy scalar is ignored; it is reported below, worded as BusConfig words
     // it so one file read by both reports it once.
@@ -701,17 +730,17 @@ bool SwI3sConfig::LoadCsv(const std::string& path, std::string& error)
     // so a config CSV writes the manager as device 0 plus ManagerDataport=True; recombine
     // them here, since 0 is a REAL peripheral address. registersFromConfig skips
     // deviceNum < 0: a manager data port is not addressable as a peripheral register write.
-    // A peripheral port whose DeviceNumber_REG is outside 0..kMaxPeripherals-1 names no
-    // device on the bus, so it is disabled: the audio decode, the grid and the register
-    // map all leave it out.
+    // A port no DeviceNumber_REG cell covers (no row, or a short one) keeps the register's
+    // default, Device 0, as BusConfig reads it. A peripheral port whose DeviceNumber_REG is outside
+    // 0..kMaxPeripherals-1 names no device on the bus, so it is disabled: the audio decode,
+    // the grid and the register map all leave it out.
     std::vector<std::string> noDevice;
     for (SwI3sDpConfig& d : dps) {
         if (d.managerDp) {
             d.deviceNum = -1;
         } else if (d.deviceNum < 0 || d.deviceNum >= swi3s::kMaxPeripherals) {
             if (d.Enabled && d.numChannels() > 0) {
-                noDevice.push_back(dpLabel(dpIndex(d)) + " (" +
-                    (gotDeviceRow ? std::to_string(d.deviceNum) : std::string("none given")) + ")");
+                noDevice.push_back(dpLabel(dpIndex(d)) + " (" + std::to_string(d.deviceNum) + ")");
             }
             d.Enabled = false;
         }
@@ -836,7 +865,7 @@ void SwI3sConfig::collectWarnings(
     }
 
     // Interface fields.
-    const int cols = NumColumns + 1;
+    const long long cols = static_cast<long long>(NumColumns) + 1;
     if (cols < swi3s::kMinColumnCount || cols > swi3s::kMaxColumnCount) {
         warnings.push_back("NumColumns_REG " + std::to_string(NumColumns) + " is outside " +
                            std::to_string(swi3s::kMinColumnCount - 1) + ".." +
@@ -860,9 +889,9 @@ void SwI3sConfig::collectWarnings(
     fit("CDS_BitWidth_REG", CdsBitWidth, 3, "");
     struct CdsField { const char* name; const std::vector<int>* values; int bits; };
     const CdsField cdsFields[] = {
-        {"CDS_TailWidthPerSource", &CdsTailWidth, 2},
-        {"CDS_DriveTypePerSource", &CdsDriveType, 1},
-        {"CDS_EndDriveEarlyPerSource", &CdsEndDriveEarly, 1},
+        {"CDS_TailWidth_REG_PerSource", &CdsTailWidth, 2},
+        {"CDS_DriveType_REG_PerSource", &CdsDriveType, 1},
+        {"CDS_EndDriveEarly_REG_PerSource", &CdsEndDriveEarly, 1},
     };
     for (const CdsField& f : cdsFields) {
         const long max = (1L << f.bits) - 1;
@@ -888,7 +917,7 @@ void SwI3sConfig::collectWarnings(
     }
     if (!reservedTail.empty()) {
         const std::string r = std::to_string(kCdsTailReserved);
-        warnings.push_back("CDS_TailWidthPerSource: CDS_TailWidth " + r + " is Reserved (0..2 UI "
+        warnings.push_back("CDS_TailWidth_REG_PerSource: CDS_TailWidth " + r + " is Reserved (0..2 UI "
                            "are defined) for " + joinList(reservedTail) +
                            "; the value is kept as written, the grid draws a " + r +
                            "-UI tail and the expected registers carry " + r + ".");
@@ -956,6 +985,38 @@ void SwI3sConfig::collectWarnings(
                            "-bit register field (0.." + std::to_string(max) + ") for " +
                            joinList(it->second) + "; the expected registers carry its " +
                            lowBits(f.bits) + " and the decode uses the value as written.");
+    }
+    // A per-port field holding its Reserved encoding fits the field: the value is kept and
+    // reported once per field, on the ports checked above, worded as BusConfig's
+    // reserved_dp_note (bus_config.DP_RESERVED, the same table in the same order).
+    struct DpReserved {
+        const char* row; const char* field; int (*get)(const SwI3sDpConfig&); int value;
+        const char* defined; const char* effect;
+    };
+    const DpReserved kDpReserved[] = {
+        {"TailWidth_REG", "TailWidth", [](const SwI3sDpConfig& d) { return d.TailWidth; }, 3,
+         "0..2 UI are defined", "tails are 3 UI"},
+        {"BitWidth_REG", "BitWidth", [](const SwI3sDpConfig& d) { return d.BitWidth; }, 3,
+         "0..2, 1 to 3 UI, are defined", "data bits are 4 UI"},
+        {"PortMode_REG", "PortMode", [](const SwI3sDpConfig& d) { return d.PortMode; }, 1,
+         "0 Normal, 2 Test0 and 3 Test1 are defined", "the port is drawn as Normal"},
+        {"FCP_BitWidth_REG", "FCP_BitWidth", [](const SwI3sDpConfig& d) { return d.FCP_BitWidth; }, 3,
+         "0..2, 1 to 3 UI, are defined", "DRQ bits are 4 UI"},
+        {"FCP_TailWidth_REG", "FCP_TailWidth", [](const SwI3sDpConfig& d) { return d.FCP_TailWidth; }, 3,
+         "0..2 UI are defined", "FCP tails are 3 UI"},
+    };
+    for (const DpReserved& f : kDpReserved) {
+        std::vector<std::string> ports;
+        for (size_t k = 0; k < dps.size(); ++k) {
+            const SwI3sDpConfig& d = dps[k];
+            if (d.Enabled && d.numChannels() > 0 && f.get(d) == f.value)
+                ports.push_back(dpLabel(k) + " = " + std::to_string(f.value));
+        }
+        if (ports.empty()) continue;
+        const std::string v = std::to_string(f.value);
+        warnings.push_back(std::string(f.row) + ": " + f.field + " " + v + " is Reserved (" +
+                           f.defined + ") for " + joinList(ports) + "; the value is kept as "
+                           "written, " + f.effect + " and the expected registers carry " + v + ".");
     }
 }
 

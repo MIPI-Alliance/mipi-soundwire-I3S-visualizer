@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import contextlib
 import re
-from typing import Dict, List
+import weakref
+from typing import Any, Dict, List
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
@@ -176,7 +177,7 @@ class RegisterView(QWidget):
         self.setStyleSheet(analyzer_stylesheet())
         self._rmap = rmap
         self._files: Dict[int, DeviceRegisterFile] = {}
-        self._peripheral_maps: Dict[int, object] = {}   # device -> PeripheralRegisterMap
+        self._peripheral_maps: Dict[int, Any] = {}   # device -> PeripheralRegisterMap
         self._device_names: Dict[int, str] = {}          # device -> display name
         self._csv_expected: Dict[tuple, int] = {}  # (device, address) -> CSV expected value
         self._active_phy: str | None = None      # 'PHY1'|'PHY2'|'PHY3' from §5.1.2 decode
@@ -192,6 +193,8 @@ class RegisterView(QWidget):
         self._arranging = False           # the view, not the user, is opening blocks
 
         self._device = QComboBox()
+        self._chosen_device: "int | None" = None   # the user's pick, kept while it has no file
+        self._bound_link: "weakref.ref | None" = None   # the Session the picks belong to
         self._device.currentIndexChanged.connect(self._on_device_changed)
         self._device.setMinimumWidth(165)     # ~50% wider than its default share of the row
         # Clear the CSV/expected comparison overlay (blue expected values in the map).
@@ -421,17 +424,39 @@ class RegisterView(QWidget):
         cur = self._device.currentData()
         self._device.blockSignals(True)
         self._device.clear()
-        devices = sorted(set(self._files) | {d for d, _ in self._csv_expected}) or [0]
-        for d in devices:
+        devices = set(self._files) | {d for d, _ in self._csv_expected}
+        if self._chosen_device is not None:
+            devices.add(self._chosen_device)    # no file at this instant is not gone
+        for d in sorted(devices) or [0]:
             self._device.addItem(self._device_label(d), d)
         idx = max(0, self._device.findData(cur))
         self._device.setCurrentIndex(idx)
         self._device.blockSignals(False)
 
+    def choose_device(self, dev: int) -> None:
+        """Select device `dev` as the user's pick, listing it even while it has no file
+        at the cursor (the pick is kept until its file returns, as a dropdown choice is)."""
+        self._chosen_device = int(dev)
+        self._rebuild_device_combo()
+        i = self._device.findData(self._chosen_device)
+        if i != self._device.currentIndex():
+            self._device.setCurrentIndex(i)     # its change handler rebuilds the tree
+        else:
+            self._rebuild()
+
     def _on_device_changed(self, _index: int) -> None:
+        self._chosen_device = self._device.currentData()
         self._rebuild()
 
-    def set_peripheral_maps(self, maps: Dict[int, object]) -> None:
+    def bind_link(self, session) -> None:
+        """Note which Link's Session the registers show: a pick of a device belongs to one
+        Link, so a different Session forgets it."""
+        bound = self._bound_link() if self._bound_link is not None else None
+        if bound is not session:
+            self._chosen_device = None
+            self._bound_link = weakref.ref(session)
+
+    def set_peripheral_maps(self, maps: Dict[int, Any]) -> None:
         """Bind per-device vendor register maps (device -> PeripheralRegisterMap),
         rendered as a 'Peripheral Registers' block under their device."""
         self._peripheral_maps = maps or {}
@@ -570,7 +595,7 @@ class RegisterView(QWidget):
         byte and emits registerEdited. Falls back to the raw-byte prompt if the
         register has no editable fields."""
         fields = self._editable_fields(item)
-        if not fields:
+        if item is None or not fields:
             self._prompt_edit(item)
             return
         key = item.data(0, Qt.UserRole)
@@ -626,7 +651,7 @@ class RegisterView(QWidget):
         cancelled. The row is read once, before the first prompt: a rebuild while a prompt
         is open deletes it."""
         key = item.data(0, Qt.UserRole) if item is not None else None
-        if not key:
+        if item is None or not key:
             return
         dev, addr = int(key[0]), int(key[1])
         name, text = item.text(0), item.text(2)
@@ -800,8 +825,9 @@ class RegisterView(QWidget):
 
         # PHY1/2/3 electrical-control blocks. PHY selection is set by the Cold Start
         # LC sequence (§5.1.2), NOT by any register — so the active PHY (from the
-        # link-control decode) is shown in bold/expanded and the others greyed +
-        # collapsed, making "which PHY is live" visible even though it's reg-invisible.
+        # link-control decode) is shown in bold and the others greyed, making "which PHY
+        # is live" visible even though it's reg-invisible. Whether a PHY block is open is
+        # the user's: a rebuild keeps the blocks as they were left.
         for name, base, kind in _PHYS:
             specs = self._rmap.blocks.get(name, [])
             if not specs:
@@ -818,7 +844,6 @@ class RegisterView(QWidget):
                 node.setForeground(0, QBrush(QColor(VizTheme.AXIS)))   # greyed
             for spec in specs:
                 self._add_register(node, name, spec, base + spec.offset, dev, dev_file)
-            node.setExpanded(active_phy)
 
         # Per-device peripheral (vendor) register map, in device-defined space.
         # Imported via the register-map assistant; decoded from the same writes.

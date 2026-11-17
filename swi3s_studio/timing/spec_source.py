@@ -15,6 +15,14 @@ threshold, and therefore each edge's, lies anywhere in 35-65 %. Hysteresis does 
 where an edge is detected; the window each edge's threshold can occupy does. A SoundWire clock
 input's thresholds (V_TP 50-65 %, V_TN 35-50 %) lie inside SWI3S's V_IH/V_IL windows, so clock
 inputs keep the V_IH/V_IL rows.
+
+A SWI3S Peripheral's timings count from its own clock-input detection, which the calculator
+places anywhere in the V_IH / V_IL window (`SWI3S_INPUT_WINDOW`). SoundWire measures a
+late-end quantity from the clock at 65 % (V_TP_Clock,max; 35 % falling), which is V_IH,max, and
+an early-end one from 50 % (V_TP_Clock,min; V_TN_Clock 50 % falling), which follows the
+earliest detection, V_IH,min (V_IL,max falling), by `sw13_clock_lead_frac` of the clock's t_RF.
+A SoundWire Peripheral's t_IS and its t_DD / t_ZD minima carry that lead; its t_DD / t_ZD
+maxima, t_DZ and t_IH carry none.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ SpecSource = Literal["SWI3S_PHY1", "SWI3S_PHY2", "SWI3S_PHY2_PROP",
 SystemSize = Literal["small", "large"]
 Corner = Literal["min", "max"]
 Side = Literal["Man", "Per"]
+Receive = Literal["IS", "IH"]
 
 SPEC_SOURCES: tuple[SpecSource, ...] = ("SWI3S_PHY1", "SWI3S_PHY2",
                                         "SWI3S_PHY2_PROP", "SWI3S_PHY2_EDE",
@@ -48,7 +57,7 @@ SPEC_LABELS: dict[SpecSource, str] = {
     "SWI3S_PHY1": "SWI3S PHY1",
     "SWI3S_PHY2": "SWI3S PHY2",
     "SWI3S_PHY2_PROP": "SWI3S PHY2 (proposed)",
-    "SWI3S_PHY2_EDE": "SWI3S PHY2 (EDE proposed)",
+    "SWI3S_PHY2_EDE": "SWI3S PHY2 EDE",
     "SW13_1V2": "SoundWire 1.3 (1.2 V)",
 }
 
@@ -60,6 +69,11 @@ THRESHOLD_NOTE = (
     "its data crossings use that window. Clock inputs, and SWI3S Data inputs, use the "
     "V_IH / V_IL rows."
 )
+
+# The SWI3S V_IH / V_IL rows, (V_IH_min, V_IH_max, V_IL_min, V_IL_max) as fractions of V_SEOS:
+# every clock input's threshold window and every SWI3S data input's. `CalcInputs` and the
+# calculator's V_IH / V_IL rows default to it.
+SWI3S_INPUT_WINDOW: DataWindow = (0.45, 0.65, 0.35, 0.55)
 
 # A SoundWire Data input's threshold window, (V_IH_min, V_IH_max, V_IL_min, V_IL_max) as
 # fractions of Vdd: V_ILmax_Data,min 35 % and V_IHmin_Data,max 65 % (Table 12).
@@ -267,7 +281,7 @@ class SpecPreset:
     t_keeper_ns: float = 3.0
 
 
-# SWI3S v1.1r06: the "PHY1 & PHY2 Clock Frequencies", "PHY1 & PHY2 Input Timing" and
+# SWI3S specification: the "PHY1 & PHY2 Clock Frequencies", "PHY1 & PHY2 Input Timing" and
 # "PHY1 & PHY2 Output Timing" tables. Man and Per differ, so both are held.
 #
 # The two timing tables are structured differently, which matters when reasoning
@@ -294,8 +308,10 @@ _SWI3S: dict[tuple[SpecSource, Side], dict] = {
     ("SWI3S_PHY1", "Per"): dict(t_DD_min_ns=14.0, t_DD_max_ns=50.0,
                                 t_IS_max_ns=4.0, t_IH_max_ns=4.5,
                                 t_DZ_max_ns=10.0, t_ZD_ns=50.0, t_ZD_min_ns=14.0),
-    # PROPOSED PHY2 revision — NOT RATIFIED. It differs from PHY2 in five rows:
-    # Man_t_DD 9-23, Per_t_IH 0-1.5, Per_t_DD 2-9, Man_t_ZD 9-23 and Per_t_ZD 2-9.
+    # PROPOSED PHY2 revision — NOT RATIFIED. It differs from PHY2 in seven rows:
+    # Man_t_DD 9-23, Per_t_IH 0-1.5, Per_t_DD 2-9, Man_t_ZD 9-23, Per_t_ZD 2-9,
+    # Man_t_DZ 0-9 and Per_t_DZ 0-9. The Timing view's Example column holds the same values
+    # as ranges (`ui.timing_view._PHY2_PROPOSED`).
     #
     # The proposal also offers a rate-relative alternative for the two Manager
     # maxima — "0.5 UI at 2x CLK, 0.25 UI at 4x CLK". The preset rows hold only the analog
@@ -306,18 +322,18 @@ _SWI3S: dict[tuple[SpecSource, Side], dict] = {
     # not say. See PROPOSAL_UI_RELATIVE_NOTE.
     ("SWI3S_PHY2_PROP", "Man"): dict(t_DD_min_ns=9.0, t_DD_max_ns=23.0,
                                      t_IS_max_ns=3.0, t_IH_max_ns=0.0,
-                                     t_DZ_max_ns=10.0, t_ZD_ns=23.0, t_ZD_min_ns=9.0),
+                                     t_DZ_max_ns=9.0, t_ZD_ns=23.0, t_ZD_min_ns=9.0),
     ("SWI3S_PHY2_PROP", "Per"): dict(t_DD_min_ns=2.0, t_DD_max_ns=9.0,
                                      t_IS_max_ns=4.0, t_IH_max_ns=1.5,
-                                     t_DZ_max_ns=10.0, t_ZD_ns=9.0, t_ZD_min_ns=2.0),
+                                     t_DZ_max_ns=9.0, t_ZD_ns=9.0, t_ZD_min_ns=2.0),
     # EDE: the proposed revision, on a side that releases by its EDE Delay. t_DZ is the
     # revision's and is not read on that side.
     ("SWI3S_PHY2_EDE", "Man"): dict(t_DD_min_ns=9.0, t_DD_max_ns=23.0,
                                     t_IS_max_ns=3.0, t_IH_max_ns=0.0,
-                                    t_DZ_max_ns=10.0, t_ZD_ns=23.0, t_ZD_min_ns=9.0),
+                                    t_DZ_max_ns=9.0, t_ZD_ns=23.0, t_ZD_min_ns=9.0),
     ("SWI3S_PHY2_EDE", "Per"): dict(t_DD_min_ns=2.0, t_DD_max_ns=9.0,
                                     t_IS_max_ns=4.0, t_IH_max_ns=1.5,
-                                    t_DZ_max_ns=10.0, t_ZD_ns=9.0, t_ZD_min_ns=2.0),
+                                    t_DZ_max_ns=9.0, t_ZD_ns=9.0, t_ZD_min_ns=2.0),
 }
 _SWI3S_FCLK: dict[SpecSource, float] = {"SWI3S_PHY1": 6.6, "SWI3S_PHY2": 13.2,
                                         "SWI3S_PHY2_PROP": 13.2,
@@ -450,29 +466,62 @@ def sw13_ramp_fracs(shape: RampShape, *, V_OH_frac: float = 0.80,
     return z, to(_SW13_TP_MAX), to(_SW13_TP_MIN), r
 
 
+@functools.lru_cache(maxsize=256)
+def sw13_clock_lead_frac(shape: RampShape, *, V_OH_frac: float = 0.80,
+                         V_OL_frac: float = 0.20,
+                         V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0],
+                         V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3],
+                         rising: bool = True) -> float:
+    """From a SWI3S clock input's earliest detection to SoundWire's early-end clock point, in
+    units of the clock ramp's t_RF, on a clock ramp of `shape` and polarity `rising`: from
+    V_IH,min to 50 % of Vdd rising (V_TP_Clock,min), from V_IL,max to 50 % falling
+    (V_TN_Clock). Linear: (0.50 − V_IH,min)/(V_OH − V_OL) rising, (V_IL,max − 0.50)/(V_OH −
+    V_OL) falling, 1/12 at the defaults. The two polarities agree where V_IH,min + V_IL,max = 1.
+    Negative where the detection lies past 50 %."""
+    swing = V_OH_frac - V_OL_frac
+
+    def at(level: float) -> float:
+        c = CrossingCorner(rising, f"{100 * level:g} %", level, 1.0, 0.0, 1.0, +1)
+        return crossing_time_frac(c, shape, swing_frac=swing)
+
+    return at(_SW13_TP_MIN) - at(V_IH_min_frac if rising else V_IL_max_frac)
+
+
 def _sw13_anchor_ns(spec: SpecSource, side: Side, corner: Corner, k: float, s: float,
                     system_size: SystemSize, shape: RampShape = "linear", *,
                     V_OH_frac: float = 0.80, V_OL_frac: float = 0.20,
-                    rising: bool = True, clk_rising: bool = True) -> float:
+                    rising: bool = True, clk_rising: bool = True,
+                    clk_shape: RampShape | None = None,
+                    V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0],
+                    V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3]) -> float:
     """A SoundWire launch's anchor, the launched ramp's 20 % point (its V_OL crossing rising,
     its V_OH crossing falling) after the side's SWI3S clock reference, at clock slew `k` and
-    data slew `s`, both ramps of `shape`. z and r are the data ramp's `sw13_ramp_fracs` at its
-    polarity `rising`, p and q the Manager clock ramp's at its polarity `clk_rising`:
+    data slew `s`, the data ramp of `shape` and the clock ramp of `clk_shape` (`shape` when
+    None). z and r are the data ramp's `sw13_ramp_fracs` at its polarity `rising`, p and q the
+    Manager clock ramp's at its polarity `clk_rising`, and e the clock's
+    `sw13_clock_lead_frac` at `clk_rising` from the detection window V_IH,min / V_IL,max:
 
-        Per max   t_OV − r·s                  t_OV ends at 80 % of the data ramp
-        Per min   t_ZD + z·s                  t_ZD_Data ends at low impedance, the ramp's 0 %
+        Per max   t_OV − r·s                  from the clock's 65 % point, V_IH,max
+        Per min   t_ZD + e·k + z·s            from the clock's 50 % point, e·k after V_IH,min
         Man max   t_OV + p·k − r·s            from the clock's 65 % point
         Man min   t_ZD + q·k + z·s            from the clock's 50 % point
+
+    t_OV ends at 80 % of the data ramp and t_ZD_Data at low impedance, the ramp's 0 %.
     """
     t = _SW13[spec]
     i = 0 if system_size == "small" else 1
+    clk_shape = shape if clk_shape is None else clk_shape
     z, _, _, r = sw13_ramp_fracs(shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
                                  rising=rising)
-    _, late, early, _ = sw13_ramp_fracs(shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+    _, late, early, _ = sw13_ramp_fracs(clk_shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
                                         rising=clk_rising)
     if corner == "max":
         return t["t_OV_max_ns"][i] - r * s + (late * k if side == "Man" else 0.0)
-    return t["t_ZD_min_ns"] + z * s + (early * k if side == "Man" else 0.0)
+    if side == "Per":
+        early = sw13_clock_lead_frac(clk_shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+                                     V_IH_min_frac=V_IH_min_frac,
+                                     V_IL_max_frac=V_IL_max_frac, rising=clk_rising)
+    return t["t_ZD_min_ns"] + z * s + early * k
 
 
 def sw13_anchor_correction(spec: SpecSource, side: Side, *, corner: Corner,
@@ -480,27 +529,107 @@ def sw13_anchor_correction(spec: SpecSource, side: Side, *, corner: Corner,
                            system_size: SystemSize = "small",
                            shape: RampShape = "linear",
                            V_OH_frac: float = 0.80, V_OL_frac: float = 0.20,
-                           rising: bool = True, clk_rising: bool = True) -> float:
-    """A SoundWire launch's anchor less its row value, at the operating slews, ramp `shape`
-    and V_OH / V_OL, for a data edge of polarity `rising` launched from a Manager clock edge of
-    polarity `clk_rising`, in ns; 0 for a SWI3S side.
+                           rising: bool = True, clk_rising: bool = True,
+                           clk_shape: RampShape | None = None,
+                           V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0],
+                           V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3]) -> float:
+    """A SoundWire launch's anchor less its row value, at the operating slews, data ramp
+    `shape`, clock ramp `clk_shape` (`shape` when None), V_OH / V_OL and clock-input window
+    V_IH,min / V_IL,max, for a data edge of polarity `rising` launched from a Manager clock
+    edge of polarity `clk_rising`, in ns; 0 for a SWI3S side.
 
     The rows hold `sw13_equivalents`: the anchor (`_sw13_anchor_ns`) on linear ramps at the
-    default V_OH / V_OL and the slews `sw13_equivalent_slews` names for `system_size`, where
-    both polarities place it alike. The correction is the anchor at the operating slews,
-    shape, V_OH / V_OL and polarities less that, so it is 0 at the equivalents' own slews on a
-    linear ramp at the default V_OH / V_OL and follows an edited row, being a difference
-    between two placements and not between a row and a table value. Each ramp is placed at
-    its own polarity (`sw13_ramp_fracs`); the two polarities agree where V_OH + V_OL = 1.
-    A Peripheral's launch has no clock part, so `clk_rising` does not move it.
+    default V_OH / V_OL and `SWI3S_INPUT_WINDOW`, at the slews `sw13_equivalent_slews` names
+    for `system_size`, where both polarities place it alike. The correction is the anchor at
+    the operating slews, shapes, levels and polarities less that, so it is 0 at the
+    equivalents' own slews on linear ramps at the default levels and follows an edited row,
+    being a difference between two placements and not between a row and a table value. Each
+    ramp is placed at its own polarity (`sw13_ramp_fracs`, `sw13_clock_lead_frac`); the two
+    polarities agree where V_OH + V_OL = 1 and V_IH,min + V_IL,max = 1. A Peripheral's
+    max-side launch has no clock part, so `clk_rising` moves only its min side, by the clock's
+    lead from V_IH,min (V_IL,max falling) to 50 %.
     """
     if not is_soundwire(spec):
         return 0.0
     k0, s0 = sw13_equivalent_slews(spec, side, corner=corner, system_size=system_size)
     return (_sw13_anchor_ns(spec, side, corner, t_rf_clk_ns, t_rf_data_ns, system_size, shape,
                             V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac, rising=rising,
-                            clk_rising=clk_rising)
+                            clk_rising=clk_rising, clk_shape=clk_shape,
+                            V_IH_min_frac=V_IH_min_frac, V_IL_max_frac=V_IL_max_frac)
             - _sw13_anchor_ns(spec, side, corner, k0, s0, system_size))
+
+
+def sw13_receive_slew(spec: SpecSource, side: Side, which: Receive, *,
+                      system_size: SystemSize = "small") -> float:
+    """The clock slew in ns `sw13_equivalents` derives a SoundWire receive row at, `which`
+    "IS" (t_ISetup) or "IH" (t_IHold): t_Slew_Clock's min for a t_IS, where the demand is the
+    largest, and t_Slew_Clock's max for system size `system_size` for a Manager's t_IH. A
+    Peripheral's t_IH starts at 65 %, V_IH,max, and has no clock part; its slew is
+    t_Slew_Clock's min and moves nothing."""
+    t = _SW13[spec]
+    if side == "Man" and which == "IH":
+        return t["t_Slew_Clock_max_ns"][0 if system_size == "small" else 1]
+    return t["t_Slew_min_ns"]
+
+
+def _sw13_receive_ns(spec: SpecSource, side: Side, which: Receive, k: float, *,
+                     clk_shape: RampShape = "linear", V_OH_frac: float = 0.80,
+                     V_OL_frac: float = 0.20,
+                     V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0],
+                     V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3],
+                     clk_rising: bool = True) -> float:
+    """A SoundWire receive demand measured from the side's SWI3S clock end at clock slew `k`,
+    on a clock ramp of `clk_shape` and polarity `clk_rising`. p and q are the clock ramp's
+    `sw13_ramp_fracs` (its 20 % point to 65 % and to 50 %), e its `sw13_clock_lead_frac` from
+    the detection window V_IH,min / V_IL,max:
+
+        Per IS    t_ISetup − e·k              to the clock's 50 % point, e·k after V_IH,min
+        Per IH    t_IHold                     from the clock's 65 % point, V_IH,max
+        Man IS    t_ISetup − q·k              to the clock's 50 % point
+        Man IH    t_IHold + p·k               from the clock's 65 % point
+    """
+    t = _SW13[spec]
+    if which == "IH":
+        if side == "Per":
+            return t["t_IHold_max_ns"]
+        _, p, _, _ = sw13_ramp_fracs(clk_shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+                                     rising=clk_rising)
+        return t["t_IHold_max_ns"] + p * k
+    if side == "Per":
+        e = sw13_clock_lead_frac(clk_shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+                                 V_IH_min_frac=V_IH_min_frac, V_IL_max_frac=V_IL_max_frac,
+                                 rising=clk_rising)
+    else:
+        _, _, e, _ = sw13_ramp_fracs(clk_shape, V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+                                     rising=clk_rising)
+    return t["t_ISetup_max_ns"] - e * k
+
+
+def sw13_receive_correction(spec: SpecSource, side: Side, which: Receive, *,
+                            t_rf_clk_ns: float, system_size: SystemSize = "small",
+                            clk_shape: RampShape = "linear",
+                            V_OH_frac: float = 0.80, V_OL_frac: float = 0.20,
+                            V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0],
+                            V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3],
+                            clk_rising: bool = True) -> float:
+    """A SoundWire receive demand at the operating clock slew `t_rf_clk_ns` less its row, in
+    ns, `which` "IS" or "IH", on a clock ramp of `clk_shape` and polarity `clk_rising` at the
+    V_OH / V_OL and clock-input window V_IH,min / V_IL,max in force; 0 for a SWI3S side.
+
+    The row holds `sw13_equivalents`' value, the demand (`_sw13_receive_ns`) on a linear clock
+    ramp at the default levels at `sw13_receive_slew`, rounded up; the correction is the
+    demand at the operating slew, shape, levels and polarity less the unrounded demand at the
+    derivation slew, so it is 0 there and the row plus it is that row's rounding plus the
+    exact conversion anywhere else. A Peripheral's t_IH has no clock part and no correction.
+    """
+    if not is_soundwire(spec):
+        return 0.0
+    k0 = sw13_receive_slew(spec, side, which, system_size=system_size)
+    return (_sw13_receive_ns(spec, side, which, t_rf_clk_ns, clk_shape=clk_shape,
+                             V_OH_frac=V_OH_frac, V_OL_frac=V_OL_frac,
+                             V_IH_min_frac=V_IH_min_frac, V_IL_max_frac=V_IL_max_frac,
+                             clk_rising=clk_rising)
+            - _sw13_receive_ns(spec, side, which, k0))
 
 
 def _round_down(x: float) -> float:
@@ -518,8 +647,12 @@ def sw13_equivalents(spec: SpecSource, side: Side,
     Each value is re-measured between the SWI3S anchors for the same event, with linear ramps;
     ``k`` is t_Slew_Clock and ``s`` t_Slew_Data:
 
-    * A SWI3S PERIPHERAL starts at its clock-input threshold crossing, and V_IH,max is
-      SoundWire's 65 % V_TP_Clock,max, so its values take no clock-side offset.
+    * A SWI3S PERIPHERAL starts at its own clock-input detection, anywhere in the V_IH / V_IL
+      window (`SWI3S_INPUT_WINDOW`). A SoundWire late-end quantity starts at 65 % (35 %
+      falling), V_IH,max, and takes no clock-side offset: t_OV, t_DZ and t_IHold. An early-end
+      one starts at 50 %, ``e·k`` after the earliest detection at V_IH,min (V_IL,max falling),
+      e = `sw13_clock_lead_frac` (1/12 at the defaults): t_ZD_Data gains ``e·k``, and t_ISetup
+      loses it.
     * A SWI3S MANAGER starts at 20 % of its clock ramp, so a SoundWire 65 % trigger is
       ``0.75·k`` later and a 50 % one ``0.5·k`` later.
     * t_OV ends at 80 % of the data ramp, the SWI3S t_DD at 20 %: one ``s`` earlier. It bounds
@@ -530,8 +663,10 @@ def sw13_equivalents(spec: SpecSource, side: Side,
     Max-side values are taken at the slow end, ``k = s`` = t_Slew_Clock's max for
     `system_size` (t_Slew_Data has none). Min-side values take the clock at t_Slew_Clock's min,
     a Peripheral's data at the reference slew and a Manager's at t_Slew_Clock's min
-    (`sw13_equivalent_slews`). `sw13_anchor_correction` moves each launch to the operating
-    slews.
+    (`sw13_equivalent_slews`). A receive row takes the clock at `sw13_receive_slew`:
+    t_Slew_Clock's min for a t_IS, where the demand is the largest, and its max for a
+    Manager's t_IH. `sw13_anchor_correction` moves each launch, and `sw13_receive_correction`
+    each receive row, to the operating slews.
     Each value is rounded to 0.1 ns in the direction that keeps it a bound: a max (and a
     receiver's demand) up, a min down.
     """
@@ -539,20 +674,17 @@ def sw13_equivalents(spec: SpecSource, side: Side,
     k = t["t_Slew_Clock_max_ns"][0 if system_size == "small" else 1]
     k_min = t["t_Slew_min_ns"]
     t_dz = t["t_DZ_max_ns"]
-    t_is, t_ih = t["t_ISetup_max_ns"], t["t_IHold_max_ns"]
-    _, late, early, _ = sw13_ramp_fracs("linear")       # clock 20 % → 65 %, → 50 %
+    _, late, _, _ = sw13_ramp_fracs("linear")       # clock 20 % → 65 %
     dd_max, dd_min = (
         _sw13_anchor_ns(spec, side, c, *sw13_equivalent_slews(spec, side, corner=c,
                                                               system_size=system_size),
                         system_size)
         for c in ("max", "min"))
-    if side == "Per":
-        dz = t_dz + _SWI3S_TDZ_DEPARTURE_NS
-        t_is_eq, t_ih_eq = t_is, t_ih
-    else:
-        dz = t_dz + late * k + _SWI3S_TDZ_DEPARTURE_NS
-        t_is_eq = t_is - early * k_min
-        t_ih_eq = t_ih + late * k
+    dz = t_dz + (late * k if side == "Man" else 0.0) + _SWI3S_TDZ_DEPARTURE_NS
+    t_is_eq, t_ih_eq = (
+        _sw13_receive_ns(spec, side, w, sw13_receive_slew(spec, side, w,
+                                                          system_size=system_size))
+        for w in ("IS", "IH"))
     return {
         "t_DD_min_ns": _round_down(dd_min), "t_DD_max_ns": _round_up(dd_max),
         "t_ZD_min_ns": _round_down(dd_min), "t_ZD_max_ns": _round_up(dd_max),

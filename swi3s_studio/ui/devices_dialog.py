@@ -4,12 +4,14 @@ One row per device (0–11). Lets the user name each device, assign/import/clear
 its peripheral register map, and set its hub depth (0 to session.MAX_HUB_DEPTH). Hub
 depth feeds the decoder: a peripheral N hub levels deep has its response delayed 2·N
 frame rows.
-This is the single place these per-device settings live.
+This is the single place these per-device settings live. They are one Link's: the title
+names that Link when the window holds several, and an On Bus mark shows each device that
+answers the Link's Pings.
 """
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict, Iterable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -29,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from .. import import_notes
 from ..session import MAX_HUB_DEPTH
-from .theme import VizTheme
+from .theme import VizTheme, analyzer_stylesheet
 
 # The per-device aspects this dialog can edit. Each Devices menu item opens it
 # focused on ONE aspect (Names / Register Maps / Hub Depth); the full set is used
@@ -48,24 +50,30 @@ class DevicesDialog(QDialog):
     (import_notes.ImportNote) of the map imported for it here."""
 
     def __init__(self, parent, devices, names: Dict[int, str],
-                 hub_depths: Dict[int, int], regmaps: Dict[int, object],
-                 sections=ALL_SECTIONS) -> None:
+                 hub_depths: Dict[int, int], regmaps: Dict[int, Any],
+                 sections=ALL_SECTIONS, link: str = "",
+                 seen: Iterable[int] = ()) -> None:
         super().__init__(parent)
+        self.setStyleSheet(analyzer_stylesheet())
         self._sections = tuple(s for s in ALL_SECTIONS if s in sections) or ALL_SECTIONS
         # Title the dialog by what it edits: the single-aspect openers read as
-        # "Device Names" / "Device Register Maps" / "Device Hub Depths".
-        self.setWindowTitle("Devices" if len(self._sections) > 1
-                            else f"Device {_SECTION_TITLE[self._sections[0]]}s")
+        # "Device Names" / "Device Register Maps" / "Device Hub Depths", then the Link
+        # (`link`, given when the window holds several).
+        what = ("Devices" if len(self._sections) > 1
+                else f"Device {_SECTION_TITLE[self._sections[0]]}s")
+        self.setWindowTitle(f"{what} — {link}" if link else what)
+        self._seen = {int(d) for d in seen}
         self.setMinimumWidth(560 if "maps" in self._sections else 360)
         self._devices = list(devices)
         self.names: Dict[int, str] = dict(names)
         self.hub_depths: Dict[int, int] = dict(hub_depths)
-        self.regmaps: Dict[int, object] = dict(regmaps)
+        self.regmaps: Dict[int, Any] = dict(regmaps)
         self.map_notes: Dict[int, list] = {}
 
         self._name_edits: Dict[int, QLineEdit] = {}
         self._depth_spins: Dict[int, QSpinBox] = {}
         self._map_labels: Dict[int, QLabel] = {}
+        self._on_bus: Dict[int, QLabel] = {}
 
         root = QVBoxLayout(self)
         # A one-line blurb only where it adds something: the Names / Register Map
@@ -76,6 +84,9 @@ class DevicesDialog(QDialog):
             blurb = "Expected device responses delayed by 2 rows per hub."
         elif len(self._sections) > 1:
             blurb = "Per-device settings (re-decodes on apply)."
+        if link:
+            blurb = (f"{link}'s devices; each Link has its own. The Registers pane's Link "
+                     "picker chooses the Link." + (f"\n{blurb}" if blurb else ""))
         if blurb:
             root.addWidget(QLabel(blurb))
 
@@ -89,8 +100,8 @@ class DevicesDialog(QDialog):
         host = QWidget()
         grid = QGridLayout(host)
         # Column layout is dynamic: "Device" then one column per shown section.
-        headers = ["Device"] + [_SECTION_TITLE[s] for s in self._sections]
-        col_of = {s: 1 + i for i, s in enumerate(self._sections)}
+        headers = ["Device", "On Bus"] + [_SECTION_TITLE[s] for s in self._sections]
+        col_of = {s: 2 + i for i, s in enumerate(self._sections)}
         if "names" in col_of:
             grid.setColumnStretch(col_of["names"], 1)
         if "maps" in col_of:
@@ -105,6 +116,12 @@ class DevicesDialog(QDialog):
             dev_lbl = QLabel(f"Device {dev}")
             dev_lbl.setAlignment(Qt.AlignCenter)
             grid.addWidget(dev_lbl, r, 0)
+            on_bus = QLabel("✓" if dev in self._seen else "")
+            on_bus.setAlignment(Qt.AlignCenter)
+            on_bus.setToolTip("Answers this Link's Pings" if dev in self._seen
+                              else "Never answers this Link's Pings")
+            self._on_bus[dev] = on_bus
+            grid.addWidget(on_bus, r, 1)
 
             if "names" in col_of:
                 name = QLineEdit(self.names.get(dev, ""))
@@ -119,7 +136,7 @@ class DevicesDialog(QDialog):
                 cell = QFrame()
                 cell.setStyleSheet(
                     f"QFrame {{ border: {VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER}; "
-                    f"border-radius: 4px; }}")
+                    f"border-radius: {VizTheme.SMALL_RADIUS}px; }}")
                 cl = QHBoxLayout(cell)
                 cl.setContentsMargins(6, 2, 6, 2)
                 map_lbl = QLabel(self._map_text(dev))

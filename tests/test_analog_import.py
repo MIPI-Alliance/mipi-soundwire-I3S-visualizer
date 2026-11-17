@@ -517,3 +517,21 @@ def test_a_channel_that_holds_only_noise_is_flat_not_thresholded_on_its_own_band
         cap = capture_from_analog(t, clk, noise, source="s.csv")
     assert cap.data_edges.size == 0 and cap.clock_edges.size > 0
     assert any("data channel's thresholds could not be detected" in str(n) for n in notes)
+
+
+def test_read_wfm_pair_rejects_a_pair_that_does_not_share_a_time_base(tmp_path):
+    """The one check lives in `read_wfm_pair`, so every caller of it gets it: a different
+    record length, sample rate or start time raises, naming both files."""
+    from swi3s_studio.ingest import wfm as wfm_ingest
+    codes = _square_wave_codes(4000, period=20)
+    clock_path, data_path = str(tmp_path / "clock.wfm"), str(tmp_path / "data.wfm")
+    _write_synthetic_wfm(clock_path, codes, dt=1e-9)
+    for other, kw in ((_square_wave_codes(2000, period=20), {"dt": 1e-9}),
+                      (codes, {"dt": 2e-9}),
+                      (codes, {"dt": 1e-9, "t0": 5e-9})):
+        _write_synthetic_wfm(data_path, other, **kw)
+        with pytest.raises(ValueError, match=r"from_wfm.*disagree.*clock\.wfm.*data\.wfm"):
+            wfm_ingest.read_wfm_pair(clock_path, data_path)
+    _write_synthetic_wfm(data_path, codes, dt=1e-9)
+    clk, dat = wfm_ingest.read_wfm_pair(clock_path, data_path)
+    assert clk["time"].size == dat["time"].size == 4000

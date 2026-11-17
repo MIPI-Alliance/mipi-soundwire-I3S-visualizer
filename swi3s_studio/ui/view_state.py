@@ -23,8 +23,11 @@ import math
 from typing import Any, List, Optional
 
 from .. import import_notes
+from ..model.registers import DEVICE_COUNT
 
 MAX_PX = 1 << 16                 # the widest column or pane a saved width may name
+# A Commands filter's number sets: the devices, and the commit groups the Groups menu offers.
+_FILTER_NUMBERS = {"devices": DEVICE_COUNT, "groups": 4}
 _MAX_INT = 2 ** 31 - 1           # a device, port, channel or rate number is a 32-bit value
 MAX_TIME_S = 1e9                 # a saved time range lies within ±MAX_TIME_S seconds
 # What a malformed saved number raises out of int() / float() / unpacking.
@@ -124,12 +127,15 @@ def restore_audio(view, d: Any, zoom: bool = True, source: Optional[str] = None)
         _report(source, "Audio", ["the whole entry"] if d is not None else [])
         return
     bad: List[str] = []
+    saved = d.get("channels")
     try:
-        chans = {_ints(r, 3) for r in d.get("channels") or ()}
+        chans: Optional[set] = {_ints(r, 3) for r in saved or ()}
     except _BAD_VALUE:
-        chans = set()
+        chans = None
         bad.append("channels")
-    view.set_channel_selection(chans)
+    # A saved empty list is every channel unchecked; a missing entry leaves them as they are.
+    if chans is not None and (chans or isinstance(saved, list)):
+        view.set_channel_selection(chans)
     try:
         spectro = {_ints(r, 3) for r in d.get("spectrogram") or ()}
     except _BAD_VALUE:
@@ -357,11 +363,10 @@ def restore_registers(view, d: Any, source: Optional[str] = None) -> None:
         return
     bad: List[str] = []
     if d.get("device") is not None:
-        dev = bounded_number(d.get("device"), -_MAX_INT - 1, _MAX_INT)
-        i = view._device.findData(dev) if dev is not None else -1
-        if i >= 0 and i != view._device.currentIndex():
-            view._device.setCurrentIndex(i)
-        elif i < 0:
+        dev = bounded_number(d.get("device"), 0, DEVICE_COUNT - 1)
+        if dev is not None:
+            view.choose_device(dev)
+        else:
             bad.append(f"device {d.get('device')!r}")
     hidden = d.get("hidden")
     # The open blocks are the unfiltered ones: the filter is off while they are opened, then
@@ -422,10 +427,28 @@ def restore_statistics(view, d: Any, source: Optional[str] = None) -> None:
 
 # ---- Timing (eye): the region, the driver filter, the hidden edge kinds ----
 def timing_state(view) -> dict:
+    """The Timing pane's region (by its section index, with its label), filter and hidden
+    categories."""
+    regions = getattr(view, "_regions", None) or []
+    i = view._region.currentIndex()
+    section = regions[i].get("section") if 0 <= i < len(regions) else None
     return {"region": view._region.currentText(),
+            **({"section": int(section)} if section is not None else {}),
             "filter": [item["action"].text() for item in view._filter_items
                        if item["action"].isChecked()],
             "hidden": sorted([bool(a), bool(b)] for a, b in view._cat_hidden)}
+
+
+def _region_by_span(view, label: str) -> int:
+    """The picker index whose label ends in the same "  (t0–t1 s)" span as `label`, when
+    exactly one does, else -1: a label saved under another region name (a region renamed, or
+    an unnumbered "16 col  (…)") still finds its region."""
+    cut = label.rfind("  (")
+    if cut < 0 or not label.endswith(" s)"):
+        return -1
+    span = label[cut:]
+    hits = [i for i in range(view._region.count()) if view._region.itemText(i).endswith(span)]
+    return hits[0] if len(hits) == 1 else -1
 
 
 def restore_timing(view, d: Any, source: Optional[str] = None) -> None:
@@ -434,11 +457,18 @@ def restore_timing(view, d: Any, source: Optional[str] = None) -> None:
         return
     bad: List[str] = []
     partial: List[str] = []
-    i = view._region.findText(str(d.get("region", "")))
+    sections = [r.get("section") for r in getattr(view, "_regions", None) or []]
+    section = d.get("section")
+    if isinstance(section, int) and not isinstance(section, bool) and section in sections:
+        i = sections.index(section)
+    else:
+        i = view._region.findText(str(d.get("region", "")))
+        if i < 0:
+            i = _region_by_span(view, str(d.get("region", "")))
     if i >= 0 and i != view._region.currentIndex():
         view._region.setCurrentIndex(i)               # rebuilds the filter for the region
-    elif i < 0 and d.get("region"):
-        bad.append(f"region {d.get('region')!r}")
+    elif i < 0 and (d.get("region") or section is not None):
+        bad.append(f"region {d.get('region', section)!r}")
     want = d.get("filter")
     if isinstance(want, list):
         if not all(isinstance(w, str) for w in want):
@@ -482,7 +512,7 @@ def filters_from_json(d: Any, source: Optional[str] = None,
     """A saved Commands filter as a `_filter_snapshot`, or None when it does not read (the
     filter is then left as it is). An on/off entry that is not a JSON true or false is off,
     a text that is not text is empty, and a kinds, devices or groups entry that is not a list
-    is empty; each is reported under `source` as `pane`."""
+    is empty, a device outside 0..11 or a group outside 0..3 is left out; each is reported under `source` as `pane`."""
     if not isinstance(d, dict):
         _report(source, pane, ["the whole entry"] if d is not None else [])
         return None
@@ -494,7 +524,13 @@ def filters_from_json(d: Any, source: Optional[str] = None,
             if v is not None and not isinstance(v, list):
                 bad.append(key)
                 v = None
-            out[key] = {tuple(x) if isinstance(x, list) else x for x in v or ()}
+            items = {tuple(x) if isinstance(x, list) else x for x in v or ()}
+            if key in _FILTER_NUMBERS:
+                read = {x: bounded_number(x, 0, _FILTER_NUMBERS[key] - 1) for x in items}
+                if None in read.values():
+                    bad.append(key)
+                items = {n for n in read.values() if n is not None}
+            out[key] = items
     except TypeError:
         _report(source, pane, ["the whole entry"])
         return None

@@ -1,14 +1,19 @@
-"""Preferences ▸ Waveforms: line colours per theme, and line weights.
+"""Preferences: the waveforms' line colours per theme and line weights, and the Timing
+Diagrams' drawing settings.
 
-Edits a working copy of line_style's settings; nothing changes until OK. A colour below
-3:1 on that theme's plot background (the threshold the default palettes are held to) is
-allowed and flagged.
+The Dark theme and Light theme tabs edit a working copy of line_style's settings; nothing
+changes until OK. The Timing Diagrams tab (`diagram_style_page.DiagramStylePage`) edits a
+working copy of diagram_style's settings and emits `diagramChanged` with it after each edit,
+for a live preview; it is stored on OK. A colour below 3:1 on that theme's background (the
+threshold the default palettes are held to) is allowed and flagged. Reset to Defaults resets
+the tab shown: the Timing Diagrams settings on their tab, else the waveforms'.
 """
 from __future__ import annotations
 
 import copy
 from typing import Dict, Optional
 
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -26,8 +31,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import line_style
-from .theme import _PALETTES, analyzer_stylesheet
+from . import diagram_style, line_style
+from .diagram_style_page import DiagramStylePage
+from .theme import _PALETTES, analyzer_stylesheet, contrast
 
 MIN_CONTRAST = 3.0
 _SWATCH = 28
@@ -46,25 +52,17 @@ def _plot_bg(mode: str) -> str:
     return str(_PALETTES[mode]["PLOT_BG"])
 
 
-def contrast(a: str, b: str) -> float:
-    """WCAG contrast ratio of two colours."""
-    def lum(c: str) -> float:
-        q = QColor(c)
-        out = 0.0
-        for w, v in zip((0.2126, 0.7152, 0.0722), (q.redF(), q.greenF(), q.blueF())):
-            out += w * (v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4)
-        return out
-    hi, lo = sorted((lum(a), lum(b)), reverse=True)
-    return (hi + 0.05) / (lo + 0.05)
-
-
 class PreferencesDialog(QDialog):
     """Per-theme line colours (data ports, bookmark pairs, Capture DP/DN, Timing
-    flavours) and the Audio / Capture line weights."""
+    flavours), the Audio / Capture line weights, and the Timing Diagrams tab, which starts
+    from the stored diagram_style settings."""
+
+    diagramChanged = Signal(dict)       # the Timing Diagrams tab's working copy, on each edit
+    DIAGRAM_TAB = 2
 
     def __init__(self, prefs: dict, parent=None, mode: Optional[str] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Preferences — Waveforms")
+        self.setWindowTitle("Preferences")
         self.setStyleSheet(analyzer_stylesheet())
         self._prefs = copy.deepcopy(prefs)
         self._prefs.setdefault("colors", {})
@@ -76,11 +74,14 @@ class PreferencesDialog(QDialog):
         self._tabs = QTabWidget()
         for m, title in (("dark", "Dark theme"), ("light", "Light theme")):
             self._tabs.addTab(self._theme_page(m), title)
+        self.diagram_page = DiagramStylePage(diagram_style.preferences())
+        self.diagram_page.changed.connect(self.diagramChanged)
+        self._tabs.addTab(self.diagram_page, "Timing Diagrams")
         if mode == "light":
             self._tabs.setCurrentIndex(1)
         lay.addWidget(self._tabs)
 
-        weights = QGroupBox("Line weight (px), both themes")
+        self._weights = weights = QGroupBox("Waveform line weight (px), both themes")
         form = QFormLayout(weights)
         self._weight_spins: Dict[str, QSpinBox] = {}
         for kind, label in (("audio", "Audio waveforms"), ("capture", "Capture DP / DN")):
@@ -94,12 +95,41 @@ class PreferencesDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self._reset_btn = QPushButton("Reset to Defaults")
-        self._reset_btn.setToolTip("Every colour in both themes, and both weights")
         buttons.addButton(self._reset_btn, QDialogButtonBox.ResetRole)
-        self._reset_btn.clicked.connect(self.reset_to_defaults)
+        self._reset_btn.clicked.connect(self._reset_shown)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
+        self._tabs.currentChanged.connect(self._tab_shown)
+        self._tab_shown(self._tabs.currentIndex())
+
+    def show_diagram_tab(self) -> None:
+        """Open on the Timing Diagrams tab."""
+        self._tabs.setCurrentIndex(self.DIAGRAM_TAB)
+
+    def set_diagram_units(self, lh: float, px: int) -> None:
+        """Show the Timing Diagrams weights and sizes against a diagram whose line height is
+        `lh` px and body font `px` px (`TimingDiagram.units`)."""
+        self.diagram_page.set_units(lh, px)
+
+    def diagram_preferences(self) -> dict:
+        """The edited Timing Diagrams settings, for diagram_style.set_preferences."""
+        return self.diagram_page.preferences()
+
+    def _tab_shown(self, index: int) -> None:
+        """The waveform weights show under the waveform tabs, and Reset says what it
+        resets."""
+        diagram = index == self.DIAGRAM_TAB
+        self._weights.setVisible(not diagram)
+        self._reset_btn.setToolTip("Every Timing Diagrams setting" if diagram
+                                   else "Every waveform colour in both themes, and both "
+                                        "weights")
+
+    def _reset_shown(self) -> None:
+        if self._tabs.currentIndex() == self.DIAGRAM_TAB:
+            self.diagram_page.reset_to_defaults()
+        else:
+            self.reset_to_defaults()
 
     # ---- layout ----
     def _theme_page(self, mode: str) -> QWidget:
@@ -169,6 +199,7 @@ class PreferencesDialog(QDialog):
             self.set_value(mode, kind, i, c.name())
 
     def reset_to_defaults(self) -> None:
+        """Every waveform colour in both themes, and both weights."""
         self._prefs = {"colors": {}, "weights": {}}
         for (mode, kind, i) in self._swatches:
             self._paint(mode, kind, i)

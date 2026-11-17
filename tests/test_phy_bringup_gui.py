@@ -112,13 +112,13 @@ def test_timeline_safe_lock_band_labelled_by_phy():
                    "label": "PHY2", "sequence": "cold", "phy_name": "PHY2",
                    "safe_lock_columns": 2}
     assert tl._segment_label(0, 2) == "PHY2 Safe-Lock-2", tl._segment_label(0, 2)
-    assert tl._segment_label(1, 16) == "16col"           # later operational band unchanged
+    assert tl._segment_label(1, 16) == "16-col"           # later operational band unchanged
     # A different PHY reflects in the label; still no "Cold/Warm Start" in the audio band.
     tl._bringup.update(sequence="warm", phy_name="PHY3", safe_lock_columns=4)
     assert tl._segment_label(0, 4) == "PHY3 Safe-Lock-4"
     # No bring-up -> plain column label.
     tl._bringup = {}
-    assert tl._segment_label(0, 2) == "2col"
+    assert tl._segment_label(0, 2) == "2-col"
     assert not tl.toolTip(), "timeline should carry no obscuring widget tooltip"
 
 
@@ -183,7 +183,7 @@ def test_grid_scroll_resets_so_new_content_is_visible():
 
 def test_a_capture_joined_mid_stream_shows_no_bringup_and_keeps_its_line_names():
     """A recording started after the bus came up has no bring-up, but the edge-only
-    detector reads one into it (a Warm Start, claimed to ride the data line). The Session
+    detector reads one into it (a Cold Start, claimed to ride the data line). The Session
     overrules it from the decode, so the Timeline draws no bring-up band and the Capture
     pane names the lines as for every genuine FBCSE capture (data DN, clock DP), not
     swapped."""

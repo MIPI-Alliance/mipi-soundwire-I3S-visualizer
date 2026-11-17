@@ -82,6 +82,22 @@ def test_bin_data_that_is_not_a_list_falls_back_to_the_file_names(tmp_path):
     info = ss.read_info(_sal(tmp_path, meta))
     assert info.channels == [0, 1]
     assert any("binData is not a list" in n for n in info.notes)
+    assert not any("taken from the digital-N.bin file names" in n for n in info.notes)
+
+
+@pytest.mark.parametrize("bin_data", [None, [], [{"type": "Analog", "file": "analog-0.bin"}]],
+                         ids=["absent", "empty", "analog-only"])
+def test_bin_data_with_no_digital_entry_falls_back_to_the_file_names_with_a_note(bin_data,
+                                                                              tmp_path):
+    meta = _meta()
+    if bin_data is None:
+        meta.pop("binData", None)
+    else:
+        meta["binData"] = bin_data
+    info = ss.read_info(_sal(tmp_path, meta))
+    assert info.channels == [0, 1]
+    assert info.notes == ["meta.json binData lists no usable digital channel; the channel "
+                          "numbers are taken from the digital-N.bin file names"]
 
 
 def test_a_window_starting_before_the_capture_is_read_from_zero_with_a_note(tmp_path):

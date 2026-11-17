@@ -7,7 +7,6 @@
 
 Run: python3 -m pytest tests/test_audio_export.py
 """
-import math
 import os
 import tempfile
 
@@ -15,6 +14,7 @@ import numpy as np
 import pytest
 import swi3score
 import wav_reader
+from demo_samples import sine_sample
 
 from swi3s_studio.ingest import transitions
 from swi3s_studio.store.audio_store import AudioStore, container_bits, sign_extend, wav_header
@@ -23,9 +23,7 @@ from swi3s_studio.store.audio_store import AudioStore, container_bits, sign_exte
 def _expected_sine_signed(tone, index, field_bits):
     # field_bits = SampleSize register value = sample_bits - 1. `tone` is the sine
     # selector the demo uses: for a data port `dp`, tone == dp*2 on its single channel.
-    amp = (1 << field_bits) * 0.45
-    v = int(round(amp * math.sin(2.0 * math.pi * (tone + 1) * index / 64.0)))
-    unsigned = v & ((1 << (field_bits + 1)) - 1)
+    unsigned = sine_sample(tone, index, field_bits)
     return int(sign_extend(np.array([unsigned]), field_bits + 1)[0])
 
 
@@ -645,3 +643,16 @@ def test_a_pdm_overshoot_in_a_wide_mixed_channel_is_held_at_full_scale_in_a_memm
         assert got.max() == 2 ** 31 - 1 and got.min() < 0 and np.argmax(got) == np.argmax(want)
     finally:
         mapped.close()
+
+
+def test_a_stream_of_unknown_rate_exports_and_plays_at_the_assumed_rate(tmp_path):
+    """A rate of 0 is unknown: `rate_known` says so, and the stream's WAV header and its
+    playback rate are ASSUMED_RATE_HZ, which the callers name to the user."""
+    from swi3s_studio.store.audio_store import ASSUMED_RATE_HZ
+    store = _rated_store(0.0)
+    assert not store.rate_known(3, 2) and store.output_rate(3, 2) == ASSUMED_RATE_HZ
+    with wav_reader.open(store.export_wav(3, 2, str(tmp_path / "x.wav")), "rb") as w:
+        assert w.getframerate() == ASSUMED_RATE_HZ
+    assert store.pcm_play(3, 2)[1] == ASSUMED_RATE_HZ
+    rated = _rated_store(44100.0)
+    assert rated.rate_known(3, 2) and rated.output_rate(3, 2) == 44100

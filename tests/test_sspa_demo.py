@@ -187,6 +187,19 @@ def test_timeline_marks_an_sspa_as_a_sync_point():
         "the legend must document the mark it draws"
 
 
+def test_an_sspa_whose_row_delay_the_decode_rejected_is_drawn_as_having_no_effect():
+    """A rejected-Row_Delay SSPA announces nothing: no SSP label, colour or rank."""
+    from swi3s_studio.ui import timeline as T
+
+    ok = {"command": "SSPA", "has_sync_point": True, "is_commit": False,
+          "crc_valid": True, "has_manager_packet": True}
+    rejected = dict(ok, row_delay_error=True)
+    assert T._kind_label(ok) == "SSP Announce"
+    assert T._kind_label(rejected) == "Other command"
+    assert T._kind_color(rejected) != T._kind_color(ok)
+    assert T.tick_rank(rejected) < T.tick_rank(ok)
+
+
 def test_flow_control_handshake_stays_clean_across_an_sspa():
     """A correctly-placed SSPA must not invent a DRQ<->TxPresent violation.
 

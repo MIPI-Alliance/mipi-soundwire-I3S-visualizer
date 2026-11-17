@@ -27,7 +27,7 @@ datas = [(os.path.join(HERE, "data", "registers.json"), "data"),
          (os.path.join(HERE, "docs", "USER_GUIDE.md"), "docs"),
          # library_dir() finds the bundled example register map under _MEIPASS/data/regmaps.
          (os.path.join(HERE, "data", "regmaps"), os.path.join("data", "regmaps")),
-         # The project licence sits at the bundle's top level.
+         # The project licence, beside the licenses/ directory.
          (os.path.join(HERE, "LICENSE.md"), ".")]
 
 # Each distribution the bundle redistributes (the runtime requirements and what they
@@ -36,15 +36,29 @@ datas = [(os.path.join(HERE, "data", "registers.json"), "data"),
 # bundle at its path inside the distribution, so that same-named files (a distribution
 # bundling the licences of several components) do not overwrite one another. The runtime
 # requirements are the names requirements.txt lists, and each must be installed.
-# Every wheel of the Qt for Python project (shiboken6, PySide6 and each PySide6-* wheel
-# it requires) carries none: their notices are kept in data/licenses/Qt-for-Python/ and
-# shipped as licenses/Qt-for-Python/. The bundle holds only the Qt modules the app
-# imports. A runtime distribution with no notice from either source stops the build.
+# The notices of every wheel of the Qt for Python project (shiboken6, PySide6 and each
+# PySide6-* wheel it requires) are kept in data/licenses/Qt-for-Python/ and none of the
+# wheels' own files ships (the Windows wheels carry a commercial-licence statement,
+# dist-info/licenses/LicenseRef-Qt-Commercial.txt; this bundle uses the LGPL-3.0 option). They are
+# shipped as licenses/Qt-for-Python/: the Qt for Python notice, the licence texts it names,
+# and THIRD-PARTY.txt, the third-party components the Qt libraries and plugins contain. The
+# bundle holds the Qt modules the app imports and
+# the ones they load (_UNSHIPPED_QT, below). A runtime distribution with no notice from either
+# source, or a data/licenses/ project lacking a file _REQUIRED_NOTICES names, stops the build.
+# The Qt for Python notice names the release series it was reviewed for and the licence the
+# wheels state; a Qt for Python wheel of another series, or stating another licence, stops
+# the build. tools/bundle_constraints.txt pins a reviewed release.
 # The app imports QtMultimedia, whose PySide6 libraries include the FFmpeg libraries
 # (libavcodec, libavformat, libavutil, libswresample, libswscale); the bundle then also ships
 # data/licenses/FFmpeg/ as licenses/FFmpeg/. The bundle freezes the building interpreter and
 # its standard library, so that interpreter's own licence text ships as licenses/Python/; an
-# interpreter whose installation holds none stops the build.
+# interpreter whose installation holds none stops the build. That licence does not cover the
+# OpenSSL and ncurses libraries an interpreter's ssl, hashlib, readline and curses extensions
+# may link: when Analysis collects them, their notices in data/licenses/Python-extras/ ship as
+# licenses/Python-extras/ (_interpreter_notices, applied to a.binaries after Analysis), and an
+# OpenSSL release whose notice it does not hold stops the build. The bundle leaves out the
+# readline module (Analysis' excludes); a GNU readline library (GPL) that Analysis still
+# collects stops the build.
 _REQUIREMENTS = os.path.join(HERE, "requirements.txt")
 _NOTICE_FILE = re.compile(r"(^|[/\\])(licen[cs]es?|copying|notice|authors)([-_.][^/\\]*)?$", re.I)
 
@@ -89,6 +103,53 @@ def _repo_notices(key):
     return None
 
 
+# The files each data/licenses/ project must hold; one that lacks any stops the build.
+# THIRD-PARTY.txt lists the third-party components the Qt libraries and plugins contain.
+_REQUIRED_NOTICES = {
+    "Qt-for-Python": ("NOTICE.txt", "LGPL-3.0.txt", "GPL-3.0.txt", "THIRD-PARTY.txt"),
+    "FFmpeg": ("NOTICE.txt", "LGPL-2.1.txt"),
+}
+
+
+_QT_NOTICE = os.path.join(HERE, "data", "licenses", "Qt-for-Python", "NOTICE.txt")
+_QT_REVIEWED = re.compile(r"^Qt for Python versions reviewed for this notice: (.+)$", re.M)
+_SERIES = re.compile(r"^(\d+)\.(\d+)$")
+
+
+def _qt_reviewed(path=_QT_NOTICE):
+    """(the (major, minor) series the Qt for Python notice was reviewed for, its text)."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    found = _QT_REVIEWED.findall(text)
+    if len(found) != 1:
+        raise SystemExit(f"{path} must carry exactly one 'reviewed for this notice' line")
+    series = set()
+    for item in found[0].split(","):
+        m = _SERIES.match(item.strip())
+        if not m:
+            raise SystemExit(f"{path}: {item.strip()!r} is not a major.minor release series")
+        series.add((int(m.group(1)), int(m.group(2))))
+    return series, text
+
+
+def _unreviewed_qt(dists):
+    """The Qt for Python distributions, with the reason, that the notice was not reviewed for:
+    a release series it does not name, or a licence statement it does not contain."""
+    series, text = _qt_reviewed()
+    out = []
+    for dist in dists:
+        if _repo_notices(_canon(dist.metadata["Name"])) != "Qt-for-Python":
+            continue
+        name, version = dist.metadata["Name"], dist.version
+        m = re.match(r"(\d+)\.(\d+)", version)
+        licence = dist.metadata.get("License-Expression") or dist.metadata.get("License")
+        if not m or (int(m.group(1)), int(m.group(2))) not in series:
+            out.append(f"{name} {version} (release series not reviewed)")
+        elif not licence or licence not in text:
+            out.append(f"{name} {version} (licence {licence!r} not in the notice)")
+    return out
+
+
 def _runtime_closure():
     seen, todo, missing = {}, [(name, True) for name in _RUNTIME], []
     while todo:
@@ -112,6 +173,61 @@ def _runtime_closure():
     return seen.values()
 
 
+# The distributions a build environment may hold beside the runtime closure: the build tools,
+# swi3score, and the build tools of one platform. Any other installed distribution stops the build, since PyInstaller's
+# hooks collect what the frozen code can reach: build in a fresh virtual environment
+# (docs/PACKAGING.md, section 3). SWI3S_BUNDLE_ALLOW_EXTRA names, comma-separated, the extra
+# distributions a build accepts; each is matched by name.
+_BUILD_DISTRIBUTIONS = ("pyinstaller", "pyinstaller-hooks-contrib", "altgraph", "packaging",
+                        "setuptools", "pip", "wheel", "swi3score")
+_PLATFORM_BUILD_TOOLS = {"darwin": ("macholib",), "win32": ("pefile", "pywin32-ctypes")}
+_ALLOW_EXTRA = "SWI3S_BUNDLE_ALLOW_EXTRA"
+
+
+def _search_path():
+    """The directories the build's distributions are read from: sys.path, and the user
+    site-packages directory when the interpreter enables it."""
+    import site
+    import sys
+    path = list(sys.path)
+    if site.ENABLE_USER_SITE:
+        user = site.getusersitepackages()
+        if user not in path:
+            path.append(user)
+    return path
+
+
+def _extra_distributions(closure, dists=None, platform=None, environ=None):
+    """The names of the installed distributions outside the runtime closure, the build tools and
+    the ones SWI3S_BUNDLE_ALLOW_EXTRA names, sorted."""
+    import sys
+    if dists is None:
+        dists = importlib.metadata.distributions(path=_search_path())
+    environ = os.environ if environ is None else environ
+    allowed = {_canon(d.metadata["Name"]) for d in closure}
+    allowed.update(_BUILD_DISTRIBUTIONS, _PLATFORM_BUILD_TOOLS.get(platform or sys.platform, ()))
+    allowed.update(_canon(n.strip()) for n in environ.get(_ALLOW_EXTRA, "").split(",") if n.strip())
+    extra = set()
+    for dist in dists:
+        name = dist.metadata["Name"]
+        if not name:
+            extra.add(f"an unnamed distribution at {getattr(dist, '_path', '?')}")
+        elif _canon(name) not in allowed:
+            extra.add(name)
+    return sorted(extra, key=str.lower)
+
+
+def _refuse_extra_distributions(closure):
+    extra = _extra_distributions(closure)
+    if extra:
+        raise SystemExit(
+            "the build environment holds distributions outside the runtime requirements, "
+            "swi3score and the build tools: " + ", ".join(extra) + ". PyInstaller collects what "
+            "the frozen code can reach from them. Build in a fresh virtual environment as "
+            f"docs/PACKAGING.md, section 3, describes, or name each one to keep in {_ALLOW_EXTRA} "
+            "(comma-separated).")
+
+
 def _python_licence():
     """The licence text of the interpreter the bundle freezes, or None: LICENSE.txt in its
     standard library or at its installation prefix, or the copyright file of a Debian-family
@@ -127,6 +243,62 @@ def _python_licence():
     return None
 
 
+# OpenSSL's libssl and libcrypto as macOS, Windows and Linux name them, with the release
+# (major, minor) their name carries: libssl.1.1.dylib, libcrypto-1_1-x64.dll, libssl.so.3.
+_OPENSSL_LIB = re.compile(
+    r"^lib(?:ssl|crypto)(?:[-.](\d+)(?:[._](\d+))?(?:[._]\d+)*(?:-x64|-arm64)?)?\.(?:dylib|dll)$"
+    r"|^lib(?:ssl|crypto)\.so(?:\.(\d+)(?:\.(\d+))?(?:\.\d+)*)?$", re.I)
+# ncurses' libraries: libncursesw.5.dylib, libtinfo.so.6, libpanelw.so.6. GNU readline's:
+# libreadline.8.dylib, libreadline.so.8.
+_NCURSES_LIB = re.compile(
+    r"^lib(?:ncurses|tinfo|panel|form|menu)(?:w|t|tw)?(?:[.-]\d+)*\.(?:dylib|so)(?:\.[\d.]+)?$", re.I)
+_GNU_READLINE_LIB = re.compile(r"^libreadline(?:[.-]\d+)*\.(?:dylib|so|dll)(?:\.[\d.]+)?$", re.I)
+# The data/licenses/Python-extras/ notice of each OpenSSL release the bundle may carry, by
+# (major, minor), or by (major, None) for every release of that major.
+_OPENSSL_NOTICES = {("1", "1"): "OpenSSL-1.1.txt", ("3", None): "OpenSSL-3.txt"}
+
+
+def _interpreter_notices(binaries):
+    """The data/licenses/Python-extras/ notices, as (source, bundle directory), of the OpenSSL
+    and ncurses libraries among `binaries`, Analysis' (bundle path, source path, kind) entries.
+    A library whose notice is not held, or a GNU readline library, stops the build."""
+    held = os.path.join(HERE, "data", "licenses", "Python-extras")
+    names = set()
+    for entry in binaries:
+        names.update(os.path.basename(str(p).replace("\\", "/")) for p in entry[:2])
+    out, bare, refused = [], [], []
+    for name in sorted(names):
+        ssl, curses = _OPENSSL_LIB.match(name), _NCURSES_LIB.match(name)
+        if _GNU_READLINE_LIB.match(name):
+            refused.append(name)
+            continue
+        if ssl:
+            release = (ssl.group(1), ssl.group(2)) if ssl.group(1) else (ssl.group(3), ssl.group(4))
+            notice = _OPENSSL_NOTICES.get(release) or _OPENSSL_NOTICES.get((release[0], None))
+            if notice is None:
+                shown = ".".join(r for r in release if r) or "release not identified"
+                bare.append(f"{name} (OpenSSL {shown}: data/licenses/Python-extras/ holds no notice)")
+                continue
+        elif curses:
+            notice = "ncurses.txt"
+        else:
+            continue
+        path = os.path.join(held, notice)
+        if not os.path.isfile(path):
+            bare.append(f"{name} (data/licenses/Python-extras/{notice} is missing)")
+        elif (path, os.path.join("licenses", "Python-extras")) not in out:
+            out.append((path, os.path.join("licenses", "Python-extras")))
+    problems = []
+    if refused:
+        problems.append("the bundle collects GNU readline (GPL): " + ", ".join(refused)
+                        + "; the interpreter's readline module must link libedit, or be excluded")
+    if bare:
+        problems.append("no licence or notice file for: " + ", ".join(bare))
+    if problems:
+        raise SystemExit("; ".join(problems))
+    return out
+
+
 def _notice_datas():
     out, bare, repo = [], [], set()
     licence = _python_licence()
@@ -134,8 +306,17 @@ def _notice_datas():
         bare.append("Python (the interpreter's installation holds no licence text)")
     else:
         out.append((licence, os.path.join("licenses", "Python")))
-    for dist in _runtime_closure():
+    closure = list(_runtime_closure())
+    unreviewed = _unreviewed_qt(closure)
+    if unreviewed:
+        raise SystemExit("data/licenses/Qt-for-Python/NOTICE.txt was not reviewed for: "
+                         + ", ".join(sorted(unreviewed)))
+    for dist in closure:
         name = dist.metadata["Name"]
+        project = _repo_notices(_canon(name))
+        if project:
+            repo.add(project)
+            continue
         found = 0
         for f in dist.files or []:
             if (".." in f.parts or not _NOTICE_FILE.search(str(f))
@@ -145,10 +326,7 @@ def _notice_datas():
             if os.path.isfile(src):
                 found += 1
                 out.append((str(src), os.path.join("licenses", name, str(f.parent))))
-        project = _repo_notices(_canon(name))
-        if project:
-            repo.add(project)
-        elif not found:
+        if not found:
             bare.append(name)
     if _imports_qt_multimedia():
         repo.add("FFmpeg")
@@ -156,6 +334,11 @@ def _notice_datas():
         held = os.path.join(HERE, "data", "licenses", project)
         if not os.path.isdir(held) or not os.listdir(held):
             bare.append(f"{project} (data/licenses/{project} is missing or empty)")
+        else:
+            lacking = [f for f in _REQUIRED_NOTICES.get(project, ())
+                       if not os.path.isfile(os.path.join(held, f))]
+            if lacking:
+                bare.append(f"{project} (data/licenses/{project} lacks {', '.join(lacking)})")
         out.append((held, os.path.join("licenses", project)))
     if bare:
         raise SystemExit("no licence or notice file for: " + ", ".join(sorted(bare)))
@@ -163,6 +346,7 @@ def _notice_datas():
 
 
 datas += _notice_datas()
+_refuse_extra_distributions(list(_runtime_closure()))
 
 # The compiled swi3score extension (.pyd on Windows, .so elsewhere) is a top-level module;
 # hiddenimports below carries it into the bundle.
@@ -180,9 +364,22 @@ a = Analysis(
     hiddenimports=["swi3score"],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter"],
+    excludes=["tkinter", "readline"],
     cipher=block_cipher,
 )
+# The Qt modules the app imports are QtCore, QtGui, QtWidgets, QtSvg and QtMultimedia, which
+# loads QtNetwork; pyqtgraph imports QtOpenGL, QtOpenGLWidgets and QtTest. PyInstaller's Qt
+# hooks collect whole plugin directories, and the virtual-keyboard input-context plugin and
+# the PDF image-format plugin bring QtVirtualKeyboard, QtQuick, QtQml and QtPdf with them.
+# Those plugins and modules are left out of the bundle by name.
+_UNSHIPPED_QT = re.compile(
+    r"(?i)(qtvirtualkeyboard|qt6?quick|qt6?qml|qt6?pdf|qpdf|qtuiotouchplugin)")
+a.binaries = [b for b in a.binaries if not _UNSHIPPED_QT.search(b[0].replace("\\", "/"))]
+a.datas = [d for d in a.datas if not _UNSHIPPED_QT.search(d[0].replace("\\", "/"))]
+# The notices of the interpreter's OpenSSL and ncurses libraries that Analysis collected.
+a.datas += [(os.path.join(dest, os.path.basename(src)), src, "DATA")
+            for src, dest in _interpreter_notices(a.binaries)]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="SWI3S Studio",

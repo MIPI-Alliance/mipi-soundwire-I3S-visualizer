@@ -6,7 +6,8 @@
 2. **Batch-invariant.** A batch size that forces many boundaries produces byte-identical
    output to one that forces none, so a batch edge landing mid-capture changes nothing.
 
-3. **Limits at their boundary.** A first row of exactly `MAX_LINE_CHARS` characters and
+3. **Limits at their boundary.** A first row or a data line of exactly `MAX_LINE_CHARS`
+   characters, its line ending not counted, whether LF or CRLF, and
    one of exactly `_MAX_HEADER_CELLS` cells are read, and one more of either is refused; a
    sample rate of 1 Hz and of `MAX_RATE_HZ` is accepted, and one just past either is
    refused; timestamps that give a rate beyond the maximum are refused naming the file; a
@@ -165,12 +166,28 @@ def _header_file(tmp_path, header: str, body="0,1,0\n1,0,1\n"):
     return str(p)
 
 
-def test_a_first_row_of_exactly_the_longest_line_is_read_and_one_more_is_refused(tmp_path):
-    fits = "Time," + "x" * (timebase.MAX_LINE_CHARS - len("Time,") - 1)      # + newline
-    assert len(fits) + 1 == timebase.MAX_LINE_CHARS
-    assert digital_csv.read_header(_header_file(tmp_path, fits))[0] == "Time"
+@pytest.mark.parametrize("eol", ["\n", "\r\n"], ids=["LF", "CRLF"])
+def test_a_first_row_of_exactly_the_longest_line_is_read_and_one_more_is_refused(tmp_path, eol):
+    """The line ending is not counted, so LF and CRLF files meet the limit at one length."""
+    fits = "Time," + "x" * (timebase.MAX_LINE_CHARS - len("Time,"))
+    assert len(fits) == timebase.MAX_LINE_CHARS
+    p = tmp_path / "h.csv"
+    p.write_bytes((fits + eol + "0,1,0" + eol).encode())
+    assert digital_csv.read_header(str(p))[0] == "Time"
+    p.write_bytes((fits + "x" + eol + "0,1,0" + eol).encode())
     with pytest.raises(ValueError, match="longer than"):
-        digital_csv.read_header(_header_file(tmp_path, fits + "x"))
+        digital_csv.read_header(str(p))
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n"], ids=["LF", "CRLF"])
+def test_a_data_line_of_exactly_the_longest_line_is_read_and_one_more_is_refused(tmp_path, eol):
+    fits = "1," + "0" * (timebase.MAX_LINE_CHARS - 2)
+    p = tmp_path / "d.csv"
+    p.write_bytes(eol.join(["Time,A", "0,1", fits, ""]).encode())
+    digital_csv.scan(str(p))
+    p.write_bytes(eol.join(["Time,A", "0,1", fits + "0", ""]).encode())
+    with pytest.raises(ValueError, match=r"line 3 is longer than"):
+        digital_csv.scan(str(p))
 
 
 def test_a_first_row_of_exactly_the_most_cells_is_read_and_one_more_is_refused(tmp_path):
@@ -217,7 +234,7 @@ def _merge_note(tmp_path, rows, rate):
     p.write_text("\n".join(rows) + "\n")
     with import_notes.collect() as notes:
         cap = digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=rate)
-    return cap, [str(n) for n in notes]
+    return cap, [str(n) for n in notes if "sample grid" not in str(n)]
 
 
 def test_the_same_sample_warning_counts_a_data_line_that_alone_merged(tmp_path):
@@ -266,4 +283,61 @@ def test_a_data_line_is_read_no_further_than_the_longest_line():
     f = Recording("0,1\n" + "1," + "0" * (timebase.MAX_LINE_CHARS + 10) + "\n")
     with pytest.raises(ValueError, match=r"line 3 is longer than"):
         list(digital_csv._data_lines(f, "x.csv"))
-    assert sizes and set(sizes) == {timebase.MAX_LINE_CHARS + 1}
+    assert sizes and set(sizes) == {timebase.MAX_LINE_CHARS + 2}   # the line and a CRLF
+
+
+# ---- row estimate across line-end forms -----------------------------------------------
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n", b"\r"], ids=["LF", "CRLF", "CR"])
+def test_the_row_estimate_counts_every_line_end_form_the_reader_accepts(tmp_path, eol):
+    """A file with lone-CR line ends is read as rows, so it is estimated as rows."""
+    rows = 3_000
+    body = eol.join(b"%.9f,%d,%d" % (i * 2e-8, i & 1, (i >> 1) & 1) for i in range(rows))
+    p = tmp_path / "e.csv"
+    p.write_bytes(eol.join([b"Time [s],Channel 0,Channel 1", body, b""]))
+    with open(p, "rb") as f:
+        sample = f.read(64 << 10)
+    assert 0.8 * rows <= digital_csv.predict_rows(str(p), sample) <= 1.25 * rows
+    assert digital_csv._row_text_bytes(sample) == pytest.approx(
+        len(b"0.000000000,0,0"), abs=1.0)
+
+
+def test_a_lone_cr_file_over_budget_is_refused_before_it_is_read(tmp_path):
+    p = tmp_path / "cr.csv"
+    p.write_bytes(b"\r".join([b"Time [s],Channel 0,Channel 1"] + [
+        b"%.9f,%d,%d" % (i * 2e-8, i & 1, (i >> 1) & 1) for i in range(2_000)] + [b""]))
+    with pytest.raises(digital_csv.CsvTooLargeError) as caught:
+        _load(str(p), max_bytes=1)
+    assert caught.value.rows > 1_000
+
+
+# ---- the off-grid warning ---------------------------------------------------------------
+
+def test_times_off_the_sample_grid_are_reported_as_the_binary_reader_reports_them(tmp_path):
+    """Each time is rounded to the nearest sample at the rate given; when they sit more than
+    a quarter sample off that grid, the user is told, in `saleae_binary.grid_note`'s words."""
+    from swi3s_studio.ingest import saleae_binary
+    rows = ["Time [s],Channel 0,Channel 1", "0.000,0,0", "0.015,1,1", "0.030,0,1",
+            "0.045,1,0", "0.060,0,0"]
+    p = tmp_path / "g.csv"
+    p.write_text("\n".join(rows) + "\n")
+    with import_notes.collect() as notes:
+        digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=100)
+    got = [str(n) for n in notes]
+    assert len(got) == 2 and all(s.startswith("g.csv: ") for s in got), got
+    assert "clock column 1: the transition times do not sit on the 100 Hz sample grid" in got[0]
+    assert "data column 2: the transition times do not sit on the 100 Hz sample grid" in got[1]
+    times = np.array([0.015, 0.030, 0.045, 0.060])
+    assert saleae_binary.grid_note(times, 100, 0.0) in got[0]
+    assert saleae_binary.grid_note(np.array([0.015, 0.045]), 100, 0.0) in got[1]
+
+
+def test_times_on_the_sample_grid_raise_no_grid_warning(tmp_path):
+    rows = ["Time [s],Channel 0,Channel 1"] + [
+        f"{i * 1e-3:.9f},{(i // 3) % 2},{i % 2}" for i in range(40)]
+    p = tmp_path / "ok.csv"
+    p.write_text("\n".join(rows) + "\n")
+    for rate in (None, 1000):
+        with import_notes.collect() as notes:
+            digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=rate)
+        assert not [n for n in notes if "sample grid" in str(n)]

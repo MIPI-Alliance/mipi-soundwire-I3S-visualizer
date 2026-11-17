@@ -527,8 +527,12 @@ void CCommandTransportParser::startReadDataPacket()
     if (n < 1) n = 1;
     mReadBytes.clear();
     mReadBytesNeeded = n + 2;                    // data + 2 CRC bytes
+    // A Manager-owned spacer of kSpacerBitsMP (10 bits, one symbol) separates the
+    // peripheral's READ_DATA_NOW from its read data; Demo's appendReadPayload writes it and
+    // analysis/cds_meaning reads it the same way.
     mState = eReadDataSpacer;
-    mSpacerSymbolsRemaining = 1;                 // Mgr-owned 10-bit spacer after response
+    mSpacerSymbolsRemaining = swi3s::kSpacerBitsMP / swi3s::kSymbolBits;
+    if (mSpacerSymbolsRemaining < 1) mSpacerSymbolsRemaining = 1;
 }
 
 bool CCommandTransportParser::emitAndReset()

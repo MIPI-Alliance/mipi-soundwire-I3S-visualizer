@@ -5,6 +5,7 @@ re-themes the views without losing the loaded capture.
 Run: QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_theme.py
 """
 import os
+import re
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -107,7 +108,7 @@ def test_live_switch_rethemes_window():
 
 def test_the_timing_page_follows_a_live_switch():
     """The Timing Calculator follows View ▸ Appearance: each way, every style it builds
-    from the palette, and the red of a failing margin, are the new palette's."""
+    from the palette, and the colours of the margins, are the new palette's."""
     _app = QApplication.instance() or QApplication([])
     from PySide6.QtWidgets import QTreeWidgetItemIterator
 
@@ -116,19 +117,23 @@ def test_the_timing_page_follows_a_live_switch():
     apply_palette("dark")
     win = MainWindow()
     page = win._timing_page
+    page.flush_recompute()
     for mode in ("light", "dark"):
         win.apply_theme(mode)
         assert VizTheme.ENTRY_BG in page.styleSheet(), mode
-        assert f"color:{VizTheme.TEXT_DIM};" in page._subtitle.styleSheet(), mode
+        assert f"color:{VizTheme.TEXT_DIM};" in page._status.styleSheet(), mode
         assert f"color:{VizTheme.TEXT_DIM};" in page._trace_hint.styleSheet(), mode
         assert VizTheme.FRAME_BG in page._tree.header().styleSheet(), mode
-        reds = set()
+        colours = {"-": set(), "+": set()}
         it = QTreeWidgetItemIterator(page._tree)
         while it.value():
-            if it.value().text(1).startswith("-"):
-                reds.add(it.value().foreground(1).color().name().lower())
+            found = re.search(r'= <span style="color:(#[0-9a-fA-F]{6})">([+-])',
+                              it.value().text(0))
+            if found:
+                colours[found.group(2)].add(found.group(1).lower())
             it += 1
-        assert reds == {VizTheme.SEM_ERROR.lower()}, (mode, reds)
+        assert colours == {"-": {VizTheme.SEM_ERROR.lower()},
+                           "+": {VizTheme.DIAG_OK.lower()}}, (mode, colours)
 
 
 def test_the_visualizer_dialog_button_follows_a_live_switch():
@@ -162,6 +167,24 @@ def test_the_link_names_beside_the_timeline_follow_a_live_switch():
         win.apply_theme(mode)
         for label in win._ribbon_labels:
             assert f"color: {VizTheme.TEXT};" in label.styleSheet(), mode
+
+def test_the_filter_expression_dialog_follows_a_live_switch():
+    """Commands ▸ Filter ▸ Filter Expression is drawn on the frame background of the theme
+    it opens in and of each theme switched to while it exists."""
+    _app = QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+
+    apply_palette("dark")
+    win = MainWindow()
+    dlg = win._filter_expression_box()
+    for mode in ("dark", "light", "dark"):
+        if mode != VizTheme.MODE:
+            win.apply_theme(mode)
+        img = dlg.grab().toImage()
+        assert img.pixelColor(2, 2).name() == VizTheme.FRAME_BG.lower(), mode
+        assert img.pixelColor(img.width() - 3, img.height() - 3).name() == \
+            VizTheme.FRAME_BG.lower(), mode
+    win.close()
 
 # --- VizTheme's palette keys must stay DECLARED for a type checker ----------------------
 #
@@ -200,3 +223,58 @@ def test_both_palettes_define_exactly_the_same_keys():
     assert set(t._DARK) == set(t._LIGHT), (
         f"dark-only={sorted(set(t._DARK) - set(t._LIGHT))} "
         f"light-only={sorted(set(t._LIGHT) - set(t._DARK))}")
+
+
+def _hls(color):
+    import colorsys
+
+    from PySide6.QtGui import QColor
+    q = QColor(color)
+    return colorsys.rgb_to_hls(q.redF(), q.greenF(), q.blueF())
+
+
+def _data_colours():
+    """Every palette colour drawn as a trace, data-port line or cursor pair, of both themes:
+    a stream colour chosen in one theme may be shown on the other's background."""
+    from swi3s_studio.ui import theme as t
+    out = []
+    for pal in (t._DARK, t._LIGHT):
+        out += list(pal["DP_LINE_PALETTE"]) + list(pal["TRACE_PALETTE"])
+        out += [pal["RAW_DP"], pal["RAW_DN"]]
+    return out
+
+
+@pytest.mark.parametrize("mode", ["light", "dark"])
+@pytest.mark.parametrize("bg_key", ["FRAME_BG", "WINDOW_BG", "ENTRY_BG", "PLOT_BG"])
+def test_text_in_a_data_colour_reads_on_each_background_in_the_same_hue(mode, bg_key):
+    """legible_text_color gives every data colour at least TEXT_ON_DATA_CONTRAST:1 on each
+    background of each theme: a colour that has it is returned as it is; one short of it
+    keeps its hue (within 3 degrees) and its lightness moves darker on a light background
+    and lighter on a dark one, no further than the floor needs."""
+    from swi3s_studio.ui import theme as t
+    from swi3s_studio.ui.theme import TEXT_ON_DATA_CONTRAST, contrast, legible_text_color
+    bg = (t._LIGHT if mode == "light" else t._DARK)[bg_key]
+    assert TEXT_ON_DATA_CONTRAST >= 3.0
+    for colour in _data_colours():
+        out = legible_text_color(colour, bg)
+        assert contrast(out, bg) >= TEXT_ON_DATA_CONTRAST, (colour, bg, out)
+        if contrast(colour, bg) >= TEXT_ON_DATA_CONTRAST:
+            assert out == colour.lower(), (colour, bg, out)
+            continue
+        (h0, l0, s0), (h1, l1, _s1) = _hls(colour), _hls(out)
+        if s0 > 0.05:
+            turn = abs(h0 - h1) * 360
+            assert min(turn, 360 - turn) <= 3.0, (colour, bg, out)
+        assert (l1 < l0) if mode == "light" else (l1 > l0), (colour, bg, out)
+        assert contrast(out, bg) < TEXT_ON_DATA_CONTRAST + 0.1, (colour, bg, out)
+
+
+def test_a_colour_with_enough_contrast_is_returned_unchanged():
+    from swi3s_studio.ui.theme import contrast, legible_text_color
+    for pal in (_LIGHT, _DARK):
+        bg = pal["FRAME_BG"]
+        assert legible_text_color(pal["TEXT"], bg) == pal["TEXT"].lower()
+        for colour in pal["DP_LINE_PALETTE"]:
+            if contrast(colour, bg) >= 3.5:
+                assert legible_text_color(colour, bg) == colour.lower()
+    assert legible_text_color("#ff50a7", _LIGHT["FRAME_BG"]) != "#ff50a7"   # 2.9:1 there

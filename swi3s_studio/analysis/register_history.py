@@ -55,6 +55,7 @@ from ..model.registers import (
     DeviceRegisterFile,
     Provenance,
     RegisterMap,
+    commit_takes_effect,
     selects_one_device,
 )
 from .errors import READ_ONLY_WRITE_MSG, command_error
@@ -219,7 +220,7 @@ def register_history(commands: List[dict], device: int, address: int,
                     has_staged = staged.provenance(next_addr) != Provenance.DEFAULT
                     out.append(_event(i, cmd, "Commit",
                                       staged.value(next_addr) if has_staged else None,
-                                      bool(cmd.get("commit_confirmed")) and has_staged))
+                                      commit_takes_effect(cmd) and has_staged))
             continue
         if (op != "WriteA32" and op not in _READS) or not mask & bit:
             continue

@@ -133,3 +133,37 @@ def test_an_ssp_part_way_through_the_skip_pattern_is_reported():
     values = _ramp(dec)
     assert _prefix_len(values) < len(values), \
         "a mid-pattern SSP was flagged but the audio was unaffected — check the fixture"
+
+
+def test_a_commit_that_rebuilds_the_ports_part_way_through_the_skip_pattern_is_reported():
+    """The demo's 8-to-16-column SSCR lands on a whole number of DP0's 160-interval skip
+    cycles. With the 8-column region's SkippingDenominator overridden to 150 it lands
+    part-way through the pattern, and it is flagged although the same commit rebuilds the
+    ports: the check reads the ports the SSP arrives at."""
+    levels = swi3score.make_demo_levels(300)
+    flagged = {}
+    for denominator in (160, 150):
+        settings = swi3score.DecoderSettings()
+        settings.register_overrides = [(1, 0, 0x1013, denominator)]   # SLC_SkippingDenominator
+        dec = swi3score.Decoder(swi3score.MemorySampleSource(levels, _RATE_HZ, _SAMPLES_PER_UI),
+                                settings)
+        dec.run()
+        assert [s["column_count"] for s in dec.segments()] == [2, 8, 16]
+        flagged[denominator] = [errors.command_error(c) for c in dec.commands()
+                                if c["command"] == "SSCR"]
+    assert flagged[160] == [None, None]
+    assert flagged[150] == [None, "SSP mid skip pattern (accumulated skipping != 0)"]
+
+
+def test_an_immediate_skipping_denominator_write_reaches_a_running_port():
+    """A single-ranked SLC_SkippingDenominator write (4 -> 8) to a port whose own config
+    does not change: the running port skips by the new ratio from the interval boundary the
+    write applies at, so the ramp stays unbroken across it. 64 intervals at 1/4 carry 48
+    samples and 64 at 1/8 carry 56."""
+    levels = swi3score.make_immediate_skipping_denominator_levels(64, 1, 4, 8)
+    dec = swi3score.Decoder(swi3score.MemorySampleSource(levels, _RATE_HZ, _SAMPLES_PER_UI),
+                            swi3score.DecoderSettings())
+    dec.run()
+    values = _ramp(dec)
+    assert _prefix_len(values) == len(values) == 48 + 56
+    assert dec.config_dataports()["skipping_denominator"] == 8

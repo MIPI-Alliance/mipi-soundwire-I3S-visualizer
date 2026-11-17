@@ -4,7 +4,7 @@ bandwidth) for the Statistics panel.
 Output is grouped into ordered, collapsible sections — each led by a
 ``(title, "", "header")`` row that MeasurementsView renders as a fold header:
 
-    Link Control  →  Regions  →  Commands  →  Peripheral Reports  →  Data Ports
+    Link Control  →  Regions  →  Commands  →  Devices  →  Peripheral Reports  →  Data Ports
 
 Rows within a section are ``(label, value)``
 or ``(label, value, kind)``. `kind` is:
@@ -21,6 +21,19 @@ from collections import Counter
 from typing import List, Tuple
 
 from .errors import count_errors, is_error
+
+
+def ssp_takes_effect(c) -> bool:
+    """True for a sync-point command the bus acts on: CRC-valid, with no Row_Delay the
+    decode rejected, and, for an SSCR, a commit that takes effect
+    (`model.registers.commit_takes_effect`)."""
+    if not (c.get("has_sync_point") and c.get("crc_valid")
+            and not c.get("row_delay_error")):
+        return False
+    if c.get("is_commit"):
+        from ..model.registers import commit_takes_effect
+        return commit_takes_effect(c)
+    return True
 
 Row = Tuple  # (label, value) or (label, value, kind)
 
@@ -88,6 +101,18 @@ def _link_control_rows(session) -> List[Row]:
     return rows
 
 
+def _region_head(session, section: int, cols: int) -> Row:
+    """A region block's heading row: "Region n", counted from 1, and the region's name: the
+    user's, followed by its column count, else the count numbered as Session.region_label
+    numbers it."""
+    name = (getattr(session, "region_names", None) or {}).get(section)
+    if name:
+        return (f"Region {section + 1}", f"{name} · {cols}-col")
+    numbers = session.region_numbers() if hasattr(session, "region_numbers") else []
+    k = numbers[section] if 0 <= section < len(numbers) else None
+    return (f"Region {section + 1}", f"{cols}-col" if k is None else f"{cols}-col {k}")
+
+
 def _region_rows(session) -> List[Row]:
     """The Regions section body: the bus-config summary, then one block per bus-config
     geometry (a 'region' is a span of constant column count; >1 means the bus
@@ -118,7 +143,7 @@ def _region_rows(session) -> List[Row]:
             ui_hz = (1e9 / ui_ns) if ui_ns > 0 else 0.0
             cols = int(st.get("column_count", 0))
             row_hz = (ui_hz / cols) if cols else 0.0
-            rows.append((f"Region {st.get('section', 0)}", f"{cols}col"))
+            rows.append(_region_head(session, int(st.get("section", 0)), cols))
             rows.append(("  clock", f"{ui_hz / clk_div / 1e6:.4f} MHz"))
             rows.append(("  UI rate", f"{ui_hz / 1e6:.4f} MHz"))
             rows.append(("  row rate", f"{row_hz / 1e3:.3f} kHz"))
@@ -136,6 +161,17 @@ def _devices_of(cmd: dict) -> List[int]:
     is counted against every device it actually wrote."""
     mask = int(cmd.get("device_mask", 0) or 0)
     return [d for d in range(12) if mask & (1 << d)]
+
+
+def devices_on_bus(commands) -> List[int]:
+    """The peripherals that drove their PingInfo token in any Ping of `commands`, sorted:
+    the devices that answer on the Link's bus."""
+    seen = set()
+    for c in commands:
+        for dev, tok in enumerate(c.get("ping_status") or ()):
+            if int(tok) >= 0:
+                seen.add(dev)
+    return sorted(seen)
 
 
 _PING_STATES = ("PING_ATTACHED", "PING_ATTACHED_BUSY", "PING_ALERT",
@@ -185,8 +221,10 @@ def _rw_detail_rows(cmds: List[dict], *, reading: bool) -> List[Row]:
     """Per-device Read/Write breakdown: command count, errors, and byte total.
 
     Bytes come from the payload actually on the wire — `data` for a Write, `read_data`
-    for a Read — so a deferred or failed read contributes 0 bytes rather than its
-    requested count."""
+    for a Read — so a failed read, or a deferred read whose delivery is missing,
+    contributes 0 bytes rather than its requested count. A delivered deferred read is
+    folded into its setup first (_fold_deferred_reads), so its bytes count on the read
+    that requested them."""
     per_dev: dict = {}                     # device -> [count, errors, bytes]
     for c in cmds:
         payload = c.get("read_data") if reading else c.get("data")
@@ -220,8 +258,11 @@ def _fold_deferred_reads(cmds: List[dict]) -> List[dict]:
     carrying no data, then a later ReadData carrying the payload and inheriting the setup's
     address and byte count. An IMMEDIATE read is a single record and is untouched here.
 
-    The delivery is folded back into its setup, contributing its payload so the byte totals
-    land on the read that requested them. Input dicts are never mutated.
+    The delivery is folded back into its setup, contributing its payload, its CRC verdict
+    and its has-data flag so the byte totals and the reply-CRC count land on the read that
+    requested them. A ReadData that carries NO data (a failed or repeated-deferred answer)
+    is not the delivery: it stays a record of its own, so its error still counts, and the
+    setup keeps waiting for the ReadData that does deliver. Input dicts are never mutated.
 
     An ORPHAN delivery — a capture that starts after the setup, so nothing to fold into —
     stays a record of its own.
@@ -231,10 +272,11 @@ def _fold_deferred_reads(cmds: List[dict]) -> List[dict]:
     for c in cmds:
         name = str(c.get("command", ""))
         devs = tuple(_devices_of(c) or [-1])
-        if name == "ReadData":
+        if name == "ReadData" and c.get("has_read_data"):
             i = awaiting.pop(devs, None)
             if i is not None:
                 merged = dict(out[i])
+                merged["has_read_data"] = c.get("has_read_data")
                 merged["read_data"] = c.get("read_data")
                 merged["read_data_crc_valid"] = c.get("read_data_crc_valid")
                 out[i] = merged
@@ -296,14 +338,15 @@ def _command_rows(session) -> List[Row]:
         rows.append(("  max", f"{max(periods):,} rows"))
         rows.append(("  mean", f"{mean:,.1f} rows"))
 
-    ssp_all = [c["start_sample"] for c in session.commands if c.get("has_sync_point")]
+    ssp_all = [c["start_sample"] for c in session.commands if ssp_takes_effect(c)]
     rows.append(("SSP count", str(len(ssp_all))))
     return rows
 
 
 def _data_port_rows(session, store) -> List[Row]:
     """The Data Ports section body: per-(device, dataport) channel count, on-bus
-    sample rate / size, bandwidth, and average SSP interval."""
+    sample rate / size, bandwidth, and average SSP interval. A row is tagged
+    `Dev<n> DP<p>`, or `Manager DP<p>` for a Manager data port (device -1)."""
     rows: List[Row] = []
     sr = session.sample_rate_hz or 1
     ssp_by_dev = _ssp_samples_by_device(session.commands)
@@ -313,11 +356,19 @@ def _data_port_rows(session, store) -> List[Row]:
         rate = store.native_rate(dev, dp)        # on-bus rate, not the 48 kHz playback decimation
         bits = max((store.native_sample_bits(dev, dp, ch) for ch in chs), default=0)
         bw = rate * len(chs) * bits              # true DP (on-bus) bandwidth
-        tag = f"Dev{dev} DP{dp}"
+        tag = f"{'Manager' if dev < 0 else f'Dev{dev}'} DP{dp}"   # as Devices names it
         rows.append((f"{tag} channels", str(len(chs))))
         rows.append((f"{tag} sample rate", f"{rate / 1000:.2f} kHz"))
-        rows.append((f"{tag} sample size", f"{bits} bits"))
-        rows.append((f"{tag} bandwidth", f"{bw / 1000:.1f} kbit/s"))
+        mixed = [r for r in (store.native_size_range(dev, dp, ch) for ch in chs) if r]
+        if mixed:
+            # A rate and a size of one run each: their product is no run's bandwidth.
+            lo, hi = min(r[0] for r in mixed), max(r[1] for r in mixed)
+            rows.append((f"{tag} sample size", f"{lo} to {hi} bits (changes between runs)"))
+            rows.append((f"{tag} bandwidth", "not measured (the sample size changes "
+                                             "between runs)"))
+        else:
+            rows.append((f"{tag} sample size", f"{bits} bits"))
+            rows.append((f"{tag} bandwidth", f"{bw / 1000:.1f} kbit/s"))
         samples = ssp_by_dev.get(dev, [])
         if len(samples) >= 2:
             diffs = [samples[i + 1] - samples[i] for i in range(len(samples) - 1)]
@@ -367,9 +418,108 @@ def _peripheral_report_rows(session) -> List[Row]:
     return rows
 
 
+def _device_rows(session, store) -> List[Row]:
+    """The Devices section body: one fold per peripheral that answers the Link's Pings, is
+    addressed by a command or carries a data port, led by "Device n" with its name and its
+    command count, then a Manager fold for the Manager's own data ports.
+
+    A device's fold holds its Ping responses (and alerts), the commands addressed to it by
+    kind (a multicast command counts on each device it addresses; a deferred read is one
+    command), the bytes read and written, its errors by kind, its reply-CRC failures and
+    reported faults, the SSPs that targeted it and its data ports."""
+    from .errors import command_error, ping_errors
+    from .port_status import fault_label, reports_for
+    from .responses import peripheral_response_name
+
+    commands = list(session.commands)
+    names = getattr(session, "device_names", None) or {}
+    store = store if store is not None else session.audio_store()
+    ports: dict = {}
+    for dev, dp in store.streams():
+        ports.setdefault(int(dev), []).append(int(dp))
+
+    pings: dict = {}                        # device -> [responses, alerts]
+    for c in commands:
+        for dev, tok in enumerate(c.get("ping_status") or ()):
+            if int(tok) < 0:
+                continue
+            slot = pings.setdefault(dev, [0, 0])
+            slot[0] += 1
+            if "ALERT" in str(peripheral_response_name("GetStatus", int(tok)) or ""):
+                slot[1] += 1
+
+    per: dict = {}                          # device -> its counters
+    def of(dev):
+        return per.setdefault(dev, {"kinds": Counter(), "errors": Counter(), "read": 0,
+                                    "written": 0, "crc": 0, "faults": 0, "ssp": 0})
+    for c in _fold_deferred_reads(commands):
+        if c.get("command") == "Ping":
+            continue
+        devs = _devices_of(c)
+        msg = command_error(c)
+        kind = ("reported fault or interrupt" if msg is not None and msg == fault_label(c)
+                else msg)
+        for dev in devs:
+            d = of(dev)
+            d["kinds"][str(c.get("command", "") or "?")] += 1
+            d["read"] += len(c.get("read_data") or b"")
+            d["written"] += len(c.get("data") or b"")
+            if kind is not None:
+                d["errors"][kind] += 1
+            if c.get("has_read_data") and c.get("read_data_crc_valid") is False:
+                d["crc"] += 1
+            if ssp_takes_effect(c):
+                d["ssp"] += 1
+        for r in reports_for(c):
+            if r.faults:
+                of(r.device)["faults"] += len(r.faults)
+    for c in commands:                      # a Ping's error is the answering device's
+        if c.get("command") == "Ping":
+            for dev, label in ping_errors(c):
+                of(dev)["errors"][f"Ping {label}"] += 1
+
+    rows: List[Row] = []
+    for dev in sorted(set(pings) | set(per) | {d for d in ports if d >= 0}):
+        d = of(dev)
+        n = sum(d["kinds"].values())
+        name = names.get(dev)
+        head = f"{n:,} commands" + (f" · {name}" if name else "")
+        rows.append((f"Device {dev}", head, "group"))
+        if dev in pings:
+            rows.append(("    Ping responses", f"{pings[dev][0]:,}", "detail"))
+            if pings[dev][1]:
+                rows.append(("      alerts", f"{pings[dev][1]:,}", "detail"))
+        for kind in sorted(d["kinds"]):
+            rows.append((f"    {kind}", f"{d['kinds'][kind]:,}", "detail"))
+        if d["read"]:
+            rows.append(("    bytes read", f"{d['read']:,}", "detail"))
+        if d["written"]:
+            rows.append(("    bytes written", f"{d['written']:,}", "detail"))
+        errs = sum(d["errors"].values())
+        if errs:
+            rows.append(("    errors", f"{errs:,}", "fail"))
+            for kind in sorted(d["errors"]):
+                rows.append((f"      {kind}", f"{d['errors'][kind]:,}", "fail"))
+        if d["crc"]:
+            rows.append(("    reply CRC failures", f"{d['crc']:,}", "fail"))
+        if d["faults"]:
+            rows.append(("    faults reported", f"{d['faults']:,}", "fail"))
+        if d["ssp"]:
+            rows.append(("    SSPs", f"{d['ssp']:,}", "detail"))
+        if ports.get(dev):
+            rows.append(("    data ports", ", ".join(f"DP{p}" for p in sorted(ports[dev])),
+                         "detail"))
+    manager = sorted(ports.get(-1, []))
+    if manager:
+        rows.append(("Manager", f"{len(manager)} data port" + ("s" if len(manager) > 1 else ""),
+                     "group"))
+        rows.append(("    data ports", ", ".join(f"DP{p}" for p in manager), "detail"))
+    return rows
+
+
 def capture_measurements(session, store=None) -> List[Row]:
-    """The full Statistics table: five ordered, collapsible sections (Link Control,
-    Regions, Commands, Peripheral Reports, Data Ports), each led by a
+    """The full Statistics table: six ordered, collapsible sections (Link Control,
+    Regions, Commands, Devices, Peripheral Reports, Data Ports), each led by a
     ``(title, "", "header")`` row. Pass the already-built AudioStore as `store` to avoid
     rebuilding it here, on the GUI thread."""
     rows: List[Row] = []
@@ -382,17 +532,19 @@ def capture_measurements(session, store=None) -> List[Row]:
     section("Link Control", _link_control_rows(session))
     section("Regions", _region_rows(session))
     section("Commands", _command_rows(session))
+    section("Devices", _device_rows(session, store))
     section("Peripheral Reports", _peripheral_report_rows(session))
     section("Data Ports", _data_port_rows(session, store))
     return rows
 
 
 def _ssp_samples_by_device(commands) -> "dict[int, List[int]]":
-    """Sync-point command start samples grouped by each targeted device. DPs on
-    the same device share the bus SSP cadence; different devices can differ."""
+    """Start samples of the sync-point commands the bus acts on (`ssp_takes_effect`),
+    grouped by each targeted device. DPs on the same device share the bus SSP cadence;
+    different devices can differ."""
     by_dev: dict = {}
     for c in commands:
-        if not c.get("has_sync_point"):
+        if not ssp_takes_effect(c):
             continue
         mask = c.get("device_mask", 0)
         for dev in range(12):

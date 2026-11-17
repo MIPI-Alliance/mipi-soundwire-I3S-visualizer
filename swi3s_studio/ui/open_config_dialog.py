@@ -10,22 +10,31 @@ authoring (in-memory), and the action is one of:
     Register Map (blue) in place of the staged values; a row's tooltip says what the
     register held without the overlay and where that came from. The diff is reported.
 
+With several Links open the dialog also asks which Link the config is for: the update
+is imposed on that Link and the compare made against it.
+
 The caller is MainWindow.open_visualizer_config.
 """
 from __future__ import annotations
 
+from typing import Sequence
+
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
 )
+
+from .theme import analyzer_stylesheet
 
 
 class OpenVisualizerConfigDialog(QDialog):
@@ -34,18 +43,33 @@ class OpenVisualizerConfigDialog(QDialog):
         path          : str   — chosen CSV path (empty when use_authoring)
         do_update     : bool  — impose the config on the decode
         do_compare    : bool  — compare the config against the decode
+        link          : int   — the index into `links` of the Link the config is for
     """
 
-    def __init__(self, parent, *, has_authoring: bool, start_dir: str = "") -> None:
+    def __init__(self, parent, *, has_authoring: bool, start_dir: str = "",
+                 links: Sequence[str] = (), link: int = 0) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Visualizer CSV")
         self.setMinimumWidth(460)
+        self.setStyleSheet(analyzer_stylesheet())
         self.use_authoring = False
         self.path = ""
         self.do_update = True
         self.do_compare = False
+        self.link = int(link)
 
         root = QVBoxLayout(self)
+
+        # -- which Link, when there are several ------------------------------
+        self._link = QComboBox()
+        self._link.addItems([str(n) for n in links])
+        if 0 <= self.link < self._link.count():
+            self._link.setCurrentIndex(self.link)
+        if len(links) > 1:
+            lr = QHBoxLayout()
+            lr.addWidget(QLabel("Link:"))
+            lr.addWidget(self._link, 1)
+            root.addLayout(lr)
 
         # -- source: a CSV file, or the current authoring --------------------
         src = QGroupBox("Config source")
@@ -117,9 +141,11 @@ class OpenVisualizerConfigDialog(QDialog):
 
     def _accept(self) -> None:
         self.use_authoring = self._from_auth.isChecked()
-        self.path = self._path_edit.text().strip()
+        self.path = "" if self.use_authoring else self._path_edit.text().strip()
         self.do_update = self._act_update.isChecked()
         self.do_compare = self._act_compare.isChecked()
+        if self._link.count():
+            self.link = self._link.currentIndex()
         if not self.use_authoring and not self.path:
             self._path_edit.setPlaceholderText("Choose a CSV file or pick authoring…")
             return                                   # keep the dialog open — no source

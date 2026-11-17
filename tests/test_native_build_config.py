@@ -7,7 +7,8 @@ configuration must use CMake's FindPython with Development.Module. The launchers
 must name the headers as the prerequisite.
 
 The swi3score distribution's minor version is its score_abi, and the distribution carries
-the repository's licence.
+the repository's licence. bindings.cpp converts a replay command dict in one function, so
+the grid, config and register replays read the same keys.
 
 CMakeLists sets CMake 3.18 as its floor, stops on a missing interpreter with a message, and
 keeps -O3 off MSVC; it and build_local.sh compile the same sources, every .cpp of the core.
@@ -17,6 +18,10 @@ CMake, so they work on any machine (CMake isn't a test dependency).
 """
 import os
 import re
+import subprocess
+import sys
+
+import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CMAKE = os.path.join(_ROOT, "native", "CMakeLists.txt")
@@ -155,10 +160,10 @@ def test_launcher_prefers_an_interpreter_with_headers():
     then no build (and no error) is needed."""
     text = _run_sh()
     assert "has_headers()" in text, "no header predicate"
-    assert text.count("for c in python3.13 python3.12 python3.11 python3;") == 2, \
+    assert text.count("for c in python3.15 python3.14 python3.13 python3.12 python3.11 python3;") == 2, \
         "expected two selection passes (prefer headers, then version-only fallback)"
-    first = text.index("for c in python3.13")
-    assert "has_headers" in text[first:text.index("for c in python3.13", first + 1)], \
+    first = text.index("for c in python3.15")
+    assert "has_headers" in text[first:text.index("for c in python3.15", first + 1)], \
         "the FIRST pass is the one that must require headers"
 
 
@@ -312,3 +317,43 @@ def test_the_core_distribution_carries_the_licence():
     with open(os.path.join(_ROOT, "LICENSE.md"), "rb") as a, \
             open(os.path.join(_ROOT, "native", "LICENSE.md"), "rb") as b:
         assert a.read() == b.read(), "native/LICENSE.md differs from LICENSE.md"
+
+
+def test_the_bindings_convert_a_replay_command_in_one_place():
+    with open(os.path.join(_ROOT, "native", "swi3score", "bindings.cpp"), encoding="utf-8") as f:
+        src = f.read()
+    for key in ("is_write", "is_commit", "is_read", "commit_confirmed", "device_mask",
+                "address", "group_mask", "data"):
+        assert src.count(f'd.contains("{key}")') == 1, key
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="build_local.sh is the Unix build path")
+@pytest.mark.parametrize("compiler_exit", [0, 1])
+def test_build_local_writes_its_output_only_on_success(tmp_path, compiler_exit):
+    """build_local.sh renames the compiler's output into place after a clean exit. A compile
+    that dies partway leaves no file at the output path (the app would import a truncated one)
+    and no temporary file beside it.
+
+    Run with a fake compiler that writes a few bytes to its -o path and exits, and stub
+    pybind11 / Python headers, so no real compile happens."""
+    inc = tmp_path / "inc"
+    (inc / "pybind11").mkdir(parents=True)
+    (inc / "pybind11" / "pybind11.h").write_text("", encoding="utf-8")
+    (inc / "Python.h").write_text("", encoding="utf-8")
+    cxx = tmp_path / "fake-cxx"
+    cxx.write_text("#!/bin/sh\n"
+                   'while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
+                   'printf partial > "$out"\n'
+                   f"exit {compiler_exit}\n", encoding="utf-8")
+    cxx.chmod(0o755)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out = out_dir / "swi3score.test.so"
+    env = dict(os.environ, PYTHON=sys.executable, CXX=str(cxx), PYBIND11_INCLUDE=str(inc),
+               PYTHON_INCLUDE=str(inc), SWI3S_NATIVE_OUT=str(out))
+    r = subprocess.run(["bash", os.path.join(_ROOT, "native", "build_local.sh")], env=env,
+                       capture_output=True, text=True)
+    assert (r.returncode == 0) == (compiler_exit == 0), r.stderr
+    assert out.exists() == (compiler_exit == 0), "output present after a failed compile"
+    assert [p.name for p in out_dir.iterdir()] == ([out.name] if compiler_exit == 0 else []), \
+        "a temporary file was left beside the output"

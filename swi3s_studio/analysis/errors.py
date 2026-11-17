@@ -18,6 +18,7 @@ def _device_count(mask: int) -> int:
 
 _ENABLECH_CURR_MSG = "Write to EnableCh_CURR with Interval != 1 Row"
 _UNEXPECTED_SSP_MSG = "SSP mid skip pattern (accumulated skipping != 0)"
+_UNEXPECTED_SSP_MID_INTERVAL_MSG = "SSP mid interval (row in interval != 0)"
 READ_ONLY_WRITE_MSG = "Programming error: write to a read-only register"
 # Single-ranked data-port control registers, by offset in a port's block.
 _RUNNING_PORT_REGS = {0x09: "SampleSizeGrouping", 0x0B: "PortControl",
@@ -57,24 +58,32 @@ def command_error(cmd: dict) -> Optional[str]:
     nothing), peripheral error-response tokens, a decoder-flagged
     EnableCh_CURR write with Interval != 1 Row (native Decoder::feed /
     CommandRec::enablechCurrError — unsafe per the SWI3S spec), an SSP-generating
-    command whose SSP landed while a Payload Interval Skipping port was part-way through
-    its skip pattern (Section 9.1.6.2.1 — CommandRec::unexpectedSspError), a Read
+    command whose SSP was unexpected: it landed while a running port was part-way through
+    its interval, or a Payload Interval Skipping port part-way through its skip pattern
+    (Section 9.1.6.2.1 — CommandRec::unexpectedSspError), a Read
     whose reply carried a peripheral-reported fault or ImpDef/SDCA interrupt (see
     :mod:`.port_status`), and a Write that changed a single-ranked control register of a
     running port (CommandRec::runningPortWriteError) — a programming error, not a
     protocol error: those registers take effect at once and are set while the port's
     channels are disabled — and a Write that covered a read-only byte
     (CommandRec::readOnlyWriteError: a register of access RO, or a CDS _CURR alias), a
-    programming error that leaves the byte unchanged.
+    programming error that leaves the byte unchanged — and an SSPA, SSCR or DSCR whose
+    Row_Delay is outside 14..15 (Section 9.1.13, CommandRec::rowDelayError), a programming
+    error the decode gives no effect: no SSP, no commit, no re-anchor.
     """
     if cmd.get("enablech_curr_error"):
         return _ENABLECH_CURR_MSG
     if cmd.get("unexpected_ssp_error"):
+        if cmd.get("unexpected_ssp_mid_interval"):
+            return _UNEXPECTED_SSP_MID_INTERVAL_MSG
         return _UNEXPECTED_SSP_MSG
     if cmd.get("running_port_write_error"):
         return _running_port_write_msg(cmd)
     if cmd.get("read_only_write_error"):
         return READ_ONLY_WRITE_MSG
+    if cmd.get("row_delay_error"):
+        return (f"Programming error: Row_Delay {int(cmd.get('row_delay', 0))} is outside "
+                "14..15; the command had no effect")
     if cmd.get("has_manager_packet") and not cmd.get("crc_valid"):
         return "CRC error"
     if cmd.get("header_valid") is False:
@@ -110,6 +119,12 @@ def command_error(cmd: dict) -> Optional[str]:
     return None
 
 
+def ping_errors(cmd: dict) -> List[Tuple[int, str]]:
+    """(device, label) for each PingInfo token of `cmd` that is an error response."""
+    return [(dev, _PERIPH_ERRORS[tok]) for dev, tok in enumerate(cmd.get("ping_status") or ())
+            if tok in _PERIPH_ERRORS]
+
+
 def is_error(cmd: dict) -> bool:
     return command_error(cmd) is not None
 
@@ -120,4 +135,5 @@ def count_errors(commands: Iterable[dict]) -> int:
 
 def error_rows(commands: List[dict]) -> List[Tuple[int, str]]:
     """(row index, label) for every flagged command."""
-    return [(i, command_error(c)) for i, c in enumerate(commands) if is_error(c)]
+    return [(i, label) for i, c in enumerate(commands)
+            if (label := command_error(c)) is not None]

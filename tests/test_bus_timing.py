@@ -25,6 +25,24 @@ def _synthetic(ui_samples=20, data_offset=4, n=4000):
                    initial_clock=False, initial_data=False, sample_rate_hz=RATE)
 
 
+def test_a_clock_pause_inside_a_region_is_not_measured():
+    """A clock paused for 1000 UIs, with one data edge inside the paused UI: that
+    transition is dropped and no margin exceeds one UI plus one sample."""
+    cap = _synthetic(ui_samples=20, data_offset=4)
+    clk = cap.clock_edges.astype(np.int64).copy()
+    k, pause = 2001, 20_000
+    clk[k:] += pause
+    dat = cap.data_edges.astype(np.int64).copy()
+    dat[k:] += pause
+    dat[k - 1] = clk[k - 1] + 10_000                     # a data edge in the paused UI
+    paused = Capture(clock_edges=clk.astype(np.uint64), data_edges=dat.astype(np.uint64),
+                     initial_clock=False, initial_data=False, sample_rate_hz=RATE)
+    whole, t = measure_bus_timing(cap), measure_bus_timing(paused)
+    one_ui_and_a_sample = t.ui_ns + 1e9 / RATE
+    assert max(t.tr_setup_ns.max(), t.tr_hold_ns.max()) <= one_ui_and_a_sample
+    assert t.tr_setup_ns.size == whole.tr_setup_ns.size - 1
+
+
 def test_setup_hold_geometry():
     t = measure_bus_timing(_synthetic(ui_samples=20, data_offset=4))
     assert t is not None
@@ -42,6 +60,23 @@ def test_setup_hold_geometry():
         assert abs(float(np.median(h)) - 16.0) < 2.0, np.median(h)
     # each transition contributes exactly one setup and one hold — equal counts
     assert t.tr_setup_ns.size == t.tr_hold_ns.size == t.n_data_edges
+
+
+def test_a_transition_on_a_clock_edge_sample_belongs_to_the_next_edge():
+    """The decoder reads the data line one sample before each clock edge, so a data edge
+    on a clock edge's own sample is seen at the NEXT edge: hold 0, setup one UI, and the
+    next column."""
+    cap = _synthetic(ui_samples=20, data_offset=0, n=4000)
+    segs = [{"start_ui": 0, "column_count": 16}]
+    t = measure_bus_timing(cap, segments=segs)
+    assert t is not None
+    ui_ns = 20 * 1e9 / RATE
+    assert np.all(t.tr_hold_ns == 0.0)
+    assert np.all(t.tr_setup_ns == ui_ns)
+    clk = cap.clock_edges.astype(np.int64)
+    # transition at clk[k] is sampled by edge k+1 (UI index k+1), so its column is (k+1) % 16
+    k = np.searchsorted(clk, t.tr_sample.astype(np.int64))
+    assert np.array_equal(t.tr_column, (k + 1) % 16)
 
 
 def test_transition_phase():

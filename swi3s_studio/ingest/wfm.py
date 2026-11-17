@@ -29,10 +29,11 @@ Layout reference (little-endian byte offsets, version 3)::
 from __future__ import annotations
 
 import math
+import os
 import re
 import struct
 import weakref
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -148,11 +149,17 @@ def _base_name(path: str) -> str:
     return re.split(r"[\\/]", str(path))[-1]
 
 
+def _held_points(path: str, curve_off: int, bytes_per_point: int) -> int:
+    """The curve points the file at `path` holds from byte `curve_off` on."""
+    return max(0, (os.path.getsize(path) - max(0, curve_off)) // max(1, bytes_per_point))
+
+
 def read_header(path: str) -> Dict[str, float]:
     """What a .wfm is, from its first kilobyte: ``{"sample_rate_hz", "n_points", "t0",
     "duration_s"}``. Every field read_wfm takes before the curve sits below 0x340, so the
     Open Capture dialog learns a pair's length without reading either record. A sample
-    interval that read_wfm refuses is refused here with the same ValueError."""
+    interval that read_wfm refuses is refused here with the same ValueError.
+    `n_points` is the curve the header gives, cut to the points the file holds."""
     with open(path, "rb") as f:
         data = f.read(_HEADER_BYTES)
     if len(data) < 0x340:
@@ -167,6 +174,8 @@ def read_header(path: str) -> Dict[str, float]:
     data_start = struct.unpack_from(f"{endian}I", data, _DATA_START_OFF_V3)[0]
     postcharge_start = struct.unpack_from(f"{endian}I", data, _POSTCHARGE_START_OFF_V3)[0]
     n = max(0, (postcharge_start - data_start) // max(1, bytes_per_point))
+    curve_buffer_start = struct.unpack_from(f"{endian}i", data, _CURVE_BUFFER_START_OFF)[0]
+    n = min(n, _held_points(path, curve_buffer_start + data_start, bytes_per_point))
     _check_interval(path, dt)
     return {"sample_rate_hz": 1.0 / dt,
             "n_points": float(n),
@@ -174,21 +183,48 @@ def read_header(path: str) -> Dict[str, float]:
 
 
 def read_wfm_pair(clock_path: str, data_path: str, max_bytes: Optional[int] = None
-                  ) -> Tuple[Dict[str, object], Dict[str, object]]:
+                  ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``(read_wfm(clock_path), read_wfm(data_path))`` with the pair priced ONCE, from
     both headers, before either curve is read: `predict_pair_peak_bytes` of the longer
     record against `memory_budget(max_bytes)` (the .sal convention: None uses the
     computed budget, a positive value overrides it, 0 opts out), raising
     :class:`analog.AnalogTooLargeError` over budget. The two reads then run unchecked,
-    so the second is not priced against memory the first already holds."""
+    so the second is not priced against memory the first already holds.
+
+    The two files must be the two channels of ONE acquisition, since a caller takes the
+    first file's time axis for both: a different record length, sample rate or start time
+    raises ValueError ("from_wfm: clock/data .wfm files disagree ...")."""
     if max_bytes != 0:
         n = max(int(read_header(p)["n_points"]) for p in (clock_path, data_path))
         analog.check_budget(f"{clock_path} + {data_path}", n, predict_pair_peak_bytes(n),
                             max_bytes)
-    return read_wfm(clock_path, max_bytes=0), read_wfm(data_path, max_bytes=0)
+    clk = read_wfm(clock_path, max_bytes=0)
+    dat = read_wfm(data_path, max_bytes=0)
+    _require_one_time_base(clock_path, clk, data_path, dat)
+    return clk, dat
 
 
-def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
+def _require_one_time_base(clock_path: str, clk: Dict[str, Any],
+                           data_path: str, dat: Dict[str, Any]) -> None:
+    """ValueError unless the two parsed records share a record length, a sample rate
+    (to 1e-6 relative) and a start time (to a thousandth of a sample period)."""
+    n_clk, n_dat = clk["time"].size, dat["time"].size
+    rate_clk, rate_dat = clk["sample_rate_hz"], dat["sample_rate_hz"]
+    rate_tol = 1e-6 * max(abs(rate_clk), abs(rate_dat))
+    t0_clk = float(clk["time"][0]) if n_clk else 0.0
+    t0_dat = float(dat["time"][0]) if n_dat else 0.0
+    dt = 1.0 / rate_clk if rate_clk else 0.0
+    t0_tol = max(1e-12, 1e-3 * dt)
+    if n_clk != n_dat or abs(rate_clk - rate_dat) > rate_tol \
+            or abs(t0_clk - t0_dat) > t0_tol:
+        raise ValueError(
+            "from_wfm: clock/data .wfm files disagree (different record length or "
+            "time base) — are they the two channels of one acquisition? "
+            f"({clock_path}: {n_clk} samples @ {rate_clk:.6g} Hz, t0={t0_clk:.6g}s vs "
+            f"{data_path}: {n_dat} samples @ {rate_dat:.6g} Hz, t0={t0_dat:.6g}s)")
+
+
+def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, Any]:
     """Parse a scope .wfm file into ``{"time", "volts", "sample_rate_hz",
     "label", "version"}``. `time` is seconds (may start negative, pre-trigger),
     READ-ONLY, and the same array for two files with the same record length,
@@ -202,8 +238,9 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     (`predict_pair_peak_bytes`) before the curve is read: `max_bytes` follows the
     .sal convention (None uses the shared `memory_budget()`, a positive value
     overrides it, 0 opts out) and :class:`analog.AnalogTooLargeError` is raised over
-    budget. To read both files of a pair, use :func:`read_wfm_pair`, which checks the
-    pair once before either is read."""
+    budget. A curve the file does not hold is refused as truncated before it is priced.
+    To read both files of a pair, use :func:`read_wfm_pair`, which checks the pair once
+    before either is read."""
     with open(path, "rb") as f:
         data = f.read(_HEADER_BYTES)
     if len(data) < 0x340:
@@ -250,8 +287,6 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
         raise ValueError(f"{path}: empty or malformed curve (data_start={data_start}, "
                          f"postcharge_start={postcharge_start})")
 
-    analog.check_budget(path, n, predict_pair_peak_bytes(n), max_bytes)
-
     curve_off = curve_buffer_start + data_start
     if curve_off < 0:
         raise ValueError(f"{path}: .wfm curve offset {curve_off} is negative "
@@ -259,6 +294,12 @@ def read_wfm(path: str, max_bytes: Optional[int] = None) -> Dict[str, object]:
     dtype = np.dtype(f"{endian}{fmt_char}")
     if dtype.itemsize != struct.calcsize(f"{endian}{fmt_char}"):
         raise AssertionError(f"{path}: dtype/struct size mismatch for format '{fmt_char}'")
+    held = _held_points(path, curve_off, dtype.itemsize)
+    if held < n:
+        raise ValueError(f"{path}: truncated curve ({held * dtype.itemsize} of "
+                         f"{n * dtype.itemsize} bytes at offset {curve_off})")
+
+    analog.check_budget(path, n, predict_pair_peak_bytes(n), max_bytes)
     with open(path, "rb") as f:
         f.seek(curve_off)
         raw = f.read(n * dtype.itemsize)

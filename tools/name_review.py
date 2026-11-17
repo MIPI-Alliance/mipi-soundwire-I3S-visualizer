@@ -306,12 +306,30 @@ def report(found: Dict[str, List[Tuple[str, int, str]]],
 _OPTIONS = ("tree", "baseline", "approve", "approve-names")
 
 
+def _tolerant_output() -> None:
+    """Make stdout and stderr write a character their encoding cannot hold as a '?' rather
+    than raise: the tool echoes repository text, and a Windows console or redirected log is
+    often cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+
+
 def main(argv: List[str] | None = None) -> int:
+    _tolerant_output()
     argv = sys.argv[1:] if argv is None else argv
     bad = [a for a in argv
            if not (a.startswith("--") and "=" in a and a[2:].split("=", 1)[0] in _OPTIONS)]
     if bad:
         print(f"name review: unknown option(s): {' '.join(bad)}\n{__doc__}", file=sys.stderr)
+        return 2
+    given = [a[2:].split("=", 1)[0] for a in argv]
+    given = ["approve-names" if n == "approve" else n for n in given]    # one option, two spellings
+    repeated = sorted({n for n in given if given.count(n) > 1})
+    if repeated:
+        print(f"name review: given more than once: {' '.join('--' + n for n in repeated)}; "
+              f"name each option once\n{__doc__}", file=sys.stderr)
         return 2
     opts = dict(a[2:].split("=", 1) for a in argv)
     approve = opts.get("approve-names", opts.get("approve"))

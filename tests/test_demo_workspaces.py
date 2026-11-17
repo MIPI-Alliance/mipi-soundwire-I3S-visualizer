@@ -70,6 +70,19 @@ def test_a_demo_opens_with_its_data_port_names(win, label):
         int(k): v for k, v in saved["source"]["region_names"].items()}
 
 
+@pytest.mark.parametrize("label", [label for label, _k in _MENU])
+def test_a_demo_opens_with_every_saved_view_read(win, label):
+    """Applying a demo's workspace reads every pane's entry, so no import warning opens
+    with the demo."""
+    from swi3s_studio.ui.import_warnings_dialog import ImportWarningsDialog
+    _open(win, label)
+    shown = [w for w in QApplication.topLevelWidgets()
+             if isinstance(w, ImportWarningsDialog) and w.isVisible()]
+    for w in shown:
+        w.close()
+    assert [w.lines() for w in shown] == []
+
+
 def test_phy2_opens_two_links_named_as_their_demos(win):
     _open(win, "PHY2")
     assert [link.name for link in win.links] == ["Link 1", "Link 2"]

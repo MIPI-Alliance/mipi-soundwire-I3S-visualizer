@@ -466,7 +466,7 @@ class BusModelBuilder:
 
     @staticmethod
     def _cds_source_device(source_index: int) -> int:
-        """Map a CDS_Guard_PerSource / CDS_Tail_PerSource list index to a device.
+        """Map a per-source CDS guard / CDS_Tail_PerSource list index to a device.
 
         Index 0 is the Manager; index d+1 (d in 0-11) is Device d. This is the
         engine-side counterpart of model/bus_config.py's cds_src_index().
@@ -481,16 +481,16 @@ class BusModelBuilder:
         which the goldens pin.
         Only a per-source DIVERGENCE (a device set differently from the rest) drops to
         per-source emission + the peripheral CDS-bit handover."""
-        return (len(set(self.interface.CDS_Guard_PerSource)) <= 1
+        return (len(set(self.interface.cds_guard_drawn())) <= 1
                 and len(set(self.interface.CDS_Tail_PerSource)) <= 1)
 
     def _cds_guard_sources(self) -> List[int]:
         """Source indices (0=Manager, 1..12=Device 0-11) that drive a CDS guard.
         Uniform configs collapse to the Manager alone (see _cds_uniform)."""
-        per_source = self.interface.CDS_Guard_PerSource
+        per_source = self.interface.CDS_GuardEnable_PerSource
         if self._cds_uniform():
-            return [0] if per_source[0] != 0 else []
-        return [i for i, value in enumerate(per_source) if value != 0]
+            return [0] if per_source[0] else []
+        return [i for i, enabled in enumerate(per_source) if enabled]
 
     def _cds_tail_sources(self) -> List[int]:
         """Source indices (0=Manager, 1..12=Device 0-11) that drive a CDS tail.
@@ -512,8 +512,8 @@ class BusModelBuilder:
         """
         for source_index in self._cds_guard_sources():
             device = self._cds_source_device(source_index)
-            polarity = self.interface.CDS_Guard_PerSource[source_index]
-            slot_type = SlotType.GUARD_1 if polarity == 2 else SlotType.GUARD_0
+            polarity = self.interface.CDS_GuardPolarity_PerSource[source_index]
+            slot_type = SlotType.GUARD_1 if polarity else SlotType.GUARD_0
             self._add_column_bits(column, device, slot_type)
 
     def _add_cds_tail_column(self, column: int, col_offset: int) -> None:
@@ -570,9 +570,9 @@ class BusModelBuilder:
         a uniform config no device is bare, so this is False (no peripheral handover)."""
         if self._cds_uniform():
             return False
-        g = self.interface.CDS_Guard_PerSource
+        g = self.interface.CDS_GuardEnable_PerSource
         t = self.interface.CDS_Tail_PerSource
-        return any(g[i] == 0 and t[i] == 0 for i in range(1, 13))
+        return any(not g[i] and t[i] == 0 for i in range(1, 13))
 
     def _add_cds_peripheral_handover(self, column: int) -> None:
         """Each peripheral device (0-11) that drives NEITHER a CDS guard nor tail drove
@@ -584,10 +584,10 @@ class BusModelBuilder:
         the guard column so its clash check has already run; being CDS turnarounds these
         don't clash with the Manager's guard/tail (time-multiplexed; add_handover
         is_cds)."""
-        g = self.interface.CDS_Guard_PerSource
+        g = self.interface.CDS_GuardEnable_PerSource
         t = self.interface.CDS_Tail_PerSource
         for dev in range(12):                      # device d -> per-source index d+1
-            if g[dev + 1] == 0 and t[dev + 1] == 0:
+            if not g[dev + 1] and t[dev + 1] == 0:
                 self._add_column_bits(column, dev, SlotType.HANDOVER)
 
     def _process_data_port(self, dp_index: int, dp: DataPort) -> None:
@@ -646,8 +646,22 @@ class BusModelBuilder:
             row = bit_num // num_cols
             column = bit_num % num_cols
 
-            # DP data path emits first
+            # The FCP ticks before the DP: its DRQ gate reads the DP's interval_skipped,
+            # which the DP's tick in the last UI of an interval already sets for the next
+            # interval. FCP emits as an independent parallel source. Any DP+FCP collision
+            # is surfaced by the bus model's SAME_DEVICE clash detector (no
+            # arbitration in the core loop).
             device_obj = dp._device
+            device_obj._active_port = fcp
+            device_obj._current_slot = None
+            fcp.clock_tick()
+            fcp_slot = device_obj._current_slot
+            if fcp_slot is None:
+                fcp_slot = BitSlotState(slot_type=SlotType.EMPTY)
+            fcp_slot.device_num = device
+            fcp_slot.dp_num = dp_index
+
+            # DP data path
             device_obj._active_port = dp
             device_obj._current_slot = None
             dp.clock_tick()
@@ -670,18 +684,6 @@ class BusModelBuilder:
                 self._transport_counts[dp_index] += 1
 
             transport_index_at_emit = self._transport_counts[dp_index]
-
-            # FCP emits as an independent parallel source. Any DP+FCP collision
-            # is surfaced by the bus model's SAME_DEVICE clash detector (no
-            # arbitration in the core loop).
-            device_obj._active_port = fcp
-            device_obj._current_slot = None
-            fcp.clock_tick()
-            fcp_slot = device_obj._current_slot
-            if fcp_slot is None:
-                fcp_slot = BitSlotState(slot_type=SlotType.EMPTY)
-            fcp_slot.device_num = device
-            fcp_slot.dp_num = dp_index
 
             # Dispatch DP slot to bus model (with handover tracking below)
             # Track tail_drawn across both paths for handover semantics.
@@ -791,7 +793,13 @@ class BusModelBuilder:
         slot_type = bit_slot.slot_type
         if slot_type == SlotType.TX_PRESENT:
             if bit_slot.direction == DirectionType.SOURCE:
-                self.clash_detector.add_txp_source(row, column, device)
+                # Validate pairing only at the last UI of a wide TxPresent bit: the sink
+                # reads it there alone. After the DataPort's tick wide_bit_remaining is
+                # back at BitWidth_REG only on that UI.
+                self.clash_detector.add_txp_source(
+                    row, column, device,
+                    for_validation=(dp.state.wide_bit_remaining == dp.config.BitWidth_REG),
+                )
             else:
                 self.clash_detector.add_txp_sink(row, column, device)
 
@@ -1090,7 +1098,11 @@ class BusModelBuilder:
         A mismatch occurs when:
         - One data port is in a test mode (Test0 or Test1) while another is in normal mode
         - Two data ports are in different test modes (Test0 vs Test1)
+
+        Modes compare by the raw bit they force (`port_mode_bit`), so Reserved, which is
+        drawn as Normal, matches Normal.
         """
+        from ..models.enums import port_mode_bit
         warned = set(self.bus_model.warnings.test_mode_mismatches)
         # Check each position for test mode mismatches
         for bit_index, bits in bits_by_index.items():
@@ -1111,7 +1123,7 @@ class BusModelBuilder:
                     seen_pairs.add(pair_key)
 
                     # Check if port modes differ
-                    if bit1.port_mode != bit2.port_mode:
+                    if port_mode_bit(bit1.port_mode) != port_mode_bit(bit2.port_mode):
                         # Mismatch found: (bit_index, (dp1, mode1), (dp2, mode2))
                         mismatch = (bit_index, (bit1.dp, bit1.port_mode), (bit2.dp, bit2.port_mode))
                         if mismatch not in warned:
@@ -1133,7 +1145,8 @@ class BusModelBuilder:
         """
         num_columns = self.interface.num_columns
         for dp_index, dp in enumerate(self.interface.data_ports):
-            if not dp.config._drq_enabled or not self.viz_config.data_ports[dp_index].enabled:
+            if (not dp.config._drq_enabled or not self.viz_config.data_ports[dp_index].enabled
+                    or not self._is_placed(dp_index)):
                 continue
             fcp_config = self.interface.flow_control_ports[dp_index].config
             last_ui_column = fcp_config.FCP_HorizontalStart_REG + fcp_config.FCP_BitWidth_REG
@@ -1172,6 +1185,16 @@ class BusModelBuilder:
             # Use popcount _num_channels property for performance
             num_channels = dp.config._num_channels
             if num_channels == 0:
+                continue
+
+            # The skipping accumulator reaches the denominator on every interval when the
+            # numerator is at least the denominator, so every interval is skipped.
+            numerator = dp.config.SkippingNumerator_REG
+            denominator = self.interface.SkippingDenominator_REG
+            if numerator and numerator >= denominator:
+                warning = (f"DP{dp_index}", numerator, denominator)
+                if warning not in self.bus_model.warnings.all_intervals_skipped_warnings:
+                    self.bus_model.warnings.all_intervals_skipped_warnings.append(warning)
                 continue
 
             # Calculate expected bits per interval

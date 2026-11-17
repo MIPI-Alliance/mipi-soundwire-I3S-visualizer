@@ -188,3 +188,67 @@ def test_a_port_on_a_device_number_that_names_no_device_gets_only_the_device_err
         assert w.sink_handover_warnings == [], regs
     assert _build_on_device(11, EnableCh_REG=0).warnings.enabled_no_channels_warnings == [
         ("DP0", 0)]
+
+
+def _row0_slots(columns, **regs):
+    """The engine's slots for DP0 in row 0 of a one-port config: {column: SlotType name}."""
+    import logging
+
+    from swi3s_studio.swviz.core.engine import BusModelBuilder
+    from swi3s_studio.swviz.models.interface import Interface
+    from swi3s_studio.swviz.viz import VizConfig
+    logging.disable(logging.CRITICAL)
+    iface, viz = Interface(), VizConfig()
+    iface.NumColumns_REG = columns
+    cfg = iface.data_ports[0].config
+    cfg.EnableCh_REG = 1
+    for k, v in regs.items():
+        setattr(cfg, k, v)
+    iface.set_dp_device(0, 0)
+    viz.data_ports[0].enabled = True
+    bm = BusModelBuilder(iface, 2, viz).build()
+    n = columns + 1
+    return {b.bit_index: b.slot.name for b in bm.bits if b.dp == 0 and b.bit_index < n}
+
+
+def test_a_spaced_pattern_shorter_than_its_window_ends_where_its_last_group_does():
+    """Outside SRI a spaced (Spacing_REG != 0) pattern stops after its last channel group, so
+    the tail is checked after that group, not at the window's end."""
+    regs = dict(columns=31, SampleSize_REG=3, SampleGrouping_REG=1, Spacing_REG=1,
+                HorizontalCount_REG=29, TailWidth_REG=2, SubRowInterval_REG=False)
+    fits = dict(regs, HorizontalStart_REG=1)              # data 1..8, tail 9..10
+    assert [c for c, s in _row0_slots(**fits).items() if s == "TAIL"] == [9, 10]
+    r = _port_validation(**fits)
+    assert not any(e.field == "TailWidth" for e in r.errors), r.get_summary()
+    # Data 24..31 leaves no column for the tail.
+    over = dict(regs, HorizontalStart_REG=24, HorizontalCount_REG=7)
+    assert "TAIL" not in _row0_slots(**over).values()
+    assert any(e.field == "TailWidth" for e in _port_validation(**over).errors)
+
+
+def test_the_spaced_pattern_length_counts_the_gaps_and_the_trailing_group():
+    v = DataPortValidator(SimpleNamespace(num_columns=32))
+    # 3 channels in groups of 2 -> groups of 2 and 1 channels; 4 bits a channel-sample,
+    # 1 sample; Spacing_REG 3 -> 2 gap UIs between the groups: 8 + 4 + 2.
+    cfg = SimpleNamespace(SampleSize_REG=3, SampleGrouping_REG=0, BitWidth_REG=0,
+                          Spacing_REG=3, _txp_enabled=False)
+    assert v._pattern_length(cfg, num_channels=3, effective_channel_grouping=2) == 14
+
+
+def test_a_guard_and_a_tail_together_must_fit_after_the_data():
+    """The guard UI comes before the tail, so a port with both needs 1 + TailWidth columns
+    after its data. Data in 2..13 of 16 columns leaves 2: the guard takes 14 and only one of
+    the two tail UIs fits, which is an error; from column 1 all three fit."""
+    regs = dict(columns=15, HorizontalCount_REG=11, SampleSize_REG=11, GuardEnable_REG=True,
+                TailWidth_REG=2)
+    short = dict(regs, HorizontalStart_REG=2)
+    slots = _row0_slots(**short)
+    assert slots[14] == "GUARD_0" and [c for c, s in slots.items() if s == "TAIL"] == [15]
+    assert any(e.field == "TailWidth" for e in _port_validation(**short).errors)
+    fits = dict(regs, HorizontalStart_REG=1)
+    assert [c for c, s in _row0_slots(**fits).items() if s == "TAIL"] == [14, 15]
+    r = _port_validation(**fits)
+    assert not any(e.field in ("TailWidth", "GuardEnable") for e in r.errors), r.get_summary()
+    # A guard with no tail is the guard check's alone.
+    guard_only = dict(short, TailWidth_REG=0, HorizontalStart_REG=4)
+    assert not any(e.field == "TailWidth" for e in _port_validation(**guard_only).errors)

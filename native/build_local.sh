@@ -74,6 +74,12 @@ echo "python   : $PYINC"
 echo "compiler : $CXX"
 echo "output   : $OUT"
 
+# The compiler writes a temporary file beside $OUT, renamed into place only after a clean
+# exit, so an interrupted build never leaves a truncated module at $OUT for the app to
+# import. The temporary name is not an importable module name, and the trap removes it.
+PARTIAL="$(dirname "$OUT")/swi3score.partial-$$${SUFFIX}"
+trap 'rm -f "$PARTIAL"' EXIT
+
 # -O3 + LTO: decode is per-clock-edge (millions of UIs), and the hot loop spans
 # several .cpp files, so cross-TU inlining matters. Portable (no -march=native).
 "$CXX" $OPT_FLAGS -std=c++17 -shared -fPIC $LINK_FLAGS -fvisibility=hidden \
@@ -82,6 +88,7 @@ echo "output   : $OUT"
     "$HERE/swi3score/bindings.cpp" \
     "$HERE/swi3score/Decoder.cpp" \
     "$HERE/swi3score/Demo.cpp" \
+    "$HERE/swi3score/VcdReader.cpp" \
     "$CORE_SRC/C8b10bDecoder.cpp" \
     "$CORE_SRC/CCommandTransportParser.cpp" \
     "$CORE_SRC/CRegisterModel.cpp" \
@@ -90,6 +97,7 @@ echo "output   : $OUT"
     "$CORE_SRC/CDataPort.cpp" \
     "$CORE_SRC/CFlowControlPort.cpp" \
     "$CORE_SRC/CPayloadEngine.cpp" \
-    -o "$OUT"
+    -o "$PARTIAL"
+mv -f "$PARTIAL" "$OUT"
 
 echo "built $(basename "$OUT")"

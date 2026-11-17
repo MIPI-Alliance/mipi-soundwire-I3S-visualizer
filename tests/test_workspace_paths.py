@@ -41,6 +41,42 @@ def test_a_capture_is_saved_relative_to_the_workspace(tmp_path):
     assert src["saved_at"] == {"path": os.path.abspath(cap)}
 
 
+def test_a_capture_with_no_relative_path_is_saved_absolute_and_opens(tmp_path, monkeypatch):
+    """A capture that has no path relative to the workspace (another drive on Windows, where
+    os.path.relpath raises ValueError) is saved as its absolute path, and opens from it after
+    the workspace is moved."""
+    cap = _sal(tmp_path / "captures")
+    ws_path = str(tmp_path / "proj" / "w.swi3s")
+    os.makedirs(tmp_path / "proj")
+
+    def no_relative_path(path, start=None):
+        raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+    with monkeypatch.context() as m:
+        m.setattr(os.path, "relpath", no_relative_path)
+        roundabout = os.path.join(os.path.dirname(cap), os.pardir, "captures", "bus.sal")
+        Workspace(links=[LinkSpec(source=_sal_source(roundabout))]).save(ws_path)
+    src = _saved(ws_path)["links"][0]["source"]
+    assert src["path"] == os.path.abspath(cap)
+    assert src["saved_at"] == {"path": os.path.abspath(cap)}
+    shutil.move(ws_path, str(tmp_path / "w.swi3s"))
+    ws = Workspace.load(str(tmp_path / "w.swi3s"))
+    assert ws.links[0].source["path"] == os.path.abspath(cap) and ws.missing_files() == []
+
+
+def test_a_capture_under_a_non_ascii_name_is_saved_relative_and_opens(tmp_path):
+    """A folder and a capture named outside ASCII are saved as the same text, relative to
+    the workspace, and open from there after the folder is moved."""
+    cap = _sal(tmp_path / "proj" / "Aufnahmen é 録音", name="Bus ü.sal")
+    ws_path = str(tmp_path / "proj" / "w.swi3s")
+    Workspace(links=[LinkSpec(source=_sal_source(cap))]).save(ws_path)
+    assert _saved(ws_path)["links"][0]["source"]["path"] == "Aufnahmen é 録音/Bus ü.sal"
+    shutil.move(str(tmp_path / "proj"), str(tmp_path / "moved"))
+    ws = Workspace.load(str(tmp_path / "moved" / "w.swi3s"))
+    assert ws.links[0].source["path"] == str(tmp_path / "moved" / "Aufnahmen é 録音" / "Bus ü.sal")
+    assert ws.missing_files() == []
+
+
 def test_a_moved_folder_still_opens(tmp_path):
     cap = _sal(tmp_path / "proj" / "captures")
     Workspace(links=[LinkSpec(source=_sal_source(cap))]).save(str(tmp_path / "proj" / "w.swi3s"))
@@ -75,6 +111,21 @@ def test_a_lost_capture_is_reported_and_locating_one_file_finds_its_partner(tmp_
     ws.locate(0, "clock", str(tmp_path / "b" / "clk.bin"))
     assert ws.missing_files() == []
     assert ws.links[0].source["data"] == str(tmp_path / "b" / "dat.bin")
+
+
+def test_a_lost_relative_capture_is_not_found_in_the_working_directory(tmp_path, monkeypatch):
+    """A relative capture found neither beside the workspace nor where it was saved is
+    reported missing, even when the working directory holds a file of that relative name."""
+    cap = _sal(tmp_path / "projA" / "captures")
+    Workspace(links=[LinkSpec(source=_sal_source(cap))]).save(str(tmp_path / "projA" / "w.swi3s"))
+    os.makedirs(tmp_path / "downloads")
+    shutil.move(str(tmp_path / "projA" / "w.swi3s"), str(tmp_path / "downloads" / "w.swi3s"))
+    shutil.rmtree(tmp_path / "projA")
+    _sal(tmp_path / "projB" / "captures")
+    monkeypatch.chdir(tmp_path / "projB")
+    ws = Workspace.load(str(tmp_path / "downloads" / "w.swi3s"))
+    expected = str(tmp_path / "downloads" / "captures" / "bus.sal")
+    assert ws.missing_files() == [(0, "path", expected)]
 
 
 def test_an_analog_csvs_channel_names_are_not_taken_for_files(tmp_path):
@@ -151,7 +202,7 @@ def test_a_lost_capture_can_be_located(opened, tmp_path, monkeypatch):
     os.makedirs(tmp_path / "archive")
     new = shutil.move(cap, str(tmp_path / "archive" / "bus.sal"))
     again, asked = _reopen(monkeypatch, ws_path, "locate", located=new)
-    assert asked == ["captures/bus.sal"]
+    assert asked == [str(tmp_path / "proj" / "captures" / "bus.sal")]
     assert len(again.links) == 1 and again._session.source["path"] == new
 
 
@@ -193,7 +244,7 @@ def test_skipping_the_first_link_opens_the_others(tmp_path, monkeypatch):
     os.remove(a)
     errors = _no_errors(monkeypatch)
     again, asked = _reopen(monkeypatch, ws_path, "skip")
-    assert asked == ["a.sal"]
+    assert asked == [os.path.abspath(a)]
     assert [(e.name, e.offset_ps) for e in again.links] == [("Bus B", 7)]
     assert again._session.source["path"] == b
     assert sorted((m.sample, m.link) for m in again._bookmarks) == [(22, 0)]
@@ -207,6 +258,53 @@ def test_skipping_every_link_opens_nothing_and_reports_no_error(tmp_path, monkey
     os.remove(b)
     errors = _no_errors(monkeypatch)
     again, asked = _reopen(monkeypatch, ws_path, "skip")
-    assert asked == ["a.sal", "b.sal"]
+    assert asked == [os.path.abspath(a), os.path.abspath(b)]
     assert len(again.links) == 0 and getattr(again, "_load_thread", None) is None
     assert errors == []
+
+
+def test_a_windows_pair_on_another_drive_is_named_and_located_by_its_file(tmp_path):
+    """A pair saved on Windows on another drive than its workspace keeps its absolute
+    `D:\\` paths; once the user finds one file, the other is taken from the same folder, and
+    the Link and an import note name each by its file."""
+    from swi3s_studio import import_notes
+    from swi3s_studio.session import Session
+    pair = {"type": "saleae_binary", "clock": "D:\\caps\\clk.bin", "data": "D:\\caps\\dat.bin",
+            "sample_rate_hz": 500_000_000,
+            "saved_at": {"clock": "D:\\caps\\clk.bin", "data": "D:\\caps\\dat.bin"}}
+    ws_path = tmp_path / "w.swi3s"
+    ws_path.write_text(json.dumps({"links": [{"source": pair}]}), encoding="utf-8")
+    found = tmp_path / "found"
+    os.makedirs(found)
+    for name in ("clk.bin", "dat.bin"):
+        (found / name).write_bytes(b"x")
+    ws = Workspace.load(str(ws_path))
+    assert [p for _i, _k, p in ws.missing_files()] == ["D:\\caps\\clk.bin", "D:\\caps\\dat.bin"]
+    assert Session.label_of(ws.links[0].source) == "clk.bin & dat.bin"
+    assert import_notes.source_name("D:\\caps\\clk.bin") == "clk.bin"
+    ws.locate(0, "clock", str(found / "clk.bin"))
+    assert ws.missing_files() == []
+    assert ws.links[0].source["data"] == str(found / "dat.bin")
+
+
+@pytest.mark.skipif(os.sep == "\\", reason="a backslash cannot be in a Windows file name")
+def test_a_posix_file_name_holding_a_backslash_is_named_and_located_by_it(tmp_path):
+    from swi3s_studio import import_notes
+    from swi3s_studio.session import Session
+    saved = tmp_path / "gone"
+    os.makedirs(saved)
+    pair = {"type": "saleae_binary", "clock": str(saved / "run\\A_clk.bin"),
+            "data": str(saved / "run\\A_dat.bin"), "sample_rate_hz": 1_000_000}
+    ws_path = tmp_path / "w.swi3s"
+    ws_path.write_text(json.dumps({"links": [{"source": pair}]}), encoding="utf-8")
+    found = tmp_path / "found"
+    os.makedirs(found)
+    for name in ("run\\A_clk.bin", "run\\A_dat.bin"):
+        (found / name).write_bytes(b"x")
+    ws = Workspace.load(str(ws_path))
+    assert Session.label_of(ws.links[0].source) == "run\\A_clk.bin & run\\A_dat.bin"
+    assert import_notes.source_name(str(saved / "run\\A_clk.bin")) == "run\\A_clk.bin"
+    assert import_notes.source_name("run\\A_clk.bin") == "A_clk.bin"
+    ws.locate(0, "clock", str(found / "run\\A_clk.bin"))
+    assert ws.missing_files() == []
+    assert ws.links[0].source["data"] == str(found / "run\\A_dat.bin")

@@ -23,6 +23,7 @@ import sys
 import time
 
 import pytest
+from conftest import symlink_or_skip
 
 from swi3s_studio import cli
 from swi3s_studio.model import viz_engine
@@ -151,13 +152,27 @@ def test_a_bus_clash_exits_two_and_still_writes_the_model(tmp_path):
     assert "Bus Clash" in r.stdout
 
 
+def test_a_report_the_stdout_encoding_cannot_hold_is_escaped_not_raised(tmp_path):
+    """The report follows the model write: an output path outside stdout's code page is
+    printed as an escape, the exit code stays the clash's 2 and the model is on disk."""
+    out = tmp_path / "\u6a21\u578b.json"
+    env = dict(os.environ, PYTHONIOENCODING="cp1252:strict")
+    r = subprocess.run([sys.executable, "-m", "swi3s_studio.app", "-c", _CLASH, "-o", str(out)],
+                       cwd=_ROOT, capture_output=True, text=True, timeout=_TIMEOUT_S, env=env)
+    assert out.is_file()
+    assert r.returncode == 2, f"exit {r.returncode}; stderr={r.stderr!r}"
+    assert "Traceback" not in r.stderr
+    assert "\\u6a21\\u578b.json" in r.stdout and "Bus Clash" in r.stdout
+
+
 def test_a_clean_config_exits_zero():
     assert _run("-c", _CLEAN, "-o", os.devnull).returncode == 0
 
 
 def test_a_truncated_drq_without_a_bus_clash_exits_two(tmp_path):
     """A wide DRQ whose last UI falls past the row end is a configuration error the exit code
-    reports as a clash is, though the bus has no clash."""
+    reports as a clash is, though the bus has no clash. The printed issue list names it: the
+    FCP-fits-row check fails on every config the truncation check flags."""
     from swi3s_studio.model.bus_config import BusConfig
     cfg = BusConfig(num_columns=15)
     port = cfg.dataports[3]
@@ -169,6 +184,7 @@ def test_a_truncated_drq_without_a_bus_clash_exits_two(tmp_path):
     assert not model.bus_clashes and model.warnings.drq_truncation_warnings == [("DP3", 17, 16)]
     out = io.StringIO()
     assert cli.run_headless(str(csv_path), str(tmp_path / "m.json"), out=out) == 2
+    assert "ERROR   DP3: FCP bits would overflow row" in out.getvalue(), out.getvalue()
     assert (tmp_path / "m.json").is_file()
 
 
@@ -208,12 +224,19 @@ def test_build_bus_model_refuses_a_csv_that_does_not_load(tmp_path):
 @pytest.mark.parametrize("config", _EXAMPLES,
                          ids=[os.path.basename(c)[:-4] for c in _EXAMPLES])
 def test_batch_json_is_identical_to_the_ui_export(config, tmp_path):
-    """Every config in the corpus: -o goes through viz_engine, like the UI's Export, and a
-    divergence can depend on a warning only some configs raise."""
+    """Every config in the corpus: the JSON `-o` writes equals what File > Export Bus Model
+    (JSON) writes for the same file. The Export loads the CSV into the authoring panel's
+    BusConfig, writes it back to CSV and builds from that (`authored_model_json`), so a field
+    the round trip drops or re-derives shows as a difference."""
+    from swi3s_studio.ingest.visualizer_csv import normalized_path
+    from swi3s_studio.model.bus_config import BusConfig
+    from swi3s_studio.ui.authoring_controller import authored_rows
     out = tmp_path / "m.json"
     rc = _run("-c", config, "-o", str(out)).returncode
     assert rc in (0, 2), f"{config} exited {rc}"
-    assert json.loads(pathlib.Path(out).read_text()) == viz_engine.model_json(config), (
+    cfg = BusConfig.from_csv(normalized_path(config))
+    exported = viz_engine.authored_model_json(cfg, authored_rows(cfg.rows_to_draw)[0])
+    assert json.loads(pathlib.Path(out).read_text()) == exported, (
         f"batch JSON differs from the UI's Export for {os.path.basename(config)}")
 
 
@@ -234,6 +257,17 @@ def test_demo_flags_still_parse():
     assert cli.parse(["x", "--demo"])[0].demo is True
     assert cli.parse(["x", "--demo-bringup"])[0].demo_bringup is True
     assert cli.parse(["x"])[0].demo is False
+
+
+def test_an_empty_config_and_a_demo_with_a_config_or_output_are_usage_errors(capsys):
+    for argv, says in ((["x", "-c", ""], "-c/--config needs a file name"),
+                       (["x", "-c", "cfg.csv", "--demo"], "takes no -c/--config"),
+                       (["x", "--demo-bringup", "-c", "cfg.csv"], "takes no -c/--config"),
+                       (["x", "--demo", "-c", "cfg.csv", "-o", "m.json"], "takes no")):
+        with pytest.raises(SystemExit) as e:
+            cli.parse(argv)
+        assert e.value.code == 1, argv
+        assert says in capsys.readouterr().err, argv
 
 
 def test_help_names_what_each_flag_opens():
@@ -436,6 +470,67 @@ def test_run_sh_rebuilds_wherever_rebuild_is_given(stub_launcher_env, args):
     assert forwarded == ["--demo"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="run.sh is the Unix launcher")
+@pytest.mark.parametrize("present", [True, False])
+def test_run_sh_stops_on_a_root_core_that_cannot_load(tmp_path, present):
+    """A decode core at the checkout root is imported before the venv's build. A truncated one
+    stops the launch with its name and the fix, before any build and before the app starts;
+    without one, the launch goes ahead.
+
+    Run in a scratch checkout (run.sh, requirements.txt, native/) so a broken root core never
+    sits in the real one. The fake python hands the EXT_SUFFIX query and the import probes to
+    the real interpreter, so the loader's own error is what run.sh sees."""
+    checkout = tmp_path / "checkout"
+    (checkout / "native").mkdir(parents=True)
+    run_sh = checkout / "run.sh"
+    run_sh.write_text(pathlib.Path(_RUN_SH).read_text(encoding="utf-8"), encoding="utf-8")
+    (checkout / "requirements.txt").write_text("", encoding="utf-8")
+    (checkout / "native" / "source.cpp").write_text("", encoding="utf-8")
+    suffix = subprocess.run([sys.executable, "-c",
+                             "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    root_core = checkout / f"swi3score{suffix}"
+    if present:
+        root_core.write_bytes(b"")
+
+    venv, binroot = tmp_path / "venv", tmp_path / "bin"
+    (venv / "bin").mkdir(parents=True)
+    binroot.mkdir()
+    (venv / "bin" / "activate").write_text(f'export PATH="{binroot}:$PATH"\n', encoding="utf-8")
+    log = tmp_path / "calls.txt"
+    spaced = tmp_path / "an interpreter dir"        # the real interpreter's path holds a space
+    spaced.mkdir()
+    real = spaced / "python"
+    symlink_or_skip(sys.executable, real)
+    fake = binroot / "python"
+    fake.write_text("#!/bin/sh\n"
+                    'case " $* " in\n'
+                    f'  *" swi3s_studio.app "*) echo app >> "{log}"; exit 0 ;;\n'
+                    f'  *" pip install "*) echo pip >> "{log}"; exit 0 ;;\n'
+                    f'  *EXT_SUFFIX*|*"import swi3score"*) exec "{real}" "$@" ;;\n'
+                    "esac\n"
+                    "exit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    after = time.time() + 1
+    for name in (".deps-stamp", ".native-stamp"):
+        (venv / name).write_text("", encoding="utf-8")
+        os.utime(venv / name, (after, after))
+
+    env = dict(os.environ, SWI3S_VENV=str(venv), PYTHON=str(fake))
+    r = subprocess.run(["bash", str(run_sh), "--demo"], cwd=checkout, env=env,
+                       capture_output=True, text=True)
+    calls = log.read_text(encoding="utf-8").split() if log.exists() else []
+    if present:
+        assert r.returncode == 1, f"run.sh went on past a broken root core: {r.stderr!r}"
+        assert f"Cannot load ./{root_core.name}" in r.stderr, r.stderr
+        assert f"rm ./{root_core.name}" in r.stderr, r.stderr
+        assert "app" not in calls and "pip" not in calls, f"run.sh still ran {calls}"
+    else:
+        assert r.returncode == 0, f"run.sh failed: {r.stdout!r} {r.stderr!r}"
+        assert "Cannot load" not in r.stderr
+        assert calls[-1:] == ["app"], f"the app was not launched: {calls}"
+
+
 def test_run_sh_reads_its_arguments_in_one_place():
     """One loop reads all the arguments, so the build step and the forwarding see the same
     list."""
@@ -473,6 +568,59 @@ def test_run_sh_is_quiet_about_a_window_it_will_not_open(stub_launcher_env):
     assert "Starting SWI3S Studio" not in r.stdout, r.stdout
     r, _ = _launch(env, record, "--demo")
     assert "Starting SWI3S Studio" in r.stdout, "the GUI path must still say it is starting"
+
+
+# The headless spellings, the same set in both launchers; a case variant is none of them.
+_HEADLESS_FORMS = [("-o", "m.json"), ("-om.json",), ("-o=m.json",), ("--output", "m.json"),
+                   ("--output=m.json",), ("--o",), ("--ou=m.json",), ("--out",), ("--outp",),
+                   ("--outpu=m.json",), ("-h",), ("--h",), ("--he",), ("--hel",), ("--help",)]
+_NOT_HEADLESS_FORMS = [("-O",), ("-H",), ("-O", "m.json"), ("--OUTPUT",), ("--Output=m.json",),
+                       ("--HELP",), ("--He",), ("-O=m.json",)]
+
+
+def _ps1_is_headless(arg):
+    """Whether run.ps1's `$headless` test counts `arg`, evaluated from the script's own text
+    with PowerShell's operators: -ceq / -clike compare case-sensitively, -eq / -like do not."""
+    import fnmatch
+    import re
+    text = pathlib.Path(_RUN_PS1).read_text(encoding="utf-8")
+    start = text.index("$headless = @(")
+    block = text[start:text.index(".Count -gt 0", start)]
+    terms = re.findall(r'\$_ -(ceq|clike|eq|like) "([^"]*)"', block)
+    assert terms, "run.ps1's $headless test no longer reads as `$_ -op \"literal\"` terms"
+    for op, literal in terms:
+        sensitive = op.startswith("c")
+        a, b = (arg, literal) if sensitive else (arg.lower(), literal.lower())
+        if op.endswith("eq") and a == b or op.endswith("like") and fnmatch.fnmatchcase(a, b):
+            return True
+    return False
+
+
+def test_run_ps1_compares_the_headless_flags_case_sensitively():
+    """run.ps1's headless test uses -ceq / -clike only, as run.sh's case patterns are
+    case-sensitive: -O and -H are not headless on either launcher."""
+    import re
+    text = pathlib.Path(_RUN_PS1).read_text(encoding="utf-8")
+    start = text.index("$headless = @(")
+    block = text[start:text.index(".Count -gt 0", start)]
+    assert not re.search(r"-(eq|like|ne|notlike|match)\b", block), (
+        "a case-insensitive operator in run.ps1's headless test")
+    for form in _HEADLESS_FORMS:
+        assert any(_ps1_is_headless(a) for a in form), f"run.ps1 misses {form}"
+    for form in _NOT_HEADLESS_FORMS:
+        assert not any(_ps1_is_headless(a) for a in form), f"run.ps1 counts {form} as headless"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="run.sh is the Unix launcher")
+@pytest.mark.parametrize("form", _HEADLESS_FORMS + _NOT_HEADLESS_FORMS, ids=" ".join)
+def test_both_launchers_agree_on_which_arguments_are_headless(stub_launcher_env, form):
+    """run.sh prints no launch notice for a headless form and does print it for any other
+    (-O and -H among them); run.ps1's test, evaluated from its text, gives the same answer."""
+    env, record = stub_launcher_env
+    r, _ = _launch(env, record, *form)
+    sh_headless = "Starting SWI3S Studio" not in r.stdout
+    assert sh_headless == (form in _HEADLESS_FORMS), (form, r.stdout)
+    assert any(_ps1_is_headless(a) for a in form) == sh_headless, form
 
 
 # ---------------------------------------------------------------- usage names the real command
@@ -635,7 +783,7 @@ def test_headless_builds_at_most_the_ui_ceiling_of_rows(tmp_path):
 def test_the_headless_and_ui_row_clamps_agree(tmp_path, wanted):
     """The UI's Rows To Draw clamp and the headless build give the same row count for the
     same RowsToDraw."""
-    from swi3s_studio.ui import main_window
+    from swi3s_studio.ui import authoring_controller
     src = os.path.join(_ROOT, "tests", "fixtures", "flow_control_demo.csv")
     with open(src, encoding="utf-8") as fh:
         text = fh.read().replace("RowsToDraw,32", f"RowsToDraw,{wanted}")
@@ -645,7 +793,7 @@ def test_the_headless_and_ui_row_clamps_agree(tmp_path, wanted):
     out = tmp_path / "m.json"
     assert cli.run_headless(str(cfg), str(out), out=io.StringIO()) in (0, 2)
     from swi3s_studio.swviz.io.json_handler import JSONHandler
-    ui_rows, _issue = main_window._authored_rows(wanted)
+    ui_rows, _issue = authoring_controller.authored_rows(wanted)
     assert JSONHandler.load_bus_model(str(out)).num_rows == ui_rows
 
 
@@ -670,3 +818,56 @@ def test_a_missing_decode_core_names_how_to_install_it():
                        text=True, timeout=_TIMEOUT_S)
     msg = next((ln for ln in r.stdout.splitlines() if ln.startswith("MSG ")), "")
     assert "pip install ./native" in msg and "build_local.sh" in msg, (r.stdout, r.stderr)
+
+
+def test_the_usage_block_names_the_demo_menu_item_the_window_has():
+    from swi3s_studio import app
+    assert "Load Demo" not in app.__doc__
+    assert "File ▸ Open Demo Capture" in app.__doc__
+
+
+def test_an_empty_output_name_is_a_usage_error_not_a_window():
+    """-o "" is an output given with no name: it exits 1 like any other usage error, where
+    a falsy test would fall through to opening the window."""
+    for argv in (["app", "-c", _CLEAN, "-o", ""], ["app", "-c", _CLEAN, "--output="],
+                 ["app", "-o", ""]):
+        with pytest.raises(SystemExit) as ex:
+            cli.parse(argv)
+        assert ex.value.code == 1, argv
+    args, _rest = cli.parse(["app", "-c", _CLEAN, "-o", "m.json"])
+    assert args.output == "m.json"
+
+
+def test_an_output_that_is_the_config_is_refused_and_the_config_kept(tmp_path, capsys):
+    cfg = tmp_path / "bus.csv"
+    cfg.write_bytes(pathlib.Path(_CLEAN).read_bytes())
+    before = cfg.read_bytes()
+    link = tmp_path / "link.csv"
+    os.link(cfg, link)
+    for output in (str(cfg), str(tmp_path / "." / "bus.csv"), str(link)):
+        assert cli.run_headless(str(cfg), output, out=io.StringIO()) == 1, output
+        assert "is the configuration file" in capsys.readouterr().err
+        assert cfg.read_bytes() == before, output
+
+
+def test_an_output_is_not_the_config_on_a_volume_that_reports_no_file_index(
+        tmp_path, monkeypatch, capsys):
+    """A volume with no file index gives every file st_ino 0, so (st_ino, st_dev) alone would
+    call two different files one: another output file is written, the same file by path is
+    still recognised."""
+    cfg = tmp_path / "bus.csv"
+    cfg.write_bytes(pathlib.Path(_CLEAN).read_bytes())
+    model = tmp_path / "model.json"
+    model.write_text("{}", encoding="utf-8")
+    real_stat = os.stat
+
+    def no_index(path, *a, **k):
+        fields = list(real_stat(path, *a, **k))
+        fields[1] = 0
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", no_index)
+    assert not cli._same_file(str(cfg), str(model))
+    assert cli._same_file(str(cfg), str(tmp_path / "." / "bus.csv"))
+    monkeypatch.undo()
+    assert cli.run_headless(str(cfg), str(model), out=io.StringIO()) == 0, capsys.readouterr().err

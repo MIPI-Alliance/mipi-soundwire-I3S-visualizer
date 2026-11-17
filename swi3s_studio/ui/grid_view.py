@@ -14,7 +14,7 @@ annotation: they are drawn from the engine's BusModel (set_bus_model) when the
 config enables handover, and are NOT synthesized for a decoded (analyzer) grid.
 
 Faithful port of `mipi-soundwire-I3S-visualizer/src/ui/frame_renderer.py`
-(COLUMN_SIZE=39, ROW_SIZE=30, Helvetica). Renders on a QGraphicsScene so the
+(cells 39 x 30 before `_SCALE`, Helvetica). Renders on a QGraphicsScene so the
 key/labels are included in the SVG/PNG export.
 
 A decoded grid draws the cells `Session.grid_cells()` places, with the CDS as Column 0;
@@ -46,7 +46,7 @@ from ..swviz.models.enums import port_mode_bit
 from . import line_style
 from .theme import VizTheme
 
-# Visualizer cell proportions (src/ui/constants.py COLUMN_SIZE=39, ROW_SIZE=30),
+# Visualizer cell proportions (39 x 30),
 # scaled here so the grid reads a little larger than the Visualizer's base in both
 # the Visualizer and the Analyzer (both render through this view). _round-half-up
 # keeps the .x5 sizes from Python's banker's rounding.
@@ -78,18 +78,27 @@ _BG = QColor(VizTheme.GRID_BG)         # canvas / empty background = parameters 
 _CDS_FILL = QColor(VizTheme.GRID_CDS_FILL)  # CDS / system full-height fill
 _TX_FILL = QColor(0x35, 0xC2, 0x8A)         # TX map: a UI with a data-line transition
 
-# Visualizer data-port palette (src/config/constants.py Colors.DP_COLORS — light
-# pastels).
+# Data-port fill palette (light pastels), in the authoring panel's DP name headers too.
 _DP_PALETTE = [
     "#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
     "#BF80FF", "#FFBFFF", "#FFBFBF", "#FFFFBF", "#BFFFBF", "#BFFFFF",
 ]
 
 
+# Palette offset of a stream whose device is not a device number: the Manager (-1) and the
+# all-devices sentinel (-2). The offsets differ from every device's (device*32 mod 12 is 0,
+# 4 or 8), so the Manager's DPn never shares a colour with Device 0's DPn.
+_SENTINEL_BASE = {-1: 2, -2: 6}
+
+
 def _dp_index(device: int, dp: int) -> int:
-    """Palette slot of a (device, dp) stream: dpNumber is 0..31, so device*32+dp is a
-    unique id, mod the palette. Shared by the fill and the line colour."""
-    return (max(0, int(device)) * 32 + max(0, int(dp))) % len(_DP_PALETTE)
+    """Palette slot of a (device, dp) stream: the device's own offset (device*32) plus the
+    dp number (0..31), mod the palette. A negative device (the Manager, the all-devices
+    sentinel) has an offset of its own (_SENTINEL_BASE). Shared by the fill and the line
+    colour."""
+    device = int(device)
+    base = device * 32 if device >= 0 else _SENTINEL_BASE.get(device, 10)
+    return (base + max(0, int(dp))) % len(_DP_PALETTE)
 
 
 def dp_stream_color(device: int, dp: int) -> QColor:
@@ -137,7 +146,7 @@ _SYS_SLOTS = (_G0, _G1, _TAIL, _S0, _S1, _HANDOVER)   # merge by type, not chann
 # Device sentinels (swviz SpecialDevices) used by the CDS split-cell band routing.
 _DEV_MANAGER, _DEV_UNIVERSAL = -1, -2
 
-# Clash-marker colours (CanvasColors): bus red, device yellow, read overlap blue.
+# Clash-marker colours: bus red, device yellow, read overlap blue.
 _CLASH_COLOR = {"bus": QColor(0xD3, 0x2F, 0x2F), "device": QColor(0xFB, 0xC0, 0x2D),
                 "read": QColor(0x19, 0x76, 0xD2)}
 
@@ -206,8 +215,8 @@ class GridView(QGraphicsView):
         # uniform _CW grid, which is every path that draws no CDS flags.
         self._col_extra: Dict[int, float] = {}
         self._show_key = True       # draw the top DP colour-key band (see set_show_key)
-        self._tx_raster_key = None  # last-rendered set_tx_raster() content key (see there)
-        self._content_key = None    # last-rendered set_cells/set_bus_model content key
+        self._tx_raster_key: Optional[tuple] = None  # last-rendered set_tx_raster() content key (see there)
+        self._content_key: Optional[tuple] = None    # last-rendered set_cells/set_bus_model content key
         # Visualizer font scheme (src/ui/constants.py TEXT_SIZE=12): numbers 12,
         # in-cell labels 12-4=8, Source/Sink 12-3=9, colour key 12-2=10 — each
         # scaled up with the cells (see _SCALE).
@@ -226,20 +235,32 @@ class GridView(QGraphicsView):
         return None
 
     def mousePressEvent(self, event) -> None:
-        """Clicking a data-port swatch in the top key emits dpKeyClicked.
+        """A left press on a data-port swatch in the top key is taken by the key; its
+        release on the same swatch emits dpKeyClicked (`mouseReleaseEvent`).
 
         The swatch names the port and carries its colour, so it opens that port's
-        chooser (in the Visualizer, clicking a port's row opens the same dialog). Left
-        button only, and only over a swatch; everything else falls through so
-        panning/scrolling is untouched.
+        chooser (in the Visualizer, clicking a port's row opens the same dialog). The dialog
+        opens on the release, so the click that opens it leaves no press behind. Everything
+        else falls through so panning/scrolling is untouched.
         """
+        self._key_pressed = None
         if event.button() == Qt.LeftButton:
             key = self._dp_key_at(event.position().toPoint())
             if key is not None:
-                self.dpKeyClicked.emit(key[0], key[1])
+                self._key_pressed = key
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        """Emit dpKeyClicked for a swatch pressed and released on."""
+        pressed, self._key_pressed = getattr(self, "_key_pressed", None), None
+        if pressed is not None and event.button() == Qt.LeftButton:
+            event.accept()
+            if self._dp_key_at(event.position().toPoint()) == pressed:
+                self.dpKeyClicked.emit(pressed[0], pressed[1])
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         """Pointing-hand cursor over a clickable swatch — without it the click target
@@ -410,7 +431,7 @@ class GridView(QGraphicsView):
         self._draw_top_key(cols)
         self._draw_headers(rows, cols)
         by_row: Dict[int, List[dict]] = {}
-        self._cell_at: dict = {}
+        self._cell_at = {}
         for c in cells:
             by_row.setdefault(c["row"], []).append(c)
             self._cell_at.setdefault((c["row"], c["col"]), []).append(c)
@@ -517,6 +538,8 @@ class GridView(QGraphicsView):
         x, y0 = self._cx(c), self._cy(r)
         at = self._cell_at.get((r, c), [])
         cds_sys_at = [cc for cc in at if cc["slot"] in (_G0, _G1, _TAIL) and cc["dp"] < 0]
+        ytop: float
+        h: float
         if cds_sys_at:
             has_mgr = any(cc["device"] < 0 for cc in cds_sys_at)
             has_periph = any(cc["device"] >= 0 for cc in cds_sys_at)
@@ -635,7 +658,7 @@ class GridView(QGraphicsView):
                     self._slot_port[s] = (int(c["device"]), int(c["dp"]))
         else:
             streams = sorted({(c["device"], c["dp"]) for c in cells
-                              if not c["is_cds"] and c["dp"] >= 0 and c["device"] >= 0})
+                              if not c["is_cds"] and c["dp"] >= 0})
             # Key each stream's colour by its (device, dp) VALUE, not appearance order, so
             # a port keeps its colour when other ports enable/disable (see dp_stream_color).
             self._stream_colors = {sd: dp_stream_color(sd[0], sd[1]) for sd in streams}
@@ -644,7 +667,7 @@ class GridView(QGraphicsView):
         for c in cells:
             key = self._slot_of(c) if by_slot else (c["device"], c["dp"])
             ok = (not c["is_cds"] and c["dp"] >= 0 and c["channel"] >= 0
-                  and (self._slot_of(c) >= 0 if by_slot else c["device"] >= 0))
+                  and (not by_slot or self._slot_of(c) >= 0))
             if ok:
                 chans.setdefault(key, set()).add(c["channel"])
         self._stream_channels = chans
@@ -886,7 +909,7 @@ class GridView(QGraphicsView):
         if slot in _DATA_SLOTS:
             label = self._data_label(cell, df, n)
             self._half_cell(r, cell["col"], n - 1, is_src, color, label, cell,
-                            scrambler=(slot == _DATA and cell.get("scrambler")))
+                            scrambler=bool(slot == _DATA and cell.get("scrambler")))
         elif slot in (_G0, _G1):
             lbl = "G1" if slot == _G1 else "G0"
             if cell["dp"] >= 0:
@@ -985,6 +1008,8 @@ class GridView(QGraphicsView):
         system = cell["dp"] < 0 and not force_half
         x = self._cx(c)
         cols = extra + 1
+        y0: float
+        h: float
         if system:
             y0, h, fill = self._cy(r), _RH, _BG
         else:
@@ -1125,7 +1150,7 @@ class GridView(QGraphicsView):
             else:
                 dev, dp = key
                 name = ((self._dp_display.get((dev, dp)) or {}).get("name") or "").strip()
-                label = name or (f"DP{dp}" if single_dev else f"D{dev}·DP{dp}")
+                label = name or (f"DP{dp}" if single_dev else f"{_dev_tag(dev)}·DP{dp}")
                 # Only the decoded (analyzer) grid keys by (device, dp) and can map a
                 # swatch back to a real port; engine mode's label chooser is the
                 # authoring panel, so its swatches stay non-clickable.

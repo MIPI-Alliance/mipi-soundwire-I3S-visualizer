@@ -38,8 +38,8 @@ _CHUNK_BYTES_PER_POINT = 19
 
 def front_end_bytes(points: int) -> int:
     """Peak of `capture_from_analog` beyond its inputs, for `points` per channel: the
-    per-point term and one chunk of the Schmitt fill. Measured with tracemalloc within
-    these figures (about 11 per point, plus the chunk)."""
+    per-point term and one chunk of the Schmitt fill; an upper bound, enforced by
+    test_a_wfm_pair_peaks_within_its_prediction."""
     points = int(points)
     return points * FRONT_END_BYTES_PER_POINT + min(points, _CHUNK) * _CHUNK_BYTES_PER_POINT
 

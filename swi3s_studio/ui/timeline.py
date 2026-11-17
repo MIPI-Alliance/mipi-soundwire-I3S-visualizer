@@ -9,13 +9,14 @@ across a long capture and to get back to a region after drilling into a command.
 from __future__ import annotations
 
 import bisect
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
 
+from ..model.registers import commit_takes_effect
 from .grid_view import bookmark_pair_color as _bookmark_pair_color
 from .row_origin import RowOriginMixin
 from .theme import VizTheme
@@ -76,7 +77,8 @@ def _lc_section_color(name: str, alpha: int = 255) -> QColor:
 _MARK_LEGEND_SPEC = [
     ("CRC error",         "SEM_ERROR",    "Manager-packet CRC failed (tall red tick)"),
     ("Commit + SSP",      "SEM_SSP",      "Confirmed commit carrying a Stream Sync Point (tall gold tick)"),
-    ("Commit",            "SEM_COMMIT",   "Commit phase, not yet SSP-confirmed (short blue tick)"),
+    ("Commit",            "SEM_COMMIT",   "Commit with no effect yet: not SSP-confirmed, or its "
+                                          "Row_Delay outside 14..15 (short blue tick)"),
     ("Commit Sync Point", "SEM_SYNC",     "Where a confirmed commit TAKES EFFECT — the SSP, Row_Delay rows "
                                           "after the command (dotted orange line)"),
     ("SSP Announce",      "SEM_SSP",      "SSPA — announces a Stream Sync Point without committing: "
@@ -108,11 +110,12 @@ def _kind_label(cmd: dict) -> str:
     if cmd.get("has_manager_packet") and not cmd.get("crc_valid"):
         return "CRC error"
     if cmd.get("is_commit"):
-        return "Commit + SSP" if cmd.get("commit_confirmed") else "Commit"
+        return "Commit + SSP" if commit_takes_effect(cmd) else "Commit"
     # An SSPA carries a Stream Sync Point without committing anything — it re-asserts
     # data-port synchronization. Label it as an SSP, not "Other command": it re-anchors
-    # every port's transport phase.
-    if cmd.get("has_sync_point"):
+    # every port's transport phase. One whose Row_Delay the decode rejected announces
+    # nothing (as a rejected commit takes no effect) and is drawn as a plain command.
+    if cmd.get("has_sync_point") and not cmd.get("row_delay_error"):
         return "SSP Announce"
     name = cmd.get("command", "") or ""
     if name == "Ping":
@@ -170,13 +173,13 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         self._by_start: List[dict] = []      # commands sorted by start sample (nearest-tick)
         self._draw_order: List[dict] = []    # commands sorted by paint rank (computed once)
         self._starts: List[int] = []         # sorted command start samples (arrow nav)
-        self._nav_starts = None              # filtered subset for arrow nav (None = all)
-        self._draw_set = None                # visible raw start_samples for the paint filter
+        self._nav_starts: Optional[List[int]] = None   # filtered subset for arrow nav (None = all)
+        self._draw_set: Optional[Set[int]] = None      # visible raw start_samples for the paint filter
         self._tick_gen = 0                   # bumped by set_events and set_draw_filter
         self._commit_gen = 0                 # bumped by set_commit_points
-        self._decim_key = None               # cache key: (lo, hi, width, _tick_gen)
+        self._decim_key: Optional[tuple] = None        # cache key: (lo, hi, width, _tick_gen)
         self._decim_ticks: List[tuple] = []  # cached [(x, cmd), …] — one per occupied pixel column
-        self._commit_decim_key = None        # cache key for the decimated commit-point x's
+        self._commit_decim_key: Optional[tuple] = None  # cache key for the decimated commit-point x's
         self._commit_decim: List[int] = []   # cached in-view commit-point pixel columns
         self._commit_starts: List[int] = []  # SSCR/DSCR starts (⌘+arrow jump)
         self._commit_points: List[int] = []  # SSP samples where confirmed commits TAKE EFFECT
@@ -252,7 +255,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         "forced" key had its width pinned by the user (Session.force_column_count_at)
         and is labelled + outlined as overridden; one carrying "csv" (the file's name) has
         a config CSV imposed on it alone (Session.apply_config_csv_at); "name" is the
-        user's name for it (Session.region_names), and "index" its section index."""
+        user's name for it (Session.region_names), "index" its section index and "number"
+        its number among the regions of its column count (Session.region_numbers)."""
         self._segments = sorted(segments, key=lambda s: s.get("start_sample", 0))
         if total_samples:
             self._total = max(1, int(total_samples))
@@ -409,7 +413,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
     def _view_span(self) -> float:
         return max(1.0, self._view_hi - self._view_lo)
 
-    def _x_for(self, sample: int) -> float:
+    def _x_for(self, sample: float) -> float:
         tr = self._track_rect()
         return tr.left() + ((sample - self._view_lo) / self._view_span()) * tr.width()
 
@@ -573,12 +577,13 @@ class TimelineRibbon(RowOriginMixin, QWidget):
             # Honor the command-table filter: no ticks for filtered-out commands (keyed by
             # raw start_sample, matching the tick position — see set_draw_filter). The
             # mask is built once per filter (per _tick_gen), not per view.
-            if self._tick_filter_key != self._tick_gen:
-                self._tick_filter_mask = np.isin(
+            mask = self._tick_filter_mask
+            if mask is None or self._tick_filter_key != self._tick_gen:
+                mask = self._tick_filter_mask = np.isin(
                     self._tick_start_i, np.fromiter(self._draw_set, dtype=np.int64,
                                                     count=len(self._draw_set)))
                 self._tick_filter_key = self._tick_gen
-            keep = self._tick_filter_mask[i0:i1]
+            keep = mask[i0:i1]
             xs, pos = xs[keep], pos[keep]
         ticks: List[tuple] = []
         if pos.size:
@@ -719,11 +724,11 @@ class TimelineRibbon(RowOriginMixin, QWidget):
                 p.drawLine(int(cx), int(band_bottom), int(cx), int(tr.bottom()))
         # cursor
         if self._in_view(self._cursor):
-            cx = self._x_for(self._cursor)
+            cursor_x = self._x_for(self._cursor)
             p.setPen(QPen(_C_CURSOR, 1))
-            p.drawLine(int(cx), 2, int(cx), int(tr.bottom()) + 4)
+            p.drawLine(int(cursor_x), 2, int(cursor_x), int(tr.bottom()) + 4)
             p.setBrush(_C_CURSOR)
-            p.drawRect(QRectF(cx - 3, 2, 6, 6))
+            p.drawRect(QRectF(cursor_x - 3, 2, 6, 6))
         # bookmarks: a diamond at the baseline, a vertical line up through the track, and
         # the pair label (A1/A2/…) at the top — coloured per PAIR (rotating the DP palette).
         yb = int(tr.bottom())
@@ -875,7 +880,7 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         what = self._segment_label(index, int(seg.get("column_count", 0)),
                                    bool(seg.get("forced")), bool(seg.get("csv")),
                                    int(seg.get("start_sample", 0)) if seg.get("restart")
-                                   else None)
+                                   else None, seg.get("number"))
         name = str(seg.get("name") or "").strip()
         return f"{name} · {what}" if name else what
 
@@ -896,7 +901,8 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         return int(s.get("index", i)), s
 
     def _segment_label(self, index: int, cols: int, forced: bool = False,
-                       csv: bool = False, restart: Optional[int] = None) -> str:
+                       csv: bool = False, restart: Optional[int] = None,
+                       number: Optional[int] = None) -> str:
         """Config-band label. The initial audio segment of a cold/warm start is the
         selected PHY's Safe-Lock geometry, so label it by the PHY (e.g. 'PHY2
         Safe-Lock-2') — the PHY is what makes that 2-column (FBCSE) / 4-column (DLV)
@@ -909,26 +915,33 @@ class TimelineRibbon(RowOriginMixin, QWidget):
         region decodes with a config CSV imposed on it, which says so for the same reason.
 
         `restart`, the start sample of a region a later bring-up (Cold or Warm) opened,
-        labels it by that bring-up's PHY the same way."""
+        labels it by that bring-up's PHY the same way. `number`, the region's number among
+        those of its column count (Session.region_numbers), follows the count's name."""
+        k = "" if number is None else f" {int(number)}"
         b = self._bringup
         if restart is not None:
             b = next((x for x in reversed(self._later_bringups)
                       if x["span_start"] <= restart), {})
         if ((index == 0 or restart is not None) and b and b.get("phy_name")
                 and b.get("safe_lock_columns") == cols and not forced and not csv):
-            return f"{b['phy_name']} Safe-Lock-{cols}"
-        return f"{cols}col (forced)" if forced else f"{cols}col (CSV)" if csv else f"{cols}col"
+            return f"{b['phy_name']} Safe-Lock-{cols}{k}"
+        return (f"{cols}-col{k} (forced)" if forced else f"{cols}-col{k} (CSV)" if csv
+                else f"{cols}-col{k}")
 
     def _nearest(self, x: float, px: float = 5.0):
-        """The command whose tick is within `px` of x (closest; higher paint rank wins
-        exact ties), or None. Bisects the start-sorted list to the pixel neighbourhood."""
+        """The command whose DRAWN tick is within `px` of x (closest; higher paint rank
+        wins exact ties), or None. A command the draw filter hides has no tick and is not
+        found. Bisects the start-sorted list to the pixel neighbourhood."""
         if not self._starts:
             return None
         lo_s, hi_s = self._sample_for(x - px), self._sample_for(x + px)
         i0 = bisect.bisect_left(self._starts, lo_s - 1)
         i1 = bisect.bisect_right(self._starts, hi_s + 1)
         best, best_d, best_rank = None, px, -1
+        shown = self._draw_set
         for cmd in self._by_start[i0:i1]:
+            if shown is not None and int(cmd.get("start_sample", 0)) not in shown:
+                continue
             d = abs(self._x_for(cmd.get("start_sample", 0)) - x)
             r = tick_rank(cmd)
             if d < best_d or (d <= best_d and r > best_rank):

@@ -280,3 +280,18 @@ def test_the_default_column_widths():
     v = RegisterView(rmap)
     v.set_files({0: DeviceRegisterFile(rmap, 0)})
     assert v.column_widths() == {"Register": 258, "Addr": 63, "Value": 52, "Fields": 407}
+
+
+def test_a_phy_found_active_is_marked_and_its_block_stays_as_the_user_left_it():
+    """The decode marks the active PHY's block (title and bold); whether any PHY block is
+    open stays the user's."""
+    QApplication.instance() or QApplication([])
+    rmap = RegisterMap.load()
+    v = RegisterView(rmap)
+    v.set_files({0: DeviceRegisterFile(rmap, 0)})
+    _block(v, "PHY1").setExpanded(True)
+    v.set_phy("PHY2")
+    assert _block(v, "PHY2").text(0).endswith("ACTIVE") and _block(v, "PHY2").font(0).bold()
+    assert _block(v, "PHY1").isExpanded() and not _block(v, "PHY2").isExpanded()
+    v.close()
+    v.deleteLater()

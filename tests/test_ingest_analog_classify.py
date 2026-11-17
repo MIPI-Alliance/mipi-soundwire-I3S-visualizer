@@ -52,3 +52,27 @@ def test_a_short_file_is_read_to_its_end(tmp_path):
     assert analog_csv.is_analog_csv(path, max_scan_rows=100) is True
     _digital(path, 50)
     assert analog_csv.is_analog_csv(path, max_scan_rows=100) is False
+
+
+def _scope_csv(rows, end):
+    """A scope analog CSV of `rows` data rows whose lines end with `end`."""
+    lines = ["Model,SCOPE1", "Sample Interval,1e-09", "", "TIME,CH1,CH2"] + [
+        f"{i * 1e-9:.6e},{0.4 + (i % 7) * 0.1:.3f},{(i % 3) * 0.5:.3f}" for i in range(rows)]
+    return end.join(lines) + end
+
+
+def test_a_lone_cr_scope_csv_reads_as_one_with_lf_line_ends(tmp_path):
+    want = {}
+    for name, end in (("lf", "\n"), ("crlf", "\r\n"), ("cr", "\r")):
+        path = tmp_path / f"{name}.csv"
+        path.write_bytes(_scope_csv(3_000, end).encode())
+        p = str(path)
+        assert analog_csv.is_analog_csv(p) is True, name
+        pre, header, _offset, _sample = analog_csv.scan_header(p)
+        rows, _width = analog_csv._predict(p)
+        got = analog_csv.read_analog_csv(p, max_bytes=0)
+        want.setdefault("header", header)
+        assert header == want["header"] == ["TIME", "CH1", "CH2"], name
+        assert len(pre) == 3, name
+        assert 2_900 <= rows <= 3_100, (name, rows)
+        assert got["time"].size == 3_000, name

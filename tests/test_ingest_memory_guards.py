@@ -11,6 +11,7 @@ figures, not RSS samples.
 import json
 import os
 import pathlib
+import struct
 import tracemalloc
 import zipfile
 
@@ -99,10 +100,18 @@ def _scope_csv(path, n):
         f.write("\n".join(f"{t[i]:.6e},{clk[i]:.4e},{dat[i]:.4e}" for i in range(n)) + "\n")
 
 
-def test_an_analog_csv_peaks_within_its_prediction(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unsorted", [False, True])
+def test_an_analog_csv_peaks_within_its_prediction(tmp_path, monkeypatch, unsorted):
+    """A file whose rows are out of time order is sorted on load, within the same figure."""
     monkeypatch.setattr(analog_csv, "_BATCH_ROWS", 5_000)
     path = str(tmp_path / "scope.csv")
     _scope_csv(path, 200_000)
+    if unsorted:
+        with open(path) as f:
+            lines = f.read().splitlines()
+        lines[10], lines[11] = lines[11], lines[10]
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
     predicted = analog_csv.predict_peak_bytes(path)
 
     def load():
@@ -164,6 +173,33 @@ def test_a_wfm_over_budget_is_refused_before_its_curve_is_read(tmp_path):
     a, _b = _wfm_pair(tmp_path, 4_000)
     with pytest.raises(analog.AnalogTooLargeError):
         wfm.read_wfm(a, max_bytes=1)
+
+
+def test_a_truncated_wfm_is_refused_as_truncated_not_as_too_large(tmp_path):
+    # The header counts 4,000 points; the file holds 1,000. A 1 MB budget fits what it
+    # holds, not what its header counts.
+    a, b = _wfm_pair(tmp_path, 4_000)
+    held = 0x346 + 2 * 1_000
+    for p in (a, b):
+        with open(p, "r+b") as f:
+            f.truncate(held)
+    budget = wfm.predict_pair_peak_bytes(2_000)
+    assert wfm.predict_pair_peak_bytes(4_000) > budget
+    assert wfm.read_header(a)["n_points"] == 1_000
+    for read in (lambda: wfm.read_wfm(a, max_bytes=budget),
+                 lambda: wfm.read_wfm_pair(a, b, max_bytes=budget)):
+        with pytest.raises(ValueError, match=r"truncated curve \(2000 of 8000 bytes"):
+            read()
+    assert probe.probe([a, b]).cost_all_bytes == wfm.predict_pair_peak_bytes(1_000)
+
+
+def test_a_wfm_header_with_a_damaged_curve_end_is_refused_as_truncated(tmp_path):
+    a, _b = _wfm_pair(tmp_path, 4_000)
+    raw = bytearray(pathlib.Path(a).read_bytes())
+    struct.pack_into("<I", raw, wfm._POSTCHARGE_START_OFF_V3, 0xFFFF_FFF0)
+    pathlib.Path(a).write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match="truncated curve"):
+        wfm.read_wfm(a, max_bytes=1 << 20)
 
 
 def test_a_wfm_pair_is_priced_once_before_either_curve_is_read(tmp_path, monkeypatch):
@@ -306,7 +342,12 @@ def test_a_bin_file_that_is_not_v0_is_charged_its_size(tmp_path):
 
 # ---- VCD --------------------------------------------------------------------------------
 
-def test_a_vcd_peaks_within_its_bytes_per_edge(tmp_path):
+@pytest.mark.parametrize("native", [True, False])
+def test_a_vcd_peaks_within_its_bytes_per_edge(tmp_path, monkeypatch, native):
+    """Both value-change readers: the native scanner's edge buffers are in the Python raw
+    allocator, which tracemalloc traces."""
+    if not native:
+        monkeypatch.setattr(vcd, "_NATIVE", None)
     cap = _edge_capture(300_000)
     path = str(tmp_path / "c.vcd")
     _write_vcd(path, cap, timescale="2ns")
@@ -316,7 +357,10 @@ def test_a_vcd_peaks_within_its_bytes_per_edge(tmp_path):
     assert peak <= edges * vcd.BYTES_PER_EDGE + (1 << 20), f"{peak / edges:.1f} B/edge"
 
 
-def test_a_vcd_past_its_budget_is_stopped_while_it_is_read(tmp_path, monkeypatch):
+@pytest.mark.parametrize("native", [True, False])
+def test_a_vcd_past_its_budget_is_stopped_while_it_is_read(tmp_path, monkeypatch, native):
+    if not native:
+        monkeypatch.setattr(vcd, "_NATIVE", None)
     monkeypatch.setattr(vcd, "_CHECK_EVERY", 100)
     path = str(tmp_path / "c.vcd")
     _write_vcd(path, _edge_capture(5_000), timescale="2ns")
@@ -352,13 +396,20 @@ def _write_sal(path, blobs, rate=500_000_000, compress=False):
     return str(path)
 
 
-def test_a_window_of_a_one_block_channel_peaks_within_the_guard(tmp_path):
-    # One block holds the whole channel: the window decode must not read it whole.
+@pytest.mark.parametrize("compress", [False, True], ids=["stored", "deflated"])
+@pytest.mark.parametrize("native", [True, False], ids=["native", "numpy"])
+def test_a_window_of_a_one_block_channel_peaks_within_the_guard(tmp_path, monkeypatch,
+                                                                native, compress):
+    # One block holds the whole channel: the window decode must not read it whole. Each
+    # decoder is held to its own figure, and a deflated member to the inflater's.
+    if not native:
+        monkeypatch.setattr(saleae_binary, "_native_v3", None)
     rng = np.random.default_rng(5)
     ce = np.cumsum(rng.integers(10, 12, 1_000_000)).astype(np.uint64)
     de = np.cumsum(rng.integers(30, 36, 300_000)).astype(np.uint64)
     path = _write_sal(tmp_path / "c.sal", [saleae_binary.build_channel_v3(False, ce),
-                                           saleae_binary.build_channel_v3(False, de)])
+                                           saleae_binary.build_channel_v3(False, de)],
+                      compress=compress)
     model = saleae_sal.window_model(path, [0, 1])
     span = model.span_samples
     w = (span // 10, span // 10 + span // 100)
@@ -418,7 +469,9 @@ def test_a_window_refused_says_what_the_window_needs(demo_sal):
     assert whole.value.window is None and whole.value.peak == whole.value.cost.est_peak_bytes
 
 
-def test_a_small_window_of_a_compressed_capture_inflates_it_about_once(demo_sal, monkeypatch):
+def test_a_small_window_of_a_compressed_capture_inflates_it_about_twice(demo_sal, monkeypatch):
+    # Once for the header walk, once for the decode, which reads the window and checks
+    # every block after it.
     with zipfile.ZipFile(demo_sal) as z:
         assert {i.compress_type for i in z.infolist()} == {zipfile.ZIP_DEFLATED}
         blobs = sum(i.file_size for i in z.infolist() if i.filename.startswith("digital"))
@@ -433,7 +486,7 @@ def test_a_small_window_of_a_compressed_capture_inflates_it_about_once(demo_sal,
     for max_bytes in (0, None):
         inflated[0] = 0
         saleae_sal.load_capture(demo_sal, 0, 1, window=(10, 1000), max_bytes=max_bytes)
-        assert inflated[0] <= 1.2 * blobs, (
+        assert inflated[0] <= 2.2 * blobs, (
             f"max_bytes={max_bytes}: inflated {inflated[0] / blobs:.2f}x the channels")
 
 

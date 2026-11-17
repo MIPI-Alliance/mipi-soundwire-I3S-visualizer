@@ -19,7 +19,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from test_links_gui import _with_added_link
+from test_links_gui import _flow_control, _with_added_link
 
 from swi3s_studio.ui.eye_view import _cat_specs
 
@@ -54,6 +54,17 @@ def test_each_lane_shows_its_own_link(two):
     labels = [lbl.text() for lbl in win._raw_lanes._labels[:2]]
     assert labels == ["Link 1", "Link 2"]
     assert all(lbl.isVisibleTo(win._raw_lanes) for lbl in win._raw_lanes._labels[:2])
+
+
+def test_a_link_added_in_all_links_gets_a_bound_lane(two):
+    win, _first, _second = two
+    third = _flow_control(win)
+    win.load_session(third, add_link=True)
+    raws, audios = _lanes(win)
+    assert len(raws) == len(audios) == 3
+    assert raws[2].shown_state is audios[2].shown_state is win.links[2].view
+    assert raws[2]._cds_provider == third.cds_column_samples          # bound to Link 3
+    assert audios[2]._store is win.links[2].view.audio_store
 
 
 def test_the_lanes_read_one_global_time(two):
@@ -208,6 +219,37 @@ def test_removing_a_middle_link_moves_the_next_up_a_lane(two, monkeypatch):
     assert audios[1]._store is win.links[1].view.audio_store
     assert [lbl.text() for lbl in win._raw_lanes._labels[:2]] == [lk.name for lk in win.links]
 
+
+
+def test_leaving_all_links_keeps_a_later_lanes_view_with_its_link(two):
+    """A toggle changed in the second lane is kept with Link 2 when All Links is turned off,
+    and shows again on Link 2's pane."""
+    win, first, second = two
+    lane = win._raw_lanes.shown()[1]
+    was = lane._legend_btn.isChecked()
+    lane._legend_btn.setChecked(not was)
+    win.set_bottom_scope_all(False)
+    assert win.links[1].view.capture_view["hide_legend"] is (not was)
+    win.set_group_link("bottom", 1)
+    assert win._raw_view._legend_btn.isChecked() is (not was)
+
+
+def test_removing_a_link_keeps_each_later_lanes_view_with_its_link(two, monkeypatch):
+    """With three Links, a toggle changed in the third lane stays with that Link when the
+    second is removed and it moves up a lane."""
+    from PySide6.QtWidgets import QMessageBox
+    from test_links_gui import _flow_control
+    win, first, second = two
+    win.set_bottom_scope_all(False)
+    win.load_session(_flow_control(win), add_link=True)
+    win.set_bottom_scope_all(True)
+    lane = win._raw_lanes.shown()[2]
+    was = lane._legend_btn.isChecked()
+    lane._legend_btn.setChecked(not was)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    win.remove_link(1)
+    assert win._raw_lanes.shown()[1]._legend_btn.isChecked() is (not was)
+    assert win.links[1].view.capture_view["hide_legend"] is (not was)
 
 # ---- CDS and Samples: one table per Link, stacked ----------------------------------------
 
@@ -589,3 +631,35 @@ def test_removing_down_to_one_link_from_all_links_binds_the_panes_once(monkeypat
 def test_entering_all_links_unseen_remembers_no_height():
     win, _first, _second = _all_links_win()                 # never shown: nothing to measure
     assert win._bottom_single_height == 0
+
+
+def test_a_new_audio_lane_plays_with_the_panes_device_and_depth(two):
+    """Lanes made after Audio ▸ Playback Output Device / Bit Depth was chosen adopt both."""
+    win, first, second = two
+    win.set_bottom_scope_all(False)
+    pane = win._audio_view
+
+    class _Dev:
+        def __init__(self, ident):
+            self._id = ident
+
+        def id(self):
+            return self._id
+
+    devs = [_Dev(b"a"), _Dev(b"b")]
+    pane._audio_devices = devs
+    pane.set_device_index(1)
+    pane.set_play_depth(24)
+    real = type(pane)._refresh_devices
+    type(pane)._refresh_devices = lambda self: setattr(self, "_audio_devices", list(devs))
+    try:
+        win.set_bottom_scope_all(True)
+    finally:
+        type(pane)._refresh_devices = real
+    lane = win._audio_lanes.shown()[1]
+    assert lane is not pane
+    assert lane.play_depth == 24
+    # A view lists output devices only where QtMultimedia imports; without it a lane has
+    # none to match and keeps index 0.
+    from swi3s_studio.ui import audio_view
+    assert lane.device_index == (1 if audio_view._HAVE_AUDIO else 0)

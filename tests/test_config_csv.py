@@ -48,18 +48,16 @@ def test_cds_per_source_roundtrip_and_legacy_migration():
     """Per-source CDS guard/tail must survive a to_csv -> from_csv_text round trip, and a
     legacy (pre-per-source) scalar-only CSV must migrate its global guard/tail onto ALL 13
     sources (Manager + 12 devices share the CDS). Guards the config-CSV upgrade pipeline."""
-    from swi3s_studio.model.bus_config import (
-        CDS_GUARD_G0,
-        CDS_GUARD_G1,
-        CDS_GUARD_OFF,
-        CDS_NUM_SOURCES,
-    )
-    # Divergent per-source config -> exact round trip through the split guard/tail rows.
+    from swi3s_studio.model.bus_config import CDS_NUM_SOURCES
+    # Divergent per-source config -> exact round trip through the guard/tail rows, a
+    # polarity of 1 on a disabled guard included.
     cfg = demo_config()
-    cfg.cds_guard = [CDS_GUARD_G0, CDS_GUARD_G1] + [CDS_GUARD_OFF] * (CDS_NUM_SOURCES - 2)
+    cfg.cds_guard_enable = [True, True, False] + [False] * (CDS_NUM_SOURCES - 3)
+    cfg.cds_guard_polarity = [0, 1, 1] + [0] * (CDS_NUM_SOURCES - 3)
     cfg.cds_tail = [2, 0, 1] + [0] * (CDS_NUM_SOURCES - 3)
     cfg2 = BusConfig.from_csv_text(cfg.to_csv())
-    assert cfg2.cds_guard == cfg.cds_guard, (cfg2.cds_guard, cfg.cds_guard)
+    assert cfg2.cds_guard_enable == cfg.cds_guard_enable, cfg2.cds_guard_enable
+    assert cfg2.cds_guard_polarity == cfg.cds_guard_polarity, cfg2.cds_guard_polarity
     assert cfg2.cds_tail == cfg.cds_tail, (cfg2.cds_tail, cfg.cds_tail)
 
     # Legacy scalar-only CSV (no per-source rows) -> broadcast the global guard/tail to
@@ -70,7 +68,8 @@ def test_cds_per_source_roundtrip_and_legacy_migration():
               "CDS_GuardPolarity_REG,1\n"
               "CDS_TailWidth_REG,2\n")
     cfg3 = BusConfig.from_csv_text(legacy)
-    assert cfg3.cds_guard == [CDS_GUARD_G1] * CDS_NUM_SOURCES, cfg3.cds_guard
+    assert cfg3.cds_guard_enable == [True] * CDS_NUM_SOURCES, cfg3.cds_guard_enable
+    assert cfg3.cds_guard_polarity == [1] * CDS_NUM_SOURCES, cfg3.cds_guard_polarity
     assert cfg3.cds_tail == [2] * CDS_NUM_SOURCES, cfg3.cds_tail
 
 

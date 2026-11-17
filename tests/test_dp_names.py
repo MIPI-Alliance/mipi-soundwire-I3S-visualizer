@@ -34,6 +34,18 @@ def test_a_name_is_kept_in_the_source_and_survives_a_reopen():
     assert again.dp_names == {} and "dp_names" not in again.source
 
 
+def test_a_saved_name_that_is_not_text_is_dropped_and_reported():
+    from swi3s_studio import import_notes
+    source = dict(Session.from_demo(300, phy=2).source)
+    source["dp_names"] = {"0.1": None, "0.2": 7, "0.3": ["x"], "0.0": "Mic L"}
+    with import_notes.collect() as notes:
+        s = Session.from_source(source)
+    assert s.dp_names == {(0, 0): "Mic L"}
+    assert s.source["dp_names"] == {"0.0": "Mic L"}
+    text = [n.message for n in notes if "dp_names" in n.message]
+    assert len(text) == 1 and all(k in text[0] for k in ("'0.1'", "'0.2'", "'0.3'"))
+
+
 @pytest.fixture
 def win():
     QApplication.instance() or QApplication([])
@@ -173,6 +185,25 @@ def test_the_audio_menus_name_the_port(win, monkeypatch):
     assert "Mic L · Device 0 · DP1…" in items and "Device 0 · DP0…" in items
 
 
+def test_a_name_with_an_ampersand_is_shown_literally_in_menus_and_checkboxes(win, monkeypatch):
+    """'&' in a port name is doubled where Qt reads one as a mnemonic marker: the audio
+    menus, the Timing filter's port item and the Audio channel checkbox."""
+    _named(win, monkeypatch, dp=2, name="A&B")
+    win._build_decimation_menu()
+    assert "A&&B · Device 0 · DP2" in [a.text() for a in win._play_rate_menu.actions()]
+    win._build_processing_menu()
+    assert "A&&B · Device 0 · DP2…" in [a.text() for a in win._process_menu.actions()]
+    labels = [i["action"].text() for i in win._eye_view._filter_items if i.get("port")]
+    assert "A&&B · Device 0 DP2" in labels
+    win.load_session(win._session)                      # the filter built with the name
+    QApplication.processEvents()
+    labels = [i["action"].text() for i in win._eye_view._filter_items if i.get("port")]
+    assert "A&&B · Device 0 DP2" in labels
+    av = win._audio_view
+    checks = [cb.text() for (d, p, _c), cb in av._checks.items() if (d, p) == (0, 2)]
+    assert checks and all(t.startswith("A&&B CH") for t in checks)
+
+
 def test_the_dialogs_name_the_port(win, monkeypatch):
     from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
     from swi3s_studio.ui.audio_process_dialog import StreamProcessingDialog
@@ -193,13 +224,148 @@ def test_the_dialogs_name_the_port(win, monkeypatch):
 
 def test_the_timing_filter_names_the_port_and_keeps_what_was_checked(win, monkeypatch):
     ev = win._eye_view
-    item = next(i for i in ev._filter_items if i.get("port") == (0, 1))
+    item = next(i for i in ev._filter_items if i.get("port") == (0, 2))
     item["action"].setChecked(True)
-    _named(win, monkeypatch)
-    assert item["action"].text() == "Mic L · Device 0 DP1" and item["action"].isChecked()
+    _named(win, monkeypatch, dp=2)
+    assert item["action"].text() == "Mic L · Device 0 DP2" and item["action"].isChecked()
     # A rebuild (a re-decode, a reopened workspace) labels it the same way, so a filter
     # saved by its labels is found again.
     win.load_session(win._session)
     QApplication.processEvents()
     labels = [i["action"].text() for i in win._eye_view._filter_items if i.get("port")]
-    assert "Mic L · Device 0 DP1" in labels
+    assert "Mic L · Device 0 DP2" in labels
+
+
+# ---- View Bus Grid in Visualizer carries the names over ----
+
+def _name_ports(win, names):
+    for (dev, dp), name in names.items():
+        win._session.set_dp_name(dev, dp, name)
+
+
+def _csv_rows(path):
+    """[(field, values)] of a saved settings CSV, in file order."""
+    import csv
+    with open(path, newline="", encoding="utf-8") as f:
+        return [(r[0], r[1:]) for r in csv.reader(f)]
+
+
+def _chips(win):
+    return [c.text() for c in win._authoring._dp_name]
+
+
+def test_the_decoder_config_takes_the_names_by_device_and_port_number():
+    from swi3s_studio.model.bus_config import BusConfig
+
+    def port(dev, number, enabled=True):
+        return {"enabled": enabled, "device_number": dev, "dp_number": number, "enable_ch": 3}
+    d = {"dataports": [port(0, 0, enabled=False), port(1, 2), port(2, 2), port(-1, 5)]}
+    names = {(1, 2): "Mic L", (-1, 5): " Manager Out ", (0, 0): "Never Packed"}
+    cfg, n = BusConfig.from_decoder_config(d, names=names)
+    assert n == 3
+    assert [dp.name for dp in cfg.dataports[:4]] == ["Mic L", "", "Manager Out", ""]
+    plain, _n = BusConfig.from_decoder_config(d)
+    assert [dp.name for dp in plain.dataports] == [""] * 12
+    assert [dp.name for dp in BusConfig.from_decoder_config(d, names={})[0].dataports] == [""] * 12
+
+
+def test_a_decoder_port_with_an_unset_number_takes_no_name():
+    from swi3s_studio.model.bus_config import BusConfig
+    d = {"dataports": [{"enabled": False, "device_number": 1, "dp_number": 0},
+                       {"enabled": True, "device_number": 1, "dp_number": -1, "enable_ch": 3},
+                       {"enabled": True, "device_number": 1, "dp_number": 4, "enable_ch": 3}]}
+    names = {(1, 0): "Slot Zero", (1, 1): "Slot One", (1, 4): "Mic"}
+    cfg, n = BusConfig.from_decoder_config(d, names=names)
+    assert n == 2
+    assert [dp.name for dp in cfg.dataports[:3]] == ["", "Mic", ""]
+
+
+def test_view_bus_grid_in_visualizer_names_the_chips_and_the_unnamed_keep_their_default(win):
+    _name_ports(win, {(0, 0): "AMP1", (0, 1): "AMP2", (0, 3): "MIC2"})
+    win.cursor.set_sample(2_000_000)                 # past the demo's port configuration
+    win.open_grid_in_visualizer()
+    QApplication.processEvents()
+    cfg = win._authoring.config()
+    assert [dp.name for dp in cfg.dataports[:4]] == ["AMP1", "AMP2", "", "MIC2"]
+    assert _chips(win)[:4] == ["AMP1", "AMP2", "DP2", "MIC2"]
+    assert _chips(win)[4:] == [f"DP{c}" for c in range(4, 12)]
+
+
+def test_a_name_carried_over_is_saved_and_loaded_like_one_typed_in_the_visualizer(
+        win, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.model.bus_config import BusConfig
+    _name_ports(win, {(0, 0): "AMP1", (0, 1): "AMP2", (0, 3): "MIC2"})
+    win.cursor.set_sample(2_000_000)
+    win.open_grid_in_visualizer()
+    QApplication.processEvents()
+    ctl = win._authoring_ctl
+    path = str(tmp_path / "bus_config.csv")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, "CSV (*.csv)"))
+    ctl.save_csv()
+    named = _csv_rows(path)
+    assert dict(named)["Name"] == ["AMP1", "AMP2", "DP2", "MIC2"] + [
+        f"DP{c}" for c in range(4, 12)]
+    # Only the Name row differs from the same grid opened with no names.
+    for dp in win._session.dp_names.copy():
+        win._session.set_dp_name(*dp, "")
+    win.open_grid_in_visualizer()
+    QApplication.processEvents()
+    bare = str(tmp_path / "bare.csv")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (bare, "CSV (*.csv)"))
+    ctl.save_csv()
+    plain = _csv_rows(bare)
+    assert [k for k, _v in named] == [k for k, _v in plain]
+    assert [k for (k, v), (_k, w) in zip(named, plain) if v != w] == ["Name"]
+    # Loaded back, the names are the config's and the chips'.
+    win._authoring.set_config(BusConfig())
+    ctl.open_csv_path(path)
+    QApplication.processEvents()
+    assert [dp.name for dp in win._authoring.config().dataports[:4]] == [
+        "AMP1", "AMP2", "", "MIC2"]
+    # A saved file names every port, the default "DP2" for an unnamed one; read back, that
+    # port is unnamed again and its chip reads "DP2".
+    assert _chips(win)[:4] == ["AMP1", "AMP2", "DP2", "MIC2"]
+
+
+# ---- Export Visualizer CSV carries the names too ----
+
+def _export_csv(win, monkeypatch, path):
+    from PySide6.QtWidgets import QFileDialog
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, "CSV (*.csv)"))
+    win.export_grid_csv()
+
+
+def test_export_visualizer_csv_holds_the_names_and_the_unnamed_keep_their_default(
+        win, monkeypatch, tmp_path):
+    _name_ports(win, {(0, 0): "AMP1", (0, 1): "AMP2", (0, 3): "MIC2"})
+    win.cursor.set_sample(2_000_000)
+    out = str(tmp_path / "export.csv")
+    _export_csv(win, monkeypatch, out)
+    assert dict(_csv_rows(out))["Name"] == ["AMP1", "AMP2", "DP2", "MIC2"] + [
+        f"DP{c}" for c in range(4, 12)]
+
+
+def test_export_visualizer_csv_writes_the_name_row_save_settings_writes_after_view_bus_grid(
+        win, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QFileDialog
+    _name_ports(win, {(0, 0): "AMP1", (0, 1): "AMP2", (0, 3): "MIC2"})
+    win.cursor.set_sample(2_000_000)
+    out = str(tmp_path / "export.csv")
+    _export_csv(win, monkeypatch, out)
+    win.open_grid_in_visualizer()
+    QApplication.processEvents()
+    saved = str(tmp_path / "saved.csv")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (saved, "CSV (*.csv)"))
+    win._authoring_ctl.save_csv()
+    assert dict(_csv_rows(out))["Name"] == dict(_csv_rows(saved))["Name"]
+    assert dict(_csv_rows(out))["Name"][0] == "AMP1"
+
+
+def test_export_visualizer_csv_of_an_unnamed_session_has_the_default_name_row(
+        win, monkeypatch, tmp_path):
+    win.cursor.set_sample(2_000_000)
+    out = str(tmp_path / "export.csv")
+    _export_csv(win, monkeypatch, out)
+    assert dict(_csv_rows(out))["Name"] == [f"DP{c}" for c in range(12)]

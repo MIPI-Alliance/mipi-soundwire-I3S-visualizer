@@ -1,10 +1,10 @@
-"""Command table for decoded commands (Apache Arrow / Parquet), a display and export cache.
+"""Command table for decoded commands (Apache Arrow / Parquet), a persisted cache with no reader.
 
 Keeps the command stream — sparse relative to the capture — in an Arrow table,
 filterable and savable to Parquet; `load_commands` reads a saved table fully into memory.
 Audio has its own memmap + pyramid store (`audio_store`). `register_writes` yields the
-CRC-valid WriteA32 rows only (Commit rows are in the table, flagged is_commit, and are not
-yielded).
+CRC-valid, single-device WriteA32 rows only (Commit rows are in the table, flagged is_commit,
+and are not yielded).
 """
 from __future__ import annotations
 
@@ -13,12 +13,17 @@ from typing import Any, Dict, Iterable, List
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# NOTE: this store is a display/persistence cache — it is NOT fed back into register
-# replay. The live register/grid state always replays the IN-MEMORY decoder output
-# (Session._build_register_files -> swi3score.registers_from_commands), never a
-# reloaded table. So fields only the replay needs (group_mask, has_sync_point,
-# row_delay, bus_row) are intentionally omitted here; add them if the store ever
-# drives replay.
+# NOTE: this store is a persistence cache that nothing in the application reads back:
+# the Commands table and every export read the IN-MEMORY decoder output
+# (`Session.commands`), and register replay does too (Session._build_register_files ->
+# swi3score.registers_from_commands). A command's fields not in `_FIELDS` are listed in
+# `OMITTED_FIELDS`; add them to the schema if anything ever reads the table.
+OMITTED_FIELDS = (
+    "bus_row", "effective_row", "enablech_curr_error", "group_mask", "has_manager_packet",
+    "has_sync_point", "header_valid", "packet_length", "read_only_write_error",
+    "row_delay", "row_delay_error", "running_port_write_error", "unexpected_ssp_error",
+    "unexpected_ssp_mid_interval",
+)
 _FIELDS = [
     ("command", pa.string()),
     ("phase", pa.string()),
@@ -65,8 +70,12 @@ def load_commands(path: str) -> pa.Table:
 
 
 def register_writes(commands: Iterable[Dict[str, Any]]):
-    """Yield (start_sample, address, data_bytes, device_mask) for each CRC-valid
-    WriteA32 — the raw material for the register-state timeline / register view."""
+    """Yield (start_sample, address, data_bytes, device_mask) for each WriteA32 the register
+    model applies: CRC-valid, addressed, and selecting exactly one device
+    (`registers.selects_one_device`). The register view replays through the native core, not
+    through this."""
+    from ..model.registers import selects_one_device
     for c in commands:
-        if c.get("command") == "WriteA32" and c.get("crc_valid") and c.get("has_address"):
+        if (c.get("command") == "WriteA32" and c.get("crc_valid") and c.get("has_address")
+                and selects_one_device(c.get("device_mask", 0))):
             yield (c["start_sample"], c["address"], c["data"], c["device_mask"])

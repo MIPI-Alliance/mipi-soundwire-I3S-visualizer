@@ -170,9 +170,9 @@ def test_opening_a_capture_does_not_cancel_a_re_decode():
     gate = threading.Event()
     calls = []
 
-    def redecode(**_kw):
+    def redecode(fork, **_kw):
         assert gate.wait(_WAIT_S)
-        return base
+        return fork
     win._load_async(redecode, kind="redecode", session=base,
                     after=lambda s: calls.append("redecode"))
     _pump_until(lambda: win._load_worker is not None, "the worker")
@@ -240,3 +240,128 @@ def test_a_locate_result_delivered_after_the_close_opens_nothing(outcome, monkey
         win._on_locate_failed("the reference could not be read")
     assert shown == [] and len(win._bookmarks) == marks
     assert win._locate_session is None
+
+
+def _gate_decodes(monkeypatch, gated: int):
+    """Hold the `gated`-th decode run (1-based) and every later one until cancel() is called
+    on its decoder, then run it (it returns at once and raises DecodeCancelled); a decode
+    that is never cancelled waits _WAIT_S. Returns the list each held decoder is appended
+    to."""
+    import swi3score
+
+    from swi3s_studio import session as session_mod
+
+    class Recorded(swi3score.Decoder):
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.cancel_called = threading.Event()
+
+        def cancel(self):
+            self.cancel_called.set()
+            super().cancel()
+    monkeypatch.setattr(swi3score, "Decoder", Recorded)
+    real = session_mod.run_watched
+    runs, held = [], []
+
+    def gated_run(decoder):
+        runs.append(decoder)
+        if len(runs) >= gated:
+            held.append(decoder)
+            decoder.cancel_called.wait(_WAIT_S)
+        real(decoder)
+    monkeypatch.setattr(session_mod, "run_watched", gated_run)
+    return held
+
+
+def _close_once_held(win, held, after):
+    """Close `win` once the load worker holds the decoder the gate holds, and check the close
+    cancelled it promptly and the request settled neither way."""
+    from swi3s_studio.ui.main_window import CLOSING_NOTICE
+    _pump_until(lambda: held and win._load_worker is not None
+                and win._load_worker.decoder is held[-1], "the worker to hold the decoder")
+    dec = held[-1]
+    start = time.time()
+    win.close()                                        # closeEvent joins the worker threads
+    assert time.time() - start < _WAIT_S / 2          # returned on cancel, not on the timeout
+    assert dec.cancelled
+    assert CLOSING_NOTICE in win._status.text()
+    assert win._load_thread is None
+    QApplication.instance().processEvents()
+    assert after == []
+
+
+def test_closing_the_window_cancels_a_re_decode(monkeypatch):
+    """A re-decode's decoder reaches the load worker, so its progress shows and the close
+    cancels it."""
+    from swi3s_studio.session import Session
+    win = _window()
+    base = Session.from_demo(300, cold_start=True, phy=2, register_map=win._rmap)
+    win.load_session(base)
+    decoder = base.decoder
+    held = _gate_decodes(monkeypatch, 1)
+    after = []
+
+    def redecode(fork):
+        fork._redecode()
+        return fork
+    win._load_async(redecode, kind="redecode", after=lambda s: after.append(s),
+                    on_fail=lambda: after.append("failed"))
+    _close_once_held(win, held, after)
+    assert base.decoder is decoder
+
+
+@pytest.mark.parametrize("gated", [1, 2], ids=["its decode", "its staged re-decode"])
+def test_closing_the_window_cancels_a_workspace_load(monkeypatch, tmp_path, gated):
+    """Open Workspace (and Open Demo Capture, which loads the same way): the decode of a
+    saved Link and the re-decode its saved register what-if starts both reach the load
+    worker, so the close cancels either."""
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.session import Session
+    win = _window()
+    base = Session.from_demo(300, cold_start=True, phy=2, register_map=win._rmap)
+    base.set_register_override(len(base.segments) - 1, 0, 0x1081, 0x05)
+    win.load_session(base)
+    path = str(tmp_path / "ws.json")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (path, ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (path, ""))
+    win.save_workspace()
+    win.join_worker_threads()
+    again = _window()
+    held = _gate_decodes(monkeypatch, gated)
+    after = []
+    again._load_pending = None
+    load = again._load_async
+
+    def tracked(*a, **k):
+        k.setdefault("on_fail", lambda: after.append("failed"))
+        return load(*a, **k)
+    monkeypatch.setattr(again, "_load_async", tracked)
+    again.open_workspace()
+    _close_once_held(again, held, after)
+    assert again.links.index_of(base) < 0 and len(again.links) == 0
+
+
+def test_every_decoder_a_session_runs_is_announced_before_it_runs(monkeypatch):
+    """Inside announcing_decoders, the first decode, a bring-up check's and a setter's
+    re-decode each hand their decoder over before it runs, and only on that thread."""
+    from swi3s_studio import session as session_mod
+    from swi3s_studio.session import Session, announcing_decoders
+    announced, ran = [], []
+    real = session_mod.run_watched
+
+    def recorded(decoder):
+        ran.append((decoder, any(d is decoder for d in announced)))
+        real(decoder)
+    monkeypatch.setattr(session_mod, "run_watched", recorded)
+    with announcing_decoders(announced.append):
+        s = Session.from_demo(300, cold_start=True, phy=2)
+        s.set_hub_depths({1: 1})
+        inside = len(ran)
+        elsewhere = threading.Thread(target=lambda: Session.from_demo(32))
+        elsewhere.start()
+        elsewhere.join()
+    Session.from_demo(32)
+    assert inside >= 2
+    assert [seen for _d, seen in ran] == [True] * inside + [False] * (len(ran) - inside)
+    assert len(announced) == inside

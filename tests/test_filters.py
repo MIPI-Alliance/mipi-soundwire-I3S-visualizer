@@ -23,10 +23,9 @@ _REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
 _CASES = [(48_000, 1.0), (48_000, 20.0), (48_000, 1_000.0), (48_000, 20_000.0),
           (8_000, 3_990.0), (16_000, 50.0)]
 _N = 600
-# Agreement to 1 part in 1e8. At a 1 Hz corner at 48 kHz the poles sit within 1.3e-4 of the
-# unit circle, so rounding differences between two correct implementations grow by about
-# that factor; measured, they reach 1.1e-9 of full scale there and at most 1e-11 at the
-# other corners. On a 16-bit stream 1e-8 of full scale is a three-thousandth of one step.
+# Agreement to 1 part in 1e8 of full scale, which allows for the rounding growth of poles
+# within 1.3e-4 of the unit circle (a 1 Hz corner at 48 kHz). On a 16-bit stream that is a
+# three-thousandth of one step.
 _TOL = 1e-8
 
 

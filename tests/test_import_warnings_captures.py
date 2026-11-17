@@ -7,6 +7,7 @@ import json
 import os
 import struct
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -183,7 +184,8 @@ def test_a_digital_csv_rate_coarser_than_its_transitions_reports_the_merged_edge
     p.write_text("\n".join(_digital_rows()) + "\n")
     with import_notes.collect() as notes:
         digital_csv.load_capture(str(p), 1, 2, sample_rate_hz=100_000)
-    assert _messages(notes, "d.csv") == [
+    got = [m for m in _messages(notes, "d.csv") if "sample grid" not in m]
+    assert got == [
         "42 transitions land on the same sample as the one before at 100,000 Hz (the rate "
         "is coarser than the transitions)"]
 
@@ -510,6 +512,37 @@ def test_opening_a_malformed_capture_shows_the_import_warnings_window(tmp_path):
 
 
 
+def test_a_sal_opened_as_two_links_shows_its_skipped_entry_warning_once(tmp_path):
+    """Each Link of one Open is a load of its own; a warning about the file is shown by the
+    first and left out of the others' windows."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from conftest import pump_loads
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.ingest import probe
+    from swi3s_studio.ui.main_window import MainWindow
+    from swi3s_studio.ui.open_capture_dialog import LinkRequest, OpenRequest
+    QApplication.instance() or QApplication([])
+    p, _cap = _sal(tmp_path)
+    out = str(tmp_path / "extra.sal")
+    with zipfile.ZipFile(p) as zin, zipfile.ZipFile(out, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "meta.json":
+                meta = json.loads(data)
+                meta.setdefault("binData", []).append(
+                    {"type": "Digital", "file": "digital-9.bin", "deviceChannel": 9})
+                data = json.dumps(meta).encode()
+            zout.writestr(item, data)
+    win = MainWindow()
+    win._open_request(probe.probe([out]), OpenRequest(
+        links=[LinkRequest("A", 0, 1), LinkRequest("B", 0, 1)]))
+    pump_loads(win)
+    assert [link.name for link in win.links] == ["A", "B"]
+    lines = [ln for d in win.import_warning_dialogs() for ln in d.lines()]
+    assert sum("digital-9.bin" in ln for ln in lines) == 1, lines
+
+
 # ------------------------------------------- times that are not finite are skipped
 
 def _with_bad_times(t):
@@ -601,6 +634,32 @@ def test_a_sal_v0_reports_transitions_on_one_sample(tmp_path):
     msgs = [str(n) for n in notes]
     assert ("v0.sal: digital ch0: 148 transitions land on the same sample as the one "
             "before at 250,000 Hz (the rate is coarser than the transitions)") in msgs
+
+
+def test_a_sal_v0_channel_with_a_low_count_reports_the_bytes_past_it_as_a_bin_does(tmp_path):
+    t = np.arange(1, 200) / _RATE
+    c, d = _bin_pair(tmp_path, t, t[::7])
+    count_at = saleae_binary.V0_HEADER.size - 8
+    raw = bytearray(Path(c).read_bytes())
+    struct.pack_into("<Q", raw, count_at, 100)
+    Path(c).write_bytes(bytes(raw))
+    with import_notes.collect() as bin_notes:
+        want = saleae_binary.load_capture(c, d, _RATE)
+    out = str(tmp_path / "low.sal")
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("meta.json", json.dumps(
+            {"data": {"legacySettings": {"sampleRate": {"digital": _RATE}}},
+             "binData": [{"type": "Digital", "file": f"digital-{i}.bin", "deviceChannel": i}
+                         for i in range(2)]}))
+        z.writestr("digital-0.bin", Path(c).read_bytes())
+        z.writestr("digital-1.bin", Path(d).read_bytes())
+    with import_notes.collect() as notes:
+        cap = saleae_sal.load_capture(out, 0, 1, max_bytes=0)
+    assert _messages(bin_notes, "clk.bin") == [
+        "792 bytes past the 100 transitions the header counts are ignored"]
+    assert _messages(notes, "low.sal") == [
+        "digital ch0: 792 bytes past the 100 transitions the header counts are ignored"]
+    assert np.array_equal(cap.clock_edges, want.clock_edges)
 
 
 def test_a_sal_v0_skips_and_reports_transition_times_that_are_not_finite(tmp_path):

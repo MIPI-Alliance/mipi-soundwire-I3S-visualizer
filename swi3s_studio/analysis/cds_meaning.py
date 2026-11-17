@@ -150,7 +150,10 @@ class _Annotator:
         self.pidx = 0
         self.count = 0          # generic countdown (spacer/response slots)
         self.dev = 0            # device index for per-device response slots
-        self.read_bytes = 0     # remaining read-data bytes (ReadSetup-with-data)
+        self.read_bytes = 0     # remaining read-data bytes of the delivery being labelled
+        self.mask = 0           # this phase's Device Mask
+        self.read_count = None  # this ReadSetup's byte count, None when it gives none
+        self.pending = [0] * _MAX_PERIPHERALS   # per device: a deferred read's byte count
         self._rd_idx = 0        # index within the Read Data field
         self._after = "idle"    # state to enter when the current spacer ends
         self.header_ok = True   # every Phase Header token so far read, PhaseID defined
@@ -192,6 +195,8 @@ class _Annotator:
             self.header_ok = False
         if i == 0:
             self.phase = v
+            self.mask = 0
+            self.read_count = None
             if not readable:
                 return "PhaseID: unreadable"
             if v not in _PHASE_NAMES:
@@ -199,6 +204,7 @@ class _Annotator:
                 return f"PhaseID: undefined ({v})"
             return f"PhaseID: {_PHASE_NAMES[v]}"
         if i in (1, 2, 3):
+            self.mask |= (v & 0xF) << (4 * (3 - i))
             field = f"Device Mask_{'HML'[i - 1]}"
             return f"{field} = 0x{v:X}" if readable else f"{field}: unreadable"   # 4-bit nibble
         if i == 4:
@@ -237,7 +243,7 @@ class _Annotator:
         if idx == 0:
             self.opcode = val if val and val >= 0 else 0
         elif idx == 1 and self.phase == 2 and self.opcode == 0:   # READ_A32 byte count (excess-1)
-            self.read_bytes = (val + 1) if (val is not None and val >= 0) else 0
+            self.read_count = (val + 1) if (val is not None and val >= 0) else None
         label = _packet_field(self.phase, self.opcode, idx, self.pktlen)
         if idx != 0 and val is not None and val >= 0:   # opcode keeps its name; else show the byte
             label = f"{label} = 0x{(val & 0xFF):02X}"
@@ -281,12 +287,25 @@ class _Annotator:
         self.state = "idle"
         return f"Peripheral Response: {_resp_name(kind, self.phase, val)}"
 
+    def _devices(self):
+        return [i for i in range(_MAX_PERIPHERALS) if self.mask & (1 << i)]
+
     def _st_read_resp(self, kind, val) -> str:
+        # As the core: READ_DATA_NOW delivers the ReadSetup's own count, else the first
+        # masked device's pending count, else 1 byte; any other answer to a ReadSetup
+        # with a count leaves that count pending on each masked device.
         name = _resp_name(kind, self.phase, val)
-        if kind == _KIND_RT and val == 0 and self.read_bytes > 0:   # READ_DATA_NOW: data follows
+        if kind == _KIND_RT and val == 0:                          # READ_DATA_NOW: data follows
+            devs = self._devices()
+            n = self.read_count if self.read_count is not None else (
+                self.pending[devs[0] if devs else 0] or 1)
+            self.read_bytes = max(1, n)
             self._rd_idx = 0
             self._goto("spacer", _SPACER_MP, "read_data")
         else:
+            if self.phase == 2 and self.read_count is not None:
+                for d in self._devices():
+                    self.pending[d] = self.read_count
             self.state = "idle"
         return f"Peripheral Response: {name}"
 
@@ -307,6 +326,8 @@ class _Annotator:
         self.count -= 1                            # CRC16 H then L
         label = "Peripheral_CRC16_H" if self.count == 1 else "Peripheral_CRC16_L"
         if self.count <= 0:
+            for d in self._devices():                 # the delivery clears the pending read
+                self.pending[d] = 0
             self._goto("spacer", _SPACER_PM, "read_mgr_resp")
         return f"{label} = 0x{(val & 0xFF):02X}" if (val is not None and val >= 0) else label
 

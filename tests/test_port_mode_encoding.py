@@ -9,6 +9,8 @@ Test1 every such bit carries raw 1. Pinned here, for each place the value is rea
 - the swviz model: `PortMode.TEST0 == 2`, `PortMode.TEST1 == 3`, and `port_mode_bit`
   maps each mode to the raw bit value it forces;
 - the native core: `grid_from_csv` carries the port's PortMode on each of its DATA cells.
+- the swviz Test Mode notification compares the bit each mode forces, so Reserved matches
+  Normal.
 
 The Bus Grid labels and the Port Test Mode dialog are in `test_port_mode_encoding_gui.py`.
 
@@ -112,3 +114,34 @@ def test_native_core_carries_port_mode_on_every_data_cell(port_mode):
     data = _data(_native_cells(port_mode))
     assert len({c["col"] for c in data}) == 2, "the fixture places two channel columns"
     assert {c["port_mode"] for c in data} == {port_mode}
+
+
+@pytest.mark.parametrize("source_mode, sink_mode, mismatch", [
+    (1, 0, False),            # Reserved is drawn as Normal
+    (0, 1, False),
+    (2, 0, True),
+    (2, 1, True),
+    (3, 2, True),
+    (3, 3, False),
+])
+def test_test_mode_mismatch_compares_the_forced_bit(source_mode, sink_mode, mismatch):
+    """The Test Mode notification compares the raw bit each port's mode forces, so a
+    Reserved port, drawn as Normal, matches a Normal partner on the same slots."""
+    from swi3s_studio.model.viz_engine import build_bus_model, issues_from_model
+
+    cfg = _cfg(source_mode)
+    sink = cfg.dataports[1]
+    sink.enabled = True
+    sink.device_number = 1
+    sink.port_direction = True
+    sink.port_mode = sink_mode
+    sink.enable_ch = 0b11
+    sink.sample_size = 0
+    sink.interval = 1
+    sink.offset = 0
+    sink.horizontal_start = 2
+    sink.horizontal_count = 2
+    with tempfile.TemporaryDirectory() as d:
+        bm, _i, _v = build_bus_model(cfg.to_csv_file(os.path.join(d, "pm.csv")))
+    assert bool(bm.warnings.test_mode_mismatches) is mismatch, bm.warnings.test_mode_mismatches
+    assert any(i.source == "Test Mode" for i in issues_from_model(bm)) is mismatch

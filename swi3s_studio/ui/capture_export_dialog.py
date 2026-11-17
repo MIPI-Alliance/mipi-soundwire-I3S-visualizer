@@ -25,7 +25,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..ingest.raw_export import bin_paths
 from .save_path import suffixed_save_path
+from .theme import analyzer_stylesheet
+
+# The channels Export Capture writes the clock and the data line to.
+CLOCK_CHANNEL, DATA_CHANNEL = 0, 1
 
 # (label, format key, extension, save-dialog filter)
 _FORMATS = [
@@ -56,11 +61,13 @@ class CaptureExportDialog(QDialog):
                  default_name: str = "capture", parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export Capture")
+        self.setStyleSheet(analyzer_stylesheet())
         self._session = session
         self._clock_name = clock_name or "SW_CLK"
         self._data_name = data_name or "SW_DATA"
         self._default_dir = default_dir or ""
         self._default_name = default_name or "capture"   # e.g. "capture_Amp_bus" per Link
+        self._confirmed: set = set()      # paths Browse's save dialog confirmed replacing
 
         lay = QVBoxLayout(self)
 
@@ -129,10 +136,13 @@ class CaptureExportDialog(QDialog):
     # ---- reactive UI ----
     def _on_format_changed(self) -> None:
         _key, ext, _filt = self._format.currentData()
-        # Re-point the file field's extension to the chosen format.
+        # Re-point the file field's extension to the chosen format: only one of the
+        # dialog's own formats is replaced, so a dot inside a name ("run 1.5") stays.
         cur = self._path.text().strip()
         base = cur or os.path.join(self._default_dir, self._default_name)
-        root, _old = os.path.splitext(base)
+        root, old = os.path.splitext(base)
+        if old.lower() not in {e for _l, _k, e, _f in _FORMATS}:
+            root = base
         self._path.setText(root + ext)
         # A .sal project stores the whole two-wire bus — both signals required; the raw
         # .bin/.csv formats can drop one. Force + lock the checkboxes for .sal.
@@ -174,10 +184,20 @@ class CaptureExportDialog(QDialog):
         start = self._path.text().strip() or self._default_dir
         path, _ = QFileDialog.getSaveFileName(self, "Export Capture", start, filt)
         if path:
-            ext = self._format.currentData()[1]
-            path = suffixed_save_path(self, path, ext, "Export Capture")
+            path = self._suffixed(path)
         if path:
+            self._confirmed.add(path)   # the save dialog confirmed replacing this name
             self._path.setText(path)
+
+    def _suffixed(self, path: str) -> Optional[str]:
+        """`path` with the format's extension, None when the user declines replacing it.
+        A .bin export never writes `<name>.bin` itself (it writes one file per signal), so
+        that name is added with no replace prompt; `output_files` confirms the files
+        written."""
+        ext = self._format.currentData()[1]
+        if self.fmt() == "bin":
+            return path if path.lower().endswith(ext) else path + ext
+        return suffixed_save_path(self, path, ext, "Export Capture")
 
     # ---- results ----
     def fmt(self) -> str:
@@ -192,6 +212,16 @@ class CaptureExportDialog(QDialog):
 
     def output_path(self) -> str:
         return self._path.text().strip()
+
+    def output_files(self) -> list:
+        """Every file the export writes: the output path, or for a .bin export one file
+        per included signal (`raw_export.bin_paths`)."""
+        path = self.output_path()
+        if self.fmt() != "bin":
+            return [path]
+        clk_on, dat_on = self.include()
+        return bin_paths(path, [ch for ch, on in ((CLOCK_CHANNEL, clk_on),
+                                                  (DATA_CHANNEL, dat_on)) if on])
 
     def sample_range(self) -> Optional[Tuple[int, int]]:
         """The chosen export window as (s0, s1) capture samples, or None for the whole
@@ -231,5 +261,24 @@ class CaptureExportDialog(QDialog):
         if rng is not None and rng[1] <= rng[0]:
             QMessageBox.information(self, "Export Capture",
                                     "The range's end must be after its start.")
+            return
+        # A typed path takes the format's extension as a Browse choice does.
+        typed = self.output_path()
+        if typed not in self._confirmed:
+            path = self._suffixed(typed)
+            if path is None:
+                return
+            if path != typed:
+                self._confirmed.add(path)      # suffixed_save_path confirmed a replacement
+                self._path.setText(path)
+        # A file the export replaces is confirmed once here, unless the save dialog or the
+        # suffix check already confirmed that name.
+        existing = [os.path.basename(p) for p in self.output_files()
+                    if os.path.exists(p) and p not in self._confirmed]
+        if existing and QMessageBox.question(
+                self, "Export Capture",
+                "These files exist and will be replaced:\n" + "\n".join(existing)
+                + "\n\nReplace them?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         super().accept()

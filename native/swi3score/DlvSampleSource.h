@@ -11,14 +11,22 @@
 // the row period, subdivides it into `columns` equal UIs, and samples each UI at its
 // MIDDLE (§12.2.5 {ASW4803}), unlike FBCSE which samples at the UI edge.
 //
+// The clock acquires at the first rising edge, which need not open a row in a capture
+// joined mid-stream. It counts as locked once kLockRows consecutive rows each open on a
+// rising edge (a data edge does not recur at the same row phase for that long), and the
+// source starts from the earliest row the capture holds, found by working back from the
+// lock one row period at a time over the edges before it, at the UI the clock locked to.
+// Every row before the lock is decoded as the rows after it are.
+//
 // The column count comes from the snoop (authoritative): the source starts at the
 // Safe-Lock-4 count and the decoder pushes each committed NumColumns change via
 // SetColumns().
 //
 // A Link brought up again restarts the clock: the decoder calls Reacquire() where the Link
 // goes inactive and again at the restart, and the DLL locks afresh at the bring-up's first
-// Row Sync with the nominal UI of its Safe-Lock geometry (the seeded row period, which a
-// bring-up does not change, over its column count). The stretch between is skipped, not
+// Row Sync, seeded with the nominal UI of its Safe-Lock geometry (the seeded row period,
+// which a bring-up does not change, over its column count) and starting at the UI it locks
+// to from there, as at the first lock. The stretch between is skipped, not
 // tracked: it has no rows, and the start sequence's link-control pulses are single-ended
 // edges the loop would snap to.
 //
@@ -193,9 +201,10 @@ public:
     }
 
     // A later bring-up (see the header comment): lock at the first rising edge at or after
-    // `sample`, as lock() does at the first, at `columns` columns and the seeded row period
-    // over them (the tracked one when none was seeded). The row log stays in UI order for
-    // Seek: the UIs consumed since the last row edge belong to the row the stop cut short.
+    // `sample`, as lock() does at the first, at `columns` columns, seeded with the row
+    // period (the tracked one when none was seeded) over them and starting at the UI
+    // acquire() tracks from that edge. The row log stays in UI order for Seek: the UIs
+    // consumed since the last row edge belong to the row the stop cut short.
     // Called twice for one bring-up (where the Link goes inactive, then at the restart
     // with its geometry), the second replaces the first, which consumed no UI.
     void Reacquire(std::uint64_t sample, int columns) override
@@ -203,7 +212,7 @@ public:
         if (!mLocked && !lock()) return;
         if (columns < swi3s::kMinColumnCount || columns > swi3s::kMaxColumnCount) columns = mColumns;
         const std::size_t at = risingAtOrAfter(sample);
-        const std::uint64_t edge = (at < mEdgeN) ? mEdges[at] : UINT64_MAX;
+        std::uint64_t edge = (at < mEdgeN) ? mEdges[at] : UINT64_MAX;
         double cutUi = mUiSamples;
         if (!mReacquired.empty() && mRowStartUi[mReacquired.back().row] >= mUi)
             cutUi = mReacquired.back().cutUiSamples;
@@ -221,6 +230,7 @@ public:
         if (!(row / columns >= kMinUiSamples)) { mEnded = true; return; }
         mColumns = columns;
         mUiSamples = row / columns;
+        acquire(edge, mUiSamples, columns);
         mRowStart = static_cast<double>(edge);
         mCol = 0;
         mRowSyncs.push_back(edge);
@@ -241,6 +251,7 @@ public:
 
 private:
     static constexpr double kMaxCoastRows = 64.0;
+    static constexpr int kLockRows = 64;   // consecutive edge-opened rows that make a lock
     static constexpr double kSampleLimit = 18446744073709551616.0;   // 2^64
 
     // `x` truncated to a sample number, saturating: 0 at or below 0 and for NaN,
@@ -317,7 +328,7 @@ private:
         return best;
     }
 
-    // Acquire: first rising edge = Row 0's Sync1 (the reference-edge phase). Seed the UI
+    // Acquire: Row 0 opens on the edge acquire() picks, with the UI it picks. Seed the UI
     // period from the nominal free-running estimate when given (robust: the aperture then
     // tracks the once-per-row reference, ignoring intra-row CDS/data edges); otherwise fall
     // back to guessing it from the first two rising edges / columns.
@@ -325,8 +336,6 @@ private:
     {
         const std::size_t r0 = firstRising();
         if (r0 >= mEdgeN) return false;
-        mRowStart = static_cast<double>(mEdges[r0]);
-        mRowStart0 = static_cast<double>(mEdges[r0]);   // fixed row-0 anchor for Seek()
         if (mNominalUi > 0.0) {
             mUiSamples = mNominalUi;
         } else {
@@ -334,7 +343,11 @@ private:
             mUiSamples = static_cast<double>(mEdges[r0 + 2] - mEdges[r0]) / mColumns;
         }
         if (!(mUiSamples >= kMinUiSamples) || !std::isfinite(mUiSamples)) return false;
-        mRowSyncs.push_back(mEdges[r0]);
+        std::uint64_t edge = mEdges[r0];
+        acquire(edge, mUiSamples, mColumns);
+        mRowStart = static_cast<double>(edge);
+        mRowStart0 = mRowStart;                // fixed row-0 anchor for Seek()
+        mRowSyncs.push_back(edge);
         mRowStartUi.push_back(0);          // row 0's Column 0 is source UI 0 (Seek row lookup)
         mRowUi.push_back(mUiSamples);
         mRow = 0;
@@ -343,39 +356,129 @@ private:
         return true;
     }
 
-    // End of a row: predict the next Sync1 (rowStart + columns*UI), snap to the nearest
-    // observed rising edge (tracks jitter/drift; coasts on the prediction if none is within
-    // half a UI — a missing Row Sync, which the spec tolerates), and refine the UI estimate.
-    // A next rising edge more than kMaxCoastRows rows on is relocked to directly, with the
-    // UI unchanged; none at all, with the capture running on further, ends the source, as
-    // does a UI under kMinUiSamples or a row that does not advance.
-    bool advanceRow()
+    // The edge the clock's first row opens on and the UI it starts with, given the first
+    // rising edge it may lock at (`edge`), the seeded UI and the column count. The clock
+    // runs on from `edge`, row by row as advanceRow does, to the first row that ends
+    // kLockRows consecutive rows each opening on a rising edge: the lock. From the lock it
+    // works back, one row period at a time (stepBack), to the earliest row that opens at or
+    // after `edge`: the first row, with the UI tracked back to it. A row with no rising edge
+    // near its predicted Sync1 is coasted, as forward; more than kMaxCoastRows of them in a
+    // row hold no rows, and the first row is the last one that opened on an edge. With no
+    // lock before the capture ends or its rows stop (a relock), the first row opens on
+    // `edge` with the seeded UI. Nothing is logged.
+    void acquire(std::uint64_t& edge, double& ui, int columns) const
     {
-        if (mRow + 1 < mRowSyncs.size()) return replayRow(mRow + 1);
-        if (!(mUiSamples >= kMinUiSamples)) return false;
-        double period = mColumns * mUiSamples;
-        double predicted = mRowStart + period;
-        if (predicted > static_cast<double>(mLastSample) + mUiSamples) return false;
+        const std::uint64_t floor = edge;
+        double start = static_cast<double>(edge);
+        double u = ui;
+        int run = 0;
+        while (run < kLockRows) {
+            std::uint64_t next = 0;
+            const Step step = nextRowEdge(start, u, columns, next);
+            if (step == Step::End || step == Step::Relocked) return;
+            if (step == Step::Snapped) {
+                u = 0.75 * u + 0.25 * (static_cast<double>(next) - start) / columns;
+                ++run;
+            } else {
+                run = 0;
+            }
+            start = static_cast<double>(next);
+        }
+        double snapped = start, snappedUi = u;
+        std::uint64_t back = 0;
+        int coasted = 0;
+        for (;;) {
+            const Step step = stepBack(start, u, columns, floor, back);
+            if (step == Step::End) break;
+            if (step == Step::Snapped) {
+                u = 0.75 * u + 0.25 * (start - static_cast<double>(back)) / columns;
+                coasted = 0;
+                snapped = static_cast<double>(back);
+                snappedUi = u;
+            } else if (++coasted > kMaxCoastRows) {
+                start = snapped;               // no rows that far back: the last edge-opened one
+                u = snappedUi;
+                break;
+            }
+            start = static_cast<double>(back);
+        }
+        edge = toSample(start);
+        ui = u;
+    }
+
+    // How the clock reaches a row's opening edge: on a rising edge, on the prediction (no
+    // edge near it), on a rising edge more than kMaxCoastRows rows on, or not at all.
+    enum class Step { Snapped, Coasted, Relocked, End };
+
+    // The opening edge of the row after the one opening at `start`, at UI `ui` over
+    // `columns`: the rising edge nearest the predicted Sync1 (start + columns*UI) within half
+    // a UI, else the prediction itself (a missing Row Sync, which the spec tolerates). A next
+    // rising edge more than kMaxCoastRows rows on is relocked to directly. Ends with no
+    // rising edge left and the capture running on further, with a UI under kMinUiSamples,
+    // and for a row that does not advance.
+    Step nextRowEdge(double start, double ui, int columns, std::uint64_t& out) const
+    {
+        if (!(ui >= kMinUiSamples)) return Step::End;
+        const double period = columns * ui;
+        const double predicted = start + period;
+        if (predicted > static_cast<double>(mLastSample) + ui) return Step::End;
         const std::uint64_t at = toSample(predicted + 0.5);
-        std::uint64_t window = toSample(mUiSamples * 0.5 + 0.5);
-        std::uint64_t snap = nearestRising(at, window);
-        bool relocked = false;
-        std::uint64_t newStart = (snap != UINT64_MAX) ? snap : at;
+        const std::uint64_t window = toSample(ui * 0.5 + 0.5);
+        const std::uint64_t snap = nearestRising(at, window);
+        Step step = Step::Snapped;
+        out = snap;
         if (snap == UINT64_MAX) {
+            step = Step::Coasted;
+            out = at;
             const std::size_t next = risingAtOrAfter(at);
             const double limit = predicted + kMaxCoastRows * period;
             if (next >= mEdgeN) {
-                if (static_cast<double>(mLastSample) > limit) return false;
+                if (static_cast<double>(mLastSample) > limit) return Step::End;
             } else if (static_cast<double>(mEdges[next]) > limit) {
-                newStart = mEdges[next];
-                relocked = true;
+                out = mEdges[next];
+                step = Step::Relocked;
             }
         }
-        if (static_cast<double>(newStart) <= mRowStart) return false;
-        // Refine UI from the measured row period (light EMA); guard against a bad snap.
-        double measured = (static_cast<double>(newStart) - mRowStart) / mColumns;
-        if (!relocked && measured > 0.0) mUiSamples = 0.75 * mUiSamples + 0.25 * measured;
-        mRowStart = newStart;
+        if (static_cast<double>(out) <= start) return Step::End;
+        return step;
+    }
+
+    // The opening edge of the row before the one opening at `start`: the rising edge at or
+    // after `floor` nearest start - columns*UI within half a UI, else that prediction. Ends
+    // where the prediction has no such edge near it and lies before `floor` (the row opened
+    // before the capture or the bring-up did), and for a row that does not recede.
+    Step stepBack(double start, double ui, int columns, std::uint64_t floor,
+                  std::uint64_t& out) const
+    {
+        const double predicted = start - columns * ui;
+        if (!(predicted > 0.0)) return Step::End;
+        const std::uint64_t at = toSample(predicted + 0.5);
+        std::uint64_t snap = nearestRising(at, toSample(ui * 0.5 + 0.5));
+        if (snap != UINT64_MAX && snap < floor) snap = UINT64_MAX;
+        Step step = Step::Snapped;
+        out = snap;
+        if (snap == UINT64_MAX) {
+            if (predicted < static_cast<double>(floor)) return Step::End;
+            step = Step::Coasted;
+            out = at;
+        }
+        if (!(static_cast<double>(out) < start)) return Step::End;
+        return step;
+    }
+
+    // End of a row: the next row's opening edge (nextRowEdge), refining the UI estimate from
+    // the measured row period (a light EMA); a relock keeps the UI. Ends the source where
+    // nextRowEdge ends.
+    bool advanceRow()
+    {
+        if (mRow + 1 < mRowSyncs.size()) return replayRow(mRow + 1);
+        std::uint64_t newStart = 0;
+        const Step step = nextRowEdge(mRowStart, mUiSamples, mColumns, newStart);
+        if (step == Step::End) return false;
+        if (step != Step::Relocked)
+            mUiSamples = 0.75 * mUiSamples
+                         + 0.25 * (static_cast<double>(newStart) - mRowStart) / mColumns;
+        mRowStart = static_cast<double>(newStart);
         // Log this row's (edge, Column-0 UI) — but only the FIRST time we advance through it.
         // A windowed re-decode (Seek + NextUi, e.g. the CDS symbol viewer or the bit-sample
         // overlay) walks rows already logged; re-appending would corrupt the recovered-clock

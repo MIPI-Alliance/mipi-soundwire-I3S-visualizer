@@ -341,6 +341,56 @@ def test_the_default_columns_and_widths():
         assert view.columnWidth(c) >= fit > 0, name
 
 
+
+def test_a_hidden_column_shown_is_as_wide_as_its_header():
+    """A column hidden by default and shown from the header menu is at least as wide as its
+    header label as well as its contents."""
+    win = _win()
+    view = win._cmd_view
+    hdr = view.horizontalHeader()
+    for name in sorted(DEFAULT_HIDDEN):
+        c = _col(view, name)
+        view.set_column_shown(name, True)
+        assert view.columnWidth(c) >= max(hdr.sectionSizeHint(c), view.sizeHintForColumn(c)), name
+
+
+def test_a_hidden_column_whose_header_is_wider_than_its_contents_is_shown_as_wide_as_it():
+    """The header label sets a hidden column's width when shown wherever it is wider than the
+    contents, whatever the platform's font metrics: here a header font three times the size
+    makes every header the wider, Row included."""
+    win = _win()
+    view = win._cmd_view
+    hdr = view.horizontalHeader()
+    font = hdr.font()
+    font.setPointSizeF(font.pointSizeF() * 3)
+    hdr.setFont(font)
+    view.fit_columns()
+    for name in sorted(DEFAULT_HIDDEN):
+        c = _col(view, name)
+        view.set_column_shown(name, True)
+        assert hdr.sectionSizeHint(c) > view.sizeHintForColumn(c), name
+        assert view.columnWidth(c) >= hdr.sectionSizeHint(c), name
+
+
+def test_a_re_decode_keeps_the_commands_column_widths():
+    """Widths set on the table, and widths restored to a Link while another is shown, are
+    kept across a re-decode of that Link."""
+    from conftest import pump_loads
+    win = _win()
+    view = win._cmd_view
+    view.setColumnWidth(_col(view, "Opcode"), 151)
+    win._redecode_preserving(lambda fork: fork)
+    pump_loads(win)
+    assert view.columnWidth(_col(view, "Opcode")) == 151
+    win = _two_links()
+    win.set_group_link("commands", 0)
+    win.links[1].view.col_widths = {"Opcode": 152}      # as a workspace restores them
+    with win._as_link(1):
+        win._redecode_preserving(lambda fork: fork)
+    pump_loads(win)
+    win.set_group_link("commands", 1)
+    assert win._cmd_view.columnWidth(_col(win._cmd_view, "Opcode")) == 152
+
 def test_column_widths_are_kept_by_name():
     from swi3s_studio.ui.command_table import COLUMN_NAMES
     from swi3s_studio.ui.main_window import _widths_by_name

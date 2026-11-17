@@ -22,7 +22,7 @@ import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
@@ -602,6 +602,32 @@ def test_outside_the_bus_analyzer_no_analyzer_pane_is_maximized(win):
     assert win.maximized_pane() is None and win._viz_split.sizes()[0] > 0
 
 
+@pytest.mark.parametrize("via_mode", [False, True], ids=["direct", "mode switch between"])
+def test_the_bus_visualizer_restore_gives_back_the_split_it_saved(win, via_mode):
+    """⤢ twice returns the grid and the controls to the split the maximize saved, once the
+    collapsed controls' scroll bar is gone, cycle after cycle, also with a mode switch while
+    maximized."""
+    from swi3s_studio.ui.mode_controller import ANALYSIS, VISUALIZATION
+    win._mode_mgr.switch_to(VISUALIZATION)
+    _settle()
+    win._viz_max_btn.click()
+    _settle()
+    win._viz_max_btn.click()
+    _settle()
+    for _ in range(3):
+        saved = win._viz_split.sizes()
+        win._viz_max_btn.click()
+        _settle()
+        if via_mode:
+            win._mode_mgr.switch_to(ANALYSIS)
+            _settle()
+            win._mode_mgr.switch_to(VISUALIZATION)
+            _settle()
+        win._viz_max_btn.click()
+        _settle()
+        assert win._viz_split.sizes() == pytest.approx(saved, abs=1)
+
+
 def test_the_shortcuts_help_lists_the_key(win, monkeypatch):
     shown = []
     monkeypatch.setattr(win, "_info_box", lambda title, html: shown.append(html))
@@ -620,7 +646,7 @@ def test_the_timing_inequalities_maximize_to_the_whole_page(win):
     win._mode_mgr.switch_to(TIMING)
     _settle()
     page = win._timing_page
-    hidden = (page._title, page._subtitle, page._topbar)
+    hidden = (page._title, page._topbar)
     assert win._maximize_action.isVisible() and win._maximize_action.isEnabled()
     assert page._results_title.text() == "Timing Inequalities"
 
@@ -788,6 +814,55 @@ def test_dragging_the_visualizer_splitter_shut_maximizes_the_grid(win):
     _viz_agrees(win, False)
 
 
+def _key_labels(grid) -> list:
+    """The labels drawn in the grid's data port colour key, left to right: the text in the
+    key band above the column numbers, none while the key is hidden."""
+    from swi3s_studio.ui.grid_view import _KEY_H
+    if not grid.show_key:
+        return []
+    items = [it for it in grid.scene().items()
+             if hasattr(it, "text") and it.sceneBoundingRect().bottom() <= _KEY_H]
+    return [it.text() for it in sorted(items, key=lambda it: it.pos().x())]
+
+
+def test_the_maximized_visualizer_grid_shows_the_key_the_export_draws(win, monkeypatch,
+                                                                       tmp_path):
+    """Maximized, the Visualizer's grid draws its data port colour key: a swatch per drawn
+    port, a named one by its whole name, the same entries Save Output (SVG) draws with the
+    grid not maximized. Restored, the key is gone and the parameters are back."""
+    win.cursor.set_sample(2_000_000)                 # past the demo's port configuration
+    win.open_grid_in_visualizer()
+    _settle()
+    cfg = win._authoring.config()
+    cfg.dataports[1].name = "Left Microphone Array"
+    win._authoring.set_config(cfg)
+    win._authoring_ctl.refresh_grid()
+    _settle()
+    grid = win._viz_grid
+    ports = [dp.name or f"DP{dp.number(c)}" for c, dp in enumerate(cfg.dataports)
+             if dp.enabled and dp.num_channels() > 0]
+    assert len(ports) > 2 and "Left Microphone Array" in ports
+    assert _key_labels(grid) == []                    # not maximized: no key
+
+    exported: list = []
+    monkeypatch.setattr(grid, "export_image", lambda path: exported.append(_key_labels(grid)))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        lambda *a, **k: (str(tmp_path / "bus_grid.svg"), "SVG (*.svg)"))
+    win.export_grid(grid)
+    assert exported and sorted(exported[0]) == sorted(ports)
+    assert _key_labels(grid) == []
+
+    win._viz_max_btn.click()
+    _settle()
+    _viz_agrees(win, True)
+    assert _key_labels(grid) == exported[0]
+
+    win._viz_max_btn.click()
+    _settle()
+    _viz_agrees(win, False)
+    assert _key_labels(grid) == [] and win._authoring.isVisible()
+
+
 # ---- the shared cursor stays where it is ----
 
 @contextlib.contextmanager
@@ -898,3 +973,17 @@ def test_a_focus_in_on_a_table_with_no_current_row_selects_nothing():
     view.selectionModel().currentChanged.connect(lambda *_: during.append(view.focus_changing))
     QApplication.sendEvent(view, QFocusEvent(QEvent.FocusIn, Qt.TabFocusReason))
     assert during == [True] and not view.focus_changing
+
+
+def test_the_maximized_visualizer_grid_keys_the_ports_by_the_analyzers_names(win):
+    """View Bus Grid in Visualizer carries the Analyzer's port names over: the maximized
+    grid's key reads as the Analyzer's key does, and a port with no name keeps its default."""
+    for dp, name in {0: "AMP1", 1: "AMP2", 3: "MIC2"}.items():
+        win._session.set_dp_name(0, dp, name)
+    win.cursor.set_sample(2_000_000)
+    win.open_grid_in_visualizer()
+    _settle()
+    win._viz_max_btn.click()
+    _settle()
+    _viz_agrees(win, True)
+    assert _key_labels(win._viz_grid) == ["AMP1", "AMP2", "DP2", "MIC2"]

@@ -78,7 +78,8 @@ def test_cds_settings_opens_for_a_bit_width_outside_the_registers_range(width):
     from swi3s_studio.model.bus_config import CDS_DRIVE_NORMAL
     dlg = D.CdsSettingsDialog(
         None, bit_width=width, drive_type=[CDS_DRIVE_NORMAL] * 13, end_drive_early=[0] * 13,
-        enforce_handover=True, guard=[0] * 13, tail=[0] * 13)
+        enforce_handover=True, guard_enable=[False] * 13, guard_polarity=[0] * 13,
+        tail=[0] * 13)
     assert dlg.bit_width == width
     assert all(btn.styleSheet() == D._UNSEL_CSS for btn in dlg._bit.values())
     dlg._pick_bit(3)

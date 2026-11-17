@@ -504,3 +504,40 @@ def test_register_map_warnings_stay_short_for_a_file_of_distinct_oddities():
     _pmap, report = import_text(bits, "odd")
     assert all(len(w) < 600 for w in report.warnings)
     assert any("and 1992 more" in w for w in report.warnings)
+
+
+def _field_default_map(reg_default, field_bits, field_default):
+    """One register R at 0x10000000 with `reg_default` and one field F at `field_bits`
+    whose `<DefaultValue>` element is `field_default` written whole (None: no element)."""
+    f_dv = "" if field_default is None else field_default
+    return (f"<DeviceMap><Registers><Register><Name>R</Name><Address>0x10000000</Address>"
+            f"<DefaultValue>{reg_default}</DefaultValue><Access>R/W</Access></Register>"
+            f"</Registers><Fields><Field><Name>F</Name><Address>R[{field_bits}]</Address>"
+            f"{f_dv}<Access>R/W</Access></Field></Fields></DeviceMap>")
+
+
+def test_a_partly_known_field_default_takes_its_x_bits_from_the_register_default():
+    """F is R[15:0] with default 0xXX01: its byte 0 piece is known (1), and its byte 1 piece
+    takes the register default's bits there, or has no reset where those are X too."""
+    for reg_default, high in (("0xXXXXXXXX", None), ("0x00005501", 0x55),
+                              ("0x0000X501", None)):
+        pmap, _ = import_text(_field_default_map(
+            reg_default, "15:0", "<DefaultValue>0xXX01</DefaultValue>"), "partial")
+        assert _fields(pmap.resolve(0x10000000))["F[7:0]"].reset == 0x01, reg_default
+        assert _fields(pmap.resolve(0x10000001))["F[15:8]"].reset == high, reg_default
+    # Inside one piece the field's known bits win and its X bits come from the register:
+    # 0bX1 on a 2-bit field reads bit 1 from the register.
+    for reg_default, reset in (("0xXX", None), ("0x02", 0b11), ("0x00", 0b01),
+                               ("0xFC", 0b01)):
+        pmap, _ = import_text(_field_default_map(
+            reg_default, "1:0", "<DefaultValue>0bX1</DefaultValue>"), "partial")
+        assert _fields(pmap.resolve(0x10000000))["F"].reset == reset, reg_default
+
+
+def test_an_empty_field_default_is_no_default_so_the_register_default_supplies_its_bits():
+    for empty in ("<DefaultValue/>", "<DefaultValue></DefaultValue>",
+                  "<DefaultValue>  </DefaultValue>", None):
+        pmap, report = import_text(_field_default_map("0x00000A50", "11:4", empty), "empty")
+        assert _fields(pmap.resolve(0x10000000))["F[3:0]"].reset == 0x5, empty
+        assert _fields(pmap.resolve(0x10000001))["F[7:4]"].reset == 0xA, empty
+        assert report.warnings == [], (empty, report.warnings)

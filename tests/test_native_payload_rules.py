@@ -105,15 +105,19 @@ def test_a_tx_present_slot_carries_bit_index_0():
 
 
 def _config(tmp_path, name, **fields):
-    """demo_config() as a config CSV with DP0's cells of `fields` replaced."""
-    from swi3s_studio.model.bus_config import demo_config
+    """demo_config() as a config CSV with DP0's cells of `fields` replaced. The native loader
+    reports nothing but the Reserved note of a field set to its Reserved value."""
+    from swi3s_studio.model.bus_config import DP_RESERVED, demo_config, reserved_dp_note
     rows = list(csv.reader(io.StringIO(demo_config().to_csv())))
     for r in rows:
         if r and r[0] in fields:
             r[1] = fields[r[0]]
     path = tmp_path / name
     path.write_text("\n".join(",".join(r) for r in rows) + "\n", encoding="utf-8")
-    assert swi3score.csv_warnings(str(path)) == []
+    reserved = [reserved_dp_note(row, [f"DP0 = {value}"])
+                for _attr, row, _name, value, _defined, _effect in DP_RESERVED
+                if fields.get(row) == str(value)]
+    assert swi3score.csv_warnings(str(path)) == reserved
     return str(path)
 
 

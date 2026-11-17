@@ -84,3 +84,30 @@ def test_a_decimation_beyond_the_denominator_bound_keeps_its_ratio():
         y = resample(x, ir, 48_000)
         assert y.size == want
         assert abs(y[y.size // 2] - 1.0) < 1e-3          # DC gain preserved mid-stream
+
+
+def test_a_stretch_shorter_than_one_block_transforms_no_full_block_filter(monkeypatch):
+    sizes = []
+    real = np.fft.rfft
+
+    def counting(a, n=None, *args, **kw):
+        sizes.append(n)
+        return real(a, n, *args, **kw)
+
+    monkeypatch.setattr(np.fft, "rfft", counting)
+    for rates in ((3_072_000, 48_000), (44_100, 48_000)):
+        sizes.clear()
+        y = resample(np.sin(np.arange(5_000) * 0.01), *rates)
+        assert y.size == resampled_length(5_000, *rates)
+        assert max(s for s in sizes if s) < 1 << 22, (rates, sizes)   # a full block's FFT
+
+
+def test_a_ratio_with_a_denominator_up_to_1024_is_exact():
+    for rates, frac in (((96_000, 44_100), (147, 320)), ((192_000, 44_100), (147, 640))):
+        n = rates[0]                                    # one second
+        assert resampled_length(n, *rates) == rates[1], rates
+        y = resample(np.sin(np.arange(n) * 2 * np.pi * 1000 / rates[0]), *rates)
+        assert y.size == rates[1], rates
+        from swi3s_studio.dsp.resample import _ratio
+        got = _ratio(rates[0], rates[1], 256)
+        assert (got.numerator, got.denominator) == frac, rates

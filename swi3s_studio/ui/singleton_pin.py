@@ -1,11 +1,13 @@
-"""Keep None, True and False alive on Python 3.11 under PySide's Linux builds.
+"""Keep None, True and False alive on Python 3.11, on every platform.
 
 On Linux, PySide (6.9 to 6.12 at least) releases references it does not hold: one to None
 each time it hands Python an empty value (an item or index read for a role it does not hold,
 an invalid index, an unset QAction.data()), and one to True each time a Python-defined signal
 is emitted (emit() returns True without taking a reference). When a count reaches zero the
 interpreter aborts ("deallocating None", "deallocating True or False"). On Python 3.12 and
-later these objects are immortal and the releases do nothing.
+later these objects are immortal and the releases do nothing. The pin does not test the
+platform: it is applied on every CPython 3.11, where it is harmless on a build that does not
+over-release.
 
 pin_singletons() adds 2**40 to the reference count of None, True and False on 3.11. It decides
 by the counts: an object whose count is already far above any real one is left alone, so calling

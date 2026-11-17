@@ -47,6 +47,18 @@ def test_delete_reopens_group_for_next_add():
     assert [g for g, _, _ in s.pairs()] == ["A"]
 
 
+def test_removing_the_first_member_reopens_its_index_for_the_next_add():
+    s = BookmarkSet()
+    a1 = s.add(10); s.add(20)             # pair A complete
+    s.remove(a1)                          # A holds A2 alone
+    bm = s.add(30)
+    assert (bm.group, bm.index) == ("A", 1)
+    assert sorted(b.index for b in s if b.group == "A") == [1, 2]
+    s.remove_at(30)                       # and through remove_at, as Ctrl+B removes
+    bm = s.add(40)
+    assert (bm.group, bm.index) == ("A", 1)
+
+
 def test_incomplete_pair_excluded_from_measurement():
     s = BookmarkSet()
     s.add(10)                             # A1 only
@@ -139,3 +151,22 @@ def test_bookmarks_read_each_item_by_its_own_form():
                                "x", {"group": "C"}, {"sample": "q"}, {"sample": 12.7}])
     assert [(b.sample, b.group, b.index) for b in s.items] == [
         (5, "A", 1), (7, "B", 1), (12, "A", 1)]
+
+
+def test_a_merged_set_keeps_its_pairs_under_new_group_names():
+    saved = BookmarkSet()
+    saved.add(10)
+    placed = BookmarkSet()
+    placed.add(20, link=1)
+    placed.add(30, link=1)
+    placed.add(40)
+    saved.merge(placed)
+    assert [(b.sample, b.group, b.index, b.link) for b in saved] == [
+        (10, "A", 1, 0), (20, "B", 1, 1), (30, "B", 2, 1), (40, "C", 1, 0)]
+
+
+def test_remove_at_with_no_tolerance_removes_only_a_bookmark_at_the_sample():
+    s = BookmarkSet()
+    s.add(1000)
+    assert not s.remove_at(999) and not s.remove_at(5000) and len(s) == 1
+    assert s.remove_at(1000) and len(s) == 0

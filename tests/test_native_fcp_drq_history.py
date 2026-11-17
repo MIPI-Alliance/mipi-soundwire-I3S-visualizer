@@ -2,7 +2,7 @@
 
 A Source DP takes FCP_DRQ as 1 for the startup intervals counted from when it was enabled,
 and after them the DRQ of the interval d = FlowControlDelay + 1 earlier ({ASW5204},
-Table 160 (v1.1 r10)). A commit that changes the port's config while the port stays
+Table 160). A commit that changes the port's config while the port stays
 enabled and keeps its FCP, an SSCR or a DSCR, carries the history when the port is at the
 start of an interval there: the decoder checks the first intervals after it against the
 DRQs sent before it. The history starts again, with TX_PRESENT 1 for the first d intervals,
@@ -20,6 +20,8 @@ first TX_PRESENT after the commit off the wire.
 import pytest
 import swi3score
 from test_native_decoder_run import _sine
+
+from swi3s_studio.analysis import errors
 
 _SAMPLES_PER_UI = 4
 _INTERVAL_ROWS = 16
@@ -143,11 +145,13 @@ def test_a_commit_that_changes_the_column_count_carries_the_drq_history(dscr, de
 
 @pytest.mark.parametrize("delay", [0, 1], ids=["d1", "d2"])
 @pytest.mark.parametrize("rows_in", [1, 8, 15])
-def test_an_sscr_part_way_through_an_interval_restarts_the_drq_history(rows_in, delay):
-    """An SSCR whose SSP lands `rows_in` rows into the port's interval re-anchors the port
-    there, and its DRQ history starts again: the first d intervals after it take
-    TX_PRESENT 1 although the DRQs before it were 0, and the decoder passes every handshake
-    check. The rule is the interval-start condition of CPayloadEngine::Configure."""
+def test_an_sscr_part_way_through_an_interval_is_an_unexpected_ssp_and_restarts_the_drq_history(
+        rows_in, delay):
+    """An SSCR whose SSP lands `rows_in` rows into a running port's interval is an
+    unexpected SSP: the decoder flags it on the SSCR. It re-anchors the port there, and the
+    port's DRQ history starts again: the first d intervals after it take TX_PRESENT 1
+    although the DRQs before it were 0, and the decoder passes every handshake check. The
+    rule is the interval-start condition of CPayloadEngine::Configure."""
     d = delay + 1
     levels = swi3score.make_fcp_move_levels(_INTERVALS, False, 13, 12, delay,
                                             commit_row_offset=rows_in)
@@ -155,6 +159,9 @@ def test_an_sscr_part_way_through_an_interval_restarts_the_drq_history(rows_in, 
     commits = _commits(dec)
     assert [c["command"] for c in commits] == ["SSCR", "SSCR"]
     assert (commits[1]["effective_row"] - commits[0]["effective_row"]) % _INTERVAL_ROWS == rows_in
+    assert [(c["unexpected_ssp_error"], c["unexpected_ssp_mid_interval"]) for c in commits] \
+        == [(False, False), (True, True)]
+    assert errors.command_error(commits[1]) == "SSP mid interval (row in interval != 0)"
     assert _drqs_before(dec, levels, commits[1], d) == [False] * d, "test premise"
     assert _tx_present_after(dec, levels, commits[1], d) == [True] * d
     stats = dec.flow_control_stats()

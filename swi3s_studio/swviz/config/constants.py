@@ -4,8 +4,6 @@ Copyright (c) 2023 MIPI Alliance and other contributors. All Rights Reserved.
 Constants and configuration values for SoundWire I3S Visualizer.
 """
 
-from typing import Tuple
-
 
 class CSVFields:
     """CSV file field names - centralized to prevent typos.
@@ -76,54 +74,6 @@ class SpecialDevices:
     UNIVERSAL = -2    # CDS bit + CDS turnaround handover (any device may drive it)
 
 
-class SlotTypeStrings:
-    """String representations of slot types for internal use"""
-    NOT_OWNED = 'not owned'
-    TAIL = 'tail'
-    GUARD_0 = 'G0'
-    GUARD_1 = 'G1'
-    HANDOVER = 'TA'
-    CDS = 'CDS'
-    S0 = 'S0'
-    S1 = 'S1'
-    TX_PRESENT = 'TxP'  # TxPresent bit prefix (label will be TxPn where n is channel)
-    DRQ = 'DRQ'  # Data Request bit for Rx Controlled or Async flow modes
-
-
-class CanvasColors:
-    """Canvas drawing colors with semantic meaning - match error_panel COLORS"""
-    # Clash/error colors - match error panel colors for consistency
-    BUS_CLASH = '#D32F2F'        # Red - physical bus collision (multiple writers)
-    DEVICE_CLASH = '#FBC02D'     # Yellow - same-device internal conflict
-    READ_OVERLAP = '#1976D2'     # Blue - read overlap (multiple readers)
-
-    # Note: Other colors come from theme and are accessed via:
-    # self.DARK_GRAY - border/grid lines
-    # self.LIGHT_GRAY - lighter borders
-    # self.PREFERRED_GRAY - backgrounds/tails (theme-aware)
-    # self.current_text_color - text (theme-aware)
-    # DP_COLORS - data port colors (see below)
-
-
-class Colors:
-    """Color palette for data ports and UI elements"""
-    # Data port colors (12 colors for 12 data ports)
-    DP_COLORS: Tuple[str, ...] = (
-        '#FF80BF',  # DP0 - Pink
-        '#FFA080',  # DP1 - Coral
-        '#FFFF80',  # DP2 - Yellow
-        '#A0FF80',  # DP3 - Light Green
-        '#80FFFF',  # DP4 - Cyan
-        '#8080FF',  # DP5 - Blue
-        '#BF80FF',  # DP6 - Purple
-        '#FFBFFF',  # DP7 - Light Pink
-        '#FFBFBF',  # DP8 - Light Coral
-        '#FFFFBF',  # DP9 - Light Yellow
-        '#BFFFBF',  # DP10 - Pale Green
-        '#BFFFFF',  # DP11 - Pale Cyan
-    )
-
-
 class InterfaceRanges:
     """Validation ranges for Interface parameters.
 
@@ -159,6 +109,7 @@ class DataPortRanges:
     """
     MIN_DEVICE_NUMBER = 0
     MAX_DEVICE_NUMBER = 11
+    MAX_DP_NUMBER = 31  # DataPortNumber, the logical data-port number 0..31
     MIN_OFFSET = 0
     MIN_INTERVAL = 0
     MAX_INTERVAL = 4095
@@ -189,6 +140,12 @@ class DataPortRanges:
     MAX_FLOW_MODE = 3
     MIN_PORT_MODE = 0
     MAX_PORT_MODE = 3
+    # The Reserved encodings of the per-port fields: a file's value loads as written and
+    # is reported. TailWidth and FCP_TailWidth define 0..2 UI, BitWidth and FCP_BitWidth
+    # 0..2 (1 to 3 UI), PortMode 0 Normal, 2 Test0 and 3 Test1.
+    RESERVED_TAIL_WIDTH = 3
+    RESERVED_BIT_WIDTH = 3
+    RESERVED_PORT_MODE = 1
 
     # Flow Control Port (FCP) parameter ranges for DRQ bits
     MIN_FCP_H_START = 0

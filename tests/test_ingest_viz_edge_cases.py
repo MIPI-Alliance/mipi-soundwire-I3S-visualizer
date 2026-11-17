@@ -382,6 +382,8 @@ def _legacy(tmp_path, rows, name="old.csv"):
 
 
 def _upgrade(path):
+    """The upgraded text of `path` and its import notes, less the missing-rows note a
+    `_legacy` file of a few per-port rows gets."""
     with import_notes.collect() as notes:
         out = visualizer_csv.normalized_path(path)
     try:
@@ -390,7 +392,7 @@ def _upgrade(path):
     finally:
         if out != path:
             os.remove(out)
-    return text, [n.message for n in notes]
+    return text, [n.message for n in notes if not n.message.startswith("legacy rows missing")]
 
 
 def _enable_ch(text, port):

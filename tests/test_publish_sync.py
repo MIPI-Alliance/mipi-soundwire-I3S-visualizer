@@ -58,7 +58,7 @@ def _tree(tmp_path, files, name="dest"):
     dest.mkdir()
     for rel, text in files.items():
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-        (dest / rel).write_bytes(text.encode("utf-8"))
+        (dest / rel).write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
     return str(dest)
 
 
@@ -176,6 +176,91 @@ def test_kept_rewrapped_or_edited_later_passes(upstream, tmp_path):
                       ("edited", INTRO + "Open a tech-debt issue, grouped by area.\n")):
         dest = _tree(tmp_path, {"DEVELOPMENT.md": dev, "CONTRIBUTING.md": GUIDE}, name)
         assert PT.check_upstream_sync(dest, "main", [p0, p1], git_dir=str(repo)) == [], name
+
+
+_DOC = ["The first long line of the contributed documentation.",
+        "The second long line of the contributed documentation.",
+        "The third long line of the contributed documentation."]
+_PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+
+
+@pytest.fixture
+def contribution(tmp_path):
+    """A publish (P0), then a contributor's commit (P1) adding three lines to GUIDE.md, two
+    short version pins, a PNG, an empty .nojekyll and run.sh, and changing logo.svg's bytes;
+    then one (P2) making run.sh executable."""
+    repo = tmp_path / "upstream"
+    repo.mkdir()
+    git_in(repo, "init", "-q", "-b", "main")
+    p0 = _publish(repo, {"GUIDE.md": INTRO + GUIDE, "requirements-dev.txt": "ruff==0.15.0\n",
+                         "logo.svg": b"<svg>old</svg>"}, "1.0.0")
+    commit_files(repo, {"GUIDE.md": INTRO + "\n".join(_DOC) + "\n" + GUIDE,
+                        "requirements-dev.txt": "ruff==0.16.0\nmypy==1.20.0\n",
+                        "logo.png": _PNG, ".nojekyll": "", "run.sh": "echo hi\n",
+                        "logo.svg": b"<svg>new</svg>"}, "contrib")
+    os.chmod(repo / "run.sh", 0o755)
+    git_in(repo, "update-index", "--chmod=+x", "run.sh")
+    git_in(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m",
+           "run.sh: executable")
+    return repo, p0, git_in(repo, "rev-parse", "HEAD")
+
+
+def _kept_all(**changes):
+    files = {"GUIDE.md": INTRO + "\n".join(_DOC) + "\n" + GUIDE,
+             "requirements-dev.txt": "ruff==0.16.0\nmypy==1.20.0\n", "logo.png": _PNG,
+             ".nojekyll": "", "run.sh": "echo hi\n", "logo.svg": "<svg>new</svg>"}
+    files.update(changes)
+    return {k: v for k, v in files.items() if v is not None}
+
+
+def _check(contribution, tmp_path, files, name):
+    repo, p0, p2 = contribution
+    dest = _tree(tmp_path, files, name)
+    if "run.sh" in files:
+        os.chmod(os.path.join(dest, "run.sh"), 0o755)
+    return PT.check_upstream_sync(dest, "main", [p0, p2], git_dir=str(repo))
+
+
+def test_a_contribution_kept_whole_passes(contribution, tmp_path):
+    assert _check(contribution, tmp_path, _kept_all(), "kept") == []
+
+
+@pytest.mark.parametrize("case, files, expected", [
+    ("a deleted run of added lines",
+     _kept_all(**{"GUIDE.md": INTRO + _DOC[0] + "\n" + GUIDE}),
+     "GUIDE.md undoes"),
+    ("reverted short pins",
+     _kept_all(**{"requirements-dev.txt": "ruff==0.15.0\n"}),
+     "requirements-dev.txt undoes"),
+    ("an added binary file absent", _kept_all(**{"logo.png": None}), "logo.png is absent"),
+    ("an added empty file absent", _kept_all(**{".nojekyll": None}), ".nojekyll is absent"),
+    ("a file's old content back", _kept_all(**{"logo.svg": "<svg>old</svg>"}),
+     "logo.svg undoes"),
+])
+def test_a_partial_short_line_binary_or_empty_revert_is_found(contribution, tmp_path, case,
+                                                              files, expected):
+    problems = _check(contribution, tmp_path, files, case.replace(" ", "_"))
+    assert any(p.startswith(expected) for p in problems), (case, problems)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows files have no executable bit")
+def test_a_lost_executable_bit_is_a_revert(contribution, tmp_path):
+    repo, p0, p2 = contribution
+    dest = _tree(tmp_path, _kept_all(), "mode")
+    os.chmod(os.path.join(dest, "run.sh"), 0o644)
+    assert PT.check_upstream_sync(dest, "main", [p0, p2], git_dir=str(repo)) == [
+        f"run.sh undoes {p2[:7]} run.sh: executable: it is not executable again"]
+
+
+def test_an_added_line_edited_later_or_a_binary_changed_later_passes(contribution, tmp_path):
+    """A run of added lines that other text now stands in, a later pin, and a binary with
+    new bytes are later edits, not reverts."""
+    files = _kept_all(**{
+        "GUIDE.md": INTRO + _DOC[0] + "\nA later rewrite of the second and third lines.\n"
+                    + GUIDE,
+        "requirements-dev.txt": "ruff==0.17.0\nmypy==1.21.0\n",
+        "logo.png": _PNG + b"later"})
+    assert _check(contribution, tmp_path, files, "edited") == []
 
 
 def test_publish_commits_are_not_held_against_the_tree(upstream, tmp_path):

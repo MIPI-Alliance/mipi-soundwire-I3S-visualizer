@@ -35,6 +35,14 @@ release commit sets the new one. The number follows from what the release contai
 ([GOVERNANCE.md](../GOVERNANCE.md), Version Numbering): any new user-visible
 functionality makes it a minor release, and a sub-minor release carries fixes only.
 
+**A development build names its commit.** Run from a checkout past the release tag, the
+window title, About and the Timing results export show the release number with the commits
+since its tag and the commit: `3.3.0+12 (1a2b3c4)`, and `, modified` while tracked files
+differ from it (`swi3s_studio/build_id.py`, from `git describe`). At the tag they show the
+release number alone, or `3.3.0 (1a2b3c4, modified)` with tracked files changed; in an
+installed package or a bundle they show the release number alone. Nothing in the tree
+changes for it.
+
 ### What the repository holds
 
 **Push only the files the application needs.** The repository holds the application, the
@@ -59,7 +67,7 @@ version or creates a tag:
 | | when | what runs | what moves |
 |---|---|---|---|
 | **local commit** | continuously | the gate (`bash tests/gate.sh`) | nothing outside this machine |
-| **branch push / pull request** | whenever convenient | CI, and the gate before review | the work branch. **No version change, no tag.** |
+| **branch push / pull request** | whenever convenient | CI on each push to an open pull request, and the gate before review | the work branch. **No version change, no tag.** |
 | **merge** | when reviewed and green | CI | `main` |
 | **release** | once, at the end | the gate **and both test guests** | the version, the notes file, one signed tag |
 
@@ -79,16 +87,23 @@ Two rules:
 
 **Where it runs:** on **this repository**, where Actions is enabled.
 
-Jobs (on every push to `main`, a `vX.Y` release branch or a `feature/`, `fix/` or `sprint/`
-branch, and on every PR). Every job but `package` installs
+Jobs (on every push to `main` or a `vX.Y` release branch, and on every PR; a work branch
+without a pull request runs by hand, through the workflow's `workflow_dispatch`). Every job but `package` installs
 `requirements-dev.txt`, the one list of what testing needs; a job does not name packages of
 its own (`tests/test_release_gate.py` checks this).
 
-- **`test`** — builds the native core and runs the full pytest suite (goldens included)
-  across ubuntu (3.11/3.12/3.13), windows (3.12 **and 3.14**) and macos (3.12). Excludes
-  perf.
+- **`core`** — builds the native core and runs the full pytest suite (goldens included)
+  once, on the reference configuration, ubuntu 3.14, under coverage; fails below 82 %.
+  Excludes perf. Coverage measures through `sys.monitoring` there (`COVERAGE_CORE=sysmon`).
+- **`platform`** — the platform scope, `-m "(gui or platform or smoke) and not perf"`, the
+  expression the guest gate runs (`tools/gate.py`, `_GUEST_SCOPE`), on every other
+  configuration: ubuntu (3.11/3.12/3.13), windows (3.12 **and 3.14**) and macos (3.12). A `core`
+  test reads the same source on every platform, so it runs once, in the `core` job, and
+  the `smoke` files (`tests/conftest.py`, `CORE_SMOKE`) check that each interpreter still
+  decodes, replays registers, times and parses. `tests/test_release_gate.py` holds the
+  expression equal to the guest gate's and the `core` job unnarrowed. The term diagram's
+  sweeps are trimmed there as on a guest (`docs/TESTING.md` §1.1).
 - **`perf`** — the perf-regression gate (`-m perf`) on one consistent runner.
-- **`coverage`** — full suite with a coverage report; fails below 82 %.
 - **`package`** — `tools/package_smoke.py`, on ubuntu and windows: a clean venv, `./native`
   and the app installed into it, `swi3s-studio-cli` run from outside the checkout, and the
   `share/swi3s-studio` data files checked. It installs through pip, not from
@@ -107,7 +122,7 @@ CI and the hand-run gate cover different things:
 
 | | CI | `tools/gate.py` |
 |---|---|---|
-| pytest, perf gate | ✅ (6 configs) | ✅ (macOS; Windows 3.14 and Linux 3.11–3.13 guests) |
+| pytest, perf gate | ✅ (the whole suite on ubuntu 3.14, the platform scope on 6 more configs) | ✅ (macOS, Windows and Linux; the full 3.11–3.15 matrix runs nightly, not as a tag requirement) |
 | ruff, mypy | ✅ | ✅ (not `--guest`) |
 | runs on every push and PR | ✅ | ❌ (by hand: each commit, each batch on the guests, each release) |
 | coverage floor (82 %, lines and branches) | ✅ | ❌ |
@@ -116,12 +131,17 @@ CI and the hand-run gate cover different things:
 | leak scan | ✅ (structural patterns only; the local gate adds the site patterns) | ✅ |
 | installed package: `tools/package_smoke.py` builds a clean venv, installs `./native` and the app, runs `swi3s-studio-cli -c <config> -o <model>` from outside the checkout, checks the `share/swi3s-studio` data files and that the register map, demo workspaces and register-map library resolve under `share/swi3s-studio` and the UI icons are installed beside `swi3s_studio.ui` | ✅ | ❌ |
 | native core coverage | ❌ | ✅ (`--release`, where clang's tools are) |
+| diagram cover: the platform scope reaches every branch of `ui/timing_diagram.py` and `ui/inequality_diagram.py` the full sweep reaches (`tools/diagram_cover.py`) | ❌ | ✅ (`--release`, on the development machine) |
 | stale-ABI assertion | ❌ | ✅ |
+| the tests that read the release tags (the native-change-since-the-release ABI assertion, and the notes kept for every earlier release): CI's checkout is shallow and holds no tags, so they skip or check only 3.0.17 | ❌ | ✅ |
 
-The **release gate is `tools/gate.py`, run by hand at the release commit**: on the
-development machine (checklist step 2), then on both test guests, a Windows guest on Python
-3.14 and a Linux guest whose venv is repointed between 3.11, 3.12 and 3.13 (step 3). CI is a
-second, differently-shaped net — useful, not sufficient.
+The **release gate is `tools/gate.py`, run by hand**: on the development machine (checklist
+step 2), on both test guests, Windows and Linux (step 3), and on the development machine again
+at the release commit (step 4).
+A tag requires the release gate on each guest as step 3 states: Windows on Python 3.14, Linux on
+one of 3.11–3.13. The gate matrix, which runs the gate on every Python from 3.11 to 3.15 on all
+three platforms, runs nightly on the gate machine and is not a tag requirement. CI is a second,
+differently-shaped net — useful, not sufficient.
 
 Every action in `ci.yml` and `cla.yml` is pinned to a full commit SHA with its version in a
 trailing comment. Nothing updates the pins: at each release, for each action, resolve its
@@ -135,10 +155,12 @@ every file under `.github/workflows` is a 40-hex commit.
 `bash tools/setup_dev.sh` (macOS / Linux) or `.\tools\setup_dev.ps1` (Windows) installs
 `requirements-dev.txt` and builds the decode core into the venv `run.sh` / `run.ps1` use, and
 prints that venv's activate command; `--test` / `-Test` then runs the functional suite.
+The gate runs `$PYTHON` (`$env:PYTHON` on Windows), else the interpreter on the path (on Windows, `.venv\Scripts\python.exe` first), so
+activate that venv or set `PYTHON=<venv python> bash tests/gate.sh` (`$env:PYTHON = "<venv python>"; .\tests\gate.ps1`).
 
 ```bash
 python3 tools/changed_tests.py --run  # the test files your change touches, in parallel
-python3 -m pytest -q -n auto          # full functional suite (-m "not perf" is the default)
+python3 -m pytest -q -n auto --dist loadfile  # full functional suite (-m "not perf" is the default)
 python3 -m pytest -m perf -q          # perf gate, in its own process
 bash tests/run_all.sh                 # per-suite pass/fail summary (--verbose: test counts)
 ```
@@ -151,8 +173,10 @@ from our own code are errors, and a test that opens an unpatched modal dialog fa
 than hangs; see `docs/TESTING.md` §8.
 
 `tests/conftest.py` sets the offscreen Qt platform, a short demo, and a test-scoped
-QSettings identity. After editing `native/`, rebuild the core or ~half the suite fails an
-ABI check. There are two builds, and under `PYTHONPATH=.` the first one wins:
+QSettings identity. After editing `native/`, rebuild the core you import (below). The ABI
+check catches a stale core only when the edit bumped `score_abi`; otherwise the tests silently
+run the previous build, and `changed_tests.py` does not rebuild it. There are two builds, and
+under `PYTHONPATH=.` the first one wins:
 
 - `bash native/build_local.sh` writes `swi3score*.so` at the checkout's root. The gate's
   Unix build is this one, so after a gate run the root module exists, and the tests, the
@@ -167,11 +191,6 @@ or delete it to use the installed one.
 
 ## Performance
 
-See the maintainers' performance notes for the full loop — the recurring
-whole-capture-scan regression class, the three layers of defense (CI cliff-detectors,
-release-time interaction profiling on a large capture, the periodic deep-review
-Workflow), the interaction latency budgets, and the UI shots review checklist.
-
 - Hot paths are guarded by **wall-clock ceilings** in `tests/test_perf.py` (marked
   `perf`). They are *cliff detectors*, not micro-benchmarks — ceilings are generous
   (several x observed) so they catch order-of-magnitude regressions, not runner jitter.
@@ -181,14 +200,27 @@ Workflow), the interaction latency budgets, and the UI shots review checklist.
   expose an O(#UIs) scan.
 - Capture memory scales with bus *activity* (edge arrays), not duration x sample rate —
   keep it that way; prefer windowed/on-demand work over full-capture materialization.
+- Work scales with what is active, not with capture duration. Anything a user waits on
+  shows progress, and heavy work runs off the GUI thread with a placeholder and a
+  token-guarded result.
+- Before a release, profile each interaction on a large real capture, then look at the
+  screenshots check's contact sheet (`build/screenshots/contact_sheet.png`) in both themes
+  for clipping, misalignment, unreadable tab text and the empty and bring-up states.
+
+| Interaction | Budget (guidance) | If it cannot meet it |
+|---|---|---|
+| Cursor move / settle → visible panes | < 100 ms | window or lazy-load the pane; defer hidden tabs |
+| Show Toggles / pane switch | < 150 ms | windowed render, cache per capture |
+| Persistence / region summary | < 100 ms cached | worker thread on a miss |
+| Re-decode (SSP / override / CSV / scrambler) | progress, off the GUI thread | never block the GUI thread |
+| Open capture | progress, off the GUI thread | the async load worker |
 
 ## Code review (per release cycle)
 
 The review that gates a release runs on the release branch/PR, not post-hoc on `main`:
 
 1. **Parallel subsystem reviews** — decode/ingest, swviz-engine/model, and UI/rendering,
-   each with a correctness-first + performance lens (delegated to cheaper models to
-   control cost). Reviewers read the actual code and verify claims by running it.
+   each with a correctness-first + performance lens. Reviewers read the actual code and verify claims by running it.
 2. **A cross-subsystem "coupling / architecture" lens.** Per-subsystem reviews miss bugs
    that span layers. Explicitly review the contracts *between* subsystems.
 3. **Feed prior findings forward** — hand the last cycle's findings (and the open `tech-debt`
@@ -313,9 +345,8 @@ Two further rules are enforced by `tests/test_reference_model_clean.py`:
   use, so the no-comment rule must not be met by deleting docs instead.
 
 If you are about to explain something in one of those two files, that explanation belongs
-somewhere else: the spacing row-boundary rationale lives in the maintainers' spacing
-row-boundary write-up, and the partial-channel-group behaviour is covered by
-`tests/test_transport_slot_budget.py`.
+somewhere else: the commit message or a covering test is where it goes; the
+partial-channel-group behaviour is covered by `tests/test_transport_slot_budget.py`.
 
 **What is NOT enforced: the docstrings' content.** This repository owns the code path these
 files sit on and not their prose. A docstring that names this codebase (module and test
@@ -379,21 +410,26 @@ for a fact, so it generates that preamble. The notes file is about the software.
    Both are thin wrappers around **`tools/gate.py`** — one implementation, so the two
    platforms cannot diverge. It rebuilds the native core and **asserts** `score_abi` against
    `session.py::_REQUIRED_SCORE_ABI`, then runs the suite (each file in its own process,
-   several at once), the perf gate, the single-process run, ruff, the mypy ratchet, the leak
-   scan, the screenshots check and the native core's coverage — aggregating failures so you
+   several at once), the perf gate, the diagrams' cover check, the single-process run,
+   ruff, the mypy ratchet, the leak scan, the screenshots check and the native core's
+   coverage — aggregating failures so you
    see all of them, not just the first, and printing each check's time. Exit 0 is the gate.
-   Without `--release` it is the commit gate, which leaves out the single-process run and the
-   native coverage; the stages, their budgets and the time limit on a test file are
-   `docs/TESTING.md` §1.1.
+   Without `--release` it is the commit gate, which leaves out the diagram cover check, the
+   single-process run and the native coverage; the stages, their budgets and the time limit on
+   a test file are `docs/TESTING.md` §1.1.
    `tools/test_report.py` reruns the suite with per-test coverage and writes the coverage,
    redundancy, fragility and durations report; read it before tagging.
 
    **The screenshots check** (`tools/screenshots.py`) renders the Bus Visualizer, Timing
-   Calculator and Bus Analyzer in light and dark, each started in a theme and each switched
-   live, on the platform's own windowing system and style. It fails on a window drawn in the
+   Calculator and Bus Analyzer, and the Filter Expression, Open Capture, Export Capture, Export
+   Audio, Preferences and Devices dialogs, in light and dark, each
+   started in a theme and each switched live, on the platform's own windowing system and style. It fails on a window drawn in the
    other theme's background, text under 3:1 contrast (or not drawn at all), and a button,
-   label or entry narrower than its text. Its contact sheet, `build/screenshots/
-   contact_sheet.png`, is the gate's visual review: look at it on every platform before
+   label or entry narrower than its text. A live switch to a theme must leave every entry and
+   button with the background tone it has in a window started in that theme; a widget styled
+   only at creation fails as "THEME not re-applied". `build/screenshots/report.txt` lists every
+   finding. Its contact sheet, `build/screenshots/contact_sheet.png`, is the gate's visual
+   review: look at it on every platform before
    tagging, since the checks cannot see a layout that is merely wrong. With no display (a
    Linux shell) it checks the offscreen platform and lists the native style as NOT RUN HERE.
 
@@ -421,6 +457,12 @@ for a fact, so it generates that preamble. The notes file is about the software.
    the Mac and a rise on one platform fails even where another platform counts more. A guest
    compares against the baseline when it has the recorded mypy version installed.
 
+   **The advisory mypy run.** The gate also runs mypy with site-packages (`mypy-typed`), so
+   numpy's and PySide6's installed types apply, and prints its error count under `ADVISORY` in
+   the summary. It is not a gate: it never fails the run, is not a regression check, and says
+   `could not run` where it cannot. It does not affect the ratchet's baseline or counts
+   (docs/TESTING.md §1.1).
+
    The gate lives in that script, not in this list. `tests/test_release_gate.py` fails the
    build if `ci.yml` declares a check `tools/gate.py` does not run.
 
@@ -429,25 +471,16 @@ for a fact, so it generates that preamble. The notes file is about the software.
    (here and on the two guests of step 3), not on every push. Run both.
 3. **Run the release gate on the test VMs, BEFORE tagging.** Not after, and not "if there
    is time". Dialog layout follows each platform's font metrics, so a defect on one guest can
-   be invisible on macOS. A guest runs the gate as `--release --on-guest`, leaving the single-process
-   run and the native coverage to step 2. The per-batch scope, `--guest`, is
-   `docs/TESTING.md` §1.1. A guest runner defaults to that per-batch scope; the release stage
-   is requested with `SWI3S_GATE_STAGE=release`, and a run without it is not this step.
+   be invisible on macOS. A guest runs `tools/gate.py --release --on-guest`, leaving the single-process
+   run, the native coverage and the diagram cover check to step 2. The per-batch scope, `--guest`, is
+   `docs/TESTING.md` §1.1, and a run at that scope is not this step.
 
-   **It is one command, and it must not need supervising.** The maintainers' tier holds a
-   runner that gates a commit on every configured guest at once and prints a single verdict,
-   nonzero if any guest fails. Both guests run concurrently. A guest with no host
-   configured is reported `UNTESTED`, which is not a pass — same principle as `NOT RUN HERE`.
-   There is also a queue watcher, so a run can be requested and its verdict collected later
-   rather than watched; it can be installed as a login agent so it is running after a reboot.
-   Prefer the direct run when you want the answer now; prefer the queue when the alternative
-   is skipping the step.
-
-   The guests are separate machines reached over SSH, with addresses and keys recorded in the
-   maintainer's own configuration rather than here — neither is a git checkout, so the runner
-   ships the exact tree (`git archive <sha>`) and extracts it beside the working copy rather
-   than over it. Windows runs a 3.14 venv; Linux runs a venv the maintainer repoints between
-   3.11/3.12/3.13.
+   **Run both guests at once, and read each verdict.** A guest that was not run is
+   UNTESTED, which is not a pass — the same principle as `NOT RUN HERE`. A guest is a
+   separate machine that is not a git checkout: put the exact tree being tagged on it
+   (`git archive <sha>`), extracted beside the working copy rather than over it. The tag
+   requires Windows on a 3.14 venv and Linux on one venv of 3.11, 3.12 or 3.13; the other
+   Pythons of 3.11–3.15 are covered by the nightly matrix, not by this step.
 
    **When a re-run is required, and when it is not.** Gate the commit you will tag. If
    something changes after that run, re-run it when the change touches anything the guest
@@ -465,9 +498,10 @@ for a fact, so it generates that preamble. The notes file is about the software.
    **A simulated font is not this step.** Scaling the application font locally can reproduce
    a layout defect, but a point size is not a width.
 
-   **Review the three contact sheets.** The runner's `wait` fetches each guest's screenshots
-   into `build/screenshots/<platform>-<sha>/`; with the Mac's own `build/screenshots/`, that
-   is every mode in both themes on all three platforms. Look at all three before tagging.
+   **Review the three contact sheets.** Fetch each guest's `build/screenshots/` into
+   `build/screenshots/<platform>-<sha>/` on the development machine; with the Mac's own
+   `build/screenshots/`, that is every mode in both themes on all three platforms. Look at all
+   three before tagging.
 4. Make the release commit, through a pull request to `main` (or to `vX.Y` for a
    sub-minor release): choose the number (see Branch model), set it in the three version
    sites, rename `docs/releases/next.md` to `vX.Y.Z.md`, and finalise its title. For a new
@@ -476,6 +510,11 @@ for a fact, so it generates that preamble. The notes file is about the software.
    the cycle is finished** — every push and merge before it is a checkpoint, not a release
    (see "A pushed branch is a checkpoint, not a release" under Branch model). Steps 4-6 are
    one event at the end, not a habit.
+
+   **Run the release gate of step 2 again on the release commit, on the development machine,
+   before tagging** (`bash tests/gate.sh --release` / `.\tests\gate.ps1 --release`). It is
+   the run that reads the version sites and the notes file, and the one the guests' exception
+   in step 3 relies on.
 5. Tag **once**, at the end: annotated `vX.Y.Z` on the release commit (GPG-signed, as
    [GOVERNANCE.md](../GOVERNANCE.md) requires). For a new minor release, create the `vX.Y`
    branch from the tag at the same time. Push the tag before step 6.
@@ -507,7 +546,7 @@ sense inside the project's development environment.
 
    It exits 2 for a usage error or an input it cannot read: an unknown option, more than one
    `<sha>`, `--tree=` or `--text=` combined with a `<sha>` (or `--tree=` with `--text=`), a
-   directory or file that does not exist, or a tree with no files. `tools/name_review.py` exits 2
+   directory or file that does not exist, a `<sha>` git cannot resolve (or git missing where a `<sha>` is given), or a tree with no files. `tools/name_review.py` exits 2
    for an unknown or malformed option, a `--tree` that is not a directory or holds no files, a
    baseline (`--baseline`) it cannot read, and a file or directory of the tree it cannot read.
 
@@ -575,9 +614,15 @@ sense inside the project's development environment.
    It refuses to build while the upstream branch has commits after the last one, when a
    recorded commit is not on the upstream branch, or when the assembled tree undoes a commit
    contributed between two recorded points: a file it added or changed is absent, a file it
-   deleted is present with any of its deleted text, or a change whose removed text is back
-   while its added text is not (whitespace and line ends do not
-   count, so re-wrapping is not a change, and a later edit of the contributed text passes).
+   deleted is present with any of its deleted text, a change whose removed text is back
+   while its added text is not, a change that only adds whose added lines are all missing or
+   whose missing run has its neighbours adjacent again (deleted, not edited), a binary or
+   empty file whose content is its parent's again, or an executable bit the commit changed
+   that is its parent's again. Whitespace and line ends do not count, so re-wrapping is not a
+   change; a line under 20 characters is compared as a whole line, and one under 8 not at all;
+   a later edit of the contributed text, which brings back neither side, passes. The check
+   reads the local upstream ref, which the tool does not fetch, and prints the commit and date
+   it compared against.
    Publish commits are this tree's own and are not checked. Carry the changes into the release
    tree and run `python3 tools/publish_tree.py --record-sync`: it appends the upstream commit
    only when every contributed commit since the last point is in the working tree, and the

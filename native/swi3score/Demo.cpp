@@ -236,6 +236,7 @@ struct SspaSchedule
     U16   devMask = 0;
     U8    group = 0;
     U8    rowDelay = 0;
+    int   byteRowDelay = -1;  // the Row_Delay byte each SSPA carries; -1 carries rowDelay
 };
 
 // The most Rows intervalAlignment returns: more than any demo region holds, so an SSPA
@@ -379,7 +380,9 @@ void fillIdleWithPings(std::vector<bool>& bits, long targetLen,
 
     while ((long)bits.size() < targetLen) {
         if (nextStart >= 0 && (long)bits.size() == nextStart) {
-            appendSspa(bits, sspa->devMask, sspa->group, sspa->rowDelay);
+            appendSspa(bits, sspa->devMask, sspa->group,
+                       sspa->byteRowDelay >= 0 ? static_cast<U8>(sspa->byteRowDelay)
+                                               : sspa->rowDelay);
             sspa->lastSsp = nextSsp;
             sinceCmd = 0;                                // an SSPA refreshes command confidence
             idleBit = 0;
@@ -418,7 +421,39 @@ void placeEventBlock(std::vector<bool>& bits, long startRow, const std::vector<b
     bits.insert(bits.end(), blk.begin(), blk.end());
 }
 
-// PCM: a distinct sine per stream, MSb..LSb over (sampleSize+1) bits.
+// SplitMix64's finaliser: a stateless hash of `x`, so a value derived from it depends only
+// on its key and index, whichever order the generator asks for them.
+U64 mix64(U64 x)
+{
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+// TPDF dither in LSBs for sample `index` of the stream `key`: the difference of two uniform
+// [0, 1) values, so triangular on (-1, 1). Stateless (see mix64), so a test regenerates it.
+double ditherTpdf(U64 key, U64 index)
+{
+    U64 h1 = mix64((key * 0xD1B54A32D192ED03ull) ^ index);
+    U64 h2 = mix64(h1);
+    return (double)(h1 >> 11) * 0x1.0p-53 - (double)(h2 >> 11) * 0x1.0p-53;
+}
+
+// A PCM sample of amplitude `amp` sin(w), rounded half away from zero to (sampleSize+1) bits
+// two's complement, with TPDF dither (ditherTpdf of `key`, `index`) added before the rounding
+// when the sample has 2 bits or more.
+U64 ditheredSample(double amp, double w, U64 key, U64 index, int sampleSize)
+{
+    double x = amp * std::sin(w);
+    if (sampleSize >= 1) x += ditherTpdf(key, index);
+    int v = (int)std::lround(x);
+    U64 mask = (1ull << (sampleSize + 1)) - 1;
+    return (U64)v & mask;
+}
+
+// PCM: a distinct sine per stream, MSb..LSb over (sampleSize+1) bits, dithered
+// (ditheredSample, keyed by the channel).
 //
 // Indexed in SAMPLES, not seconds — one cycle per 64 transported samples — so a port running a
 // lower effective rate produces the same sample SEQUENCE at a lower pitch. That is what makes a
@@ -429,9 +464,7 @@ U64 sineSample(int channel, U64 index, int sampleSize)
 {
     double amp = std::ldexp(1.0, sampleSize) * 0.45;
     double w = 2.0 * kPi * (double)(channel + 1) * (double)index / 64.0;
-    int v = (int)std::lround(amp * std::sin(w));
-    U64 mask = (1ull << (sampleSize + 1)) - 1;
-    return (U64)v & mask;
+    return ditheredSample(amp, w, (U64)channel, index, sampleSize);
 }
 
 // ---------------------------------------------------------------- payload interval skipping
@@ -513,15 +546,14 @@ void emitPortWrites(std::vector<bool>& bits, CRegisterModel& regs, U16 dev, cons
 
 // A distinct audio tone at an EXPLICIT frequency (Hz), unlike sineSample() whose
 // frequency is hard-wired to (channel+1)*sampleRate/64. MSb..LSb over (sampleSize+1)
-// bits, two's-complement masked, so the bit-exact round-trip test regenerates the
-// identical value with the same formula.
+// bits, two's-complement masked and dithered (ditheredSample, keyed by the frequency in
+// whole millihertz), so the bit-exact round-trip test regenerates the identical value with
+// the same formula.
 U64 sineAt(double freqHz, double sampleRateHz, U64 index, int sampleSize)
 {
     double amp = std::ldexp(1.0, sampleSize) * 0.45;
     double w = 2.0 * kPi * freqHz * (double)index / sampleRateHz;
-    int v = (int)std::lround(amp * std::sin(w));
-    U64 mask = (1ull << (sampleSize + 1)) - 1;
-    return (U64)v & mask;
+    return ditheredSample(amp, w, (U64)std::llround(freqHz * 1000.0), index, sampleSize);
 }
 
 // A small deterministic PRNG (SplitMix64-style) so the transport jitter is identical
@@ -709,11 +741,18 @@ std::vector<bool> MakeDemoLevels(int audioSamplesPerChannel)
     appendSscr(blk, dev, group, rowDelay);                        // confirm bit = blk.back()
 
     // 8-col audio phase: ~1/3 of the audio, but at least enough interval-aligned rows to
-    // hold the 16-col control block plus a spare interval.
+    // hold the 16-col control block plus a spare interval. SSCR#2's SSP lands on a whole
+    // number of the 8-col ports' pattern periods (intervalAlignment), or it would arrive
+    // part-way through DP0's skip pattern: an unexpected SSP (Section 9.1.6.2.1).
     long minRows8 = (long)blk.size() + (int)rowDelay + (kPcmInt8 + 1);
     long minSamples8 = (minRows8 + kPcmInt8) / (kPcmInt8 + 1);     // ceil to whole intervals
     long samples8 = audioSamplesPerChannel / 3;
     if (samples8 < minSamples8) samples8 = minSamples8;
+    const long align8 = intervalAlignment(cfg8);
+    if (align8 < kMaxAlignmentRows && align8 % (kPcmInt8 + 1) == 0) {
+        const long step = align8 / (kPcmInt8 + 1);                 // samples per pattern period
+        samples8 = (samples8 + step - 1) / step * step;
+    }
     long rows8 = samples8 * (kPcmInt8 + 1);
     long ssp2 = ssp1 + rows8;
 
@@ -1030,9 +1069,11 @@ std::vector<bool> MakeDemoLevelsFlowControl(int audioSamplesPerChannel, bool fcp
             FcpEmit fes[4];
             if (started) {
                 for (int p = 0; p < P; ++p) {
-                    es[p] = ports[p].clock_tick();
+                    // The FCP ticks first: its DRQ gate takes this interval's skip, which the
+                    // port's tick in the interval's last UI advances to the next one's.
                     if (dps[p]->drqEnabled())
                         fes[p] = fcps[p].clock_tick(ports[p].IntervalSkipped());
+                    es[p] = ports[p].clock_tick();
                 }
             }
 
@@ -1372,8 +1413,8 @@ std::vector<bool> MakeFcpReseedLevels(int intervalsPerPhase, const std::string& 
             DpEmit e;
             FcpEmit fe;
             if (phase >= 0) {
+                if (fcpOn) fe = fcp.clock_tick(port.IntervalSkipped());   // before the port's tick
                 e = port.clock_tick();
-                if (fcpOn) fe = fcp.clock_tick(port.IntervalSkipped());
             }
             bool level = cur;
             if (c == swi3s::kCdsColumn) {
@@ -1427,9 +1468,16 @@ std::vector<bool> MakeFcpReseedLevels(int intervalsPerPhase, const std::string& 
 std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHStart,
                                     int fcpOffset, int flowControlDelay, bool scrambled,
                                     int fcpBitWidth, bool reenable, int commitRowOffset,
-                                    int columnsAfter)
+                                    int columnsAfter, int skippingNumerator,
+                                    int skippingDenominator)
 {
     requireDemoLength(intervalsPerPhase, "make_fcp_move_levels", "intervals_per_phase");
+    if (skippingDenominator < 1 || skippingDenominator > kMaxRegisterField12 ||
+        skippingNumerator < 0 || skippingNumerator >= skippingDenominator ||
+        intervalsPerPhase % skippingDenominator != 0)
+        throw std::invalid_argument("make_fcp_move_levels: skipping_denominator must be "
+                                    "1..4095 and divide intervals_per_phase, and "
+                                    "skipping_numerator 0..skipping_denominator - 1");
     const U16 dev = 0x001;
     const U8  group = 0x01, rowDelay = 14;
     const int kSS = 15, kInt = 15, cols = 16;
@@ -1468,6 +1516,16 @@ std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHSt
         emitWrite(bits, regs, dev, base + swi3s::reg::kDpFlowMode,
                   {(U8)(kFlowRxControlled | 0x80)});
     if (scrambled) emitWrite(bits, regs, dev, base + swi3s::reg::kDpScramDirMode, {0x08});
+    if (skippingNumerator != 0) {
+        // SLC_SkippingDenominator is MSB-first, DPn_SkippingNumerator LSB-first.
+        emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomHi,
+                  {(U8)((skippingDenominator >> 8) & 0x0F)});
+        emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomLo,
+                  {(U8)(skippingDenominator & 0xFF)});
+        emitWrite(bits, regs, dev, base + swi3s::reg::kDpSkipNumLo,
+                  {(U8)(skippingNumerator & 0xFF), (U8)((skippingNumerator >> 8) & 0x0F)});
+    }
+    const int denom = skippingNumerator != 0 ? skippingDenominator : 1;
     appendPing(bits);
     const int kCommits = reenable ? 3 : 2;
     long eventRow[3];
@@ -1536,7 +1594,7 @@ std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHSt
                 // The port's enable: a new interval phase, sample index, scrambler and
                 // DRQ history. A DSCR enables it on Column 0 of its commit row, as an SSCR's
                 // SSP does.
-                port.Configure(d, columnCount, 1);
+                port.Configure(d, columnCount, denom);
                 port.Initialize();
                 if (!dscr || phase == 0) port.SyncToSSP();
                 fcp.Configure(d, columnCount);
@@ -1550,7 +1608,7 @@ std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHSt
                 // A rebuild: an SSCR re-anchors the port at its SSP, a DSCR that changes
                 // the column count starts its interval on Column 0 of its commit row. The
                 // DRQ history carries only from an interval boundary.
-                port.Configure(d, columnCount, 1);
+                port.Configure(d, columnCount, denom);
                 port.Initialize();
                 if (!dscr) port.SyncToSSP();
                 fcp.Configure(d, columnCount);
@@ -1560,7 +1618,7 @@ std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHSt
                     txps = 0;
                 }
             } else {
-                port.ApplyConfigKeepingPhase(d, cols, 1);
+                port.ApplyConfigKeepingPhase(d, cols, denom);
                 fcp.Configure(d, cols);
             }
         }
@@ -1568,8 +1626,8 @@ std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase, bool dscr, int fcpHSt
             DpEmit e;
             FcpEmit fe;
             if (on) {
+                fe = fcp.clock_tick(port.IntervalSkipped());   // before the port's tick
                 e = port.clock_tick();
-                fe = fcp.clock_tick(port.IntervalSkipped());
             }
             bool level = cur;
             if (c == swi3s::kCdsColumn) {
@@ -1713,8 +1771,8 @@ std::vector<bool> MakeFcpGuardTailLevels(int intervalsPerPhase, bool dscr, int f
             DpEmit e;
             FcpEmit fe;
             if (phase >= 0) {
+                fe = fcp.clock_tick(port.IntervalSkipped());   // before the port's tick
                 e = port.clock_tick();
-                fe = fcp.clock_tick(port.IntervalSkipped());
             }
             bool level = cur;
             if (c == swi3s::kCdsColumn) {
@@ -1819,11 +1877,18 @@ std::vector<bool> MakeDemoLevelsPhy1(int audioSamplesPerChannel)
     appendSscr(blk, dev, group, rowDelay);                        // confirm bit = blk.back()
 
     // config_1 audio phase: half the audio, but at least enough interval-aligned rows to
-    // hold the config_2 control block plus a spare interval.
+    // hold the config_2 control block plus a spare interval. SSCR#2's SSP lands on a whole
+    // number of config_1's pattern periods (intervalAlignment), or it would arrive part-way
+    // through DP0's skip pattern: an unexpected SSP (Section 9.1.6.2.1).
     long minRows1 = (long)blk.size() + (int)rowDelay + (kPcmInt + 1);
     long minSamples1 = (minRows1 + kPcmInt) / (kPcmInt + 1);      // ceil to whole intervals
     long samples1 = audioSamplesPerChannel / 2;
     if (samples1 < minSamples1) samples1 = minSamples1;
+    const long align1 = intervalAlignment(cfg1);
+    if (align1 < kMaxAlignmentRows && align1 % (kPcmInt + 1) == 0) {
+        const long step = align1 / (kPcmInt + 1);                  // samples per pattern period
+        samples1 = (samples1 + step - 1) / step * step;
+    }
     long rows1 = samples1 * (kPcmInt + 1);
     long ssp2 = ssp1 + rows1;
 
@@ -2072,9 +2137,16 @@ std::vector<bool> MakeDscrDisableLevels(int samplesPerChannel, bool disableAll)
 // anchored there, and every newly enabled channel's descrambler is freshly seeded. Each
 // channel carries sineSample(p * 2 + ch, index, 15), scrambled. Returns bus levels for
 // MemorySampleSource.
-std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel, bool enableChannel)
+std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel, bool enableChannel,
+                                       int dscrRowDelay, int sscrRowDelay)
 {
     requireDemoLength(samplesPerChannel, "make_dscr_enable_levels", "samples_per_channel");
+    if (dscrRowDelay < 0 || dscrRowDelay > 0xFF)
+        throw std::invalid_argument("make_dscr_enable_levels: dscr_row_delay " +
+                                    std::to_string(dscrRowDelay) + " is not a byte (0..255)");
+    if (sscrRowDelay < 0 || sscrRowDelay > 0xFF)
+        throw std::invalid_argument("make_dscr_enable_levels: sscr_row_delay " +
+                                    std::to_string(sscrRowDelay) + " is not a byte (0..255)");
     const U16 dev = 0x001;
     const U8  group = 0x01, rowDelay = 14;
     const int kSS = 15, kInt = 63, cols = 8;      // 16-bit PCM; 8-col 48 kHz (64 rows/sample)
@@ -2088,7 +2160,8 @@ std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel, bool enableChannel
     emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {0x07});
     emitPortWrites(bits, regs, dev, g[0]);
     appendPing(bits);
-    long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);        // SSCR: dp0 ch0 only
+    long ssp1Bit = (long)appendSscr(bits, dev, group,                   // SSCR: dp0 ch0 only
+                                    static_cast<U8>(sscrRowDelay));
     regs.Commit(group, dev);
     SwI3sConfig cfg1; regs.BuildConfig(cfg1); cfg1.NumColumns = cols - 1;
     if (cfg1.SkippingDenominator < 1) cfg1.SkippingDenominator = 1;
@@ -2103,7 +2176,7 @@ std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel, bool enableChannel
         emitPortWrites(blk, regs, dev, g[1]);
     }
     appendPing(blk);
-    appendSscr(blk, dev, group, rowDelay, swi3s::kOpDscr);
+    appendSscr(blk, dev, group, static_cast<U8>(dscrRowDelay), swi3s::kOpDscr);
     long rows1 = (long)samplesPerChannel * (kInt + 1);
     long ssp2 = ssp1 + rows1;                                  // the DSCR takes effect here
     long blkStart = ssp2 - (int)rowDelay - (long)blk.size();
@@ -2494,6 +2567,99 @@ std::vector<bool> MakeImmediateSampleSizeLevels(int samplesPerChannel, int fromS
     return levels;
 }
 
+std::vector<bool> MakeImmediateSkippingDenominatorLevels(int intervalsPerPhase, int numerator,
+                                                        int fromDenominator, int toDenominator)
+{
+    requireDemoLength(intervalsPerPhase, "make_immediate_skipping_denominator_levels",
+                      "intervals_per_phase");
+    const U16 dev = 0x001;
+    const U8  group = 0x01, rowDelay = 14;
+    const int kSS = 15, kInt = 31, cols = 8;   // 16-bit PCM; 32 Rows/Interval on an 8-col bus
+    if (intervalsPerPhase < 8) intervalsPerPhase = 8;
+    for (int v : {numerator, fromDenominator, toDenominator}) {
+        if (v < 1 || v > 0xFF)
+            throw std::invalid_argument(
+                "make_immediate_skipping_denominator_levels: numerator " +
+                std::to_string(numerator) + " and denominators " +
+                std::to_string(fromDenominator) + ", " + std::to_string(toDenominator) +
+                " must be 1..255");
+    }
+    const PortGeom g = {0, kSS, 1, 0, kInt, 0, 0};
+
+    CRegisterModel regs;
+    std::vector<bool> bits;
+    for (int i = 0; i < 8; ++i) appendSymbol(bits, 0x155);
+    appendPing(bits);
+    appendEnumerationPings(bits);
+    emitWrite(bits, regs, dev, swi3s::reg::kNumColumns_Next, {(U8)(cols - 1)});
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomHi, {0x00});
+    emitWrite(bits, regs, dev, swi3s::reg::kSkippingDenomLo, {(U8)fromDenominator});
+    emitPortWrites(bits, regs, dev, g);
+    // Unscrambled SOURCE, PortMode 0, so a mis-phased skip surfaces as a wrong ramp value.
+    emitWrite(bits, regs, dev, swi3s::reg::kDpBase + swi3s::reg::kDpScramDirMode, {0x00});
+    emitWrite(bits, regs, dev, swi3s::reg::kDpBase + swi3s::reg::kDpSkipNumLo,
+              {(U8)numerator, 0x00});
+    appendPing(bits);
+    long ssp1Bit = (long)appendSscr(bits, dev, group, rowDelay);
+    regs.Commit(group, dev);
+    SwI3sConfig cfg; regs.BuildConfig(cfg); cfg.NumColumns = cols - 1;
+    long ssp1 = ssp1Bit + 1 + (int)rowDelay;
+
+    std::vector<bool> blk;
+    emitWrite(blk, regs, dev, swi3s::reg::kSkippingDenomLo, {(U8)toDenominator});
+    // The row the decode reconfigures at: the first row after the write's last CDS bit,
+    // here an interval boundary.
+    const long applyRow = ssp1 + (long)intervalsPerPhase * (kInt + 1);
+    const long writeRow = applyRow - (long)blk.size();
+    fillIdleWithPings(bits, writeRow);
+    bits.insert(bits.end(), blk.begin(), blk.end());
+    const long totalRows = applyRow + (long)intervalsPerPhase * (kInt + 1);
+    fillIdleWithPings(bits, totalRows);
+
+    SwI3sDpConfig dp;
+    for (const SwI3sDpConfig& d : cfg.dps)
+        if (d.Enabled && d.numChannels() > 0) { dp = d; break; }
+
+    U64 curSample = 0, sampleIndex = 0;
+    CDataPort port;
+    int columnCount = 2;
+    bool portReady = false;
+    std::vector<bool> levels;
+    bool cur = false;
+
+    for (long r = 0; r < totalRows; ++r) {
+        if (r == ssp1) {
+            columnCount = cols;
+            port.Configure(dp, cols, fromDenominator);
+            port.Initialize();
+            port.SyncToSSP();
+            portReady = true;
+        }
+        if (r == applyRow && portReady) {
+            port.ApplyConfigKeepingPhase(dp, cols, toDenominator);
+        }
+        for (int c = 0; c < columnCount; ++c) {
+            DpEmit e;
+            if (portReady) e = port.clock_tick();
+            bool level;
+            if (c == swi3s::kCdsColumn) {
+                bool bit = (r < (long)bits.size()) ? (bool)bits[r] : true;
+                level = bit ? cur : !cur;
+            } else {
+                level = cur;                    // a skipped interval drives nothing: line holds
+                if (portReady && e.sampleHere && e.slot == SwI3sSlot::Data) {
+                    if (e.bitInChannel == kSS)
+                        curSample = sampleIndex++ & ((1ull << (kSS + 1)) - 1);
+                    level = ((curSample >> e.bitInChannel) & 1) != 0;
+                }
+            }
+            levels.push_back(level);
+            cur = level;
+        }
+    }
+    return levels;
+}
+
 // One scrambled 16-bit PCM port (dp0, col1) committed with Interval `interval`; after
 // `samplesPerChannel` samples a single WriteA32 writes `value` to the register at `address`.
 // With `beforeRun` that write is the last setup write before the SSCR instead. The wire
@@ -2651,9 +2817,12 @@ std::vector<bool> MakeRunningPortWriteLevels(int samplesPerChannel, int offset, 
 // row_in_interval == 0, so the ONLY thing wrong is the skipping phase, which is exactly
 // the unexpected SSP of Section 9.1.6.2.1.
 std::vector<bool> MakeSkippingLevels(int samplesPerChannel, int numerator, int denominator,
-                                     bool misalignedSspa)
+                                     bool misalignedSspa, int sspaRowDelay)
 {
     requireDemoLength(samplesPerChannel, "make_skipping_levels", "samples_per_channel");
+    if (sspaRowDelay < 0 || sspaRowDelay > 0xFF)
+        throw std::invalid_argument("make_skipping_levels: sspa_row_delay " +
+                                    std::to_string(sspaRowDelay) + " is not a byte (0..255)");
     const U16 dev = 0x001;
     const U8  group = 0x01, rowDelay = 14;
     const int kSS = 15, kInt = 31, cols = 8;   // 16-bit PCM; 32 Rows/Interval on an 8-col bus
@@ -2712,6 +2881,7 @@ std::vector<bool> MakeSkippingLevels(int samplesPerChannel, int numerator, int d
     // ports are unaffected (they never re-anchor), so the wire keeps the true pattern and
     // the decode meets an SSP where its accumulated skipping is NOT 0.
     if (misalignedSspa) sspa.anchor += (kInt + 1);
+    sspa.byteRowDelay = sspaRowDelay;
     fillIdleWithPings(bits, totalRows, &sspa);
 
     std::vector<const SwI3sDpConfig*> dps;

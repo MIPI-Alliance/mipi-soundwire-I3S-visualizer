@@ -19,17 +19,17 @@ for a in "$@"; do
     esac
 done
 
-# The interpreters run.sh supports: 3.11-3.13.
-supported() { "$1" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)' 2>/dev/null; }
+# The interpreters run.sh supports: 3.11-3.15.
+supported() { "$1" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,15) else 1)' 2>/dev/null; }
 PY="${PYTHON:-}"
 if [ -n "$PY" ]; then
-    supported "$PY" || { echo "PYTHON=$PY is not Python 3.11-3.13." >&2; exit 1; }
+    supported "$PY" || { echo "PYTHON=$PY is not Python 3.11-3.15." >&2; exit 1; }
 else
-    for c in python3.13 python3.12 python3.11 python3; do
+    for c in python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$c" >/dev/null 2>&1 && supported "$c"; then PY="$c"; break; fi
     done
 fi
-[ -n "$PY" ] || { echo "Need Python 3.11-3.13. Install one, or set PYTHON=/path/to/python3.12" >&2; exit 1; }
+[ -n "$PY" ] || { echo "Need Python 3.11-3.15. Install one, or set PYTHON=/path/to/python3.12" >&2; exit 1; }
 
 # The decode core is C++ and needs the interpreter's C API headers (Python.h).
 if ! "$PY" -c 'import os,sysconfig,sys; sys.exit(0 if os.path.isfile(os.path.join(sysconfig.get_paths()["include"],"Python.h")) else 1)' \

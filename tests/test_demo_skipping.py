@@ -21,6 +21,7 @@ from conftest import (
     demo_skipped_rate_hz,
     demo_transported_samples,
 )
+from demo_samples import signed, sine_sample
 
 from swi3s_studio.session import Session
 
@@ -35,12 +36,8 @@ def sessions():
 
 def _generated_sine(n: int, tone_index: int, sample_size: int = 15) -> np.ndarray:
     """Demo.cpp's sineSample, as a signed array: one cycle per 64 SAMPLES."""
-    amp = (1 << sample_size) * 0.45
-    idx = np.arange(n)
-    v = np.rint(amp * np.sin(2 * np.pi * (tone_index + 1) * idx / 64.0)).astype(np.int64)
-    v &= (1 << (sample_size + 1)) - 1
-    sign = 1 << sample_size
-    return np.where(v & sign, v - (1 << (sample_size + 1)), v).astype(np.int64)
+    return np.array([signed(sine_sample(tone_index, i, sample_size), sample_size)
+                     for i in range(n)], dtype=np.int64)
 
 
 def test_the_fraction_is_exact():
@@ -98,7 +95,7 @@ def test_the_demo_decodes_without_an_unexpected_ssp(sessions, phy):
     (Section 9.1.6.2.1). The demo's SSPA scheduler multiplies by the denominator; an SSPA
     part-way through the pattern is flagged by the decoder."""
     s = sessions[phy]
-    flagged = [c for c in s.commands if c.get("unexpected_ssp") or c.get("unexpectedSsp")]
+    flagged = [c for c in s.commands if c.get("unexpected_ssp_error")]
     assert not flagged, f"phy{phy}: {len(flagged)} command(s) flagged an unexpected SSP"
     errs = [c for c in s.commands if c.get("error")]
     assert not errs, f"phy{phy}: {len(errs)} command(s) decoded with an error"

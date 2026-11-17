@@ -1,6 +1,8 @@
 """A framing taken at a known column count without a CRC-valid command to confirm Column 0
 is reported to the user as an import warning, once per distinct report, for the decode the
-Session keeps: a decode a later one in the same step replaces is not reported."""
+Session keeps: a decode a later one in the same step replaces is not reported. A column
+count a resync's blind detector adopted without a commit is warned about by name: its old
+and new count and its sample, the first five, and a count of the rest."""
 import numpy as np
 
 from swi3s_studio import import_notes
@@ -50,6 +52,9 @@ def test_the_report_names_the_first_samples_and_counts_the_rest(monkeypatch):
         def guessed_framing_samples(self):
             return np.arange(100, 108, dtype=np.uint64)
 
+        def guessed_width_changes(self):
+            return []
+
     monkeypatch.setattr(sess, "decoder", Fake())
     with import_notes.collect() as notes:
         sess._warn_guessed_framing()
@@ -91,3 +96,40 @@ def test_two_decodes_with_the_same_guess_report_it_once():
         sess.set_hub_depths({1: 2})
         assert [int(x) for x in sess.decoder.guessed_framing_samples()] == first
     assert len([n for n in notes if "guess" in n.message]) == 1
+
+
+def test_a_column_count_re_detected_without_a_commit_warns_with_its_counts_and_sample():
+    """A 4-column Ping prefix ahead of an 8-column stream: the decode locks 4, holds it at
+    the first resync and adopts 8 at the next; the warning names both counts and the
+    sample."""
+    from test_native_decoder_run import _mislocked
+
+    from swi3s_studio.ingest.transitions import build_capture_from_levels
+    prefix, body, _setup = _mislocked()
+    with import_notes.collect() as notes:
+        sess = Session(build_capture_from_levels(prefix + body))
+    [(at, old, new)] = sess.decoder.guessed_width_changes()
+    assert (old, new) == (4, 8)
+    [note] = [n for n in notes if "column count changed" in n.message]
+    assert note.message == (f"The column count changed from 4 to 8 at sample {at} without a "
+                            "commit; the framing from there is a guess.")
+    assert note.source == sess.source_label()
+
+
+def test_the_width_change_report_names_the_first_five_and_counts_the_rest(monkeypatch):
+    sess = Session(_noise_capture(n_ui=200))
+
+    class Fake:
+        def guessed_framing_samples(self):
+            return np.zeros(0, dtype=np.uint64)
+
+        def guessed_width_changes(self):
+            return [(1000 * i, 4, 8) for i in range(7)]
+
+    monkeypatch.setattr(sess, "decoder", Fake())
+    with import_notes.collect() as notes:
+        sess._warn_guessed_framing()
+    assert [n.message.split(" at sample ")[1].split(" ")[0] for n in notes[:5]] == \
+        ["0", "1000", "2000", "3000", "4000"]
+    assert notes[5].message.startswith("2 more column-count changes without a commit")
+    assert len(notes) == 6

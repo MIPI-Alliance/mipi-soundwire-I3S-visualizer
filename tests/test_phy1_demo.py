@@ -10,10 +10,10 @@ without changing the column count — exercising a placement-only reconfigure.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_phy1_demo.py
 """
-import math
 
 import pytest
 from conftest import demo_skipped_rate_hz, demo_transported_samples
+from demo_samples import sine_sample
 
 from swi3s_studio.session import Session
 
@@ -63,8 +63,7 @@ def test_phy1_audio_decodes_clean():
     lo, hi = demo_transported_samples(n)
     assert lo <= len(dp0) <= hi, f"dp0 transported {len(dp0)}, expected {lo}..{hi} of {n}"
     assert len(dp1) == n, len(dp1)
-    amp = (1 << 15) * 0.45
-    expect = [int(round(amp * math.sin(2 * math.pi * i / 64))) & 0xFFFF for i in range(len(dp0))]
+    expect = [sine_sample(0, i, 15) for i in range(len(dp0))]
     assert dp0 == expect
 
 

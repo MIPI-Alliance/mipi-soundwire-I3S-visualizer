@@ -109,7 +109,7 @@ void CRegisterModel::applyWrite(int dev, U32 addr, U8 value)
         d.nextSrc[base] = SrcWritten;
     } else if (isDualRanked(base)) {
         // Direct write to a dual-ranked, writable _CURR alias (the Current Value Register):
-        // takes effect IMMEDIATELY with no Commit, and per spec (SWI3S v1.1 Table
+        // takes effect IMMEDIATELY with no Commit, and per spec (Table
         // 165 / {ASW5612}, Dual-Curr-is-RW) the same value is mirrored into the
         // _NEXT register (NVR == CVR). BuildConfig reads _CURR, so this changes the
         // decoded config right away — matching WriteIsImmediate()/ForceOverride(),
@@ -200,16 +200,13 @@ void CRegisterModel::commitDevice(int dev, U8 groupMask)
         return (groupMask & 0x1) != 0;
     };
 
-    for (auto kv = d.next.begin(); kv != d.next.end(); ) {
-        if (inGroup(kv->first)) {
-            d.cur[kv->first] = kv->second;
-            auto s = d.nextSrc.find(kv->first);           // carry provenance across commit
-            d.curSrc[kv->first] = (s != d.nextSrc.end()) ? s->second : U8(SrcWritten);
-            if (s != d.nextSrc.end()) d.nextSrc.erase(s);
-            kv = d.next.erase(kv);
-        } else {
-            ++kv;
-        }
+    // Commit copies _NEXT to _CURR; the _NEXT register keeps its value (it holds what was
+    // last written to it), so a later change to _CURR alone leaves _NEXT as it was.
+    for (const auto& kv : d.next) {
+        if (!inGroup(kv.first)) continue;
+        d.cur[kv.first] = kv.second;
+        auto s = d.nextSrc.find(kv.first);           // carry provenance across commit
+        d.curSrc[kv.first] = (s != d.nextSrc.end()) ? s->second : U8(SrcWritten);
     }
 }
 
@@ -304,6 +301,24 @@ std::vector<std::tuple<int, U32, U8, bool, U8, U8, bool, U8>> CRegisterModel::Sn
         }
     }
     return out;
+}
+
+void CRegisterModel::Restore(
+    const std::vector<std::tuple<int, U32, U8, bool, U8, U8, bool, U8>>& snap)
+{
+    mDev.clear();
+    for (const auto& t : snap) {
+        DeviceRegs& d = mDev[std::get<0>(t)];
+        const U32 a = std::get<1>(t);
+        if (std::get<3>(t)) {
+            d.cur[a] = std::get<2>(t);
+            d.curSrc[a] = std::get<4>(t);
+        }
+        if (std::get<6>(t)) {
+            d.next[a] = std::get<5>(t);
+            d.nextSrc[a] = std::get<7>(t);
+        }
+    }
 }
 
 bool CRegisterModel::has(int dev, U32 baseAddr) const
@@ -474,9 +489,8 @@ bool CRegisterModel::BuildConfig(SwI3sConfig& out) const
         if (has(dev, reg::kCdsBitWidthGuardTail_N)) {
             const U8 b = get(dev, reg::kCdsBitWidthGuardTail_N);
             out.CdsEndDriveEarly[src] = (b >> 4) & 0x1;
-            const bool en = ((b >> 3) & 0x1) != 0;
-            const bool pol = ((b >> 2) & 0x1) != 0;
-            out.CdsGuard[src] = en ? (pol ? 2 : 1) : 0;
+            out.CdsGuardEnable[src] = (b >> 3) & 0x1;
+            out.CdsGuardPolarity[src] = (b >> 2) & 0x1;
             out.CdsTailWidth[src] = b & 0x3;
         }
     }

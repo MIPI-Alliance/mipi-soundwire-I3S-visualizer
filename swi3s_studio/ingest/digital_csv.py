@@ -22,12 +22,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .. import import_notes
+from . import saleae_binary
 from .capture import Capture
 from .timebase import (
     MAX_LINE_CHARS,
     MAX_RATE_HZ,
     TimeRangeError,
     check_rate,
+    coarser_grid_note,
     quoted,
     rate_from_times,
     repeats,
@@ -68,8 +70,8 @@ def _header_row(f, path: str) -> Optional[List[str]]:
     file. ValueError when the row is longer than `MAX_LINE_CHARS`, has more than
     `_MAX_HEADER_CELLS` cells, or starts with a number (a file with no header row: its first
     data row would be read as column names). The rows after it are read from `f`."""
-    line = f.readline(MAX_LINE_CHARS + 1)
-    if len(line) > MAX_LINE_CHARS:
+    line = f.readline(MAX_LINE_CHARS + 2)
+    if len(line.rstrip("\r\n")) > MAX_LINE_CHARS:
         raise ValueError(f"{path}: not a capture CSV (the first row is longer than "
                          f"{MAX_LINE_CHARS:,} characters)")
     if not line:
@@ -120,11 +122,11 @@ def _data_lines(f, path: str, notes: Optional["_RowNotes"] = None):
     `notes`, those lines are counted there (line numbers count the header as line 1)."""
     n = 1
     while True:
-        line = f.readline(MAX_LINE_CHARS + 1)
+        line = f.readline(MAX_LINE_CHARS + 2)
         if not line:
             return
         n += 1
-        if len(line) > MAX_LINE_CHARS:
+        if len(line.rstrip("\r\n")) > MAX_LINE_CHARS:
             raise ValueError(f"{path}: not a capture CSV (line {n:,} is longer than "
                              f"{MAX_LINE_CHARS:,} characters)")
         if '"' in line and (line.count('"') & 1 or not _quotes_balanced(line)):
@@ -256,8 +258,8 @@ def infer_sample_rate(path: str, max_rows: int = 2_000_000) -> int:
 
 
 # Rows converted to arrays per batch. Big enough that the per-batch NumPy calls are
-# amortised; the batch's Python-object working set (`_batch_bytes`, about 35 MB on a
-# three-column export) is a constant whatever the file's length.
+# amortised; the batch's Python-object working set (`_batch_bytes`) is a constant whatever
+# the file's length.
 _ROW_CHUNK = 200_000
 
 # Peak bytes per row of `load_capture` on a time-ascending file, an upper bound: a row
@@ -271,14 +273,14 @@ _BYTES_PER_ROW = 24
 # holds the int64 sort order (8) and one sorted copy of the time (8).
 _UNSORTED_BYTES_PER_ROW = 26
 # Python-object bytes per row of a batch, beyond the row's text: the row list with its
-# GC header, the time cell's str header, and the batch's pointer lists. Measured with
-# tracemalloc at about 165 on a three-column export. A one-character level cell is a
-# cached str, so a cell costs its list pointer.
+# GC header, the time cell's str header, and the batch's pointer lists. An upper bound,
+# enforced by test_a_digital_csv_peaks_within_its_prediction. A one-character level cell
+# is a cached str, so a cell costs its list pointer.
 _ROW_OBJECT_BYTES = 200
 _CELL_POINTER_BYTES = 8
 # Bytes per row of the first `_RATE_ROWS` rows while the rate is inferred from them:
-# the rows held as arrays (10), their times joined (8), and `rate_from_times` (measured
-# with tracemalloc at 42).
+# the rows held as arrays (10), their times joined (8), and `rate_from_times`; an upper
+# bound, enforced by test_a_digital_csv_peaks_within_its_prediction.
 _RATE_BYTES_PER_ROW = 64
 
 
@@ -290,7 +292,8 @@ def _batch_bytes(ncols: int, row_text_bytes: float) -> int:
 
 def _row_text_bytes(sample_bytes: bytes) -> float:
     """Mean length of the data rows in `sample_bytes` (the header dropped), or 0."""
-    lines = [ln for ln in sample_bytes.split(b"\n")[1:] if ln]
+    lines = [ln.rstrip(b"\r\n") for ln in sample_bytes.splitlines(keepends=True)[1:]]
+    lines = [ln for ln in lines if ln]
     return sum(len(ln) for ln in lines) / len(lines) if lines else 0.0
 
 
@@ -332,16 +335,18 @@ class CsvTooLargeError(MemoryError):
 def predict_rows(path: str, sample_bytes: bytes) -> int:
     """Rows in the file, estimated from its size and the width of a sampled row.
 
-    Divides the file size by the mean length of the first few data rows. Row width
-    in a Logic export is near-constant (fixed-precision timestamps and single-digit
-    levels), so this is accurate to a few percent.
+    Divides the file size by the mean length, line end included, of the first few data
+    rows. A line ends in LF, CRLF or a lone CR, as the reader accepts. Row width in a
+    digital CSV export is near-constant (fixed-precision timestamps and single-digit levels), so
+    this is accurate to a few percent.
     """
     import os
     size = os.path.getsize(path)
-    lines = [ln for ln in sample_bytes.split(b"\n")[1:] if ln]      # drop the header
+    lines = sample_bytes.splitlines(keepends=True)[1:]              # drop the header
+    lines = [ln for ln in lines if ln.rstrip(b"\r\n")]
     if not lines:
         return 0
-    mean = sum(len(ln) + 1 for ln in lines) / len(lines)
+    mean = sum(len(ln) for ln in lines) / len(lines)
     return int(size / mean) if mean > 0 else 0
 
 
@@ -366,6 +371,7 @@ class _RowNotes:
         self.bad_time: List[Any] = [0, 0, ""]
         self.bad_level: Dict[str, List[Any]] = {}
         self.rate_defaulted = False
+        self.coarser = ""
         self.unsorted = False
 
     def report(self, path: str) -> None:
@@ -402,6 +408,8 @@ class _RowNotes:
         if self.rate_defaulted:
             import_notes.warn(src, "the timestamps do not give a sample rate; 1 MHz is "
                                    "assumed")
+        if self.coarser:
+            import_notes.warn(src, self.coarser)
 
 
 def _check_levels(batch: List[list], col: int, role: str, base: int,
@@ -476,8 +484,7 @@ def _batches(r, m: int, clock_col: int, data_col: int, notes: Optional[_RowNotes
     with no usable rows from one with no numeric times. With `notes`, the skipped rows
     and the rows with cells past the header are counted there (line numbers count the
     header as line 1). The Time column is `scale` seconds per unit."""
-    # PULL WHOLE BATCHES WITH islice, and keep the row filter a comprehension; an
-    # explicit `for row in r: ... append` loop is much slower.
+    # Read a batch with `list(islice(r, _ROW_CHUNK))` and filter it with a comprehension.
     from itertools import islice
     line = 2                           # the first data row's line
     while True:
@@ -518,6 +525,8 @@ class _Line:
         self.parts: List[np.ndarray] = []
         self.last: Optional[int] = None      # level of the last row added
         self.initial = False
+        self.grid = ""                       # the off-grid warning of the first edges, or ""
+        self._grid_seen = 0                  # edges checked against the grid so far
 
     def add(self, t: np.ndarray, levels: np.ndarray, origin: float, rate: int) -> None:
         """Append the edges of one batch: the rows whose level differs from the row
@@ -529,6 +538,10 @@ class _Line:
             change = np.flatnonzero(np.diff(levels, prepend=np.int8(self.last)))
         if change.size:
             self.parts.append(to_samples(t[change], origin, rate))
+            if not self.grid and self._grid_seen < saleae_binary._GRID_CHECK:
+                head = t[change][:saleae_binary._GRID_CHECK - self._grid_seen]
+                self._grid_seen += head.size
+                self.grid = saleae_binary.grid_note(head, rate, origin)
         self.last = int(levels[-1])
 
     def edges(self) -> np.ndarray:
@@ -551,6 +564,8 @@ def _rate_of(times: List[np.ndarray], notes: Optional[_RowNotes] = None) -> int:
                              f"Capture dialog")
     if not rate and notes is not None:
         notes.rate_defaulted = True
+    if rate and notes is not None:
+        notes.coarser = coarser_grid_note(t, rate)
     return rate or 1_000_000
 
 
@@ -741,6 +756,9 @@ def _load_capture(path: str, clock_col: int, data_col: int,
     if rows < 2:
         raise ValueError(f"{path}: not enough numeric rows to form a capture")
     notes.report(path)
+    for role, col, line in (("clock", clock_col, clk), ("data", data_col, dat)):
+        if line.grid:
+            import_notes.warn(import_notes.source_name(path), f"{role} column {col}: {line.grid}")
     ce = clk.edges()
     de = dat.edges()
     same = repeats(ce) + repeats(de)

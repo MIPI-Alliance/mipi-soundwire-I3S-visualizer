@@ -10,6 +10,7 @@ the decode on load (fast, and keeps workspaces tiny + portable).
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -114,7 +115,7 @@ class LinkSpec:
         rows, bad = _rows(got.get("even_timing", []), _pair_row)
         if bad:
             note(f"{_plural(bad, 'Evenly Spaced stream')} not read (not [device "
-                 f"0..{_DEVICES - 1}, data port])")
+                 f"-1..{_DEVICES - 1}, data port])")
         got["even_timing"] = rows
         for key, what, check, why in (
                 ("device_names", "device name", lambda v: isinstance(v, str), "is not text"),
@@ -261,11 +262,12 @@ def _scrambler_row(row) -> Optional[list]:
 
 
 def _pair_row(row) -> Optional[list]:
-    """[device, data port] as whole JSON numbers: a device 0..11 and a non-negative 32-bit
-    data port. The row as integers, or None."""
+    """[device, data port] as whole JSON numbers: a device -1..11 (-1 is the Manager, the
+    core's key for a Manager data port) and a non-negative 32-bit data port. The row as
+    integers, or None."""
     if not (isinstance(row, list) and len(row) == 2):
         return None
-    device, port = _in(row[0], 0, _DEVICES - 1), _in(row[1], 0, _MAX_PORT)
+    device, port = _in(row[0], -1, _DEVICES - 1), _in(row[1], 0, _MAX_PORT)
     return None if device is None or port is None else [device, port]
 
 
@@ -400,9 +402,10 @@ class Workspace:
             import_notes.warn(source, "the saved active Link is one not opened; the first is "
                                       "used")
             active = 0
-        if not 0 <= active < len(links):
-            raise ValueError(f"not a valid workspace file (active Link {active} of "
-                             f"{len(links)})")
+        elif not 0 <= active < len(links):
+            import_notes.warn(source, f"the saved active Link index {active} is outside the "
+                                      f"{_plural(len(links), 'Link')} saved; the first is used")
+            active = 0
         unknown = sorted(str(k) for k in d if k not in known)
         if unknown:
             import_notes.warn(source, f"{_plural(len(unknown), 'saved setting')} this "
@@ -435,7 +438,7 @@ class Workspace:
         kept, unread, off_link = _readable_bookmarks(bookmarks, len(links))
         if unread:
             import_notes.warn(source, f"{_plural(unread, 'cursor')} with no readable sample, "
-                                      f"index or Link {_was(unread)} not read")
+                                      f"index, Link, group or label {_was(unread)} not read")
         if off_link:
             import_notes.warn(source, f"{_plural(off_link, 'cursor')} on a Link the workspace "
                                       f"does not have {_was(off_link)} not read")
@@ -499,7 +502,7 @@ class Workspace:
         return ws
 
     def missing_files(self) -> List[Tuple[int, str, str]]:
-        """(Link index, source key, path as saved) for each capture file not found."""
+        """(Link index, source key, path looked for) for each capture file not found."""
         return [(i, key, str(link.source[key])) for i, link in enumerate(self.links)
                 for key in source_files(link.source) if not os.path.isfile(link.source[key])]
 
@@ -509,7 +512,7 @@ class Workspace:
         self.links[link].source = {**self.links[link].source, key: os.path.abspath(path)}
         folder = os.path.dirname(os.path.abspath(path))
         for i, k, saved in self.missing_files():
-            candidate = os.path.join(folder, os.path.basename(saved))
+            candidate = os.path.join(folder, import_notes.source_name(saved))
             if os.path.isfile(candidate):
                 self.links[i].source = {**self.links[i].source, k: candidate}
 
@@ -525,12 +528,15 @@ _BOOKMARK_READS, _BOOKMARK_UNREAD, _BOOKMARK_OFF_LINK = "reads", "unread", "off_
 
 def _bookmark_state(b, n_links: int) -> str:
     """_BOOKMARK_READS when `b` is a paired bookmark BookmarkSet.from_json reads: a mapping
-    whose sample is a whole sample number, whose index is a whole number 0..2**31-1 and
-    whose Link is one of 0..`n_links` - 1. _BOOKMARK_OFF_LINK when only its Link fails (it
-    is not one of those, or not a whole number); _BOOKMARK_UNREAD otherwise."""
+    whose sample is a whole sample number, whose index is a whole number 0..2**31-1, whose
+    group and label, where given, are text and whose Link is one of 0..`n_links` - 1.
+    _BOOKMARK_OFF_LINK when only its Link fails (it is not one of those, or not a whole
+    number); _BOOKMARK_UNREAD otherwise."""
     if not (isinstance(b, dict) and _sample(b.get("sample")) is not None):
         return _BOOKMARK_UNREAD
     if _in(b.get("index", 1), 0, _MAX_BOOKMARK_INDEX) is None:
+        return _BOOKMARK_UNREAD
+    if not all(isinstance(b.get(k, ""), str) for k in ("group", "label")):
         return _BOOKMARK_UNREAD
     link = _whole(b.get("link", 0))
     return _BOOKMARK_READS if link is not None and 0 <= link < n_links else _BOOKMARK_OFF_LINK
@@ -598,18 +604,23 @@ def relative_source(source: dict, base: str) -> dict:
 
 def resolve_source(source: dict, base: str) -> dict:
     """`source` with each file as an absolute path that exists if one can be found: a
-    relative path against `base`, then the path it had when saved. A file found nowhere
-    keeps the path it was saved with, for `Workspace.missing_files` to report."""
+    relative path against `base`, then the path it had when saved. A relative file found
+    nowhere is anchored to `base`, never to the working directory; an absolute one (this
+    platform's, or a Windows drive or UNC path) keeps the path it was saved with. Either is
+    what `Workspace.missing_files` reports."""
     out = {k: v for k, v in source.items() if k != _SAVED_AT}
     saved = _dict_or_empty(source.get(_SAVED_AT))
     for key in source_files(out):
         p = out[key]
-        tries = [p] if os.path.isabs(p) else [os.path.join(base, p)]
+        absolute = os.path.isabs(p) or bool(ntpath.splitdrive(p)[0])
+        tries = [p] if absolute else [os.path.join(base, p)]
         if isinstance(saved.get(key), str):
             tries.append(saved[key])
         found = next((os.path.normpath(t) for t in tries if os.path.isfile(t)), None)
         if found is not None:
             out[key] = found
+        elif not absolute:
+            out[key] = os.path.normpath(tries[0])
     return out
 
 
