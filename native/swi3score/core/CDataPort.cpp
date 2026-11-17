@@ -119,6 +119,18 @@ void CDataPort::SyncToSSP()
     startInterval();
 }
 
+void CDataPort::AnchorAfterSsp(long long intervals, long long rows, int column)
+{
+    mColumn = 0;
+    SyncToSSP();
+    for (long long i = 0; i < intervals; ++i) {
+        mRowInInterval = 0;
+        startInterval();
+    }
+    const long long ticks = rows * mNumColumns + ((column % mNumColumns) + mNumColumns) % mNumColumns;
+    for (long long t = 0; t < ticks; ++t) clock_tick();
+}
+
 CDataPort::State CDataPort::SaveState() const
 {
     return { mColumn, mRowInInterval, mIntervalSkipped, mSkippingAccumulator,

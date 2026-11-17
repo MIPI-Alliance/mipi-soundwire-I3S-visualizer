@@ -12,9 +12,10 @@ from ..session import zero_based_row
 
 
 class RowOriginMixin:
-    """Mixin for views that display bus rows 0-based. `set_row_origin` is called
-    once per capture (from MainWindow.load_session); `display_row` formats an
-    internal bus row for display."""
+    """Mixin for views that display bus rows 0-based. A view that shows bus rows gets its
+    origin from the bind that feeds it (MainWindow._feed_timeline, MainWindow._bind_tables)
+    or its constructor, on every bind; `display_row` formats an internal bus row for
+    display."""
 
     _row_origin = 0
 

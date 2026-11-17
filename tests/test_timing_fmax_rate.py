@@ -314,21 +314,28 @@ def test_a_soundwire_manager_launch_is_its_equivalent_plus_its_anchor_correction
 
 
 def test_the_soundwire_min_corner_starts_its_ramp_at_low_impedance():
-    """The t_DD,min slot is t_ZD_Data,Min's equivalent, measured to 20 % of the ramp at the
-    reference slew. At its anchor, at any data slew, the ramp starts at SoundWire's own
-    low-impedance instant: t_ZD_Data,Min = 8.1 ns after the 50 % clock, the equivalent less
-    5.0/3 rounded down. The min corner reads an early data edge (`edge_factor`)."""
+    """The t_DD,min slot is t_ZD_Data,Min's equivalent, measured from the Peripheral's
+    earliest clock detection (V_IH,min, 45 %) to 20 % of the ramp, at t_Slew_Clock's min and
+    the reference slew. At its anchor, at any clock and data slew, the ramp starts at
+    SoundWire's own low-impedance instant: t_ZD_Data,Min = 8.1 ns after the clock's 50 %
+    point, which is k/12 after the detection on a linear clock ramp; the equivalent less
+    2.0/12 and 5.0/3 rounded down. The min corner reads an early data edge and an early clock
+    edge (`edge_factor`)."""
     from swi3s_studio.timing.calculator import _launch_anchor_ns, anchor_frac, edge_factor
 
     p = preset("SW13_1V2", "Per")
     assert p.t_DD_min_ns == p.t_ZD_min_ns
-    for s_ in (2.0, 3.5, 5.0):
-        inp = CalcInputs(Per_spec="SW13_1V2", Per_t_DD_min_ns=p.t_DD_min_ns,
-                         tRF_Per_DATA_ns=s_)
-        edge = edge_factor(inp, "Per DATA", "early") * s_
-        start = _launch_anchor_ns(inp, "Per", "DD", "min") - anchor_frac(inp, "Per") * edge
-        assert start == pytest.approx(p.t_DD_min_ns - REF_TRF_NS / 3.0, abs=1e-12), s_
-        assert start <= 8.1
+    for k in (3.0, 5.0, 8.3):
+        for s_ in (2.0, 3.5, 5.0):
+            inp = CalcInputs(Per_spec="SW13_1V2", Per_t_DD_min_ns=p.t_DD_min_ns,
+                             tRF_Per_DATA_ns=s_, tRF_Man_CLK_ns=k)
+            edge = edge_factor(inp, "Per DATA", "early") * s_
+            to_50 = edge_factor(inp, "Man CLK", "early") * k / 12.0
+            start = (_launch_anchor_ns(inp, "Per", "DD", "min")
+                     - anchor_frac(inp, "Per") * edge - to_50)
+            assert start == pytest.approx(p.t_DD_min_ns - 2.0 / 12.0 - REF_TRF_NS / 3.0,
+                                          abs=1e-12), (k, s_)
+            assert start <= 8.1
 
 
 def _growing_release() -> CalcInputs:

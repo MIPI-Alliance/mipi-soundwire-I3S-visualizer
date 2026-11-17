@@ -210,6 +210,33 @@ def test_a_deferred_read_is_delivered_by_a_zero_length_read_data_phase():
         "Read Data[1] = 0x55", "Peripheral_CRC16_H = 0x01", "Peripheral_CRC16_L = 0x02"]
 
 
+def _read_setup_to(mask, count_minus_1, response):
+    addr = [0x00, 0x00, 0x21, 0x23]
+    return (_header(2, 6, mask=mask) + [_byte(0x00), _byte(count_minus_1)]
+            + [_byte(b) for b in addr] + [_byte(0xAB), _byte(0xCD)] + _spacer() + [_rt(response)])
+
+
+def _delivery(mask, data):
+    return (_header(3, 0, mask=mask) + _spacer() + [_rt(0)] + _spacer()
+            + [_byte(b) for b in data] + [_byte(0x01), _byte(0x02)])
+
+
+def test_a_deferred_read_is_delivered_with_its_own_devices_byte_count():
+    """The core keeps a deferred read's byte count per device: another device's read in
+    between does not change it, and a ReadData with none pending delivers one byte."""
+    syms = _read_setup_to(1 << 1, 1, 5)                       # dev 1: 2 bytes, deferred
+    syms += _read_setup_to(1 << 2, 3, 0)                      # dev 2: 4 bytes, delivered now
+    syms += _spacer() + [_byte(0x10 + i) for i in range(4)] + [_byte(0xE1), _byte(0xE2)]
+    syms += _spacer(2) + [_rt(0)]
+    syms += _delivery(1 << 1, [0x44, 0x55])                   # dev 1's two bytes
+    syms += _delivery(1 << 3, [0x66])                         # dev 3: nothing pending
+    phases = _phases(annotate(syms))
+    assert phases[2][-4:] == ["Read Data[0] = 0x44", "Read Data[1] = 0x55",
+                              "Peripheral_CRC16_H = 0x01", "Peripheral_CRC16_L = 0x02"]
+    assert phases[3][-3:] == ["Read Data[0] = 0x66", "Peripheral_CRC16_H = 0x01",
+                              "Peripheral_CRC16_L = 0x02"]
+
+
 def test_a_read_setup_answered_with_no_data_ends_after_the_response():
     labels = annotate(_read_setup(3, 4) + _spacer(3))         # READ_FAILED
     assert labels[-4] == "Peripheral Response: READ_FAILED"

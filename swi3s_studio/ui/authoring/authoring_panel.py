@@ -21,7 +21,7 @@ from functools import reduce
 from typing import Dict, List
 
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QIntValidator, QPalette
+from PySide6.QtGui import QColor, QDoubleValidator, QFontMetricsF, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -41,6 +41,7 @@ from ...analysis.issues import Issue
 from ...model.bus_config import NUM_DATA_PORTS, BusConfig
 from ...swviz.config.constants import InterfaceRanges
 from .. import timers
+from ..grid_view import _DP_PALETTE
 from ..theme import VizTheme, authoring_stylesheet
 from .dialogs import (
     MANAGER,
@@ -52,6 +53,7 @@ from .dialogs import (
     FlowModeSelectorDialog,
     GuardSelectorDialog,
     PortModeSelectorDialog,
+    cds_guard_summary,
     cds_summary,
     plain_validator,
 )
@@ -74,9 +76,19 @@ def _dialog_button_css() -> str:
             f"QPushButton:hover {{ border-color:{VizTheme.ACCENT}; }}")
 
 
+def _chip_css(c: int) -> str:
+    """A DP name chip: data port `c`'s colour, dark text, the entry border and padding."""
+    return (f"background:{_DP_PALETTE[c]}; color:black; "
+            f"border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER}; "
+            f"border-radius:{VizTheme.CORNER_RADIUS}px; padding:1px {_CHIP_PAD_X}px;")
+
+
 class _ClickLineEdit(QLineEdit):
-    """A read-only entry that emits `clicked` on press — used for the Device and
-    Num Channels cells, which open a picker dialog like the Visualizer."""
+    """A read-only entry that emits `clicked` when a left click is released on it — used for
+    the DP name chips and the Device and Num Channels cells, which open a picker dialog like
+    the Visualizer. The press is taken whole and never reaches QLineEdit (no text selection
+    or drag starts), and the dialog opens only after the release, so the click that opens a
+    modal dialog leaves no press behind it."""
     clicked = Signal()
 
     def __init__(self) -> None:
@@ -84,15 +96,25 @@ class _ClickLineEdit(QLineEdit):
         self.setReadOnly(True)
         self.setAlignment(Qt.AlignCenter)
         self.setCursor(Qt.PointingHandCursor)
+        self._pressed = False
 
     def mousePressEvent(self, e) -> None:  # noqa: N802 (Qt signature)
-        self.clicked.emit()
-        super().mousePressEvent(e)
+        self._pressed = e.button() == Qt.LeftButton
+        e.accept()
 
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802 (Qt signature)
+        e.accept()
 
-# The Visualizer's 12 data-port colours (Colors.DP_COLORS) — the DP name headers.
-_DP_COLORS = ["#FF80BF", "#FFA080", "#FFFF80", "#A0FF80", "#80FFFF", "#8080FF",
-              "#BF80FF", "#FFBFFF", "#FFBFBF", "#FFFFBF", "#BFFFBF", "#BFFFFF"]
+    def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802 (Qt signature)
+        e.accept()
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802 (Qt signature)
+        e.accept()
+        if self._pressed and e.button() == Qt.LeftButton and self.rect().contains(
+                e.position().toPoint()):
+            self._pressed = False
+            self.clicked.emit()
+        self._pressed = False
 
 
 # Data-port numeric rows: (label, attr, min, max). "num_channels" is special
@@ -116,10 +138,11 @@ _NUMERIC_ROWS = [
 
 # Data-port checkbox rows: (label, mode). "direction" inverts (checked = Source);
 # "bool:<attr>" is a plain boolean; "dialog:<kind>" opens the matching dialog on
-# click (its checked state reflects whether the feature is on).
+# click (its checked state reflects whether the feature is on). The guard row's cell also
+# shows the guard's polarity (0 / 1) beside the checkbox, whether or not it is enabled.
 _CHECK_ROWS = [
     ("Source [checked] / Sink", "direction"),
-    ("Guard Enable", "dialog:guard"),
+    ("Guard Enable / Polarity", "dialog:guard"),
     ("Sub Row Interval", "bool:sub_row_interval"),
     ("Flow Control", "dialog:flow"),
     ("Port Test Mode", "dialog:port"),
@@ -157,8 +180,17 @@ _IFACE_ROWS = [
 # one name rather than each testing the widget type.
 _IFACE_NON_ATTR = {"cds_settings"}
 
-_ENTRY_W = 48
-_ROW_H = 24                # uniform row height so the frozen label column and the
+_ENTRY_W = 48             # a DP column's width, and its narrowest
+# A DP column is as wide as its name chip's label needs, from _ENTRY_W up to _DP_COL_MAX,
+# past which the label is elided (the chip's tooltip holds it whole). A chip's text
+# needs its padding, its border and the line edit's own 2 px margin on each side, and
+# 2 px at the end: the 1 px text cursor and 1 px of slack.
+_DP_COL_MAX = 200
+_CHIP_PAD_X = 4
+_CHIP_ROOM = 2 * (VizTheme.BORDER_WIDTH + _CHIP_PAD_X + 2) + 2
+# The guard row's polarity digit beside the checkbox, and the spacer balancing it.
+_GUARD_POL_W = 12
+_ROW_H = 24               # uniform row height so the frozen label column and the
                            # scrollable entry columns line up row-for-row
 _HEADER_CSS = VizTheme.HEADER_CSS
 # Initial height for the (internally-scrolling) Notifications panel. It is then
@@ -189,6 +221,7 @@ class AuthoringPanel(QWidget):
         self._dp_num: Dict[str, List[QLineEdit]] = {a: [] for _, a, _, _ in _NUMERIC_ROWS}
         self._dp_check: Dict[str, List[QCheckBox]] = {m: [] for _, m in _CHECK_ROWS}
         self._dp_rate: List[QLabel] = []
+        self._dp_guard_pol: List[QLabel] = []   # each port's guard polarity, beside its box
         self._iface: Dict[str, QWidget] = {}
         self._iface_typed: set = set()   # interface boxes typed in since the last commit or populate
         self._action_btns: List[QPushButton] = []   # re-styled on theme switch
@@ -291,10 +324,7 @@ class AuthoringPanel(QWidget):
             e.setAlignment(Qt.AlignCenter)
             e.setFixedWidth(_ENTRY_W)
             e.setFixedHeight(_ROW_H)
-            e.setStyleSheet(
-                f"background:{_DP_COLORS[c]}; color:black; "
-                f"border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER}; "
-                f"border-radius:{VizTheme.CORNER_RADIUS}px;")
+            e.setStyleSheet(_chip_css(c))
             e.clicked.connect(lambda col=c: self._open_dp_dialog("identity", col))
             entry_grid.addWidget(e, 0, c)
             self._dp_name.append(e)
@@ -337,7 +367,22 @@ class AuthoringPanel(QWidget):
                 h = QHBoxLayout(cell); h.setContentsMargins(0, 0, 0, 0)
                 # Symmetric stretches centre the checkbox in its column, so it lines
                 # up with the (centred) text entries above it.
-                h.addStretch(1); h.addWidget(cb); h.addStretch(1)
+                h.addStretch(1)
+                if mode == "dialog:guard":
+                    # The polarity digit on the right, balanced by an equal spacer on the
+                    # left so the checkbox stays centred with the other rows'.
+                    h.setSpacing(0)
+                    pol = QLabel("0")
+                    pol.setFixedWidth(_GUARD_POL_W)
+                    pol.setContentsMargins(3, 0, 0, 0)
+                    pol.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    h.addSpacing(_GUARD_POL_W)
+                    h.addWidget(cb)
+                    h.addWidget(pol)
+                    self._dp_guard_pol.append(pol)
+                else:
+                    h.addWidget(cb)
+                h.addStretch(1)
                 entry_grid.addWidget(cell, r, c)
                 self._dp_check[mode].append(cb)
             r += 1
@@ -600,10 +645,7 @@ class AuthoringPanel(QWidget):
         the Notifications sub-panel are refreshed explicitly."""
         self.setStyleSheet(authoring_stylesheet())
         for c, e in enumerate(self._dp_name):
-            e.setStyleSheet(
-                f"background:{_DP_COLORS[c]}; color:black; "
-                f"border:{VizTheme.BORDER_WIDTH}px solid {VizTheme.BORDER}; "
-                f"border-radius:{VizTheme.CORNER_RADIUS}px;")
+            e.setStyleSheet(_chip_css(c))
         for b in self._action_btns:
             b.setStyleSheet(_action_button_css())
         for b in self._dialog_btns:
@@ -621,7 +663,7 @@ class AuthoringPanel(QWidget):
         self._loading = True
         for c in range(NUM_DATA_PORTS):
             dp = self._cfg.dataports[c]
-            self._dp_name[c].setText(self._chip_text(dp, c))
+            self._show_chip(c, self._chip_text(dp, c))
             self._dp_name[c].setToolTip(
                 f"Data port {dp.number(c)}" + (f" — {dp.name}" if dp.name else "")
                 + "\nClick to edit number / name")
@@ -635,6 +677,12 @@ class AuthoringPanel(QWidget):
                 self._dp_num[attr][c].setText(text)
             for _, mode in _CHECK_ROWS:
                 self._dp_check[mode][c].setChecked(self._check_state(dp, mode))
+            pol = 1 if dp.guard_polarity else 0
+            tip = (f"Guard {'enabled' if dp.guard_enable else 'off'}, polarity {pol}"
+                   "\nClick to change")
+            self._dp_guard_pol[c].setText(str(pol))
+            self._dp_guard_pol[c].setToolTip(tip)
+            self._dp_check["dialog:guard"][c].setToolTip(tip)
         for attr, (lab, w) in self._iface.items():
             if attr in _IFACE_NON_ATTR:
                 continue          # a dialog button, not a value (see _IFACE_ROWS)
@@ -654,9 +702,25 @@ class AuthoringPanel(QWidget):
 
     @staticmethod
     def _chip_text(dp, c: int) -> str:
-        """DP header chip label: number + optional name, e.g. 'DP17' or '17·MicL'."""
+        """DP header chip label: the port's name as the user gave it, e.g. 'MicL', or 'DP17'
+        for a port without one. The number is in the chip's tooltip."""
         n = dp.number(c)
-        return f"{n}·{dp.name}" if dp.name else f"DP{n}"
+        return dp.name if dp.name else f"DP{n}"
+
+    def _show_chip(self, c: int, label: str) -> None:
+        """Show `label` on DP column `c`'s chip and size the column to it (_DP_COL_MAX):
+        the chip and the column's entries take one width, so the column follows the label,
+        wider for a longer one and back to _ENTRY_W for a short one. A label wider than
+        _DP_COL_MAX is elided."""
+        chip = self._dp_name[c]
+        chip.ensurePolished()
+        need = math.ceil(QFontMetricsF(chip.font()).horizontalAdvance(label)) + _CHIP_ROOM
+        width = max(_ENTRY_W, min(_DP_COL_MAX, need))
+        chip.setText(label if need <= width else chip.fontMetrics().elidedText(
+            label, Qt.ElideRight, width - _CHIP_ROOM))
+        chip.setFixedWidth(width)
+        for entries in self._dp_num.values():
+            entries[c].setFixedWidth(width)
 
     @staticmethod
     def _check_state(dp, mode: str) -> bool:
@@ -782,20 +846,23 @@ class AuthoringPanel(QWidget):
         the guard/tail lists come back through this dialog, not applied by the inner one.
 
         `cds_guard_enabled` / `cds_tail_enabled` are READ-ONLY properties derived from
-        the per-source lists; assigning either raises, so the lists are what is set.
+        the per-source lists; assigning either raises, so the lists are what is set. The
+        guard's enable and polarity lists are written together, on OK only.
         """
         dlg = CdsSettingsDialog(self, bit_width=self._cfg.cds_bit_width,
                                 drive_type=list(self._cfg.cds_drive_type),
                                 end_drive_early=list(self._cfg.cds_end_drive_early),
                                 enforce_handover=self._cfg.enforce_cds_handover,
-                                guard=list(self._cfg.cds_guard),
+                                guard_enable=list(self._cfg.cds_guard_enable),
+                                guard_polarity=list(self._cfg.cds_guard_polarity),
                                 tail=list(self._cfg.cds_tail))
         if dlg.exec():
             self._cfg.cds_bit_width = int(dlg.bit_width)
             self._cfg.cds_drive_type = list(dlg.drive_type)
             self._cfg.cds_end_drive_early = list(dlg.end_drive_early)
             self._cfg.enforce_cds_handover = bool(dlg.enforce_handover)
-            self._cfg.cds_guard = list(dlg.guard)
+            self._cfg.cds_guard_enable = list(dlg.guard_enable)
+            self._cfg.cds_guard_polarity = list(dlg.guard_polarity)
             self._cfg.cds_tail = list(dlg.tail)
             self.configChanged.emit()
         self._update_cds_settings_row()
@@ -807,7 +874,7 @@ class AuthoringPanel(QWidget):
             f"Bit width {self._cfg.cds_bit_width}"
             f" · drive {cds_summary(self._cfg.cds_drive_type, 'drive')}"
             f" · end drive early {cds_summary(self._cfg.cds_end_drive_early, 'ede')}"
-            f" · guard {cds_summary(self._cfg.cds_guard, 'guard')}"
+            f" · guard {cds_guard_summary(self._cfg.cds_guard_enable, self._cfg.cds_guard_polarity)}"
             f" · tail {cds_summary(self._cfg.cds_tail, 'tail')}"
             f" · handover {'on' if self._cfg.enforce_cds_handover else 'off'}"
             "\nClick to change.")

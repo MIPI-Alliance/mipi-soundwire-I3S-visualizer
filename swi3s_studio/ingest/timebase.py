@@ -8,10 +8,12 @@ which on a forwarded-clock capture is many samples.
 
 `rate_from_times` finds that grid. With ``d`` the finest spacing, the period is
 ``d / k`` for some whole ``k``; candidates are tried from ``k = 1`` up. Each candidate
-is fitted over doubling prefixes of the timestamps: a prefix assigns each timestamp
-its nearest whole sample (each within `_ASSIGN_TOLERANCE`), and the period is then
-re-estimated from the farthest of them, so a starting estimate taken from timestamps
-printed to a coarser precision than the period still converges. The first fitted
+is fitted over doubling runs of the timestamps around the finest spacing: a run assigns
+each timestamp its nearest whole sample from the run's anchor, the first timestamp of the
+finest spacing (each within `_ASSIGN_TOLERANCE`), and the period is then re-estimated
+from the farthest of them, so a starting estimate taken from timestamps printed to a
+coarser precision than the period, or a finest spacing measured far from the first
+timestamp (an idle lead-in), still converges. The first fitted
 candidate whose grid holds every timestamp to `_GRID_TOLERANCE` of a sample wins. The
 result is rounded to the kHz, then the Hz, taking the first rounding the grid holds.
 
@@ -52,10 +54,13 @@ _ASSIGN_TOLERANCE = 0.25
 _FIRST_STAGE = 2
 
 
-def _on_grid(off: np.ndarray, rate: float, tol: float = _GRID_TOLERANCE) -> bool:
-    """True if every offset in `off` (seconds) is within `tol` samples of a whole one.
-    Two temporaries the size of `off`, whatever its length."""
+def _on_grid(off: np.ndarray, rate: float, tol: float = _GRID_TOLERANCE,
+             origin: float = 0.0) -> bool:
+    """True if every offset in `off` (seconds) is within `tol` samples of a whole number of
+    samples from `origin`. Two temporaries the size of `off`, whatever its length."""
     pos = off * rate
+    if origin:
+        pos -= origin * rate
     whole = np.rint(pos)
     pos -= whole
     del whole
@@ -63,26 +68,72 @@ def _on_grid(off: np.ndarray, rate: float, tol: float = _GRID_TOLERANCE) -> bool
     return bool(pos.max() <= tol)
 
 
-def _fit(off: np.ndarray, rate: float) -> float:
-    """The fitted rate if `off` sits on a grid near `rate`, else 0.
+def _fit(off: np.ndarray, rate: float, at: int = 0) -> float:
+    """The fitted rate if `off` (ascending) sits on a grid near `rate`, else 0.
 
-    Checks prefixes of 2, 4, 8, ... offsets to `_ASSIGN_TOLERANCE`. After each passing
-    stage the rate is re-estimated as (whole samples at the farthest offset) / (that
-    offset), so an error in the starting estimate does not accumulate across a long
-    capture. The caller checks the fitted rate to `_GRID_TOLERANCE`.
+    Checks runs of offsets around `off[at]` (the first of the finest spacing), measured
+    from it, to `_ASSIGN_TOLERANCE`: first the finest pair, then each stage every offset
+    within twice the run's reach, or the nearest one beyond it when none is. A stage that
+    fails at the estimate is tried at the estimate rounded to the kHz, then the Hz. After
+    each passing stage the rate is re-estimated as (whole samples to the farthest offset of
+    the run) / (that distance), so an error in the starting estimate does not accumulate
+    across a long capture or an idle lead-in. The caller checks the fitted rate to
+    `_GRID_TOLERANCE`.
     """
-    m = _FIRST_STAGE
     n = off.size
+    anchor = float(off[at])
+    lo, hi = at, min(n, at + _FIRST_STAGE)
     while True:
-        part = off[:min(m, n)]
-        if not _on_grid(part, rate, _ASSIGN_TOLERANCE):
+        part = off[lo:hi]
+        for r in (rate, float(round(rate / 1000.0) * 1000), float(round(rate))):
+            if r > 0 and _on_grid(part, r, _ASSIGN_TOLERANCE, anchor):
+                rate = r
+                break
+        else:
             return 0.0
-        far = float(part[-1])
+        far = max(float(off[hi - 1]) - anchor, anchor - float(off[lo]))
         if far > 0:
             rate = float(np.rint(far * rate)) / far
-        if m >= n:
+        if lo == 0 and hi == n:
             return rate
-        m *= 2
+        left = anchor - float(off[lo - 1]) if lo else np.inf
+        right = float(off[hi]) - anchor if hi < n else np.inf
+        reach = max(2.0 * far, min(left, right))
+        # Each stage takes at least the nearest offset outside the run, whatever the
+        # rounding of anchor -/+ reach.
+        new_lo = int(np.searchsorted(off, anchor - reach, side="left"))
+        new_hi = int(np.searchsorted(off, anchor + reach, side="right"))
+        lo = min(new_lo, lo - 1) if left <= reach else min(new_lo, lo)
+        hi = max(new_hi, hi + 1) if right <= reach else max(new_hi, hi)
+
+
+# Divisors j of a found rate tried by `coarser_grid_note`, and the share of timestamps that
+# may sit off rate/j for it to be named (at least one).
+_COARSER_MAX_DIVISOR = 64
+_COARSER_MAX_SHARE = 1e-3
+
+
+def coarser_grid_note(times: np.ndarray, rate: int) -> str:
+    """The import warning for `times` (seconds) whose `rate` grid is j times a coarser one
+    (j from 2 to `_COARSER_MAX_DIVISOR`) that all but a few of them sit on: at most
+    `_COARSER_MAX_SHARE` of them, and at least one. A few timestamps printed off the
+    analyzer's grid make `rate_from_times` find this finer grid. "" when there is none;
+    the largest such j is named."""
+    t = np.asarray(times, dtype=np.float64)
+    t = t[np.isfinite(t)]
+    if t.size < 2 or rate <= 0:
+        return ""
+    pos = np.rint((t - t.min()) * float(rate)).astype(np.int64)
+    limit = max(1, int(t.size * _COARSER_MAX_SHARE))
+    for j in range(_COARSER_MAX_DIVISOR, 1, -1):
+        off = int(np.count_nonzero(pos % j))
+        if 0 < off <= limit:
+            coarse = f"{rate // j:,}" if rate % j == 0 else f"{rate / j:,.3f}"
+            return (f"{off:,} of the {t.size:,} timestamps read for the rate "
+                    f"{'is' if off == 1 else 'are'} off the {coarse} Hz grid the rest "
+                    f"sit on; the capture is read at {rate:,} Hz, the grid that holds them "
+                    f"all")
+    return ""
 
 
 def rate_from_times(times: np.ndarray) -> int:
@@ -100,14 +151,17 @@ def rate_from_times(times: np.ndarray) -> int:
     if off.size < 2:
         return 0
     off -= off[0]                     # in place: `off` is unique's own sorted copy
-    finest = float(np.min(np.diff(off)))
+    gaps = np.diff(off)
+    at = int(np.argmin(gaps))
+    finest = float(gaps[at])
+    del gaps
     if finest <= 0:
         return 0
     last = float(off[-1])
     for k in range(1, _MAX_SAMPLES_PER_GAP + 1):
         if not np.isfinite(last * (k / finest)):
             break
-        rate = _fit(off, k / finest)
+        rate = _fit(off, k / finest, at)
         if rate <= 0 or not _on_grid(off, rate):
             continue
         for rounded in (round(rate / 1000.0) * 1000, round(rate)):
@@ -130,7 +184,7 @@ MAX_RATE_HZ = 1e15
 _RATE_CEILING = 10 ** 30
 
 # The longest line, in characters, the digital CSV reader, the probe's first-line and head
-# reads and the analog-CSV detection read as one row.
+# reads and the analog-CSV detection read as one row, its line ending not counted.
 MAX_LINE_CHARS = 1 << 16
 _CHUNK = 1 << 20
 

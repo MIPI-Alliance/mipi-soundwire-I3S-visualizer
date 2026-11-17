@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication, QColorDialog, QMenu
 
 from swi3s_studio.ui import line_style
 from swi3s_studio.ui.grid_view import _dp_index
-from swi3s_studio.ui.theme import _PALETTES, apply_palette
+from swi3s_studio.ui.theme import _PALETTES, VizTheme, apply_palette, legible_text_color
 
 pytestmark = [pytest.mark.gui, pytest.mark.platform]
 
@@ -100,7 +100,7 @@ def test_overrides_round_trip_through_json():
 def win(monkeypatch):
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.main_window import MainWindow
-    monkeypatch.setattr("swi3s_studio.ui.main_window.save_preference", lambda _p: None)
+    monkeypatch.setattr("swi3s_studio.ui.theme_controller.save_preference", lambda _p: None)
     w = MainWindow()
     w.load_demo()
     s0 = w._session.commands[2]["start_sample"]
@@ -210,13 +210,16 @@ def _choose(win, monkeypatch, which, dev, dp):
 
 
 def _stream_colours(win, dev, dp):
-    """Every pane's colour for (dev, dp): Audio pens + checkbox, Capture overlay, Samples."""
+    """Every pane's colour for (dev, dp): Audio pens, Capture overlay, Samples. A checkbox's
+    text is in the legible shade of its trace's colour (theme.legible_text_color)."""
     out = {c for (d, p, _ch), (c, _w) in _audio_pens(win).items() if (d, p) == (dev, dp)}
     out |= {c.name() for k, c in win._raw_view._port_colors.items() if k[:2] == (dev, dp)}
     out |= {c.name() for k, c in win._sample_view._lane_colors.items() if k[:2] == (dev, dp)}
-    for (d, p, _ch), cb in win._audio_view._checks.items():
+    for (d, p, ch), cb in win._audio_view._checks.items():
         if (d, p) == (dev, dp):
-            out.add(cb.styleSheet().split("color:")[1].split(";")[0].strip())
+            text = cb.styleSheet().split("color:")[1].split(";")[0].strip()
+            trace = win._audio_view._lane_colors[(d, p, ch)]
+            assert text == legible_text_color(trace, VizTheme.FRAME_BG), (text, trace.name())
     return out
 
 

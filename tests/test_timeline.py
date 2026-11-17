@@ -86,6 +86,14 @@ def test_legend_tick_heights_match_what_the_painter_draws():
                 f"{label!r} is drawn SHORT (colour {token}) but its legend claims 'tall'")
 
 
+def test_a_commit_whose_row_delay_the_decode_rejected_is_a_commit_with_no_ssp():
+    rejected = dict(_COMMIT, row_delay_error=True)
+    assert tl._kind_label(rejected) == "Commit"
+    assert _kind_color(rejected) == _kind_color(dict(_COMMIT, commit_confirmed=False))
+    assert tick_rank(rejected) < tick_rank(_COMMIT)
+    assert tl._kind_label(_COMMIT) == "Commit + SSP"
+
+
 def test_sspa_and_commit_ssp_are_admittedly_indistinguishable():
     """They share colour AND rank, so the ribbon cannot separate them; the legend must not
     pretend otherwise. If SSPA is ever given its own colour/shape, update the legend text

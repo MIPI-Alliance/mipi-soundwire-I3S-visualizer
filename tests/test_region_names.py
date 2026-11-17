@@ -25,6 +25,18 @@ def test_a_region_name_is_kept_in_the_source_and_survives_a_reopen():
     assert again.region_names == {} and "region_names" not in again.source
 
 
+def test_a_saved_region_name_that_is_not_text_is_dropped_and_reported():
+    from swi3s_studio import import_notes
+    source = dict(Session.from_demo(300, phy=2).source)
+    source["region_names"] = {"0": None, "1": 3, "2": "Boot"}
+    with import_notes.collect() as notes:
+        s = Session.from_source(source)
+    assert s.region_names == {2: "Boot"}
+    assert s.source["region_names"] == {"2": "Boot"}
+    text = [n.message for n in notes if "region_names" in n.message]
+    assert len(text) == 1 and "'0'" in text[0] and "'1'" in text[0]
+
+
 @pytest.fixture
 def win():
     QApplication.instance() or QApplication([])
@@ -84,6 +96,29 @@ def test_rename_names_the_band_and_keeps_the_zoom(win, monkeypatch):
     monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("", True)))
     win._region_band_menu(ribbon, 1, QPoint(0, 0))
     assert win._session.region_names == {} and "name" not in ribbon._segments[1]
+
+
+def _statistics_text(win) -> str:
+    """The text of the Statistics rows the window would show for the active Link."""
+    m = win._meas_view
+    if win._link_state().meas_rows is None:
+        win._refresh_measurements()
+    return "\n".join(m.item(r, c).text() for r in range(m.rowCount()) for c in (0, 1)
+                     if m.item(r, c))
+
+
+def test_rename_names_the_region_in_statistics_and_the_timing_selector(win, monkeypatch):
+    sel = win._eye_view._region
+    assert sel.count() > 1
+    win._refresh_measurements()
+    assert "Playback" not in _statistics_text(win)
+    keep = sel.currentIndex()
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("Playback", True)))
+    win.rename_region(1)
+    assert "Playback" in _statistics_text(win)
+    texts = [sel.itemText(k) for k in range(sel.count())]
+    assert sum("Playback" in t for t in texts) == 1, texts
+    assert sel.currentIndex() == keep
 
 
 def test_a_re_decode_keeps_the_name(win):

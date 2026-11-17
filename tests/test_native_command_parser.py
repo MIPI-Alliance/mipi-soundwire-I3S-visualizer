@@ -19,6 +19,9 @@ phase's responses with their protocol spacers, and idle 0x155 spacers after.
 - Each device's Ping status and Commit response token is read 2 CDS bits per hub level
   later than the device before it; a hub depth above max_hub_depth (session.MAX_HUB_DEPTH)
   reads as max_hub_depth.
+- decode_symbols frames as the parser does: a K.28.7 bit pattern inside a Manager Packet
+  does not re-frame the symbols, with or without hub depths, and the idle symbols between
+  phases show with a hub depth set.
 """
 import swi3score
 from test_native_reference_vectors import _crc16
@@ -125,6 +128,18 @@ def test_symbol_framing_reads_only_the_depths_of_the_bus_devices():
         assert symbols(ignored) == blind, ignored
 
 
+def test_the_idle_symbols_between_phases_show_with_a_hub_depth_set():
+    depths = [1] * 12
+    commit = _commit([0] * 12, depths=depths, mask=0xFFF)
+    cds = _idle(4) + commit + _idle(6) + commit + _idle(6) + commit + _idle(4)
+    src = swi3score.MemorySampleSource(_bus(4, {0: cds}), 98_304_000, 4)
+    raws = [s["raw"] for s in swi3score.decode_symbols(src, 4, hub_depths=depths)]
+    commas = [i for i, r in enumerate(raws) if r == COMMA]
+    assert len(commas) == 3, commas
+    for c in commas[1:]:
+        assert raws[c - 6:c] == [SPACER] * 6, raws[c - 8:c]
+
+
 def test_commit_responses_follow_the_hub_depths():
     depths = [1] * 12
     stream = _commit([COMMIT_NOT_READY] + [UNDRIVEN] * 11, depths=depths) + _idle()
@@ -186,6 +201,26 @@ def _write(mask=0x001, packet=_WRITE_PACKET, *, corrupt=None):
     if corrupt is not None:
         syms[corrupt] = swi3score.encode_codeword(0x5A)
     return _symbol_bits(syms)
+
+
+def test_a_comma_pattern_inside_a_manager_packet_does_not_reframe_the_symbols():
+    """decode_symbols with no hub depth holds the decode's framing through a Manager
+    Packet: data bytes 0x60, 0x07 carry the K.28.7 pattern across their boundary, and the
+    symbols read the packet's codewords, as Decoder.commands() reads them."""
+    packet = [0x00, 0x00, 0x00, 0x20, 0x90, 0x60, 0x07]      # WriteA32 0x2090 <- 0x60, 0x07
+    pair = (swi3score.encode_codeword(0x60) << 10) | swi3score.encode_codeword(0x07)
+    assert any((pair >> s) & 0x3FF in (COMMA, 0x307) for s in range(1, 10)), "test premise"
+    write = _header(WRITE, 0x001, packet) + [SPACER, _tok(0)]
+    cds = _idle(4) + _ping() + _idle(2) + _symbol_bits(write) + _idle(2) + _ping() + _idle(4)
+    levels = _bus(4, {0: cds})
+    [w] = _decode([_symbol_bits(write)])
+    assert (w["crc_valid"], w["data"]) == (True, bytes([0x60, 0x07]))
+    for depths in ([], [0] * 12):
+        src = swi3score.MemorySampleSource(levels, 98_304_000, 4)
+        raws = [s["raw"] for s in swi3score.decode_symbols(src, 4, hub_depths=depths)]
+        commas = [i for i, r in enumerate(raws) if r == COMMA]
+        assert len(commas) == 3, (depths, commas)            # the Ping, the Write, the Ping
+        assert raws[commas[1]:commas[1] + len(write)] == write, depths
 
 
 def _delivery(data, corrupt):

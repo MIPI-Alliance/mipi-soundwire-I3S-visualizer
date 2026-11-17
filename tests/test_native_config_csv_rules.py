@@ -17,7 +17,7 @@
 * The scalar CDS_DriveType row is broadcast to every source when no per-source row is
   present, like the Python readers. A negative scalar CDS_TailWidth_REG or CDS_DriveType is
   ignored (the sources keep their defaults) and reported once, in BusConfig's words.
-* A CDS_GuardEnabledPerSource or CDS_GuardPolarityPerSource cell other than 0 or 1 is
+* A CDS_GuardEnable_REG_PerSource or CDS_GuardPolarity_REG_PerSource cell other than 0 or 1 is
   reported, and reads as 1.
 * An EnableCh_REG that does not fit its 16 bits is reported on every enabled port, also
   when its low 16 bits enable no channel, and not on a disabled one.
@@ -257,10 +257,10 @@ def test_a_repeated_row_rate_takes_its_last_row_a_blank_one_included(tmp_path):
 
 
 def test_a_cds_guard_cell_other_than_0_or_1_is_reported_and_read_as_1(tmp_path):
-    for key in ("CDS_GuardEnabledPerSource", "CDS_GuardPolarityPerSource"):
+    for key in ("CDS_GuardEnable_REG_PerSource", "CDS_GuardPolarity_REG_PerSource"):
         for value in ("5", "-1", "2"):
             rows = _rows()
-            _set(rows, "CDS_GuardEnabledPerSource", 2, "1")
+            _set(rows, "CDS_GuardEnable_REG_PerSource", 2, "1")
             _set(rows, key, 2, value)
             path = _write(tmp_path / "guard.csv", rows)
             assert _mentions(swi3score.csv_warnings(path),
@@ -268,12 +268,12 @@ def test_a_cds_guard_cell_other_than_0_or_1_is_reported_and_read_as_1(tmp_path):
                              f"Device 0 = {value}; a value other than 0 reads as 1."), \
                 (key, value)
             one = _rows()
-            _set(one, "CDS_GuardEnabledPerSource", 2, "1")
+            _set(one, "CDS_GuardEnable_REG_PerSource", 2, "1")
             _set(one, key, 2, "1")
             assert swi3score.registers_from_csv(path) == \
                 swi3score.registers_from_csv(_write(tmp_path / "guard1.csv", one)), (key, value)
     rows = _rows()
-    _set(rows, "CDS_GuardEnabledPerSource", 2, "1")
+    _set(rows, "CDS_GuardEnable_REG_PerSource", 2, "1")
     assert not _mentions(swi3score.csv_warnings(_write(tmp_path / "guard_ok.csv", rows)),
                          "CDS_Guard")
 
@@ -298,11 +298,11 @@ def test_an_enable_ch_that_wraps_to_no_channel_is_reported(tmp_path):
 
 def test_the_scalar_drive_type_is_broadcast_like_the_per_source_row(tmp_path):
     scalar = _rows()
-    scalar = [r for r in scalar if r and r[0] != "CDS_DriveTypePerSource"]
+    scalar = [r for r in scalar if r and r[0] != "CDS_DriveType_REG_PerSource"]
     scalar.append(["CDS_DriveType", "0"])
     per_source = _rows()
     for i in range(1, 14):
-        _set(per_source, "CDS_DriveTypePerSource", i, "0")
+        _set(per_source, "CDS_DriveType_REG_PerSource", i, "0")
     a = swi3score.registers_from_csv(_write(tmp_path / "scalar.csv", scalar))
     b = swi3score.registers_from_csv(_write(tmp_path / "per.csv", per_source))
     assert a == b
@@ -310,16 +310,16 @@ def test_the_scalar_drive_type_is_broadcast_like_the_per_source_row(tmp_path):
 
 
 def test_a_blank_scalar_drive_type_keeps_the_default(tmp_path):
-    blank = [r for r in _rows() if r and r[0] != "CDS_DriveTypePerSource"]
+    blank = [r for r in _rows() if r and r[0] != "CDS_DriveType_REG_PerSource"]
     blank.append(["CDS_DriveType", ""])
-    default = [r for r in _rows() if r and r[0] != "CDS_DriveTypePerSource"]
+    default = [r for r in _rows() if r and r[0] != "CDS_DriveType_REG_PerSource"]
     assert swi3score.registers_from_csv(_write(tmp_path / "blank.csv", blank)) == \
         swi3score.registers_from_csv(_write(tmp_path / "none.csv", default))
 
 
 @pytest.mark.parametrize("key, per_source", [
-    ("CDS_TailWidth_REG", "CDS_TailWidthPerSource"),
-    ("CDS_DriveType", "CDS_DriveTypePerSource")])
+    ("CDS_TailWidth_REG", "CDS_TailWidth_REG_PerSource"),
+    ("CDS_DriveType", "CDS_DriveType_REG_PerSource")])
 def test_a_negative_legacy_scalar_cds_row_is_ignored_and_reported_once(tmp_path, key,
                                                                          per_source):
     """The scalar row is not applied (the registers equal the file without it) and the
@@ -542,9 +542,9 @@ def test_a_long_cell_or_key_is_quoted_cut_to_60_characters(tmp_path):
 # Description and the visualizer-only rows.
 _READ_ROWS = (
     "NumColumns_REG", "SkippingDenominator_REG", "PHY3Enabled", "S1TailWidth_REG",
-    "EnforceS1Handover", "CDS_BitWidth_REG", "RowRate", "CDS_GuardEnabledPerSource",
-    "CDS_GuardPolarityPerSource", "CDS_TailWidthPerSource", "CDS_DriveTypePerSource",
-    "CDS_EndDriveEarlyPerSource", "Enabled", "DeviceNumber_REG", "PortDirection_REG",
+    "EnforceS1Handover", "CDS_BitWidth_REG", "RowRate", "CDS_GuardEnable_REG_PerSource",
+    "CDS_GuardPolarity_REG_PerSource", "CDS_TailWidth_REG_PerSource", "CDS_DriveType_REG_PerSource",
+    "CDS_EndDriveEarly_REG_PerSource", "Enabled", "DeviceNumber_REG", "PortDirection_REG",
     "EnableCh_REG", "SampleSize_REG", "SampleGrouping_REG", "ChannelGrouping_REG",
     "Spacing_REG", "Interval_REG", "Offset_REG", "HorizontalStart_REG",
     "HorizontalCount_REG", "BitWidth_REG", "TailWidth_REG", "SkippingNumerator_REG",
@@ -579,10 +579,10 @@ def test_a_file_cut_at_a_row_boundary_names_every_missing_row(tmp_path):
 
 def test_a_legacy_cds_scalar_stands_in_for_its_per_source_row(tmp_path):
     for per_source, legacy, value in (
-            ("CDS_GuardEnabledPerSource", "CDS_GuardEnabled_REG", "False"),
-            ("CDS_GuardPolarityPerSource", "CDS_GuardPolarity_REG", "False"),
-            ("CDS_TailWidthPerSource", "CDS_TailWidth_REG", "0"),
-            ("CDS_DriveTypePerSource", "CDS_DriveType", "1")):
+            ("CDS_GuardEnable_REG_PerSource", "CDS_GuardEnabled_REG", "False"),
+            ("CDS_GuardPolarity_REG_PerSource", "CDS_GuardPolarity_REG", "False"),
+            ("CDS_TailWidth_REG_PerSource", "CDS_TailWidth_REG", "0"),
+            ("CDS_DriveType_REG_PerSource", "CDS_DriveType", "1")):
         rows = [r for r in _rows() if r and r[0] != per_source] + [[legacy, value]]
         assert not _mentions(swi3score.csv_warnings(_write(tmp_path / "legacy.csv", rows)),
                              "missing"), per_source
@@ -643,7 +643,7 @@ def _python_notes(rows):
 def test_a_warning_listing_more_than_three_items_reads_as_the_python_importers(tmp_path):
     """Both engines list three items and count the rest, so one file gives one warning per
     field: five ports over Interval_REG's width and thirteen sources with a bad
-    CDS_DriveTypePerSource cell, each word for word."""
+    CDS_DriveType_REG_PerSource cell, each word for word."""
     rows = _rows()
     for i in range(1, 5):
         _set(rows, "Enabled", i + 1, "True")
@@ -651,14 +651,14 @@ def test_a_warning_listing_more_than_three_items_reads_as_the_python_importers(t
     for i in range(1, 6):
         _set(rows, "Interval_REG", i, "99999")
     for i in range(1, 14):
-        _set(rows, "CDS_DriveTypePerSource", i, "2")
+        _set(rows, "CDS_DriveType_REG_PerSource", i, "2")
     native = swi3score.csv_warnings(_write(tmp_path / "many.csv", rows))
     python = _python_notes(rows)
-    for needle in ("Interval_REG does not fit", "CDS_DriveTypePerSource"):
+    for needle in ("Interval_REG does not fit", "CDS_DriveType_REG_PerSource"):
         n, p = _mentions(native, needle), _mentions(python, needle)
         assert n and n == p, (needle, n, p)
     assert " and 2 more;" in _mentions(native, "Interval_REG does not fit")[0]
-    assert " and 10 more" in _mentions(native, "CDS_DriveTypePerSource")[0]
+    assert " and 10 more" in _mentions(native, "CDS_DriveType_REG_PerSource")[0]
 
 
 def test_a_cell_or_key_that_is_not_utf8_is_echoed_with_replacement_characters(tmp_path):
@@ -751,13 +751,13 @@ def test_a_row_rate_warning_reads_as_busconfigs(tmp_path, cell):
 def test_a_one_bit_field_that_does_not_fit_names_its_low_bit(tmp_path):
     """A 1-bit CDS field over its width is reported as carrying its low bit."""
     rows = _rows()
-    _set(rows, "CDS_DriveTypePerSource", 2, "2")
-    _set(rows, "CDS_EndDriveEarlyPerSource", 1, "3")
+    _set(rows, "CDS_DriveType_REG_PerSource", 2, "2")
+    _set(rows, "CDS_EndDriveEarly_REG_PerSource", 1, "3")
     warnings = swi3score.csv_warnings(_write(tmp_path / "bit.csv", rows))
     assert warnings == [
-        "CDS_DriveTypePerSource does not fit its 1-bit register field (0..1) for Device 0 = 2; "
+        "CDS_DriveType_REG_PerSource does not fit its 1-bit register field (0..1) for Device 0 = 2; "
         "the expected registers carry its low bit.",
-        "CDS_EndDriveEarlyPerSource does not fit its 1-bit register field (0..1) for "
+        "CDS_EndDriveEarly_REG_PerSource does not fit its 1-bit register field (0..1) for "
         "Manager = 3; the expected registers carry its low bit."]
 
 

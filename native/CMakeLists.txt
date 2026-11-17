@@ -59,6 +59,7 @@ pybind11_add_module(swi3score
     swi3score/bindings.cpp
     swi3score/Decoder.cpp
     swi3score/Demo.cpp
+    swi3score/VcdReader.cpp
     ${CORE_SRC}/C8b10bDecoder.cpp
     ${CORE_SRC}/CCommandTransportParser.cpp
     ${CORE_SRC}/CRegisterModel.cpp

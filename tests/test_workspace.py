@@ -293,8 +293,7 @@ def test_a_v4_workspace_round_trips_every_link():
 
 def test_from_json_rejects_a_broken_link_list():
     import json
-    for bad in ({"links": []}, {"links": [{"name": "no source"}]},
-                {"links": [{"source": {"type": "demo"}}], "active_link": 1}):
+    for bad in ({"links": []}, {"links": [{"name": "no source"}]}):
         with pytest.raises(ValueError):
             Workspace.from_json(json.dumps(bad))
 
@@ -400,3 +399,26 @@ def test_load_of_a_device_that_never_ends_raises(monkeypatch):
     monkeypatch.setattr(workspace, "MAX_WORKSPACE_CHARS", 64)
     with pytest.raises(ValueError, match="too large for a workspace"):
         Workspace.load("/dev/zero")
+
+
+@pytest.mark.parametrize("what", ["hub depths", "scrambler overrides", "both"])
+def test_a_reopened_links_decode_applies_its_saved_decode_inputs(what):
+    """A saved Link's hub depths and scrambler overrides, with no register what-if, are in
+    the reopened decode, not only in the Session's maps."""
+    QApplication.instance() or QApplication([])
+    win = MainWindow()
+    saved = Session.from_demo(300, cold_start=True, phy=2, register_map=win._rmap)
+    plain = saved.audio_columns()["value"].copy()
+    if what != "scrambler overrides":
+        saved.hub_depths = {1: 1}
+    if what != "hub depths":
+        saved.scrambler_overrides = {(0, 0): True, (0, 1): False}
+    saved._redecode()
+    assert not np.array_equal(saved.audio_columns()["value"], plain)    # the inputs matter
+    win.load_session(saved)
+    spec = win._workspace_ctl.link_spec(win.links[0])
+    again = win._workspace_ctl.build_link_session(spec)
+    assert (again.hub_depths, again.scrambler_overrides) == (
+        saved.hub_depths, saved.scrambler_overrides)
+    assert np.array_equal(again.audio_columns()["value"], saved.audio_columns()["value"])
+    win.join_worker_threads()

@@ -663,17 +663,17 @@ def test_no_worker_respawns_after_join_worker_threads():
     paths (_run_pending_load and _start_tx_persist_worker) honour _closing.
     """
     w = MainWindow()
-    w._load_pending = (lambda **kw: w._session, None)
-    w._tx_persist_pending = (w._session, 0, object())
     w.join_worker_threads()
-    assert w._load_pending is None and w._tx_persist_pending is None, \
-        "join left pending work queued"
+    assert w._load_pending is None, "join left pending work queued"
+    # A request that lands in the queue after the join: (factory, after, kind, key, on_fail).
+    w._load_pending = [(lambda **kw: w._session, None, "open", None, None)]
     w._run_pending_load()
+    assert w._load_pending is None, "a request queued after the join was kept"
     assert getattr(w, "_load_thread", None) is None, \
         "a load thread was spawned after join_worker_threads()"
     w._start_tx_persist_worker(w._session, 0, object())
-    assert getattr(w, "_tx_persist_thread", None) is None, \
-        "a TX-persist thread was spawned after join_worker_threads()"
+    assert not w._tx_persist_job.busy, \
+        "a TX-persist scan was started after join_worker_threads()"
 
 
 def test_locate_subcapture_refuses_a_second_search_while_one_runs(monkeypatch):
@@ -931,3 +931,22 @@ def test_an_owned_one_shot_never_runs_on_a_destroyed_owner(monkeypatch):
         for _ in range(5):
             QApplication.processEvents()
         assert ran == ["alive"], (patch_out_context, ran)
+
+
+def test_widget_code_schedules_no_unowned_one_shot():
+    """Under swi3s_studio/ui every one-shot timer has an owner: `timers.after(ms, owner, fn)`
+    or `QTimer.singleShot(ms, owner, fn)`, never the two-argument `QTimer.singleShot(ms, fn)`,
+    which can call a widget deleted before it fires."""
+    import ast
+    import pathlib
+    ui = pathlib.Path(__file__).resolve().parents[1] / "swi3s_studio" / "ui"
+    unowned = []
+    for path in sorted(ui.rglob("*.py")):
+        if path.name == "timers.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "singleShot"
+                    and len(node.args) + len(node.keywords) < 3):
+                unowned.append(f"{path.relative_to(ui.parent.parent)}:{node.lineno}")
+    assert not unowned, f"one-shot timers with no owner (use timers.after): {unowned}"

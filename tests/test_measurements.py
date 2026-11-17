@@ -12,9 +12,9 @@ def test_measurements():
     d = dict((r[0], r[1]) for r in rows)     # rows may be (m, v) or (m, v, kind)
     # The demo reconfigures (safe-lock-2 -> 8 -> 16 columns), so rates are listed PER
     # REGION (the single whole-capture "Columns" row only appears for a fixed geometry).
-    assert d["Region 0"] == "2col"
-    assert d["Region 1"] == "8col"
-    assert d["Region 2"] == "16col"
+    assert d["Region 1"] == "2-col"
+    assert d["Region 2"] == "8-col"
+    assert d["Region 3"] == "16-col"
     # Command count lives under the Commands section (the "Commands" key is the section
     # header, value "").
     assert d["Count"] == str(len(sess.commands))
@@ -38,15 +38,20 @@ def test_measurements():
 
 def test_sections_ordered_link_regions_commands_dataports():
     """The Statistics rows are grouped into collapsible sections in a fixed order:
-    Link Control, Regions, Commands, Data Ports (each a 'header'-kind row)."""
+    Link Control, Regions, Commands, Devices, Data Ports (each a 'header'-kind row)."""
     sess = Session.from_demo(300, cold_start=True)      # cold start => Link Control present
     rows = capture_measurements(sess)
     headers = [m for (m, *rest) in rows if len(rest) > 1 and rest[1] == "header"]
-    assert headers == ["Link Control", "Regions", "Commands", "Data Ports"], headers
+    assert headers == ["Link Control", "Regions", "Commands", "Devices", "Data Ports"], headers
     # Link Control carries the decoded sequence + the §5.2.3 timing (with PASS/FAIL).
     d = dict((r[0], r[1]) for r in rows)
     assert "Cold Start" in d.get("Sequence", "")
     assert any(len(r) > 2 and r[2] in ("pass", "fail") for r in rows)
+    # The module docstring states the same order.
+    import swi3s_studio.analysis.measurements as m
+    line = next(ln for ln in m.__doc__.splitlines() if "→" in ln)
+    stated = [part.strip() for part in line.split("→")]
+    assert [t for t in stated if t in headers] == headers and set(headers) <= set(stated)
 
 
 def test_per_config_rates_when_bus_reconfigures():
@@ -62,16 +67,16 @@ def test_per_config_rates_when_bus_reconfigures():
     rows = capture_measurements(sess)
     labels = [m for (m, *_rest) in rows]
     # Both regions are listed, and the single whole-capture "Columns" row is gone.
-    assert labels.count("Region 0") == 1 and labels.count("Region 1") == 1
+    assert labels.count("Region 1") == 1 and labels.count("Region 2") == 1
     assert "Columns" not in labels and "Clock" not in labels
-    # Region 0 (2col) is the slower clock; region 1 (16col) faster — from ui_ns.
+    # Region 1 (2-col) is the slower clock; region 2 (16-col) faster — from ui_ns.
     def val_after(anchor, key):
         i = labels.index(anchor)
         return next(v for m, v in ((r[0], r[1]) for r in rows[i:]) if m == key)
-    assert val_after("Region 0", "Region 0") == "2col"
-    assert val_after("Region 1", "Region 1") == "16col"
-    c0 = float(val_after("Region 0", "  clock").split()[0])
-    c1 = float(val_after("Region 1", "  clock").split()[0])
+    assert val_after("Region 1", "Region 1") == "2-col"
+    assert val_after("Region 2", "Region 2") == "16-col"
+    c0 = float(val_after("Region 1", "  clock").split()[0])
+    c1 = float(val_after("Region 2", "  clock").split()[0])
     assert c1 > c0 and abs(c0 - 3.072) < 0.01 and abs(c1 - 12.288) < 0.01
 
 
@@ -194,6 +199,43 @@ def test_folding_keeps_an_orphan_delivery():
     assert len(_fold_deferred_reads(seq)) == 2
 
 
+def _deferred_setup(dev=3):
+    return {"command": "ReadA32", "phase": "ReadSetup", "device_mask": 1 << dev,
+            "peripheral_response": 5, "has_manager_packet": True, "crc_valid": True,
+            "address": 0x40}
+
+
+def _read_data(dev=3, **kw):
+    c = {"command": "ReadData", "phase": "ReadData", "device_mask": 1 << dev,
+         "has_manager_packet": False}
+    c.update(kw)
+    return c
+
+
+def test_a_dataless_read_data_does_not_consume_the_deferred_setup():
+    """READ_FAILED / no-answer ReadData between a deferred setup and its delivery stays a
+    record of its own (so its error counts) and the delivery still folds into the setup."""
+    from swi3s_studio.analysis.measurements import _fold_deferred_reads
+    failed = _read_data(has_read_data=False, peripheral_response=4)
+    delivery = _read_data(has_read_data=True, read_data=b"\x01\x02", read_data_crc_valid=True)
+    out = _fold_deferred_reads([_deferred_setup(), failed, delivery])
+    assert [c["command"] for c in out] == ["ReadA32", "ReadData"]
+    assert out[1] is failed
+    assert out[0]["read_data"] == b"\x01\x02" and out[0]["has_read_data"]
+
+
+def test_a_deferred_read_with_a_bad_reply_crc_counts_as_a_reply_crc_failure():
+    from swi3s_studio.analysis.measurements import _fold_deferred_reads
+    bad = _read_data(has_read_data=True, read_data=b"\x01", read_data_crc_valid=False)
+    (merged,) = _fold_deferred_reads([_deferred_setup(), bad])
+    assert merged["has_read_data"] and merged["read_data_crc_valid"] is False
+    sess = Session.from_demo(300)
+    sess.commands = list(sess.commands) + [_deferred_setup(dev=6), _read_data(
+        dev=6, has_read_data=True, read_data=b"\x01", read_data_crc_valid=False)]
+    d6 = _device_fold(capture_measurements(sess), "Device 6")
+    assert d6["ReadA32"] == "1" and d6["reply CRC failures"] == "1" and d6["bytes read"] == "1"
+
+
 def test_link_control_lists_every_bring_up():
     from types import SimpleNamespace
 
@@ -290,6 +332,10 @@ class _Store:
     def native_sample_bits(self, dev, dp, ch):
         return self._streams[(dev, dp)][2]
 
+    def native_size_range(self, dev, dp, ch):
+        entry = self._streams[(dev, dp)]
+        return entry[3] if len(entry) > 3 else None
+
 
 def _data_port_rows_for(commands, streams, sample_rate_hz=1_000_000):
     from types import SimpleNamespace
@@ -308,7 +354,8 @@ def test_data_port_bandwidth_is_rate_times_channels_times_bits():
 
 def test_the_ssp_interval_needs_two_sync_points_and_is_averaged_per_device():
     def ssp(sample, mask):
-        return {"has_sync_point": True, "start_sample": sample, "device_mask": mask}
+        return {"has_sync_point": True, "start_sample": sample, "device_mask": mask,
+                "crc_valid": True}
     streams = {(0, 0): (1, 48_000, 16)}
     one = _data_port_rows_for([ssp(100, 1)], streams)
     assert not any("SSP interval" in r[0] for r in one)
@@ -316,6 +363,52 @@ def test_the_ssp_interval_needs_two_sync_points_and_is_averaged_per_device():
     assert ("Dev0 DP0 avg SSP interval", "200.00 µs") in two
     three = _data_port_rows_for([ssp(100, 1), ssp(300, 1), ssp(700, 1)], streams)
     assert ("Dev0 DP0 avg SSP interval", "300.00 µs") in three
+
+
+def test_a_port_whose_sample_size_changes_shows_its_size_range_and_no_bandwidth():
+    rows = dict(_data_port_rows_for([], {(0, 0): (1, 3_072_000, 16, (1, 16))}))
+    assert rows["Dev0 DP0 sample size"] == "1 to 16 bits (changes between runs)"
+    assert rows["Dev0 DP0 bandwidth"] == "not measured (the sample size changes between runs)"
+
+
+def test_a_mixed_size_store_records_its_channel_size_range():
+    import numpy as np
+
+    from swi3s_studio.store.audio_store import AudioStore
+    pdm, pcm = 59 * 400, 50
+    n = pdm + pcm
+    sizes = np.r_[np.ones(pdm), np.full(pcm, 16)].astype(np.int32)
+    cols = {"device": np.zeros(n, np.int32), "dp": np.zeros(n, np.int32),
+            "channel": np.zeros(n, np.int32), "sample_size": sizes,
+            "value": np.r_[np.arange(pdm) & 1, np.arange(pcm)].astype(np.uint32),
+            "index": np.arange(n, dtype=np.uint64),
+            "start_sample": (np.arange(n) * 8).astype(np.uint64)}
+    store = AudioStore.from_audio_columns(cols, {(0, 0): 2_822_400.0},
+                                          capture_rate_hz=8 * 2_822_400.0)
+    assert store.native_size_range(0, 0, 0) == (1, 16)
+    one = AudioStore.from_audio_columns({**cols, "sample_size": np.full(n, 16, np.int32)},
+                                        {(0, 0): 2_822_400.0},
+                                        capture_rate_hz=8 * 2_822_400.0)
+    assert one.native_size_range(0, 0, 0) is None
+
+
+def test_an_ssp_the_bus_does_not_act_on_is_not_counted():
+    """A CRC-failed SSPA, a cancelled or Row_Delay-rejected SSCR are not SSPs: the SSP
+    count, the device's SSPs and the SSP interval leave them out."""
+    from swi3s_studio.analysis.measurements import _ssp_samples_by_device, ssp_takes_effect
+
+    def ssp(sample, **kw):
+        return {"has_sync_point": True, "start_sample": sample, "device_mask": 1,
+                "crc_valid": True, **kw}
+    good = [ssp(100), ssp(300, is_commit=True, commit_confirmed=True)]
+    bad = [ssp(200, crc_valid=False), ssp(250, is_commit=True, commit_confirmed=False),
+           ssp(280, is_commit=True, commit_confirmed=True, row_delay_error=True),
+           ssp(290, row_delay_error=True)]
+    assert [ssp_takes_effect(c) for c in good + bad] == [True, True] + [False] * 4
+    assert _ssp_samples_by_device(good + bad) == {0: [100, 300]}
+    streams = {(0, 0): (1, 48_000, 16)}
+    rows = _data_port_rows_for(sorted(good + bad, key=lambda c: c["start_sample"]), streams)
+    assert ("Dev0 DP0 avg SSP interval", "200.00 µs") in rows
 
 
 def _read_cmd(address, value, row):
@@ -433,3 +526,54 @@ def test_the_per_device_write_breakdown_covers_device_11_and_counts_errors_per_d
         ("    Device 3", "2", "detail"), ("      bytes written", "4", "detail"),
         ("      errors", "1", "fail"),
         ("    Device 11", "2", "detail"), ("      bytes written", "3", "detail")]
+
+
+def _device_fold(rows, title):
+    """{metric: value} of the Devices section's `title` fold."""
+    i = next(k for k, r in enumerate(rows) if r[0] == "Devices")
+    j = next(k for k in range(i + 1, len(rows)) if rows[k][0] == title)
+    out = {"": rows[j][1]}
+    for r in rows[j + 1:]:
+        if len(r) < 3 or r[2] not in ("detail", "fail", "pass"):
+            break
+        out[r[0].strip()] = r[1]
+    return out
+
+
+def test_the_devices_section_sums_each_devices_commands_errors_and_replies():
+    """One fold per device on the bus: its Ping responses and alerts, the commands that
+    addressed it (a multicast write on each device), bytes, errors by kind (a Ping's error
+    on the device that answered it), reply-CRC failures, SSPs and data ports, its name in
+    the heading."""
+    sess = Session.from_demo(300)
+    sess.device_names = {0: "Codec"}
+    ping = {"command": "Ping", "phase": "Ping", "device_mask": 0xFFF, "crc_valid": True,
+            "has_manager_packet": True, "ping_status": [-1] * 12}
+    ping["ping_status"][3], ping["ping_status"][5] = 12, 8          # PROTOCOL_ERROR, ALERT
+    multicast = {"command": "WriteA32", "phase": "Write", "device_mask": (1 << 3) | (1 << 5),
+                 "data": b"\x01\x02", "crc_valid": True, "has_manager_packet": True,
+                 "address": 0x40}
+    bad_reply = {"command": "ReadA32", "phase": "ReadSetup", "device_mask": 1 << 5,
+                 "has_read_data": True, "read_data": b"\x00", "read_data_crc_valid": False,
+                 "crc_valid": True, "has_manager_packet": True, "address": 0x40}
+    sess.commands = list(sess.commands) + [ping, multicast, bad_reply]
+    rows = capture_measurements(sess)
+    d0 = _device_fold(rows, "Device 0")
+    assert d0[""].endswith(" commands · Codec") and d0["data ports"] == "DP0, DP1, DP2, DP3"
+    assert int(d0["SSPs"]) >= 1 and "errors" not in d0
+    d3 = _device_fold(rows, "Device 3")
+    assert d3[""] == "1 commands" and d3["WriteA32"] == "1" and d3["bytes written"] == "2"
+    assert d3["Ping responses"] == "1" and d3["errors"] == "2"
+    assert d3["Ping PROTOCOL_ERROR"] == "1" and d3["device mask: expected 1, got 2"] == "1"
+    d5 = _device_fold(rows, "Device 5")
+    assert d5["alerts"] == "1" and d5["WriteA32"] == "1" and d5["ReadA32"] == "1"
+    assert d5["reply CRC failures"] == "1" and d5["bytes read"] == "1"
+    assert "Device 7" not in [r[0] for r in rows]       # never on the bus, never addressed
+
+
+
+def test_a_manager_data_port_is_tagged_manager_as_the_devices_section_names_it():
+    rows = _data_port_rows_for([], {(-1, 2): (1, 48_000, 16), (3, 1): (1, 48_000, 16)})
+    labels = [r[0] for r in rows]
+    assert "Manager DP2 channels" in labels and "Dev3 DP1 channels" in labels
+    assert not any(label.startswith("Dev-1") for label in labels)

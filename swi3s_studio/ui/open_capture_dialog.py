@@ -181,7 +181,10 @@ class _LinkRow:
                 return None
             if not hi or not lo:
                 raise ValueError("give both hi and lo, or neither")
-            h, low = float(hi), float(lo)
+            try:
+                h, low = float(hi), float(lo)
+            except ValueError:
+                raise ValueError("give each as a number of volts") from None
             if not (math.isfinite(h) and math.isfinite(low)):
                 raise ValueError("give each as a number of volts")
             if h <= low:
@@ -335,10 +338,18 @@ class OpenCaptureDialog(QDialog):
         return f"{ch.label}  ({_edges(ch.edges, ch.approx)} edges)"
 
     def _cost(self, t0: Optional[float] = None, t1: Optional[float] = None) -> Optional[int]:
-        """The predicted peak for what is asked: one Link's cost (the probe's) times the
-        Links on the page, each loaded and kept."""
-        one = self.probe.cost_bytes(t0, t1)
-        return None if one is None else one * max(1, len(self._rows))
+        """The predicted peak for what is asked: the sum over the Links on the page of each
+        one's cost for its own clock and data channels (the probe's), each loaded and
+        kept."""
+        total = 0
+        pairs: List[Optional[Tuple[object, ...]]] = [
+            tuple(self.probe.channels[i].value for i in row.pair()) for row in self._rows]
+        for pair in pairs or [None]:
+            one = self.probe.cost_bytes(t0, t1, channels=pair)
+            if one is None:
+                return None
+            total += one
+        return total
 
     def _show_costs(self) -> None:
         """The Source line's load-all cost and the window's, for the Links on the page."""
@@ -379,7 +390,7 @@ class OpenCaptureDialog(QDialog):
         if self._fits(cost) or not span or not self.probe.windowed:
             self._all.setChecked(True)
             return
-        longest = self.probe.largest_window_s(self._budget // max(1, len(self._rows)))
+        longest = self.probe.largest_window_s(self._budget, cost=self._cost)
         if longest is None or longest <= 0.0:
             frac = max(0.0, min(1.0, self._budget / float(cost))) if cost else 1.0
             longest = span * frac

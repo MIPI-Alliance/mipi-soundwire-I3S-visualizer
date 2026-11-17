@@ -24,22 +24,21 @@ $AppArgs = @($args)
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
-# Pick a Python the launcher supports: 3.11-3.13. 3.14 on Windows x64 works through the
-# manual setup in README.md. Prefer the newest supported via the py launcher, then fall
-# back to `python` if it's in range.
+# Pick a Python the launcher supports: 3.11-3.15. Prefer the newest supported via the py
+# launcher, then fall back to `python` if it's in range.
 $pyCmd = $null
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    foreach ($v in "3.13", "3.12", "3.11") {
+    foreach ($v in "3.15", "3.14", "3.13", "3.12", "3.11") {
         & cmd /c "py -$v -c ""import sys"" 2>nul"
         if ($LASTEXITCODE -eq 0) { $pyCmd = "py -$v"; break }
     }
 }
 if (-not $pyCmd) {
-    & cmd /c "python -c ""import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)"" 2>nul"
+    & cmd /c "python -c ""import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,15) else 1)"" 2>nul"
     if ($LASTEXITCODE -eq 0) { $pyCmd = "python" }
 }
 if (-not $pyCmd) {
-    Write-Error ("Need Python 3.11-3.13 (the versions this launcher supports). " +
+    Write-Error ("Need Python 3.11-3.15 (the versions this launcher supports). " +
                  "Install one, e.g.:  winget install --id Python.Python.3.12 -e")
     exit 1
 }
@@ -122,6 +121,23 @@ if (-not (Test-Path $stamp) -or (Get-Item "requirements.txt").LastWriteTime -gt 
     $installedDeps = $true
 }
 
+# Under PYTHONPATH=. a decode core at the checkout root is imported instead of the venv's.
+# One that cannot load stops the launch here: rebuilding the venv's copy cannot help while it
+# is there, and the probe below would rebuild on every run. `cmd /c ... 2>&1` keeps the
+# traceback off PowerShell's error stream, as in the probe below.
+$rootCore = & $python -c "import sysconfig; print('swi3score' + sysconfig.get_config_var('EXT_SUFFIX'))"
+if (Test-Path $rootCore) {
+    $rootErr = & cmd /c """$python"" -c ""import swi3score"" 2>&1"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Cannot load .\$rootCore from the checkout root:"
+        Write-Host "  $(@($rootErr)[-1])"
+        Write-Host "The app imports it before the venv's build, so it cannot start while it is there."
+        Write-Host "Delete it:  Remove-Item .\$rootCore"
+        Write-Error "The decode core at the checkout root cannot be loaded."
+        exit 1
+    }
+}
+
 # Build the native decode core when it's missing, out of date, or -Rebuild was asked
 # for. "Out of date" = a native\ source is newer than the last build (a stamp in the
 # venv), so a git pull or edit that touches the C++ auto-rebuilds - the user never has
@@ -178,16 +194,17 @@ swi3score build failed. Not stamping - will retry next run.
 # Announce the launch; the first launch after an install is slow while the OS scans the
 # newly written Qt libraries. -o implies headless, so no window message is printed.
 # Every spelling argparse accepts: -o FILE, -oFILE, -o=FILE and an unambiguous prefix of
-# --output or --help, with or without =VALUE (the same set as run.sh).
-$headless = @($AppArgs | Where-Object { $_ -eq "-o" -or $_ -like "-o*" -or $_ -eq "--output" -or
-                                        $_ -like "-o=*" -or $_ -like "--output=*" -or
-                                        $_ -eq "--o" -or $_ -eq "--ou" -or $_ -eq "--out" -or
-                                        $_ -eq "--outp" -or $_ -eq "--outpu" -or
-                                        $_ -like "--o=*" -or $_ -like "--ou=*" -or
-                                        $_ -like "--out=*" -or $_ -like "--outp=*" -or
-                                        $_ -like "--outpu=*" -or
-                                        $_ -eq "-h" -or $_ -eq "--h" -or $_ -eq "--he" -or
-                                        $_ -eq "--hel" -or $_ -eq "--help" }).Count -gt 0
+# --output or --help, with or without =VALUE (the same set as run.sh). The comparisons are
+# case-sensitive (-ceq, -clike), as run.sh's case patterns are: -O and -H are not flags.
+$headless = @($AppArgs | Where-Object { $_ -ceq "-o" -or $_ -clike "-o*" -or $_ -ceq "--output" -or
+                                        $_ -clike "-o=*" -or $_ -clike "--output=*" -or
+                                        $_ -ceq "--o" -or $_ -ceq "--ou" -or $_ -ceq "--out" -or
+                                        $_ -ceq "--outp" -or $_ -ceq "--outpu" -or
+                                        $_ -clike "--o=*" -or $_ -clike "--ou=*" -or
+                                        $_ -clike "--out=*" -or $_ -clike "--outp=*" -or
+                                        $_ -clike "--outpu=*" -or
+                                        $_ -ceq "-h" -or $_ -ceq "--h" -or $_ -ceq "--he" -or
+                                        $_ -ceq "--hel" -or $_ -ceq "--help" }).Count -gt 0
 if ($headless) {
     # nothing to announce: no window opens
 } elseif ($installedDeps) {

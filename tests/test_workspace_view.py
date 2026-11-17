@@ -299,6 +299,42 @@ def test_the_all_links_commands_filter_and_lanes_come_back(two, tmp_path, monkey
             for v in again._audio_lanes.views[:2]] == want_lanes
 
 
+
+def test_the_commands_filter_reopens_against_the_commands_panes_link(two, tmp_path,
+                                                                      monkeypatch):
+    """A Commands filter on a kind only the Commands pane's Link has (SSPA, on Link 2) comes
+    back with a workspace while another Link is active."""
+    two.set_group_link("commands", 1)
+    snap = two._filter_snapshot()
+    snap.update(kinds={"SSPA"})
+    two._restore_filters(snap)
+    two._activate_link(0)
+    assert "SSPA" not in two.links[0].view.kinds
+    want = two._filter_snapshot()
+    again, _path = _save_and_reopen(two, tmp_path, monkeypatch)
+    assert again._pane_link["commands"] == 1 and again.links.active_index == 0
+    assert again._filter_snapshot() == want
+    assert [a.data() for a in again._kind_menu._actions] == two.links[1].view.kinds
+
+
+def test_every_audio_channel_unchecked_reopens_unchecked(two, tmp_path, monkeypatch):
+    """A workspace saved with no Audio channel checked reopens with none checked; one whose
+    Audio entry has no channel list keeps every channel shown."""
+    audio = two._audio_view
+    assert audio._checks
+    for cb in audio._checks.values():
+        cb.setChecked(False)
+    QApplication.processEvents()
+    assert audio.channel_selection() == set()
+    again, _path = _save_and_reopen(two, tmp_path, monkeypatch)
+    assert again._audio_view._checks and again._audio_view.channel_selection() == set()
+
+    def drop_channels(doc):
+        for link in doc["links"]:
+            link["view"]["audio"].pop("channels", None)
+    again, _path = _save_and_reopen(two, tmp_path, monkeypatch, edit=drop_channels)
+    assert again._audio_view.channel_selection() == set(again._audio_view._checks)
+
 # ------------------------------------------------- Commands column widths, by column name
 def _cmd_col(win, name):
     from PySide6.QtCore import Qt

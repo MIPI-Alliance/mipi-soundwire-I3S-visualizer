@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import re
 from itertools import islice
 from typing import Dict, List, Optional
 
@@ -58,6 +59,43 @@ def _non_binary(vals: List[float]) -> bool:
     return any(v != 0.0 and v != 1.0 for v in vals)
 
 
+_LINE_END = re.compile(rb"\r\n?|\n")
+_LINE_READ = 1 << 13
+
+
+def _lines(f, limit: int, where: Optional[List[int]] = None):
+    """The lines of binary file `f` from its position, each with its line end: LF, CRLF
+    or a lone CR, as the text-mode reader splits them. A line longer than `limit` bytes is
+    yielded `limit` bytes at a time. With `where`, the byte offset just past each line
+    yielded is appended to it; the position of `f` is never the end of the line, since `f` is
+    read in `_LINE_READ` chunks."""
+    buf = b""
+    at = f.tell()                   # byte offset of buf[0]
+    scan = 0                        # buf before this holds no line end
+    eof = False
+    while True:
+        m = _LINE_END.search(buf, scan)
+        if m is not None and m.start() < limit and (m.end() < len(buf) or eof
+                                                     or m.group() == b"\r\n"
+                                                     or m.group() == b"\n"):
+            end = m.end()
+        elif len(buf) >= limit or (eof and buf):
+            end = min(len(buf), limit)
+        elif eof:
+            return
+        else:
+            more = f.read(_LINE_READ)
+            eof = not more
+            scan = max(0, len(buf) - 1)
+            buf += more
+            continue
+        line, buf, scan = buf[:end], buf[end:], 0
+        at += end
+        if where is not None:
+            where.append(at)
+        yield line
+
+
 def _row_of_line(line: bytes) -> List[str]:
     """The cells of one CSV line read as bytes; a leading byte-order mark is not part of
     the first cell."""
@@ -90,12 +128,14 @@ def is_analog_csv(path: str, max_scan_rows: int = 10_000) -> bool:
     lines = 0
     try:
         with open(path, "rb") as f:
+            ends: List[int] = []
+            head = _lines(f, MAX_LINE_CHARS + 2, ends)
             while seen < max_scan_rows and lines < max_scan_rows + _PREAMBLE_MAX_ROWS:
-                line = f.readline(MAX_LINE_CHARS + 1)
+                line = next(head, b"")
                 if not line:
                     return False                 # whole file read: only 0/1 seen
                 lines += 1
-                if len(line) > MAX_LINE_CHARS:
+                if len(line.rstrip(b"\r\n")) > MAX_LINE_CHARS:
                     return False                 # not a scope export's row
                 row = _row_of_line(line)
                 vals = _numeric_channels(row)
@@ -104,17 +144,18 @@ def is_analog_csv(path: str, max_scan_rows: int = 10_000) -> bool:
                 seen += 1
                 if _non_binary(vals):
                     return True                  # a non-binary value -> analog
-            start = f.tell()
+            start = ends[-1] if ends else 0
             size = os.fstat(f.fileno()).st_size
             step = (size - start) / float(max_scan_rows)
             for k in range(max_scan_rows):
                 f.seek(int(start + k * step))
+                there = _lines(f, MAX_LINE_CHARS + 2)
                 if k:
-                    f.readline(MAX_LINE_CHARS)  # finish the line the offset fell in
-                line = f.readline(MAX_LINE_CHARS + 1)
+                    next(there, b"")             # finish the line the offset fell in
+                line = next(there, b"")
                 if not line:
                     break
-                if len(line) > MAX_LINE_CHARS:
+                if len(line.rstrip(b"\r\n")) > MAX_LINE_CHARS:
                     continue
                 row = _row_of_line(line)
                 vals = _numeric_channels(row)
@@ -165,16 +206,16 @@ def _split_header(rows, path: str) -> tuple:
     raise _no_header_error(path)
 
 
-def _rows_of(f, path: str):
-    """The CSV rows of binary file `f` from its position, one line at a time, stopping
-    once `_PREAMBLE_MAX_BYTES` have been read. A line the csv module cannot read is no
+def _rows_of(f, path: str, where: Optional[List[int]] = None):
+    """The CSV rows of binary file `f` from its position, one line at a time (`_lines`),
+    stopping once `_PREAMBLE_MAX_BYTES` have been read; with `where`, the byte offset
+    past each row's line is appended to it. A line the csv module cannot read is no
     header row: the no-header error naming `path`."""
     used = 0
-    while used < _PREAMBLE_MAX_BYTES:
-        line = f.readline(_PREAMBLE_MAX_BYTES - used)
-        if not line:
-            return
+    for line in _lines(f, _PREAMBLE_MAX_BYTES, where):
         used += len(line)
+        if used > _PREAMBLE_MAX_BYTES:
+            return
         try:
             yield _row_of_line(line)
         except csv.Error:                    # a cell over the csv field limit
@@ -252,9 +293,11 @@ def scan_header(path: str):
     then one unique name per channel column (`_named_header`). Raises ValueError when
     there is no TIME header within them."""
     with open(path, "rb") as f:
-        pre, row = _split_header(_rows_of(f, path), path)
+        ends: List[int] = []
+        pre, row = _split_header(_rows_of(f, path, ends), path)
         header = _named_header(row)[0]
-        offset = f.tell()
+        offset = ends[-1]
+        f.seek(offset)
         sample = f.read(64 << 10)
     return pre, header, offset, sample
 
@@ -266,9 +309,15 @@ def predict_peak_bytes(path: str) -> int:
     Rows are estimated from the file size and the width of the sampled rows. Every
     column is kept as float64 (8 per column per row); on top of that comes the larger
     of joining a column's batches into one (8 per row, one column at a time) and the
-    analog front end (`analog.front_end_bytes`); and one batch of `_BATCH_ROWS` rows is
+    analog front end (`analog.front_end_bytes`) and sorting rows out of time order
+    (`_SORT_BYTES_PER_ROW`); and one batch of `_BATCH_ROWS` rows is
     live as Python objects while it is parsed."""
     return _predict(path)[1]
+
+
+# Sorting rows out of time order: the argsort's order (8 per row), its workspace, and one
+# column's reordered copy (8 per row) at a time.
+_SORT_BYTES_PER_ROW = 24
 
 
 def _predict(path: str):
@@ -277,16 +326,17 @@ def _predict(path: str):
     rows, row_text = _estimate_rows(path, offset, sample)
     ncols = max(1, len(header))
     batch = _BATCH_ROWS * (_ROW_OBJECT_BYTES + ncols * _CELL_OBJECT_BYTES + row_text)
-    return rows, int(rows * 8 * ncols + max(8 * rows, analog.front_end_bytes(rows)) + batch)
+    return rows, int(rows * 8 * ncols + max(8 * rows, analog.front_end_bytes(rows),
+                                            _SORT_BYTES_PER_ROW * rows) + batch)
 
 
 def _estimate_rows(path: str, offset: int, sample: bytes):
     """``(data rows, mean row text bytes)`` from the file size past `offset` and the
     mean width of the whole rows in `sample`."""
-    lines = [ln for ln in sample.split(b"\n")[:-1] if ln.strip()]
+    lines = [ln for ln in sample.splitlines(keepends=True)[:-1] if ln.strip()]
     if not lines:
         return 0, 0.0
-    mean = sum(len(ln) + 1 for ln in lines) / len(lines)
+    mean = sum(len(ln) for ln in lines) / len(lines)
     size = os.path.getsize(path) - offset
     return int(size / mean) if mean > 0 else 0, mean - 1
 
@@ -411,6 +461,14 @@ def read_analog_csv(path: str, max_bytes: Optional[int] = None) -> Dict[str, obj
         col = parts[c][0] if len(parts[c]) == 1 else np.concatenate(parts[c])
         parts[c] = []
         columns.append(col)
+    # Rows out of time order are sorted here, one column at a time in place, so the front
+    # end finds them ascending (priced by _SORT_BYTES_PER_ROW).
+    unsorted = not analog._ascending(columns[0])
+    if unsorted:
+        order = np.argsort(columns[0], kind="stable")
+        for col in columns:
+            col[:] = col[order]
+        del order
     time = columns[0]
     channels = {header[c]: columns[c] for c in range(1, ncols)}
 
@@ -428,6 +486,8 @@ def read_analog_csv(path: str, max_bytes: Optional[int] = None) -> Dict[str, obj
                                f"{'s' if len(repeated) != 1 else ''} "
                                f"{', '.join(map(repr, repeated))}; every column is kept, "
                                f"the later ones numbered ('{repeated[0]} (2)')")
+    if unsorted:
+        import_notes.warn(src, "the samples are not in time order; they are sorted by time")
     if cut is not None:
         import_notes.warn(src, f"the last data row ({cut[0]:,} after the TIME header) is not "
                                f"all numbers and was dropped (the file may be partly "

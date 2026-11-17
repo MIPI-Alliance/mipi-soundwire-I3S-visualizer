@@ -76,3 +76,68 @@ def test_sweep_reference_single_dp_is_that_dp():
     av._cursor_sample = 0
     ref = av._sweep_reference([(0, 2)], [(0, 2, 0)], 48000)
     assert ref is not None and ref[0] == 0 and ref[1] == 2
+
+
+class _Click:
+    def __init__(self, pos):
+        self._p = pos
+
+    def button(self):
+        from PySide6.QtCore import Qt
+        return Qt.LeftButton
+
+    def scenePos(self):
+        return self._p
+
+    def accept(self):
+        pass
+
+
+def test_a_click_on_the_amplitude_axis_seeks_nowhere_and_one_in_the_data_area_stays_in_the_capture():
+    """Only the data area seeks, and never to a sample before 0 or past the capture."""
+    from PySide6.QtCore import QPointF
+    store = _store()
+    av = AudioView()
+    av.resize(900, 500)
+    av.set_capture_context(48000.0, 1000)
+    av.set_store(store)
+    av.show()
+    _app.processEvents()
+    plot = av._plots[0][0]
+    got = []
+    av.seeked.connect(got.append)
+    box = plot.vb.sceneBoundingRect()
+    mid = box.center().y()
+    av._on_plot_click(_Click(QPointF(box.left() - 8, mid)), plot, 0, 0, 0)     # the axis
+    assert got == []
+    plot.vb.setXRange(-500, 5000, padding=0)
+    _app.processEvents()
+    av._on_plot_click(_Click(QPointF(box.left() + 2, mid)), plot, 0, 0, 0)
+    av._on_plot_click(_Click(QPointF(box.right() - 2, mid)), plot, 0, 0, 0)
+    assert len(got) == 2 and all(0 <= s <= 1000 for s in got)
+
+
+def test_a_click_past_the_capture_in_a_widened_view_seeks_to_its_first_and_last_sample():
+    """All Links lets a lane's view run past its own capture (`set_x_bounds`); a click there
+    seeks to sample 0 or the capture's last sample, not outside it."""
+    from PySide6.QtCore import QPointF
+    store = _store()
+    av = AudioView()
+    av.resize(900, 500)
+    av.set_capture_context(48000.0, 1000)
+    av.set_store(store)
+    av.set_x_bounds((-0.01, 0.1))                 # about -480 .. 4800 samples at 48 kHz
+    av.show()
+    _app.processEvents()
+    plot = av._plots[0][0]
+    plot.vb.setXRange(-400, 4000, padding=0)
+    _app.processEvents()
+    got = []
+    av.seeked.connect(got.append)
+    box = plot.vb.sceneBoundingRect()
+    left, right = QPointF(box.left() + 2, box.center().y()), QPointF(box.right() - 2, box.center().y())
+    assert plot.vb.mapSceneToView(left).x() < 0
+    assert plot.vb.mapSceneToView(right).x() > 1000
+    av._on_plot_click(_Click(left), plot, 0, 0, 0)
+    av._on_plot_click(_Click(right), plot, 0, 0, 0)
+    assert got == [0, 1000]

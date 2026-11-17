@@ -3,7 +3,7 @@
 The panel shows a System SSP interval and each port's sample rate, computed from the config
 it holds. The SSP interval is the LCM of the enabled ports' pattern periods — a skipping
 port's is Interval x SkippingDenominator (Section 4.2.3.1) — as the visualizer's
-Interface.interval_lcm computes it. A port's rate is the one the core reports for the same
+Interface.pattern_lcm computes it over the drawn ports. A port's rate is the one the core reports for the same
 config (Decoder.audio_sample_rates), TX_PRESENT counted in every flow mode that has one.
 
 Every input is synthetic: the demo config with cells edited.
@@ -20,10 +20,12 @@ from swi3s_studio.model.viz_engine import build_bus_model
 pytestmark = pytest.mark.gui
 
 
-def _csv(tmp_path, cells: dict[str, str]) -> str:
+def _csv(tmp_path, cells: dict[str, str], dp1: dict[str, str] | None = None) -> str:
     rows = list(csv.reader(io.StringIO(demo_config().to_csv())))
     for key, value in cells.items():
         next(r for r in rows if r and r[0] == key)[1] = value     # the scalar / DP0 column
+    for key, value in (dp1 or {}).items():
+        next(r for r in rows if r and r[0] == key)[2] = value     # the DP1 column
     path = tmp_path / "cfg.csv"
     path.write_text("\n".join(",".join(r) for r in rows) + "\n", encoding="utf-8")
     return str(path)
@@ -64,9 +66,24 @@ _SRI = {"SubRowInterval_REG": "True", "Interval_REG": "0", "HorizontalStart_REG"
 def test_the_panel_shows_the_core_rate_and_the_model_ssp_interval(panel, tmp_path, cells):
     path = _csv(tmp_path, cells)
     panel.set_config(BusConfig.from_csv(path))
-    _bus, iface, _viz = build_bus_model(path)
-    assert panel._ssp_value.text() == str(iface.interval_lcm)
+    _bus, iface, viz = build_bus_model(path)
+    assert panel._ssp_value.text() == str(iface.pattern_lcm([d.enabled for d in viz.data_ports]))
     assert float(panel._dp_rate[0].text()) == pytest.approx(_core_rate_khz(path), abs=0.05)
+
+
+def test_a_disabled_port_with_channels_is_left_out_of_the_ssp_interval(panel, tmp_path):
+    """DP1 carries a channel at Interval 2 (3 rows) but is not enabled: the panel, the
+    model over the drawn ports and the core give the demo's 8 rows; the LCM over every
+    channel-carrying port (interval_lcm) is 24."""
+    path = _csv(tmp_path, {}, dp1={"Enabled": "False", "EnableCh_REG": "1",
+                                   "Interval_REG": "2"})
+    panel.set_config(BusConfig.from_csv(path))
+    _bus, iface, viz = build_bus_model(path)
+    assert not viz.data_ports[1].enabled and iface.data_ports[1].config._num_channels == 1
+    assert panel._ssp_value.text() == "8"
+    assert iface.pattern_lcm([d.enabled for d in viz.data_ports]) == 8
+    assert swi3score.pattern_period(path, 1 << 20) == 8
+    assert iface.interval_lcm == 24
 
 
 def test_a_skipping_port_lengthens_the_ssp_interval(panel, tmp_path):

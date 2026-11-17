@@ -7,17 +7,9 @@ Exercised from Python through the pybind11 module.
 
 Run:  pytest -q   (after `pip install ./native`)
 """
-import math
-
 import pytest
 import swi3score
-
-
-def _expected_sine(channel: int, index: int, sample_size: int) -> int:
-    amp = (1 << sample_size) * 0.45
-    w = 2.0 * math.pi * (channel + 1) * index / 64.0
-    v = int(round(amp * math.sin(w)))
-    return v & ((1 << (sample_size + 1)) - 1)
+from demo_samples import sine_sample
 
 
 def decode_demo(samples_per_channel: int = 300):
@@ -88,7 +80,7 @@ def test_dscr_disable_drops_port_from_audio_and_samples():
     dp1 = [a["value"] for a in d.audio() if a["dp"] == 1]
     assert len(dp1) == N, f"dp1 kept emitting after the DSCR disable: {len(dp1)} (want {N})"
     assert len(dp0) == 2 * N, f"dp0 should span both phases: {len(dp0)}"
-    assert all(v == _expected_sine(0, i, 15) for i, v in enumerate(dp0)), "dp0 phase broke at the DSCR"
+    assert all(v == sine_sample(0, i, 15) for i, v in enumerate(dp0)), "dp0 phase broke at the DSCR"
 
     # Samples-view cousin: with bit-sample collection on, dp1 must produce NO bit samples
     # after the DSCR row (else the Raw Capture / samples view shows the disabled port too).
@@ -137,9 +129,9 @@ def test_dscr_enabling_a_port_decodes_it_from_its_first_sample():
     def stream(dp):
         return sorted((a for a in d.audio() if a["dp"] == dp), key=lambda a: a["start_sample"])
     dp0, dp1 = stream(0), stream(1)
-    assert [a["value"] for a in dp0] == [_expected_sine(0, i, 15) for i in range(2 * N)]
+    assert [a["value"] for a in dp0] == [sine_sample(0, i, 15) for i in range(2 * N)]
     assert [a["index"] for a in dp1] == list(range(N))
-    assert [a["value"] for a in dp1] == [_expected_sine(2, i, 15) for i in range(N)]
+    assert [a["value"] for a in dp1] == [sine_sample(2, i, 15) for i in range(N)]
     assert dp1[0]["start_sample"] > dp0[N - 1]["end_sample"]
 
     import numpy as np
@@ -181,11 +173,11 @@ def test_immediate_single_ranked_write_reconfigures_decode():
                                        key=lambda a: a["start_sample"])]
     assert len(vals) >= 2 * N - 4
     phase1, phase2 = vals[:N], vals[N + 2:2 * N]     # skip a couple transition samples
-    assert all(v == _expected_sine(0, i, 15) for i, v in enumerate(phase1)), \
+    assert all(v == sine_sample(0, i, 15) for i, v in enumerate(phase1)), \
         "phase 1 should descramble to the sine"
     # After the immediate ScramblerEn=0 write the decode stops descrambling, so the raw
     # (still-scrambled) wire data no longer matches the sine.
-    matched = sum(1 for j, v in enumerate(phase2) if v == _expected_sine(0, N + 2 + j, 15))
+    matched = sum(1 for j, v in enumerate(phase2) if v == sine_sample(0, N + 2 + j, 15))
     assert matched < len(phase2) // 4, \
         f"immediate ScramblerEn=0 write did not reconfigure the decode ({matched} still match)"
 
@@ -240,9 +232,9 @@ def test_dscr_enabling_a_channel_keeps_the_port_phase():
     audio = sorted((a for a in d.audio() if a["dp"] == 0), key=lambda a: a["start_sample"])
     ch0 = [a for a in audio if a["channel"] == 0]
     ch1 = [a for a in audio if a["channel"] == 1]
-    assert [a["value"] for a in ch0] == [_expected_sine(0, i, 15) for i in range(2 * N)]
+    assert [a["value"] for a in ch0] == [sine_sample(0, i, 15) for i in range(2 * N)]
     assert [a["index"] for a in ch1] == list(range(N))
-    assert [a["value"] for a in ch1] == [_expected_sine(1, i, 15) for i in range(N)]
+    assert [a["value"] for a in ch1] == [sine_sample(1, i, 15) for i in range(N)]
     interval = ch0[N + 1]["start_sample"] - ch0[N]["start_sample"]
     assert ch0[N]["start_sample"] < ch1[0]["start_sample"] < ch0[N]["start_sample"] + interval
 
@@ -335,7 +327,7 @@ def test_audio_roundtrips_to_sine():
         assert ss == 15, f"dp{dp} expected 16-bit PCM, got {ss + 1}-bit"
         assert len(vals) >= 16
         for i, v in enumerate(vals):
-            assert v == _expected_sine(dp * 2, i, ss), f"dp{dp}[{i}]: {v} != {_expected_sine(dp*2, i, ss)}"
+            assert v == sine_sample(dp * 2, i, ss), f"dp{dp}[{i}]: {v} != {sine_sample(dp*2, i, ss)}"
     # PDM ports are 1-bit density streams (values in {0, 1}).
     for dp in (2, 3):
         vals = {a["value"] for a in audio if a["device"] == 0 and a["dp"] == dp}
@@ -535,3 +527,22 @@ def test_native_abi_guard():
             assert state in msg and "rebuild" in msg, e.value
     finally:
         swi3score.score_abi = saved
+
+
+def test_the_demo_pcm_is_dithered_within_one_lsb():
+    """The demo's PCM sine carries TPDF dither: each sample is within 1 LSB of the plainly
+    rounded sine, about a third of them differ from it, and the error averages out."""
+    import math
+
+    from demo_samples import signed
+    dec = decode_demo(2000)
+    dp = [a for a in dec.audio() if a["dp"] == 1]
+    assert len(dp) > 1000
+    vals = [signed(a["value"], 15) for a in sorted(dp, key=lambda a: a["start_sample"])]
+    tone = 2                                     # DP1's channel carries sineSample(2, …)
+    plain = [round((1 << 15) * 0.45 * math.sin(2.0 * math.pi * (tone + 1) * i / 64.0))
+             for i in range(len(vals))]
+    diff = [v - p for v, p in zip(vals, plain)]
+    assert set(diff) <= {-1, 0, 1}
+    assert 0.2 < sum(1 for e in diff if e) / len(diff) < 0.5, diff[:64]
+    assert abs(sum(diff) / len(diff)) < 0.05

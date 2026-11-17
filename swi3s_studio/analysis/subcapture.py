@@ -218,15 +218,18 @@ def _collapse(offsets: list, scores: list, m: int) -> list:
 
 
 def _search_one(main_seq, sub_seq, score_threshold: float, max_matches: int):
-    """Find `sub_seq`'s symbol sequence in `main_seq`. Returns (matches, best): matches
-    is the above-threshold, overlap-collapsed, capped list of
+    """Find `sub_seq`'s symbol sequence in `main_seq`. Returns (matches, best, cuts):
+    matches is the above-threshold, overlap-collapsed, capped list of
     ``{"start_sample","end_sample","score"}``; best describes the single closest
-    candidate (score/location) regardless of threshold, for the no-match bookmark."""
+    candidate (score/location) regardless of threshold, for the no-match bookmark; cuts is
+    ``{"total": occurrences before the max_matches cut, "hits_capped": the raw hit list was
+    limited to _MAX_HITS}``, so ``total`` is a lower bound when ``hits_capped``."""
     _NONE = {"score": 0.0, "start_sample": None, "end_sample": None}
+    cuts = {"total": 0, "hits_capped": False}
     m = len(sub_seq)
     n = len(main_seq)
     if m == 0 or n < m:
-        return [], dict(_NONE)
+        return [], dict(_NONE), cuts
 
     def _rec(off, score):
         end = min(off + m, n - 1)
@@ -238,12 +241,12 @@ def _search_one(main_seq, sub_seq, score_threshold: float, max_matches: int):
     if use_convolve:
         counts = _match_counts(main_seq.syms, sub_seq.syms)
         if counts.size == 0:
-            return [], dict(_NONE)
+            return [], dict(_NONE), cuts
         peak = int(np.argmax(counts))
         best = _rec(peak, counts[peak] / m)              # global peak (for the no-match bookmark)
         hit = np.flatnonzero(counts >= score_threshold * m)
         if hit.size == 0:
-            return [], best
+            return [], best, cuts
         # Cap the hit list like the exact-search path (_MAX_HITS): a low-entropy sub
         # (idle/constant run) clears the threshold at a huge number of overlapping offsets,
         # and _collapse over millions of Python-list hits is an O(hits) stall. flatnonzero
@@ -251,6 +254,7 @@ def _search_one(main_seq, sub_seq, score_threshold: float, max_matches: int):
         # occurrences; beyond the cap the sub simply isn't distinctive.
         if hit.size > _MAX_HITS:
             hit = hit[:_MAX_HITS]
+            cuts["hits_capped"] = True
         collapsed = _collapse(list(hit), [counts[i] / m for i in hit], m)
         matches = [_rec(o, sc) for o, sc in collapsed]
     else:
@@ -258,26 +262,28 @@ def _search_one(main_seq, sub_seq, score_threshold: float, max_matches: int):
         # Capped: a low-entropy sub (idle/constant run) matches at millions of offsets,
         # which without a cap is an O(N * hits) hang. Adjacent hits from a constant run
         # then collapse to one occurrence; beyond the cap the sub simply isn't distinctive.
-        hits, _trunc = _exact_offsets(main_seq.syms, sub_seq.syms, limit=_MAX_HITS)
+        hits, cuts["hits_capped"] = _exact_offsets(main_seq.syms, sub_seq.syms,
+                                                   limit=_MAX_HITS)
         if not hits:
             frac, bi = _best_partial(main_seq.syms, sub_seq.syms)
-            return [], (_rec(bi, frac) if bi is not None else dict(_NONE))
+            return [], (_rec(bi, frac) if bi is not None else dict(_NONE)), cuts
         collapsed = _collapse(hits, [1.0] * len(hits), m)   # merge overlapping edge-index hits
         matches = [_rec(o, sc) for o, sc in collapsed]      # exact => score 1.0
         best = matches[0]
 
     matches.sort(key=lambda d: d["start_sample"])
+    cuts["total"] = len(matches)
     if len(matches) > max_matches:
         matches.sort(key=lambda d: d["score"], reverse=True)
         matches = matches[:max_matches]
         matches.sort(key=lambda d: d["start_sample"])
-    return matches, best
+    return matches, best, cuts
 
 
 def locate_subcapture(main, sub, *, max_matches: int = 64,
                       score_threshold: float = DEFAULT_SCORE_THRESHOLD,
                       progress=None,
-                      diagnostics: dict = None) -> list:
+                      diagnostics: dict | None = None) -> list:
     """Find every place `sub`'s logical (data, clock) pattern occurs in `main`.
 
     Both are :class:`~swi3s_studio.ingest.capture.Capture` and may have different
@@ -297,7 +303,10 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
     If `diagnostics` (a dict) is given, it is populated with ``best_score`` (the closest
     candidate's matching fraction, even below threshold), ``best_start_sample`` /
     ``best_end_sample`` (that candidate's span, for a no-match bookmark; may be None), and
-    ``orientation`` ('as-loaded', 'clock/data swapped', or None).
+    ``orientation`` ('as-loaded', 'clock/data swapped', or None). It also reports the two
+    cuts: ``total_matches`` (occurrences found before the `max_matches` cut),
+    ``hits_capped`` (the raw hit list was limited, so ``total_matches`` is a lower bound)
+    and ``truncated`` (either cut dropped matches from the returned list).
 
     Returns up to `max_matches` dicts sorted by ``start_sample`` ascending:
         {"start_sample": int, "end_sample": int, "score": float}
@@ -317,19 +326,20 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
     sub_seq = _timed("reduce sub", capture_to_symbols, sub)
 
     _p(0.65, "Searching (as-loaded)…")
-    matches, best = _timed("search as-loaded", _search_one,
-                           main_seq, sub_seq, score_threshold, max_matches)
+    matches, best, cuts = _timed("search as-loaded", _search_one,
+                                 main_seq, sub_seq, score_threshold, max_matches)
     orientation = "as-loaded" if matches else None
 
     if not matches:
         _p(0.80, "Searching (clock/data swapped)…")
         swapped_seq = _timed("reduce sub (swapped)", capture_to_symbols, _swapped(sub))
-        swap_matches, swap_best = _timed("search swapped", _search_one, main_seq,
-                                         swapped_seq, score_threshold, max_matches)
+        swap_matches, swap_best, swap_cuts = _timed(
+            "search swapped", _search_one, main_seq, swapped_seq, score_threshold,
+            max_matches)
         if swap_best["score"] > best["score"]:
             best = swap_best
         if swap_matches:
-            matches = swap_matches
+            matches, cuts = swap_matches, swap_cuts
             orientation = "clock/data swapped"
 
     _p(1.0, "Done")
@@ -338,4 +348,7 @@ def locate_subcapture(main, sub, *, max_matches: int = 64,
         diagnostics["best_start_sample"] = best["start_sample"]
         diagnostics["best_end_sample"] = best["end_sample"]
         diagnostics["orientation"] = orientation
+        diagnostics["total_matches"] = cuts["total"]
+        diagnostics["hits_capped"] = cuts["hits_capped"]
+        diagnostics["truncated"] = cuts["hits_capped"] or cuts["total"] > len(matches)
     return matches

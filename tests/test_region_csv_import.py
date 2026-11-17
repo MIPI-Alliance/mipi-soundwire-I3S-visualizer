@@ -174,7 +174,7 @@ def test_the_window_imports_into_the_cursor_region_only(monkeypatch, tmp_path):
     calls, prompts = [], []
     monkeypatch.setattr(QMessageBox, "warning",
                         staticmethod(lambda *a, **k: prompts.append(a) or QMessageBox.No))
-    monkeypatch.setattr(win, "_load_async", lambda fn, **k: calls.append(fn()))
+    monkeypatch.setattr(win, "_load_async", lambda fn, **k: calls.append(fn(s)))
     monkeypatch.setattr(s, "apply_config_csv",
                         lambda p: pytest.fail("the whole-capture import ran"))
     win._apply_config_csv_path(csv)
@@ -195,7 +195,7 @@ def test_decode_menu_removes_the_cursor_regions_csv(monkeypatch, tmp_path):
     csv2 = _csv_of_region(s, 2, tmp_path / "r2.csv")
     s.apply_config_csv_at(_mid(s, 1), csv1)
     s.apply_config_csv_at(_mid(s, 2), csv2)
-    monkeypatch.setattr(win, "_load_async", lambda fn, **k: fn())
+    monkeypatch.setattr(win, "_load_async", lambda fn, **k: fn(s))
     act = win._remove_region_csv_action
     win.cursor.set_sample(_mid(s, 0))
     win._update_remove_region_csv()
@@ -206,3 +206,34 @@ def test_decode_menu_removes_the_cursor_regions_csv(monkeypatch, tmp_path):
     act.trigger()
     assert s.csv_sections == {2: csv2}
     assert "config_csv@1" not in s.source and s.source["config_csv@2"] == csv2
+
+
+def test_remove_region_csv_waits_for_a_region_csv_after_every_capture_update(tmp_path):
+    """Updating the capture items (a mode or Link switch, a capture opened) leaves Remove …
+    from This Region on its own rule: off until the cursor's region has an imported CSV."""
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.load_session(_fresh())
+    s = win._session
+    act = win._remove_region_csv_action
+    win.cursor.set_sample(_mid(s, 1))
+    win._update_capture_actions()
+    assert not act.isEnabled()
+    s.apply_config_csv_at(_mid(s, 1), _csv_of_region(s, 1, tmp_path / "r1.csv"))
+    win._update_capture_actions()
+    assert act.isEnabled() and "r1.csv" in act.text()
+
+
+def test_remove_region_csv_names_a_file_with_an_ampersand_literally(tmp_path):
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.load_session(_fresh())
+    s = win._session
+    s.apply_config_csv_at(_mid(s, 1), _csv_of_region(s, 1, tmp_path / "R&D.csv"))
+    win.cursor.set_sample(_mid(s, 1))
+    win._update_remove_region_csv()
+    assert win._remove_region_csv_action.text() == "&Remove R&&D.csv from This Region"

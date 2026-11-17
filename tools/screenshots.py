@@ -4,10 +4,11 @@
     python3 tools/screenshots.py                       # render + check, into build/screenshots
     python3 tools/screenshots.py --out DIR             # somewhere else
 
-For each mode (Bus Visualizer, Timing Calculator, Bus Analyzer with the PHY1 demo) it renders
-four states: started in light, started in dark, and each switched live to the other theme. Each
-image is written to OUT/<mode>_<state>.png, with OUT/contact_sheet.png holding all of them and
-OUT/report.txt listing every finding. tools/gate.py runs it as the "screenshots" check; the
+For each mode (Bus Visualizer, Timing Calculator, Bus Analyzer with the PHY1 demo) and each
+dialog in DIALOGS (Filter Expression, Open Capture, Export Capture, Export Audio,
+Preferences, Devices) it renders four states: started in light, started in dark,
+and each switched live to the other theme. Each image is written to OUT/<name>_<state>.png, with
+OUT/contact_sheet.png holding all of them and OUT/report.txt listing every finding. tools/gate.py runs it as the "screenshots" check; the
 contact sheets from the three platforms are the gate's visual review.
 
 Four checks, and a finding in any fails the run (exit 1):
@@ -42,6 +43,52 @@ CLIP_SLACK = 2            # px of a widget's text it may not show before that is
 _TILE = 16
 _SIZE = (1400, 900)
 _STATES = ("start-light", "start-dark", "switched-to-dark", "switched-to-light")
+
+
+def _open_capture_dialog(win):
+    from swi3s_studio.ingest.probe import CaptureProbe, ProbedChannel
+    from swi3s_studio.ui.open_capture_dialog import OpenCaptureDialog
+    chans = [ProbedChannel(i, f"Ch {i}", (9000, 900, 8800, 700)[i], approx=True)
+             for i in range(4)]
+    probe = CaptureProbe("sal", ["/x/run.sal"], "Logic 2 project (.sal)", chans,
+                         sample_rate_hz=500e6, duration_s=2.0, windowed=True, analog=False,
+                         two_file=False, cost_all_bytes=10**9)
+    return OpenCaptureDialog(probe, ["Link 1"], win, budget_bytes=4 * 10**9)
+
+
+def _export_capture_dialog(win):
+    from swi3s_studio.ui.capture_export_dialog import CaptureExportDialog
+    return CaptureExportDialog(win._session, parent=win)
+
+
+def _export_audio_dialog(win):
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    return AudioExportDialog(win._audio_store, parent=win, names=win._session.dp_names)
+
+
+def _preferences_dialog(win):
+    from swi3s_studio.ui import line_style
+    from swi3s_studio.ui.preferences_dialog import PreferencesDialog
+    return PreferencesDialog(line_style.preferences(), win)
+
+
+def _devices_dialog(win):
+    from swi3s_studio.ui.devices_dialog import DevicesDialog
+    sess = win._session
+    return DevicesDialog(win, range(12), sess.device_names, sess.hub_depths,
+                         dict(sess.peripheral_maps))
+
+
+# The dialogs rendered beside the modes: the name each image is saved under, and the function
+# that builds the dialog, unshown and never run modally, on the window with the demo open.
+DIALOGS = (
+    ("Filter_Expression", lambda win: win._filter_expression_box()),
+    ("Open_Capture", _open_capture_dialog),
+    ("Export_Capture", _export_capture_dialog),
+    ("Export_Audio", _export_audio_dialog),
+    ("Preferences", _preferences_dialog),
+    ("Devices", _devices_dialog),
+)
 
 
 def _sheet_order(path: str) -> tuple[str, int]:
@@ -151,10 +198,27 @@ def clipped_by(wdg, text: str) -> int:
     return 0
 
 
-def _crop(rgb, window, wdg, inset: int = 0):
+def _label_left(wdg) -> int:
+    """The px a check box or radio button's label starts from the widget's left edge: the
+    indicator and its spacing lie to the left of it. 0 for any other widget."""
+    from PySide6.QtWidgets import QCheckBox, QRadioButton, QStyle, QStyleOptionButton
+    if isinstance(wdg, QCheckBox):
+        element = QStyle.SubElement.SE_CheckBoxContents
+    elif isinstance(wdg, QRadioButton):
+        element = QStyle.SubElement.SE_RadioButtonContents
+    else:
+        return 0
+    opt = QStyleOptionButton()
+    opt.initFrom(wdg)
+    opt.text = wdg.text()
+    return max(0, wdg.style().subElementRect(element, opt, wdg).left())
+
+
+def _crop(rgb, window, wdg, inset: int = 0, left: int = 0):
     """The pixels of `wdg`'s visible part in the window's image, `inset` px in from each
-    side (to leave out a frame)."""
-    r = wdg.visibleRegion().boundingRect().adjusted(inset, inset, -inset, -inset)
+    side (to leave out a frame) and `left` px further in from the left (to leave out an
+    indicator)."""
+    r = wdg.visibleRegion().boundingRect().adjusted(inset + left, inset, -inset, -inset)
     tl = wdg.mapTo(window, r.topLeft())
     scale = rgb.shape[1] / max(1, window.width())
     x0, y0 = int(tl.x() * scale), int(tl.y() * scale)
@@ -222,7 +286,7 @@ def check_window(window, img, mode: str) -> tuple[list[str], str]:
         short = clipped_by(wdg, text)
         if short > CLIP_SLACK:
             found.append(f"CLIPPED by {short} px — {what}")
-        crop = _crop(rgb, window, wdg, inset)
+        crop = _crop(rgb, window, wdg, inset, _label_left(wdg))
         if crop.shape[0] < 4 or crop.shape[1] < 4:
             continue
         c = text_contrast(crop)
@@ -352,12 +416,24 @@ def _render(out: str, settings: str) -> int:
                 verdict = "ok" if not found else f"{len(found)} finding(s)"
                 report.append(f"{name}: {verdict} ({summary})")
                 report.extend(f"    {f}" for f in found)
+            for label, build in DIALOGS:
+                dlg = build(win)
+                dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
+                dlg.show()
+                settle()
+                name = f"{label}_{state}"
+                path, found, summary, tones[name] = render_state(dlg, theme, name, out)
+                dlg.hide()
+                paths.append(path)
+                failed += len(found)
+                verdict = "ok" if not found else f"{len(found)} finding(s)"
+                report.append(f"{name}: {verdict} ({summary})")
+                report.extend(f"    {f}" for f in found)
         win.close()
         win.deleteLater()
         settle()
     # A switch to a theme must leave every widget as a window started in it draws it.
-    for mode in MODES:
-        label = MODE_LABELS[mode].replace(' ', '_')
+    for label in [MODE_LABELS[m].replace(' ', '_') for m in MODES] + [d for d, _ in DIALOGS]:
         for theme in ("light", "dark"):
             name = f"{label}_switched-to-{theme}"
             stale = unthemed(tones[f"{label}_start-{theme}"], tones[name])

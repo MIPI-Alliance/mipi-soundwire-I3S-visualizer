@@ -170,12 +170,16 @@ def test_a_tx_controlled_port_expects_its_txp_bit_in_every_channel_sample():
 def test_a_wide_drq_past_the_row_end_is_reported_only_for_a_drawn_port():
     from swi3s_studio.swviz.models import FlowMode
 
-    def truncations(drawn):
+    def truncations(drawn, device=None):
         iface, viz = _one_port(FlowMode_REG=FlowMode.RX_CONTROLLED, PortDirection_REG=True)
         fcp = iface.flow_control_ports[0].config
         fcp.FCP_HorizontalStart_REG, fcp.FCP_BitWidth_REG = 15, 2
         viz.data_ports[0].enabled = drawn
+        if device is not None:
+            iface.set_dp_device(0, device)
         return _build(iface, viz).warnings.drq_truncation_warnings
 
     assert truncations(True) == [("DP0", 17, 16)]
     assert truncations(False) == []
+    # A port on a device number the build places nowhere draws nothing to truncate.
+    assert truncations(True, device=12) == []

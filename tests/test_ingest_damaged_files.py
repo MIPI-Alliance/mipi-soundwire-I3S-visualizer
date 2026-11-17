@@ -100,28 +100,53 @@ def test_a_damaged_channel_is_refused_as_malformed_once_admitted(sal_with_a_dama
                                 max_bytes=0)
 
 
-# ---- v3: the chain start is searched for in one bounded prefix by every reader -----------
+# ---- v3: every reader searches the bounded prefix, then the rest of the blob -------------
 
 
-def test_every_v3_reader_looks_for_the_chain_start_in_the_same_prefix():
-    edges = np.arange(5, 50_000, 7, dtype=np.uint64)
-    blob = saleae_binary.build_channel_v3(False, edges)
+def _late_chain(meta_bytes, edges, fill=b"\xff"):
+    blob = saleae_binary.build_channel_v3(False, edges, chunk_size=1_000)
     head = 16                                       # magic, version, type
-    pad = b"\xff" * (saleae_binary.V3_CHAIN_START_SCAN + 100)
-    late = blob[:head] + pad + blob[head:]          # chain starts past the prefix
-    for reader in (saleae_binary.parse_channel_v3,
-                   saleae_binary._find_v3_chain_start,
-                   lambda d: saleae_binary.parse_channel_v3_window(d, 0, 1_000)):
-        with pytest.raises(saleae_binary.MalformedSaleaeV3):
-            reader(late)
-    assert saleae_sal._v3_span_streaming(io.BytesIO(late), len(late)) == 0
+    meta = (fill * (meta_bytes // len(fill) + 1))[:meta_bytes]
+    return blob[:head] + meta + blob[head:], head + meta_bytes
 
-    early = blob[:head] + pad[:1_000] + blob[head:]  # chain starts inside it
-    got = saleae_binary.parse_channel_v3(early)
-    assert np.array_equal(got.transition_samples, edges)
-    assert saleae_binary._find_v3_chain_start(early)[0] == head + 1_000
-    assert saleae_sal._v3_span_streaming(io.BytesIO(early), len(early), want_start=True)[1] \
-        == head + 1_000
+
+@pytest.mark.parametrize("meta_bytes", [1_000, 70 * 1024,
+                                        saleae_binary.V3_CHAIN_START_SCAN - 16 - 26,
+                                        saleae_binary.V3_CHAIN_START_SCAN - 16 - 25])
+def test_every_v3_reader_finds_the_chain_start_inside_and_past_the_prefix(meta_bytes,
+                                                                         monkeypatch):
+    """Metadata of 1,000 bytes or 70 KiB ahead of the chain, and a chain starting on either
+    side of the prefix's last candidate offset: every reader finds the same start. A small
+    search step makes the streaming search cross step boundaries."""
+    edges = np.arange(5, 50_000, 7, dtype=np.uint64)
+    data, start = _late_chain(meta_bytes, edges)
+    got = saleae_binary.parse_channel_v3(data)
+    assert np.array_equal(got.transition_samples, edges) and got.initial_state is False
+    assert saleae_binary._find_v3_chain_start(data)[0] == start
+    win = saleae_binary.parse_channel_v3_window(data, 0, 1_000)
+    assert np.array_equal(win.transition_samples, edges[edges < 1_000])
+    for step in (saleae_binary.V3_CANDIDATE_STEP, 4_099):
+        monkeypatch.setattr(saleae_binary, "V3_CANDIDATE_STEP", step)
+        assert saleae_sal._v3_span_streaming(io.BytesIO(data), len(data), want_start=True) \
+            == (saleae_binary._find_v3_chain_start(data)[1], start)
+
+
+def test_a_zero_run_in_70_kib_of_metadata_does_not_hide_the_chain():
+    edges = np.arange(3, 9_000, 5, dtype=np.uint64)
+    data, start = _late_chain(70 * 1024, edges, fill=b"\x00\x00\x00\x00\x00\x00\x00\x00\xff")
+    assert np.array_equal(saleae_binary.parse_channel_v3(data).transition_samples, edges)
+    assert saleae_sal._v3_span_streaming(io.BytesIO(data), len(data), want_start=True)[1] \
+        == saleae_binary._find_v3_chain_start(data)[0] == start
+
+
+def test_no_chain_in_or_past_the_prefix_is_refused_naming_the_bound():
+    data = saleae_binary.build_channel_v3(False, np.arange(5, 500, 7, dtype=np.uint64))
+    broken = data[:16] + b"\xff" * (70 * 1024) + data[16:-1]      # the chain no longer tiles
+    for reader in (saleae_binary.parse_channel_v3, saleae_binary._find_v3_chain_start,
+                   lambda d: saleae_binary.parse_channel_v3_window(d, 0, 1_000)):
+        with pytest.raises(saleae_binary.MalformedSaleaeV3, match="in the first 64 KiB or past"):
+            reader(broken)
+    assert saleae_sal._v3_span_streaming(io.BytesIO(broken), len(broken)) == 0
 
 
 # ---- v0 .bin: a lost tail or a damaged count ----------------------------------------------
@@ -269,7 +294,9 @@ def _v0_sal(tmp_path, clock_times, data_times, clock_begin=-1e-6, data_begin=-1e
     out = str(tmp_path / name)
     with zipfile.ZipFile(out, "w") as z:
         z.writestr("meta.json", json.dumps(
-            {"data": {"legacySettings": {"sampleRate": {"digital": _RATE}}}}))
+            {"data": {"legacySettings": {"sampleRate": {"digital": _RATE}}},
+             "binData": [{"type": "Digital", "file": f"digital-{i}.bin", "deviceChannel": i}
+                         for i in range(2)]}))
         z.writestr("digital-0.bin", paths[0].read_bytes())
         z.writestr("digital-1.bin", paths[1].read_bytes())
     return out

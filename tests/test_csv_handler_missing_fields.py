@@ -1,13 +1,18 @@
-"""CSVHandler.load_csv's missing_fields for the scalar CDS registers.
+"""CSVHandler.load_csv's missing_fields for the CDS rows.
 
 save_csv writes the per-source CDS rows and not the scalar CDS_GuardEnabled_REG,
-CDS_GuardPolarity_REG and CDS_TailWidth_REG, which load_csv derives from those rows. A
-scalar is reported missing only when the per-source row it is derived from is absent too.
+CDS_GuardPolarity_REG, CDS_TailWidth_REG and CDS_DriveType, which load_csv reads in place of
+an absent per-source row. A per-source row is reported missing, by its per-source name as
+BusConfig and the native loader name it, when the file carries neither it nor its scalar.
 """
 import csv
 import os
 
+import pytest
+
 from swi3s_studio.swviz.io.csv_handler import (
+    CDS_DRIVE_TYPE_PER_SOURCE,
+    CDS_EDE_PER_SOURCE,
     CDS_GUARD_ENABLE_PER_SOURCE,
     CDS_GUARD_POLARITY_PER_SOURCE,
     CDS_TAIL_PER_SOURCE,
@@ -16,7 +21,10 @@ from swi3s_studio.swviz.io.csv_handler import (
 from swi3s_studio.swviz.models.interface import Interface
 from swi3s_studio.swviz.viz import VizConfig
 
-_SCALARS = ("CDS_GuardEnabled_REG", "CDS_GuardPolarity_REG", "CDS_TailWidth_REG")
+_SCALARS = ("CDS_GuardEnabled_REG", "CDS_GuardPolarity_REG", "CDS_TailWidth_REG",
+            "CDS_DriveType")
+_PER_SOURCE = (CDS_GUARD_ENABLE_PER_SOURCE, CDS_GUARD_POLARITY_PER_SOURCE, CDS_TAIL_PER_SOURCE,
+               CDS_DRIVE_TYPE_PER_SOURCE, CDS_EDE_PER_SOURCE)
 
 
 def _saved(tmp_path) -> str:
@@ -48,17 +56,23 @@ def test_the_saver_writes_no_scalar_cds_row(tmp_path):
     assert not names & set(_SCALARS)
 
 
-def test_a_scalar_is_missing_when_its_per_source_row_is_absent_too(tmp_path):
-    """Without the per-source rows the scalar is the source of the derived rows, so its
-    absence does default them."""
+def test_every_cds_row_is_missing_when_neither_spelling_is_present(tmp_path):
     stripped = os.path.join(str(tmp_path), "stripped.csv")
-    _without_rows(_saved(tmp_path), stripped,
-                  {CDS_GUARD_ENABLE_PER_SOURCE, CDS_GUARD_POLARITY_PER_SOURCE,
-                   CDS_TAIL_PER_SOURCE})
-    assert _load(stripped).missing_fields == [f"Interface: {n}" for n in _SCALARS]
+    _without_rows(_saved(tmp_path), stripped, set(_PER_SOURCE))
+    assert _load(stripped).missing_fields == [f"Interface: {n}" for n in _PER_SOURCE]
 
 
-def test_only_the_tail_scalar_is_missing_when_only_the_tail_row_is_absent(tmp_path):
+@pytest.mark.parametrize("row", _PER_SOURCE)
+def test_a_per_source_row_dropped_alone_is_missing(tmp_path, row):
     stripped = os.path.join(str(tmp_path), "stripped.csv")
-    _without_rows(_saved(tmp_path), stripped, {CDS_TAIL_PER_SOURCE})
-    assert _load(stripped).missing_fields == ["Interface: CDS_TailWidth_REG"]
+    _without_rows(_saved(tmp_path), stripped, {row})
+    assert _load(stripped).missing_fields == [f"Interface: {row}"]
+
+
+@pytest.mark.parametrize("row, scalar", list(zip(_PER_SOURCE, _SCALARS)))
+def test_a_legacy_scalar_stands_in_for_its_per_source_row(tmp_path, row, scalar):
+    stripped = os.path.join(str(tmp_path), "stripped.csv")
+    _without_rows(_saved(tmp_path), stripped, {row})
+    with open(stripped, "a", encoding="utf8", newline="") as f:
+        csv.writer(f).writerow([scalar, "1"])
+    assert _load(stripped).missing_fields == []

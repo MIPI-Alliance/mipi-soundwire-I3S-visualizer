@@ -109,6 +109,63 @@ def test_digital_csv_import_ceiling():
     assert dt < 12.0, f"digital-CSV import took {dt:.2f}s (ceiling 12s) — perf regression?"
 
 
+
+def test_sal_v3_encode_ceiling():
+    """Write 10M transitions as a Logic-2 version-3 blob — guards the array delta encoder
+    (saleae_binary.encode_v3_deltas; no per-transition Python loop)."""
+    import numpy as np
+
+    from swi3s_studio.ingest import saleae_binary
+    rng = np.random.default_rng(0)
+    s = np.cumsum(rng.integers(1, 400, 10_000_000)).astype(np.uint64)
+    dt = _elapsed(lambda: saleae_binary.build_logic2_channel_v3(
+        False, s, sample_rate_hz=500e6, unix_ms=0, frac_ms=0.0, capture_end=int(s[-1]) + 5))
+    assert dt < 6.0, f"v3 encode took {dt:.2f}s (ceiling 6s) — perf regression?"
+
+def _write_busy_vcd(path, steps: int) -> int:
+    """A VCD of `steps` time steps: a clock change at every one, and a data, an enable, an
+    8-bit bus and a long-named signal changing every 4th, 8th, 8th and 16th. Returns the
+    number of value changes."""
+    changes = 5
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("$timescale 1ns $end\n$var wire 1 ! clk $end\n$var wire 1 % dat $end\n"
+                "$var wire 1 a en $end\n$var wire 8 v bus $end\n"
+                "$var wire 1 longer_ident x $end\n$enddefinitions $end\n"
+                "#0\n$dumpvars\n0!\n0%\n0a\nb0 v\n0longer_ident\n$end\n")
+        block = 200_000
+        for base in range(1, steps + 1, block):
+            out = []
+            for t in range(base, min(base + block, steps + 1)):
+                out.append(f"#{t}\n{t & 1}!\n")
+                if t & 3 == 0:
+                    out.append(f"{(t >> 2) & 1}%\n")
+                if t & 7 == 0:
+                    out.append(f"{(t >> 3) & 1}a\nb{t & 255:b} v\n")
+                if t & 15 == 0:
+                    out.append(f"{(t >> 4) & 1}longer_ident\n")
+            f.write("".join(out))
+    return changes + steps + steps // 4 + 2 * (steps // 8) + steps // 16
+
+
+def test_vcd_import_ceiling(tmp_path):
+    """Count the transitions of a 10M-change VCD and load its clock and data — guards the
+    native value-change reader (swi3score.VcdScanner; no per-token Python loop, and no
+    NumPy pass per read step)."""
+    from swi3s_studio.ingest import vcd
+    assert vcd._NATIVE is swi3score.VcdScanner
+    path = str(tmp_path / "busy.vcd")
+    changes = _write_busy_vcd(path, 6_400_000)
+    assert changes >= 10_000_000
+
+    def run():
+        counts, cut, _t = vcd.transition_counts_until(path)
+        cap = vcd.load_capture(path, "!", "%", max_bytes=0)
+        assert not cut and counts["!"] == cap.clock_edges.size == 6_400_000
+
+    dt = _elapsed(run)
+    assert dt < 1.5, f"VCD import took {dt:.2f}s (ceiling 1.5s) — perf regression?"
+
+
 # --- Whole-capture-scan cliff detectors -------------------------------------
 # A per-cursor-move / per-toggle op must not scan the WHOLE capture (O(#UIs)) instead of
 # O(active/#edges).
@@ -134,9 +191,11 @@ def _big_capture():
 def test_link_control_decode_ceiling():
     """Cold/Warm-start detection must read only a bounded PREFIX of the edges — a bring-up
     is a few dozen slow pulses at the very start. The cost is independent of the capture's
-    length."""
+    length. The capture is built before the timer starts: the ceiling times the decode
+    alone."""
     from swi3s_studio.analysis.link_control import decode_link_control
-    dt = _elapsed(lambda: decode_link_control(_big_capture()))
+    cap = _big_capture()
+    dt = _elapsed(lambda: decode_link_control(cap))
     assert dt < 0.5, (f"decode_link_control took {dt:.2f}s (ceiling 0.5s) — "
                       "decode_link_control must not scan every edge")
 
@@ -696,15 +755,18 @@ def test_the_widest_line_weight_paints_within_budget(monkeypatch):
 
 
 def _time_recompute(tv, app, repeats: int = 5) -> tuple:
-    """(median, worst) seconds of `repeats` recomputes of `tv`, each asserted to have computed
-    margins: a recompute refused (a page still loading, an input the model cannot evaluate)
-    returns at once and would time nothing."""
+    """(median, worst) seconds of `repeats` recomputes of `tv`, each from its start to its
+    result applied (the corner search runs on the page's worker; `flush_recompute` waits for
+    it), and each asserted to have computed margins: a recompute refused (a page still
+    loading, an input the model cannot evaluate) returns at once and would time nothing."""
     times = []
     assert not tv._loading, "the Timing page is still loading, so a recompute does nothing"
+    tv.flush_recompute()                # the page's first recompute is not timed
     for _ in range(repeats):
         tv._rendered = None
         t0 = time.perf_counter()
         tv._recompute()
+        tv.flush_recompute()
         app.processEvents()
         times.append(time.perf_counter() - t0)
         assert tv._compute_error == "" and tv._rendered is not None, (
@@ -719,9 +781,9 @@ def test_timing_recompute_budget():
     The corner search evaluates each perturbed row once for all inequalities together
     (`find_worst_corner_rows_all`), searching alpha and delta jointly with the slews and tau,
     and each evaluation runs every leg at each device-supply assignment. The ceilings are
-    3.0 s (median) and 4.5 s (worst) on a Mac, and 6.0 s and 9.0 s on Windows and on a shared
+    1.5 s (median) and 2.25 s (worst) on a Mac, and 3.0 s and 4.5 s on Windows and on a shared
     runner (_SHARED_RUNNER). A page with a SoundWire Peripheral is timed
-    separately, against its own ceilings of 7.0 s and 10.0 s (13.0 s and 18.0 s on Windows and
+    separately, against its own ceilings of 2.4 s and 3.5 s (4.5 s and 6.5 s on Windows and
     on a shared runner). The `perf margins` section prints the medians.
     """
     from PySide6.QtWidgets import QApplication
@@ -734,7 +796,7 @@ def test_timing_recompute_budget():
     tv.show()
     app.processEvents()
     slow = sys.platform == "win32" or _SHARED_RUNNER
-    ceiling, worst_ceiling = (6.0, 9.0) if slow else (3.0, 4.5)
+    ceiling, worst_ceiling = (3.0, 4.5) if slow else (1.5, 2.25)
     median, worst = _time_recompute(tv, app)
     record_perf("Timing recompute", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
@@ -750,7 +812,7 @@ def test_timing_recompute_budget():
     app.processEvents()
     assert is_soundwire(combo.currentData()), "the SoundWire Peripheral page is not selected"
     slow = sys.platform == "win32" or _SHARED_RUNNER
-    ceiling, worst_ceiling = (13.0, 18.0) if slow else (7.0, 10.0)
+    ceiling, worst_ceiling = (4.5, 6.5) if slow else (2.4, 3.5)
     median, worst = _time_recompute(tv, app)
     record_perf("Timing recompute (SoundWire Peripheral)", median, ceiling, worst, worst_ceiling)
     assert median < ceiling, (
@@ -760,3 +822,47 @@ def test_timing_recompute_budget():
         f"worst Timing recompute with a SoundWire Peripheral {worst * 1000:.0f} ms "
         f"(ceiling {worst_ceiling * 1000:.0f} ms)")
     tv.close()
+
+
+def test_grid_cells_at_with_a_config_csv_does_not_replay_the_csv():
+    """The as-of-cursor Bus Grid under a 275-register config CSV continues from the CSV's
+    replayed register model. One grid_cells_at costs less than a quarter of the way from the
+    grid built on that model from the cursor's own commands to the grid built by replaying the
+    CSV's commands before them: a path that replays the CSV lies about three quarters of the
+    way, one that continues below the first. Both are measured in this process through the
+    same native call, so the platform's ratio of grid building to replay cancels. The median
+    stays under an absolute ceiling."""
+    from swi3s_studio.session import Session
+    csv = (pathlib.Path(__file__).resolve().parent.parent / "visualizer_examples" /
+           "directed_tests" / "intentional_errors" / "CDS_split_guard_1.csv")
+    s = Session.from_demo(600, phy=3)
+    s.apply_config_csv(str(csv))
+    assert len(s._csv_replay) > 250, f"the CSV replays only {len(s._csv_replay)} commands"
+    last = int(s.last_sample())
+    xs = [last * k // 39 for k in range(40)]
+
+    def median(fn):
+        times = []
+        for _ in range(7):
+            t0 = time.perf_counter()
+            for x in xs:
+                fn(x)
+            times.append((time.perf_counter() - t0) / len(xs))
+        times.sort()
+        return times[len(times) // 2], times[-1]
+
+    own = {x: s._grid_replay_in_effect(x) for x in xs}       # the cursor's own commands
+    assert s._csv_base is not None and any(own.values())
+    median(s.grid_cells_at)                                  # warm
+    based, _ = median(lambda x: swi3score.grid_from_commands(own[x], 32, base=s._csv_base))
+    again, _ = median(lambda x: swi3score.grid_from_commands(s._csv_replay + own[x], 32))
+    med, worst = median(s.grid_cells_at)
+    ceiling, worst_ceiling = (0.004, 0.008) if _SHARED_RUNNER else (0.002, 0.004)
+    record_perf("grid_cells_at under a config CSV", med, ceiling, worst, worst_ceiling)
+    assert med < based + 0.25 * (again - based), (
+        f"grid_cells_at {med * 1e6:.0f} us against {based * 1e6:.0f} us continuing from the "
+        f"CSV's register model and {again * 1e6:.0f} us replaying the CSV first: the cursor "
+        "path is replaying the CSV prefix again")
+    assert med < ceiling, f"grid_cells_at median {med * 1e6:.0f} us (ceiling {ceiling * 1e6:.0f} us)"
+    assert worst < worst_ceiling, (
+        f"grid_cells_at worst {worst * 1e6:.0f} us (ceiling {worst_ceiling * 1e6:.0f} us)")

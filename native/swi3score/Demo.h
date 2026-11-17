@@ -94,11 +94,17 @@ std::vector<bool> MakeFcpReseedLevels(int intervalsPerPhase = 96,
 // std::invalid_argument. A count too small to place the commit after the setup (which runs to
 // CDS row 8520) throws std::invalid_argument: the smallest is 65 with the default arguments,
 // 64 with a `commitRowOffset` of 6 or more, and 75 with `reenable` or a `columnsAfter` of 32.
+// `skippingNumerator` over `skippingDenominator` sets the port's Payload Interval Skipping
+// from the first commit: a skipped interval carries no transport and no DRQ, and the DRQ
+// history counts the DRQs sent. A denominator outside 1..4095, a numerator outside
+// 0..denominator - 1, or an `intervalsPerPhase` that is not a multiple of the denominator
+// throws std::invalid_argument.
 std::vector<bool> MakeFcpMoveLevels(int intervalsPerPhase = 96, bool dscr = false,
                                     int fcpHStart = 13, int fcpOffset = 12,
                                     int flowControlDelay = 0, bool scrambled = false,
                                     int fcpBitWidth = 0, bool reenable = false,
-                                    int commitRowOffset = 0, int columnsAfter = 16);
+                                    int commitRowOffset = 0, int columnsAfter = 16,
+                                    int skippingNumerator = 0, int skippingDenominator = 1);
 
 // Test fixture for the FCP guard and tail: one RX_CONTROLLED (ASYNC when `async`) SINK data
 // port (dp0, unscrambled, 16-bit samples, 16-row Interval from Row 2, Columns 2..14) on a
@@ -174,8 +180,13 @@ std::vector<bool> MakeDscrDisableLevels(int samplesPerChannel = 32, bool disable
 // Test fixture: dp0 (16-bit PCM, ch0) comes up at the SSCR; a DSCR mid-stream enables dp1,
 // which starts on Column 0 of the commit's row with its interval anchored there, or
 // (`enableChannel`) channel 1 on dp0, which keeps its phase. A correct decode keeps dp0's
-// running channel uninterrupted and decodes the new one from its first sample.
-std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel = 32, bool enableChannel = false);
+// running channel uninterrupted and decodes the new one from its first sample. The DSCR
+// carries `dscrRowDelay` as its Row_Delay byte (0..255; throws std::invalid_argument
+// outside it); the bus still applies the new config where a Row_Delay of 14 puts it, so a
+// value outside 14..15 gives a DSCR the decode flags and does not commit. The SSCR carries
+// `sscrRowDelay` the same way.
+std::vector<bool> MakeDscrEnableLevels(int samplesPerChannel = 32, bool enableChannel = false,
+                                       int dscrRowDelay = 14, int sscrRowDelay = 14);
 
 // Test fixture for a DSCR that changes a running port's channel set: one scrambled 16-bit
 // PCM port (dp0, Columns 1-7, 64-row Interval, data in its first rows) on an 8-column bus.
@@ -203,7 +214,7 @@ std::vector<bool> MakeImmediateScramblerLevels(int samplesPerChannel = 32,
 std::vector<bool> MakeImmediateSampleSizeLevels(int samplesPerChannel = 32, int fromSize = 23,
                                                 int toSize = 15, int rowsIntoSample = 8);
 
-// Test fixture for the EnableCh_CURR protocol-error rule (SWI3S v1.1: EnableCh is
+// Test fixture for the EnableCh_CURR protocol-error rule (the SWI3S specification: EnableCh is
 // dual-ranked; a direct write to its _CURR address is only safe when the port's
 // Interval == 1 Row). One PCM port is configured + committed with Interval = `interval`
 // (rows/interval - 1; 0 == every row transports == "1 Row"), then a single WriteA32
@@ -238,8 +249,22 @@ std::vector<bool> MakeRunningPortWriteLevels(int samplesPerChannel, int offset, 
 // std::invalid_argument, as does a `numerator` or `denominator` above 4095, past its 12-bit
 // register. A `denominator` below 1 is written to the bus as 0, which reads as the
 // register's reset value 1. Returns bus levels for MemorySampleSource.
+// Each SSPA carries `sspaRowDelay` as its Row_Delay byte (0..255; throws
+// std::invalid_argument outside it), placed where a Row_Delay of 14 puts its SSP.
 std::vector<bool> MakeSkippingLevels(int samplesPerChannel = 200, int numerator = 13,
-                                     int denominator = 160, bool misalignedSspa = false);
+                                     int denominator = 160, bool misalignedSspa = false,
+                                     int sspaRowDelay = 14);
+
+// Test fixture: one unscrambled 16-bit PCM source port (Interval = 32 Rows, 8 columns)
+// carrying a RAMP (sample n has value n), skipping by `numerator` / `fromDenominator`. After
+// `intervalsPerPhase` intervals a single-ranked write to SLC_SkippingDenominator[7:0] sets
+// `toDenominator`, applied at that interval boundary with no SSP; the port keeps its
+// interval phase and skipping accumulator and skips by the new ratio for another
+// `intervalsPerPhase` intervals. Each value must be 1..255, else std::invalid_argument.
+std::vector<bool> MakeImmediateSkippingDenominatorLevels(int intervalsPerPhase = 64,
+                                                        int numerator = 1,
+                                                        int fromDenominator = 4,
+                                                        int toDenominator = 8);
 
 } // namespace swi3score
 

@@ -158,7 +158,8 @@
       "expanded": []
     },
     "timing_pane": {
-      "region": "4 col  (0.00\u20131.00 s)",
+      "region": "1 x 44.1ksps, 1 x 48ksps, 1 x 3.072 Msps  (0.00\u20131.00 s)",
+      "section": 1,
       "filter": [
         "AMP1 \u00b7 Device 0 DP0",
         "MIC \u00b7 Device 0 DP2",

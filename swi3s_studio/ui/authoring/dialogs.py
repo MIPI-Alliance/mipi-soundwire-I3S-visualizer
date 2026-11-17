@@ -4,13 +4,13 @@ result is in the dialog's named attributes.
 
 - DeviceSelectorDialog      — Manager (M) or device 0-11 (radio)
 - ChannelSelectorDialog     — toggle channels 0-15 (Clear / All)
-- GuardSelectorDialog       — Guard 0 / Guard 1 / Off
+- GuardSelectorDialog       — guard Enable + Polarity 0 / 1
 - FlowModeSelectorDialog    — Normal / Tx / Rx / Async + Flow Control Port params
 - PortModeSelectorDialog    — Normal (Off) / Test0 (all 0) / Test1 (all 1)
 - DisplayOptionsDialog      — Draw DataPort + Sample / Channel / Bit label fields
 - GridLabelFieldsDialog     — a decoded port's grid label fields
 - DataPortIdentityDialog    — a data port's number and name
-- CdsGuardDialog            — per-source (Manager + Device 0-11) Guard 0 / Guard 1 / Off
+- CdsGuardDialog            — per-source (Manager + Device 0-11) guard Enable + Polarity 0 / 1
 - CdsTailDialog             — per-source (Manager + Device 0-11) Tail Width 0-2
 - CdsDriveTypeDialog        — per-source drive type
 - CdsEndDriveEarlyDialog    — per-source end drive early
@@ -241,39 +241,63 @@ class ChannelSelectorDialog(QDialog):
         super().accept()
 
 
+def _left_checkbox(checked: bool) -> QCheckBox:
+    """A text-less checkbox whose indicator sits at the left edge of its cell, for a value
+    column of left-packed controls (the panel's stylesheet centres the indicator)."""
+    cb = QCheckBox()
+    cb.setChecked(bool(checked))
+    cb.setStyleSheet("QCheckBox::indicator { subcontrol-position: left center; }")
+    return cb
+
+
+def _polarity_strip(on_pick, store: dict) -> QWidget:
+    """The guard Polarity choice: toggles 0 and 1, registered in `store` by value."""
+    return _toggle_strip(range(2), str, on_pick, store, 34)
+
+
 class GuardSelectorDialog(QDialog):
+    """A data port's guard: an Enable checkbox and a Polarity choice (0 / 1), the
+    GuardEnable_REG and GuardPolarity_REG fields. The polarity stays editable, and is kept,
+    with Enable off. `guard_enabled` and `guard_polarity` change only on OK."""
+
     def __init__(self, parent, guard_enabled: bool = False, guard_polarity: int = 0,
                  dp_index: int = 0, title: str | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title or f"DP{dp_index} Guard Selection")
-        self.guard_enabled = guard_enabled
-        self.guard_polarity = guard_polarity
-        self._sel = ("g1" if guard_polarity else "g0") if guard_enabled else "off"
+        self.guard_enabled = bool(guard_enabled)
+        self.guard_polarity = 1 if guard_polarity else 0
+        self._pol = self.guard_polarity
 
         root = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        for row, text in enumerate(("Enable", "Polarity")):
+            lab = QLabel(text)
+            lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(lab, row, 0)
         root.addWidget(QLabel("Select Guard:"))
-        row = QHBoxLayout()
-        self._g0 = _toggle_btn("Guard 0"); self._g0.clicked.connect(lambda: self._pick("g0"))
-        self._g1 = _toggle_btn("Guard 1"); self._g1.clicked.connect(lambda: self._pick("g1"))
-        self._off = _toggle_btn("Off"); self._off.clicked.connect(lambda: self._pick("off"))
-        for b in (self._g0, self._g1, self._off):
-            row.addWidget(b)
-        root.addLayout(row)
+        self._enable = _left_checkbox(self.guard_enabled)
+        grid.addWidget(self._enable, 0, 1, alignment=Qt.AlignLeft)
+        self._pol_btns: dict = {}
+        grid.addWidget(_polarity_strip(self._pick, self._pol_btns), 1, 1)
+        root.addLayout(grid)
         root.addWidget(_OkCancel(self))
         self._refresh()
         _fit_title(self)
 
-    def _pick(self, s: str) -> None:
-        self._sel = s; self._refresh()
+    def _pick(self, polarity: int) -> None:
+        self._pol = int(polarity)
+        self._refresh()
 
     def _refresh(self) -> None:
-        self._g0.setStyleSheet(_SEL_CSS if self._sel == "g0" else _UNSEL_CSS)
-        self._g1.setStyleSheet(_SEL_CSS if self._sel == "g1" else _UNSEL_CSS)
-        self._off.setStyleSheet(_SEL_CSS if self._sel == "off" else _UNSEL_CSS)
+        for value, b in self._pol_btns.items():
+            b.setStyleSheet(_SEL_CSS if value == self._pol else _UNSEL_CSS)
 
     def accept(self) -> None:
-        self.guard_enabled = self._sel in ("g0", "g1")
-        self.guard_polarity = 1 if self._sel == "g1" else 0
+        self.guard_enabled = self._enable.isChecked()
+        self.guard_polarity = self._pol
         super().accept()
 
 
@@ -312,17 +336,20 @@ class FlowModeSelectorDialog(QDialog):
         self._bw = self._int_entry(0, 2, fcp_bit_width)
         self._tw = self._int_entry(0, 2, fcp_tail_width)
         self._off = self._int_entry(0, 4095, fcp_offset)
-        self._ge = QCheckBox(); self._ge.setChecked(fcp_guard_enable)
-        self._gp = self._int_entry(0, 1, fcp_guard_polarity)
+        self._ge = _left_checkbox(fcp_guard_enable)
+        self._gpol = 1 if fcp_guard_polarity else 0
+        self._gp: dict = {}
+        gp_strip = _polarity_strip(self._pick_polarity, self._gp)
         form.addRow("Horizontal Start (0-31)", self._hs)
         form.addRow("Bit Width (0-2)", self._bw)
         form.addRow("Tail Width (0-2)", self._tw)
         form.addRow("Offset (0-4095)", self._off)
         form.addRow("Guard Enable", self._ge)
-        form.addRow("Guard Polarity", self._gp)
+        form.addRow("Guard Polarity", gp_strip)
         root.addWidget(self._fcp_box)
         root.addWidget(_OkCancel(self))
         self._select(flow_mode)
+        self._pick_polarity(self._gpol)
         _fit_title(self)
 
     @staticmethod
@@ -339,11 +366,17 @@ class FlowModeSelectorDialog(QDialog):
         # FCP params apply only to Rx (2) and Async (3).
         self._fcp_box.setEnabled(m in (2, 3))
 
+    def _pick_polarity(self, polarity: int) -> None:
+        """The FCP guard polarity, independent of Guard Enable."""
+        self._gpol = int(polarity)
+        for value, b in self._gp.items():
+            b.setStyleSheet(_SEL_CSS if value == self._gpol else _UNSEL_CSS)
+
     def accept(self) -> None:
         """Commit the entries; an empty entry is 0. An entry outside its range keeps the
         dialog open with the entry marked, while the parameters apply (Rx or Async), and is
         left uncommitted otherwise."""
-        entries = (self._hs, self._bw, self._tw, self._off, self._gp)
+        entries = (self._hs, self._bw, self._tw, self._off)
         values = {}
         for e in entries:
             if not e.text():
@@ -361,7 +394,7 @@ class FlowModeSelectorDialog(QDialog):
         self.fcp_tail_width = values.get(self._tw, self.fcp_tail_width)
         self.fcp_offset = values.get(self._off, self.fcp_offset)
         self.fcp_guard_enable = self._ge.isChecked()
-        self.fcp_guard_polarity = values.get(self._gp, self.fcp_guard_polarity)
+        self.fcp_guard_polarity = self._gpol
         super().accept()
 
 
@@ -544,7 +577,7 @@ class DataPortIdentityDialog(QDialog):
 
 
 # Source labels shared by the two per-source CDS dialogs below: index 0 = Manager,
-# index i = Device (i-1), matching BusConfig.cds_guard/cds_tail's convention.
+# index i = Device (i-1), matching BusConfig's per-source CDS lists.
 _CDS_SOURCE_LABELS = ["Manager"] + [f"Device {i}" for i in range(12)]
 
 
@@ -638,24 +671,115 @@ class _CdsPerSourceDialog(QDialog):
                 b.setStyleSheet(_SEL_CSS if value == current else _UNSEL_CSS)
 
 
-class CdsGuardDialog(_CdsPerSourceDialog):
-    """Per-source CDS guard (Off / G0 / G1). The CDS is time-multiplexed, so the Manager
-    and each of devices 0-11 drive their own guard polarity without a bus clash.
+class CdsGuardDialog(QDialog):
+    """Per-source CDS guard: for the Manager and each of devices 0-11, an Enable checkbox
+    and a Polarity choice (0 / 1), the source's CDS_GuardEnable and CDS_GuardPolarity
+    register fields. The CDS is time-multiplexed, so each source drives its own guard
+    without a bus clash. A polarity stays editable, and is kept, with its Enable off.
 
-    `self.guard` aliases `self.values`."""
+    An "All sources" row sets every Enable (its On / Off buttons) or every Polarity (its
+    0 / 1 buttons) at once. `enable` and `polarity` change only on OK."""
 
     TITLE = "CDS Guard Selection"
     PROMPT = "Select Guard per source:"
-    OPTIONS = ((0, "Off"), (1, "Guard 0"), (2, "Guard 1"))
-    BTN_W = 76
+    BTN_W = 34
 
-    @property
-    def guard(self) -> List[int]:
-        return self.values
+    def __init__(self, parent, enable: List[bool], polarity: List[int]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(self.TITLE)
+        self.enable = [bool(e) for e in enable]
+        self.polarity = [1 if p else 0 for p in polarity]
+        self._pol = list(self.polarity)
+        self._checks: List[QCheckBox] = []
+        self._rows: List[dict] = []
 
-    @guard.setter
-    def guard(self, v: List[int]) -> None:
-        self.values = list(v)
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(self.PROMPT))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+
+        for col, text in ((1, "Enable"), (2, "Polarity")):
+            head = QLabel(text)
+            head.setStyleSheet(f"color:{VizTheme.TEXT_DIM};")
+            grid.addWidget(head, 0, col, 1, 1 if col == 1 else 2, alignment=Qt.AlignLeft)
+
+        all_lab = QLabel("All sources")
+        all_lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(all_lab, 1, 0)
+        every_label = [all_lab]
+        all_enable = QHBoxLayout()
+        all_enable.setContentsMargins(0, 0, 0, 0)
+        all_enable.setSpacing(4)
+        self._all_on_off = {}
+        for on, text in ((True, "On"), (False, "Off")):
+            b = _action_btn(text)
+            b.setToolTip(f"{'Enable' if on else 'Disable'} every source's guard")
+            b.clicked.connect(lambda _c=False, v=on: self._enable_all(v))
+            all_enable.addWidget(b)
+            self._all_on_off[on] = b
+        all_enable.addStretch(1)
+        host = QWidget()
+        host.setLayout(all_enable)
+        grid.addWidget(host, 1, 1)
+        every_btn = []
+        for value in (0, 1):
+            b = _action_btn(str(value))
+            b.setToolTip(f"Polarity {value} for every source")
+            b.clicked.connect(lambda _c=False, v=value: self._set_all_polarity(v))
+            grid.addWidget(b, 1, 2 + value)
+            every_btn.append(b)
+        grid.addWidget(_hline(), 2, 0, 1, 4)
+
+        for i, label in enumerate(_CDS_SOURCE_LABELS):
+            lab = QLabel(label)
+            lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(lab, i + 3, 0)
+            every_label.append(lab)
+            cb = _left_checkbox(self.enable[i])
+            cb.setToolTip(f"{label}: guard enable")
+            grid.addWidget(cb, i + 3, 1, alignment=Qt.AlignLeft)
+            self._checks.append(cb)
+            btns = {}
+            for value in (0, 1):
+                b = _toggle_btn(str(value))
+                b.setToolTip(f"{label}: guard polarity {value}")
+                b.clicked.connect(lambda _c=False, r=i, v=value: self._pick(r, v))
+                grid.addWidget(b, i + 3, 2 + value)
+                btns[value] = b
+                every_btn.append(b)
+            self._rows.append(btns)
+
+        root.addLayout(grid)
+        root.addStretch(1)
+        root.addWidget(_OkCancel(self))
+        self._refresh()
+        self.adjustSize()
+        _fit_uniform(every_btn, self.BTN_W)
+        grid.setColumnMinimumWidth(0, max(lab.sizeHint().width() for lab in every_label))
+        self.setFixedWidth(max(self.sizeHint().width(), _title_width(self)))
+
+    def _pick(self, row: int, polarity: int) -> None:
+        self._pol[row] = int(polarity)
+        self._refresh()
+
+    def _set_all_polarity(self, polarity: int) -> None:
+        self._pol = [int(polarity)] * len(self._pol)
+        self._refresh()
+
+    def _enable_all(self, on: bool) -> None:
+        for cb in self._checks:
+            cb.setChecked(bool(on))
+
+    def _refresh(self, *_a) -> None:
+        for row, btns in enumerate(self._rows):
+            for value, b in btns.items():
+                b.setStyleSheet(_SEL_CSS if value == self._pol[row] else _UNSEL_CSS)
+
+    def accept(self) -> None:
+        self.enable = [cb.isChecked() for cb in self._checks]
+        self.polarity = list(self._pol)
+        super().accept()
 
 
 class CdsTailDialog(_CdsPerSourceDialog):
@@ -740,13 +864,11 @@ class CdsEndDriveEarlyDialog(_CdsPerSourceDialog):
 _CDS_SETTINGS_KINDS = {
     "drive": "drive_type",
     "ede": "end_drive_early",
-    "guard": "guard",
     "tail": "tail",
 }
 _CDS_SETTINGS_DIALOGS = {
     "drive": CdsDriveTypeDialog,
     "ede": CdsEndDriveEarlyDialog,
-    "guard": CdsGuardDialog,
     "tail": CdsTailDialog,
 }
 
@@ -761,14 +883,14 @@ class CdsSettingsDialog(QDialog):
     state.
 
     NOTHING IS COMMITTED UNTIL OK, including a change made two dialogs deep: the per-source
-    dialogs edit copies handed back through `guard` / `tail` / `drive_type` /
-    `end_drive_early`, so cancelling the outer dialog discards them.
+    dialogs edit copies handed back through `guard_enable` / `guard_polarity` / `tail` /
+    `drive_type` / `end_drive_early`, so cancelling the outer dialog discards them.
 
     ONE GRID, TWO COLUMNS, FIXED WIDTH: every label is right-aligned in column 0, every
     control sits in column 1, dividers SPAN both, and no selection changes the width.
 
-    On accept: `bit_width`, `enforce_handover`, `guard`, `tail`, `drive_type`,
-    `end_drive_early`.
+    On accept: `bit_width`, `enforce_handover`, `guard_enable`, `guard_polarity`, `tail`,
+    `drive_type`, `end_drive_early`.
     """
 
     # The minimum width; no selection resizes the window.
@@ -777,13 +899,15 @@ class CdsSettingsDialog(QDialog):
     _WIDTH = 470
 
     def __init__(self, parent, *, bit_width: int, drive_type: List[int],
-                 enforce_handover: bool, guard: List[int], tail: List[int],
+                 enforce_handover: bool, guard_enable: List[bool],
+                 guard_polarity: List[int], tail: List[int],
                  end_drive_early: List[int]) -> None:
         super().__init__(parent)
         self.setWindowTitle("CDS Settings")
         self.bit_width = int(bit_width)
         self.enforce_handover = bool(enforce_handover)
-        self.guard = list(guard)
+        self.guard_enable = [bool(e) for e in guard_enable]
+        self.guard_polarity = [1 if p else 0 for p in guard_polarity]
         self.tail = list(tail)
         self.drive_type = list(drive_type)
         self.end_drive_early = list(end_drive_early)
@@ -869,6 +993,13 @@ class CdsSettingsDialog(QDialog):
         self._refresh()
 
     def _open_per_source(self, kind: str) -> None:
+        if kind == "guard":
+            g = CdsGuardDialog(self, list(self.guard_enable), list(self.guard_polarity))
+            if g.exec():
+                self.guard_enable = list(g.enable)
+                self.guard_polarity = list(g.polarity)
+            self._refresh()
+            return
         attr = _CDS_SETTINGS_KINDS[kind]
         d = _CDS_SETTINGS_DIALOGS[kind](self, list(getattr(self, attr)))
         if d.exec():
@@ -884,6 +1015,8 @@ class CdsSettingsDialog(QDialog):
                 f"{self.bit_width + 1} UI per CDS bit")
         for kind, attr in _CDS_SETTINGS_KINDS.items():
             self._summaries[kind].setText(cds_summary(getattr(self, attr), kind))
+        self._summaries["guard"].setText(
+            cds_guard_summary(self.guard_enable, self.guard_polarity))
 
     def accept(self) -> None:
         self.enforce_handover = bool(self._handover.isChecked())
@@ -945,12 +1078,37 @@ _EXCEPTION_SUMMARY = {
 }
 
 
+def cds_guard_summary(enable: List[bool], polarity: List[int]) -> str:
+    """One-line summary of the per-source CDS guard, e.g. 'Manager G0; 2 devices G1;
+    1 device off, polarity 1'. An enabled guard reads G<polarity>; a disabled one is named
+    only when its polarity is 1, and 'off' alone means every guard is off at polarity 0.
+
+    Shared by the panel's row tooltip and the settings dialog's inline summary."""
+    def state(i: int) -> str:
+        pol = 1 if polarity[i] else 0
+        return f"G{pol}" if enable[i] else ("off, polarity 1" if pol else "")
+    parts = []
+    if state(0):
+        parts.append(f"Manager {state(0)}")
+    groups: dict[str, List[int]] = {}
+    for i in range(1, len(enable)):
+        if state(i):
+            groups.setdefault(state(i), []).append(i - 1)
+    for text in ("G0", "G1", "off, polarity 1"):
+        devs = groups.get(text, [])
+        if devs:
+            noun = "device" if len(devs) == 1 else "devices"
+            parts.append(f"{len(devs)} {noun} {text}")
+    return "; ".join(parts) if parts else "off"
+
+
 def cds_summary(values: List[int], kind: str) -> str:
-    """One-line summary of a per-source CDS list, e.g. 'Manager G0; 2 devices G1'.
+    """One-line summary of a per-source CDS tail, drive type or end-drive-early list, e.g.
+    'Manager tail 1; 2 devices tail 2'. The guard has its own, `cds_guard_summary`.
 
     Shared by the panel's row tooltip and the settings dialog's inline summaries.
 
-    Guard and tail encode "not set" as 0, so an all-zero list means off. Drive type (SPECIAL
+    The tail encodes "not set" as 0, so an all-zero list means off. Drive type (SPECIAL
     is 0) and end drive early (0 is its ordinary value) do not use that any() test; both
     report against a declared table, `_EXCEPTION_SUMMARY`.
     """
@@ -974,12 +1132,9 @@ def cds_summary(values: List[int], kind: str) -> str:
 
     if not any(values):
         return "off"
-    if kind == "guard":
-        def fmt(v):
-            return "G0" if v == 1 else "G1"
-    else:
-        def fmt(v):
-            return f"tail {v}"
+
+    def fmt(v):
+        return f"tail {v}"
     groups: dict[int, List[int]] = {}
     parts = []
     if values[0]:

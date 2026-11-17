@@ -204,10 +204,10 @@ def test_workspace_carries_authoring():
     win._mode_mgr.switch_to(VISUALIZATION)
     win._authoring.config().dataports[5].enabled = True
     win._authoring.config().dataports[5].enable_ch = 0b101
-    # Timing page: set the Spec bus-length range (corners are auto-selected, so
+    # Timing page: set the Example bus-length range (corners are auto-selected, so
     # pin min == max to make the round-trip assertion exact).
-    win._timing_page._min[("spec", "bus length (cm)")].setValue(42.0)
-    win._timing_page._max[("spec", "bus length (cm)")].setValue(42.0)
+    win._timing_page._min[("proposed", "bus length (cm)")].setValue(42.0)
+    win._timing_page._max[("proposed", "bus length (cm)")].setValue(42.0)
     ws = Workspace.single(source=win._session.source, mode=VISUALIZATION,
                           authoring=win._authoring.config().to_dict(),
                           timing=win._timing_page.to_dict())
@@ -219,7 +219,7 @@ def test_workspace_carries_authoring():
         win2.load_session(session_from_source(loaded.links[0].source, register_map=win2._rmap))
         win2.apply_workspace(loaded)
     assert win2._authoring.config().dataports[5].enable_ch == 0b101
-    assert win2._timing_page.inputs("spec").bus_length_cm == 42.0
+    assert win2._timing_page.inputs("proposed").bus_length_cm == 42.0
     assert win2._mode_mgr.current() == VISUALIZATION
 
 
@@ -235,7 +235,8 @@ def test_dp_dialogs_apply():
     assert pd.port_mode == 3
     cd = D.ChannelSelectorDialog(None, 0, 0); cd._toggle(0); cd._toggle(2); cd.accept()
     assert cd.result_mask == 0b101
-    gd = D.GuardSelectorDialog(None, False, 0, 0); gd._pick("g1"); gd.accept()
+    gd = D.GuardSelectorDialog(None, False, 0, 0); gd._enable.setChecked(True); gd._pick(1)
+    gd.accept()
     assert gd.guard_enabled and gd.guard_polarity == 1
     dv = D.DeviceSelectorDialog(None, 0, 0); dv._select(D.MANAGER); dv.accept()
     assert dv.device == D.MANAGER

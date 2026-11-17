@@ -39,6 +39,7 @@ from ..model.regmap_import import (
     library_dir,
     read_text,
 )
+from .theme import VizTheme, analyzer_stylesheet
 
 _PREVIEW_LIMIT = 50          # registers shown in the preview tree
 
@@ -54,6 +55,7 @@ class RegisterMapImportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Import Peripheral Register Map")
         self.setMinimumWidth(560)
+        self.setStyleSheet(analyzer_stylesheet())
         self.pmap: Optional[PeripheralRegisterMap] = None
         self.device: Optional[int] = None
         self.report: Optional[ImportReport] = None
@@ -64,7 +66,7 @@ class RegisterMapImportDialog(QDialog):
         # Source row: a path label + Browse.
         src = QHBoxLayout()
         self._path_label = QLabel("No file selected")
-        self._path_label.setStyleSheet("color: gray;")
+        self._path_label.setStyleSheet(f"color: {VizTheme.TEXT_DIM};")
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
         src.addWidget(QLabel("Source:"))

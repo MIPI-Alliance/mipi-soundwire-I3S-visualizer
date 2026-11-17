@@ -168,3 +168,19 @@ def test_cursor_into_bringup_is_not_yanked_back_by_sample_view():
     _app.processEvents()
     assert w.cursor.sample == target, (
         f"cursor yanked back to {w.cursor.sample} (expected {target}) — sample-view echo")
+
+
+def test_the_selected_sample_is_the_top_row():
+    """select_sample scrolls the selected sample to the top of the table, moving down and
+    then up through it."""
+    w, _ = _win()
+    sv = w._sample_view
+    t = sv._table
+    t.setFixedHeight(160)
+    _app.processEvents()
+    n = t.rowCount()
+    assert n > 60, n
+    for k in (n // 4, n // 2, n // 3, n // 8):
+        sv.select_sample(int(sv._samples[k]["start_sample"]))
+        _app.processEvents()
+        assert t.rowAt(0) == k, (k, t.rowAt(0))

@@ -187,9 +187,43 @@ def test_a_capture_without_a_bringup_has_none(phy, variant, edges_fooled):
 
 
 def test_a_capture_joined_after_audio_began_has_no_bringup():
+    """The edge-only detector reads a Cold Start that never reaches audio into the
+    recording; a CRC-valid command decodes inside its phases, so the Session drops it."""
     s = _joined_late()
-    assert decode_link_control(s.capture).sequence == "warm"     # the phantom
+    phantom = decode_link_control(s.capture)
+    assert phantom.sequence == "cold" and phantom.audio_start_sample is None
     assert not s.has_bringup and not s.link_control.lc_on_data_line
+
+
+@pytest.mark.parametrize("cut, evidence", [(1_800_000, "a CRC-valid command at sample"),
+                                           (2_000_000, "clock edges")])
+def test_a_warm_start_the_link_was_in_audio_mode_up_to_is_dropped(cut, evidence):
+    """Joined later, the edge-only detector reads a Warm Start that fits between two Pings
+    and reaches audio, with no command inside it. A Warm Start restarts a Link that went
+    inactive, and the Link was in audio mode up to the pulse with no clock stop between: a
+    CRC-valid command (at 1.8 M) or the clock running at audio rate (at 2.0 M) before it."""
+    s = _joined_late(cut)
+    phantom = decode_link_control(s.capture)
+    assert phantom.sequence == "warm" and phantom.audio_start_sample is not None
+    assert not s.has_bringup and s.link_control.sequence == "none"
+    assert "audio mode up to it" in s.link_control.note and evidence in s.link_control.note
+
+
+def test_a_warm_start_after_a_clock_stop_is_kept():
+    """The same recording with the clock stopped for longer than LINK_IDLE_MIN_US before the
+    Warm Start pulse: the Link went inactive there, so the Warm Start is kept."""
+    from swi3s_studio.analysis.link_control import LINK_IDLE_MIN_US
+    cap = _joined_late(2_000_000).capture
+    rise = next(int(x["start"]) for x in decode_link_control(cap).sections
+                if x["name"] == "Warm Start")
+    gap = np.uint64(int(1.2 * LINK_IDLE_MIN_US * cap.sample_rate_hz / 1e6))
+
+    def stopped(edges):
+        return np.where(edges >= np.uint64(rise), edges + gap, edges)
+    s = Session(Capture(stopped(cap.clock_edges), stopped(cap.data_edges), cap.initial_clock,
+                        cap.initial_data, cap.sample_rate_hz), source={"type": "fixture"})
+    assert s.has_bringup and s.link_control.sequence == "warm"
+    assert s.link_control.audio_start_sample > rise + int(gap)
 
 
 @pytest.mark.parametrize("phy, variant", [(1, ""), (2, ""), (3, ""), (2, "flow_control")])
@@ -405,3 +439,112 @@ def test_a_dp_low_longer_than_48_us_after_a_falling_edge_is_phystart_and_exactly
         assert r.sequence == "cold"
         assert (r.phystart_sample == 700_000) is phystart, (low_us, r.phystart_sample)
         assert (r.audio_start_sample is not None) is phystart
+
+
+def _phystart_row(r):
+    return next((t for t in r.timing if t["param"] == "Man_tPhyStart"), None)
+
+
+def test_man_tphystart_is_measured_to_the_first_audio_edge_and_judged_against_64_to_96_us():
+    """Cold Start: the span from the PhyStart falling edge to the first edge after it, on
+    the clock line or the data line, is a Man_tPhyStart row; 64 and 96 us pass, 63 and 97
+    fail, and a 130 us low is flagged."""
+    base = [50, 650, 670, 700]                       # Bus Reset pulse, then burst pulses
+    for low_us, ok in ((63.0, False), (64.0, True), (80.0, True), (96.0, True),
+                       (97.0, False), (130.0, False)):
+        r = decode_link_control(_us_capture(base + [700 + low_us, 700 + low_us + 1]))
+        row = _phystart_row(r)
+        assert row is not None and row["ok"] is ok, (low_us, row)
+        assert abs(row["measured_us"] - low_us) < 1e-6
+        assert (row["min_us"], row["max_us"]) == (64.0, 96.0)
+    # The first edge after PhyStart on the DATA line counts as well (audio clock stored there).
+    cap = Capture(clock_edges=np.asarray([int(x * 1000) for x in base + [800]], np.uint64),
+                  data_edges=np.asarray([int(x * 1000) for x in (770,)], np.uint64),
+                  initial_clock=False, initial_data=False, sample_rate_hz=1_000_000_000)
+    row = _phystart_row(decode_link_control(cap))
+    assert abs(row["measured_us"] - 70.0) < 1e-6 and row["ok"] is True
+
+
+def test_man_tphystart_on_a_warm_start_and_when_no_edge_follows():
+    r = decode_link_control(_us_capture([50, 500, 500 + 130]))
+    assert r.sequence == "warm" and _phystart_row(r)["ok"] is False
+    assert abs(_phystart_row(r)["measured_us"] - 130.0) < 1e-6
+    assert _phystart_row(decode_link_control(_us_capture([50, 500, 500 + 80]))) ["ok"] is True
+    # A capture that ends at PhyStart observes no audio edge: no row rather than a guess.
+    assert _phystart_row(decode_link_control(_us_capture([50, 500]))) is None
+    assert _phystart_row(decode_link_control(_us_capture([50, 650, 670, 700, 800]))) is not None
+
+
+def test_a_synthetic_cold_start_spliced_before_audio_is_in_spec_on_man_tphystart():
+    audio = transitions.demo_capture(32, cold_start=False)
+    r = decode_link_control(transitions.prepend_cold_start(audio, 2))
+    row = _phystart_row(r)
+    assert row is not None and row["ok"] is True, row
+
+
+def test_man_tphystart_skips_a_ring_at_phystart_and_a_glitch_on_either_line():
+    """PhyStart is an edge of the glitch-coalesced clock: the rest of a ring at its falling
+    edge, and a glitch pair on the data line, are not the first edge of audio mode."""
+    ring = [50, 650, 670, 700, 700.1, 700.2, 780, 781]
+    r = decode_link_control(_us_capture(ring))
+    assert r.phystart_sample == 700_000
+    assert abs(_phystart_row(r)["measured_us"] - 80.0) < 1e-6
+    cap = Capture(clock_edges=np.asarray([int(round(x * 1000)) for x in ring], np.uint64),
+                  data_edges=np.asarray([710_000, 710_200], np.uint64),
+                  initial_clock=False, initial_data=False, sample_rate_hz=1_000_000_000)
+    row = _phystart_row(decode_link_control(cap))
+    assert abs(row["measured_us"] - 80.0) < 1e-6 and row["ok"] is True
+    # A single data-line edge is a real level change and still counts.
+    cap = Capture(clock_edges=np.asarray([int(round(x * 1000)) for x in ring], np.uint64),
+                  data_edges=np.asarray([770_000], np.uint64),
+                  initial_clock=False, initial_data=False, sample_rate_hz=1_000_000_000)
+    assert abs(_phystart_row(decode_link_control(cap))["measured_us"] - 70.0) < 1e-6
+
+
+def _phystart_first_edge_by_scan(edges, phystart, min_gap):
+    """The first edge of audio mode on one line by a scan of every edge after PhyStart: the
+    ring chained to PhyStart skipped, then the first cluster that is odd or spans more than
+    the gap."""
+    e = [int(x) for x in edges if int(x) > phystart]
+    i, prev = 0, phystart
+    while i < len(e) and e[i] - prev <= min_gap:
+        prev, i = e[i], i + 1
+    while i < len(e):
+        j = i + 1
+        while j < len(e) and e[j] - e[j - 1] <= min_gap:
+            j += 1
+        if (j - i) % 2 == 1 or e[j - 1] - e[i] > min_gap:
+            return e[i]
+        i = j
+    return None
+
+
+def test_man_tphystart_matches_a_scan_and_reads_only_the_edges_near_phystart():
+    """The Man_tPhyStart row's first edge equals a scan of every edge on random lines, and a
+    dense audio clock or a long chained ring after PhyStart is not read edge by edge."""
+    from swi3s_studio.analysis import link_control as lc
+    spp, phystart = 1000.0, 10_000
+    gap = max(1, int(lc.GLITCH_MAX_US * spp))
+    rng = np.random.default_rng(7)
+    for _ in range(300):
+        steps = rng.choice([1, gap // 2, gap, gap + 1, 3 * gap], size=int(rng.integers(0, 40)))
+        edges = np.asarray(phystart - 2 * gap + np.cumsum(steps), np.uint64)
+        want = _phystart_first_edge_by_scan(edges, phystart, gap)
+        rows = lc._phystart_row(phystart, spp, edges)
+        got = (round(rows[0]["measured_us"] * spp) + phystart) if rows else None
+        assert got == want, (edges.tolist(), got, want)
+
+    class Counted(np.ndarray):
+        reads = 0
+
+        def __getitem__(self, key):
+            Counted.reads += 1
+            return super().__getitem__(key)
+    clock = np.arange(phystart + 80_000, phystart + 80_000 + 20 * 400_000, 20,
+                      dtype=np.uint64).view(Counted)                 # a dense audio clock
+    ring = np.concatenate([np.arange(phystart + 5, phystart + 5 + 10 * 400_000, 10),
+                           [phystart + 9_000_000]]).astype(np.uint64).view(Counted)
+    Counted.reads = 0
+    rows = lc._phystart_row(phystart, spp, clock, ring)
+    assert abs(rows[0]["measured_us"] - 80.0) < 1e-9
+    assert Counted.reads < 2_000, Counted.reads

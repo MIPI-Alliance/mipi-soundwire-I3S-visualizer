@@ -192,6 +192,15 @@ def test_the_setting_round_trips_and_a_bad_one_is_refused():
     assert StreamProcessing.from_json({"gain_db": 2}) == StreamProcessing(gain_db=2.0)
     for bad in ({"highpass_hz": "x"}, {"highpass_hz": -5}, None, {"gain_db": [1]}):
         assert StreamProcessing.from_json(bad) is None
+    nan, inf = float("nan"), float("inf")
+    for bad in ({"gain_db": nan}, {"gain_db": inf}, {"gain_db": -inf}, {"highpass_hz": inf},
+                {"highpass_hz": nan}, {"allow_clipping": "false"}, {"dc_block": "true"},
+                {"allow_clipping": 2}, {"dc_block": None}, {"gain_db": True},
+                {"gain_db": "3"}, {"highpass_hz": "20"}, {"highpass_hz": True},
+                {"gain_db": None}):
+        assert StreamProcessing.from_json(bad) is None, bad
+    assert StreamProcessing.from_json({"allow_clipping": 1, "dc_block": 0}) == \
+        StreamProcessing(allow_clipping=True)
     assert p.describe() == "HPF 20 Hz, -3.5 dB"
     assert StreamProcessing(gain_db=0.0).is_identity()
 
@@ -269,8 +278,33 @@ def test_a_stream_with_no_rate_is_not_dc_blocked():
     assert np.array_equal(store.samples(1, 2, 0), x)
 
 
+def test_a_stream_with_no_rate_is_not_high_passed_and_keeps_its_gain():
+    x = _tone(dc=4000.0, amp=1000.0)
+    for rate in (0.0, 2.0):
+        store = _store([x], rate=rate)
+        store.set_processing(1, 2, StreamProcessing(highpass_hz=20.0))
+        assert np.array_equal(store.samples(1, 2, 0), x)
+        store.set_processing(1, 2, StreamProcessing(highpass_hz=20.0, gain_db=6.0))
+        assert np.array_equal(store.samples(1, 2, 0),
+                              np.rint(x * 10 ** (6.0 / 20)).astype(np.int32))
+        assert store.peak_db(1, 2, highpass_hz=20.0) == pytest.approx(
+            20 * np.log10(np.max(np.abs(x)) / 32768))
+
+
 def test_the_dc_blocker_round_trips_and_an_old_setting_reads_it_off():
     proc = StreamProcessing(highpass_hz=20.0, dc_block=True)
     assert StreamProcessing.from_json(proc.to_json()) == proc
     old = {"highpass_hz": 20.0, "gain_db": 0.0, "allow_clipping": False}   # a setting saved with no dc_block key
     assert StreamProcessing.from_json(old) == StreamProcessing(highpass_hz=20.0)
+
+
+def test_a_setting_that_only_allows_clipping_is_kept_and_leaves_the_samples():
+    x = _tone()
+    store = _store([x])
+    only = StreamProcessing(allow_clipping=True)
+    assert only.is_identity() and not only.is_default()
+    store.set_processing(1, 2, only)
+    assert np.array_equal(store.samples(1, 2, 0), x)
+    assert store.processing(1, 2) is None and store.setting(1, 2) == only
+    store.set_processing(1, 2, StreamProcessing())
+    assert store.setting(1, 2) is None

@@ -235,7 +235,7 @@ def test_a_saved_config_with_wrong_typed_values_reads_the_rest_and_reports_them(
     d["rows_to_draw"] = None
     d["row_rate_khz"] = float("inf")
     d["cds_drive_type"][3] = "x"
-    d["cds_guard"] = {}
+    d["cds_guard_enable"] = {}
     d["description"] = 5
     d["dataports"][0]["enabled"] = "x"
     d["dataports"][0]["horizontal_start"] = 1.5
@@ -251,7 +251,7 @@ def test_a_saved_config_with_wrong_typed_values_reads_the_rest_and_reports_them(
     assert cfg.rows_to_draw == defaults.rows_to_draw
     assert cfg.row_rate_khz == defaults.row_rate_khz
     assert cfg.cds_drive_type == defaults.cds_drive_type
-    assert cfg.cds_guard == defaults.cds_guard
+    assert cfg.cds_guard_enable == defaults.cds_guard_enable
     assert cfg.description == ""
     assert cfg.dataports[0].enabled is False and cfg.dataports[0].horizontal_start == 0
     assert cfg.dataports[1].interval == port.interval
@@ -263,6 +263,23 @@ def test_a_saved_config_with_wrong_typed_values_reads_the_rest_and_reports_them(
     for fragment in ("num_columns 'x'", "rows_to_draw None", "cds_drive_type[3] 'x'",
                      "dataports[0].enabled 'x'", "dataports[0].horizontal_start 1.5",
                      "dataports[3] 'not a port'"):
+        assert fragment in notes[0].message, fragment
+
+
+def test_a_bool_in_a_number_field_reads_as_its_default_and_is_reported():
+    """JSON true or false is not a number: num_columns, a port's interval and the row rate
+    each read their default and are named in the note."""
+    d = demo_config().to_dict()
+    d["num_columns"] = True
+    d["row_rate_khz"] = False
+    d["dataports"][0]["interval"] = True
+    with import_notes.collect() as notes:
+        cfg = BusConfig.from_dict(d, "ws.swi3s")
+    assert cfg.num_columns == BusConfig().num_columns
+    assert cfg.row_rate_khz == BusConfig().row_rate_khz
+    assert cfg.dataports[0].interval == DataPortConfig().interval
+    assert len(notes) == 1
+    for fragment in ("num_columns True", "row_rate_khz False", "dataports[0].interval True"):
         assert fragment in notes[0].message, fragment
 
 
@@ -414,7 +431,7 @@ def test_a_row_missing_from_the_file_is_reported_by_name():
     cfg, notes = _read([r for r in rows if r[0] not in ("DisplayFields", "ManagerDataport")])
     assert notes == ["2 rows are missing and take their defaults: ManagerDataport, "
                      "DisplayFields."]
-    legacy = [r for r in rows if r[0] != "CDS_TailWidthPerSource"] + [["CDS_TailWidth_REG", "1"]]
+    legacy = [r for r in rows if r[0] != "CDS_TailWidth_REG_PerSource"] + [["CDS_TailWidth_REG", "1"]]
     assert _read(legacy)[1] == []
 
 
@@ -517,21 +534,36 @@ def test_a_blank_or_absent_row_rate_reads_as_the_measured_rate_the_native_loader
         "1 row is missing and takes its default: RowRate."]
 
 
-def test_a_cds_guard_outside_off_g0_g1_in_a_saved_config_reads_as_the_default():
+def test_a_packed_cds_guard_outside_off_g0_g1_in_a_saved_config_reads_as_the_default():
     d = demo_config().to_dict()
+    del d["cds_guard_enable"], d["cds_guard_polarity"]
     d["cds_guard"] = [7, -1, 3, 0, 1, 2] + [0] * (CDS_NUM_SOURCES - 6)
     with import_notes.collect() as collected:
         cfg = BusConfig.from_dict(d, "ws")
-    assert cfg.cds_guard[:6] == [BusConfig().cds_guard[0]] * 3 + [0, 1, 2]
+    assert cfg.cds_guard_enable[:6] == [False] * 3 + [False, True, True]
+    assert cfg.cds_guard_polarity[:6] == [0] * 3 + [0, 0, 1]
     msgs = [n.message for n in collected]
     assert len(msgs) == 1
     assert all(f"cds_guard[{i}]" in msgs[0] for i in range(3))
-    assert BusConfig.from_csv_text(cfg.to_csv()).cds_guard == cfg.cds_guard
+    back = BusConfig.from_csv_text(cfg.to_csv())
+    assert (back.cds_guard_enable, back.cds_guard_polarity) == (
+        cfg.cds_guard_enable, cfg.cds_guard_polarity)
+
+
+def test_a_cds_guard_polarity_other_than_0_or_1_in_a_saved_config_reads_as_the_default():
+    d = demo_config().to_dict()
+    d["cds_guard_polarity"] = [2, -1, "x", 0, 1, True] + [0] * (CDS_NUM_SOURCES - 6)
+    with import_notes.collect() as collected:
+        cfg = BusConfig.from_dict(d, "ws")
+    assert cfg.cds_guard_polarity[:6] == [0, 0, 0, 0, 1, 1]
+    msgs = [n.message for n in collected]
+    assert len(msgs) == 1
+    assert all(f"cds_guard_polarity[{i}]" in msgs[0] for i in range(3))
 
 
 def test_a_saved_config_with_hostile_text_gives_short_warnings():
     d = demo_config().to_dict()
-    d["cds_guard"] = ["x" * 1_000_000] * CDS_NUM_SOURCES
+    d["cds_guard_polarity"] = ["x" * 1_000_000] * CDS_NUM_SOURCES
     for i in range(3000):
         d[f"unknown_{i}_" + "k" * 1000] = 1
     d["dataports"][0]["num_wide"] = 1
@@ -553,7 +585,7 @@ def _csv_rows(extra, drop=()):
 
 
 def test_a_blank_scalar_cds_drive_type_leaves_the_default():
-    text = _csv_rows([["CDS_DriveType", ""]], drop=("CDS_DriveTypePerSource",))
+    text = _csv_rows([["CDS_DriveType", ""]], drop=("CDS_DriveType_REG_PerSource",))
     with import_notes.collect() as notes:
         cfg = BusConfig.from_csv_text(text, "t.csv")
     assert cfg.cds_drive_type == [1] * 13
@@ -561,7 +593,7 @@ def test_a_blank_scalar_cds_drive_type_leaves_the_default():
 
 
 def test_a_scalar_cds_drive_type_broadcasts_to_every_source():
-    text = _csv_rows([["CDS_DriveType", "0"]], drop=("CDS_DriveTypePerSource",))
+    text = _csv_rows([["CDS_DriveType", "0"]], drop=("CDS_DriveType_REG_PerSource",))
     assert BusConfig.from_csv_text(text, "t.csv").cds_drive_type == [0] * 13
 
 
@@ -574,8 +606,8 @@ def test_a_config_csv_with_a_bom_reads_its_first_field(tmp_path):
 
 
 @pytest.mark.parametrize("key, per_source, value, default", [
-    ("CDS_TailWidth_REG", "CDS_TailWidthPerSource", "-2", [0] * 13),
-    ("CDS_DriveType", "CDS_DriveTypePerSource", "-2", [1] * 13)])    # -2 has low bits 2 and 0
+    ("CDS_TailWidth_REG", "CDS_TailWidth_REG_PerSource", "-2", [0] * 13),
+    ("CDS_DriveType", "CDS_DriveType_REG_PerSource", "-2", [1] * 13)])    # -2 has low bits 2 and 0
 def test_a_negative_legacy_scalar_cds_row_is_ignored_as_the_native_loader_ignores_it(
         tmp_path, key, per_source, value, default):
     rows = [r for r in _rows() if r[0] != per_source] + [[key, value]]
@@ -628,3 +660,97 @@ def test_config_csv_text_the_csv_module_rejects_raises_value_error_naming_the_so
             BusConfig.from_csv_text("AppVersion,1\nDescription," + "x" * 200 + "\n", "t.csv")
     finally:
         csv.field_size_limit(saved)
+
+
+@pytest.mark.parametrize("number", ["-1", "-5", "12", "40"])
+def test_a_device_number_naming_no_device_disables_the_port_as_the_native_loader_does(
+        number, tmp_path):
+    """DeviceNumber_REG outside 0..11 without the ManagerDataport flag: -1 is not the Manager
+    there. The port is disabled and the note is the native loader's."""
+    rows = _rows()
+    _row(rows, "DeviceNumber_REG")[1] = number
+    cfg, notes = _read(rows)
+    assert cfg.dataports[0].enabled is False
+    native = _native_notes(rows, tmp_path)
+    assert native and notes == native
+    assert native[0].startswith("DeviceNumber_REG names no device on the bus (0..11) for DP0")
+
+
+@pytest.mark.parametrize("cells", [None, 4])
+def test_an_absent_or_short_device_number_row_reads_device_0_in_both_engines(cells, tmp_path):
+    """No DeviceNumber_REG row, or one with fewer cells than ports: a port it does not cover
+    is on Device 0 and stays enabled, in BusConfig and in the native loader alike."""
+    rows = _rows()
+    zero = [list(r) for r in rows]
+    _row(zero, "DeviceNumber_REG")[1:] = ["0"] * (len(_row(zero, "DeviceNumber_REG")) - 1)
+    if cells is None:
+        rows.remove(_row(rows, "DeviceNumber_REG"))
+    else:
+        del _row(rows, "DeviceNumber_REG")[1 + cells:]
+        _row(rows, "DeviceNumber_REG")[1:] = ["0"] * cells
+    cfg, _notes = _read(rows)
+    want, _ = _read(zero)
+    flagged = [dp.device_number == -1 for dp in want.dataports]
+    assert [dp.device_number for dp in cfg.dataports] == \
+        [-1 if m else 0 for m in flagged] == [dp.device_number for dp in want.dataports]
+    assert [dp.enabled for dp in cfg.dataports] == [dp.enabled for dp in want.dataports]
+    assert any(dp.enabled and dp.device_number == 0 for dp in cfg.dataports)
+    paths = []
+    for name, content in (("got.csv", rows), ("zero.csv", zero)):
+        path = tmp_path / name
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(content)
+        paths.append(str(path))
+    assert swi3score.registers_from_csv(paths[0]) == swi3score.registers_from_csv(paths[1])
+    assert not any("names no device" in n for n in swi3score.csv_warnings(paths[0]))
+
+
+def test_a_flagged_manager_port_and_a_valid_device_number_are_not_reported():
+    rows = _rows()
+    _row(rows, "DeviceNumber_REG")[1] = "0"
+    _row(rows, "ManagerDataport")[1] = "True"
+    cfg, notes = _read(rows)
+    assert cfg.dataports[0].device_number == -1 and cfg.dataports[0].enabled is True
+    assert notes == []
+    _row(rows, "ManagerDataport")[1] = "False"
+    _row(rows, "DeviceNumber_REG")[1] = "11"
+    cfg, notes = _read(rows)
+    assert cfg.dataports[0].device_number == 11 and cfg.dataports[0].enabled is True
+    assert notes == []
+
+
+def test_ports_with_no_device_are_listed_and_a_port_without_channels_is_only_disabled(tmp_path):
+    rows = _rows()
+    for col in range(1, 7):                    # DP0..DP5 on devices 12..17
+        _row(rows, "Enabled")[col] = "True"
+        _row(rows, "EnableCh_REG")[col] = "1" if col < 6 else "0"
+        _row(rows, "DeviceNumber_REG")[col] = str(11 + col)
+    cfg, notes = _read(rows)
+    assert not any(dp.enabled for dp in cfg.dataports[:6])
+    assert notes == _native_notes(rows, tmp_path)
+    assert "for DP0 (12), DP1 (13), DP2 (14) and 2 more; those ports are disabled" in notes[0]
+
+
+def test_a_saved_config_with_a_device_number_naming_no_device_disables_the_port():
+    d = demo_config().to_dict()
+    d["dataports"][0]["device_number"] = 12
+    d["dataports"][1]["device_number"] = -1                # the in-memory Manager
+    with import_notes.collect() as notes:
+        cfg = BusConfig.from_dict(d, "ws")
+    assert cfg.dataports[0].enabled is False and cfg.dataports[1].device_number == -1
+    assert [n.message for n in notes] == [
+        "DeviceNumber_REG names no device on the bus (0..11) for DP0 (12); that port is "
+        "disabled and left out of the audio, the grid and the registers."]
+
+
+def test_an_unnamed_port_stays_unnamed_through_a_csv_save_and_load():
+    """to_csv writes "DP<slot>" for an unnamed port; reading it back gives no name, so the
+    chip reads 'DP<number>' (not '<number>·DP<slot>'). A name of "DP<number>" is no name
+    either, and a real name survives. (The chip text is pinned in test_dp_names.py.)"""
+    cfg = demo_config()
+    cfg.dataports[3] = DataPortConfig(dp_number=17)
+    cfg.dataports[4] = DataPortConfig(dp_number=9, name="DP9")
+    cfg.dataports[5] = DataPortConfig(dp_number=2, name="MicL")
+    back = BusConfig.from_csv_text(cfg.to_csv())
+    assert [back.dataports[i].name for i in (3, 4, 5)] == ["", "", "MicL"]
+    assert BusConfig.from_csv_text(back.to_csv()).to_dict() == back.to_dict()

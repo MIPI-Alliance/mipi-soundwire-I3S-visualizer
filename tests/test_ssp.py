@@ -83,6 +83,30 @@ def test_gui_exposes_ssp_controls():
     assert win._session.ssp_row == -1
 
 
+def test_ssp_steps_pressed_while_a_re_decode_runs_each_count():
+    """Three steps pressed before the first re-decode lands step from the row the latest
+    request sets, so the SSP lands three rows on; a step with nothing in flight steps from
+    the Session's row."""
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from conftest import pump_loads
+
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.load_demo()
+    win.set_ssp_row_async(5)
+    pump_loads(win)
+    assert win._session.ssp_row == 5
+    for _ in range(3):
+        win.step_ssp_row(+1)                      # the first runs, the others queue
+    assert win._load_thread is not None
+    pump_loads(win)
+    assert win._session.ssp_row == 8
+    win.step_ssp_row(-1)
+    pump_loads(win)
+    assert win._session.ssp_row == 7
+
+
 def test_ssp_redecode_keeps_audio_view():
     """Stepping the SSP must NOT re-show hidden tracks or reset the zoom — the user
     is watching one spot on one channel to judge sync."""

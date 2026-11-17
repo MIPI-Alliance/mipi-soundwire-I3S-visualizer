@@ -101,14 +101,24 @@ def measure_bus_timing(capture, *, segments=None, start_sample: int = 0,
     # Setup/hold, measured per data transition over the region: each transition sits
     # between two sample edges and contributes exactly one setup and one hold.
     #
-    # A transition d falls in the UI (clk[e-1], clk[e]] whose END sample edge is e (the
-    # edge that samples the new value). Its SETUP is that edge's margin (clk[e] - d, how
+    # A transition d falls in the UI [clk[e-1], clk[e]) whose END sample edge is e (the
+    # edge that samples the new value). A transition on a clock edge's own sample is not
+    # seen by that edge (the decoder reads the data line one sample before the edge), so it
+    # belongs to the next edge: hold 0, setup one UI. Its SETUP is that edge's margin (clk[e] - d, how
     # long the value was stable before it was sampled). Its HOLD is the PREVIOUS edge's
     # margin (d - clk[e-1], how long the old value was held after it was last sampled).
     # Both bounding edges must lie strictly inside the region (c0 < end_i < c1), which
     # excludes the handover UI at the boundary.
-    end_i = np.searchsorted(clk, dat, side="left")       # first sample edge >= d (UI end)
+    end_i = np.searchsorted(clk, dat, side="right")      # first sample edge > d (UI end)
     ok = (end_i >= c0 + 1) & (end_i <= min(c1, n) - 1)
+    # A transition is measured only inside a real UI: its bounding clock gap is at most 1.5
+    # times that clock phase's median, plus one sample. A longer gap is a clock pause, not a
+    # UI, and its margins have no meaning.
+    if clk_high > 0.0 and clk_low > 0.0:
+        ei = np.clip(end_i, 1, n - 1)
+        starts_high = initial_clock ^ (((ei - 1) & 1) == 0)    # edge ei-1 rose: clock high
+        phase = np.where(starts_high, clk_high, clk_low) / to_ns
+        ok &= (clk[ei] - clk[ei - 1]) <= 1.5 * phase + 1
     d, end_i = dat[ok], end_i[ok]
     start_i = end_i - 1
     setup = (clk[end_i] - d) * to_ns                     # data edge -> its sampling edge

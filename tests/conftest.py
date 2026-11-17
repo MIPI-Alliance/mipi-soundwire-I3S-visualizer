@@ -6,11 +6,25 @@ test process so loading one stays near-instant. Tests that need specific audio l
 call Session.from_demo(N) with an explicit N, which this does not affect.
 """
 import os
+import sys
 
+import perf_retry
 import pytest
+from perf_retry import pytest_runtest_call  # noqa: F401  (a hook: pytest registers it)
 
 os.environ.setdefault("SWI3S_DEMO_SAMPLES", "300")   # short demo for MainWindow.load_demo
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# Offscreen on Windows, Qt reads fonts only from its own fonts folder, which the PySide6 wheels
+# do not ship, so every glyph is a missing-glyph box and text measures as boxes. Point it at the
+# system's fonts, and resolve the offscreen default family to the one the native Windows
+# platform uses, so a layout test measures the text a Windows user sees.
+if sys.platform == "win32" and os.environ["QT_QPA_PLATFORM"] == "offscreen":
+    os.environ.setdefault("QT_QPA_FONTDIR",
+                          os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"))
+    from PySide6.QtGui import QFont  # noqa: E402
+
+    QFont.insertSubstitution("Sans Serif", "Segoe UI")
 
 # QSettings needs a non-empty organisation/application name to persist reliably on
 # Windows (its registry scope is keyed on them). The real app sets these in app.py, but
@@ -120,15 +134,17 @@ def _no_unexpected_modal():
 @pytest.fixture(autouse=True)
 def _fresh_settings():
     """Every test starts with no saved settings: the default appearance, waveform colours
-    and weights, folders. They are shared by the whole run, so one
+    and weights, Timing Diagrams settings, folders. They are shared by the whole run, so one
     test's saved choice (or one left behind by a failed assertion before its restore)
     would otherwise reach every test after it."""
-    from swi3s_studio.ui import line_style
+    from swi3s_studio.ui import diagram_style, line_style
     QSettings().clear()
     line_style.reset_cache()
+    diagram_style.reset_cache()
     yield
     QSettings().clear()
     line_style.reset_cache()
+    diagram_style.reset_cache()
 
 
 # The free memory every test sees unless it asks for the machine's own reading.
@@ -194,24 +210,55 @@ def _close_the_tests_windows(_no_unexpected_modal, _no_swallowed_slot_exception,
 
     A TimingView a test built on its own, with no parent, is deleted here too, the way Qt
     deletes a child; left to the collector below, one the test had clicked can segfault
-    (Python 3.13, PySide 6.11)."""
+    (Python 3.13, PySide 6.11).
+
+    Every QDialog the test built, shown or not (a non-modal window it opened, a dialog it
+    built and never closed), is closed and deleted before the windows: none survives into the
+    next test of the process. Dialogs are recorded as they are built, like the windows, so
+    ones built before the test began belong to a wider-scoped fixture and are left alone, and
+    so is one a wider-scoped window built during the test and caches (a dialog whose parent
+    chain ends in a MainWindow this test did not build).
+    A dialog Qt builds inside a static function is modal and caught by `_no_unexpected_modal`."""
+    from PySide6 import QtWidgets
+    from PySide6.QtWidgets import QDialog
     from shiboken6 import isValid
 
     from swi3s_studio.ui.main_window import MainWindow
     from swi3s_studio.ui.timing_view import TimingView
     made = []
     views = []
+    dialogs = []
 
     def recording(cls, into):
         build = cls.__init__
 
         def recording_init(self, *args, **kwargs):
             build(self, *args, **kwargs)
-            into.append(self)
+            if not any(self is seen for seen in into):
+                into.append(self)
         monkeypatch.setattr(cls, "__init__", recording_init)
     recording(MainWindow, made)
     recording(TimingView, views)
+    # QDialog and each dialog class Qt itself defines (QMessageBox, QFileDialog, ...), whose
+    # constructors do not pass through QDialog's; a Python subclass reaches one of them.
+    for cls in [QDialog] + [c for c in vars(QtWidgets).values()
+                            if isinstance(c, type) and c is not QDialog and issubclass(c, QDialog)]:
+        recording(cls, dialogs)
+    def owned_by_an_older_window(dialog):
+        top = dialog.parentWidget()
+        while top is not None and top.parentWidget() is not None:
+            top = top.parentWidget()
+        return isinstance(top, MainWindow) and not any(top is w for w in made)
     yield
+    for d in dialogs:
+        if not isValid(d) or owned_by_an_older_window(d):
+            continue
+        try:
+            d.close()
+            d.deleteLater()
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            pass
+    dialogs.clear()
     for w in made:
         if not isValid(w):
             continue
@@ -263,6 +310,85 @@ def no_toggle_ceiling(monkeypatch):
     monkeypatch.setattr(calculator, "toggle_ceiling_MHz", lambda inp: math.inf)
 
 
+class SharedCompute:
+    """A Timing calculator function of one input, `compute` or the corner search's
+    `_leg_margins`, with a memo held for one test module: an input the module evaluated before
+    is read back, the least recently used dropped past `MAX`. Results are shared, so no test
+    changes one. Off (`enabled` False) the real function runs. With
+    $SWI3S_SHARED_COMPUTE_AUDIT set, every read is evaluated again and must equal the result
+    held. The memo is read and written under a lock, as the Timing page's worker thread calls
+    it too."""
+    MAX = 4096
+    hits = misses = 0               # every instance's reads, for a report on the memo
+
+    def __init__(self, real):
+        import collections
+        import threading
+        self.real = real
+        self.memo = collections.OrderedDict()
+        self._lock = threading.Lock()
+        self.enabled = True
+        self.audit = bool(os.environ.get("SWI3S_SHARED_COMPUTE_AUDIT"))
+
+    def __call__(self, inp):
+        if not self.enabled:
+            return self.real(inp)
+        key = inp
+        with self._lock:
+            held = self.memo.get(key)
+            if held is not None:
+                SharedCompute.hits += 1
+                self.memo.move_to_end(key)
+        if held is None:
+            held = self.real(inp)
+            with self._lock:
+                SharedCompute.misses += 1
+                held = self.memo.setdefault(key, held)
+                if len(self.memo) > self.MAX:
+                    self.memo.popitem(last=False)
+        elif self.audit:
+            assert self.real(inp) == held, f"compute is not a function of its input: {inp}"
+        return held
+
+
+@pytest.fixture(scope="module")
+def shared_compute():
+    """For a module that requests it (`pytest.mark.usefixtures("shared_compute")`), the
+    calculator's `compute` is a `SharedCompute`, and so is the Timing page's binding of it
+    in each test that runs with the page's module loaded (`_shared_compute_per_test`); the
+    corner search's `_leg_margins` is another, its `margins`."""
+    from swi3s_studio.timing import calculator
+    shared = SharedCompute(calculator.compute)
+    shared.margins = SharedCompute(calculator._leg_margins)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(calculator, "compute", shared)
+        mp.setattr(calculator, "_leg_margins", shared.margins)
+        yield shared
+
+
+@pytest.fixture(autouse=True)
+def _shared_compute_per_test(request):
+    """In a module with `shared_compute`: a test whose function takes `monkeypatch`, or that
+    uses `no_toggle_ceiling`, runs with it off, so a test that replaces calculator code
+    computes every input afresh; and the Timing page's module, once imported, calls it too.
+    (`monkeypatch` is in every test's fixtures through the autouse fixtures above, so the
+    test function's own parameters decide.)"""
+    import inspect
+    if "shared_compute" not in request.fixturenames:
+        yield
+        return
+    shared = request.getfixturevalue("shared_compute")
+    own = inspect.signature(request.function).parameters
+    shared.enabled = shared.margins.enabled = (
+        "monkeypatch" not in own and "no_toggle_ceiling" not in request.fixturenames)
+    with pytest.MonkeyPatch.context() as mp:
+        page = sys.modules.get("swi3s_studio.ui.timing_view")
+        if page is not None:
+            mp.setattr(page, "compute", shared)
+        yield
+    shared.enabled = shared.margins.enabled = True
+
+
 def pump_loads(win, seconds: float = 120.0) -> None:
     """Run the event loop until `win` has no decode running or queued, failing if that
     takes longer than `seconds` (a load that never finishes is reported as itself, not as
@@ -292,7 +418,7 @@ def record_perf(name: str, median: float, ceiling: float,
     _PERF_MARGINS.append((name, median, ceiling, worst, worst_ceiling))
 
 
-def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG001
+def _perf_margins_summary(terminalreporter):
     if not _PERF_MARGINS:
         return
     import platform
@@ -305,6 +431,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG0
         tr.write_line(f"{name}: median {median * 1000:.0f} / {ceiling * 1000:.0f} ms "
                       f"({median / ceiling:.0%}), worst {worst * 1000:.0f} / "
                       f"{worst_ceiling * 1000:.0f} ms ({worst / worst_ceiling:.0%})")
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    _perf_margins_summary(terminalreporter)
+    perf_retry.pytest_terminal_summary(terminalreporter, exitstatus, config)
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
@@ -471,10 +602,30 @@ def load_tool(name: str):
     return mod
 
 
+def current_notes_path() -> str:
+    """The release notes this checkout is written for: docs/releases/next.md during a cycle,
+    and at a release commit, which renames it, docs/releases/v<__version__>.md."""
+    from swi3s_studio import __version__
+    releases = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "docs", "releases")
+    nxt = os.path.join(releases, "next.md")
+    return nxt if os.path.exists(nxt) else os.path.join(releases, f"v{__version__}.md")
+
+
+def current_notes() -> str:
+    """current_notes_path()'s text, its whitespace runs read as one space."""
+    with open(current_notes_path(), encoding="utf-8") as f:
+        return " ".join(f.read().split())
+
+
 # ---------------------------------------------------------------- throwaway git repositories
 # The environment under which git reads none of the machine's own configuration (signing,
 # hooks, line-end conversion, default branch, path quoting).
-ISOLATED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+# Isolated git reads no configuration, so it has no user identity: one is given here, or a commit
+# fails wherever git cannot make one up from the host name.
+ISOLATED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 # The variables that point git at a repository other than the one its directory is in, which
 # a git hook running the suite sets. Each is removed, so git works on the throwaway one.
 _GIT_REPOSITORY_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -544,6 +695,20 @@ def publish_release_repo(repo, tool, app: dict) -> tuple[str, str, str]:
 
 
 _PROTECTS = {"gui", "platform", "perf"}
+# Core test files the platform scope runs whole besides the `gui` and `platform` tests, one per
+# area, so each platform still decodes, replays registers, times and parses on its own
+# interpreter. Their tests carry the `smoke` marker (pytest_collection_modifyitems).
+CORE_SMOKE = ("tests/test_swi3score.py", "tests/test_register_model.py",
+              "tests/test_timing_vs_reference.py", "tests/test_ingest_formats.py",
+              "tests/test_regmap_import.py", "tests/test_publish_sync.py")
+# The platform scope's -m expression, tools/gate.py's _GUEST_SCOPE: the guest gate and CI's
+# platform jobs run it (docs/TESTING.md §1.1).
+PLATFORM_SCOPE = "(gui or platform or smoke) and not perf"
+
+
+def platform_scope(config) -> bool:
+    """Whether this run is the platform scope: its -m expression is `PLATFORM_SCOPE`."""
+    return (config.getoption("markexpr", "") or "").strip() == PLATFORM_SCOPE
 
 
 # The longest test id the suite accepts. pytest puts the id in the PYTEST_CURRENT_TEST
@@ -554,7 +719,7 @@ MAX_TEST_ID = 1000
 
 def pytest_collection_modifyitems(config, items):
     """A test marked none of gui, platform or perf is core (docs/TESTING.md §1.1), so
-    `-m core` selects it. A test id longer than `MAX_TEST_ID` stops the run at collection,
+    `-m core` selects it, and a test in a `CORE_SMOKE` file is smoke. A test id longer than `MAX_TEST_ID` stops the run at collection,
     naming the test."""
     long_ids = [item.nodeid for item in items if len(item.nodeid) > MAX_TEST_ID]
     if long_ids:
@@ -564,6 +729,8 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if not _PROTECTS & {m.name for m in item.iter_markers()}:
             item.add_marker(pytest.mark.core)
+        if item.nodeid.split("::", 1)[0] in CORE_SMOKE:
+            item.add_marker(pytest.mark.smoke)
 
 
 _SNR_WINDOW = 4096

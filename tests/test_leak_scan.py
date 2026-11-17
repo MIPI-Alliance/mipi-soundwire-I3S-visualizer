@@ -137,6 +137,24 @@ def test_a_missing_text_file_is_refused_not_read_as_empty():
     assert "no leaks found" not in r.stdout
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_a_text_file_holding_a_home_path_is_reported_with_its_line(tmp_path, encoding):
+    """`--text=` reads a file the way a tree scan does, so UTF-16 text (a PowerShell
+    redirect) is searched as text, not as NUL-interleaved characters."""
+    f = tmp_path / "description.txt"
+    f.write_bytes("release notes\nbuilt in /Users/alice/work\n".encode(encoding))
+    r = _run(f"--text={f}")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"{f}:2:" in r.stdout and "/Users/alice" in r.stdout, r.stdout
+
+
+def test_a_clean_text_file_passes(tmp_path):
+    f = tmp_path / "description.txt"
+    f.write_bytes("release notes\nnothing private here\n".encode("utf-16"))
+    r = _run(f"--text={f}")
+    assert r.returncode == 0 and "no leaks found" in r.stdout, r.stdout + r.stderr
+
+
 def test_the_scanner_scans_its_own_prose_for_site_patterns():
     """The self-exemption is per pattern KIND, not per file.
 
@@ -277,6 +295,66 @@ def test_an_empty_pattern_file_is_reported_as_covering_nothing(tmp_path):
     r = subprocess.run([sys.executable, str(dest / "tools" / "leak_scan.py")], cwd=dest,
                        capture_output=True, text=True, env=env)
     assert "0 site-specific" in r.stdout and "holds NO patterns" in r.stdout, r.stdout
+
+
+def _scan_tree_with_patterns(tmp_path, patterns: bytes, files: dict[str, str]):
+    """Run the scanner over a tree of `files` with a site-pattern file holding `patterns`."""
+    import shutil
+    tree = tmp_path / "scanned"
+    shutil.rmtree(tree, ignore_errors=True)
+    for rel, body in files.items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(body, encoding="utf-8")
+    pats = tmp_path / "patterns.txt"
+    pats.write_bytes(patterns)
+    env = dict(os.environ, SWI3S_LEAK_PATTERNS=str(pats))
+    return subprocess.run([sys.executable, os.path.join(_ROOT, "tools", "leak_scan.py"),
+                           f"--tree={tree}"], capture_output=True, text=True, env=env)
+
+
+def test_a_byte_order_mark_in_the_pattern_file_does_not_disable_its_first_line(tmp_path):
+    """An editor's UTF-8 byte-order mark is not part of the first pattern: a leading comment
+    is still a comment, a leading `published-only:` line still takes its prefix, and a leading
+    pattern still matches."""
+    mark, tier = b"\xef\xbb\xbf", _load()._INTERNAL_TIER
+    commented = _scan_tree_with_patterns(tmp_path, mark + b"# a comment\n",
+                                         {"a.md": "the zzqq-host machine\n"})
+    assert "0 site-specific" in commented.stdout and "holds NO patterns" in commented.stdout
+    leading = _scan_tree_with_patterns(tmp_path, mark + b"zzqq-host\n",
+                                       {"a.md": "the zzqq-host machine\n"})
+    assert leading.returncode == 1 and "zzqq-host" in leading.stdout, leading.stdout
+    prefixed = _scan_tree_with_patterns(tmp_path, mark + b"published-only:zzqq-host\n",
+                                        {tier + "n.md": "the zzqq-host machine\n"})
+    assert prefixed.returncode == 0 and "no leaks found" in prefixed.stdout, prefixed.stdout
+
+
+def test_a_site_pattern_reaches_the_scanners_own_files(tmp_path):
+    """The scanner and its test hold the structural patterns as source and are exempt from
+    those only: a site pattern written in either is a hit."""
+    got = _scan_tree_with_patterns(tmp_path, b"zzqq-host\n", {
+        "tools/leak_scan.py": "# the zzqq-host machine\n",
+        "tests/test_leak_scan.py": "# the zzqq-host machine\n"})
+    assert got.returncode == 1, got.stdout
+    assert "tools/leak_scan.py:1" in got.stdout and "tests/test_leak_scan.py:1" in got.stdout
+
+
+def test_a_published_only_pattern_holds_in_published_paths_and_not_in_the_internal_tier(tmp_path):
+    """A `published-only:` pattern matches the content and the name of a file that is
+    published, and neither in the internal tier, which is pruned before publishing; every
+    other pattern applies there too."""
+    pats = b"published-only:zzqq-vendor\n"
+    tier = _load()._INTERNAL_TIER
+    internal = _scan_tree_with_patterns(tmp_path, pats, {
+        tier + "note.md": "a zzqq-vendor capture\n",
+        tier + "zzqq-vendor.md": "text\n", "a.md": "text\n"})
+    assert internal.returncode == 0 and "no leaks found" in internal.stdout, internal.stdout
+    other = _scan_tree_with_patterns(tmp_path, pats + b"zzqq-host\n",
+                                     {tier + "note.md": "the zzqq-host machine\n"})
+    assert other.returncode == 1, "an ordinary site pattern still applies in the internal tier"
+    in_content = _scan_tree_with_patterns(tmp_path, pats, {"docs/a.md": "a zzqq-vendor capture\n"})
+    assert in_content.returncode == 1 and "docs/a.md:1" in in_content.stdout, in_content.stdout
+    in_name = _scan_tree_with_patterns(tmp_path, pats, {"docs/zzqq-vendor.md": "text\n"})
+    assert in_name.returncode == 1 and "IN THE FILE NAME" in in_name.stdout, in_name.stdout
 
 
 # --------------------------------------------------------------- symlinks and --tree=DIR

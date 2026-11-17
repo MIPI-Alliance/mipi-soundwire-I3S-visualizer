@@ -313,14 +313,15 @@ def test_an_unterminated_block_is_reported_by_its_keyword_once(tmp_path):
     assert len(open_notes) == 1 and "$comment block has no $end" in open_notes[0]
 
 
-def test_a_dump_on_one_line_is_read_in_steps(tmp_path, monkeypatch):
+@pytest.mark.parametrize("native", [True, False])
+def test_a_dump_on_one_line_is_read_in_steps(tmp_path, monkeypatch, native):
     changes = " ".join(f"#{t} {t % 2}!" for t in range(1, 40001))
     p = tmp_path / "flat.vcd"
     p.write_text(_VCD_HEAD.replace("\n", " ") + "#0 0! 0% " + changes + "\n", encoding="utf-8")
     assert len(p.read_text(encoding="utf-8").splitlines()) == 1
     step = 1024
     reads = []
-    real = vcd._tokens
+    real_open = open
 
     class _Spy:
         def __init__(self, f):
@@ -331,13 +332,50 @@ def test_a_dump_on_one_line_is_read_in_steps(tmp_path, monkeypatch):
             reads.append((n, len(got)))
             return got
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.f.__exit__(*exc)
+
+    if not native:
+        monkeypatch.setattr(vcd, "_NATIVE", None)
     monkeypatch.setattr(vcd, "_READ_CHARS", step)
-    monkeypatch.setattr(vcd, "_tokens", lambda f: real(_Spy(f)))
+    monkeypatch.setattr(vcd, "_READ_BYTES", step)
+    monkeypatch.setattr(vcd, "_NATIVE_READ_BYTES", step)
+    monkeypatch.setattr(vcd, "open", lambda *a, **k: _Spy(real_open(*a, **k)), raising=False)
     cap = vcd.load_capture(str(p), "!", "%")
     assert cap.clock_edges.size == 40000
     assert cap.clock_edges.tolist() == list(range(1, 40001))
     assert len(reads) > 100                          # many steps, not one read of the file
     assert all(n == step and got <= step for n, got in reads)
+
+
+def test_the_value_changes_are_read_by_the_native_scanner(tmp_path, monkeypatch):
+    """The module routes through swi3score.VcdScanner when the loaded core has it; the
+    NumPy reader (`_scan`) is not reached."""
+    import swi3score
+    assert vcd._NATIVE is swi3score.VcdScanner
+
+    def no_array_reader(*_a, **_k):
+        raise AssertionError("the NumPy reader was used")
+
+    monkeypatch.setattr(vcd, "_scan", no_array_reader)
+    cap, _notes = _load_text(tmp_path, "#0\n0!\n0%\n#10\n1!\n#20\n1%\n")
+    assert cap.clock_edges.tolist() == [10] and cap.data_edges.tolist() == [20]
+    assert vcd.transition_counts_until(str(tmp_path / "t.vcd")) == ({"!": 1, "%": 1}, False, 20)
+
+
+def test_without_the_native_scanner_the_numpy_reader_reads_the_value_changes(tmp_path,
+                                                                              monkeypatch):
+    monkeypatch.setattr(vcd, "_NATIVE", None)
+    used = []
+    real = vcd._scan
+    monkeypatch.setattr(vcd, "_scan", lambda *a: used.append(1) or real(*a))
+    cap, _notes = _load_text(tmp_path, "#0\n0!\n0%\n#10\n1!\n#20\n1%\n")
+    assert cap.clock_edges.tolist() == [10] and cap.data_edges.tolist() == [20]
+    assert vcd.transition_counts_until(str(tmp_path / "t.vcd")) == ({"!": 1, "%": 1}, False, 20)
+    assert len(used) == 2
 
 
 def test_a_token_that_straddles_a_read_step_is_not_split(tmp_path):

@@ -22,10 +22,10 @@ for a in "$@"; do
     app_args+=("$a")
 done
 
-# Pick a Python the launcher supports: 3.11-3.13, where every platform has PySide6 /
+# Pick a Python the launcher supports: 3.11-3.15, where every platform has PySide6 /
 # pyarrow / numpy wheels. Honour a PYTHON override, else prefer the newest supported
 # interpreter on PATH.
-supported() { "$1" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)' 2>/dev/null; }
+supported() { "$1" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,15) else 1)' 2>/dev/null; }
 
 # Does this interpreter have the C API headers (Python.h)? The decode core is C++, so a
 # build needs them — and they're a separate package on most Linux distros. sysconfig
@@ -73,23 +73,23 @@ EOF
 PY="${PYTHON:-}"
 if [ -n "$PY" ]; then
     if ! supported "$PY"; then
-        echo "PYTHON=$PY is not in the supported 3.11-3.13 range ($("$PY" --version 2>&1))." >&2
+        echo "PYTHON=$PY is not in the supported 3.11-3.15 range ($("$PY" --version 2>&1))." >&2
         exit 1
     fi
 else
     # Two passes: prefer a supported interpreter that also has the headers, else fall back
     # to version-only (the module may already be built, in which case no build is needed).
-    for c in python3.13 python3.12 python3.11 python3; do
+    for c in python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$c" >/dev/null 2>&1 && supported "$c" && has_headers "$c"; then PY="$c"; break; fi
     done
     if [ -z "$PY" ]; then
-        for c in python3.13 python3.12 python3.11 python3; do
+        for c in python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
             if command -v "$c" >/dev/null 2>&1 && supported "$c"; then PY="$c"; break; fi
         done
     fi
 fi
 if [ -z "$PY" ]; then
-    echo "Need Python 3.11-3.13 (the versions this launcher supports). Install one and re-run, or set PYTHON=/path/to/python3.12" >&2
+    echo "Need Python 3.11-3.15 (the versions this launcher supports). Install one and re-run, or set PYTHON=/path/to/python3.12" >&2
     exit 1
 fi
 
@@ -126,6 +126,20 @@ if [ ! -f "$STAMP" ] || [ requirements.txt -nt "$STAMP" ]; then
     python -m pip install -r requirements.txt
     touch "$STAMP"
     installed_deps=1
+fi
+
+# Under PYTHONPATH=. a decode core at the checkout root (native/build_local.sh, which the
+# gate runs) is imported instead of the venv's. One that cannot load stops the launch here:
+# rebuilding the venv's copy cannot help while it is there, and the probe below would rebuild
+# on every run.
+root_core=$(python -c 'import sysconfig; print("swi3score" + sysconfig.get_config_var("EXT_SUFFIX"))')
+if [ -e "$root_core" ] && ! root_err=$(PYTHONPATH=. python -c 'import swi3score' 2>&1); then
+    echo "Cannot load ./$root_core from the checkout root:" >&2
+    echo "  $(printf '%s\n' "$root_err" | tail -n 1)" >&2
+    echo "The app imports it before the venv's build, so it cannot start while it is there." >&2
+    echo "Delete it:   rm ./$root_core" >&2
+    echo "or rebuild:  bash native/build_local.sh" >&2
+    exit 1
 fi
 
 # Build the native decode core when it's missing, out of date, or --rebuild was asked
@@ -178,9 +192,7 @@ else
     echo "Starting SWI3S Studio..."
 fi
 
-# Under PYTHONPATH=. a decode core built at the checkout root (native/build_local.sh, which
-# the gate runs) is imported instead of the venv's. Name it so a stale one is noticed.
-root_core=$(python -c 'import sysconfig; print("swi3score" + sysconfig.get_config_var("EXT_SUFFIX"))')
+# A root decode core that loads is used; name it so a stale one is noticed.
 if [ -e "$root_core" ]; then
     echo "Note: using ./$root_core from the checkout root, not the venv's build." >&2
     echo "  After a native/ change, rebuild it with: bash native/build_local.sh (or delete it)." >&2

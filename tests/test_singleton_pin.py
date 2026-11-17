@@ -125,3 +125,10 @@ def test_the_pin_is_made_with_the_collector_off_and_leaves_it_as_it_was():
         assert during == [False, False], during                        # off while it wrote
         print("ALIVE", flush=True)
     """))
+
+
+def test_the_module_says_it_pins_on_every_platform_not_only_linux():
+    """The pin tests the interpreter, not the platform, and its documentation says so."""
+    title = singleton_pin.__doc__.splitlines()[0]
+    assert "Linux" not in title and "every platform" in title
+    assert "does not test the\nplatform" in singleton_pin.__doc__

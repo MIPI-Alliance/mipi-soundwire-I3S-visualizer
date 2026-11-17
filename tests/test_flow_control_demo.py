@@ -16,7 +16,7 @@ to the generated sine.
 
 It also pins the mid-phase framing lock: a K.28.7 SPM pattern that appears by chance
 inside a Write payload/CRC byte must NOT re-frame or abandon the in-progress phase
-(SWI3S v1.1 §7.2.2 {ASW1907}: hold symbol alignment by counting bits mod 10 mid-phase;
+(the SWI3S specification §7.2.2 {ASW1907}: hold symbol alignment by counting bits mod 10 mid-phase;
 §8.2.1 {ASW2206}: a mid-phase SPM only ARMS header detection). dev1's
 WriteA32(0x2090, 0x60) forms such a pattern.
 
@@ -25,12 +25,12 @@ to its generator; a config CSV keeps the FlowControlDelay and FCP_ScramblerEn re
 decoded DRQ bit is read on its last UI, whether the bit is wide or cut short by the row
 edge; drq_sample marks the DRQ that permitted each sample.
 """
-import math
 import os
 from collections import defaultdict
 
 import pytest
 import swi3score
+from demo_samples import sine_at
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FIXTURES = os.path.join(_HERE, "fixtures")
@@ -48,10 +48,7 @@ _FLOW_RATE_HZ = 48000.0
 
 def _flow_expected(device: int, channel: int, index: int) -> int:
     """Regenerate the demo's uniform 48 kHz sine sample (mirrors Demo.cpp sineAt)."""
-    amp = (1 << _FLOW_SS) * 0.45
-    freq = _FLOW_FREQ[(device, channel)]
-    v = int(round(amp * math.sin(2.0 * math.pi * freq * index / _FLOW_RATE_HZ)))
-    return v & ((1 << (_FLOW_SS + 1)) - 1)
+    return sine_at(_FLOW_FREQ[(device, channel)], _FLOW_RATE_HZ, index, _FLOW_SS)
 
 
 def _decode_flow(samples_per_channel: int = 200, fcp_scrambled: bool = False):

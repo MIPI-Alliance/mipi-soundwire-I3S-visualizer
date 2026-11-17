@@ -139,6 +139,52 @@ def test_a_scrambled_channel_keeps_its_lfsr_across_an_sscr():
     assert reseeded[cut // 16] != values[cut // 16]
 
 
+def _descrambler_state(received, seed=0x154, no_toggle=16):
+    """The (LFSR register Q8..Q0, No-Toggle state) `_descramble` ends in after `received`."""
+    q, run = seed, 0
+    for r in received:
+        toggled = r ^ ((q >> 8) & 1)
+        q = ((q >> 1) | (r << 8)) & 0x1FF
+        if run == no_toggle:
+            run = 0 if toggled else 1
+        else:
+            run = 0 if toggled else run + 1
+    return q, run
+
+
+def test_a_checkpoint_carries_the_full_decodes_descrambler_state():
+    """Each transport checkpoint a windowed re-decode restores from holds, for every channel
+    of every port, the descrambler state of the full decode at that UI: the independent
+    descrambler run over the channel's wire bits before the checkpoint for a scrambled
+    port, the seed for an unscrambled one."""
+    levels, dec = _demo(300, collect_bit_samples=True)
+    bits = dec.bit_samples()
+    wire = np.asarray(levels, dtype=np.uint8)
+    scrambled = {(p["device_number"], p["dp_number"])
+                 for p in dec.config_dataports()["dataports"] if p["scrambler_en"]}
+    assert scrambled, "test premise: the demo has a scrambled port"
+    carried = no_toggle = 0
+    checkpoints = dec.checkpoint_descramblers()
+    assert len(checkpoints) >= 3
+    for cp in checkpoints:
+        cut = (cp["ui"] + 1) * _SAMPLES_PER_UI           # the checkpoint UI's sample
+        for port in cp["ports"]:
+            for ch, got in enumerate(port["channels"]):
+                mine = ((bits["device"] == port["device"]) & (bits["dp"] == port["dp"])
+                        & (bits["channel"] == ch) & (bits["sample"] < cut))
+                received = [int(v) for v in wire[(bits["sample"][mine] // _SAMPLES_PER_UI
+                                                  - 2).astype(np.int64)]]
+                if (port["device"], port["dp"]) in scrambled:
+                    want = _descrambler_state(received)
+                else:
+                    want = (0x154, 0)
+                assert got == want, (cp["ui"], port["device"], port["dp"], ch)
+                if received and (port["device"], port["dp"]) in scrambled:
+                    carried += 1
+                    no_toggle += got[1] != 0
+    assert carried >= 4 and no_toggle >= 1, "test premise: running LFSRs are carried"
+
+
 def test_the_no_toggle_rule_inverts_the_bit_after_sixteen_unchanged_bits():
     """The demo's dp0 is sent unscrambled, and its wire holds runs that set the No-Toggle
     detector off. Decoded with ScramblerEn forced on, every value equals the independent

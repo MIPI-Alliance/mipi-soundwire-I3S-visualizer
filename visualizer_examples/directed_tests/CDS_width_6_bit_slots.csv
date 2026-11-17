@@ -1,4 +1,4 @@
-AppVersion,3.2.0
+AppVersion,3.3.0
 NumColumns_REG,23
 SkippingDenominator_REG,16
 PHY3Enabled,False
@@ -10,11 +10,11 @@ EnforceCDSHandover,False
 RowRate,3072.0
 Description,Checking CDS with a width of six bit slots.
 RowsToDraw,2
-CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
-CDS_GuardPolarityPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
-CDS_TailWidthPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
-CDS_DriveTypePerSource,1,1,1,1,1,1,1,1,1,1,1,1,1
-CDS_EndDriveEarlyPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_GuardEnable_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_GuardPolarity_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_TailWidth_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_DriveType_REG_PerSource,1,1,1,1,1,1,1,1,1,1,1,1,1
+CDS_EndDriveEarly_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
 DeviceNumber_REG,0,0,0,0,0,0,0,0,0,0,0,0
 ManagerDataport,False,False,False,False,False,False,False,False,False,False,False,False
 EnableCh_REG,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0,0b0

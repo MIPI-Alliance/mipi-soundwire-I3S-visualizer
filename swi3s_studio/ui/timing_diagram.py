@@ -4,8 +4,11 @@
 `timing.timeline.LegTimeline` (the Timing view's two columns, stacked, or side by side with
 `set_side_by_side`), each at the corner the calculator found worst for that
 inequality. A panel shows only what the term connects:
-- the ramps the term's span names (`Span.view`), one row per signal at each pin, named
-  "Clk @ Peripheral" or "Data @ Manager" in its edges' colour over the driver's V_DD label,
+- the ramps the term's span names (`Span.view`), and a clock's other edges at its pin within
+  the panel's time window, one row per signal at each pin, named
+  "Clk @ Peripheral" or "Data @ Manager" in its first edge's colour over the driver's V_DD
+  label, a data edge in the colour of the device driving it (`_ink`: the Manager, a
+  Peripheral or Peripheral A, Peripheral B), at every pin it is seen,
   each edge drawn as the curve the calculator models (linear or exponential) at its own t_RF,
   from the driver's ground (solid) to its rail;
 - the level each of the term's ends is measured at, as a line: a clock reference or a
@@ -19,15 +22,16 @@ inequality. A panel shows only what the term connects:
   where a receiver's offset ground takes the right half; the receiver's V_DD across the right
   half; each V_DD and an offset ground labelled as a percentage of nominal;
 - a driver's state on its trace: solid while it drives, dotted while it is high-Z (after a
-  release, and before a turn-on), labelled "high-Z"; a level held through the leg is drawn
+  release in the releasing driver's colour, and before a turn-on in the colour of the device
+  that last drove the wire, the other device on a handover and the releaser on contention),
+  labelled "high-Z"; a level held through the leg is drawn
   flat across the row;
 - a ramp's 80 % point as a level line like an anchor's, a release as a tick across the trace,
   and the keeper having followed as a labelled point;
 - the term as a dimensioned span with its length in ns, and below it, dim, the intervals the
   span's `guides` name (the margin beside a setup or hold window, a release, a turn-on or a
-  keeper's response), over a time axis in ns from the term's start. The margin is green where
-  it is a gap and red where it is short, labelled "overlap" on a contention leg and "short" on
-  a keeper leg. A point on no drawn ramp is a dashed line, labelled but for a deadline, which
+  keeper's response), over a time axis in ns from the term's start. The margin is labelled
+  "margin" on every leg, green where it is a gap and red where it is negative. A point on no drawn ramp is a dashed line, labelled but for a deadline, which
   the window drawn to it names.
 A span with no ramps (a flight mismatch) is drawn as its guides alone: each an arrow from its
 start to its end in its signal's colour, labelled with its length, and the term between the
@@ -36,7 +40,7 @@ A row is scaled to the levels it draws, from the lowest ground to the highest ra
 EVERY TEXT IS PLACED CLEAR OF EVERY OTHER TEXT AND EVERY DRAWN LINE, INSIDE ITS PANEL'S PLOT.
 A panel draws its lines first, then its text in order: the labels of points on no drawn ramp
 (`_strip`), the dimensions' and the axis's labels, then each row's. Each label takes the
-first spot of a fixed sequence whose box lies within the plot and, grown by `_PAD`, meets no
+first spot of a fixed sequence whose box lies within the plot and, grown by `_pad`, meets no
 line, dot or text box already drawn (`_put`):
 - a level's label: its line's end (the driver's at the left, the receiver's at the right, a
   bound at the centre) on its side (away from where the edge rests at that end), slid along
@@ -50,10 +54,17 @@ line, dot or text box already drawn (`_put`):
 A label no spot of its sequence frees is placed on a grid around its anchor, nearest first,
 with a leader line. The spots with no leader are tried before any with one, first clear of
 the guides (the dotted and dashed lines from a point down to the dimension lines), then over
-them; a guide is drawn last, broken behind any label placed over it. Every label is rich
+them, stage by stage or, where `_over_guides` does not hold, only once no stage has a spot
+clear of them; a guide is drawn last, broken behind any
+label placed over it. Every label is rich
 text, its symbols subscripted (V_DD, Man_t_DD) as in the heading.
-A widget given to `set_corner_widget` sits at the top right; a double-click emits
-`doubleClicked`. `set_shown_column` draws one column alone, in either layout.
+A widget given to `set_corner_widget` sits at the top right, and the leg's title wraps at the
+width left of it (`_title_w`), so the title is never cut off or drawn under it; where the
+title wraps onto more lines there than at the full width, it goes below the widget at the full
+width instead (`_title_below`); a double-click emits `doubleClicked`. `set_shown_column` draws one column alone, in either layout.
+While `set_pending` holds (a recompute runs), the diagram keeps its panels and its size but
+draws only the leg's title and "Computing…" in their place, so no number is drawn from a
+corner the recompute replaces.
 A term the leg holds more than once (P→M's two flights) gets one panel per occurrence; a
 launch and its SoundWire anchor correction are one panel, as they chain, each span on its
 own dimension line. A panel's heading names its terms and their total: a span running
@@ -65,39 +76,68 @@ taller pane draws taller edges. A row is never shorter than the first of `_ROW_S
 every label finds a free position with no leader line, else the step with the fewest labels
 short of one (`_row_floor`), and the diagram's minimum height reserves it.
 
-Every line's width is a fixed fraction of the font's line height (`_W_TRACE` and its
-siblings), so the strokes keep their weight against the text at any font size. The labels
-are the body font in demi-bold (smaller in a column too narrow for them, `_LABEL_FULL_W`),
-the panel heading and the leg's title larger and bold, and the corner note smaller.
+Every pen, brush, font and size is read from `diagram_style` at paint time: a line's
+colour (per theme), weight and dash, the arrowheads, dots and ticks, and each text class's
+font. A weight or a size is a fraction of the font's line height, so the strokes keep their
+weight against the text at any font size, and a font's size is a multiple of the body font
+(the widget's). Labels in a column narrower than `_LABEL_FULL_W` line heights take
+`label.narrow` of their size. Every text box keeps `_PAD` line heights clear of the lines,
+and at least half the widest pen (`_pad`). While `set_reduced` holds (the diagram is not maximized)
+the body font, and with it every font, weight and size, is `REDUCED_SCALE` of its size. After
+a settings change, `restyle` lays the diagram out again; a theme switch needs only a repaint.
 
-The widget computes no timing: it draws what the timeline holds. Colours are read from
-`VizTheme`'s `DIAG_` tokens at paint time, so a theme switch needs only a repaint.
+The widget computes no timing: it draws what the timeline holds.
+
+`paint_diagram` paints onto any painter's device laid out at the widget's size, and the
+widget's own paint is that call. `export` writes the diagram through it as PNG (at a scale),
+SVG or PDF, in the current palette or the light one, so a vector file holds vector lines and
+text; it holds while `can_export` does (panels drawn, no recompute running), and
+`exportableChanged` reports each change of that. Every font the diagram draws in takes
+horizontal design metrics (`_design`), so a text is as wide on the screen as on an image at
+any scale, in an SVG and in a PDF, and every device paints the layout the widget shows.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from functools import partial
 from html import escape
-from typing import Any, Callable, Iterator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, Sequence, cast
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QBuffer,
+    QEvent,
+    QIODevice,
+    QMarginsF,
+    QPointF,
+    QRectF,
+    QSize,
+    QSizeF,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetricsF,
+    QImage,
+    QPageSize,
     QPainter,
     QPainterPath,
+    QPdfWriter,
     QPen,
     QStaticText,
     QTextOption,
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from ..timing.timeline import Event, LegTimeline, Ramp, Span
-from .theme import VizTheme
+from ..timing.timeline import Event, LegTimeline, Ramp, Span, clock_edges
+from . import diagram_style as ds
+from .theme import VizTheme, palette_applied
 
 
 @dataclass
@@ -134,7 +174,7 @@ class _Label:
     """A label on a line at `y` running from `x0` to `x1` (the plot's edges where None): at
     the line's left end, centre or right end (`at`), above or under it by preference
     (`above`), and on the line (`off` 0) or one label further off (1). A label at "point" is
-    beside the point (`x0`, `y`), above it by preference."""
+    beside the point (`x0`, `y`), above it by preference. `font` names its text class."""
     y: float
     text: str
     colour: QColor
@@ -143,6 +183,7 @@ class _Label:
     x0: Optional[float] = None
     x1: Optional[float] = None
     off: int = 0
+    font: str = "level"        # its `diagram_style.FONTS` text class
 
 
 # A label's candidate position: its box's top-left corner, and the point a leader line joins
@@ -150,6 +191,23 @@ class _Label:
 _Spot = tuple[float, float, Optional[QPointF]]
 # A label's candidate positions, in order; a None between two ends a stage (`_put`).
 _Spots = Iterator[Optional[_Spot]]
+# A leader line: its points, from just off its label's box to its end.
+_Lead = tuple[QPointF, ...]
+# The spot `_put` chose for a label: its box and leader line (None: no leader); None, none.
+_Chosen = Optional[tuple[QRectF, Optional[_Lead]]]
+# A label `_put` placed: its text, its font's key, its spot and whether no spot was free.
+_Placed = tuple[str, str, _Chosen, bool]
+# The widget events after which the line height is measured and the labels placed anew: a
+# font, style, palette or screen change.
+_LAYOUT_EVENTS = frozenset({
+    QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange, QEvent.Type.StyleChange,
+    QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange,
+    QEvent.Type.ScreenChangeInternal, QEvent.Type.DevicePixelRatioChange})
+_SPOTS_MAX = 256      # panel layouts `TimingDiagram._spots` keeps, the oldest dropped first
+EXPORT_FORMATS = ("png", "svg", "pdf")    # the file formats `TimingDiagram.export` writes
+_EXPORT_SCALE_MAX = 8.0                   # a PNG export's largest scale
+_EXPORT_PNG_BYTES = 1 << 30               # a PNG export's largest raster, ARGB32
+_SVG_FAMILY = re.compile(rb'font-family="([^"&]*)"')     # a font as the SVG writer names it
 
 
 # Layout, in multiples of the font's line height.
@@ -161,40 +219,32 @@ _ROW_ASPECT = 0.6     # and at most this fraction of the column's width
 _DIM_H = 1.7          # a dimension line and its label
 _AXIS_H = 1.8         # the time axis
 _GAP_H = 1.4          # between panels
-_TITLE_H = 1.9        # the leg's title
+_TITLE_H = 1.9        # the leg's title, on one line (`_title_h`)
 _FLIGHT_H = 2.6       # a flight's arrow and its label
 _MARK_MARGIN = 0.6    # between the labels of points on no ramp and the first row
 _FLIGHT_LEAD = 0.9    # above a flights panel's first arrow
 _LEVEL_TOP = 1.2      # the highest level a row is scaled for, as a fraction of V_nom
 _SAMPLES = 400        # points across a row
-_PAD = 0.15           # the clearance kept around a text box, clear of the widest stroke
+_PAD = 0.15           # the clearance kept around a text box, at least
 _LABEL_GAP = 0.15     # between a level's label and its line
 _STEP = 0.5           # a label's step along its line, and the leader grid's pitch
 _GRID_NEAR = (24, 12)  # the leader grid's near cells: this many steps across and up or down
+_LEADER_GAP = 0.3     # a headed leader's tip, short of the line it names, at least (`_leader_gap`)
 _EPS = 1e-9
 _FLOOR_DELAY_MS = 120  # a width change's `_row_floor` waits this long for the next one
 _TOUCH = 1e-6         # px: a line or box this close inside a box's edge lies along it
 
-# Line widths, in multiples of the font's line height.
-_W_TRACE = 0.18       # a signal's edges
-_W_FLIGHT = 0.18      # a flight's arrow
-_W_SPAN = 0.18        # the term's own dimension line
-_W_TICK = 0.18        # a release's tick
-_W_DIM = 0.15         # a guide's dimension line, and the time axis
-_W_LEVEL = 0.14       # a threshold, an anchor's or 80 % level, a ground, the threshold's arrow
-_W_RAIL = 0.12        # a V_DD rail
-_W_GUIDE = 0.12       # the dotted and dashed guides down to the dimension lines
-_W_LEADER = 0.06      # a label's leader line
-_DOT_R = 0.25         # a term end's dot, its radius
+# The scale of every font, weight and size while the diagram is not maximized (`set_reduced`).
+REDUCED_SCALE = 0.7
 
-# The heading's and the leg title's size, and the corner note's, against the body font.
-_HEAD_SCALE = 1.04
-_TITLE_SCALE = 1.12
-_NOTE_SCALE = 0.85
-# A column at least `_LABEL_FULL_W` line heights wide takes labels at the body size, a narrower
-# one at `_LABEL_NARROW` of it.
+# A column at least `_LABEL_FULL_W` line heights wide takes labels at their size, a narrower
+# one at `label.narrow` of it.
 _LABEL_FULL_W = 34.0
-_LABEL_NARROW = 0.85
+
+# `diagram_style` dash names as pen styles.
+_DASH = {"solid": Qt.SolidLine, "dash": Qt.DashLine, "dot": Qt.DotLine,
+         "dashdot": Qt.DashDotLine}
+_FONT_WEIGHT = {"normal": QFont.Normal, "demibold": QFont.DemiBold, "bold": QFont.Bold}
 
 
 def _row_name(r: Ramp) -> str:
@@ -232,22 +282,43 @@ def _settle_ns(r: Ramp) -> float:
     return r.t_rf_ns * math.log(20.0, 4.0)
 
 
+# Between a crossing's pair and its lane word in a span's label, X_MP,CLK (`crossing_label`).
+LANE_SEP = ","
+
+
+def crossing_label(pair: str, lane: str, sub: Callable[[str], str]) -> str:
+    """A crossing's span label as rich text: its pair (`X_MP`, or `X_MP,B` naming a
+    peripheral) and the lane word of its row (`Man_t_RF,CLK` gives CLK) in one subscript,
+    joined by `LANE_SEP`: X<sub>MP,CLK</sub>, X<sub>MP,B,CLK</sub>."""
+    html, word = sub(pair), lane.split(",")[-1]
+    if html.endswith("</sub>"):
+        return f"{html[:-len('</sub>')]}{LANE_SEP}{word}</sub>"
+    return f"{html}<sub>{word}</sub>"
+
+
 def _short_label(symbol: str, sub: Callable[[str], str]) -> str:
     """A span's label: the term's parameter, or for a crossing the coefficient's pair and the
-    lane, as rich text."""
+    lane (`crossing_label`), as rich text."""
     if " · " in symbol:
         head, _, lane = symbol.partition(" · ")
         first = head.strip("()").split(" ")[0]          # the first crossing named
         pair = first.split(",")[0]                       # e.g. X_PM
-        return f"{sub(pair)} {lane.split(',')[-1]}"
+        return crossing_label(pair, lane, sub)
     return sub(symbol)
 
 
-def _rows(tl: LegTimeline, keys: tuple[str, ...]) -> list[list[Ramp]]:
+def _rows(tl: LegTimeline, keys: tuple[str, ...],
+          window: tuple[float, float] = (-math.inf, math.inf)) -> list[list[Ramp]]:
     """`keys`' ramps in rows: one per signal at a pin, clocks first, a row holding several
-    edges only where they alternate in polarity."""
+    edges only where they alternate in polarity. A clock row also holds every other edge the
+    clock makes at its pin that is drawn in `window`, from its start to where it settles
+    (`timeline.clock_edges`), so the clock is drawn with each edge it makes there."""
     rows: list[list[Ramp]] = []
     ramps = [tl.ramp(k) for k in dict.fromkeys(keys)]
+    pins = list(dict.fromkeys(r.pin for r in ramps if r.signal == "clock"))
+    lo, hi = window
+    ramps += [r for pin in pins for r in clock_edges(tl, pin, lo, hi)
+              if r.key not in keys and r.start_ns < hi and r.start_ns + _settle_ns(r) > lo]
     for want in ("clock", "data"):
         for r in sorted((r for r in ramps if r.signal == want), key=lambda r: r.start_ns):
             for row in rows:
@@ -299,7 +370,8 @@ def panels(sections: list[DiagramSection], key: str,
             title = s.title + (f" ({i + 1} of {len(groups)})" if len(groups) > 1 else "")
             out.append(Panel(title, s.corner, tl, g,
                              [s.terms[sp.term].symbol for sp in g if sp.term is not None],
-                             _rows(tl, view), (lo - pad, hi + pad), column=col,
+                             _rows(tl, view, (lo - pad, hi + pad)), (lo - pad, hi + pad),
+                             column=col,
                              guides=guides))
     return out
 
@@ -341,28 +413,68 @@ def _signed_ns(d_ns: float) -> str:
     return f"+{r:.2f}" if r > 0 else f"\u2212{abs(r):.2f}"
 
 
-def _margin_label(leg: str, d_ns: float) -> tuple[str, QColor]:
-    """A margin guide's label and colour: green "margin" for a gap, red where it is short,
-    "overlap" on a contention leg and "short" on a keeper leg."""
-    if d_ns >= 0.0:
-        return "margin", QColor(VizTheme.DIAG_OK)
-    name = ("overlap" if leg.endswith("_contention")
-            else "short" if leg.startswith("keeper_") else "margin")
-    return name, QColor(VizTheme.DIAG_BAD)
+def _colour(key: str) -> QColor:
+    """A `diagram_style` colour in the active theme."""
+    return QColor(ds.color(key))
+
+
+def _margin_colour(d_ns: float) -> QColor:
+    """A margin's colour: the gap colour for a gap, the short colour where it is negative."""
+    return _colour("margin_ok" if d_ns >= 0.0 else "margin_bad")
 
 
 def _point_colour(kind: str) -> QColor:
-    """A point's colour by its event kind: a reference or an anchor green, a ramp's 80 % point
-    as its level line, a release as the text, the keeper's response its own, the rest (a
-    detection or a crossing) as the threshold it is read on."""
-    return QColor({"reference": VizTheme.DIAG_OK, "anchor": VizTheme.DIAG_OK,
-                   "valid": VizTheme.DIAG_VALID, "release": VizTheme.DIAG_TEXT,
-                   "keeper": VizTheme.DIAG_KEEPER}.get(kind, VizTheme.DIAG_LEVEL))
+    """A point's colour by its event kind: a reference or an anchor as the 20 % level, a
+    ramp's 80 % point as its level line, a release as its tick, the keeper's response its
+    own, the rest (a detection or a crossing) as the threshold it is read on."""
+    return _colour({"reference": "reference", "anchor": "reference", "valid": "valid",
+                    "release": "release", "keeper": "keeper"}.get(kind, "threshold"))
+
+
+def _signal_key(signal: str) -> str:
+    """A signal's line class: "clock" or "data"."""
+    return "clock" if signal == "clock" else "data"
 
 
 def _ink_of(signal: str) -> QColor:
     """A signal's edge colour: "clock" or "data"."""
-    return QColor(VizTheme.DIAG_CLOCK if signal == "clock" else VizTheme.DIAG_DATA)
+    return _colour(_signal_key(signal))
+
+
+def _ink_key(r: Ramp) -> str:
+    """The colour key a ramp is drawn in: "clock" for a clock edge; for data the device
+    driving it (`_device`), "data" for the Manager, "data_per_b" for Peripheral B and
+    "data_per" for a Peripheral or Peripheral A, at whichever pin it is seen."""
+    if r.signal == "clock":
+        return "clock"
+    return _device_key(_device(r))
+
+
+def _device_key(device: str) -> str:
+    """A driving device's data colour key: "data" for the Manager ("Man"), "data_per_b" for
+    Peripheral B, "data_per" for a Peripheral or Peripheral A."""
+    return {"Man": "data", "Per B": "data_per_b"}.get(device, "data_per")
+
+
+def _undriven_colour(r: Ramp) -> QColor:
+    """The colour of turn-on `r`'s undriven stretch: the device that last drove the wire
+    (`Ramp.before`), whose level the keeper holds; the data colour where the leg does not
+    say."""
+    return _colour(_device_key(r.before) if r.before else "data")
+
+
+def _ink(r: Ramp) -> QColor:
+    """A ramp's colour (`_ink_key`)."""
+    return _colour(_ink_key(r))
+
+
+def _design(font: QFont) -> QFont:
+    """A copy of `font` hinted vertically at most, so its glyphs advance by their design widths
+    on every paint device: the widths an SVG or a PDF lays its text out in, and an image's at
+    any scale."""
+    f = QFont(font)
+    f.setHintingPreference(QFont.PreferVerticalHinting)
+    return f
 
 
 def _seg_hits(x0: float, y0: float, x1: float, y1: float, r: QRectF) -> bool:
@@ -389,19 +501,22 @@ def _seg_hits(x0: float, y0: float, x1: float, y1: float, r: QRectF) -> bool:
 
 
 def _seg_array(segs: list[tuple[float, float, float, float]]) -> np.ndarray:
-    """`segs` as rows of x0, y0, x1, y1 and their bounds: x min, x max, y min, y max."""
-    a = np.array(segs, dtype=float).reshape(-1, 4)
-    return np.hstack([a, np.minimum(a[:, :1], a[:, 2:3]), np.maximum(a[:, :1], a[:, 2:3]),
-                      np.minimum(a[:, 1:2], a[:, 3:4]), np.maximum(a[:, 1:2], a[:, 3:4])])
+    """`segs` as eight contiguous columns, one row of the array each: x0, y0, x1, y1 and
+    their bounds, x min, x max, y min, y max."""
+    a = np.array(segs, dtype=float).reshape(-1, 4).T
+    return np.ascontiguousarray(np.vstack([a, np.minimum(a[0], a[2]), np.maximum(a[0], a[2]),
+                                           np.minimum(a[1], a[3]), np.maximum(a[1], a[3])]))
 
 
 def _crosses(segs: np.ndarray, r: QRectF) -> bool:
-    """Whether any of `segs` (`_seg_array` rows) passes through the inside of `r`."""
-    if not len(segs):
+    """Whether any of `segs` (a `_seg_array`) passes through the inside of `r`."""
+    if not segs.shape[1]:
         return False
-    near = segs[(segs[:, 4] < r.right()) & (segs[:, 5] > r.left())
-                & (segs[:, 6] < r.bottom()) & (segs[:, 7] > r.top())]
-    return any(_seg_hits(x0, y0, x1, y1, r) for x0, y0, x1, y1 in near[:, :4].tolist())
+    near = np.flatnonzero((segs[4] < r.right()) & (segs[5] > r.left())
+                          & (segs[6] < r.bottom()) & (segs[7] > r.top()))
+    if not len(near):
+        return False
+    return any(_seg_hits(x0, y0, x1, y1, r) for x0, y0, x1, y1 in segs[:4, near].T.tolist())
 
 
 class _Ink:
@@ -410,32 +525,44 @@ class _Ink:
     placed so far and the plot rect it draws in. A box is free where it lies within the plot
     and, grown by `pad`, meets no segment, dot or box (nor guide, unless `over_guides`), and
     its leader line, if it has one, crosses no box; one within `_TOUCH` of another's edge
-    touches it and does not meet it."""
+    touches it and does not meet it; nor do the strokes of its arrowhead, where it has one.
+    A headed leader's head also keeps clear of every other head and the leader crosses no
+    other head, unless `strict` is negative; as `strict` asks, the leader also crosses no
+    other headed leader, and the head keeps clear of every segment and the leader crosses no
+    line but a guide or one drawn `soft` (a rail or a level line) (`head_clear`)."""
 
     def __init__(self, plot: QRectF, pad: float) -> None:
         self.plot = plot
         self.pad = pad
         self.boxes: list[QRectF] = []
         self.dots: list[QRectF] = []
+        self.heads: list[QRectF] = []    # each headed leader's head (`head_bounds`)
+        self.leads: list[tuple[QPointF, QPointF]] = []    # and the leader's pieces
         self.guides: list[tuple[QPointF, QPointF, QPen]] = []
         self._segs: list[tuple[float, float, float, float]] = []
         self._arr: Optional[np.ndarray] = None
+        self._hard: list[tuple[float, float, float, float]] = []    # the segments not `soft`
+        self._hard_arr: Optional[np.ndarray] = None
         self._guide_arr: Optional[np.ndarray] = None
 
-    def line(self, a: QPointF, b: QPointF) -> None:
+    def line(self, a: QPointF, b: QPointF, soft: bool = False) -> None:
         self._segs.append((a.x(), a.y(), b.x(), b.y()))
         self._arr = None
+        if not soft:
+            self._hard.append(self._segs[-1])
+            self._hard_arr = None
 
     def polyline(self, pts: list[QPointF]) -> None:
-        self._segs += [(a.x(), a.y(), b.x(), b.y()) for a, b in zip(pts, pts[1:])]
-        self._arr = None
+        for a, b in zip(pts, pts[1:]):
+            self.line(a, b)
 
     def guide(self, a: QPointF, b: QPointF, pen: QPen) -> None:
         self.guides.append((a, b, QPen(pen)))
         self._guide_arr = None
 
-    def free(self, r: QRectF, leader: Optional[tuple[QPointF, QPointF]] = None,
-             over_guides: bool = False) -> bool:
+    def free(self, r: QRectF, leader: Optional[_Lead] = None,
+             over_guides: bool = False,
+             strokes: Sequence[tuple[QPointF, QPointF]] = (), strict: int = 2) -> bool:
         pl, e = self.plot, 0.01
         if (r.left() < pl.left() - e or r.right() > pl.right() + e
                 or r.top() < pl.top() - e or r.bottom() > pl.bottom() + e):
@@ -444,10 +571,12 @@ class _Ink:
         t = g.adjusted(_TOUCH, _TOUCH, -_TOUCH, -_TOUCH)    # a box tangent to g is clear
         if any(t.intersects(o) for o in self.boxes) or any(t.intersects(o) for o in self.dots):
             return False
-        if leader is not None:
-            (ax, ay), (bx, by) = (leader[0].x(), leader[0].y()), (leader[1].x(), leader[1].y())
-            if any(_seg_hits(ax, ay, bx, by, o) for o in self.boxes):
+        pieces = list(zip(leader, leader[1:])) if leader is not None else []
+        for a, b in pieces + list(strokes):
+            if any(_seg_hits(a.x(), a.y(), b.x(), b.y(), o) for o in self.boxes):
                 return False
+        if leader is not None and strokes and not self.head_clear(leader, strokes, strict):
+            return False
         if self._arr is None:
             self._arr = _seg_array(self._segs)
         if _crosses(self._arr, g):
@@ -458,6 +587,56 @@ class _Ink:
             self._guide_arr = _seg_array([(a.x(), a.y(), b.x(), b.y())
                                           for a, b, _ in self.guides])
         return not _crosses(self._guide_arr, g)
+
+    def head_bounds(self, strokes: Sequence[tuple[QPointF, QPointF]]) -> QRectF:
+        """The bounds of an arrowhead's `strokes`, grown by half of `pad`."""
+        xs = [q.x() for s in strokes for q in s]
+        ys = [q.y() for s in strokes for q in s]
+        g = 0.5 * self.pad
+        return QRectF(min(xs) - g, min(ys) - g, max(xs) - min(xs) + 2.0 * g,
+                      max(ys) - min(ys) + 2.0 * g)
+
+    def head_clear(self, leader: _Lead, strokes: Sequence[tuple[QPointF, QPointF]],
+                   strict: int = 2) -> bool:
+        """Whether a headed leader's head (`head_bounds`) meets no head placed before it and
+        the leader crosses no such head (with a negative `strict`, True); with `strict` 1 or
+        more, also whether the leader crosses no headed leader placed before it; with `strict`
+        2, also whether the head meets no segment and the leader crosses none but a `soft`
+        one."""
+        if strict < 0:
+            return True
+        g = self.head_bounds(strokes)
+        if any(g.intersects(o) for o in self.heads):
+            return False
+        pieces = list(zip(leader, leader[1:]))
+        for a, b in pieces:
+            if any(_seg_hits(a.x(), a.y(), b.x(), b.y(), o) for o in self.heads):
+                return False
+            if strict and any(_segs_cross(a, b, c, d) for c, d in self.leads):
+                return False
+        if strict < 2:
+            return True
+        if self._arr is None:
+            self._arr = _seg_array(self._segs)
+        if _crosses(self._arr, g):
+            return False
+        if self._hard_arr is None:
+            self._hard_arr = _seg_array(self._hard)
+        segs = self._hard_arr
+        for a, b in pieces:
+            near = np.flatnonzero(
+                (segs[4] <= max(a.x(), b.x())) & (segs[5] >= min(a.x(), b.x()))
+                & (segs[6] <= max(a.y(), b.y())) & (segs[7] >= min(a.y(), b.y())))
+            if any(_segs_cross(a, b, QPointF(x0, y0), QPointF(x1, y1))
+                   for x0, y0, x1, y1 in segs[:4, near].T.tolist()):
+                return False
+        return True
+
+    def add_head(self, leader: _Lead, strokes: Sequence[tuple[QPointF, QPointF]]) -> None:
+        """Hold a headed leader drawn and its head, for `head_clear`."""
+        if strokes:
+            self.heads.append(self.head_bounds(strokes))
+        self.leads += list(zip(leader, leader[1:]))
 
     def crosses(self, r: QRectF) -> bool:
         """Whether a segment other than a guide passes through `r`."""
@@ -546,11 +725,51 @@ def _leader(r: QRectF, a: QPointF) -> tuple[QPointF, QPointF]:
     return q, a
 
 
+def _bent(r: QRectF, a: QPointF, gap: float, run: float, lean: float = 0.0) -> Optional[_Lead]:
+    """A headed leader from just off the box `r`, over or under the horizontal line through
+    the point `a`, to `a`: straight to its knee, the point `gap + run` px off the line and
+    `lean` px across from `a`, then straight toward `a`, ending `gap` px short of the line, so
+    its last piece points at `a` and its tip lies `lean * gap / (gap + run)` px across from
+    it; a box over the knee drops straight to it, a box beside it runs to it. None where a box
+    over the knee comes within `gap + run` px of the line, or the box lies across the line."""
+    s = 1.0 if r.center().y() > a.y() else -1.0
+    edge = r.top() if s > 0 else r.bottom()
+    if s * (edge - a.y()) <= 0.0:
+        return None
+    knee = QPointF(a.x() + lean, a.y() + s * (gap + run))
+    tip = a + (knee - a) * (gap / (gap + run))
+    if r.left() <= knee.x() <= r.right():
+        if s * (edge - a.y()) < gap + run - 1e-6:
+            return None
+        start = QPointF(knee.x(), edge - s * 1.5)
+        return (start, tip) if lean == 0.0 else (start, knee, tip)
+    return _leader(r, knee)[0], knee, tip
+
+
+def _segs_cross(a: QPointF, b: QPointF, c: QPointF, d: QPointF) -> bool:
+    """Whether the segments from `a` to `b` and from `c` to `d` meet, ends included."""
+    def side(p: QPointF, q: QPointF, r: QPointF) -> float:
+        return (q.x() - p.x()) * (r.y() - p.y()) - (q.y() - p.y()) * (r.x() - p.x())
+
+    def within(p: QPointF, q: QPointF, r: QPointF) -> bool:
+        return (min(p.x(), q.x()) - _EPS <= r.x() <= max(p.x(), q.x()) + _EPS
+                and min(p.y(), q.y()) - _EPS <= r.y() <= max(p.y(), q.y()) + _EPS)
+
+    d1, d2 = side(c, d, a), side(c, d, b)
+    d3, d4 = side(a, b, c), side(a, b, d)
+    if ((d1 > _EPS and d2 < -_EPS) or (d1 < -_EPS and d2 > _EPS)) and \
+            ((d3 > _EPS and d4 < -_EPS) or (d3 < -_EPS and d4 > _EPS)):
+        return True
+    return any(abs(s) <= _EPS and within(p, q, r) for s, p, q, r in
+               ((d1, c, d, a), (d2, c, d, b), (d3, a, b, c), (d4, a, b, d)))
+
+
 class TimingDiagram(QWidget):
     """Paints the clicked term, one `Panel` per column and occurrence; see the module
     docstring."""
 
     doubleClicked = Signal()
+    exportableChanged = Signal(bool)     # `can_export`, emitted where it changes
 
     def __init__(self, subscript: Callable[[str], str], term_key: Callable[[str], str],
                  parent: QWidget | None = None) -> None:
@@ -562,6 +781,9 @@ class TimingDiagram(QWidget):
         self.panels: list[Panel] = []
         self.side_by_side = False
         self.shown_column: Optional[int] = None    # the one section drawn; None for all
+        self.pending = False             # a recompute runs: the panels are not drawn
+        self.reduced = False             # not maximized: drawn at `REDUCED_SCALE` (`set_reduced`)
+        self._exportable = False         # `can_export`, as `exportableChanged` last gave it
         self._frame = (0.0, 1.0)         # the column being laid out: its x and width
         self._corner: QWidget | None = None
         self._ink = _Ink(QRectF(), 0.0)  # the panel being painted
@@ -569,6 +791,12 @@ class TimingDiagram(QWidget):
         self._misses = 0                 # labels placed with no free spot, this paint
         self._strays = 0                 # and those placed with a leader line
         self._one_line: dict[tuple[str, str], QStaticText] = {}
+        self._lh_px: Optional[float] = None          # `_lh`
+        # Each panel layout's placed labels, by `_paint_panel`'s key: the panel, and per
+        # `_put` in order its text, its font's key and the spot it took (`_put`).
+        self._spots: dict[tuple, tuple[Panel, list[_Placed]]] = {}
+        self._replay: Optional[Iterator[_Placed]] = None    # the panel painted: replayed
+        self._record: Optional[list[_Placed]] = None        # or recorded
         self._floor: Optional[tuple[tuple[int, float], float]] = None   # (width, lh), row
         # A width change keeps the last floor until `_FLOOR_DELAY_MS` pass with no other.
         self._floor_timer = QTimer(self)
@@ -584,12 +812,19 @@ class TimingDiagram(QWidget):
         self.term = key
         new = panels(sections, key, self._key) if key else []
         same = new == self.panels
-        self.panels = new
+        if not same:                     # equal panels keep their placed labels
+            self.panels = new
+            self._spots.clear()
         self._relayout(keep_floor=same)
+        self._emit_exportable()
 
-    def set_side_by_side(self, on: bool) -> None:
-        """Lay the columns out side by side, or stacked."""
+    def set_side_by_side(self, on: bool, reduced: Optional[bool] = None) -> None:
+        """Lay the columns out side by side, or stacked; with `reduced` given, `set_reduced`
+        to it in the same layout."""
         self.side_by_side = bool(on)
+        if reduced is not None and bool(reduced) != self.reduced:
+            self.reduced = bool(reduced)
+            self._forget_layout()
         self._relayout()
 
     def set_shown_column(self, column: Optional[int]) -> None:
@@ -598,8 +833,41 @@ class TimingDiagram(QWidget):
             self.shown_column = column
             self._relayout()
 
+    def set_pending(self, on: bool) -> None:
+        """While `on`, draw "Computing…" in place of the panels, keeping them and the
+        diagram's size; off, draw the panels again."""
+        if bool(on) != self.pending:
+            self.pending = bool(on)
+            self.update()
+            self._emit_exportable()
+
     def clear(self) -> None:
         self.show_term("", "", [])
+
+    def set_reduced(self, on: bool) -> None:
+        """Draw the body font, and with it every font, weight and size, at `REDUCED_SCALE` of
+        its size while `on` (the diagram is not maximized); off, at its size."""
+        if bool(on) != self.reduced:
+            self.reduced = bool(on)
+            self.restyle()
+
+    def restyle(self) -> None:
+        """Lay the diagram out again from the `diagram_style` settings in force, after they
+        change."""
+        self._forget_layout()
+        self._relayout()
+        self.place_corner()
+
+    def _forget_layout(self) -> None:
+        """Drop what was measured and placed with the settings or the scale in force."""
+        self._lh_px = None
+        self._spots.clear()
+
+    def units(self) -> tuple[float, int]:
+        """The widget font's line height in px, measured as the diagram draws it (`_design`),
+        and its size in px (0 where it is set in points): what a weight of one line height and
+        a font size of one body font draw at full scale."""
+        return QFontMetricsF(_design(self.font())).height(), self.font().pixelSize()
 
     def set_corner_widget(self, w: QWidget) -> None:
         """Put `w` at the widget's top right."""
@@ -610,10 +878,15 @@ class TimingDiagram(QWidget):
 
     def place_corner(self) -> None:
         """Put the corner widget at the top right at its current size: called again when the
-        widget's contents change size."""
+        widget's contents change size. The title wraps beside it, so a change of its width
+        lays the diagram out again."""
         if self._corner is not None:
+            was = self._corner.width()
             self._corner.adjustSize()
             self._corner.move(self.width() - self._corner.width() - 4, 2)
+            if self._corner.width() != was:
+                self.setMinimumHeight(self._min_height())
+                self.update()
 
     def mouseDoubleClickEvent(self, event) -> None:     # noqa: N802 - Qt override
         if event.button() == Qt.LeftButton:
@@ -652,33 +925,74 @@ class TimingDiagram(QWidget):
                 self._floor_timer.start()
 
     # --- geometry ---------------------------------------------------------------------
-    def _lh(self) -> float:
-        return QFontMetricsF(self.font()).height()
+    def style_scale(self) -> float:
+        """The scale every font, weight and size is drawn at: `REDUCED_SCALE` while `reduced`,
+        else 1."""
+        return REDUCED_SCALE if self.reduced else 1.0
 
-    def _scaled(self, k: float, weight: QFont.Weight = QFont.Normal) -> QFont:
-        """The body font at `k` times its size, of `weight`: in pixels where the font is set
-        in pixels, else in points."""
-        f = QFont(self.font())
+    def _body_font(self) -> QFont:
+        """The widget's font at `style_scale`: the font the line height is measured on."""
+        f = _design(self.font())
+        k = self.style_scale()
+        if k != 1.0:
+            if f.pixelSize() > 0:
+                f.setPixelSize(max(round(f.pixelSize() * k), 1))
+            else:
+                f.setPointSizeF(max(f.pointSizeF() * k, 1.0))
+        return f
+
+    def _lh(self) -> float:
+        """The body font's line height, in px, kept until a `_LAYOUT_EVENTS` event or a
+        `restyle`."""
+        if self._lh_px is None:
+            self._lh_px = QFontMetricsF(self._body_font()).height()
+        return self._lh_px
+
+    def _pad(self) -> float:
+        """The clearance kept around a text box, in line heights: `_PAD`, and at least half
+        the widest pen."""
+        return max(_PAD, 0.5 * ds.widest_weight())
+
+    def changeEvent(self, event) -> None:     # noqa: N802 - Qt override
+        if event.type() in _LAYOUT_EVENTS:
+            self._lh_px = None
+            self._spots.clear()
+        super().changeEvent(event)
+
+    def _font(self, key: str, k: float = 1.0) -> QFont:
+        """The `diagram_style` text class `key`'s font: its family (the widget's where none
+        is set), weight, and size times `k` and `style_scale`, in pixels where the widget's
+        font is set in pixels, else in points."""
+        family, size, weight = ds.font(key)
+        f = _design(self.font())
+        if family:
+            f.setFamily(family)
+        k = size * k * self.style_scale()
         if f.pixelSize() > 0:
             f.setPixelSize(max(round(f.pixelSize() * k), 8))
         else:
             f.setPointSizeF(max(f.pointSizeF() * k, 7.0))
-        f.setWeight(weight)
+        f.setWeight(_FONT_WEIGHT[weight])
         return f
 
     def _small(self) -> QFont:
-        """The corner note's font."""
-        return self._scaled(_NOTE_SCALE)
+        """The corner note's and the footnote's font."""
+        return self._font("note")
+
+    def _text_font(self, key: str) -> QFont:
+        """A label's font, of text class `key` ("row", "span", "level" or "axis"): at its
+        size in a column of at least `_LABEL_FULL_W` line heights, and `label.narrow` of it
+        in a narrower one."""
+        full = self._frame[1] >= _LABEL_FULL_W * self._lh()
+        return self._font(key, 1.0 if full else float(ds.value("label.narrow")))
 
     def _label_font(self) -> QFont:
-        """Every label's font: the body font, demi-bold, in a column of at least
-        `_LABEL_FULL_W` line heights, and `_LABEL_NARROW` of it in a narrower one."""
-        full = self._frame[1] >= _LABEL_FULL_W * self._lh()
-        return self._scaled(1.0 if full else _LABEL_NARROW, QFont.DemiBold)
+        """A level's or a point's label's font (`_text_font`)."""
+        return self._text_font("level")
 
     def _head_font(self) -> QFont:
         """A panel heading's font."""
-        return self._scaled(_HEAD_SCALE)
+        return self._font("heading")
 
     def _pen(self, colour: QColor, width: float, style: Qt.PenStyle = Qt.SolidLine) -> QPen:
         """A pen `width` line heights wide: round-capped where solid, flat-capped where
@@ -687,6 +1001,16 @@ class TimingDiagram(QWidget):
         pen.setCapStyle(Qt.RoundCap if style == Qt.SolidLine else Qt.FlatCap)
         pen.setJoinStyle(Qt.RoundJoin)
         return pen
+
+    def _line(self, key: str, colour: Optional[QColor] = None, dashed: bool = True) -> QPen:
+        """Line class `key`'s pen: its colour (or `colour`), its weight and, with `dashed`
+        where it has one, its dash style."""
+        style = _DASH[ds.dash(key)] if dashed and f"{key}.dash" in ds.VALUES else Qt.SolidLine
+        return self._pen(_colour(key) if colour is None else colour, ds.weight(key), style)
+
+    def _size(self, key: str) -> float:
+        """A `diagram_style` length (an arrowhead, the dot's radius, a tick), in px."""
+        return float(ds.value(key)) * self._lh()
 
     def columns(self) -> list[list[Panel]]:
         """The panels in drawing columns: one per section side by side, else one; only the
@@ -755,6 +1079,62 @@ class TimingDiagram(QWidget):
     def _text_w(self) -> float:
         return max(self._frame[1] - 1.2 * self._lh(), 10.0)
 
+    def _title_font(self) -> QFont:
+        return self._font("title")
+
+    def _title_full_w(self) -> float:
+        """The width the leg's title wraps at with nothing beside it: the widget's, less the
+        title's indent."""
+        return max(self.width() - 0.6 * self._lh(), 10.0)
+
+    def _title_beside_w(self) -> float:
+        """The width the leg's title wraps at beside the corner widget, with a gap."""
+        corner = self._corner.width() + 8 if self._corner is not None else 0
+        return max(self._title_full_w() - corner, 10.0)
+
+    def _title_below(self) -> bool:
+        """The title goes below the corner widget: beside it, it would wrap onto more lines
+        than at the full width."""
+        if self._corner is None:
+            return False
+        html, font = self._html(self.leg_title), self._title_font()
+        return (self._static(html, font, self._title_beside_w()).size().height()
+                > self._static(html, font, self._title_full_w()).size().height())
+
+    def _title_w(self) -> float:
+        """The width the leg's title wraps at: beside the corner widget, or the full width
+        below it (`_title_below`)."""
+        return self._title_full_w() if self._title_below() else self._title_beside_w()
+
+    def _title_drop(self) -> float:
+        """How far below its own line the title starts: the corner widget's bottom where the
+        title goes below it, else 0."""
+        if self._corner is not None and self._title_below():
+            return float(self._corner.y() + self._corner.height())
+        return 0.0
+
+    def _title_top(self) -> float:
+        """The top of the title's first line (`_title_drop` under the top line)."""
+        return 0.2 * self._lh() + self._title_drop()
+
+    def _title_text(self) -> QStaticText:
+        """The leg's title, its symbols subscripted (`_html`), wrapped at `_title_w`."""
+        return self._static(self._html(self.leg_title), self._title_font(), self._title_w())
+
+    def _title_h(self) -> float:
+        """The height of the band the title takes: `_TITLE_H` lines, the height of each line
+        the title wraps onto beyond its first, and the corner widget's where the title goes
+        below it."""
+        one = self._static("X", self._title_font(), -1.0).size().height()
+        return (_TITLE_H * self._lh() + max(0.0, self._title_text().size().height() - one)
+                + self._title_drop())
+
+    def _paint_title(self, p: QPainter) -> None:
+        lh = self._lh()
+        p.setFont(self._title_font())
+        p.setPen(_colour("text"))
+        p.drawStaticText(QPointF(0.6 * lh, self._title_top()), self._title_text())
+
     def _head_height(self, pn: Panel) -> float:
         """The heading and the corner (or the note), wrapped at the column's width."""
         lh = self._lh()
@@ -766,8 +1146,10 @@ class TimingDiagram(QWidget):
         return h + 0.6 * lh
 
     def _label_h(self) -> float:
-        """A label's height, in px, subscripts included."""
-        return self._static(self._html("V_DD"), self._label_font(), -1.0).size().height()
+        """A label's height, in px, subscripts included: the tallest of the row-name, span
+        and level label fonts."""
+        return max(self._static(self._html("V_DD"), self._text_font(k), -1.0).size().height()
+                   for k in ("row", "span", "level"))
 
     def strip_pitch(self) -> float:
         """The height of one of the strip's label lines (`_strip`), in px: a label's height,
@@ -779,7 +1161,7 @@ class TimingDiagram(QWidget):
         stacked over a rail at that level (the row's name over the rail's own, `_level_spots`),
         and at least 1.5 line heights."""
         lh, h = self._lh(), self._label_h()
-        return max(1.5 * lh, _LABEL_GAP * lh + 2.0 * (h + _PAD * lh) + 1.0)
+        return max(1.5 * lh, _LABEL_GAP * lh + 2.0 * (h + self._pad() * lh) + 1.0)
 
     def _mark_lines(self, pn: Panel) -> float:
         """The height, in lines, of the strip above a panel's first row that carries its
@@ -807,7 +1189,7 @@ class TimingDiagram(QWidget):
             return []
         lh = self._lh()
         left, right = self._plot_x()
-        small, gap, pad = self._label_font(), 0.2 * lh, _PAD * lh
+        small, gap, pad = self._label_font(), 0.2 * lh, self._pad() * lh
         pitch = self.strip_pitch()
         off = [e for e in _ends(pn) if not _on_drawn_ramp(pn, e)]
         marks = [e for e in off if e.kind != "deadline"]
@@ -881,7 +1263,7 @@ class TimingDiagram(QWidget):
     def _fixed_height(self, col: list[Panel]) -> float:
         """A column's height but its signal rows, at the current frame's width."""
         lh = self._lh()
-        h = _TITLE_H * lh + _GAP_H * lh * max(len(col) - 1, 0) + 0.5 * lh
+        h = self._title_h() + _GAP_H * lh * max(len(col) - 1, 0) + 0.5 * lh
         for pn in col:
             h += self._head_height(pn) + self._body_height(pn, 0.0)
         return h
@@ -894,7 +1276,7 @@ class TimingDiagram(QWidget):
 
     def _row_floor(self) -> float:
         """The least signal row height, in px, at the current width: the first of
-        `_ROW_STEPS` lines at which every label of every panel finds a free spot with no
+        `_row_steps` lines at which every label of every panel finds a free spot with no
         leader line, found by laying the panels out unseen; where none does, the first with
         the fewest labels without a free spot, then the fewest with a leader. Where every
         step leaves a label without a free spot, rows `_ROW_GROW` times taller each, up to
@@ -905,7 +1287,7 @@ class TimingDiagram(QWidget):
         if self._floor is not None and (self._floor[0] == key or (
                 self._floor_timer.isActive() and self._floor[0][1] == lh)):
             return self._floor[1]
-        floor = _ROW_MIN * lh
+        floor = self._row_steps()[0] * lh
         if any(pn.rows for pn in self.panels):
             best: Optional[tuple[int, int]] = None
 
@@ -916,16 +1298,21 @@ class TimingDiagram(QWidget):
                 if best is None or (self._misses, self._strays) < best:
                     best, floor = (self._misses, self._strays), lines * lh
 
-            for lines in _ROW_STEPS:
+            steps = self._row_steps()
+            for lines in steps:
                 tried(lines)
                 if best == (0, 0):
                     break
-            lines = _ROW_STEPS[-1]
+            lines = steps[-1]
             while best is not None and best[0] and lines < _ROW_MAX:
                 lines = min(lines * _ROW_GROW, _ROW_MAX)
                 tried(lines)
         self._floor = (key, floor)
         return floor
+
+    def _row_steps(self) -> tuple[float, ...]:
+        """The row heights, in lines, `_row_floor` tries first: `_ROW_STEPS`."""
+        return _ROW_STEPS
 
     def _row_h(self) -> float:
         """One signal row's height, the same in every column: the height the text leaves,
@@ -953,28 +1340,133 @@ class TimingDiagram(QWidget):
     def sizeHint(self) -> QSize:          # noqa: N802 - Qt override
         return QSize(int(30 * self._lh()), self._min_height())
 
+    # --- export -------------------------------------------------------------------------
+    def can_export(self) -> bool:
+        """Whether `export` has a diagram to write: a term is drawn and no recompute runs."""
+        return bool(self.panels) and not self.pending
+
+    def _emit_exportable(self) -> None:
+        """Emit `exportableChanged` where `can_export` differs from when it last did."""
+        now = self.can_export()
+        if now != self._exportable:
+            self._exportable = now
+            self.exportableChanged.emit(now)
+
+    def export(self, fmt: str, scale: float = 2.0, light: bool = False) -> bytes:
+        """The diagram as `paint_diagram` draws it at the widget's current size, as the bytes
+        of a `fmt` file: "png" at `scale` times the size, "svg" or "pdf" (one page) as vector
+        drawings, one SVG unit per widget pixel and a PDF page of the widget's size at its
+        DPI. In the current palette, or the light palette with `light`. The corner widget is
+        not drawn. Every device takes the widget's logical DPI, so the text is laid out as on
+        screen. Raises ValueError where `can_export` does not hold or `fmt` or `scale` is not
+        one of these, and OSError where the file cannot be made."""
+        if fmt not in EXPORT_FORMATS:
+            raise ValueError(f"unknown export format {fmt!r}")
+        if not self.can_export():
+            raise ValueError("no diagram is drawn")
+        if not (isinstance(scale, (int, float)) and 0.0 < scale <= _EXPORT_SCALE_MAX):
+            raise ValueError(f"the scale must be above 0 and at most {_EXPORT_SCALE_MAX:g}")
+        with palette_applied("light" if light else VizTheme.MODE):
+            return {"png": self._export_png, "svg": self._export_svg,
+                    "pdf": self._export_pdf}[fmt](scale)
+
+    def _export_png(self, scale: float) -> bytes:
+        w, h = math.ceil(self.width() * scale), math.ceil(self.height() * scale)
+        if w * h * 4 > _EXPORT_PNG_BYTES:
+            raise OSError(f"the diagram is {w} x {h} pixels at {scale:g}x, too large for a "
+                          "PNG; export it at a smaller scale, as SVG or as PDF")
+        img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        if img.isNull():
+            raise OSError(f"not enough memory for a {w} x {h} pixel PNG")
+        img.setDevicePixelRatio(scale)
+        img.setDotsPerMeterX(round(self.logicalDpiX() / 0.0254))
+        img.setDotsPerMeterY(round(self.logicalDpiY() / 0.0254))
+        img.fill(QColor(VizTheme.FRAME_BG))
+        p = QPainter(img)
+        try:
+            self.paint_diagram(p)
+        finally:
+            p.end()
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        if not img.save(buf, "PNG"):
+            raise OSError("the PNG could not be encoded")
+        return bytes(buf.data())
+
+    def _export_svg(self, _scale: float) -> bytes:
+        from PySide6.QtSvg import QSvgGenerator
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        gen = QSvgGenerator()
+        gen.setOutputDevice(buf)
+        gen.setSize(QSize(self.width(), self.height()))
+        gen.setViewBox(QRectF(0, 0, self.width(), self.height()))
+        gen.setResolution(self.logicalDpiY())
+        gen.setTitle(self.leg_title)
+        self._paint_onto(gen)
+        data = bytes(buf.data())
+        if not data:
+            raise OSError("the SVG could not be drawn")
+        # Each text names its font, and a generic family after it for a viewer without it.
+        return _SVG_FAMILY.sub(lambda m: b'font-family="&apos;' + m[1] + b'&apos;, sans-serif"',
+                               data)
+
+    def _export_pdf(self, _scale: float) -> bytes:
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        pdf = QPdfWriter(buf)
+        dpi = self.logicalDpiY()
+        pdf.setResolution(dpi)
+        pdf.setPageMargins(QMarginsF(0, 0, 0, 0))
+        pdf.setPageSize(QPageSize(QSizeF(self.width() * 72.0 / dpi, self.height() * 72.0 / dpi),
+                                  QPageSize.Point, "", QPageSize.ExactMatch))
+        pdf.setTitle(self.leg_title)
+        self._paint_onto(pdf)
+        data = bytes(buf.data())
+        if not data:
+            raise OSError("the PDF could not be drawn")
+        return data
+
+    def _paint_onto(self, device) -> None:
+        """`paint_diagram` onto a vector `device`."""
+        p = QPainter(device)
+        if not p.isActive():
+            raise OSError("the file could not be drawn")
+        try:
+            self.paint_diagram(p)
+        finally:
+            p.end()
+
     # --- painting -----------------------------------------------------------------------
     def paintEvent(self, _event) -> None:     # noqa: N802 - Qt override
-        p = QPainter(self)
+        self.paint_diagram(QPainter(self))
+
+    def paint_diagram(self, p: QPainter) -> None:
+        """Paint the diagram onto `p`'s device, laid out at the widget's size and font: the
+        widget's own paint, and `export`'s onto an image or a vector file."""
         p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), QColor(VizTheme.FRAME_BG))
+        p.fillRect(QRectF(0, 0, self.width(), self.height()), QColor(VizTheme.FRAME_BG))
         lh = self._lh()
         if not self.panels:
-            p.setPen(QColor(VizTheme.DIAG_DIM))
+            p.setFont(self._body_font())
+            p.setPen(_colour("dim_text"))
             p.drawText(QRectF(0, 0, self.width(), 3 * lh), Qt.AlignCenter | Qt.TextWordWrap,
                        "Click a term to draw it here, to scale.")
             return
-        p.setFont(self._scaled(_TITLE_SCALE, QFont.Bold))
-        p.setPen(QColor(VizTheme.DIAG_TEXT))
-        p.drawText(QRectF(0.6 * lh, 0.2 * lh, self.width(), (_TITLE_H - 0.2) * lh),
-                   Qt.AlignLeft, self.leg_title)
+        self._paint_title(p)
+        if self.pending:
+            p.setFont(self._body_font())
+            p.setPen(_colour("dim_text"))
+            p.drawText(QRectF(0, self._title_h(), self.width(), 3 * lh),
+                       Qt.AlignCenter | Qt.TextWordWrap, "Computing…")
+            return
         self._paint_columns(p, self._row_h())
 
     def _paint_columns(self, p: QPainter, row_h: float) -> None:
         """Every column's panels, top to bottom, their signal rows `row_h` each."""
         lh = self._lh()
         for _, col in self._each_column():
-            y = _TITLE_H * lh
+            y = self._title_h()
             for pn in col:
                 y = self._paint_panel(p, pn, y, row_h) + _GAP_H * lh
 
@@ -991,65 +1483,181 @@ class TimingDiagram(QWidget):
         p.setPen(col)
         p.drawStaticText(QPointF(x - (0.5 * st.size().width() if centre else 0.0), y), st)
 
-    def _seg(self, p: QPainter, a: QPointF, b: QPointF) -> None:
-        """A line from `a` to `b` in the painter's pen, kept clear of the panel's text."""
+    def _seg(self, p: QPainter, a: QPointF, b: QPointF, soft: bool = False) -> None:
+        """A line from `a` to `b` in the painter's pen, kept clear of the panel's text, and
+        unless `soft` (a rail or a level line) of the headed leaders (`_Ink.head_clear`)."""
         p.drawLine(a, b)
-        self._ink.line(a, b)
+        self._ink.line(a, b, soft)
 
     def _put(self, p: QPainter, html: str, font: QFont, col: QColor,
              spots: Callable[[float, float], _Spots],
-             need: bool = True) -> Optional[QRectF]:
+             need: bool = True, head: bool = False) -> Optional[QRectF]:
         """`html` on one line at the first of `spots(width, height)` whose box is free in the
-        panel's ink, with its leader line where the spot has one. The spots are tried in
-        stages, each first clear of the guides and then over them: the spots with no leader,
+        panel's ink, with its leader line where the spot has one, ending in an open arrowhead
+        the size of a span's (`span.head`) with `head`. A headed leader runs to the point on a
+        horizontal line its spot names, bent so that its last piece points at it, ending
+        `_leader_gap` short of the line, straight over or under it where it can (`_bent`),
+        its head clear of every head drawn and the leader crossing
+        none, and where a spot of the stage allows it, the leader crossing no other leader, and
+        where one allows that, the head also clear of every line and the leader crossing no
+        line but a guide or a soft one (`_Ink.head_clear`); a spot too near the line for that
+        takes no headed leader. Only a label with no such spot clear or over the guides lets
+        its head meet another's. The spots are tried in stages, each
+        first clear of the guides and then over them, or where `_over_guides` does not hold
+        every stage clear of them and then every stage over them: the spots with no leader,
         then those with one, the sequence's None marking a further stage's start; a guide a
-        label is placed over is broken behind it. With no free spot the label is drawn at the
-        first spot where `need`, else not at all. Returns the box drawn."""
+        label is placed over is broken behind it. With no free spot the
+        label is drawn at the first spot where `need`, else not at all. Returns the box drawn.
+        A replayed layout (`_paint_panel`) gives the label the spot it took before, where its
+        text and font are the same, and else searches from this label on."""
         st = self._static(html, font, -1.0)
-        w, h = st.size().width(), st.size().height()
-        chosen: Optional[tuple[QRectF, Optional[tuple[QPointF, QPointF]]]] = None
-        first: Optional[QRectF] = None
-        tried: list[tuple[QRectF, Optional[tuple[QPointF, QPointF]]]] = []
+        placed = self._replayed(html, font)
+        if placed is not None:
+            chosen, missed = placed
+        else:
+            chosen, missed = self._search(st, spots, need, head)
+            if self._record is not None:
+                self._record.append((html, font.key(), chosen, missed))
+        if chosen is None:
+            return None
+        self._misses += missed
+        r, lead = chosen
+        if lead is not None:
+            self._strays += 1
+            p.setPen(self._line("leader", col))
+            for a, b in zip(lead, lead[1:]):
+                self._seg(p, a, b)
+            if head:
+                self._arrowhead(p, *lead[-2:])
+                self._ink.add_head(lead, self._head_strokes(*lead[-2:]))
+        self._ink.boxes.append(r)
+        self._rich(p, r.left(), r.top(), html, font, col)
+        return r
 
-        def over_guides() -> Optional[tuple[QRectF, Optional[tuple[QPointF, QPointF]]]]:
-            found = next(((r, lead) for r, lead in tried
-                          if self._ink.free(r, lead, over_guides=True)), None)
+    def _replayed(self, html: str, font: QFont) -> Optional[tuple[_Chosen, bool]]:
+        """The next label's spot and miss from the replayed layout, where its text and font
+        are this label's; else None, and the panel's remaining labels are searched for."""
+        if self._replay is None:
+            return None
+        got = next(self._replay, None)
+        if got is not None and got[0] == html and got[1] == font.key():
+            return got[2], got[3]
+        self._replay = None
+        return None
+
+    def _search(self, st: QStaticText, spots: Callable[[float, float], _Spots],
+                need: bool, head: bool = False) -> tuple[_Chosen, bool]:
+        """`_put`'s spot for a label laid out as `st`: its box and leader line (None: not
+        drawn), and whether no spot was free. With `head`, a leader is bent to end short of its
+        line (`_bent`) and its arrowhead (`_head_strokes`) crosses no box placed before it, as
+        the leader itself does not; a stage's headed spots are tried clear of the lines
+        (`_Ink.head_clear`), then, before the stage ends, over them, and then over the other
+        leaders."""
+        w, h = st.size().width(), st.size().height()
+        gap, run = self._leader_gap(), 2.0 * self._size("span.head")
+        chosen: Optional[tuple[QRectF, Optional[_Lead]]] = None
+        first: Optional[QRectF] = None
+        tried: list[tuple[QRectF, Optional[_Lead]]] = []
+        staged = self._over_guides()
+        held: list[tuple[QRectF, Optional[_Lead]]] = []   # every stage's
+
+        loose: list[tuple[QRectF, QPointF]] = []   # the stage's headed spots, for `over_lines`
+        # The knee's offsets tried after a straight drop: a head's width and two, each way.
+        leans = [k * 1.2 * self._size("span.head") + math.copysign(self._ink.pad, k)
+                 for k in (-1, 1, -2, 2)]
+
+        def free(r: QRectF, lead: Optional[_Lead], over: bool = False,
+                 strict: int = 2) -> bool:
+            strokes = self._head_strokes(*lead[-2:]) if head and lead is not None else []
+            return self._ink.free(r, lead, over_guides=over, strokes=strokes, strict=strict)
+
+        def over_lines() -> Optional[tuple[QRectF, Optional[_Lead]]]:
+            found = next(((r, lead) for strict in (1, 0) for lean in (0.0, *leans)
+                          for r, a in loose
+                          if (lead := _bent(r, a, gap, run, lean)) is not None
+                          and free(r, lead, strict=strict)), None)
+            loose.clear()
+            return found
+
+        def over_guides() -> Optional[tuple[QRectF, Optional[_Lead]]]:
+            found = None
+            if staged:
+                found = next(((r, lead) for r, lead in tried if free(r, lead, True)), None)
+            else:
+                held.extend(tried)
             tried.clear()
             return found
 
         for spot in spots(w, h):
             if spot is None:                 # a stage ends: its spots, now over the guides
-                chosen = over_guides()
+                chosen = over_lines()
+                if chosen is None:
+                    chosen = over_guides()
                 if chosen is not None:
                     break
                 continue
             x, y, anchor = spot
             r = QRectF(x, y, w, h)
             first = first or r
-            lead = _leader(r, anchor) if anchor is not None else None
+            lead: Optional[_Lead] = None
+            if anchor is not None and head:
+                lead = _bent(r, anchor, gap, run)
+                if lead is None:             # too near its line for a straight drop
+                    loose.append((r, anchor))
+                    continue
+            elif anchor is not None:
+                lead = _leader(r, anchor)
             if lead is not None and tried and tried[-1][1] is None:
                 chosen = over_guides()       # the spots with no leader, now over the guides
                 if chosen is not None:
                     break
-            if self._ink.free(r, lead):
+            if free(r, lead):
                 chosen = (r, lead)
                 break
             tried.append((r, lead))
+            if head and lead is not None:
+                loose.append((r, anchor))
+        if chosen is None:
+            chosen = over_lines()
         if chosen is None:
             chosen = over_guides()
+        if chosen is None and not staged:   # no spot of any stage clear: now over the guides
+            chosen = next(((r, lead) for strict in (0, -1) for r, lead in held
+                           if free(r, lead, True, strict)), None)
         if chosen is None:
             if not need or first is None:
-                return None
-            self._misses += 1
-            chosen = (first, None)
-        r, lead = chosen
-        if lead is not None:
-            self._strays += 1
-            p.setPen(self._pen(col, _W_LEADER))
-            self._seg(p, *lead)
-        self._ink.boxes.append(r)
-        self._rich(p, r.left(), r.top(), html, font, col)
-        return r
+                return None, False
+            return (first, None), True
+        return chosen, False
+
+    def _over_guides(self) -> bool:
+        """Whether a label no spot of a stage frees clear of the guides may take one of that
+        stage over them (`_put`), else only once no spot of any stage is free clear of them:
+        in the term diagram, the first."""
+        return True
+
+    def _leader_gap(self) -> float:
+        """How far short of the line it names a headed leader ends, in px: `_LEADER_GAP` line
+        heights, and at least a span's arrowhead (`span.head`)."""
+        return max(_LEADER_GAP * self._lh(), self._size("span.head"))
+
+    def _arrowhead(self, p: QPainter, a: QPointF, b: QPointF) -> None:
+        """An open arrowhead at `b` on the line from `a`, in the painter's pen
+        (`_head_strokes`)."""
+        for s in self._head_strokes(a, b):
+            self._seg(p, *s)
+
+    def _head_strokes(self, a: QPointF, b: QPointF) -> list[tuple[QPointF, QPointF]]:
+        """The two strokes of an open arrowhead at `b` on the line from `a`: each from `b`,
+        `span.head` long, at most half the line's length."""
+        d = b - a
+        n = math.hypot(d.x(), d.y())
+        if n < 1e-6:
+            return []
+        size = min(self._size("span.head"), 0.5 * n)
+        ux, uy = d.x() / n, d.y() / n
+        return [(b, QPointF(b.x() - size * ux - s * 0.6 * size * uy,
+                            b.y() - size * uy + s * 0.6 * size * ux)) for s in (1.0, -1.0)]
 
     def _guide(self, p: QPainter, a: QPointF, b: QPointF) -> None:
         """A guide from `a` to `b` in the painter's pen, drawn by `_draw_guides` once the
@@ -1108,7 +1716,7 @@ class TimingDiagram(QWidget):
         lo, hi = x0 + 0.3 * lh, x1 - 0.3 * lh - w
         start = {"left": lo, "centre": 0.5 * (x0 + x1 - w), "right": hi}[lab.at]
         xs = _slide(start, lo, hi, _STEP * lh, {"left": 1, "centre": 0, "right": -1}[lab.at])
-        gap, pitch = _LABEL_GAP * lh, h + 2.0 * _PAD * lh + 1.0     # a label further off
+        gap, pitch = _LABEL_GAP * lh, h + 2.0 * self._pad() * lh + 1.0  # a label further off
 
         def top(above: bool, j: int) -> float:
             return lab.y - gap - h - j * pitch if above else lab.y + gap + j * pitch
@@ -1176,13 +1784,34 @@ class TimingDiagram(QWidget):
             job()
 
     def _paint_panel(self, p: QPainter, pn: Panel, y0: float, row_h: float) -> float:
-        """Paint `pn` from `y0` in the current frame; returns where it ends."""
+        """Paint `pn` from `y0` in the current frame; returns where it ends. A layout already
+        painted at the same panel, `y0`, row height, frame, line height and font replays its
+        labels' spots (`_spots`) in place of searching for them."""
+        key = (id(pn), y0, row_h, self._frame, self._lh(), self._body_font().key())
+        hit = self._spots.get(key)
+        if hit is not None and hit[0] is pn:
+            self._replay = iter(hit[1])
+        else:
+            self._record = []
+        try:
+            end = self._paint_panel_at(p, pn, y0, row_h)
+            if self._record is not None:
+                self._spots.pop(key, None)
+                self._spots[key] = (pn, self._record)
+                while len(self._spots) > _SPOTS_MAX:
+                    del self._spots[next(iter(self._spots))]
+        finally:
+            self._replay = self._record = None
+        return end
+
+    def _paint_panel_at(self, p: QPainter, pn: Panel, y0: float, row_h: float) -> float:
+        """`_paint_panel`'s drawing."""
         lh = self._lh()
-        text, dim = QColor(VizTheme.DIAG_TEXT), QColor(VizTheme.DIAG_DIM)
-        small = self._label_font()
+        text, dim = _colour("text"), _colour("dim_text")
+        small, span_font = self._label_font(), self._text_font("span")
         left, right = self._plot_x()
         end = y0 + self._head_height(pn) + self._body_height(pn, row_h)
-        self._ink = ink = _Ink(QRectF(left, y0, right - left, end - y0), _PAD * lh)
+        self._ink = ink = _Ink(QRectF(left, y0, right - left, end - y0), self._pad() * lh)
         self._pending = []
         st = self._static(self._heading(pn), self._head_font(), self._text_w())
         p.setFont(self._head_font())    # a static text draws in the painter's font
@@ -1201,7 +1830,7 @@ class TimingDiagram(QWidget):
         if pn.timeline is None:
             return top
         if not pn.rows:
-            end = self._paint_flights(p, pn, top, small)
+            end = self._paint_flights(p, pn, top, span_font)
             self._flush(p)
             self._draw_guides(p)
             return end
@@ -1225,22 +1854,21 @@ class TimingDiagram(QWidget):
                       for i, row in enumerate(pn.rows)]
 
         # The term's ends, each a dot with a guide down to the dimension line.
-        guide = QColor(VizTheme.DIAG_GUIDE)
         dim_y = top + len(pn.rows) * row_h + 0.55 * lh
         dots = []
+        r = self._size("dot.radius")
         for e in ends:
             if e.ramp is None or e.ramp not in row_of:
                 continue
             x = self.x_of(pn, e.t_ns)
-            y = level_y(row_of[e.ramp], tl.ramp(e.ramp).level(e.t_ns))
-            p.setPen(self._pen(guide, _W_GUIDE, Qt.DotLine))
+            y = level_y(row_of[e.ramp], tl.ramp(e.ramp).wire(e.t_ns))
+            p.setPen(self._line("guide_dot"))
             self._guide(p, QPointF(x, y), QPointF(x, dim_y))
             dots.append((QPointF(x, y), _point_colour(e.kind)))
-            r = _DOT_R * lh
             ink.dots.append(QRectF(x - r, y - r, 2 * r, 2 * r))
         # A point on no drawn ramp: a dashed guide from its label in the strip above the rows
         # (`_strip`). A deadline is named by the window drawn to it.
-        p.setPen(self._pen(guide, _W_GUIDE, Qt.DashLine))
+        p.setPen(self._line("guide_dash"))
         for e in ends:
             if e.kind == "deadline" and not _on_drawn_ramp(pn, e):
                 x = self.x_of(pn, e.t_ns)
@@ -1250,21 +1878,22 @@ class TimingDiagram(QWidget):
             self._guide(p, QPointF(x, strip_top + lane * pitch), QPointF(x, dim_y))
         # Chained spans each on their own dimension line, the guides on the next.
         for k, (sp, sym) in enumerate(zip(pn.spans, pn.symbols)):
-            self._paint_span(p, pn, sp, sym, dim_y + k * _DIM_H * lh, small)
+            self._paint_span(p, pn, sp, sym, dim_y + k * _DIM_H * lh, span_font)
         guide_y = dim_y + len(pn.spans) * _DIM_H * lh
         for start, end_key, label in pn.guides:
             d = tl.event(end_key).t_ns - tl.event(start).t_ns
-            ink_col = dim
+            ink_col = _colour("interval")
             if label == "margin":
-                label, ink_col = _margin_label(tl.leg, d)
+                ink_col = _margin_colour(d)
                 value = _signed_ns(d)
             else:
                 value = f"{abs(d):.2f}"
             self._dimension(p, self.x_of(pn, tl.event(start).t_ns),
                             self.x_of(pn, tl.event(end_key).t_ns), guide_y,
-                            f"{self._sub(label)} {value} ns", ink_col, small)
+                            f"{self._sub(label)} {value} ns", ink_col, span_font)
         lanes = _dim_lanes(pn)
-        self._paint_axis(p, pn, dim_y + _DIM_H * lanes * lh - 0.2 * lh, small)
+        self._paint_axis(p, pn, dim_y + _DIM_H * lanes * lh - 0.2 * lh,
+                         self._text_font("axis"))
         # The text, over the lines: the strip's, the dimensions' and the axis's, the rows'.
         for e, lx, lane, _, wrap in strip:
             html = self._html(e.label)
@@ -1273,12 +1902,12 @@ class TimingDiagram(QWidget):
                                     self._static(html, small, wrap).size()))
         self._flush(p)
         for labels in row_labels:
-            self._place_labels(p, labels, small)
+            self._place_labels(p, labels)
         self._draw_guides(p)
         p.setPen(Qt.NoPen)
         for at, colour in dots:
             p.setBrush(colour)
-            p.drawEllipse(at, _DOT_R * lh, _DOT_R * lh)
+            p.drawEllipse(at, r, r)
         p.setBrush(Qt.NoBrush)
         return top + len(pn.rows) * row_h + (_DIM_H * lanes + _AXIS_H) * lh
 
@@ -1293,15 +1922,17 @@ class TimingDiagram(QWidget):
         y = top + _FLIGHT_LEAD * lh
         bottom = y + _FLIGHT_H * len(pn.guides) * lh
         xs = sorted({self.x_of(pn, tl.event(k).t_ns) for gd in pn.guides for k in gd[:2]})
-        p.setPen(self._pen(QColor(VizTheme.DIAG_GUIDE), _W_GUIDE, Qt.DashLine))
+        p.setPen(self._line("guide_dash"))
         for x in xs:
             self._guide(p, QPointF(x, top + 0.2 * lh), QPointF(x, bottom + 0.4 * lh))
-        head = 0.4 * lh
+        head = self._size("flight.head")
         for start, end, label in pn.guides:
-            ink = _ink_of("clock" if label.lower().startswith("clock") else "data")
+            on = tl.event(end).ramp
+            ink = (_ink_of("clock") if label.lower().startswith("clock")
+                   else _ink(tl.ramp(on)) if on is not None else _ink_of("data"))
             x0, x1 = (self.x_of(pn, tl.event(k).t_ns) for k in (start, end))
             d = 1.0 if x1 >= x0 else -1.0
-            p.setPen(self._pen(ink, _W_FLIGHT))
+            p.setPen(self._line("flight", ink))
             self._seg(p, QPointF(x0, y), QPointF(x1 - d * head, y))
             tip = [QPointF(x1, y), QPointF(x1 - d * head, y - 0.45 * head),
                    QPointF(x1 - d * head, y + 0.45 * head)]
@@ -1347,8 +1978,7 @@ class TimingDiagram(QWidget):
         assert tl is not None
         left, right = self._plot_x()
         mid = 0.5 * (left + right)
-        dim = QColor(VizTheme.DIAG_DIM)
-        ink = _ink_of(row[0].signal)
+        ink = _ink(row[0])
         keys = {r.key for r in row}
         drv = _device(row[0])
         ordered = sorted(row, key=lambda r: r.start_ns)
@@ -1358,10 +1988,9 @@ class TimingDiagram(QWidget):
         split = any(abs(th.corner.ground_shift) > 1e-12 for th in ths)
         labels: list[_Label] = []
 
-        def line(level: float, x0: float, x1: float, colour: QColor, style=Qt.SolidLine,
-                 width: float = _W_LEVEL) -> float:
+        def line(level: float, x0: float, x1: float, key: str) -> float:
             y = level_y(level)
-            p.setPen(self._pen(colour, width, style))
+            p.setPen(self._line(key))
             self._seg(p, QPointF(x0, y), QPointF(x1, y))
             return y
 
@@ -1371,25 +2000,26 @@ class TimingDiagram(QWidget):
 
         # The driver's ground and rail, labelled at the left.
         g_end = mid if split else right
-        g0 = line(0.0, left, g_end, dim)
-        labels.append(_Label(g0, f"{drv} gnd", dim, "left", False, left, g_end))
+        g0 = line(0.0, left, g_end, "gnd")
+        labels.append(_Label(g0, f"{drv} gnd", _colour("gnd"), "left", False, left, g_end))
         v_dd = max(r.vdd_tx for r in row)
-        vy = line(v_dd, left, mid, dim, Qt.DotLine, _W_RAIL)
-        labels.append(_Label(vy, f"{drv} V_DD {pct_text(v_dd - 1.0)}", dim, "left", True,
-                             left, mid))
-        # The row's name, in its edges' colour, over its rail's label.
-        labels.append(_Label(vy, _row_name(row[0]), ink, "left", True, left, mid, off=1))
+        vy = line(v_dd, left, mid, "vdd")
+        labels.append(_Label(vy, f"{drv} V_DD {pct_text(v_dd - 1.0)}", _colour("vdd"), "left",
+                             True, left, mid))
+        # The row's name, in its first edge's colour, over its rail's label.
+        labels.append(_Label(vy, _row_name(row[0]), ink, "left", True, left, mid, off=1,
+                             font="row"))
         for th in ths:
             labels += self._paint_threshold(p, th, tl.ramp(th.ramp), level_y, g0, mid,
                                             end_level, font)
-        green = QColor(VizTheme.DIAG_OK)
+        green = _colour("reference")
         for e in ends:
             if e.ramp in keys and e.kind in ("reference", "anchor"):
                 r = tl.ramp(e.ramp)
                 level = r.level(e.t_ns)
                 # The driver's level: the left half, or to the point where that is further.
                 x1 = max(mid, self.x_of(pn, e.t_ns) + lh)
-                y = line(level, left, x1, green, Qt.DashLine)
+                y = line(level, left, x1, "reference")
                 pct = 100.0 * level / r.vdd_tx if r.vdd_tx else 0.0
                 labels.append(_Label(y, f"{pct:.0f} % {_device(r)} V_DD", green, "left",
                                      away(level, start_level), left, x1))
@@ -1397,30 +2027,32 @@ class TimingDiagram(QWidget):
             if e.ramp not in keys or e.kind not in ("valid", "release", "keeper"):
                 continue
             r = tl.ramp(e.ramp)
-            level = r.level(e.t_ns)
+            level = r.wire(e.t_ns)
             x = self.x_of(pn, e.t_ns)
             colour = _point_colour(e.kind)
             if e.kind == "valid":
                 # The 80 % point's level, as an anchor's: V_OH rising, V_OL falling.
                 x1 = max(mid, x + lh)
-                y = line(level, left, x1, colour, Qt.DashLine)
+                y = line(level, left, x1, "valid")
                 pct = 100.0 * level / r.vdd_tx if r.vdd_tx else 0.0
                 labels.append(_Label(y, f"{pct:.0f} % {_device(r)} V_DD", colour, "left",
                                      away(level, start_level), left, x1))
             elif e.kind == "release":
                 y = level_y(level)
-                p.setPen(self._pen(colour, _W_TICK))
-                self._seg(p, QPointF(x, y - 0.6 * lh), QPointF(x, y + 0.6 * lh))
+                tick = self._size("release.length")
+                p.setPen(self._line("release"))
+                self._seg(p, QPointF(x, y - tick), QPointF(x, y + tick))
             else:
                 labels.append(_Label(level_y(level), "keeper follows", colour, "point",
                                      level <= 0.5 * r.vdd_tx, x, x))
-        labels += self._paint_row(p, pn, row, level_y, ink)
+        labels += self._paint_row(p, pn, row, level_y)
         return labels
 
-    def _place_labels(self, p: QPainter, labels: list[_Label], font: QFont) -> None:
-        """Each label at the first free spot of its sequence (`_level_spots`), in order."""
+    def _place_labels(self, p: QPainter, labels: list[_Label]) -> None:
+        """Each label, in its text class's font, at the first free spot of its sequence
+        (`_level_spots`), in order."""
         for lab in labels:
-            self._put(p, self._html(lab.text), font, lab.colour,
+            self._put(p, self._html(lab.text), self._text_font(lab.font), lab.colour,
                       partial(self._level_spots, lab))
 
     def _paint_threshold(self, p: QPainter, th, r: Ramp, level_y, g0: float, mid: float,
@@ -1437,62 +2069,65 @@ class TimingDiagram(QWidget):
         labels = []
         gy = level_y(c.ground_shift)
         if abs(c.ground_shift) > 1e-12:
-            gnd = QColor(VizTheme.DIAG_GROUND)
-            p.setPen(self._pen(gnd, _W_LEVEL, Qt.DashLine))
+            gnd = _colour("gnd_offset")
+            p.setPen(self._line("gnd_offset"))
             self._seg(p, QPointF(mid, gy), QPointF(right, gy))
             labels.append(_Label(gy, f"{rx} gnd {pct_text(c.ground_shift)}", gnd, "right",
                                  end_level <= c.ground_shift + _EPS, mid, right))
-            # The offset itself, a step between the two halves.
-            p.setPen(self._pen(gnd, _W_LEVEL))
+            # The offset itself, a step between the two halves, solid.
+            p.setPen(self._line("gnd_offset", dashed=False))
             self._seg(p, QPointF(mid, g0), QPointF(mid, gy))
             for yy in (g0, gy):
                 self._seg(p, QPointF(mid - 0.25 * lh, yy), QPointF(mid + 0.25 * lh, yy))
-        dim = QColor(VizTheme.DIAG_DIM)
         rail = c.ground_shift + c.rx_supply
         ry = level_y(rail)
-        p.setPen(self._pen(dim, _W_RAIL, Qt.DotLine))
+        p.setPen(self._line("vdd"))
         self._seg(p, QPointF(mid, ry), QPointF(right, ry))
-        labels.append(_Label(ry, f"{rx} V_DD {pct_text(c.rx_supply - 1.0)}", dim, "right",
-                             end_level <= rail + _EPS, mid, right))
-        accent = QColor(VizTheme.DIAG_LEVEL)
+        labels.append(_Label(ry, f"{rx} V_DD {pct_text(c.rx_supply - 1.0)}", _colour("vdd"),
+                             "right", end_level <= rail + _EPS, mid, right))
+        accent = _colour("threshold")
         ty = level_y(c.threshold)
-        p.setPen(self._pen(accent, _W_LEVEL))
+        p.setPen(self._line("threshold"))
         self._seg(p, QPointF(left, ty), QPointF(right, ty))
         tx_pct = 100.0 * c.threshold / r.vdd_tx if r.vdd_tx else 0.0
         rx_pct = 100.0 * c.rx_threshold / c.rx_supply if c.rx_supply else 0.0
         labels += [_Label(ty, f"{tx_pct:.0f} % {tx} V_DD", accent, "left", False),
                    _Label(ty, c.bound, accent, "centre", False),
                    _Label(ty, f"{rx_pct:.0f} % {rx} V_DD", accent, "right", False)]
-        # The arrow from the receiver's ground, at the right where the edge has settled.
+        # The arrow from the receiver's ground, at the right where the edge has settled, solid.
         ax = right - 0.6 * lh
-        p.setPen(self._pen(accent, _W_LEVEL))
+        p.setPen(self._line("threshold", dashed=False))
         self._seg(p, QPointF(ax, gy), QPointF(ax, ty))
-        head = 0.32 * lh
+        head = self._size("threshold.head")
         d = 1.0 if ty > gy else -1.0
         self._seg(p, QPointF(ax, ty), QPointF(ax - 0.6 * head, ty - d * head))
         self._seg(p, QPointF(ax, ty), QPointF(ax + 0.6 * head, ty - d * head))
         return labels
 
-    def _paint_row(self, p: QPainter, pn: Panel, row: list[Ramp], level_y,
-                   ink: QColor) -> list[_Label]:
+    def _paint_row(self, p: QPainter, pn: Panel, row: list[Ramp], level_y) -> list[_Label]:
         """One row's edges across the window, each the curve of its own ramp from its start
-        to the next edge's, solid while its driver drives: a driver that goes high-Z drives to
-        its `off_ns`, past the next edge's start where they overlap, and a turn-on from its
-        start. An undriven stretch is dotted at the level the wire holds, labelled "high-Z";
+        to the next edge's in its driver's colour (`_ink`), solid while its driver drives: a
+        driver that goes high-Z drives to its `off_ns`, past the next edge's start where they
+        overlap, and a turn-on from its start. An undriven stretch is dotted at the level the
+        wire holds, labelled "high-Z": after a release in the releasing driver's colour, before
+        a turn-on in the colour of the device that last drove the wire (`_undriven_colour`);
         returns those labels."""
         lo, hi = pn.window
         ordered = sorted(row, key=lambda r: r.start_ns)
-        solid, dotted = self._pen(ink, _W_TRACE), self._pen(ink, _W_TRACE, Qt.DotLine)
+        w = ds.weight(_signal_key(row[0].signal))
+        dash = _DASH[ds.dash("high_z")]
         labels: list[Optional[_Label]] = []
         for i, r in enumerate(ordered):
+            solid, dotted = self._pen(_ink(r), w), self._pen(_ink(r), w, dash)
             nxt = ordered[i + 1] if i + 1 < len(ordered) else None
             start = r.start_ns if (i > 0 or r.from_hiz) else lo
             end = r.off_ns if r.off_ns is not None else (nxt.start_ns if nxt else hi)
             self._trace(p, pn, r.level, max(start, lo), min(end, hi), r.start_ns, level_y,
                         solid)
             if r.from_hiz and i == 0:
-                labels.append(self._high_z(p, pn, r.level(r.start_ns), lo, r.start_ns,
-                                           level_y, dotted, at_end=True))
+                labels.append(self._high_z(p, pn, r.level(r.start_ns), lo, r.start_ns, level_y,
+                                           self._pen(_undriven_colour(r), w, dash),
+                                           at_end=True))
             if r.off_ns is not None:
                 labels.append(self._high_z(p, pn, r.level(r.off_ns), r.off_ns,
                                            nxt.start_ns if nxt else hi, level_y, dotted))
@@ -1531,17 +2166,17 @@ class TimingDiagram(QWidget):
         self._seg(p, QPointF(x0, y), QPointF(x1, y))
         if x1 - x0 <= 3.5 * lh:
             return None
-        return _Label(y, "high-Z", QColor(VizTheme.DIAG_DIM), "right" if at_end else "left",
+        return _Label(y, "high-Z", _colour("dim_text"), "right" if at_end else "left",
                       level < 0.5, x0, x1)
 
     def _dimension(self, p: QPainter, x0: float, x1: float, y: float, label: str,
-                   col: QColor, font: QFont, width: float = _W_DIM) -> None:
-        """A dimension line from `x0` to `x1` at `y`, arrowed at both ends; its label is
-        queued for `_flush`, under the line by preference (`_dim_spots`)."""
-        lh = self._lh()
-        p.setPen(self._pen(col, width))
+                   col: QColor, font: QFont, key: str = "interval") -> None:
+        """A dimension line from `x0` to `x1` at `y` in `col`, of line class `key` ("span"
+        or "interval"), arrowed at both ends; its label is queued for `_flush`, under the
+        line by preference (`_dim_spots`)."""
+        p.setPen(self._line(key, col))
         self._seg(p, QPointF(x0, y), QPointF(x1, y))
-        head = 0.3 * lh
+        head = self._size(f"{key}.head")
         for x, d in ((x0, 1 if x1 >= x0 else -1), (x1, -1 if x1 >= x0 else 1)):
             if abs(x1 - x0) > 2 * head:
                 self._seg(p, QPointF(x, y), QPointF(x + d * head, y - 0.6 * head))
@@ -1556,38 +2191,48 @@ class TimingDiagram(QWidget):
         x0, x1 = self.x_of(pn, tl.event(sp.start).t_ns), self.x_of(pn, tl.event(sp.end).t_ns)
         self._dimension(p, x0, x1, y,
                         f"{_short_label(symbol, self._sub)} {abs(tl.duration(sp)):.2f} ns",
-                        QColor(VizTheme.DIAG_TEXT), font, _W_SPAN)
+                        _colour("span"), font, "span")
 
-    def _paint_axis(self, p: QPainter, pn: Panel, y: float, font: QFont) -> None:
-        """A time axis in ns from the term's start; its numbers, each under its tick where
-        that is free, and its unit, over the axis at its right end by preference, are queued
-        for `_flush`."""
+    def _paint_axis(self, p: QPainter, pn: Panel, y: float, font: QFont,
+                    unit_under: bool = False, origin: Optional[float] = None) -> None:
+        """A time axis in ns from the term's start, or from `origin`; its numbers, each under
+        its tick where that is free, and its unit, over the axis at its right end by
+        preference, are queued for `_flush`. With `unit_under` the unit is placed first, under the axis at its right
+        end by preference, and a number that would meet it is not drawn."""
         lh = self._lh()
         tl = pn.timeline
         assert tl is not None
         lo, hi = pn.window
-        t0 = min(tl.event(sp.start).t_ns for sp in pn.spans)
+        t0 = (min(tl.event(sp.start).t_ns for sp in pn.spans) if origin is None
+              else origin)
         step = _nice_step(hi - lo)
-        dim = QColor(VizTheme.DIAG_TEXT)
+        dim = _colour("axis")
         left, right = self._plot_x()
-        p.setPen(self._pen(dim, _W_DIM))
+        p.setPen(self._line("axis"))
         self._seg(p, QPointF(left, y), QPointF(right, y))
         ticks = []
+        tick = self._size("axis.tick")
         k = math.ceil((lo - t0) / step)
         while t0 + k * step <= hi:
             x = self.x_of(pn, t0 + k * step)
-            self._seg(p, QPointF(x, y), QPointF(x, y + 0.25 * lh))
+            self._seg(p, QPointF(x, y), QPointF(x, y + tick))
             ticks.append((x, f"{k * step:g}"))
             k += 1
 
+        under = y + 0.4 * lh + max(0.0, tick - 0.25 * lh)    # clear of a longer tick
+
         def place() -> None:
-            for x, number in ticks:
-                self._put(p, number, font, dim, partial(_under, x, y + 0.4 * lh), need=False)
             s = _STEP * lh
 
             def unit(w: float, h: float) -> _Spots:
-                for yy in (y - 0.15 * lh - h, y + 0.4 * lh):
+                sides = (y - 0.15 * lh - h, under)
+                for yy in (sides[::-1] if unit_under else sides):
                     for x in _slide(right - w, left, right - w, s, -1):
                         yield x, yy, None
-            self._put(p, "ns", font, dim, unit)
+            if unit_under:                  # the unit first, at the right end under the axis
+                self._put(p, "ns", font, dim, unit)
+            for x, number in ticks:
+                self._put(p, number, font, dim, partial(_under, x, under), need=False)
+            if not unit_under:
+                self._put(p, "ns", font, dim, unit)
         self._pending.append(place)

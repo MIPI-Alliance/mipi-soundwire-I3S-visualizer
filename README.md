@@ -48,10 +48,10 @@ rebuild" message if it spots a stale one.
 Ctrl+C in the terminal that launched the app quits it as File ▸ Quit does; if that quit
 hangs, a second Ctrl+C ends the process at once.
 
-Both launchers pick the newest **3.11–3.13** they can find, and refuse a newer one. Python
-3.14 is tested on Windows x64 (CI and the release gate install `requirements.txt` there);
-on Windows 3.14 use the manual setup below. On other platforms 3.14 is unverified: if
-PySide6 or pyarrow has no wheel for it there, pip tries to build Arrow from source and fails.
+Both launchers pick the newest **3.11–3.15** they can find, and refuse a newer one; on a
+later Python use the manual setup below. The gate runs 3.11–3.15 on macOS, Windows and Linux
+(nightly, and the release tag requires Windows on 3.14 and Linux on one of 3.11–3.13;
+`docs/DEVELOPMENT.md`, "Neither gate subsumes the other").
 
 **The virtualenv lives outside the repo** — `~/.cache/swi3s-studio/…`, or
 `%LOCALAPPDATA%\swi3s-studio\…` on Windows — so it is safe to clone under a
@@ -212,13 +212,17 @@ swi3s-studio -c config.csv -o model.json      # headless: write the bus model, n
 `-e .`) creates; the launchers and the manual setup above do not install them. Without that
 install, give the same arguments to the launcher (`./run.sh -c config.csv -o model.json`,
 `.\run.ps1 -c config.csv -o model.json`) or run `PYTHONPATH=. python3 -m swi3s_studio.app ...`.
-`--demo` is not the bundled two-Link workspace that **File ▸ Open Demo Capture ▸ PHY2** opens.
+`--demo` is not the bundled two-Link workspace that **File ▸ Open Demo Capture ▸ PHY2** opens,
+and takes no `-c` or `-o`; either with `--demo`, or `-c` with an empty name, is a usage error
+(exit 1).
 
 On Windows use `swi3s-studio-cli` for scripting: the `swi3s-studio` launcher has no console, so it prints nothing and returns no exit code to the shell.
 
 **`-o` implies headless.** No window is opened and Qt is never even imported, so it runs on a
 machine with no display. It writes the same bus-model JSON as **File ▸ Export Bus Model (JSON)…** in
 the Bus Visualizer — byte for byte — and prints the same issue list the notifications panel shows.
+A character of the report that stdout's encoding cannot hold (such as a non-ASCII output path on
+a legacy Windows code page) is printed as a backslash escape; the exit code is unaffected.
 
 Exit codes, for scripting:
 
@@ -246,8 +250,7 @@ Exit codes, for scripting:
   `pip install .\native` fails with a "Microsoft Visual C++ 14.0 or greater is required"
   error.
 - **Use the `py` launcher** to get a supported version if several Pythons are installed.
-  `run.ps1` auto-selects the newest **3.11–3.13** and refuses 3.14. On x64 Windows 3.14
-  installs and passes the suite: use the manual setup above with it.
+  `run.ps1` auto-selects the newest **3.11–3.15** and refuses a newer one.
 - **Windows on ARM (Parallels, Surface Pro X).** Install the **x64** build of Python, not
   the arm64 one: `pyarrow` ships no `win_arm64` wheel, so pip would try (and fail) to
   build Arrow from source. Windows-on-ARM runs x64 Python fine under emulation, and all
@@ -356,7 +359,9 @@ bash tools/setup_dev.sh               # macOS / Linux  (--test: then run the sui
 .\tools\setup_dev.ps1                 # Windows        (-Test:  then run the suite)
 ```
 
-It prints the venv's activate command and the test commands. By hand, in any environment:
+It prints the venv's activate command and the test commands. The gate runs the interpreter in
+`$PYTHON` (`$env:PYTHON` on Windows), else the `python3` on the path (on Windows, `.venv\Scripts\python.exe` first): activate that venv,
+or set `PYTHON=<venv python> bash tests/gate.sh` (`$env:PYTHON = "<venv python>"; .\tests\gate.ps1`). By hand, in any environment:
 `python3 -m pip install -r requirements-dev.txt` and `python3 -m pip install ./native`.
 
 ```bash
@@ -365,20 +370,21 @@ bash tests/gate.sh --release          # the release gate: also the single-proces
 python3 tools/changed_tests.py --run  # dev loop: the test files your change touches
 python3 tools/screenshots.py          # just the screenshots check (build/screenshots/)
 bash tests/gate.sh --quick            # the commit gate without the perf ceilings
-python3 -m pytest -n auto             # the functional suite, one worker per CPU
+python3 -m pytest -n auto --dist loadfile  # the functional suite, one worker per CPU
 bash tests/run_all.sh                 # every suite in its own process (gate.py --only suite)
 bash tests/run_all.sh --build         # rebuild the core first
 bash tests/run_all.sh --perf          # the perf benchmarks instead
 bash tests/run_all.sh --native        # also run the external native C++ suite ($SWI3S_NATIVE_CPP_SUITE names its runner)
 ```
 
-`gate.sh --release` is what a release must pass, on macOS, Windows **and** Linux, at the release
-commit — it rebuilds the native core and asserts `score_abi`, then runs the suite (each file in
-its own process, several at once, and once more in a single process), the perf gate, `ruff`, a
-mypy non-regression check, the leak scan, the screenshots check and the native coverage,
-reporting every failure rather than stopping at the first. On a test guest it is
-`--release --on-guest`, which leaves the single-process run and the native coverage to the
-development machine (`docs/DEVELOPMENT.md`, Release checklist). What runs where and when is `docs/TESTING.md` §1.1. The screenshots check
+`gate.sh --release` is what a release must pass: on each test guest (Windows and Linux) before the
+tag, and again on the development machine at the release commit (`docs/DEVELOPMENT.md`, Release
+checklist, steps 2–4). It rebuilds the native core and asserts `score_abi`, then runs the suite (each file in
+its own process, several at once, and once more in a single process), the perf gate, the
+diagrams' cover check, `ruff`, a mypy non-regression check, the leak scan, the screenshots check
+and the native coverage, reporting every failure rather than stopping at the first. On a test
+guest it is `--release --on-guest`, which leaves the single-process run, the native coverage
+and the diagram cover check to the development machine (`docs/DEVELOPMENT.md`, Release checklist). What runs where and when is `docs/TESTING.md` §1.1. The screenshots check
 renders every mode in light and dark on the platform's own style, fails on wrong-theme panes,
 widgets a live theme switch missed, faint or missing text and clipped labels, and leaves a
 contact sheet in `build/screenshots/contact_sheet.png` to review. It needs `ruff` and `mypy` on `PATH` or importable by the
@@ -410,7 +416,7 @@ Version numbers, branches and tags follow [`GOVERNANCE.md`](GOVERNANCE.md): a mi
 release adds functionality, and a sub-minor release carries fixes only.
 
 **Supported:** 3.x, the current major version. Fixes are made on its latest minor
-version, currently 3.2; within a major version releases stay compatible, so moving up to
+version, currently 3.3; within a major version releases stay compatible, so moving up to
 the latest minor version is how an older 3.x install gets a fix. The SWI3S Traffic
 Visualizer's `v1.*` and `v2.*` releases are no longer maintained.
 

@@ -105,6 +105,11 @@ class BusModelWarnings:
     # Format: (dp_name, bits_needed, bits_available)
     interval_overflow_warnings: List[Tuple[str, int, int]] = field(default_factory=list)
 
+    # Data ports whose SkippingNumerator_REG is at least SkippingDenominator_REG: every
+    # interval is skipped, so the port places nothing and takes no interval-overflow check.
+    # Format: (dp_name, skipping_numerator, skipping_denominator)
+    all_intervals_skipped_warnings: List[Tuple[str, int, int]] = field(default_factory=list)
+
     # DRQ truncation warnings (wide DRQ's last UI falls past the row end, so
     # the DRQ never completes on the bus — it's a configuration error).
     # Format: (dp_name, last_ui_column, num_columns)

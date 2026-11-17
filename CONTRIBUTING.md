@@ -15,7 +15,7 @@ contributions it is least able to produce for itself.
 Choose **Bug report** for a problem and **Feature request** for something the tool
 should do. A good report says:
 
-- **the version**, from the window title or **Help ▸ About SWI3S Studio**, and how you
+- **the version**, from the window title or **Help ▸ About SWI3S Studio** (on macOS, SWI3S Studio ▸ About SWI3S Studio), and how you
   run it (`run.sh`, `run.ps1`, a manual setup or a packaged build);
 - **the platform**: operating system, and the Python version for a source install;
 - **what you opened**: the mode, the capture format (Logic 2 `.sal`, CSV, `.vcd`, a
@@ -87,15 +87,19 @@ checks this on every pull request; to sign, comment on your PR exactly:
   manual steps) and the test commands. `bash tools/setup_dev.sh` (`.\tools\setup_dev.ps1`
   on Windows) installs what testing needs, `requirements-dev.txt`, and builds the decode
   core. Before opening a PR, run
-  `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows). It rebuilds the
+  `bash tests/gate.sh --quick` (`.\tests\gate.ps1 --quick` on Windows) with the venv
+  `setup_dev` prints active, or name its interpreter: `PYTHON=<venv python> bash tests/gate.sh --quick`
+  (`$env:PYTHON = "<venv python>"; .\tests\gate.ps1 --quick`). It rebuilds the
   native decode core and checks its ABI, then runs the test suite (each file in its own
   process, several at once), `ruff`, the `mypy` check, the leak scan and the screenshots
   check (every mode in light and dark, checked for wrong-theme panes, widgets a theme switch
-  missed, faint text and clipped labels); it skips only the perf gate. While you work,
+  missed, faint text and clipped labels); it skips only the perf gate. The diagrams' cover
+  check runs under `--release` only, on the development machine. While you work,
   `python3 tools/changed_tests.py --run` runs the test files your change touches.
-  On a pull request, CI runs the test suite on Linux, macOS and Windows, and the perf,
-  coverage and lint (which includes the structural leak scan) jobs on Linux and the
-  installed-package job on Linux and Windows. If you run `pytest` directly after changing
+  On a pull request, CI runs the whole test suite under coverage on Linux and the platform
+  scope (`gui`, `platform` and `smoke` tests) on Linux, macOS and Windows, the perf and lint
+  (which includes the structural leak scan) jobs on Linux, and the installed-package job on
+  Linux and Windows. If you run `pytest` directly after changing
   anything under `native/`, rebuild the decode core first. See
   [docs/TESTING.md](docs/TESTING.md) for how the suites are organised.
 - **Docs change with the code.** If a change makes a sentence in the README, the User

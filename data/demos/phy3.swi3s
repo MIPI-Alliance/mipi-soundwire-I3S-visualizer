@@ -159,7 +159,8 @@
       "expanded": []
     },
     "timing_pane": {
-      "region": "16 col  (0.00\u20131.00 s)",
+      "region": "1x44.1k, 1x48k, 2x3.072M  (0.00\u20131.00 s)",
+      "section": 1,
       "filter": [
         "Manager",
         "Device -1 DP-1",

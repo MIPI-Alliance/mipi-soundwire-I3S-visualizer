@@ -29,8 +29,10 @@ import math
 from dataclasses import replace as dc_replace
 
 import pytest
+from timing_page_inputs import column, page, worst
 
 from swi3s_studio.timing import (
+    INEQUALITIES,
     CalcInputs,
     CalcResults,
     CalcRow,
@@ -39,6 +41,7 @@ from swi3s_studio.timing import (
     compute,
     default_swi3s_rows,
     find_worst_corner_rows,
+    find_worst_corner_rows_all,
 )
 from swi3s_studio.timing.spec_source import (
     HANDOVER_CROSS_SPEC_NOTE,
@@ -60,9 +63,11 @@ from swi3s_studio.timing.spec_source import (
     sw13_anchor_correction,
     sw13_equivalent_slews,
     sw13_equivalents,
+    sw13_receive_correction,
+    sw13_receive_slew,
 )
 
-pytestmark = pytest.mark.gui
+pytestmark = pytest.mark.usefixtures("shared_compute")
 
 # Baseline corner: 30 cm, 13.2 MHz, small/1.2 V.
 BASE = dict(bus_length_cm=30.0, F_CLK_target_MHz=13.2)
@@ -160,7 +165,7 @@ def test_swi3s_defaults_unchanged_by_the_spec_selector():
     # crossing counted from there, each leg at one V_SEOS per device.
     expect = {
         "MP_setup": +7.121, "MP_setup_ho": +15.121, "MP_hold": -2.470,
-        "PM_setup": -3.429, "PM_setup_ho": +6.571, "PM_hold": +7.573,
+        "PM_setup": -3.629, "PM_setup_ho": +6.371, "PM_hold": +7.373,
     }
     for ineq, want in expect.items():
         assert r.breakdowns[ineq].margin_ns == pytest.approx(want, abs=5e-4), ineq
@@ -225,6 +230,7 @@ def _row_rounding_ns(terms) -> float:
     return bound + 1e-9
 
 
+@pytest.mark.gui
 @pytest.mark.parametrize("spec", SPEC_SOURCES)
 def test_every_leg_s_substitution_row_reads_its_margin(spec):
     """The substitution row's numbers, as printed, add up to the margin beside them: a term
@@ -464,7 +470,7 @@ def test_an_exponential_ramp_to_v_oh_is_its_true_crossing_on_keeper_and_ede_legs
         b = compute(ede).breakdowns[leg]
         at = dc_replace(ede, fast_data_edge=b.fast_data_edge)
         lane = f"{side} DATA"
-        rising = _keeper_case(at, lane, b.supplies, ede=True)[0]
+        rising = _keeper_case(at, lane, b.supplies, ede=True)[0].rising
         c_edge = c_rise if rising else c_fall
         ramp = _ramp_term(b.terms, side)
         fast = ",fast" if lane in b.fast_data_edge else ""
@@ -528,7 +534,7 @@ def test_the_edge_tie_goes_rising_on_a_keeper_and_falling_on_an_ede_release():
             inp = CalcInputs(Man_shape=shape, Per_shape=shape, V_IH_max_frac=v_ih)
             for lane in ("Man DATA", "Per DATA"):
                 for ede in (False, True):
-                    got = _keeper_case(inp, lane, (1.0, 1.0, 1.0), ede=ede)[0]
+                    got = _keeper_case(inp, lane, (1.0, 1.0, 1.0), ede=ede)[0].rising
                     assert got is rising, (shape, v_ih, lane, ede)
     for shape, v_ol in (("linear", 0.20), ("linear", 0.15), ("exp", 0.20)):
         inp = CalcInputs(Man_shape=shape, Per_shape=shape, V_OL_max_frac=v_ol)
@@ -870,10 +876,11 @@ def test_a_clock_crossing_counts_from_the_manager_s_clock_reference():
         # The PM margins, the peripheral's detection read from the Manager's clock reference
         # and its data from the launch's anchor.
         pm_setup = (inp.UI_ns() - 2 * inp.t_PD_ns() - (cc - f_a) * late_k * k
-                    - inp.Per_t_DD_max_ns - (cd - f_a) * late_s * s - inp.Man_t_IS_max_ns)
+                    - inp.Per_t_DD_max_ns - inp.t_PD_mis_ns() - (cd - f_a) * late_s * s
+                    - inp.Man_t_IS_max_ns)
         assert b["PM_setup"].margin_ns == pytest.approx(pm_setup, abs=1e-9), k
         pm_hold = (2 * inp.t_PD_ns() + (hc - f_a) * early_k * k + inp.Per_t_DD_min_ns
-                   + (hd - f_a) * early_s * s - inp.Man_t_IH_max_ns)
+                   - inp.t_PD_mis_ns() + (hd - f_a) * early_s * s - inp.Man_t_IH_max_ns)
         assert b["PM_hold"].margin_ns == pytest.approx(pm_hold, abs=1e-9), k
 
 
@@ -915,6 +922,11 @@ _T_OV = {"small": 27.9, "large": 29.0}
 _K_MAX = {"small": 5.0, "large": 6.0}
 _K_MIN, _T_ZD, _T_DZ, _T_IS, _T_IH, _T_KEEP = 2.0, 8.1, 5.0, 0.0, 4.0, 2.5
 _DEPART = 500.0 * 5e-12 * 1e9 * math.log(1 / 0.9)      # SWI3S test load, 10 % departure
+# A SWI3S clock input's earliest detection, V_IH,min rising and V_IL,max falling, and
+# SoundWire's early-end clock point, V_TP_Clock,min / V_TN_Clock, as fractions of the rail; a
+# linear clock ramp swings 0.20 to 0.80 in one t_RF.
+_V_IH_MIN, _V_IL_MAX, _V_TP_MIN = 0.45, 0.55, 0.50
+_LEAD = (_V_TP_MIN - _V_IH_MIN) / 0.6                    # 1/12 of the clock's t_RF
 
 
 def _exact_equivalents(side: str, size: str) -> dict:
@@ -922,28 +934,32 @@ def _exact_equivalents(side: str, size: str) -> dict:
     k = t_Slew_Clock, s = t_Slew_Data:
 
         Peripheral  t_DD,max = t_ZD,max = t_OV − s
-                    t_DD,min = t_ZD,min = t_ZD + s_ref/3
-                    t_DZ = t_DZ_Data + RC·ln(1/0.9)          t_IS = t_ISetup    t_IH = t_IHold
+                    t_DD,min = t_ZD,min = t_ZD + (0.05/0.6)·k_min + s_ref/3
+                    t_DZ = t_DZ_Data + RC·ln(1/0.9)
+                    t_IS = t_ISetup − (0.05/0.6)·k_min        t_IH = t_IHold
         Manager     t_DD,max = t_ZD,max = t_OV + 0.75·k − s
                     t_DD,min = t_ZD,min = t_ZD + (0.5/0.6)·k_min
                     t_DZ = t_DZ_Data + 0.75·k + RC·ln(1/0.9)
                     t_IS = t_ISetup − 0.5·k_min               t_IH = t_IHold + 0.75·k
 
-    with k = s = t_Slew_Clock's max, k_min = 2.0 ns and s_ref the SWI3S reference slew.
+    with k = s = t_Slew_Clock's max, k_min = 2.0 ns and s_ref the SWI3S reference slew. A
+    Peripheral's late-end values start at the clock's 65 %, V_IH,max; its early-end ones at
+    50 %, (0.50 − V_IH,min)/0.6 of the clock's slew after its earliest detection.
     """
     k = s_ = _K_MAX[size]
     if side == "Per":
-        return dict(dd_max=_T_OV[size] - s_, dd_min=_T_ZD + REF_TRF_NS / 3.0,
-                    dz=_T_DZ + _DEPART, t_is=_T_IS, t_ih=_T_IH)
+        return dict(dd_max=_T_OV[size] - s_,
+                    dd_min=_T_ZD + _LEAD * _K_MIN + REF_TRF_NS / 3.0,
+                    dz=_T_DZ + _DEPART, t_is=_T_IS - _LEAD * _K_MIN, t_ih=_T_IH)
     return dict(dd_max=_T_OV[size] + 0.75 * k - s_, dd_min=_T_ZD + 0.5 / 0.6 * _K_MIN,
                 dz=_T_DZ + 0.75 * k + _DEPART, t_is=_T_IS - 0.5 * _K_MIN,
                 t_ih=_T_IH + 0.75 * k)
 
 
 @pytest.mark.parametrize("side,size,want", [
-    ("Per", "small", dict(dd=(9.7, 22.9), dz=5.3, t_is=0.0, t_ih=4.0, trf=5.0)),
+    ("Per", "small", dict(dd=(9.9, 22.9), dz=5.3, t_is=-0.1, t_ih=4.0, trf=5.0)),
     ("Man", "small", dict(dd=(9.7, 26.7), dz=9.1, t_is=-1.0, t_ih=7.8, trf=5.0)),
-    ("Per", "large", dict(dd=(9.7, 23.0), dz=5.3, t_is=0.0, t_ih=4.0, trf=6.0)),
+    ("Per", "large", dict(dd=(9.9, 23.0), dz=5.3, t_is=-0.1, t_ih=4.0, trf=6.0)),
     ("Man", "large", dict(dd=(9.7, 27.5), dz=9.8, t_is=-1.0, t_ih=8.5, trf=6.0)),
 ])
 def test_the_soundwire_equivalents_are_the_derivation_rounded_outward(side, size, want):
@@ -991,13 +1007,14 @@ def test_the_presets_carry_the_equivalents_on_their_own_side():
                                      ("SW13_1V2", "SW13_1V2")])
 @pytest.mark.usefixtures("no_toggle_ceiling")
 def test_a_soundwire_side_is_evaluated_as_a_swi3s_side_with_the_same_rows(man, per):
-    """Three SoundWire-specific things remain, the data-input window, the anchor correction
-    (`sw13_anchor_correction`) and a SoundWire Manager's keeper threshold: relabelling a
-    SoundWire side as SWI3S, rows unchanged, drops the `,anchor` terms and moves no other term
-    on any leg except a data-lane crossing, the keeper legs' `X_K` among them
+    """Four SoundWire-specific things remain, the data-input window, the anchor correction
+    (`sw13_anchor_correction`), the receive-row correction (`sw13_receive_correction`) and a
+    SoundWire Manager's keeper threshold: relabelling a SoundWire side as SWI3S, rows
+    unchanged, drops the `,anchor` and `,ref` terms and moves no other term on any leg except
+    a data-lane crossing, the keeper legs' `X_K` among them
     (`test_a_soundwire_data_input_takes_its_own_threshold_window` and
     `test_a_keeper_counts_its_response_from_the_managers_threshold` pin those). On a leg with
-    no data-lane crossing the margin moves by the anchor terms alone. Compared at 3.5 ns on
+    no data-lane crossing the margin moves by the anchor and receive-row terms alone. Compared at 3.5 ns on
     every lane, inside both specs' slew ranges, so the per-edge slew tolerance is the same. On
     a leg with no data-lane crossing the anchor terms are the whole difference, and its F_max,
     0.0 or unbounded, is the same on both; every leg with a finite non-zero F_max here carries
@@ -1026,12 +1043,15 @@ def test_a_soundwire_side_is_evaluated_as_a_swi3s_side_with_the_same_rows(man, p
             out.append(head + sep + lane)
         return out
 
+    def sw_only(sym):
+        return ",anchor" in sym or ",ref," in sym
+
     for leg in b.breakdowns:
         a = _compute_at(inp, b.breakdowns[leg].supplies)
-        ta = [t for t in a.breakdowns[leg].terms if ",anchor" not in t.symbol]
+        ta = [t for t in a.breakdowns[leg].terms if not sw_only(t.symbol)]
         tb = b.breakdowns[leg].terms
-        anchors = sum(t.value_ns for t in a.breakdowns[leg].terms if ",anchor" in t.symbol)
-        assert not any(",anchor" in t.symbol for t in tb), leg
+        anchors = sum(t.value_ns for t in a.breakdowns[leg].terms if sw_only(t.symbol))
+        assert not any(sw_only(t.symbol) for t in tb), leg
         assert names(ta) == names(tb), leg
         for x, y in zip(ta, tb):
             if not data_crossing(x):
@@ -1046,19 +1066,195 @@ def test_a_soundwire_side_is_evaluated_as_a_swi3s_side_with_the_same_rows(man, p
     assert compute(inp).caveats != b.caveats
 
 
-def test_a_soundwire_peripheral_takes_no_clock_side_offset():
-    """A SWI3S Peripheral's clock reference is its own V_IH crossing, and V_IH,max is
-    SoundWire's 65 % V_TP_Clock,max, so a SoundWire Peripheral's launch is its equivalent at
-    its anchor alone: PM setup carries its clock detection once, gathered with the Manager's
-    clock reference, and no re-anchor of the clock's 0 % → 65 % on top. At the slews the
-    equivalent is derived at, with no per-edge slew tolerance, the anchor correction is zero
-    and is no term."""
+def test_a_soundwire_peripheral_takes_no_clock_side_offset_at_the_late_end():
+    """A SWI3S Peripheral's timings count from its own clock detection, and the late end of
+    its V_IH window, V_IH,max, is SoundWire's 65 % V_TP_Clock,max, so a SoundWire Peripheral's
+    t_OV launch is its equivalent at its anchor alone: PM setup carries its clock detection
+    once, gathered with the Manager's clock reference, and no re-anchor of the clock's
+    0 % → 65 % on top. At the slews the equivalent is derived at, with no per-edge slew
+    tolerance, the anchor correction is zero and is no term."""
     inp = _mixed("SWI3S_PHY2", "SW13_1V2", F_CLK_target_MHz=12.288, tRF_tolerance_frac=0.0)
     terms = compute(inp).breakdowns["PM_setup"].terms
     launch = next(t for t in terms if t.symbol == "Per_t_DD")
     assert -launch.value_ns == pytest.approx(22.9, abs=1e-9)
     assert not any(t.symbol.startswith("Per_t_DD,anchor") for t in terms)
     assert sum(1 for t in terms if t.symbol.endswith("· Man_t_RF,CLK")) == 1
+
+
+@pytest.mark.parametrize("size", ["small", "large"])
+def test_a_soundwire_peripherals_early_end_counts_from_its_earliest_detection(size):
+    """SoundWire measures t_ISetup and t_ZD_Data from the clock at 50 % (V_TP_Clock,min), and a
+    SWI3S Peripheral's earliest detection is V_IH,min, 45 %: on a linear clock ramp swinging
+    0.20-0.80 in one t_RF the 50 % point is (0.50 − 0.45)/0.6 = 1/12 of the clock's slew
+    later. The Peripheral's t_IS row is t_ISetup less that lead at t_Slew_Clock's min (the
+    largest demand over the clock slews), rounded up; its t_DD and t_ZD minima are t_ZD_Data
+    plus the lead at t_Slew_Clock's min plus the data ramp to its 20 % point at the reference
+    slew, rounded down. Its maxima, t_DZ and t_IH take none."""
+    e = sw13_equivalents("SW13_1V2", "Per", size)
+    t_is = _T_IS - (0.50 - 0.45) / 0.6 * 2.0
+    assert t_is == pytest.approx(-1.0 / 6.0)
+    assert e["t_IS_max_ns"] == pytest.approx(math.ceil(t_is * 10.0 - 1e-6) / 10.0) == -0.1
+    # Every clock slew SoundWire allows leaves a demand no larger than the row.
+    for k in (2.0, 3.0, _K_MAX[size]):
+        assert _T_IS - (0.50 - 0.45) / 0.6 * k <= e["t_IS_max_ns"] + 1e-12, k
+    dd_min = _T_ZD + (0.50 - 0.45) / 0.6 * 2.0 + 5.0 / 3.0
+    for f in ("t_DD_min_ns", "t_ZD_min_ns"):
+        assert e[f] == pytest.approx(math.floor(dd_min * 10.0 + 1e-6) / 10.0) == 9.9, f
+    assert (e["t_DD_max_ns"], e["t_DZ_max_ns"], e["t_IH_max_ns"]) == pytest.approx(
+        (_T_OV[size] - _K_MAX[size], 5.3, _T_IH))
+    # The calculator's Per_t_IS and Per_t_DD rows carry the same values.
+    p = preset("SW13_1V2", "Per", size)
+    assert (p.t_IS_max_ns, p.t_DD_min_ns, p.t_ZD_min_ns) == (-0.1, 9.9, 9.9)
+
+
+def test_a_soundwire_peripherals_early_end_lead_moves_with_the_clock_and_its_window():
+    """A SoundWire Peripheral's min-side anchor carries the clock's lead from the earliest
+    detection to 50 %, so its correction at the operating slews is (k − k_min)·lead plus the
+    data part (s − s_ref)/3: zero at the derivation slews, and on a clock slower than
+    t_Slew_Clock's min the launch is later. The lead is V_IH,min to 50 % on a rising clock
+    and V_IL,max to 50 % on a falling one, (V_IL,max − 0.50)/0.6, and follows the V_IH / V_IL
+    rows in force. The calculator takes the clock's early edge and the polarity that places
+    the launch the earlier, and the max side moves with neither."""
+    from swi3s_studio.timing.calculator import edge_factor, sw_anchor_ns
+    k0, s0 = sw13_equivalent_slews("SW13_1V2", "Per", corner="min")
+    assert (k0, s0) == pytest.approx((_K_MIN, REF_TRF_NS))
+    for k, s_ in ((2.0, 5.0), (5.0, 5.0), (8.3, 3.0)):
+        for clk_rising in (True, False):
+            got = sw13_anchor_correction("SW13_1V2", "Per", corner="min", t_rf_clk_ns=k,
+                                         t_rf_data_ns=s_, clk_rising=clk_rising)
+            assert got == pytest.approx((k - k0) / 12.0 + (s_ - s0) / 3.0, abs=1e-12), (
+                k, s_, clk_rising)
+    # An asymmetric window: V_IH,min 0.40 rising, V_IL,max 0.58 falling.
+    win = dict(V_IH_min_frac=0.40, V_IL_max_frac=0.58)
+    rise_lead, fall_lead = (0.50 - 0.40) / 0.6, (0.58 - 0.50) / 0.6
+    for clk_rising, lead in ((True, rise_lead), (False, fall_lead)):
+        got = sw13_anchor_correction("SW13_1V2", "Per", corner="min", t_rf_clk_ns=5.0,
+                                     t_rf_data_ns=REF_TRF_NS, clk_rising=clk_rising, **win)
+        assert got == pytest.approx(lead * 5.0 - k0 / 12.0, abs=1e-12), clk_rising
+    inp = CalcInputs(Per_spec="SW13_1V2", tRF_Man_CLK_ns=5.0, tRF_Per_DATA_ns=REF_TRF_NS,
+                     tRF_tolerance_frac=0.05, V_IH_min_frac=0.40, V_IL_max_frac=0.58)
+    k = 5.0 * edge_factor(inp, "Man CLK", "early")
+    s_ = REF_TRF_NS * edge_factor(inp, "Per DATA", "early")
+    want = min(rise_lead, fall_lead) * k - k0 / 12.0 + (s_ - s0) / 3.0
+    for c in (True, False):
+        assert sw_anchor_ns(inp, "Per", "min", clk_rising=c) == pytest.approx(want, abs=1e-12)
+    # The max side is from V_IH,max, so neither the clock nor the window moves it.
+    base = CalcInputs(Per_spec="SW13_1V2", tRF_tolerance_frac=0.0)
+    for kw in ({"tRF_Man_CLK_ns": 8.3}, win):
+        assert sw_anchor_ns(dc_replace(base, **kw), "Per", "max") == pytest.approx(
+            sw_anchor_ns(base, "Per", "max"), abs=1e-12), kw
+    # A hold leg carries the lead in its `,anchor` term.
+    inp = CalcInputs(Man_spec="SWI3S_PHY2", Per_spec="SW13_1V2", tRF_tolerance_frac=0.0,
+                     tRF_Man_CLK_ns=8.3, tRF_Per_DATA_ns=REF_TRF_NS)
+    terms = compute(inp).breakdowns["PM_hold"].terms
+    (corr,) = [t for t in terms if t.symbol.startswith("Per_t_DD,anchor")]
+    assert corr.value_ns == pytest.approx((8.3 - k0) / 12.0, abs=1e-12)
+
+
+# A SoundWire receive demand measured from the SWI3S clock end at clock slew k, linear clock
+# ramp 0.20-0.80 in one t_RF: t_ISetup to the clock's 50 % point and t_IHold from its 65 %
+# point, which on a Peripheral are (0.50 − V_IH,min)/0.6·k after its earliest detection and at
+# V_IH,max, and on a Manager (0.50 − 0.20)/0.6·k and (0.65 − 0.20)/0.6·k after its 20 %
+# reference.
+_RECEIVE_EXACT = {
+    ("Per", "IS"): lambda k: _T_IS - (0.50 - 0.45) / 0.6 * k,
+    ("Per", "IH"): lambda k: _T_IH,
+    ("Man", "IS"): lambda k: _T_IS - (0.50 - 0.20) / 0.6 * k,
+    ("Man", "IH"): lambda k: _T_IH + (0.65 - 0.20) / 0.6 * k,
+}
+
+
+@pytest.mark.parametrize("size", ["small", "large"])
+def test_a_soundwire_receive_row_follows_the_clock_slew_exactly(size):
+    """A SoundWire side's t_IS and t_IH rows are each derived at one clock slew, t_Slew_Clock's
+    min for a t_IS (the largest demand) and its max for a Manager's t_IH, and rounded up there.
+    The receive-row correction is the exact demand at the operating clock slew less the exact
+    demand at that slew, at either clock polarity: 0 at the derivation slew, so the leg reads
+    the rounded row, and elsewhere the row plus the exact move. A Peripheral's t_IH, from
+    65 %, has none. At small size, t_Slew_Clock 2.0 and 5.0 ns, the leg reads Per t_IS
+    −0.1 / −0.35, Man t_IS −1.0 / −2.5 and Man t_IH 5.55 / 7.8 ns."""
+    k_max = _K_MAX[size]
+    k0 = {("Per", "IS"): _K_MIN, ("Per", "IH"): _K_MIN, ("Man", "IS"): _K_MIN,
+          ("Man", "IH"): k_max}
+    for (side, which), exact in _RECEIVE_EXACT.items():
+        row = sw13_equivalents("SW13_1V2", side, size)[f"t_{which}_max_ns"]
+        assert sw13_receive_slew("SW13_1V2", side, which, system_size=size) == k0[side, which]
+        residue = row - exact(k0[side, which])
+        assert -1e-9 <= residue < 0.1, (side, which, row)
+        for clk_rising in (True, False):
+            def corr(k):
+                return sw13_receive_correction("SW13_1V2", side, which, t_rf_clk_ns=k,
+                                               system_size=size, clk_rising=clk_rising)
+            assert corr(k0[side, which]) == pytest.approx(0.0, abs=1e-12), (side, which)
+            for k in (2.0, 5.0, k_max):
+                assert corr(k) == pytest.approx(exact(k) - exact(k0[side, which]),
+                                                abs=1e-12), (side, which, k)
+                assert row + corr(k) == pytest.approx(exact(k) + residue, abs=1e-12)
+    if size == "small":
+        def leg(side, which, k):
+            return (sw13_equivalents("SW13_1V2", side)[f"t_{which}_max_ns"]
+                    + sw13_receive_correction("SW13_1V2", side, which, t_rf_clk_ns=k))
+        assert [leg("Per", "IS", k) for k in (2.0, 5.0)] == pytest.approx([-0.1, -0.35])
+        assert [leg("Man", "IS", k) for k in (2.0, 5.0)] == pytest.approx([-1.0, -2.5])
+        assert [leg("Man", "IH", k) for k in (2.0, 5.0)] == pytest.approx([5.55, 7.8])
+        assert [leg("Per", "IH", k) for k in (2.0, 5.0)] == pytest.approx([4.0, 4.0])
+
+
+def test_a_soundwire_receive_row_carries_its_correction_on_its_legs():
+    """A setup or hold leg charges a SoundWire receiver's row and its correction to the
+    operating clock slew (`sw_receive_ns`), the term `<side>_t_<IS|IH>,ref,<edge>` naming the
+    sampling clock edge: a t_IS on the clock's early edge and a Manager's t_IH on its late
+    edge, the edge that makes each demand the larger. With no per-edge slew tolerance the
+    leg's demand is the row plus the exact move from the derivation slew. The two polarities
+    differ where the clock's levels are asymmetric: a Manager's 50 % and 65 % points are
+    (0.50 − V_OL)/(V_OH − V_OL) and (V_OH − 0.50)/(V_OH − V_OL) of k after its reference
+    rising and falling, and a Peripheral's lead is (0.50 − V_IH,min)/0.6 rising and
+    (V_IL,max − 0.50)/0.6 falling. The term's note states the slews that reproduce it."""
+    import re
+
+    from swi3s_studio.timing.calculator import sw_receive_ns
+
+    pat = re.compile(r"derived at \(k = ([0-9.]+) ns\), so at k = ([0-9.]+) ns \(.*\) the "
+                     r"demand moves by ([+-][0-9]+\.[0-9]+) ns")
+    rate = {("Per", "IS"): -(0.50 - 0.45) / 0.6, ("Man", "IS"): -0.5, ("Man", "IH"): 0.75}
+    for k in (2.0, 5.0):
+        inp = _mixed("SW13_1V2", "SW13_1V2", tRF_Man_CLK_ns=k, tRF_Man_DATA_ns=k,
+                     tRF_tolerance_frac=0.0)
+        r = compute(inp).breakdowns
+        for leg, side, which in (("MP_setup", "Per", "IS"), ("MP_hold", "Per", "IH"),
+                                 ("PM_setup", "Man", "IS"), ("PM_hold", "Man", "IH"),
+                                 ("PP_setup", "Per", "IS"), ("PP_hold", "Per", "IH")):
+            row = getattr(inp, f"{side}_t_{which}_max_ns")
+            k0 = sw13_receive_slew("SW13_1V2", side, which)
+            want = rate.get((side, which), 0.0) * (k - k0)
+            parts = [t for t in r[leg].terms if t.symbol.startswith(f"{side}_t_{which}")]
+            assert -sum(t.value_ns for t in parts) == pytest.approx(row + want, abs=1e-12), \
+                (leg, k, [(t.symbol, t.value_ns) for t in parts])
+            refs = [t for t in parts if ",ref," in t.symbol]
+            assert len(refs) == (abs(want) > 1e-12), (leg, k, refs)
+            edge = "rise" if r[leg].sampling_rising else "fall"
+            for t in refs:
+                assert t.symbol == f"{side}_t_{which},ref,{edge}", (leg, t.symbol)
+                m = pat.search(t.note)
+                assert m, t.note
+                n_k0, n_k, move = (float(g) for g in m.groups())
+                assert (n_k0, n_k, move) == pytest.approx((k0, k, want), abs=5e-3), t.note
+    # The polarities at asymmetric levels, on a clock edge the tolerance moves.
+    levels = dict(V_OH_min_frac=0.85, V_OL_max_frac=0.25, V_IH_min_frac=0.40,
+                  V_IL_max_frac=0.58, tRF_Man_CLK_ns=4.0, tRF_tolerance_frac=0.05)
+    inp = _mixed("SW13_1V2", "SW13_1V2", **levels)
+    early, late = 4.0 * 0.95, 4.0 * 1.05
+    swing = 0.85 - 0.25
+    want = {("Per", "IS", True): -(0.50 - 0.40) / 0.6 * early + (0.05 / 0.6) * _K_MIN,
+            ("Per", "IS", False): -(0.58 - 0.50) / 0.6 * early + (0.05 / 0.6) * _K_MIN,
+            ("Man", "IS", True): -(0.50 - 0.25) / swing * early + 0.5 * _K_MIN,
+            ("Man", "IS", False): -(0.85 - 0.50) / swing * early + 0.5 * _K_MIN,
+            ("Man", "IH", True): (0.65 - 0.25) / swing * late - 0.75 * _K_MAX["small"],
+            ("Man", "IH", False): (0.85 - 0.35) / swing * late - 0.75 * _K_MAX["small"],
+            ("Per", "IH", True): 0.0, ("Per", "IH", False): 0.0}
+    for (side, which, clk_rising), w in want.items():
+        assert sw_receive_ns(inp, side, which, clk_rising=clk_rising) == pytest.approx(
+            w, abs=1e-12), (side, which, clk_rising)
 
 
 @pytest.mark.parametrize("size", ["small", "large"])
@@ -1091,20 +1287,23 @@ def test_the_anchor_correction_is_zero_at_the_equivalents_own_slews(size):
 def test_a_soundwire_anchor_takes_its_sides_ramp_shape():
     """A SoundWire launch's anchor is placed with the side's ramp shape: on an exponential
     ramp the 20 % point is 0.161·s after low impedance (1/3·s linear) and the clock's 65 % and
-    50 % crossings 0.596·k and 0.339·k after its 20 % point (0.75·k, 0.5·k linear). The rows
-    are the linear equivalents, so the correction is the exponential anchor less the linear
-    one at the equivalents' slews, and the calculator applies it per side."""
+    50 % crossings 0.596·k and 0.339·k after its 20 % point (0.75·k, 0.5·k linear); a
+    Peripheral's clock part, from its earliest detection at 45 % to 50 %, is
+    ln(0.55/0.5)/ln 4·k = 0.069·k (k/12 linear). The rows are the linear equivalents, so the
+    correction is the exponential anchor less the linear one at the equivalents' slews, and
+    the calculator applies it per side."""
     from swi3s_studio.timing.calculator import sw_anchor_ns
     z = -math.log(0.8) / math.log(4.0)
     p = (-math.log(0.35) + math.log(0.8)) / math.log(4.0)
     q = (-math.log(0.5) + math.log(0.8)) / math.log(4.0)
+    e = math.log(0.55 / 0.5) / math.log(4.0)
     k, s = 5.0, 4.0
     for side, corner in (("Per", "max"), ("Per", "min"), ("Man", "max"), ("Man", "min")):
         k0, s0 = sw13_equivalent_slews("SW13_1V2", side, corner=corner)
         lin = {"max": (0.75 if side == "Man" else 0.0, -1.0),
-               "min": (0.5 if side == "Man" else 0.0, 1.0 / 3.0)}[corner]
+               "min": (0.5 if side == "Man" else _LEAD, 1.0 / 3.0)}[corner]
         exp = {"max": (p if side == "Man" else 0.0, -1.0),
-               "min": (q if side == "Man" else 0.0, z)}[corner]
+               "min": (q if side == "Man" else e, z)}[corner]
         want = exp[0] * k + exp[1] * s - lin[0] * k0 - lin[1] * s0
         got = sw13_anchor_correction("SW13_1V2", side, corner=corner, t_rf_clk_ns=k,
                                      t_rf_data_ns=s, shape="exp")
@@ -1213,19 +1412,22 @@ def test_soundwire_hold_bound_is_t_ZD_not_t_OH():
 
     Its equivalent, rounded down, is the min of both t_DD and t_ZD on either side. At the
     operating slews the calculator puts the launch's ramp start no later than the SoundWire
-    guarantee: 8.1 ns after the 50 % clock crossing (at its earliest, the fastest clock).
+    guarantee: 8.1 ns after the 50 % clock crossing (at its earliest, the fastest clock),
+    which on a Peripheral follows its earliest detection at V_IH,min by k/12 of its early
+    clock edge.
     """
     from swi3s_studio.timing.calculator import _launch_anchor_ns, anchor_frac
 
-    for side in ("Per", "Man"):
+    for side, want in (("Per", 9.9), ("Man", 9.7)):
         p = preset("SW13_1V2", side)
-        assert p.t_DD_min_ns == p.t_ZD_min_ns == pytest.approx(9.7), side
+        assert p.t_DD_min_ns == p.t_ZD_min_ns == pytest.approx(want), side
         assert p.t_DD_min_ns > 6.7, "not t_OH_Data"
     for s_ in (2.0, 5.0):
         per = dc_replace(_mixed("SWI3S_PHY2", "SW13_1V2"), tRF_Per_DATA_ns=s_)
         start = (_launch_anchor_ns(per, "Per", "DD", "min")
                  - anchor_frac(per, "Per") * _edge(s_, 2.0, 5.0)[1] * s_)
-        assert start <= 8.1 + 1e-9, (s_, start)
+        k_early = per.tRF_Man_CLK_ns * _edge(per.tRF_Man_CLK_ns, 3.0, 8.3)[1]
+        assert start <= k_early / 12.0 + 8.1 + 1e-9, (s_, start)
         man = dc_replace(_mixed("SW13_1V2", "SWI3S_PHY2"), tRF_Man_CLK_ns=2.0,
                          tRF_Man_DATA_ns=s_)
         # Measured from the Manager's clock reference, the 20 % point of its (late) clock
@@ -1321,15 +1523,21 @@ def test_a_soundwire_data_input_takes_its_own_threshold_window():
 
     # On the margins: a SoundWire Peripheral receiving costs MP hold, not MP setup's late
     # data crossing; a SoundWire Manager receiving costs PM hold and leaves PM setup alone.
-    # At 3.5 ns on every lane, inside both specs' slew ranges.
+    # At 3.5 ns on every lane, inside both specs' slew ranges. A SoundWire receiver's receive-row
+    # correction (`,ref`) is the clock's, not the data window's, so it is left out.
     lanes = dict(tRF_Man_CLK_ns=3.5, tRF_Man_DATA_ns=3.5, tRF_Per_DATA_ns=3.5)
     plain = compute(CalcInputs(**lanes)).breakdowns
     per_rx = compute(CalcInputs(Per_spec="SW13_1V2", **lanes)).breakdowns
     man_rx = compute(CalcInputs(Man_spec="SW13_1V2", **lanes)).breakdowns
-    assert per_rx["MP_hold"].margin_ns < plain["MP_hold"].margin_ns
-    assert per_rx["PP_hold"].margin_ns < plain["PP_hold"].margin_ns
-    assert man_rx["PM_hold"].margin_ns < plain["PM_hold"].margin_ns
-    assert man_rx["PM_setup"].margin_ns == pytest.approx(plain["PM_setup"].margin_ns)
+
+    def window_part(b):
+        return b.margin_ns - sum(t.value_ns for t in b.terms if ",ref," in t.symbol)
+
+    assert window_part(per_rx["MP_hold"]) < plain["MP_hold"].margin_ns
+    assert window_part(per_rx["PP_hold"]) < plain["PP_hold"].margin_ns
+    assert window_part(man_rx["PM_hold"]) < plain["PM_hold"].margin_ns
+    assert window_part(man_rx["PM_setup"]) == pytest.approx(plain["PM_setup"].margin_ns)
+    assert any(",ref," in t.symbol for t in man_rx["PM_hold"].terms)
 
 
 def test_every_spec_source_builds_and_converts():
@@ -1500,8 +1708,8 @@ def test_a_keeper_counts_an_ede_release_from_its_threshold_crossing(shape, man):
     worst = math.inf
     for supplies in inp.supply_corners():
         b = _compute_at(inp, supplies).breakdowns["keeper_Per"]
-        rising, coef, _ = _keeper_case(inp, "Per DATA", supplies, ede=True)
-        edge = "rise" if rising else "fall"
+        corner, coef, _ = _keeper_case(inp, "Per DATA", supplies, ede=True)
+        edge = "rise" if corner.rising else "fall"
         assert [t.symbol for t in b.terms] == [f"X_K,{edge},late · Per_t_RF,DATA",
                                                f"Per_t_RF,DATA,{edge}", "Per_t_EDE",
                                                "Man_t_Keeper_Response"]
@@ -1539,6 +1747,22 @@ def test_every_unratified_source_carries_the_proposal_note(spec):
             assert caveats[0] == PROPOSAL_NOTE, caveats
 
 
+@pytest.mark.gui
+@pytest.mark.parametrize("spec", ["SWI3S_PHY2_PROP", "SWI3S_PHY2_EDE"])
+def test_the_proposed_presets_hold_the_example_columns_values(spec):
+    """The proposed PHY2 revision is held twice: as the calculator's presets and as the
+    Timing view's Example column ranges. Every row the Example column revises has the same
+    max in both, and the same min where the preset holds one."""
+    from swi3s_studio.ui.timing_view import _MAN_ROW_FIELDS, _PER_ROW_FIELDS, _PHY2_PROPOSED
+    for name, r in _PHY2_PROPOSED.items():
+        side = name.split("_", 1)[0]
+        lo_field, hi_field = (_MAN_ROW_FIELDS if side == "Man" else _PER_ROW_FIELDS)[name]
+        p = preset(spec, side)
+        assert getattr(p, hi_field) == r.max, (spec, name)
+        if lo_field != hi_field:
+            assert getattr(p, lo_field) == r.min, (spec, name)
+
+
 # ---------------------------------------------------------------------------
 # 5. UI
 # ---------------------------------------------------------------------------
@@ -1557,7 +1781,7 @@ def test_an_anchor_correction_note_reproduces_its_value(size):
                      r"(?:k = ([0-9.]+), )?s = ([0-9.]+) ns \(.*\) the anchor moves by "
                      r"([+-][0-9]+\.[0-9]+) ns")
     formula = {("Per", "max"): lambda k0, s0, k, s_: s0 - s_,
-               ("Per", "min"): lambda k0, s0, k, s_: (s_ - s0) / 3.0,
+               ("Per", "min"): lambda k0, s0, k, s_: (k - k0) / 12.0 + (s_ - s0) / 3.0,
                ("Man", "max"): lambda k0, s0, k, s_: 0.75 * (k - k0) + (s0 - s_),
                ("Man", "min"): lambda k0, s0, k, s_: 0.5 * (k - k0) + (s_ - s0) / 3.0}
     slow = dict(tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3, tRF_Per_DATA_ns=8.3)
@@ -1594,9 +1818,27 @@ def _view():
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
     from swi3s_studio.ui.timing_view import TimingView
-    return TimingView()
+    tv = TimingView()
+    tv.flush_recompute()
+    return tv
 
 
+def _quiet(tv):
+    """`tv` running no recompute from here on, for a test that reads its numbers through
+    `_column_worst`."""
+    tv._job.discard()
+    tv._job.submit = lambda fn: 0
+    return tv
+
+
+def _column_worst(tv, side):
+    """Each inequality's breakdown in the page's `side` column at the worst corner its
+    recompute finds (`timing_view._worst_at`), from the inputs the page reads now."""
+    results, _ = page._worst_at(*tv._typ_baseline(side))
+    return {leg: r.breakdowns[leg] for leg, r in results.items()}
+
+
+@pytest.mark.gui
 def test_a_spec_change_reseeds_the_page_from_the_selected_pair():
     """Switching the Peripheral to SoundWire reseeds the page from the selected pair
     (`TimingView._on_spec_changed`): the Peripheral rows take its SWI3S equivalents, and the
@@ -1611,9 +1853,9 @@ def test_a_spec_change_reseeds_the_page_from_the_selected_pair():
         tv._max[("spec", n)].setValue(seeds[n, "max"] + 1.5)
         assert tv._max[("spec", n)].value() != pytest.approx(seeds[n, "max"]), n
     tv._fclk.setValue(9.0)
-    # The title is fixed; the SUBTITLE names the selected bus.
+    # The title is fixed; its tooltip names the selected bus.
     assert tv._title.text() == "SWI3S & SoundWire Timing Calculator"
-    assert tv._subtitle.text() == "SWI3S PHY2 Manager and Peripheral"
+    assert tv._title.toolTip() == "SWI3S PHY2 Manager and Peripheral"
     # The size envelope is SoundWire-only, and HIDDEN rather than greyed when
     # neither side is SoundWire.
     assert not tv._size_row.isVisibleTo(tv), "size envelope is SoundWire-only"
@@ -1623,7 +1865,7 @@ def test_a_spec_change_reseeds_the_page_from_the_selected_pair():
     # Peripheral now carries the small-system equivalents.
     e = sw13_equivalents("SW13_1V2", "Per")
     for side in ("spec", "proposed"):
-        assert tv._min[(side, "Per_t_DD")].value() == pytest.approx(e["t_DD_min_ns"])  # 9.7
+        assert tv._min[(side, "Per_t_DD")].value() == pytest.approx(e["t_DD_min_ns"])  # 9.9
         assert tv._max[(side, "Per_t_DD")].value() == pytest.approx(e["t_DD_max_ns"])  # 22.9
         assert tv._min[(side, "Per_t_ZD")].value() == pytest.approx(e["t_ZD_min_ns"])
         assert tv._max[(side, "Per_t_ZD")].value() == pytest.approx(e["t_ZD_max_ns"])
@@ -1639,12 +1881,12 @@ def test_a_spec_change_reseeds_the_page_from_the_selected_pair():
         assert spins[("spec", n)].value() == pytest.approx(seed), (n, end)
     assert tv._fclk.value() == pytest.approx(tv._default_fclk())
     assert tv._default_fclk() != pytest.approx(9.0)
-    # The subtitle names both sides, Manager first — which side is which
-    # changes the answer, so it must not be hidden.
-    assert tv._subtitle.text() == ("SWI3S PHY2 Manager  ↔  "
+    # The title's tooltip names both sides, Manager first.
+    assert tv._title.toolTip() == ("SWI3S PHY2 Manager  ↔  "
                                    "SoundWire 1.3 (1.2 V) Peripheral")
 
 
+@pytest.mark.gui
 def test_a_soundwire_manager_seeds_its_keeper_response_and_a_negative_setup():
     """A SoundWire Manager's keeper response is its t_Keeper_Delay, 2.5 ns, against SWI3S's
     3.0 ns, and its t_IS equivalent is −1.0 ns, which the box keeps."""
@@ -1665,6 +1907,7 @@ def test_a_soundwire_manager_seeds_its_keeper_response_and_a_negative_setup():
     assert tv.inputs("spec").t_keeper_ns == pytest.approx(3.0)
 
 
+@pytest.mark.gui
 def test_system_size_switches_the_soundwire_envelope():
     tv = _view()
     tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V2"))
@@ -1675,6 +1918,7 @@ def test_system_size_switches_the_soundwire_envelope():
     assert tv._fclk.value() == pytest.approx(11.0)
 
 
+@pytest.mark.gui
 def test_fclk_seeds_to_the_legal_ceiling_not_the_swi3s_rate():
     """A mixed bus may not clock at 13.2 MHz, so reset must not seed it there."""
     tv = _view()
@@ -1688,10 +1932,12 @@ def test_fclk_seeds_to_the_legal_ceiling_not_the_swi3s_rate():
     assert tv._fclk.value() == pytest.approx(11.0)
 
 
+@pytest.mark.gui
 def test_advisory_warns_above_the_ceiling():
     tv = _view()
     assert tv._ceiling_label.text() == ""
     tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V2"))
+    tv.flush_recompute()
     # Reset seeded a legal rate, so no warning shows; the caveats are the tooltip.
     assert tv._ceiling_label.text() == ""
     assert "35-65 %" in tv._ceiling_label.toolTip()
@@ -1701,6 +1947,7 @@ def test_advisory_warns_above_the_ceiling():
     assert "ceiling" in tv._ceiling_label.text()
 
 
+@pytest.mark.gui
 def test_spec_selection_round_trips_and_legacy_dicts_default_to_swi3s():
     tv = _view()
     tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData("SW13_1V2"))
@@ -1711,7 +1958,7 @@ def test_spec_selection_round_trips_and_legacy_dicts_default_to_swi3s():
     tv2.set_from_dict(d)
     assert tv2._man_spec_combo.currentData() == "SW13_1V2"
     assert tv2._size_combo.currentData() == "large"
-    assert tv2._subtitle.text() == tv._subtitle.text()
+    assert tv2._title.toolTip() == tv._title.toolTip()
 
     # A workspace saved before the selector existed can only have been all-SWI3S.
     for k in ("man_spec", "per_spec", "sw_system_size"):
@@ -1720,9 +1967,10 @@ def test_spec_selection_round_trips_and_legacy_dicts_default_to_swi3s():
     tv3.set_from_dict(d)
     assert tv3._man_spec_combo.currentData() == "SWI3S_PHY2"
     assert tv3._per_spec_combo.currentData() == "SWI3S_PHY2"
-    assert tv3._subtitle.text() == "SWI3S PHY2 Manager and Peripheral"
+    assert tv3._title.toolTip() == "SWI3S PHY2 Manager and Peripheral"
 
 
+@pytest.mark.gui
 def test_legacy_phy1_workspace_restores_as_a_phy1_bus():
     """PHY1 is a spec source on each side.
 
@@ -1744,7 +1992,7 @@ def test_legacy_phy1_workspace_restores_as_a_phy1_bus():
     tv.set_from_dict(legacy)
     assert tv._man_spec_combo.currentData() == "SWI3S_PHY1"
     assert tv._per_spec_combo.currentData() == "SWI3S_PHY1"
-    assert tv._subtitle.text() == "SWI3S PHY1 Manager and Peripheral"
+    assert tv._title.toolTip() == "SWI3S PHY1 Manager and Peripheral"
     assert tv._max[("spec", "Per_t_DD")].value() == pytest.approx(50.0)
     # The margins must match the bus that was saved, not a PHY2 reading of it.
     assert tv.summary_text() == src.summary_text()
@@ -1756,6 +2004,7 @@ def test_legacy_phy1_workspace_restores_as_a_phy1_bus():
     assert tv2._per_spec_combo.currentData() == "SWI3S_PHY1"
 
 
+@pytest.mark.gui
 def test_the_size_row_hides_and_returns_with_the_soundwire_selection():
     """Hiding must be reversible, and must survive a workspace load.
 
@@ -1779,9 +2028,10 @@ def test_the_size_row_hides_and_returns_with_the_soundwire_selection():
     assert tv2._size_row.isVisibleTo(tv2)
 
 
+@pytest.mark.gui
 def test_phy1_example_column_follows_the_table_structure_not_the_numbers():
     """Which half of the proposal reaches a PHY1 side is decided by how the SPEC
-    IS STRUCTURED, not by which numbers happen to coincide (v1.1r06).
+    IS STRUCTURED, not by which numbers happen to coincide.
 
     The "PHY1 & PHY2 Input Timing" table is genuinely shared — one row per parameter, no
     PHY1/PHY2 distinction — so revising Per_tIH 0-4.5 -> 0-1.5 revises it for both PHYs.
@@ -1852,6 +2102,7 @@ def test_the_shared_input_table_is_shared_on_both_phys():
     assert preset("SWI3S_PHY1", "Man").t_ZD_ns != preset("SWI3S_PHY2", "Man").t_ZD_ns
 
 
+@pytest.mark.gui
 def test_the_two_swi3s_phys_are_independently_selectable_per_side():
     """A PHY1 Manager with a PHY2 Peripheral.
 
@@ -1861,7 +2112,7 @@ def test_the_two_swi3s_phys_are_independently_selectable_per_side():
     """
     tv = _view()
     tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData("SWI3S_PHY1"))
-    assert tv._subtitle.text() == ("SWI3S PHY1 Manager  ↔  SWI3S PHY2 Peripheral")
+    assert tv._title.toolTip() == ("SWI3S PHY1 Manager  ↔  SWI3S PHY2 Peripheral")
     assert tv._max[("spec", "Man_t_ZD")].value() == pytest.approx(30.0)   # PHY1
     assert tv._max[("spec", "Per_t_DD")].value() == pytest.approx(20.0)   # PHY2
     # Shared PHY1&2 values are unaffected by either side's choice.
@@ -1903,7 +2154,7 @@ def test_proposal_closes_every_failing_inequality_at_the_reference_corner():
     cur = compute(_same("SWI3S_PHY2"))
     prop = compute(_same("SWI3S_PHY2_PROP"))
     for ineq, before, after in (("MP_hold", -2.47, +2.53),
-                                ("PM_setup", -3.43, +7.57),
+                                ("PM_setup", -3.63, +7.37),
                                 ("MP_setup", +7.12, +2.12)):
         assert cur.breakdowns[ineq].margin_ns == pytest.approx(before, abs=0.01), ineq
         assert prop.breakdowns[ineq].margin_ns == pytest.approx(after, abs=0.01), ineq
@@ -1933,7 +2184,7 @@ def test_proposal_at_the_design_target_leaves_a_sub_ns_worst_corner_deficit():
         "the proposal must close at the design point with nominal slew"
     assert prop.breakdowns["MP_hold"].margin_ns == pytest.approx(+2.53, abs=0.02)
     assert prop.breakdowns["MP_setup"].margin_ns == pytest.approx(+4.65, abs=0.02)
-    assert prop.breakdowns["PM_setup"].margin_ns == pytest.approx(+10.10, abs=0.02)
+    assert prop.breakdowns["PM_setup"].margin_ns == pytest.approx(+9.90, abs=0.02)
 
     worst = compute(_same("SWI3S_PHY2_PROP", F_CLK_target_MHz=12.288,
                           tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3,
@@ -2175,6 +2426,7 @@ def test_launch_mode_governs_man_t_ZD_on_an_analog_column():
         assert "snapped" in t.note, f"{mode}: the move must be reported, got {t.note!r}"
 
 
+@pytest.mark.gui
 def test_the_launch_mode_governs_every_manager_output_including_ede_t_DZ():
     """EDE redefines what t_DZ MEANS, not whether the clock can place it -- so the
     selector governs all three Manager outputs, on every column.
@@ -2186,12 +2438,12 @@ def test_the_launch_mode_governs_every_manager_output_including_ede_t_DZ():
     the place of t_DZ in the legs (`calculator._ede_release_terms`), and the t_DZ row stays
     on the launch grid with the other two.
     """
-    tv = _view()
+    tv = _quiet(_view())
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY2_EDE"))
     UI = 1000 * 0.45 / tv._fclk.value()
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData(LaunchMode.ANALOG.value))
-    analog = {leg: b.margin_ns for leg, b in tv._per_inequality_worst("proposed").items()}
+    analog = {leg: b.margin_ns for leg, b in _column_worst(tv, "proposed").items()}
 
     grid = {LaunchMode.CLK2: 0.50, LaunchMode.CLK4: 0.25}
     for mode, g in grid.items():
@@ -2214,7 +2466,7 @@ def test_the_launch_mode_governs_every_manager_output_including_ede_t_DZ():
         # same column's analog launch, which is the bound and not zero: the revision's own
         # analog minimum leaves the leg short at its worst corner. PM_hold_ho reads no
         # Manager output timing, so the launch mode leaves it where it is.
-        w = tv._per_inequality_worst("proposed")
+        w = _column_worst(tv, "proposed")
         assert w["MP_hold_ho"].margin_ns >= analog["MP_hold_ho"] - 1e-9, \
             (mode, w["MP_hold_ho"].margin_ns, analog["MP_hold_ho"])
         assert w["PM_hold_ho"].margin_ns == pytest.approx(analog["PM_hold_ho"], abs=1e-9), \
@@ -2259,6 +2511,7 @@ def test_the_hold_on_acquire_leg_is_what_the_handover_UI_was_paying_for():
     assert leg(9.0, 0.0) > leg(2.0, 0.0)
 
 
+@pytest.mark.gui
 def test_launch_selector_preserves_the_users_clock_rate():
     """Switching launch mode must not reseed or reset F_CLK.
 
@@ -2272,6 +2525,7 @@ def test_launch_selector_preserves_the_users_clock_rate():
         assert tv._fclk.value() == pytest.approx(12.288), mode
 
 
+@pytest.mark.gui
 def test_launch_selector_hint_tracks_the_rate_and_flags_the_ceiling():
     """The hint is the only place the rate-dependent bound is visible. It reads the bound from
     the Example column's own MP legs at their worst corner (`_launch_limit`), not from
@@ -2280,24 +2534,28 @@ def test_launch_selector_hint_tracks_the_rate_and_flags_the_ceiling():
     tv = _view()
     tv._fclk.setValue(12.288)
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData("analog"))
-    assert "spread" in tv._launch_hint.text()          # analog: no fixed value
+    tv.flush_recompute()
+    assert "spread" in tv._launch_combo.toolTip()          # analog: no fixed value
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData("4x"))
-    text = tv._launch_hint.text()
+    tv.flush_recompute()
+    text = tv._launch_combo.toolTip()
     assert "0.25 UI = 9.16 ns" in text
     assert "12.2 MHz" in text and "hold" in text
     assert "above this mode's limit" in text            # past 4x's worst-corner limit
     tv._fclk.setValue(10.0)
-    assert "above this mode's limit" not in tv._launch_hint.text()
+    assert "above this mode's limit" not in tv._launch_combo.toolTip()
     tv._fclk.setValue(12.288)
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData("2x"))
-    text = tv._launch_hint.text()
+    tv.flush_recompute()
+    text = tv._launch_combo.toolTip()
     assert "0.5 UI = 18.31 ns" in text
     assert "19.2 MHz" in text and "setup" in text
     assert "above this mode's limit" not in text
     tv._fclk.setValue(20.0)
-    assert "above this mode's limit" in tv._launch_hint.text()
+    assert "above this mode's limit" in tv._launch_combo.toolTip()
 
 
+@pytest.mark.gui
 def test_launch_selector_is_disabled_and_forced_analog_for_a_soundwire_manager():
     """A SoundWire Manager has no clock-launch option, so the control must not
     offer one — and must not leave a stale clock mode applied to it."""
@@ -2311,6 +2569,7 @@ def test_launch_selector_is_disabled_and_forced_analog_for_a_soundwire_manager()
     assert tv._launch_combo.isEnabled()
 
 
+@pytest.mark.gui
 def test_launch_mode_round_trips_and_legacy_dicts_default_to_analog():
     tv = _view()
     tv._launch_combo.setCurrentIndex(tv._launch_combo.findData("2x"))
@@ -2326,9 +2585,10 @@ def test_launch_mode_round_trips_and_legacy_dicts_default_to_analog():
     assert tv3._launch_combo.currentData() == LaunchMode.ANALOG.value
 
 
+@pytest.mark.gui
 def test_the_launch_hint_names_only_the_column_the_selector_drives():
     """On a bus with an EDE Manager and a clocked launch selected, the hint says the selector
-    applies to the right-hand column, by its heading (Example / EDE Proposed), only, and that
+    applies to the right-hand column, by its heading (Example / PHY2 EDE), only, and that
     the left-hand one keeps its analog delays, and the two columns read their launch modes
     accordingly: the selected clocked mode on the right-hand column, ANALOG on the left-hand
     one."""
@@ -2338,11 +2598,11 @@ def test_the_launch_hint_names_only_the_column_the_selector_drives():
                if is_ede(tv._man_spec_combo.itemData(i)))
     tv._man_spec_combo.setCurrentIndex(ede)
     left, right = tv._column_labels()
-    assert right == "Example / EDE Proposed", right
+    assert right == "Example / PHY2 EDE", right
     for mode in (LaunchMode.CLK2, LaunchMode.CLK4):
         tv._launch_combo.setCurrentIndex(tv._launch_combo.findData(mode.value))
         tv._update_launch_hint()
-        hint = tv._launch_hint.text()
+        hint = tv._launch_combo.toolTip()
         assert f"applies to the {right} column only" in hint, (mode, hint)
         assert f"the {left} column keeps its analog delays" in hint, (mode, hint)
         assert tv._launch_mode_for("proposed") is mode
@@ -2366,6 +2626,7 @@ def test_a_soundwire_managers_margins_do_not_depend_on_the_launch_mode():
             .margin_ns != compute(swi3s).breakdowns["MP_setup"].margin_ns)
 
 
+@pytest.mark.gui
 def test_the_launch_mode_never_governs_the_specification_column():
     """A clocked launch is the revision's option, so it cannot touch tabulated values.
 
@@ -2394,6 +2655,7 @@ def test_the_launch_mode_never_governs_the_specification_column():
             assert tv.inputs("proposed").launch_mode is mode, mode
 
 
+@pytest.mark.gui
 def test_a_clocked_launch_never_snaps_below_the_tabulated_minimum():
     """Nearest-point snapping rounds DOWN through a row's minimum, and on a coarse
     grid it rounds down to zero.
@@ -2495,43 +2757,45 @@ def test_scenario_A_pm_setup_is_not_swi3s_to_fix():
     cancellation needs equal per-leg t_RF, which the small/1.2 V presets give
     (5.00 ns on both legs).
 
-    At 12.288 MHz the UI is 0.45·1000/12.288 = 36.62 ns. Both crossings count from their
-    edges' 20 % points -- the clock's from the Manager's clock reference, the data's from its
-    anchor -- and the leg is evaluated at one V_SEOS per device. A/PM setup is
-    36.62 − 2·2.0 − 1.091·5.0 − Per_t_DD 22.9 − 0.5 − 0.868·5.0 − Man_t_IS 3.0 = −3.58 ns: a
+    At 12.288 MHz the UI is 0.45·1000/12.288 = 36.62 ns. Both crossings count from their edges'
+    20 % points -- the clock's from the Manager's clock reference, the data's from its anchor
+    -- and the leg is evaluated at one V_SEOS per device. A/PM setup is 36.62 − 2·2.0 −
+    1.091·5.0 − Per_t_DD 22.9 − 0.5 − 0.868·5.0 − t_PD,mis 0.2 − Man_t_IS 3.0 = −3.78 ns: a
     rising clock with falling data, Sigma_cross,PM,setup's cross case, the SoundWire data edge
     on its fast edge, 4.5 ns against the 5.0 ns top of its range: its t_OV ends at 80 % of the
     ramp, so the fast edge puts the 20 % point 0.5 ns later, more than it brings the crossing
     forward (`CalcInputs.fast_data_edge`). B/PM setup carries the SWI3S Peripheral's 20.0 ns
-    and the SoundWire Manager's t_IS of −1.0 instead, +3.34 ns.
+    and the SoundWire Manager's t_IS of −1.0 instead, moved to the clock's early edge, 4.5 ns:
+    −1.0 − 0.5·(4.5 − 2.0) = −2.25 (`sw13_receive_correction`), +4.39 ns.
     """
     F = dict(F_CLK_target_MHz=12.288)
     a_cur = compute(_mixed("SWI3S_PHY2", "SW13_1V2", **F))
     a_prop = compute(_mixed("SWI3S_PHY2_PROP", "SW13_1V2", **F))
-    assert a_cur.breakdowns["PM_setup"].margin_ns == pytest.approx(-3.58, abs=0.02)
+    assert a_cur.breakdowns["PM_setup"].margin_ns == pytest.approx(-3.78, abs=0.02)
     assert a_cur.breakdowns["PM_setup"].fast_data_edge == {"Per DATA"}
-    assert a_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(-3.58, abs=0.02)
+    assert a_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(-3.78, abs=0.02)
     assert a_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(
         a_cur.breakdowns["PM_setup"].margin_ns, abs=1e-9), \
         "a SWI3S revision must not move a leg the SoundWire side owns"
 
     b_cur = compute(_mixed("SW13_1V2", "SWI3S_PHY2", **F))
     b_prop = compute(_mixed("SW13_1V2", "SWI3S_PHY2_PROP", **F))
-    assert b_cur.breakdowns["PM_setup"].margin_ns == pytest.approx(+3.34, abs=0.02)
-    assert b_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(+14.34, abs=0.02)
+    assert b_cur.breakdowns["PM_setup"].margin_ns == pytest.approx(+4.39, abs=0.02)
+    assert b_prop.breakdowns["PM_setup"].margin_ns == pytest.approx(+15.39, abs=0.02)
     # The revision's worth on B is a clean +11 ns.
     assert (b_prop.breakdowns["PM_setup"].margin_ns
             - b_cur.breakdowns["PM_setup"].margin_ns) == pytest.approx(11.0, abs=5e-3)
     # Scenario B's one deficit under the revision is PM hold. The SoundWire Manager's t_IHold
     # runs from its clock's 65 % crossing, its equivalent (7.8 ns) from the 20 % reference
     # 5.0/3 ns after the clock starts, and the Peripheral's t_DD,min of 2.0 ns does not cover
-    # it: 2.0 + 2·2.0 + (0.168 − 0.038)·5.0 − 7.8 = −1.15 ns at these slews, the two crossings
+    # it: 2.0 + 2·2.0 + (0.168 − 0.038)·5.0 − t_PD,mis 0.2 − 7.8 = −1.35 ns at these slews, the
+    # two crossings
     # counted from their edges' 20 % points, the Manager's clock reference and the data's
     # anchor.
     short = {k: b.margin_ns for k, b in _guaranteed(b_prop.breakdowns).items()
              if b.margin_ns < 0}
     assert set(short) == {"PM_hold"}, short
-    assert short["PM_hold"] == pytest.approx(-1.15, abs=0.02)
+    assert short["PM_hold"] == pytest.approx(-1.35, abs=0.02)
 
 
 def test_preset_trf_means_different_things_on_the_two_sides():
@@ -2610,6 +2874,7 @@ def test_mp_hold_at_each_sides_own_slew_maximum():
     assert b_prop - b_cur == pytest.approx(+3.0, abs=0.02)
 
 
+@pytest.mark.gui
 def test_example_column_seeds_from_the_proposed_revision():
     """The page opens on a current-vs-proposed comparison.
 
@@ -2639,7 +2904,7 @@ def test_example_column_seeds_from_the_proposed_revision():
 
     # The delta is the proposal's effect, and it is what the summary reports.
     txt = tv.summary_text()
-    assert "MP hold" in txt and "PM setup" in txt
+    assert "Manager Holding for Peripheral" in txt and "Peripheral Setup for Manager" in txt
 
     # Nothing is labelled "proposed".
     assert "PROPOSED" not in tv._title.text()
@@ -2649,6 +2914,7 @@ def test_example_column_seeds_from_the_proposed_revision():
     assert not any(d.endswith("_PROP") for d in data), data
 
 
+@pytest.mark.gui
 def test_proposal_delta_is_visible_in_the_two_columns():
     """The Spec-vs-Example delta must BE the revision's effect.
 
@@ -2901,7 +3167,10 @@ def test_contention_is_overlap_bounded_by_one_flight_not_a_gap():
             also the pair furthest apart and so the largest allowance
 
     PM and PP coming out bus-independent is structural, not arithmetic: the distance
-    that makes a releasing peripheral late is the distance that licenses the overlap.
+    that makes a releasing peripheral late is the distance that licenses the overlap. The
+    two ride different traces, the clock the CLK and the acquirer's drive the DATA, so each
+    leg also pays the trace mismatch over that distance, t_PD,mis (PP: t_PD,mis,AB): the
+    bus moves PM and PP by it alone, and MP by 2*t_PD less it.
     """
     kw = dict(Man_spec="SWI3S_PHY1", Per_spec="SWI3S_PHY1", handover_UIs=0.0,
               Man_t_DZ_max_ns=10.0, Per_t_DZ_max_ns=10.0,
@@ -2909,14 +3178,15 @@ def test_contention_is_overlap_bounded_by_one_flight_not_a_gap():
     near = compute(CalcInputs(bus_length_cm=0.0, **kw)).breakdowns
     far = compute(CalcInputs(bus_length_cm=30.0, **kw)).breakdowns   # t_PD = 2.0 ns
 
-    # The two peripheral-releasing legs: skew and allowance are the same distance.
+    # The two peripheral-releasing legs: skew and allowance are the same distance, to within
+    # the trace mismatch over it (0.1 of the 2 ns flight).
     for leg in ("PM_contention", "PP_contention"):
-        assert far[leg].margin_ns == pytest.approx(near[leg].margin_ns), \
-            f"{leg} must be bus-length independent"
-    # M->P banks both, so it gains 2 traversals -- and its worst case is the SHORT
-    # bus, which is why `find_worst_corner_rows` drives the bus row to 0 for it.
+        assert far[leg].margin_ns - near[leg].margin_ns == pytest.approx(-0.2), \
+            f"{leg} must be bus-length independent but for the trace mismatch"
+    # M->P banks both, less the mismatch, so it gains 2 traversals -- and its worst case is
+    # the SHORT bus, which is why `find_worst_corner_rows` drives the bus row to 0 for it.
     assert far["MP_contention"].margin_ns - near["MP_contention"].margin_ns == \
-        pytest.approx(+4.0)
+        pytest.approx(+4.0 - 0.2)
     # M->P's two traversals are two `t_PD` terms, the clock's flight to the acquiring
     # peripheral and its drive's flight back, in time order around its detection and
     # turn-on. A zero net count states the cancellation instead of showing a +t_PD/-t_PD
@@ -3063,18 +3333,368 @@ def test_pp_placement_is_a_selector_and_the_two_legs_read_opposite_ends_of_it():
         assert pd_terms(placement, "PP_hold") == [], placement
 
     # And the search is exact: no combination of the geometric/peripheral rows beats
-    # what it finds. (A subset, brute-forced -- the full product is 3**17.)
+    # what it finds. (A subset, brute-forced -- the full product is 3**17.) Every row outside
+    # the subset stays at the search's pick, so no other row can mask a wrong pick inside it.
     rows = default_swi3s_rows()
-    sub = [r for r in rows if r.name in ("bus length (cm)", "t_PD,mis fraction", "Per_t_DD",
-                                         "Per_t_IS", "Per_t_IH", "t_RF Per DATA")]
+    sub = [r.name for r in rows if r.name in ("bus length (cm)", "t_PD,mis fraction",
+                                              "Per_t_DD", "Per_t_IS", "Per_t_IH",
+                                              "t_RF Per DATA")]
     for leg in ("PP_setup", "PP_hold"):
-        got = compute(apply_row_picks(
-            base, rows, find_worst_corner_rows(leg, rows, base))).breakdowns[leg].margin_ns
+        picks = find_worst_corner_rows(leg, rows, base)
+        got = compute(apply_row_picks(base, rows, picks)).breakdowns[leg].margin_ns
         brute = min(
-            compute(apply_row_picks(base, sub, dict(zip([r.name for r in sub], combo)))
+            compute(apply_row_picks(base, rows, {**picks, **dict(zip(sub, combo))})
                     ).breakdowns[leg].margin_ns
             for combo in itertools.product(("min", "typ", "max"), repeat=len(sub)))
         assert got <= brute + 1e-9, f"{leg}: search found {got:+.3f}, brute force {brute:+.3f}"
+
+
+# Each column's margins on the page Reset to SWI3S PHY2 on both sides, under Worst Per
+# Inequality (the default placement), in ns.
+_DEFAULT_MARGINS = {
+    "spec": {
+        "MP_setup": 6.874646382, "MP_setup_ho": 6.874646382, "MP_hold": -5.246447368,
+        "MP_hold_ho": 26.374646382, "PM_setup": -7.210109258, "PM_setup_ho": -5.210109258,
+        "PM_hold": 2.993734336, "PM_hold_ho": 39.614828086, "PP_setup": -6.806493969,
+        "PP_setup_ho": -4.806493969, "PP_hold": -8.891228070, "PP_hold_ho": 27.148455905,
+        "MP_contention": 29.055304276, "PM_contention": 19.793462171,
+        "PP_contention": 20.874646382, "keeper_Man": 9.396093750, "keeper_Per": -1.928925047},
+    "proposed": {
+        "MP_setup": 1.874646382, "MP_setup_ho": 1.874646382, "MP_hold": -0.246447368,
+        "MP_hold_ho": 36.374646382, "PM_setup": 3.789890742, "PM_setup_ho": 3.789890742,
+        "PM_hold": 2.993734336, "PM_hold_ho": 39.614828086, "PP_setup": 4.193506031,
+        "PP_setup_ho": 4.193506031, "PP_hold": -5.891228070, "PP_hold_ho": 30.148455905,
+        "MP_contention": 30.055304276, "PM_contention": 27.793462171,
+        "PP_contention": 21.874646382, "keeper_Man": 4.396093750, "keeper_Per": 9.071074953},
+}
+
+
+def test_worst_per_inequality_gives_each_default_column_its_margins():
+    """Worst Per Inequality, the default placement, gives both columns of the default page the
+    margins `_DEFAULT_MARGINS` holds, on every leg."""
+    for side, want in _DEFAULT_MARGINS.items():
+        base, rows = column("SWI3S_PHY2", "SWI3S_PHY2", side)
+        assert base.pp_placement == "unknown"
+        results, _ = worst(base, rows)
+        got = {leg: r.breakdowns[leg].margin_ns for leg, r in results.items()}
+        assert got == pytest.approx(want, abs=1e-6), side
+
+
+def _flight_values(b, symbol):
+    """The values of `b`'s terms whose symbol is `symbol`, rounded to 1e-9 ns."""
+    return [round(t.value_ns, 9) for t in b.terms if t.symbol == symbol]
+
+
+_MP_DATA = ("MP_setup", "MP_setup_ho", "MP_hold", "MP_hold_ho")
+_PM_DATA = ("PM_setup", "PM_setup_ho", "PM_hold", "PM_hold_ho")
+_PP_DATA = ("PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho")
+_NO_FLIGHT = ("PM_contention", "PP_contention", "keeper_Man", "keeper_Per")
+
+
+def test_all_near_the_manager_puts_every_peripheral_at_0_cm_on_every_leg():
+    """All near the Manager: t_PD and t_PD,mis read 0 on every M->P, P->M and contention leg
+    whatever the bus length, the P->P legs carry no flight, and the legs that read no t_PD
+    under Worst Per Inequality read none here either. Worst Per Inequality at the default
+    30 cm bus charges t_PD,mis on every M->P and P->M data leg."""
+    for bus in (0.0, 30.0, 60.0):
+        inp = CalcInputs(bus_length_cm=bus, pp_placement="both_near")
+        assert inp.t_PD_ns() == 0.0 and inp.t_PD_mis_ns() == 0.0
+        b = compute(inp).breakdowns
+        for leg in (*_MP_DATA, *_PM_DATA, "MP_contention", "PM_contention"):
+            assert _flight_values(b[leg], "t_PD,mis") == [0.0], (bus, leg)
+        assert _flight_values(b["PP_contention"], "t_PD,mis,AB") == [0.0], bus
+        for leg in (*_PM_DATA, "MP_contention"):
+            assert _flight_values(b[leg], "t_PD") == [0.0, 0.0], (bus, leg)
+        for leg in (*_PP_DATA, *_NO_FLIGHT):
+            assert _flight_values(b[leg], "t_PD") == [], (bus, leg)
+    # Worst Per Inequality, at the same 30 cm bus, does charge them.
+    b = compute(CalcInputs()).breakdowns
+    for leg in (*_MP_DATA, *_PM_DATA):
+        assert _flight_values(b[leg], "t_PD,mis") == [-0.2], leg
+    assert _flight_values(b["PM_setup"], "t_PD") == [-2.0, -2.0]
+
+
+def test_a_term_a_placement_sets_to_zero_is_shown_and_drawn():
+    """Checklist rule 5 for the placements: a term a placement sets to zero is SHOWN at 0.00
+    and drawn, not dropped. Under All near the Manager t_PD, t_PD,mis and t_PD,mis,AB read 0
+    on every leg that carries them, at any bus length, and every leg prints the terms Worst Per
+    Inequality prints but the P->P flights the placement does not levy (`pp_net_pd`), each with
+    a span of no length; under All at the far end the P->P trace mismatch reads 0 the same
+    way, on the P->P data legs and PP_contention. So each leg's equation and drawing are the
+    same across placements."""
+    from swi3s_studio.timing.calculator import PP_MIS_SYMBOL
+    from swi3s_studio.timing.timeline import leg_timeline
+
+    zeroed = {"t_PD", "t_PD,mis", PP_MIS_SYMBOL}
+    seen = set()
+    for bus in (0.0, 30.0, 60.0):
+        worst_inp = CalcInputs(bus_length_cm=bus)
+        unknown = compute(worst_inp).breakdowns
+        for placement, legs in (("both_near", INEQUALITIES),
+                                ("both_far", (*_PP_DATA, "PP_contention"))):
+            inp = dc_replace(worst_inp, pp_placement=placement)
+            b = compute(inp).breakdowns
+            for leg in legs:
+                syms = [t.symbol for t in b[leg].terms]
+                want = [s for s in (t.symbol for t in unknown[leg].terms)
+                        if not (leg in _PP_DATA and s == "t_PD")]
+                if placement == "both_near":
+                    assert syms == want, (bus, leg, syms, want)
+                zero = [i for i, t in enumerate(b[leg].terms) if t.symbol in zeroed
+                        and (placement == "both_near" or t.symbol == PP_MIS_SYMBOL)]
+                if leg in (*_PP_DATA, "PP_contention"):
+                    assert [syms[i] for i in zero] == [PP_MIS_SYMBOL], (placement, leg)
+                tl = leg_timeline(inp, leg)
+                for i in zero:
+                    assert b[leg].terms[i].value_ns == 0.0, (placement, leg, syms[i])
+                    (sp,) = [s for s in tl.spans if s.term == i]
+                    assert tl.duration(sp) == 0.0, (placement, leg, syms[i])
+                    seen.add(syms[i])
+    assert seen == zeroed, seen
+
+
+def test_a_zero_keeper_response_is_shown_and_drawn():
+    """Checklist rule 5 for the keeper's response: Man_t_Keeper_Response is a spec parameter, so
+    at 0 ns both keeper legs, with a conventional and an EndDriveEarly release, print it at
+    0.00 as their last term, in the place and with the other terms they print at its default,
+    and draw it as a span of no length."""
+    from swi3s_studio.timing.timeline import leg_timeline
+
+    for kw in ({}, {"Man_ede": True, "Per_ede": True, "handover_UIs": 0.0}):
+        default = dc_replace(CalcInputs(), **kw)
+        zero = dc_replace(default, t_keeper_ns=0.0)
+        at_default, at_zero = compute(default).breakdowns, compute(zero).breakdowns
+        for leg in ("keeper_Man", "keeper_Per"):
+            syms = [t.symbol for t in at_zero[leg].terms]
+            assert syms == [t.symbol for t in at_default[leg].terms], (kw, leg, syms)
+            assert syms[-1] == "Man_t_Keeper_Response", (kw, leg, syms)
+            assert at_zero[leg].terms[-1].value_ns == 0.0, (kw, leg)
+            (span,) = [s for s in leg_timeline(zero, leg).spans if s.term == len(syms) - 1]
+            assert leg_timeline(zero, leg).duration(span) == 0.0, (kw, leg)
+
+
+def test_all_at_the_far_end_pins_every_peripheral_at_the_bus_rows_max():
+    """All at the far end: the corner search pins the bus-length row at its max on every leg
+    instead of searching it, so P->M hold and MP_contention bank the two 30 cm flights that
+    Worst Per Inequality gives them at 0 cm, and M->P and P->M charge the mismatch over 30 cm.
+    The P->P legs carry no flight."""
+    rows = default_swi3s_rows()
+    far = CalcInputs(pp_placement="both_far")
+    picks = find_worst_corner_rows_all(INEQUALITIES, rows, far)
+    assert {p["bus length (cm)"] for p in picks.values()} == {"max"}
+    worst_picks = find_worst_corner_rows_all(("PM_hold", "MP_contention"), rows, CalcInputs())
+    assert {p["bus length (cm)"] for p in worst_picks.values()} == {"min"}
+    b = {leg: compute(apply_row_picks(far, rows, picks[leg])).breakdowns[leg]
+         for leg in INEQUALITIES}
+    t_pd = 30.0 / 15.0
+    for leg in ("PM_setup", "PM_setup_ho"):
+        assert _flight_values(b[leg], "t_PD") == [-t_pd, -t_pd], leg
+    for leg in ("PM_hold", "PM_hold_ho", "MP_contention"):
+        assert _flight_values(b[leg], "t_PD") == [t_pd, t_pd], leg
+    for leg in (*_MP_DATA, *_PM_DATA):
+        assert _flight_values(b[leg], "t_PD,mis") == [round(-0.10 * t_pd, 9)], leg
+    for leg in (*_PP_DATA, *_NO_FLIGHT):
+        assert _flight_values(b[leg], "t_PD") == [], leg
+
+
+def test_every_pm_setup_and_hold_leg_charges_the_trace_mismatch_after_the_data_s_flight_back():
+    """The clock reaches the Peripheral on the CLK trace and its data returns on the DATA
+    trace, so every P->M setup and hold leg carries one t_PD,mis, a cost, right after the
+    data's flight back and before the Manager's crossing of it: subtracted from setup's UI, and
+    on hold taken off the two flights' credit. Its value is the mismatch over the peripheral's
+    distance at every placement (`peripheral_distance_cm`): 0 under All near the Manager and
+    vPCB_err_frac · t_PD otherwise, and the margin moves by exactly that value. Under Worst Per
+    Inequality P->M setup's worst corner reads the bus length and mismatch rows at their max,
+    0.2 ns, and P->M hold's the bus at its min, 0 cm, where the term reads 0."""
+    from swi3s_studio.timing import PP_PLACEMENT_LABELS
+
+    for placement in PP_PLACEMENT_LABELS:
+        for kw in ({}, {"handover_UIs": 0.0}, {"Man_ede": True, "Per_ede": True},
+                   {"Per_spec": "SW13_1V2"}):
+            inp = CalcInputs(pp_placement=placement, **kw)
+            b = compute(inp).breakdowns
+            free = compute(dc_replace(inp, vPCB_err_frac=0.0)).breakdowns
+            want = 0.0 if placement == "both_near" else 0.10 * inp.bus_length_cm / 15.0
+            assert inp.t_PD_mis_ns() == pytest.approx(want, abs=1e-12), placement
+            for leg in _PM_DATA:
+                syms = [t.symbol for t in b[leg].terms]
+                assert syms.count("t_PD,mis") == 1, (placement, leg, syms)
+                i = syms.index("t_PD,mis")
+                assert syms[i - 1] == "t_PD" and syms[i + 1].startswith("X_PM,"), (leg, syms)
+                term = b[leg].terms[i]
+                assert term.op == "-" and "mismatch" in term.note, (placement, leg)
+                assert term.value_ns == pytest.approx(-want, abs=1e-12), (placement, leg)
+                assert b[leg].margin_ns - free[leg].margin_ns == pytest.approx(
+                    -want, abs=1e-12), (placement, kw, leg)
+    rows = default_swi3s_rows()
+    picks = find_worst_corner_rows_all(_PM_DATA, rows, CalcInputs())
+    for leg in _PM_DATA:
+        b = compute(apply_row_picks(CalcInputs(), rows, picks[leg])).breakdowns[leg]
+        if "setup" in leg:
+            assert (picks[leg]["bus length (cm)"], picks[leg]["t_PD,mis fraction"]) == (
+                "max", "max"), (leg, picks[leg])
+            assert _flight_values(b, "t_PD,mis") == [-0.2], leg
+        else:
+            assert picks[leg]["bus length (cm)"] == "min", (leg, picks[leg])
+            assert _flight_values(b, "t_PD,mis") == [0.0], leg
+
+
+def test_a_driver_placement_is_one_layout_with_the_far_device_at_the_bus_rows_max():
+    """Driver near, sampler far and Driver far, sampler near are each one layout: the corner
+    search pins the bus-length row at its max on the four P->P setup and hold legs, and leaves
+    every other leg at the picks Worst Per Inequality gives it. So Driver far, sampler near
+    banks the two 30 cm flights on P->P hold, which a searched row would drop to 0 cm."""
+    from swi3s_studio.timing.calculator import PP_SETUP_HOLD_LEGS, placement_row_picks
+
+    rows = default_swi3s_rows()
+    assert PP_SETUP_HOLD_LEGS == set(_PP_DATA)
+    unknown = find_worst_corner_rows_all(INEQUALITIES, rows, CalcInputs())
+    for placement in ("driver_near", "driver_far"):
+        base = CalcInputs(pp_placement=placement)
+        picks = find_worst_corner_rows_all(INEQUALITIES, rows, base)
+        for leg in INEQUALITIES:
+            if leg in _PP_DATA:
+                assert placement_row_picks(placement, rows, leg) == {"bus length (cm)": "max"}
+                assert picks[leg]["bus length (cm)"] == "max", (placement, leg)
+            else:
+                assert placement_row_picks(placement, rows, leg) == {}
+                assert picks[leg] == unknown[leg], (placement, leg)
+    far = CalcInputs(pp_placement="driver_far")
+    picks = find_worst_corner_rows_all(_PP_DATA, rows, far)
+    for leg in ("PP_hold", "PP_hold_ho"):
+        b = compute(apply_row_picks(far, rows, picks[leg])).breakdowns[leg]
+        assert _flight_values(b, "t_PD") == [2.0, 2.0], leg
+
+
+def test_every_contention_leg_charges_the_trace_mismatch_last():
+    """A contention leg's skew rides the CLK trace and its overlap allowance, the acquirer's
+    drive reaching the releaser, the DATA trace, so each pays the trace mismatch as its last
+    term, a cost: t_PD,mis on MP_contention and PM_contention, and on PP_contention
+    t_PD,mis,AB over A and B's separation (`pp_net_mis`), 0 with both peripherals at one end.
+    Under Worst Per Inequality PM_contention and PP_contention take the bus length and mismatch
+    rows at their max, and MP_contention, whose two flights out-credit the mismatch, the bus at
+    its min."""
+    from swi3s_studio.timing import PP_PLACEMENT_LABELS
+    from swi3s_studio.timing.calculator import PP_MIS_SYMBOL, pp_net_mis
+
+    for placement in PP_PLACEMENT_LABELS:
+        for bus in (0.0, 30.0):
+            for kw in ({}, {"handover_UIs": 0.0}, {"Man_ede": True, "Per_ede": True}):
+                inp = CalcInputs(pp_placement=placement, bus_length_cm=bus, **kw)
+                b = compute(inp).breakdowns
+                for leg, sym, count in (("MP_contention", "t_PD,mis", 1.0),
+                                        ("PM_contention", "t_PD,mis", 1.0),
+                                        ("PP_contention", PP_MIS_SYMBOL, pp_net_mis(placement))):
+                    last = b[leg].terms[-1]
+                    assert last.symbol == sym and "mismatch" in last.note, (placement, leg)
+                    assert last.value_ns == pytest.approx(-count * inp.t_PD_mis_ns(),
+                                                          abs=1e-12), (placement, bus, leg)
+                    assert [t.symbol for t in b[leg].terms].count(sym) == 1, (placement, leg)
+    rows = default_swi3s_rows()
+    picks = find_worst_corner_rows_all(("MP_contention", "PM_contention", "PP_contention"),
+                                       rows, CalcInputs())
+    assert picks["MP_contention"]["bus length (cm)"] == "min", picks["MP_contention"]
+    for leg in ("PM_contention", "PP_contention"):
+        assert (picks[leg]["bus length (cm)"], picks[leg]["t_PD,mis fraction"]) == (
+            "max", "max"), (leg, picks[leg])
+        b = compute(apply_row_picks(CalcInputs(), rows, picks[leg])).breakdowns[leg]
+        assert b.terms[-1].value_ns == pytest.approx(-0.2, abs=1e-12), leg
+
+
+def test_every_pp_setup_and_hold_leg_charges_the_trace_mismatch_over_the_separation():
+    """The clock reaches each peripheral on the CLK trace and A's data reaches B on the DATA
+    trace, so a P->P bracket carries the CLK-vs-DATA mismatch over A and B's separation: one
+    t_PD,mis with the two at opposite ends (Worst Per Inequality and both driver placements),
+    none with both at one end. Every P->P setup and hold leg carries it as one term, a cost,
+    after A's data's flight and before B's crossing of it; no other leg but PP_contention
+    carries it (`test_every_contention_leg_charges_the_trace_mismatch_last`). Under Worst
+    Per Inequality each leg's worst corner reads the bus length and mismatch rows at their max,
+    and each P->P leg's margin is the least any placement gives it: setup's at Driver far,
+    sampler near and hold's at Driver near, sampler far."""
+    from swi3s_studio.timing import PP_PLACEMENT_LABELS
+    from swi3s_studio.timing.calculator import PP_MIS_SYMBOL, pp_net_mis
+
+    separated = {"unknown": 1.0, "driver_near": 1.0, "driver_far": 1.0,
+                 "both_near": 0.0, "both_far": 0.0}
+    assert {p: pp_net_mis(p) for p in PP_PLACEMENT_LABELS} == separated
+    for placement, count in separated.items():
+        inp = CalcInputs(pp_placement=placement)
+        b = compute(inp).breakdowns
+        for leg in INEQUALITIES:
+            syms = [t.symbol for t in b[leg].terms]
+            if leg not in _PP_DATA:
+                assert (PP_MIS_SYMBOL in syms) == (leg == "PP_contention"), (placement, leg)
+                continue
+            assert _flight_values(b[leg], PP_MIS_SYMBOL) == [
+                round(-count * inp.t_PD_mis_ns(), 9)], (placement, leg)
+            i = syms.index(PP_MIS_SYMBOL)
+            assert syms[i + 1].startswith("X_PP,B,"), (placement, leg, syms)
+            assert "t_PD" not in syms[i + 1:] and "mismatch" in b[leg].terms[i].note
+    rows = default_swi3s_rows()
+    picks = find_worst_corner_rows_all(_PP_DATA, rows, CalcInputs())
+    for leg in _PP_DATA:
+        assert (picks[leg]["bus length (cm)"], picks[leg]["t_PD,mis fraction"]) == (
+            "max", "max"), (leg, picks[leg])
+        b = compute(apply_row_picks(CalcInputs(), rows, picks[leg])).breakdowns[leg]
+        assert _flight_values(b, PP_MIS_SYMBOL) == [-0.2], leg
+    base, rows = column("SWI3S_PHY2", "SWI3S_PHY2", "spec")
+    at = {p: {leg: r.breakdowns[leg].margin_ns
+              for leg, r in worst(dc_replace(base, pp_placement=p), rows)[0].items()}
+          for p in PP_PLACEMENT_LABELS}
+    for leg in _PP_DATA:
+        least = min(at[p][leg] for p in PP_PLACEMENT_LABELS if p != "unknown")
+        assert at["unknown"][leg] == pytest.approx(least, abs=1e-12), leg
+        layout = "driver_far" if "setup" in leg else "driver_near"
+        assert at["unknown"][leg] == pytest.approx(at[layout][leg], abs=1e-12), leg
+
+def test_a_pinned_placement_fixes_the_distance_and_the_search_stays_exact():
+    """Checklist rule 4 under the placements that fix a distance: the distance is a selector,
+    so the search over the rows it still moves finds the least margin a brute force over a
+    subset of them finds, the bus-length row held where the placement pins it on the leg and
+    every row outside the subset at the search's pick."""
+    from swi3s_studio.timing.calculator import placement_row_picks
+
+    rows = default_swi3s_rows()
+    sub = [r for r in rows if r.name in ("bus length (cm)", "t_PD,mis fraction", "Man_t_DD",
+                                         "Per_t_DD", "Man_t_ZD")]
+    names = [r.name for r in sub]
+    legs = ("MP_setup", "MP_hold", "PM_setup", "PM_hold", "MP_contention", "PP_setup",
+            "PP_hold")
+    for placement in ("both_near", "both_far", "driver_near", "driver_far"):
+        base = CalcInputs(pp_placement=placement)
+        picks = find_worst_corner_rows_all(legs, rows, base)
+        for leg in legs:
+            pinned = bool(placement_row_picks(placement, rows, leg))
+            got = compute(apply_row_picks(base, rows, picks[leg])).breakdowns[leg].margin_ns
+            brute = min(
+                compute(apply_row_picks(base, rows, {**picks[leg], **dict(zip(names, combo))})
+                        ).breakdowns[leg].margin_ns
+                for combo in itertools.product(("min", "typ", "max"), repeat=len(sub))
+                if not pinned or combo[names.index("bus length (cm)")] == "max")
+            assert got <= brute + 1e-9, (placement, leg, got, brute)
+
+
+def test_each_placement_bounds_worst_per_inequality_from_above():
+    """At both default columns, each pinned placement leaves every leg at least the margin
+    Worst Per Inequality gives it, and the two driver placements move only the P->P legs."""
+    for side in ("spec", "proposed"):
+        base, rows = column("SWI3S_PHY2", "SWI3S_PHY2", side)
+        at = {p: {leg: r.breakdowns[leg].margin_ns
+                  for leg, r in worst(dc_replace(base, pp_placement=p), rows)[0].items()}
+              for p in ("unknown", "both_near", "both_far", "driver_near", "driver_far")}
+        for p in ("both_near", "both_far", "driver_near", "driver_far"):
+            for leg, m in at[p].items():
+                assert m >= at["unknown"][leg] - 1e-9, (side, p, leg)
+                if p.startswith("driver") and not leg.startswith("PP_"):
+                    assert m == pytest.approx(at["unknown"][leg], abs=1e-12), (side, p, leg)
+        # Every peripheral at the Manager frees P->M setup of its two 30 cm flights and their
+        # trace mismatch, and every one at the far end banks the flights on P->M hold less the
+        # mismatch.
+        assert at["both_near"]["PM_setup"] == pytest.approx(at["unknown"]["PM_setup"] + 4.2)
+        assert at["both_far"]["PM_hold"] == pytest.approx(at["unknown"]["PM_hold"] + 3.8)
+        # The driver at the far end and the sampler near banks the two 30 cm flights on P->P
+        # hold.
+        assert at["driver_far"]["PP_hold"] == pytest.approx(at["unknown"]["PP_hold"] + 4.0)
 
 
 def test_pp_completes_the_launch_method_2x2():
@@ -3128,16 +3748,18 @@ def test_pp_hold_is_the_tightest_data_leg_and_says_what_it_would_cost():
 
 
 def test_no_handover_ui_means_no_ui_term():
-    """With no handover UI scheduled, no inequality shows one.
+    """With no handover UI scheduled, no inequality shows one, and one moves only the six
+    handover legs.
 
     Display only: with no handover UI allocated, no term shows one, and every margin is the
     sum of the terms it shows. One allocated UI shows as a `1·UI` term, moves the margin by
     that UI plus the shift of the crossings it moves, and leaves every other term as it is.
 
-    A FRACTIONAL allocation still shows, which is the guard against "drop it unless it is a
-    whole UI": handovers can be programmed longer (§11.1.1.1) and `handover_UIs` is a float.
+    Two allocated UIs show as one `2·UI` term worth two UIs, which is the guard against
+    "show it only at one UI": handovers can be programmed longer (§11.1.1.1).
     """
-    legs = ("MP_hold_ho", "PM_hold_ho", "MP_contention", "PM_contention", "PP_contention")
+    legs = ("MP_hold_ho", "PM_hold_ho", "PP_hold_ho", "MP_contention", "PM_contention",
+            "PP_contention")
 
     def terms(n_ho, leg):
         return compute(CalcInputs(handover_UIs=n_ho)).breakdowns[leg]
@@ -3168,9 +3790,15 @@ def test_no_handover_ui_means_no_ui_term():
             return sorted((t.symbol, round(t.value_ns, 9)) for t in b.terms
                           if "UI" not in t.symbol and "X_" not in t.symbol)
         assert rest(one) == rest(none), leg
-        # A part-UI allocation is not rounded away.
-        half = [t for t in terms(0.5, leg).terms if t.symbol == "0.5·UI"]
-        assert len(half) == 1, (leg, "a fractional allocation must still show")
+        # A longer allocation shows as its own count.
+        two = [t for t in terms(2.0, leg).terms if t.symbol == "2·UI"]
+        assert len(two) == 1, (leg, "a two-UI allocation must show as 2·UI")
+        assert two[0].value_ns == pytest.approx(2 * CalcInputs().UI_ns())
+
+    # The allocation moves no other leg.
+    none_all, one_all = (compute(CalcInputs(handover_UIs=n)).breakdowns for n in (0.0, 1.0))
+    for leg in set(none_all) - set(legs):
+        assert one_all[leg].margin_ns == none_all[leg].margin_ns, leg
 
     # The zero that STAYS: Man_t_IH reads 0.00 ns on PHY2 because that is the spec's
     # value, not because nothing was allocated, so the row keeps it.
@@ -3282,6 +3910,7 @@ def test_phy2_needs_its_handover_ui_and_the_model_says_why():
     assert ok.F_max_MHz == pytest.approx(1000.0 * 0.45 / (8.0 - spread), rel=1e-6)
 
 
+@pytest.mark.gui
 def test_the_contention_legs_take_the_opposite_t_zd_corner_from_setup():
     """t_ZD is ONE field, and the two uses want opposite ends of it.
 
@@ -3340,44 +3969,88 @@ def test_a_soundwire_side_flags_the_handover_assumption():
     assert "SWI3S side" not in HANDOVER_SW_PAIR_NOTE
 
 
-def test_handover_ui_checkbox_selects_whether_the_ui_term_applies():
-    """The control that prepares for EndDriveEarly.
+_HANDOVER_LEGS = ("MP_hold_ho", "PM_hold_ho", "PP_hold_ho",
+                  "MP_contention", "PM_contention", "PP_contention")
 
-    Ticked = one UI scheduled, cleared = none, and the three handover
-    inequalities lose their N_HO*UI term with it. Seeded from the selected PHYs
-    on reset -- PHY2 schedules one, PHY1 does not -- and overridable in both
-    directions, because allocating a UI on PHY1 is legal (11.1.1.1 allows longer
-    handovers) and clearing it on PHY2 is the EDE case.
-    """
-    tv = _view()
-    # PHY2 defaults to a scheduled UI.
-    assert tv._ho_ui_check.isChecked()
+
+def _ho_ui_terms(b):
+    """The handover-UI terms of handover leg breakdown `b` (`calculator._handover_ui_terms`)."""
+    return [t for t in b.terms if t.symbol.endswith("·UI")]
+
+
+@pytest.mark.gui
+def test_handover_ui_checkbox_starts_on_the_pairs_allocation_and_selects_the_ui_term():
+    """A fresh page, Reset and a spec change set the Handover UI box to the selected pair's
+    allocation (`default_handover_UIs`): ticked for PHY2 and SoundWire, cleared for PHY1 and
+    EDE, a mixed pair taking the larger. The box stays editable and applies to both columns.
+    Cleared, PHY2's contention legs fail at every rate; PHY1 closes them with no UI; ticking
+    the box only adds margin."""
+    tv = _quiet(_view())
+    assert tv._ho_ui_check.isChecked(), "PHY2 allocates one handover UI"
     assert tv.inputs("spec").handover_UIs == 1.0
+    assert tv.inputs("proposed").handover_UIs == 1.0
 
-    # Clearing it must FAIL the handover legs at PHY2's current numbers: t_ZD,min
-    # 2.0 cannot cover t_DZ,max 10.0 without a UI. That is the deficit EDE has to
-    # close.
+    # PHY2's t_ZD,min 2.0 cannot cover t_DZ,max 10.0 without a UI.
     tv._ho_ui_check.setChecked(False)
     assert tv.inputs("spec").handover_UIs == 0.0
-    w = tv._per_inequality_worst("spec")
+    assert tv.inputs("proposed").handover_UIs == 0.0
+    w = _column_worst(tv, "spec")
     for leg in ("MP_contention", "PM_contention", "PP_contention"):
         assert w[leg].margin_ns < 0, leg
         assert w[leg].F_max_MHz == 0.0, f"{leg}: no clock rate fixes a zero-UI deficit"
-    assert "EndDriveEarly" in tv._ho_hint.text()
+        assert not _ho_ui_terms(w[leg]), leg
+    tv._reset_to_defaults()
+    assert tv._ho_ui_check.isChecked(), "Reset takes PHY2's allocation"
 
-    # PHY1 reseeds it OFF, because PHY1 hands over intra-UI.
+    for man, per, implied in (("SWI3S_PHY1", "SWI3S_PHY1", False),
+                              ("SWI3S_PHY2_EDE", "SWI3S_PHY2_EDE", False),
+                              ("SWI3S_PHY2_EDE", "SWI3S_PHY2", True),
+                              ("SWI3S_PHY1", "SWI3S_PHY2", True),
+                              ("SW13_1V2", "SWI3S_PHY2", True),
+                              ("SWI3S_PHY2", "SWI3S_PHY2", True)):
+        tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData(man))
+        tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData(per))
+        assert implied is (default_handover_UIs(man, per) > 0), (man, per)
+        assert tv._ho_ui_check.isChecked() is implied, (man, per)
+        tv._ho_ui_check.setChecked(not implied)
+        tv._reset_to_defaults()
+        assert tv._ho_ui_check.isChecked() is implied, ("Reset", man, per)
+
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY1"))
     assert not tv._ho_ui_check.isChecked()
-    assert tv._per_inequality_worst("spec")["MP_contention"].margin_ns > 0, \
+    assert _column_worst(tv, "spec")["MP_contention"].margin_ns > 0, \
         "PHY1 closes with no UI — that is what makes it the intra-UI PHY"
-
-    # Ticking it on PHY1 is legal and only adds margin.
-    before = tv._per_inequality_worst("spec")["MP_contention"].margin_ns
+    before = _column_worst(tv, "spec")["MP_contention"].margin_ns
     tv._ho_ui_check.setChecked(True)
-    assert tv._per_inequality_worst("spec")["MP_contention"].margin_ns > before
+    assert _column_worst(tv, "spec")["MP_contention"].margin_ns > before
 
 
+@pytest.mark.gui
+def test_the_handover_ui_box_adds_one_ui_term_to_each_handover_leg_on_both_columns():
+    """With the box cleared no handover leg of either column carries an N_HO·UI term; ticked,
+    each carries exactly one, 1·UI, worth its column's UI, and no other leg's margin moves."""
+    tv = _quiet(_view())
+    for man, per in (("SWI3S_PHY2", "SWI3S_PHY2"), ("SWI3S_PHY2_EDE", "SWI3S_PHY2_EDE")):
+        tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData(man))
+        tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData(per))
+        for side in ("spec", "proposed"):
+            tv._ho_ui_check.setChecked(False)
+            off = _column_worst(tv, side)
+            tv._ho_ui_check.setChecked(True)
+            on = _column_worst(tv, side)
+            ui = tv.inputs(side).UI_ns()
+            for leg in _HANDOVER_LEGS:
+                assert not _ho_ui_terms(off[leg]), (man, side, leg)
+                terms = _ho_ui_terms(on[leg])
+                assert [t.symbol for t in terms] == ["1·UI"], (man, side, leg, terms)
+                assert terms[0].value_ns == pytest.approx(ui), (man, side, leg)
+            for leg in set(off) - set(_HANDOVER_LEGS):
+                if off[leg].margin_ns is not None:
+                    assert on[leg].margin_ns == pytest.approx(off[leg].margin_ns), (man, leg)
+
+
+@pytest.mark.gui
 def test_handover_ui_does_not_reseed_and_round_trips():
     """Toggling it must not reset the rate or the edited Example column.
 
@@ -3399,8 +4072,7 @@ def test_handover_ui_does_not_reseed_and_round_trips():
     assert not tv2._ho_ui_check.isChecked()
     assert tv2.inputs("spec").handover_UIs == 0.0
 
-    # A workspace written before the checkbox existed falls back to what the
-    # selected PHYs imply.
+    # Settings written before the key existed follow what the selected PHYs imply.
     d.pop("handover_ui")
     tv3 = _view()
     tv3.set_from_dict(d)
@@ -3551,8 +4223,12 @@ def _sw_anchor_closed_form(side, corner, rising, clk_rising, shape, v_oh, v_ol, 
     equivalent's placement on linear ramps at 0.20 / 0.80 at its slews k0, s0. Max corner:
     t_OV from the clock's 65 % point (35 % falling) to 80 % of the data transition (the level
     0.80 rising, 0.20 falling); min corner: t_ZD_Data from the clock's 50 % point to the data
-    ramp's start. On a rail of 1, a level v is reached v/swing (rising) or (1 − v)/swing
-    (falling) into a linear ramp, −log_4(1 − v) or −log_4(v) into an exponential one."""
+    ramp's start. A Manager's clock end is its clock's 20 % point; a Peripheral's is its
+    detection, at the late end V_IH,max = 65 %, so the max corner has no clock part, and at the
+    early end V_IH,min = 0.45 (V_IL,max = 0.55 falling), so the min corner's clock part runs
+    from there to 50 %. On a rail of 1, a level v is reached v/swing (rising) or
+    (1 − v)/swing (falling) into a linear ramp, −log_4(1 − v) or −log_4(v) into an
+    exponential one."""
     swing = v_oh - v_ol
 
     def at(level, r):
@@ -3567,8 +4243,12 @@ def _sw_anchor_closed_form(side, corner, rising, clk_rising, shape, v_oh, v_ol, 
     if corner == "max":
         return (from_anchor(0.65, clk_rising) * k * man - from_anchor(0.80, rising) * s
                 - (0.75 * k0 * man - s0))
-    return (from_anchor(0.50, clk_rising) * k * man + at(v_ol if rising else v_oh, rising) * s
-            - (0.5 * k0 * man + s0 / 3.0))
+    if man:
+        clk, clk0 = from_anchor(0.50, clk_rising) * k, 0.5 * k0
+    else:
+        clk = min(at(0.50, r) - at(0.45 if r else 0.55, r) for r in (True, False)) * k
+        clk0 = (0.50 - 0.45) / 0.6 * k0
+    return clk + at(v_ol if rising else v_oh, rising) * s - (clk0 + s0 / 3.0)
 
 
 @pytest.mark.parametrize("v_oh, v_ol", [(0.80, 0.20), (0.80, 0.15), (0.85, 0.25), (0.90, 0.30)])
@@ -3951,20 +4631,24 @@ def test_a_shared_clock_edge_takes_its_worse_factor_and_two_edges_their_own():
     assert early_worse, "no case reaches a shared edge whose worse factor is the early one"
 
 
-def test_a_fractional_handover_count_is_one_whole_count_for_every_edge_rule():
-    """A fractional handover count takes the nearest whole one, a tie going up, and the polarity
-    and shared-edge rules read that one count."""
+def test_a_handover_count_is_a_whole_number_of_uis():
+    """A launch out of high-Z is on a clock edge, so a fractional handover count is refused,
+    naming handover_UIs; a whole count gives the polarity and shared-edge rules that count."""
     from swi3s_studio.timing.calculator import (
         handover_flips_edge,
         handover_whole_UIs,
         pp_shares_clock_edge,
     )
 
-    for n, whole in [(0.0, 0), (0.4, 0), (0.5, 1), (1.4, 1), (1.5, 2), (2.5, 3), (3.5, 4)]:
+    for n in (0.4, 0.5, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="handover_UIs"):
+            compute(CalcInputs(handover_UIs=n))
+    for n in (0.0, 1.0, 2.0, 3.0):
         inp = CalcInputs(handover_UIs=n)
-        assert handover_whole_UIs(inp) == whole, n
-        assert handover_flips_edge(inp) == (whole % 2 == 1), n
-        assert pp_shares_clock_edge(inp, "PP_hold_ho") == (whole == 0), n
+        compute(inp)
+        assert handover_whole_UIs(inp) == int(n)
+        assert handover_flips_edge(inp) == (int(n) % 2 == 1), n
+        assert pp_shares_clock_edge(inp, "PP_hold_ho") == (n == 0), n
 
 
 def test_pp_hold_ho_launches_on_the_edge_its_handover_count_gives():
@@ -3982,6 +4666,7 @@ def test_pp_hold_ho_launches_on_the_edge_its_handover_count_gives():
         B's data, early    ((1.05 − (0.55·1.05 + 0.1)) / (0.6·1.05) − 1/3) · 0.95 = 0.24504
 
         margin = N_HO·UI + (c_A − c_B)·t_RF,CLK + Per_t_ZD + c_data·t_RF,DATA − Per_t_IH
+                 − t_PD,mis,AB
     """
     from swi3s_studio.timing.calculator import _compute_at
 
@@ -4003,7 +4688,8 @@ def test_pp_hold_ho_launches_on_the_edge_its_handover_count_gives():
         clk = [t for t in b.terms if t.symbol.endswith("· Man_t_RF,CLK")]
         assert [t.symbol for t in clk] == [f"(X_MP,B,rise,late − {a_sym}) · Man_t_RF,CLK"], n
         assert clk[0].value_ns == pytest.approx((c_a - c_b) * k, abs=1e-9), n
-        want = n * ui + (c_a - c_b) * k + inp.Per_t_ZD_ns + c_data * s - inp.Per_t_IH_max_ns
+        want = (n * ui + (c_a - c_b) * k + inp.Per_t_ZD_ns + c_data * s - inp.Per_t_IH_max_ns
+                - inp.t_PD_mis_ns())
         assert b.margin_ns == pytest.approx(want, abs=1e-9), n
     # PP_hold is one edge whatever the handover count: A's detection is of B's polarity.
     for n in (1.0, 2.0):
@@ -4022,8 +4708,9 @@ def test_pp_hold_ho_samples_on_either_polarity_and_reports_the_worse():
     V_IL,max + α; or on a falling edge, detected late at V_IL,min − α, against A's rising data
     at V_IH,min − α. A launches on B's polarity at an even count and the other at an odd one,
     detected early: rising at V_IH,min − α, falling at V_IL,max + α. Linear ramps, swing 0.6,
-    α 0.1, τ 0.05, every crossing counted from its ramp's 20 % point. The leg is the worse
-    case, and each case's symbols name its polarities.
+    α 0.1, τ 0.05, every crossing counted from its ramp's 20 % point, and the trace mismatch
+    t_PD,mis,AB charged. The leg is the worse case, and each case's symbols name its
+    polarities.
     """
     from swi3s_studio.timing.calculator import _compute_at
 
@@ -4044,7 +4731,7 @@ def test_pp_hold_ho_samples_on_either_polarity_and_reports_the_worse():
         inp = CalcInputs(handover_UIs=n, V_IH_min_frac=0.40, V_IL_max_frac=0.50)
         k, s, ui = inp.tRF_Man_CLK_ns, inp.tRF_Per_DATA_ns, inp.UI_ns()
         odd = n % 2 == 1
-        rest = n * ui + inp.Per_t_ZD_ns - inp.Per_t_IH_max_ns
+        rest = n * ui + inp.Per_t_ZD_ns - inp.Per_t_IH_max_ns - inp.t_PD_mis_ns()
         b_rising = rest + ((a_fall if odd else a_rise) - b_rise) * k + d_fall * s
         b_falling = rest + ((a_rise if odd else a_fall) - b_fall) * k + d_rise * s
         b = _compute_at(inp, (m, pa, pb)).breakdowns["PP_hold_ho"]
@@ -4519,6 +5206,7 @@ def test_ede_applies_only_to_the_side_that_has_it():
         assert per_only[leg].margin_ns > man_only[leg].margin_ns, leg
 
 
+@pytest.mark.gui
 def test_the_ede_column_pair_is_proposal_versus_ede():
     """Selecting EDE shifts the comparison UP a step.
 
@@ -4531,7 +5219,7 @@ def test_the_ede_column_pair_is_proposal_versus_ede():
     assert tv._column_labels() == ("Specification", "Example")
     for combo in (tv._man_spec_combo, tv._per_spec_combo):
         combo.setCurrentIndex(combo.findData("SWI3S_PHY2_EDE"))
-    assert tv._column_labels() == ("PHY2 Proposed", "EDE Proposed")
+    assert tv._column_labels() == ("PHY2 Proposed", "PHY2 EDE")
 
     # Left column = the PROPOSED revision, not the current spec.
     assert (tv._min[("spec", "Man_t_DD")].value(),
@@ -4564,12 +5252,13 @@ def test_ede_helps_every_contention_leg_it_owns():
       instead (`test_the_ede_column_releases_both_sides_by_their_ede_delay`).
     * Which legs reach positive is a RESULT, and is recorded as one rather than
       demanded.
+
+    Both sides on the EDE source, each column at the page's inputs
+    (`timing_page_inputs.column`).
     """
-    tv = _view()
-    for combo in (tv._man_spec_combo, tv._per_spec_combo):
-        combo.setCurrentIndex(combo.findData("SWI3S_PHY2_EDE"))
-    ede = tv._per_inequality_worst("proposed")
-    base = tv._per_inequality_worst("spec")
+    ede, base = ({leg: r.breakdowns[leg]
+                  for leg, r in worst(*column("SWI3S_PHY2_EDE", "SWI3S_PHY2_EDE", side))[0].items()}
+                 for side in ("proposed", "spec"))
 
     for leg in ("MP_contention", "PM_contention", "PP_contention"):
         assert ede[leg].margin_ns > base[leg].margin_ns, \
@@ -4582,8 +5271,8 @@ def test_ede_helps_every_contention_leg_it_owns():
     # still covers it. P->P closing is a statement about driver current only: `PP_hold_ho`
     # still fails wherever a peripheral acquires, so the P->P handover still owes its UI.
     assert ede["MP_contention"].margin_ns == pytest.approx(1.40, abs=0.005)
-    assert ede["PM_contention"].margin_ns == pytest.approx(12.69, abs=0.005)
-    assert ede["PP_contention"].margin_ns == pytest.approx(6.77, abs=0.005)
+    assert ede["PM_contention"].margin_ns == pytest.approx(12.49, abs=0.005)
+    assert ede["PP_contention"].margin_ns == pytest.approx(6.57, abs=0.005)
     # The setup and hold legs are not owned by the releaser: EDE leaves them positive and
     # no worse than the baseline.
     for leg in ("MP_setup", "PM_setup", "PM_hold"):
@@ -4634,6 +5323,7 @@ def test_the_threshold_window_is_never_collapsed_by_a_corner_pick():
         "and the acquirer's early crossing must NOT rise with it"
 
 
+@pytest.mark.gui
 def test_no_ede_row_moves_with_the_rate():
     """Every EDE column value is absolute (`_ede_ranges`), so every row, edits included, holds
     its value across a rate change."""
@@ -4740,6 +5430,7 @@ def test_the_keeper_leg_is_meaningful_without_ede_too():
         assert not any(s.endswith(",min") for s in syms), (leg, syms)
 
 
+@pytest.mark.gui
 def test_the_ede_column_releases_both_sides_by_their_ede_delay():
     """What the EDE column IS: the revision's values, both sides releasing their EDE Delay
     after their ramp's 80 % point, and no handover UI.
@@ -4776,7 +5467,7 @@ def test_the_ede_column_releases_both_sides_by_their_ede_delay():
     assert set(short) - set(_PP_DATA_LEGS) == {"MP_hold", "MP_hold_ho", "PP_hold_ho",
                                                 "keeper_Per"}, \
         f"the set of short legs moved: {short}"
-    assert w["PP_hold_ho"].margin_ns == pytest.approx(-5.69, abs=0.02), \
+    assert w["PP_hold_ho"].margin_ns == pytest.approx(-5.89, abs=0.02), \
         ("the level a releasing MANAGER drove, against an acquiring peripheral's turn-on: "
          "in scope, unclosed, and what still owes a handover UI wherever a peripheral "
          "acquires")
@@ -4830,6 +5521,7 @@ def test_setup_and_contention_agree_about_man_t_zd():
             assert used == pytest.approx(want), mode
 
 
+@pytest.mark.gui
 def test_ede_column_spreads_are_not_tighter_than_2_to_1():
     """A delay's max/min over PVT and mismatch is floored at 2:1.
 
@@ -4978,6 +5670,7 @@ def test_clocking_the_manager_release_costs_mp_contention():
     assert kp[LaunchMode.CLK2] > kp[LaunchMode.ANALOG], kp
 
 
+@pytest.mark.gui
 def test_every_governed_row_agrees_with_the_term_it_feeds():
     """When the picker moves the margins, the parameters they are computed from
     move with them on screen, so the value in force is on the page.
@@ -5017,12 +5710,11 @@ def test_the_keeper_legs_are_split_so_the_corner_search_stays_exact():
     two-coordinate move. So each keeper leg is reported on its own.
 
     Checked against brute force over the rows the keeper reads, at 13.2 MHz (PHY2's
-    mandatory maximum), with and without EndDriveEarly.
+    mandatory maximum), with and without EndDriveEarly, the EDE rows at the page's EDE
+    column values.
     """
-    from swi3s_studio.ui.timing_view import _ede_ranges
-
     f = 13.2
-    ede = _ede_ranges()
+    ede = page._ede_ranges()
     rows = [dc_replace(r, range=ede[r.name]) if r.name in ede else r
             for r in default_swi3s_rows()]
     plain = CalcInputs(F_CLK_target_MHz=f, duty_min=0.45, bus_length_cm=30.0,
@@ -5261,20 +5953,17 @@ def test_the_corner_search_is_exact_with_the_input_windows_set_low(man, per, kw,
 
 def test_the_corner_search_is_exact_where_delta_binds_at_typ():
     """δ can leave a margin smaller at typ than at either end: on the Timing view's
-    Specification column, a SWI3S PHY2 Manager on an exponential ramp and a SoundWire
-    Peripheral, V_IH 0.30-0.60 and V_IL 0.30-0.40, no handover UI, P->M hold is least at δ's
-    typ. The search takes every pick of α and δ with the slews and τ, so over the coupled rows
-    and the bus length its corner is the worst corner of the whole min/typ/max grid, on every
-    leg, and its PM_hold pick holds δ inside its range, with a margin no larger than at typ
-    and below both ends."""
+    Specification column, SWI3S PHY2 on both sides, the Manager on an exponential ramp,
+    V_IH 0.30-0.60 and V_IL 0.30-0.40, the Manager's clock t_RF row 6.0-8.3 ns, no handover
+    UI, P->M hold is least at δ's typ. The search takes every pick of α and δ with the slews
+    and τ, so over the coupled rows and the bus length its corner is the worst corner of the
+    whole min/typ/max grid, on every leg, and its PM_hold pick holds δ inside its range, with
+    a margin no larger than at typ and below both ends."""
     from swi3s_studio.timing import INEQUALITIES, find_worst_corner_rows_all
 
-    tv = _view()
-    tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData("SWI3S_PHY2"))
-    tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V2"))
-    tv._set_shape(tv._man_shape, "exp")
-    base, rows = tv._typ_baseline("spec")
-    windows = {"V_IH": ParamRange(0.30, 0.45, 0.60), "V_IL": ParamRange(0.30, 0.35, 0.40)}
+    base, rows = column("SWI3S_PHY2", "SWI3S_PHY2", "spec", man_shape="exp")
+    windows = {"V_IH": ParamRange(0.30, 0.45, 0.60), "V_IL": ParamRange(0.30, 0.35, 0.40),
+               "t_RF Man CLK": ParamRange(6.0, 7.15, 8.3)}
     rows = [dc_replace(r, range=windows[r.name]) if r.name in windows else r
             for r in rows if r.is_window or r.name in _SW_SEARCHED_ROWS]
     base = apply_row_picks(dc_replace(base, handover_UIs=0.0), rows, {})
@@ -5549,15 +6238,14 @@ def test_the_other_rows_move_a_margin_independently_of_the_coupled_rows(man, per
 def test_the_view_shows_the_reachable_worst_with_soundwire_on_both_sides():
     """Specification column, both sides SoundWire 1.3 at 12.288 MHz: MP_hold,
     PM_setup and keeper_Per, as the view shows them, are no better than any corner of the
-    coupled rows reachable from their own picks."""
+    coupled rows reachable from their own picks. The page's inputs and worst corners are
+    `timing_page_inputs.column` and `worst`, which
+    `test_timing_view_columns.py::test_the_page_reads_the_inputs_its_seed_tables_give` pins
+    against the page."""
     from swi3s_studio.timing import INEQUALITIES
 
-    tv = _view()
-    tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData("SW13_1V2"))
-    tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SW13_1V2"))
-    tv._fclk.setValue(12.288)
-    shown, picked = tv._worst_results("spec")
-    base, rows = tv._typ_baseline("spec")
+    base, rows = column("SW13_1V2", "SW13_1V2", "spec", fclk=12.288)
+    shown, picked = worst(base, rows)
     names = [r.name for r in rows if r.name in _SW_SEARCHED_ROWS and r.linked_to is None]
     for leg in ("MP_hold", "PM_setup", "keeper_Per"):
         assert leg in INEQUALITIES

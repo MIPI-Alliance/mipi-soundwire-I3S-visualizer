@@ -4,7 +4,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
-#include <algorithm>          // std::copy
+#include <algorithm>          // std::copy, std::sort
 #include <limits>             // decode_saleae_v3_deltas overflow bound
 #include <memory>             // pyOwner()
 #include <stdexcept>          // requireAudio() throws
@@ -19,6 +19,7 @@
 #include "CCrc16.h"
 #include "CRegisterModel.h"
 #include "SosFilter.h"
+#include "VcdReader.h"
 
 namespace py = pybind11;
 using namespace swi3score;
@@ -63,9 +64,13 @@ static py::dict commandToDict(const CommandRec& c)
     // A write covered a read-only byte (a programming error) — see
     // CommandRec::readOnlyWriteError.
     d["read_only_write_error"] = c.readOnlyWriteError;
-    // ERROR: this command's SSP landed while a skipping port was part-way through its skip
-    // pattern (Section 9.1.6.2.1) — see CommandRec::unexpectedSspError.
+    // A sync-point command's Row_Delay was outside 14..15, so it had no effect (a
+    // programming error) — see CommandRec::rowDelayError.
+    d["row_delay_error"] = c.rowDelayError;
+    // ERROR: this command's SSP was unexpected — mid interval, or mid skip pattern
+    // (Section 9.1.6.2.1) — see CommandRec::unexpectedSspError.
     d["unexpected_ssp_error"] = c.unexpectedSspError;
+    d["unexpected_ssp_mid_interval"] = c.unexpectedSspMidInterval;
     d["bus_row"] = c.busRow;
     d["effective_row"] = c.effectiveRow;   // SSP row a confirmed sync-commit takes effect (-1 otherwise)
     d["start_sample"] = c.startSample;
@@ -111,7 +116,8 @@ static py::dict configToDict(const SwI3sConfig& cfg)
     // an addressable CDS block, so nothing on the wire reveals how the Manager drives the
     // CDS; see CRegisterModel::BuildConfig.
     out["cds_bit_width"] = cfg.CdsBitWidth;
-    out["cds_guard"] = py::cast(cfg.CdsGuard);
+    out["cds_guard_enable"] = py::cast(cfg.CdsGuardEnable);
+    out["cds_guard_polarity"] = py::cast(cfg.CdsGuardPolarity);
     out["cds_tail"] = py::cast(cfg.CdsTailWidth);
     out["cds_drive_type"] = py::cast(cfg.CdsDriveType);
     out["cds_end_drive_early"] = py::cast(cfg.CdsEndDriveEarly);
@@ -169,9 +175,38 @@ static py::dict audioToDict(const AudioRec& a)
     return d;
 }
 
-// Reading the decoded audio after release_audio() dropped it is a caller bug. Say so:
-// handing back an empty list would be indistinguishable from a capture that carried no
-// audio at all, which is a silent wrong answer rather than a loud one.
+// Write/commit/read command dicts (keys is_write, is_commit, is_read, commit_confirmed,
+// device_mask, address, data, group_mask) as the register-model replay. Every replay binding
+// converts its commands here; only registers_from_commands applies the reads.
+static std::vector<CommandReplay> toCommandReplay(const std::vector<py::dict>& cmds)
+{
+    std::vector<CommandReplay> replay;
+    replay.reserve(cmds.size());
+    for (const auto& d : cmds) {
+        CommandReplay r;
+        r.isWrite = d.contains("is_write") && d["is_write"].cast<bool>();
+        r.isCommit = d.contains("is_commit") && d["is_commit"].cast<bool>();
+        r.isRead = d.contains("is_read") && d["is_read"].cast<bool>();
+        r.commitConfirmed = d.contains("commit_confirmed") &&
+                            d["commit_confirmed"].cast<bool>();
+        if (d.contains("device_mask"))
+            r.deviceMask = static_cast<std::uint16_t>(d["device_mask"].cast<int>());
+        if (d.contains("address"))
+            r.address = d["address"].cast<std::uint32_t>();
+        if (d.contains("group_mask"))
+            r.groupMask = static_cast<std::uint16_t>(d["group_mask"].cast<int>());
+        if (d.contains("data")) {
+            py::bytes b = d["data"].cast<py::bytes>();
+            std::string s = b;
+            r.data.assign(s.begin(), s.end());
+        }
+        replay.push_back(std::move(r));
+    }
+    return replay;
+}
+
+// Reading the decoded audio after release_audio() dropped it raises: an empty list means a
+// capture that carried no audio.
 static void requireAudio(const Decoder& d)
 {
     if (d.audioReleased())
@@ -191,17 +226,80 @@ static std::shared_ptr<const void> pyOwner(py::object obj)
     });
 }
 
+// An edge argument as a C-contiguous array of 64-bit sample numbers, which the caller views
+// as uint64 and holds as the owner of that view. A C-contiguous uint64 or int64 array is the
+// caller's own (no copy); an unsigned, signed or bool array of another dtype or layout, or
+// a list, is converted once. A signed array is accepted when no value is negative, and its
+// 64-bit values are read as uint64. A negative value raises ValueError; a floating-point or
+// other dtype raises TypeError.
+static py::array edgeArray(const py::handle& obj, const char* name)
+{
+    py::array a = py::array::ensure(obj);
+    if (!a)
+        throw py::type_error(std::string(name) + " is not an array of sample numbers");
+    const char kind = a.dtype().kind();
+    if (kind == 'i') {
+        auto i64 = py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>::ensure(a);
+        const std::int64_t* v = i64.data();
+        for (py::ssize_t k = 0, n = i64.size(); k < n; ++k)
+            if (v[k] < 0)
+                throw py::value_error(std::string(name) + " holds a negative sample number (" +
+                                      std::to_string(v[k]) + ")");
+        return std::move(i64);
+    }
+    if (kind != 'u' && kind != 'b')
+        throw py::type_error(std::string(name) + " has dtype " +
+                             py::str(a.dtype()).cast<std::string>() +
+                             "; edge arrays hold whole sample numbers (an unsigned or signed "
+                             "integer dtype)");
+    return py::array_t<std::uint64_t, py::array::c_style | py::array::forcecast>::ensure(a);
+}
+
+static const std::uint64_t* edgeData(const py::array& a)
+{
+    return static_cast<const std::uint64_t*>(a.data());
+}
+
+// A uint64 array over an EdgeArray's buffer, which it owns from then on (PyMem_RawFree).
+static py::array_t<std::uint64_t> releaseEdges(EdgeArray& edges)
+{
+    const auto n = static_cast<py::ssize_t>(edges.size());
+    std::uint64_t* p = edges.release();
+    if (!p) return py::array_t<std::uint64_t>(0);
+    py::capsule owner(p, [](void* q) { PyMem_RawFree(q); });
+    return py::array_t<std::uint64_t>({n}, {static_cast<py::ssize_t>(sizeof(std::uint64_t))},
+                                      p, owner);
+}
+
+// The notes of one kind on the two lines, as (line, count, first time) in the order of
+// each line's first record.
+static py::list vcdNotes(VcdScanner& s, VcdScanner::Note VcdScanner::Line::*kind)
+{
+    std::vector<std::pair<std::uint64_t, int>> order;
+    for (int k = 0; k < 2; ++k)
+        if ((s.line(k).*kind).count) order.emplace_back((s.line(k).*kind).order, k);
+    std::sort(order.begin(), order.end());
+    py::list out;
+    for (const auto& o : order) {
+        const VcdScanner::Note& rec = s.line(o.second).*kind;
+        out.append(py::make_tuple(o.second, rec.count, rec.first));
+    }
+    return out;
+}
+
 PYBIND11_MODULE(swi3score, m)
 {
     m.doc() = "SWI3S decode core: PHY1/PHY2 forwarded-clock (FBCSE) and PHY3 (DLV) bus decode.";
 
-    // ABI version of the Python<->native interface. Bump whenever a binding's
-    // signature / return shape changes in a way the Python side depends on, or when an
-    // older module would silently ignore a new setting or behaviour the Python side
-    // relies on. swi3s_studio checks this at decode time and asks the user to rebuild if
-    // the loaded .so is stale. A purely additive binding the Python side reaches with
-    // getattr is not a bump.
-    m.attr("score_abi") = 18;
+    // ABI version of the Python<->native interface; session._REQUIRED_SCORE_ABI states the
+    // same number and rule. Bump it whenever a core built before a change would read, accept
+    // or decode differently, once per release: a number no release carries yet is not bumped
+    // again. swi3s_studio checks it at decode time and asks the user to rebuild a stale
+    // module. tests/test_release_gate.py enforces the rule by a conservative proxy: when the
+    // native sources (the .cpp, .h and .hpp under native/swi3score and the build files that
+    // compile them, not README or other docs) changed since the last release tag reachable
+    // from HEAD, the number is above that tag's.
+    m.attr("score_abi") = 19;
     // Protocol constants the Python side repeats (session._MIN_COLUMNS/_MAX_COLUMNS,
     // dlv_detect.DLV_CDS_COLUMN and MIN_UI_SAMPLES); the tests pin each copy to these.
     m.attr("min_column_count") = swi3s::kMinColumnCount;
@@ -220,18 +318,17 @@ PYBIND11_MODULE(swi3score, m)
              "In-memory per-UI data-level source for tests/demos.");
 
     py::class_<TransitionSampleSource, ISampleSource>(m, "TransitionSampleSource")
-        .def(py::init([](py::array_t<std::uint64_t, py::array::c_style> clockEdges,
-                         py::array_t<std::uint64_t, py::array::c_style> dataEdges,
+        .def(py::init([](const py::object& clockArg, const py::object& dataArg,
                          bool initialClock, bool initialData, std::uint64_t sampleRateHz) {
-                 // The source views the buffers of the arrays the casters produced: the
-                 // caller's own arrays when they are already C-contiguous uint64 (zero
-                 // copy), otherwise converted copies that exist only in these parameters.
-                 // The casters convert only what numpy casts to uint64 safely; a signed or
-                 // floating-point array does not match this overload and raises TypeError.
-                 // Both are handed to the source as its owner, so whichever buffers it
-                 // views live exactly as long as it does.
-                 const std::uint64_t* clock = clockEdges.data();
-                 const std::uint64_t* data = dataEdges.data();
+                 // The source views the buffers of the arrays edgeArray produced: the
+                 // caller's own arrays when they are already C-contiguous 64-bit integers
+                 // (zero copy), otherwise converted copies that exist only here. Both are
+                 // handed to the source as its owner, so whichever buffers it views live
+                 // exactly as long as it does.
+                 py::array clockEdges = edgeArray(clockArg, "clock_edges");
+                 py::array dataEdges = edgeArray(dataArg, "data_edges");
+                 const std::uint64_t* clock = edgeData(clockEdges);
+                 const std::uint64_t* data = edgeData(dataEdges);
                  const auto clockN = static_cast<std::size_t>(clockEdges.size());
                  const auto dataN = static_cast<std::size_t>(dataEdges.size());
                  return new TransitionSampleSource(
@@ -240,20 +337,21 @@ PYBIND11_MODULE(swi3score, m)
              }),
              py::arg("clock_edges"), py::arg("data_edges"),
              py::arg("initial_clock"), py::arg("initial_data"), py::arg("sample_rate_hz"),
-             "Capture-backed source: clock/data transition arrays (uint64; viewed without a "
-             "copy when C-contiguous uint64; a strided view, a list or a narrower unsigned "
-             "dtype is converted once; a signed or floating-point dtype raises TypeError).");
+             "Capture-backed source: clock/data transition arrays (sample numbers; viewed "
+             "without a copy when C-contiguous uint64 or int64; a strided view, a list or "
+             "another integer dtype is converted once; a negative value raises ValueError "
+             "and a floating-point dtype TypeError).");
 
     py::class_<DlvSampleSource, ISampleSource>(m, "DlvSampleSource")
-        .def(py::init([](py::array_t<std::uint64_t, py::array::c_style> dpEdges,
+        .def(py::init([](const py::object& dpArg,
                          bool initialDp, std::uint64_t sampleRateHz, int initialColumns,
                          double nominalUiSamples) {
                  // DLV: one differential signal; only the DP-wire edges are needed (DN is
-                 // its complement). The source views the buffer of the array the caster
-                 // produced (the caller's own when it is already C-contiguous uint64,
-                 // otherwise a converted copy) and holds that array as its owner, as
-                 // TransitionSampleSource does, with the same dtype rule.
-                 const std::uint64_t* dp = dpEdges.data();
+                 // its complement). The source views the buffer of the array edgeArray
+                 // produced and holds that array as its owner, as TransitionSampleSource
+                 // does, with the same dtype rule.
+                 py::array dpEdges = edgeArray(dpArg, "dp_edges");
+                 const std::uint64_t* dp = edgeData(dpEdges);
                  const auto dpN = static_cast<std::size_t>(dpEdges.size());
                  return new DlvSampleSource(
                      dp, dpN, initialDp, sampleRateHz, initialColumns, nominalUiSamples,
@@ -261,10 +359,10 @@ PYBIND11_MODULE(swi3score, m)
              }),
              py::arg("dp_edges"), py::arg("initial_dp"), py::arg("sample_rate_hz"),
              py::arg("initial_columns"), py::arg("nominal_ui_samples") = 0.0,
-             "PHY3 (DLV) source: recovers the bit clock from the DP-wire edges (uint64; viewed "
-             "without a copy when C-contiguous uint64; a strided view, a list or a narrower "
-             "unsigned dtype is converted once; a signed or floating-point dtype raises "
-             "TypeError) via a virtual "
+             "PHY3 (DLV) source: recovers the bit clock from the DP-wire edges (sample "
+             "numbers; viewed without a copy when C-contiguous uint64 or int64; a strided "
+             "view, a list or another integer dtype is converted once; a negative value "
+             "raises ValueError and a floating-point dtype TypeError) via a virtual "
              "DLL locked to the Sync1 row edges, sampling mid-UI. initial_columns = Safe-Lock "
              "count (outside 2..32: the cold-start count); the decoder pushes NumColumns "
              "changes. nominal_ui_samples seeds the loop's "
@@ -601,6 +699,46 @@ PYBIND11_MODULE(swi3score, m)
            "seekable source and settings.decode_audio (else empty); a window starting past "
            "the capture's last UI is empty. This is the on-demand "
            "path the Raw Capture 'Port Samples' overlay uses per visible window.")
+        .def("withheld_samples", [](const Decoder& d) {
+            py::list out;
+            for (const auto& [key, n] : d.withheldSamples()) {
+                py::dict e;
+                e["device"] = std::get<0>(key);
+                e["dp"] = std::get<1>(key);
+                e["channel"] = std::get<2>(key);
+                e["samples"] = n;
+                out.append(e);
+            }
+            return out;
+        }, "Samples not emitted because a bit of them was recovered while a scrambled "
+           "channel's descrambler settled after a decode started on running ports (an SSP "
+           "row phasing the ports from the first UI): [{'device', 'dp', 'channel', "
+           "'samples'}], by (device, dp, channel).")
+        .def("checkpoint_descramblers", [](const Decoder& d) {
+            py::list out;
+            for (const auto& [ui, ports] : d.checkpointDescramblers()) {
+                py::list pl;
+                for (const auto& p : ports) {
+                    py::list channels;
+                    for (const CDescrambler& c : p.channels)
+                        channels.append(py::make_tuple(c.Q(), c.NoToggleState()));
+                    py::dict e;
+                    e["device"] = p.deviceNum;
+                    e["dp"] = p.dpIndex;
+                    e["channels"] = channels;
+                    e["fcp"] = py::make_tuple(p.fcp.Q(), p.fcp.NoToggleState());
+                    pl.append(e);
+                }
+                py::dict cp;
+                cp["ui"] = ui;
+                cp["ports"] = pl;
+                out.append(cp);
+            }
+            return out;
+        }, "Diagnostic: per transport checkpoint recorded during run() (needs "
+           "settings.decode_audio), {'ui', 'ports'}: each port of the engine a windowed "
+           "re-decode restores from it, {'device', 'dp', 'channels': 16 (q, nt), 'fcp': "
+           "(q, nt)}, q the descrambler's LFSR register Q8..Q0 and nt its No-Toggle state.")
         .def("grid_cells", [](const Decoder& d, int rows) {
             py::list out;
             for (const auto& c : d.gridLayout(rows)) out.append(gridCellToDict(c));
@@ -613,6 +751,15 @@ PYBIND11_MODULE(swi3score, m)
         }, "DLV Row Sync Point samples (each Column-0 UI's sample), from the decoder's "
            "own framing — the authoritative row boundaries for the recovered-clock RSP "
            "marks. Empty for FBCSE.")
+        .def("guessed_width_changes", [](const Decoder& d) {
+            py::list out;
+            for (const auto& w : d.guessedWidthChanges())
+                out.append(py::make_tuple(w.sample, w.fromColumns, w.toColumns));
+            return out;
+        }, "Each column count the blind detector adopted at a resync with no commit to set "
+           "it, as (sample, from_columns, to_columns): the sample of the first Column-0 UI "
+           "framed at the new count. A resync holds the current count first and re-detects "
+           "only after a second command-free confidence window.")
         .def("guessed_framing_samples", [](const Decoder& d) {
             const auto& v = d.guessedFramingSamples();
             return py::array_t<std::uint64_t>(
@@ -709,39 +856,29 @@ PYBIND11_MODULE(swi3score, m)
        "Every grid_* layout holds rows to max_grid_rows and the column count to "
        "min_column_count..max_column_count.");
 
+    py::class_<CRegisterModel>(m, "ReplayCheckpoint")
+        .def(py::init([](const std::vector<py::dict>& cmds) {
+                 return modelFromCommands(toCommandReplay(cmds));
+             }), py::arg("commands"),
+             "The register model after replaying write/commit command dicts (the keys "
+             "grid_from_commands reads). Passed as grid_from_commands(base=...), the "
+             "commands given there replay on a copy of it, which lays out the same grid as "
+             "replaying this checkpoint's commands followed by them.");
+
     m.def("grid_from_commands", [](const std::vector<py::dict>& cmds, int rows,
                                    int forceColumns,
                                    const std::vector<std::tuple<int, std::uint32_t, int>>& overrides,
-                                   bool dlv, int cdsHorizontalStart) {
-        std::vector<CommandReplay> replay;
-        replay.reserve(cmds.size());
-        for (const auto& d : cmds) {
-            CommandReplay r;
-            r.isWrite = d.contains("is_write") && d["is_write"].cast<bool>();
-            r.isCommit = d.contains("is_commit") && d["is_commit"].cast<bool>();
-            r.commitConfirmed = d.contains("commit_confirmed") &&
-                                d["commit_confirmed"].cast<bool>();
-            if (d.contains("device_mask"))
-                r.deviceMask = static_cast<std::uint16_t>(d["device_mask"].cast<int>());
-            if (d.contains("address"))
-                r.address = d["address"].cast<std::uint32_t>();
-            if (d.contains("group_mask"))
-                r.groupMask = static_cast<std::uint16_t>(d["group_mask"].cast<int>());
-            if (d.contains("data")) {
-                py::bytes b = d["data"].cast<py::bytes>();
-                std::string s = b;
-                r.data.assign(s.begin(), s.end());
-            }
-            replay.push_back(std::move(r));
-        }
+                                   bool dlv, int cdsHorizontalStart, const CRegisterModel* base) {
+        const std::vector<CommandReplay> replay = toCommandReplay(cmds);
         py::list out;
         for (const auto& c : gridFromCommands(replay, rows, forceColumns, overrides,
-                                              dlv, cdsHorizontalStart))
+                                              dlv, cdsHorizontalStart, base))
             out.append(gridCellToDict(c));
         return out;
     }, py::arg("commands"), py::arg("rows") = 32, py::arg("force_columns") = 0,
        py::arg("register_overrides") = std::vector<std::tuple<int, std::uint32_t, int>>{},
        py::arg("dlv") = false, py::arg("cds_horizontal_start") = 0,
+       py::arg("base") = static_cast<const CRegisterModel*>(nullptr),
        "As-of-cursor grid: replay decoded write/commit command dicts (keys "
        "is_write, is_commit, commit_confirmed, device_mask, address, data, "
        "group_mask) through the real register model, honouring dual-ranked _NEXT "
@@ -750,32 +887,12 @@ PYBIND11_MODULE(swi3score, m)
        "= (device, address, value) what-if forces folded in after the replay "
        "(already filtered to the cursor's config section by the caller). dlv=true "
        "lays out PHY3 (DLV) framing: CDS at cds_horizontal_start, S1 at Column 0, "
-       "S0 at the last column.");
+       "S0 at the last column. base (a ReplayCheckpoint, or None) is the register model "
+       "the commands replay on: the checkpoint's commands, then these.");
 
     m.def("config_from_commands", [](const std::vector<py::dict>& cmds, int forceColumns,
                                      const std::vector<std::tuple<int, std::uint32_t, int>>& overrides) {
-        std::vector<CommandReplay> replay;
-        replay.reserve(cmds.size());
-        for (const auto& d : cmds) {
-            CommandReplay r;
-            r.isWrite = d.contains("is_write") && d["is_write"].cast<bool>();
-            r.isCommit = d.contains("is_commit") && d["is_commit"].cast<bool>();
-            r.commitConfirmed = d.contains("commit_confirmed") &&
-                                d["commit_confirmed"].cast<bool>();
-            if (d.contains("device_mask"))
-                r.deviceMask = static_cast<std::uint16_t>(d["device_mask"].cast<int>());
-            if (d.contains("address"))
-                r.address = d["address"].cast<std::uint32_t>();
-            if (d.contains("group_mask"))
-                r.groupMask = static_cast<std::uint16_t>(d["group_mask"].cast<int>());
-            if (d.contains("data")) {
-                py::bytes b = d["data"].cast<py::bytes>();
-                std::string s = b;
-                r.data.assign(s.begin(), s.end());
-            }
-            replay.push_back(std::move(r));
-        }
-        return configToDict(configFromCommands(replay, forceColumns, overrides));
+        return configToDict(configFromCommands(toCommandReplay(cmds), forceColumns, overrides));
     }, py::arg("commands"), py::arg("force_columns") = 0,
        py::arg("register_overrides") = std::vector<std::tuple<int, std::uint32_t, int>>{},
        "As-of-cursor CONFIG (same replay + force_columns + overrides as "
@@ -784,44 +901,26 @@ PYBIND11_MODULE(swi3score, m)
        "rather than always the final operational config.");
 
     m.def("registers_from_commands", [](const std::vector<py::dict>& cmds,
-                                        const std::vector<std::tuple<int, std::uint32_t, int>>& overrides) {
-        std::vector<CommandReplay> replay;
-        replay.reserve(cmds.size());
-        for (const auto& d : cmds) {
-            CommandReplay r;
-            r.isWrite = d.contains("is_write") && d["is_write"].cast<bool>();
-            r.isCommit = d.contains("is_commit") && d["is_commit"].cast<bool>();
-            r.isRead = d.contains("is_read") && d["is_read"].cast<bool>();
-            r.commitConfirmed = d.contains("commit_confirmed") &&
-                                d["commit_confirmed"].cast<bool>();
-            if (d.contains("device_mask"))
-                r.deviceMask = static_cast<std::uint16_t>(d["device_mask"].cast<int>());
-            if (d.contains("address"))
-                r.address = d["address"].cast<std::uint32_t>();
-            if (d.contains("group_mask"))
-                r.groupMask = static_cast<std::uint16_t>(d["group_mask"].cast<int>());
-            if (d.contains("data")) {
-                py::bytes b = d["data"].cast<py::bytes>();
-                std::string s = b;
-                r.data.assign(s.begin(), s.end());
-            }
-            replay.push_back(std::move(r));
-        }
+                                        const std::vector<std::tuple<int, std::uint32_t, int>>& overrides,
+                                        const RegisterSnapshot& start) {
         py::list out;
-        for (const auto& t : registersFromCommands(replay, overrides))
+        for (const auto& t : registersFromCommands(toCommandReplay(cmds), overrides, start))
             out.append(py::make_tuple(std::get<0>(t), std::get<1>(t), std::get<2>(t),
                                       std::get<3>(t), std::get<4>(t), std::get<5>(t),
                                       std::get<6>(t), std::get<7>(t)));
         return out;
     }, py::arg("commands"),
        py::arg("register_overrides") = std::vector<std::tuple<int, std::uint32_t, int>>{},
+       py::arg("start") = RegisterSnapshot{},
        "As-of-cursor register state from the SAME replay + override fold as "
        "grid_from_commands, PLUS bus reads overlaid: list of (device, address, cur, "
        "has_cur, cur_src, next, has_next, next_src). *_src is provenance (1 written, "
        "2 read). Reads (is_read command dicts) reveal live values in the register map "
        "without perturbing the grid/audio config. NEXT display = next if has_next else "
        "cur; CURR = cur. The register map's value + provenance source, so register map "
-       "/ grid / audio share one decode authority.");
+       "/ grid / audio share one decode authority. `start`, when not empty, is a list this "
+       "function returned for a replay WITHOUT overrides: the replay continues from that "
+       "state, so a prefix's result plus the remaining commands equals the whole replay.");
 
     m.def("sosfilt", [](py::array_t<double, py::array::c_style | py::array::forcecast> sos,
                         py::array_t<double, py::array::c_style | py::array::forcecast> x,
@@ -876,9 +975,19 @@ PYBIND11_MODULE(swi3score, m)
     }, py::arg("csv_path"),
        "What reading a visualizer CSV config did not take as written: one line per field "
        "(a port disabled for its DeviceNumber_REG, a value masked or clamped to its "
-       "register field, a Reserved CDS_TailWidth 3, an unreadable cell, values past the "
+       "register field, a Reserved value (CDS_TailWidth 3, a port's TailWidth, BitWidth, "
+       "FCP_BitWidth or FCP_TailWidth 3, PortMode 1), an unreadable cell, values past the "
        "last column, a key that is not a config field). A file that cannot be opened "
        "reports why. Empty for a clean file.");
+
+    m.def("config_from_csv", [](const std::string& csvPath) {
+        SwI3sConfig cfg;
+        std::string err;
+        cfg.LoadCsv(csvPath, err);
+        return configToDict(cfg);
+    }, py::arg("csv_path"),
+       "A visualizer CSV config as the native loader reads it, in the fields "
+       "config_dataports() returns. A file that cannot be opened gives the defaults.");
 
     m.def("pattern_period", [](const std::string& csvPath, long long cap) {
         SwI3sConfig cfg;
@@ -929,14 +1038,17 @@ PYBIND11_MODULE(swi3score, m)
     m.def("make_skipping_levels", &MakeSkippingLevels,
           py::arg("samples_per_channel") = 200, py::arg("numerator") = 13,
           py::arg("denominator") = 160, py::arg("misaligned_sspa") = false,
+          py::arg("sspa_row_delay") = 14,
           "Synthetic PHY2 stream exercising Payload Interval Skipping: one unscrambled "
           "16-bit PCM source port (Interval = 32 Rows) carrying a RAMP, transporting "
           "(denominator - numerator) of every denominator intervals and leaving the rest "
           "idle, with periodic SSPAs on the pattern period. Sample n has value n, so a "
           "decode that skips the wrong interval no longer counts up. misaligned_sspa puts "
           "the SSPAs one Interval off the pattern boundary (an unexpected SSP). A "
-          "denominator below 1 is written as 0, which reads as the reset value 1. Raises "
-          "ValueError for a numerator or denominator above 4095, or for a ratio whose "
+          "denominator below 1 is written as 0, which reads as the reset value 1. Each SSPA "
+          "carries sspa_row_delay as its Row_Delay byte, placed where 14 puts its SSP. Raises "
+          "ValueError for a numerator or denominator above 4095, an sspa_row_delay that is "
+          "not a byte, or for a ratio whose "
           "samples_per_channel * denominator / (denominator - numerator) intervals exceed "
           "4 * max_demo_samples.");
 
@@ -946,11 +1058,14 @@ PYBIND11_MODULE(swi3score, m)
           "mid-stream. Raises ValueError when samples_per_channel is too small to place the "
           "DSCR before its commit point.");
     m.def("make_dscr_enable_levels", &MakeDscrEnableLevels, py::arg("samples_per_channel") = 32,
-          py::arg("enable_channel") = false,
+          py::arg("enable_channel") = false, py::arg("dscr_row_delay") = 14,
+          py::arg("sscr_row_delay") = 14,
           "Test fixture: one 16-bit PCM port; a DSCR enables a second port (or, with "
-          "enable_channel, a second channel on the running port) mid-stream. Raises "
-          "ValueError when samples_per_channel is too small to place the DSCR before its "
-          "commit point.");
+          "enable_channel, a second channel on the running port) mid-stream. The DSCR "
+          "carries dscr_row_delay and the SSCR sscr_row_delay as its Row_Delay byte; the bus "
+          "applies each config where 14 puts it. Raises ValueError when samples_per_channel "
+          "is too small to place the DSCR before its commit point, or a row delay is not a "
+          "byte.");
     m.def("make_dscr_channel_set_levels", &MakeDscrChannelSetLevels,
           py::arg("samples_per_channel") = 32, py::arg("from_mask") = 0x3,
           py::arg("to_mask") = 0x1, py::arg("row_in_interval") = 0,
@@ -979,6 +1094,7 @@ PYBIND11_MODULE(swi3score, m)
           py::arg("flow_control_delay") = 0, py::arg("scrambled") = false,
           py::arg("fcp_bit_width") = 0, py::arg("reenable") = false,
           py::arg("commit_row_offset") = 0, py::arg("columns_after") = 16,
+          py::arg("skipping_numerator") = 0, py::arg("skipping_denominator") = 1,
           "Test fixture: one RX_CONTROLLED port (data from Row 2) with its DRQ at Column 11, "
           "Row 12 and FlowControlDelay flow_control_delay (0 or 1); an SSCR (or a DSCR when "
           "dscr) then commits FCP_HorizontalStart fcp_h_start, FCP_Offset fcp_offset and "
@@ -996,7 +1112,11 @@ PYBIND11_MODULE(swi3score, m)
           "flow_control_delay other than 0 or 1, an "
           "fcp_bit_width outside 0..3, a DRQ whose fcp_bit_width + 1 UIs leave Columns "
           "1..15 or Rows 0..15 or reach Columns 2..14 of Rows 2..4, or a commit_row_offset "
-          "or columns_after outside its range.");
+          "or columns_after outside its range. skipping_numerator over skipping_denominator "
+          "sets the port's Payload Interval Skipping from the first commit: a skipped "
+          "interval carries no transport and no DRQ. Raises ValueError for a denominator "
+          "outside 1..4095, a numerator outside 0..denominator - 1, or an "
+          "intervals_per_phase that is not a multiple of the denominator.");
     m.def("make_fcp_guard_tail_levels", &MakeFcpGuardTailLevels,
           py::arg("intervals_per_phase") = 96, py::arg("dscr") = false,
           py::arg("fcp_h_start") = 8, py::arg("fcp_offset") = 12,
@@ -1027,6 +1147,15 @@ PYBIND11_MODULE(swi3score, m)
           "Test fixture: one scrambled PCM port; a single-ranked write changes SampleSize "
           "from from_size to to_size (register values, bits - 1) with the reconfigure "
           "rows_into_sample rows into a sample, so that sample is in flight across it.");
+    m.def("make_immediate_skipping_denominator_levels",
+          &MakeImmediateSkippingDenominatorLevels,
+          py::arg("intervals_per_phase") = 64, py::arg("numerator") = 1,
+          py::arg("from_denominator") = 4, py::arg("to_denominator") = 8,
+          "Test fixture: one unscrambled 16-bit PCM port carrying a ramp, skipping by "
+          "numerator / from_denominator; after intervals_per_phase intervals a single-ranked "
+          "write sets SLC_SkippingDenominator to to_denominator at an interval boundary, and "
+          "the port skips by the new ratio for intervals_per_phase more. Each value must be "
+          "1..255, else ValueError.");
     m.def("make_enablech_curr_write_levels", &MakeEnableChCurrWriteLevels,
           py::arg("samples_per_channel") = 32, py::arg("interval") = 0,
           "Test fixture: one PCM port committed with Interval=`interval`; a WriteA32 then "
@@ -1186,6 +1315,76 @@ PYBIND11_MODULE(swi3score, m)
         return out;
     }, py::arg("emit_depths"), py::arg("parse_depths"),
        "Test hook: decode a synthetic hub-delayed Ping; returns 12 ping tokens.");
+
+    // The value-change reader of a VCD (VcdReader.h). swi3s_studio/ingest/vcd.py feeds it
+    // the file's bytes and words every warning and error from what it returns.
+    py::class_<VcdScanner>(m, "VcdScanner")
+        .def_static("capture", [](py::bytes clock, py::bytes data, std::int64_t budget,
+                                  std::int64_t checkEvery, std::int64_t bytesPerEdge) {
+                return std::unique_ptr<VcdScanner>(new VcdScanner(
+                    std::string(clock), std::string(data), budget, checkEvery, bytesPerEdge,
+                    &PyMem_RawRealloc, &PyMem_RawFree));
+            }, py::arg("clock"), py::arg("data"), py::arg("budget"), py::arg("check_every"),
+            py::arg("bytes_per_edge"),
+            "A scanner that collects the edges of the idents `clock` and `data` (UTF-8 bytes), "
+            "checking every `check_every` edges that edges * `bytes_per_edge` is within "
+            "`budget` (0: no check).")
+        .def_static("counts", [](std::int64_t maxChanges) {
+                return std::unique_ptr<VcdScanner>(new VcdScanner(maxChanges));
+            }, py::arg("max_changes"),
+            "A scanner that counts the transitions of every ident, stopping at the change after "
+            "`max_changes` changes (< 0: no limit).")
+        .def("feed", [](VcdScanner& s, py::bytes chunk) {
+                char* p = nullptr;
+                Py_ssize_t n = 0;
+                if (PyBytes_AsStringAndSize(chunk.ptr(), &p, &n) != 0) throw py::error_already_set();
+                py::gil_scoped_release rel;
+                return s.feed(reinterpret_cast<const std::uint8_t*>(p), static_cast<std::size_t>(n));
+            }, py::arg("chunk"),
+            "Read the next bytes of the file: 0 to go on, 1 once the change limit is reached, 2 "
+            "on an error (see error()).")
+        .def("finish", &VcdScanner::finish, "The end of the file; returns as feed() does.")
+        .def("error", [](VcdScanner& s) -> py::object {
+                switch (s.error()) {
+                case VcdScanner::kBadStamp:
+                    return py::make_tuple("stamp", py::bytes(s.errorToken()));
+                case VcdScanner::kTooLong:
+                    return py::make_tuple("too_long");
+                case VcdScanner::kTooLarge:
+                    return py::make_tuple("too_large", s.errorEdges(), s.errorTime());
+                case VcdScanner::kNoMemory:
+                    return py::make_tuple("memory");
+                default:
+                    return py::none();
+                }
+            },
+            "None, ('stamp', token), ('too_long',), ('too_large', edges, time) or ('memory',).")
+        .def("capture_result", [](VcdScanner& s) {
+                py::dict d;
+                d["clock_edges"] = releaseEdges(s.line(0).edges);
+                d["data_edges"] = releaseEdges(s.line(1).edges);
+                d["initial"] = py::make_tuple(s.line(0).init, s.line(1).init);
+                d["missing"] = py::make_tuple(s.line(0).last < 0, s.line(1).last < 0);
+                d["ascending"] = py::make_tuple(s.line(0).ascending, s.line(1).ascending);
+                d["xz"] = vcdNotes(s, &VcdScanner::Line::xz);
+                d["unread"] = vcdNotes(s, &VcdScanner::Line::unread);
+                d["same"] = vcdNotes(s, &VcdScanner::Line::same);
+                d["back"] = py::make_tuple(s.backCount(), s.backFirst());
+                d["bare"] = s.bare();
+                d["open_block"] = s.hasOpenBlock() ? py::object(py::bytes(s.openBlock()))
+                                                   : py::object(py::none());
+                d["header_open"] = s.headerOpen();
+                return d;
+            },
+            "The edges (uint64 arrays, handed over once), initial levels, lines with no 0/1 "
+            "value, whether each line's edges are ascending, and the notes of a capture scan.")
+        .def("counts_result", [](VcdScanner& s) {
+                py::list pairs;
+                for (const auto& pr : s.counts())
+                    pairs.append(py::make_tuple(py::bytes(pr.first), pr.second));
+                return py::make_tuple(pairs, s.cut(), s.lastTimeRead());
+            },
+            "([(ident, transitions)] in the order of first transition, cut, last time read).");
 
     m.def("decode_saleae_v3_deltas", [](py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> buf,
                                         std::size_t off, std::size_t nbytes) {

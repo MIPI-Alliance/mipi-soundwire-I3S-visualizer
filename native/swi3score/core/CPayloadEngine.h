@@ -18,6 +18,7 @@
 
 #include <map>
 #include <deque>
+#include <tuple>
 #include <vector>
 #include <cstdio>
 #include <LogicPublicTypes.h>
@@ -73,9 +74,20 @@ struct BitSample
 class CPayloadEngine
 {
 public:
-    // Close the debug dump file (opened in Configure when SWI3S_DUMP_PATH is set)
-    // so the FILE* isn't leaked for the engine's lifetime.
+    // Closes the debug dump file (EnableBitDump).
     ~CPayloadEngine() { if (mDumpFile) { std::fclose(mDumpFile); mDumpFile = nullptr; } }
+    // The engine owns a FILE* (the debug dump), so it is neither copied nor moved.
+    CPayloadEngine() = default;
+    CPayloadEngine(const CPayloadEngine&) = delete;
+    CPayloadEngine& operator=(const CPayloadEngine&) = delete;
+
+    // Debug dump (env SWI3S_DUMP_PATH, SWI3S_DUMP_DP, SWI3S_DUMP_MAX), for the engine of a
+    // decode only: the first call opens SWI3S_DUMP_PATH (truncating it) when it is set, and
+    // later calls do nothing. From then on the engine writes one line per assembled data
+    // bit, "<sample> <dp> <channel> <bit> <level>", for the port SWI3S_DUMP_DP (every port
+    // when unset), up to SWI3S_DUMP_MAX lines (default 200000) over the engine's lifetime,
+    // across every Configure and Reconfigure. An engine that never calls it writes nothing.
+    void EnableBitDump();
 
     // Rebuilds and re-Initializes every enabled port. Each surviving (device,dp) channel
     // carries its running sample index, and its descrambler when the channel is enabled
@@ -88,7 +100,7 @@ public:
     // with an FCP before and after then carries its DRQ pipeline (the DRQ history, the
     // TxPresent interval count and the last DRQ's sample): the startup intervals, whose
     // TX_PRESENT takes DRQ 1, are counted from when the Source DP was enabled ({ASW5204},
-    // Table 160 (v1.1 r10)). The history is carried only when the port is at the start of
+    // Table 160). The history is carried only when the port is at the start of
     // an interval, where the rebuild leaves the interval numbering unchanged; SyncToSSP
     // keeps it there by the same rule. A port that is (re-)enabled, or whose FlowMode gains
     // the DRQ (FlowMode 0 or 1 has no FCP_DRQ, {ASW5201}), starts with an empty history.
@@ -119,25 +131,51 @@ public:
     void SetBitSampleStart(U64 s) { mBitSampleStart = s; }
     const std::vector<BitSample>& bitSamples() const { return mBitSamples; }
 
+    // Where an SSP landed relative to the running ports' timing. Either condition is an
+    // unexpected SSP, which the peripheral reports as IntStat_UnexpectedSSP.
+    struct SspCheck {
+        bool midInterval = false;     // a port was at row_in_interval != 0
+        bool midSkipPattern = false;  // a SKIPPING port's accumulator was not at 0 (9.1.6.2.1)
+        bool unexpected() const { return midInterval || midSkipPattern; }
+    };
+
+    // Where an SSP arriving at the current row lands for the running ports, including a
+    // port the commit the SSP carries disables. Asked before that commit rebuilds the ports.
+    SspCheck CheckSsp() const;
+
     // Re-anchor all dataports to a Stream Synchronization Point observed on the
     // bus: each port's row counter is set so this row is row_in_interval == 0.
-    // Returns true if any SKIPPING port was mid-pattern when the SSP arrived — an
-    // unexpected SSP per Section 9.1.6.2.1, which re-phases its skip pattern.
-    bool SyncToSSP();
+    void SyncToSSP();
+
+    // Phase every port for an SSP `rowsToSsp` rows after the start (Column 0) of the row
+    // the next tick lands in: SSPs recur every SSP Interval, the port's Interval + 1 rows,
+    // times SkippingDenominator for a skipping port (SwI3sConfig::patternRows), so that row
+    // is (-rowsToSsp) mod patternRows rows after an SSP for each port. The port then stands
+    // at the start column (StartColumn), its FCP at the port's column and row, and its DRQ
+    // pipeline empty; a sample its ports are partway through is not emitted. A port with
+    // a negative Interval is left as configured.
+    void AnchorBeforeSsp(long long rowsToSsp);
 
     // The column the next tick lands on (last SetStartColumn), so a checkpoint can
     // record it and a windowed re-decode can rebuild the same port phase.
     int StartColumn() const { return mStartColumn; }
 
-    // Snapshot / restore the transport phase of every port. Bit SAMPLE POINTS do not
-    // depend on the levels, so a windowed re-decode that collects only where bits are
-    // sampled restores the schedule and not the descrambler LFSRs, which RestoreState
-    // leaves seeded: values a restored engine assembles are not the live decode's.
-    // RestoreState re-Configures for `cfg` from an empty engine (the same enabled-port
-    // set, in the order the states were saved) then overwrites each port's phase.
+    // Snapshot / restore the transport phase of every port, and with SaveDescramblers
+    // each port's channel and FCP descramblers. RestoreState re-Configures for `cfg` from an
+    // empty engine (the same enabled-port set, in the order the states were saved), then
+    // overwrites each port's phase and, given `descramblers`, its descramblers; without
+    // them the descramblers stay seeded. The sample being assembled is not restored.
     std::vector<CDataPort::State> SaveState() const;
+    struct PortDescramblers {
+        int deviceNum = -1;
+        int dpIndex = 0;
+        CDescrambler channels[16];
+        CDescrambler fcp;
+    };
+    std::vector<PortDescramblers> SaveDescramblers() const;
     void RestoreState(const SwI3sConfig& cfg, int startColumn,
-                      const std::vector<CDataPort::State>& ports);
+                      const std::vector<CDataPort::State>& ports,
+                      const std::vector<PortDescramblers>* descramblers = nullptr);
 
     // Advance every dataport by one UI WITHOUT reading a data level, descrambling,
     // or collecting — just the placement schedule. Used to fast-forward a windowed
@@ -162,6 +200,11 @@ public:
     };
     const FlowControlStats& flowControlStats() const { return mFcStats; }
 
+    // Samples not emitted because a bit of them was recovered while a scrambled channel's
+    // descrambler was settling (see ChannelRuntime), per (device, dp, channel), since the
+    // engine was built. Configure does not clear it.
+    const std::map<std::tuple<int, int, int>, U64>& withheld() const { return mWithheld; }
+
 private:
     struct ChannelRuntime {
         CDescrambler descram;
@@ -175,6 +218,20 @@ private:
         // (to keep the descrambler in step) but NOT emitted, so audio() carries
         // only the de-jittered used samples.
         bool txpValid = true;
+        // The sample being assembled began before the decode's first UI (AnchorBeforeSsp
+        // phases a port partway into one): it is not emitted, and the next MSB clears it.
+        bool startedEarlier = false;
+        // A scrambled channel AnchorBeforeSsp phases has a descrambler whose state the
+        // wire set before the decode's first UI: a bit is recovered from a known state once
+        // 9 received bits fill the LFSR and a received bit has differed from the one before
+        // (the No-Toggle run is then counted from the wire). A sample with a bit, or a
+        // TX_PRESENT, recovered before that is not emitted and is counted in withheld().
+        bool settling = false;
+        int  settleSeen = 0;
+        bool settleToggled = false;
+        bool settleLast = false;
+        bool txpUnsettled = false;
+        bool sampleUnsettled = false;
     };
     struct DpRuntime {
         int dpIndex = 0;
@@ -203,7 +260,7 @@ private:
         // (only the last d+2 intervals are ever read). `txpInterval` counts validated
         // TxPresent intervals so Earlier_FCP_DRQ = interval (txpInterval - d), with
         // d = FlowControlDelay+1. Startup assumes DRQ=1 for the first d intervals after
-        // the Source DP's enable ({ASW5204}, Table 160 (v1.1 r10)); Configure, Reconfigure
+        // the Source DP's enable ({ASW5204}, Table 160); Configure, Reconfigure
         // and SyncToSSP state when the history carries.
         std::deque<char> drqHistory;
         U64 drqBase = 0;               // interval index of drqHistory.front()
@@ -225,8 +282,8 @@ private:
     // Column the next tick lands on (capture's Column-0 phase; 0 = starts on a row
     // boundary). Applied to every port in Configure so audio shares the CDS origin.
     int mStartColumn = 0;
-    // Debug dump (env SWI3S_DUMP_PATH/DP/MAX): per assembled data bit, write
-    // "sampleNumber channel bitInChannel recoveredLevel" for the target DP.
+    // Debug dump (EnableBitDump).
+    bool mDumpOpened = false;
     std::FILE* mDumpFile = nullptr;
     long mDumpMax = 0, mDumpCount = 0;
     int  mDumpDp = -1;
@@ -236,6 +293,7 @@ private:
     U64  mBitSampleStart = 0;      // windowed collection: skip bit points before this sample
     std::vector<BitSample> mBitSamples;
     static const std::size_t kMaxBitSamples = 24000000;
+    std::map<std::tuple<int, int, int>, U64> mWithheld;
     FlowControlStats mFcStats;     // DRQ<->TxPresent handshake validation accumulators
 };
 

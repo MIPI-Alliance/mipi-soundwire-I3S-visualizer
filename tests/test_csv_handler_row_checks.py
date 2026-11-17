@@ -1,5 +1,6 @@
 """CSVHandler.load_csv row checks: repeated field rows, DisplayFields characters, a field
-row without a value, a UTF-8 byte-order mark, and the VizConfig a load returns; and
+row without a value, cells past the values a row needs, a short row, a UTF-8 byte-order
+mark, the VizConfig a load returns, and a file's AppVersion kept as written; and
 CSVHandler.save_csv writes unix line endings."""
 from pathlib import Path
 
@@ -177,17 +178,17 @@ def test_a_per_port_cell_that_is_refused_names_its_line_field_and_port(tmp_path,
     assert res.error_message.startswith(f"Line {line} ({field}): data port 1: ")
 
 
-_CDS_ROWS = {"CDS_TailWidthPerSource": ("CDS_Tail_PerSource", 2),
-             "CDS_DriveTypePerSource": ("CDS_DriveType_PerSource", 1),
-             "CDS_EndDriveEarlyPerSource": ("CDS_EndDriveEarly_PerSource", 1)}
+_CDS_ROWS = {"CDS_TailWidth_REG_PerSource": ("CDS_Tail_PerSource", 2),
+             "CDS_DriveType_REG_PerSource": ("CDS_DriveType_PerSource", 1),
+             "CDS_EndDriveEarly_REG_PerSource": ("CDS_EndDriveEarly_PerSource", 1)}
 
 
 @pytest.mark.parametrize("field, cell, want", [
-    ("CDS_DriveTypePerSource", "4", 0),          # the field's default is 1
-    ("CDS_DriveTypePerSource", "6", 0),
-    ("CDS_EndDriveEarlyPerSource", "3", 1),      # the field's default is 0
-    ("CDS_TailWidthPerSource", "-5", 3),         # the field's default is 0
-    ("CDS_TailWidthPerSource", "9", 1),
+    ("CDS_DriveType_REG_PerSource", "4", 0),          # the field's default is 1
+    ("CDS_DriveType_REG_PerSource", "6", 0),
+    ("CDS_EndDriveEarly_REG_PerSource", "3", 1),      # the field's default is 0
+    ("CDS_TailWidth_REG_PerSource", "-5", 3),         # the field's default is 0
+    ("CDS_TailWidth_REG_PerSource", "9", 1),
 ])
 def test_a_per_source_cds_cell_wider_than_its_register_carries_its_low_bits(
         tmp_path, field, cell, want):
@@ -214,7 +215,7 @@ def test_a_per_source_cds_cell_wider_than_its_register_carries_its_low_bits(
 
 def test_a_scalar_cds_drive_type_wider_than_its_register_carries_its_low_bit(tmp_path):
     path = _saved(tmp_path)
-    keep = [ln for ln in _lines(path) if not ln.startswith("CDS_DriveTypePerSource,")]
+    keep = [ln for ln in _lines(path) if not ln.startswith("CDS_DriveType_REG_PerSource,")]
     path.write_text("\n".join(keep + ["CDS_DriveType,2"]) + "\n", encoding="utf-8")
     iface = Interface()
     res = CSVHandler.load_csv(str(path), iface)
@@ -281,7 +282,7 @@ def test_a_config_with_over_range_cds_values_builds_the_grid_of_the_carried_valu
     low = csv_for(tail & 3, drive & 1, ede & 1, "low.csv")
     with import_notes.collect() as notes:
         cells = viz_engine.render_payload(raw, 8)[0]
-    assert any("CDS_TailWidthPerSource" in n.message and "carried" in n.message
+    assert any("CDS_TailWidth_REG_PerSource" in n.message and "carried" in n.message
                for n in notes), [str(n) for n in notes]
     assert key(cells) == key(viz_engine.render_payload(low, 8)[0])
     assert key(swi3score.grid_from_csv(raw, 8)) == key(swi3score.grid_from_csv(low, 8))
@@ -289,8 +290,8 @@ def test_a_config_with_over_range_cds_values_builds_the_grid_of_the_carried_valu
 
 # (scalar row, per-source row, Interface attribute, the attribute's default, a valid scalar
 # value that differs from the default)
-_SCALARS = [("CDS_TailWidth_REG", "CDS_TailWidthPerSource", "CDS_Tail_PerSource", [0] * 13, 2),
-            ("CDS_DriveType", "CDS_DriveTypePerSource", "CDS_DriveType_PerSource", [1] * 13, 0)]
+_SCALARS = [("CDS_TailWidth_REG", "CDS_TailWidth_REG_PerSource", "CDS_Tail_PerSource", [0] * 13, 2),
+            ("CDS_DriveType", "CDS_DriveType_REG_PerSource", "CDS_DriveType_PerSource", [1] * 13, 0)]
 
 
 def _with_scalar(tmp_path: Path, name: str, per_source: str, scalar_rows, keep_per_source=False):
@@ -451,7 +452,7 @@ def test_a_legacy_scalar_cds_tail_width_above_its_register_carries_its_low_bits(
     names the line and the value, as the other readers do."""
     from swi3s_studio import import_notes
     from swi3s_studio.model.bus_config import BusConfig
-    path, line = _with_scalar(tmp_path, "wide.csv", "CDS_TailWidthPerSource",
+    path, line = _with_scalar(tmp_path, "wide.csv", "CDS_TailWidth_REG_PerSource",
                               ["CDS_TailWidth_REG,6"])
     iface = Interface()
     res = CSVHandler.load_csv(str(path), iface)
@@ -463,3 +464,74 @@ def test_a_legacy_scalar_cds_tail_width_above_its_register_carries_its_low_bits(
         cfg = BusConfig.from_csv_text(path.read_text(encoding="utf-8"), "t.csv")
     assert cfg.cds_tail == [6] * 13 and any("does not fit its 2-bit" in n.message
                                             for n in notes)
+
+
+def _edit_row(path: Path, name: str, edit) -> int:
+    """Rewrite the row named `name` with `edit(cells)`; returns its line number."""
+    lines = _lines(path)
+    i = next(i for i, ln in enumerate(lines) if ln.split(",")[0] == name)
+    lines[i] = ",".join(edit(lines[i].split(",")))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return i + 1
+
+
+@pytest.mark.parametrize("name", ["EnableCh_REG", "FCP_Offset_REG", "Name",
+                                  "ManagerDataport", "CDS_TailWidth_REG_PerSource",
+                                  "CDS_GuardEnable_REG_PerSource", "NumColumns_REG", "RowsToDraw"])
+def test_blank_cells_past_a_row_load_clean(tmp_path, name):
+    """Blank cells past the values a row needs, as a spreadsheet pads rows, are ignored and
+    report nothing."""
+    path = _saved(tmp_path)
+    _edit_row(path, name, lambda cells: cells + ["", " "])
+    res = _load(path)
+    assert res.success, res.error_message
+    assert res.warnings == []
+
+
+@pytest.mark.parametrize("name, last", [
+    ("EnableCh_REG", "the last data port"),
+    ("Name", "the last data port"),
+    ("DeviceNumber_REG", "the last data port"),
+    ("CDS_DriveType_REG_PerSource", "the last CDS source"),
+    ("NumColumns_REG", "the first"),
+    ("RowsToDraw", "the first"),
+    ("CDS_TailWidth_REG", "the first"),
+])
+def test_a_non_blank_cell_past_a_row_is_ignored_and_reported(tmp_path, name, last):
+    path = _saved(tmp_path)
+    if name == "CDS_TailWidth_REG":
+        lines = _lines(path)
+        path.write_text("\n".join(lines + ["CDS_TailWidth_REG,0"]) + "\n", encoding="utf-8")
+    line = _edit_row(path, name, lambda cells: cells + ["", "7", "x"])
+    res = _load(path)
+    assert res.success, res.error_message
+    assert res.warnings == [f"Line {line} ({name}): values past {last} are ignored: '7', 'x'."]
+
+
+def test_a_scalar_row_keeps_its_first_value_beside_an_extra_cell(tmp_path):
+    path = _saved(tmp_path)
+    _edit_row(path, "NumColumns_REG", lambda cells: [cells[0], "15", "16"])
+    iface = Interface()
+    res = CSVHandler.load_csv(str(path), iface, None)
+    assert res.success and iface.NumColumns_REG == 15
+
+
+@pytest.mark.parametrize("name, n, kind", [("EnableCh_REG", 12, "data port"),
+                                           ("CDS_TailWidth_REG_PerSource", 13, "per-source")])
+def test_a_short_row_is_refused(tmp_path, name, n, kind):
+    path = _saved(tmp_path)
+    line = _edit_row(path, name, lambda cells: cells[:-1])
+    res = _load(path)
+    assert not res.success
+    assert res.error_message == f"Line {line} ({name}): Expected {n} {kind} values, found {n - 1}"
+
+
+@pytest.mark.parametrize("version", ["99.0.0", "2.0", "not a version"])
+def test_a_file_s_app_version_is_kept_as_written_and_changes_nothing(tmp_path, version):
+    path = _saved(tmp_path)
+    lines = [f"AppVersion,{version}" if ln.startswith("AppVersion,") else ln
+             for ln in _lines(path)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    res = _load(path)
+    assert res.success and res.notes() == []
+    assert res.file_app_version == version

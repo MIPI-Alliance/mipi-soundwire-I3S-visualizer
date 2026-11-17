@@ -10,6 +10,9 @@ Two devices DRIVING one DRQ column is a bus clash; several devices SAMPLING one 
 is a read overlap. The vendored goldens in `test_visualizer_engine.py` carry no DRQ
 collision, so this file pins the case with a hand-built config.
 
+A DRQ in the last UI of an interval is gated by that interval's skip: the engine ticks the
+flow control port before its data port, whose tick there already starts the next interval.
+
 Run: PYTHONPATH=. python3 -m pytest tests/test_drq_clash.py
 """
 import logging
@@ -121,3 +124,43 @@ def test_a_driven_drq_is_registered_as_a_write():
     both = _driven_drq_and_a_data_port_in_its_column(drq_enabled=True)
     assert _FCP_COLUMN in both.bus_clashes, (
         f"a data port in a driven DRQ's column must clash with it; got {both.bus_clashes}")
+
+
+def test_a_drq_in_the_last_ui_of_an_interval_follows_that_intervals_skip():
+    """A DRQ placed in the last row and last column of an interval is gated by that
+    interval's skip, not the next one's.
+
+    Interval_REG 1 makes each interval two rows; SkippingNumerator 1 over Denominator 2 skips
+    every second interval (1, 3, ...). The DRQ sits at FCP_Offset 1, the last column, so it
+    is the interval's last UI."""
+    from swi3s_studio.swviz.models.enums import SlotType
+
+    iface, viz = Interface(), VizConfig()
+    iface.NumColumns_REG = _NUM_COLUMNS - 1
+    iface.SkippingDenominator_REG = 2
+    sink = iface.data_ports[0].config
+    sink.PortDirection_REG = True
+    sink.FlowMode_REG = FlowMode.RX_CONTROLLED
+    sink.EnableCh_REG = 0b1
+    sink.SampleSize_REG = 0
+    sink.HorizontalStart_REG = 2
+    sink.HorizontalCount_REG = 0
+    sink.Interval_REG = 1
+    sink.Offset_REG = 0
+    sink.SkippingNumerator_REG = 1
+    fcp = iface.flow_control_ports[0].config
+    fcp.FCP_HorizontalStart_REG = _NUM_COLUMNS - 1
+    fcp.FCP_BitWidth_REG = 0
+    fcp.FCP_TailWidth_REG = 0
+    fcp.FCP_Offset_REG = 1
+    fcp.FCP_GuardEnable_REG = False
+    fcp.FCP_GuardPolarity_REG = False
+    viz.data_ports[0].enabled = True
+    iface.set_dp_device(0, 3)
+    bm = BusModelBuilder(iface, _ROWS, viz).build()
+
+    drq_rows = sorted(b.bit_index // _NUM_COLUMNS for b in bm.bits if b.slot == SlotType.DRQ)
+    data_rows = sorted({b.bit_index // _NUM_COLUMNS for b in bm.bits
+                        if b.slot in (SlotType.DATA, SlotType.TX_PRESENT)})
+    assert data_rows == [0, 1, 4, 5], data_rows       # intervals 0 and 2 are not skipped
+    assert drq_rows == [1, 5], drq_rows

@@ -71,7 +71,7 @@ def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
     # A full block spans this many input positions; fix its FFT size so h transforms once.
     seg_common = (out_block - 1) * M + (T - 1) + 1
     fft_common = 1 << int(np.ceil(np.log2(max(1, seg_common + T - 1))))
-    Hf_common = np.fft.rfft(h, fft_common)
+    Hf_common = None                       # transformed by the first full block, if any
 
     for k0 in range(0, n_out, out_block):
         k1 = min(k0 + out_block, n_out)
@@ -90,6 +90,8 @@ def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
             idxs = np.arange(lo, hi + 1, L)
             up_seg[idxs - up_lo] = x[idxs // L]
         if seg_len == seg_common:
+            if Hf_common is None:
+                Hf_common = np.fft.rfft(h, fft_common)
             fftsize, Hf = fft_common, Hf_common
         else:                                        # last (short) block
             fftsize = 1 << int(np.ceil(np.log2(max(1, seg_len + T - 1))))
@@ -101,10 +103,20 @@ def _resample_core(x: np.ndarray, L: int, M: int, h: np.ndarray) -> np.ndarray:
     return out
 
 
+# The largest reduced denominator of out/in kept exact whatever `max_denominator` is:
+# 96 kHz -> 44.1 kHz is 147/320 and 192 kHz -> 44.1 kHz is 147/640.
+_EXACT_DENOMINATOR = 1024
+
+
 def _ratio(ir: int, orate: int, max_denominator: int) -> Fraction:
-    """out/in as L/M. The denominator bound is raised to ceil(in/out) so a heavy
-    decimation keeps its ratio (24.576 MHz -> 48 kHz is exactly 1/512) and L stays >= 1."""
-    return Fraction(orate, ir).limit_denominator(max(max_denominator, -(-ir // orate)))
+    """out/in as L/M: exact when its reduced denominator is at most `_EXACT_DENOMINATOR`,
+    else the nearest fraction whose denominator is at most max(max_denominator,
+    ceil(in/out)), so a heavy decimation keeps its ratio (24.576 MHz -> 48 kHz is exactly
+    1/512) and L stays >= 1."""
+    exact = Fraction(orate, ir)
+    if exact.denominator <= _EXACT_DENOMINATOR:
+        return exact
+    return exact.limit_denominator(max(max_denominator, -(-ir // orate)))
 
 
 def resample(x, in_rate: float, out_rate: float, half_width: int = 24,
@@ -114,7 +126,8 @@ def resample(x, in_rate: float, out_rate: float, half_width: int = 24,
 
     `half_width` sets the filter quality (taps per polyphase branch ≈ 2*half_width);
     `max_denominator` is the smallest bound on the rational approximation of the ratio
-    (a tiny rate error in exchange for a bounded filter / upsample factor). The bound used
+    (a tiny rate error in exchange for a bounded filter / upsample factor). A ratio whose
+    reduced denominator is at most `_EXACT_DENOMINATOR` is exact; otherwise the bound used
     is max(max_denominator, ceil(in_rate / out_rate)), so a 1/N decimation is exact and a
     non-integer heavy decimation stays approximate (the output length is then within about
     1/bound of out_rate * duration)."""

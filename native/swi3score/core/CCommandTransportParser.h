@@ -125,6 +125,9 @@ public:
     void SetSymbolSink(std::vector<C8b10bDecoder::Symbol>* sink) { mSymbolSink = sink; }
     // True when the next pushed bit is a hub-delay gap bit.
     bool InHubGap() const { return mSkipBitsRemaining > 0; }
+    // True when the next pushed bit is inside a known-length data region (a Manager Packet
+    // or a ReadData delivery), where a K.28.7 bit pattern does not re-frame the symbols.
+    bool FramingLocked() const { return mDecoder.FramingLocked(); }
 
     // Feed one NRZS-decoded CDS bit captured at the given sample. Returns true
     // when a command phase has completed; read it via Command().

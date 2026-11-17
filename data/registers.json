@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "spec": "MIPI SoundWire I3S (SWI3S) Specification, Version 1.1 Revision 08 (draft, review)",
+    "spec": "MIPI SoundWire I3S (SWI3S) Specification",
     "source_tables": ["165","166","167","168","169","170","171","172","173","174","175","176","177","178","179","180","181","182"],
     "source_sections": ["14.2.1","14.2.2","14.2.3","14.2.4","14.2.5","14.2.6","14.2.7","14.2.8","14.2.9","14.2.10","14.2.11"],
     "conventions": [
@@ -11,9 +11,9 @@
       "Endianness: SLC ManufacturerID/PartID/SkippingDenominator are MSB-first (hi byte at lower addr). DP Interval/Offset/ConverterClockDiv/SkippingNumerator and FCP_Offset are LSB-first (lo byte at lower addr).",
       "Local 0x0-0x7FFFFFFF complete in-Phase; Remote 0x80000000-0xFFFFFFFF may be buffered/deferred (the \"Comparison of Local and Remote Addresses\" and \"Peripheral Top-Level Address Map\" tables).",
       "INCONSISTENCY: DP FlowMode (0x0E[1:0]) is in the single-ranked map (Table 166) yet Table 168 marks its access 'Dual'; no _CURR address is given, so it is represented single-ranked here.",
-      "TABLE AND SECTION NUMBERS ARE NOT STABLE KEYS. r08 moved the register content from Chapter 15 to Chapter 14 (Interrupts became Chapter 15), renumbering sections 15.2.1-15.2.5 -> 14.2.1-14.2.11 and tables 163-171 -> 165-182, WITHOUT moving a single register. Key this extract on register/field NAME + block + offset + bit range, which were stable across r06->r08. Citations elsewhere in this file name a table by its caption; the FlowMode INCONSISTENCY note cites r06 table numbers.",
-      "r06 -> r08 field deltas applied: DPn_CommitPointDelay[3:0] added at DP 0x0F (was Reserved, {ASW5702}/{ASW5801}); CDS_EndDriveEarly / EndDriveEarly / FCP_EndDriveEarly are read-only 0 in PHY1 ({ASW6201}/{ASW5801}) and their encoding no longer names a half UI (r08 removed that idea and made the granularity bits, not UIs); IntCascade_SDCA / _ImpDef / _DP<n> OR the IntActive_* terms rather than IntStat_* ({ASW6001}); NumColumns gained an encoding example. No register moved offset, no block base moved, no reset value changed, nothing was removed.",
-      "NOT verified against r06 byte-for-byte (only r08 was available): IntCascade_DFI<n> is the same family as the three corrected IntCascade_* fields but was not named in the revision history, so it is left as extracted."
+      "TABLE AND SECTION NUMBERS ARE NOT STABLE KEYS. The specification's register chapter has been renumbered between drafts without moving a register. Key this extract on register/field NAME + block + offset + bit range. Citations elsewhere in this file name a table by its caption; the FlowMode INCONSISTENCY note cites table numbers, which can differ in other drafts.",
+      "Field behaviours applied: DPn_CommitPointDelay[3:0] at DP 0x0F ({ASW5702}/{ASW5801}); CDS_EndDriveEarly / EndDriveEarly / FCP_EndDriveEarly are read-only 0 in PHY1 ({ASW6201}/{ASW5801}) and their encoding does not name a half UI (the granularity is bits, not UIs); IntCascade_SDCA / _ImpDef / _DP<n> OR the IntActive_* terms rather than IntStat_* ({ASW6001}); NumColumns carries an encoding example.",
+      "NOT verified: IntCascade_DFI<n> is the same family as the three IntCascade_* fields that OR the IntActive_* terms, but the specification does not name it, so it is left as extracted."
     ]
   },
   "blocks": [
@@ -99,11 +99,11 @@
         ]},
         {"offset":"0x27","abs_address":"0x1027","name":"IntCascade_Misc","reset":"-","access":"RO","dual_ranked":false,"fields":[
           {"name":"Reserved","bits":"[7:2]","reset":"-","access":"-","description":"Reserved."},
-          {"name":"IntCascade_ImpDef","bits":"[1]","reset":"-","access":"RO","description":"OR of IntActive_ImpDef_* (IntStat AND IntEn), not IntStat_* alone (r07 {ASW6001})."},
-          {"name":"IntCascade_SDCA","bits":"[0]","reset":"-","access":"RO","description":"OR of the 64 IntActive_SDCA_* (IntStat AND IntEn), not IntStat_* alone (r07 {ASW6001})."}
+          {"name":"IntCascade_ImpDef","bits":"[1]","reset":"-","access":"RO","description":"OR of IntActive_ImpDef_* (IntStat AND IntEn), not IntStat_* alone ({ASW6001})."},
+          {"name":"IntCascade_SDCA","bits":"[0]","reset":"-","access":"RO","description":"OR of the 64 IntActive_SDCA_* (IntStat AND IntEn), not IntStat_* alone ({ASW6001})."}
         ]},
         {"offset":"0x28-0x2B","abs_address":"0x1028","name":"IntCascade_DP","reset":"-","access":"RO","dual_ranked":false,"array":{"kind":"bits","member":"IntCascade_DP","first":0,"digits":2},"fields":[
-          {"name":"IntCascade_DP<n>","bits":"[7:0]","reset":"-","access":"RO","description":"OR of DPn_IntActive_* (IntStat AND IntEn), not IntStat_* alone (r07 {ASW6001}), for n=0..31 (0x28:DP0-7, 0x29:DP8-15, 0x2A:DP16-23, 0x2B:DP24-31)."}
+          {"name":"IntCascade_DP<n>","bits":"[7:0]","reset":"-","access":"RO","description":"OR of DPn_IntActive_* (IntStat AND IntEn), not IntStat_* alone ({ASW6001}), for n=0..31 (0x28:DP0-7, 0x29:DP8-15, 0x2A:DP16-23, 0x2B:DP24-31)."}
         ]},
         {"offset":"0x2C-0x31","abs_address":"0x102C","name":"Reserved","reset":"-","access":"-","dual_ranked":false,"fields":[{"name":"Reserved","bits":"[7:0]","reset":"-","access":"-","description":"Reserved (6 bytes)."}]},
         {"offset":"0x32","abs_address":"0x1032","name":"IntEn_Link","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
@@ -202,7 +202,7 @@
         ]},
         {"offset":"0x87","abs_address":"0x1187","curr_offset":"0xC7","name":"CDS_BitWidth_Guard_Tail","reset":"0x00","access":"Dual-CURR-RO","dual_ranked":true,"fields":[
           {"name":"CDS_BitWidth","bits":"[7:5]","reset":0,"access":"RW","excess1":true,"description":"UIs per CDS bit (excess-1: 0->1 UI .. 7->8 UI)."},
-          {"name":"CDS_EndDriveEarly","bits":"[4]","reset":0,"access":"RW","valid":"0=drive_to_end_of_UI,1=stop_before_end_of_last_UI","description":"Stop driving before the end of the last UI, relying on the bus keeper and/or bus capacitance to hold the level. Granularity is BITS not UIs: applied once per Bus Output Value, so a Wide Bit / guard / tail group gets one early release. The amount is NOT a fixed half UI (r08 removed that) -- PHY2 bounds it by Per_tZD_Actual + Per_tRampTime_Actual + 3.0 ns to UI - 2.0 ns and the exact point is ImpDef. PHY3 mandatory, PHY2 optional, PHY1 RO 0."},
+          {"name":"CDS_EndDriveEarly","bits":"[4]","reset":0,"access":"RW","valid":"0=drive_to_end_of_UI,1=stop_before_end_of_last_UI","description":"Stop driving before the end of the last UI, relying on the bus keeper and/or bus capacitance to hold the level. Granularity is BITS not UIs: applied once per Bus Output Value, so a Wide Bit / guard / tail group gets one early release. The amount is NOT a fixed half UI -- PHY2 bounds it by Per_tZD_Actual + Per_tRampTime_Actual + 3.0 ns to UI - 2.0 ns and the exact point is ImpDef. PHY3 mandatory, PHY2 optional, PHY1 RO 0."},
           {"name":"CDS_GuardEnable","bits":"[3]","reset":0,"access":"RW","valid":"0=no_guard,1=add_guard_bit","description":"Add a 1-UI guard bit after the CDS bit."},
           {"name":"CDS_GuardPolarity","bits":"[2]","reset":0,"access":"RW","valid":"0=drive_0,1=drive_1","description":"Guard bit polarity."},
           {"name":"CDS_TailWidth","bits":"[1:0]","reset":0,"access":"RW","valid":"0=0UI,1=1UI,2=2UI,3=Reserved","description":"Tail UIs after the CDS (or guard) bit. PHY1: RO 0."}
@@ -364,7 +364,7 @@
         ]},
         {"offset":"0x0F","abs_address":"0x200F","name":"CommitPointDelay","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
           {"name":"Reserved","bits":"[7:4]","reset":"-","access":"-","description":"Reserved."},
-          {"name":"CommitPointDelay","bits":"[3:0]","reset":0,"access":"RW","valid":"0-15","description":"Delay the commit point by 0 to 15 Intervals, to compensate for forwarding delays in Hubs. Added in v1.1 r08 ({ASW5702}/{ASW5801}) into bits that were Reserved."}
+          {"name":"CommitPointDelay","bits":"[3:0]","reset":0,"access":"RW","valid":"0-15","description":"Delay the commit point by 0 to 15 Intervals, to compensate for forwarding delays in Hubs. Specified by {ASW5702}/{ASW5801}."}
         ]},
         {"offset":"0x10","abs_address":"0x2010","name":"IntEn","reset":"0x00","access":"RW","dual_ranked":false,"fields":[
           {"name":"IntEn_PortImpDef_1","bits":"[7]","reset":0,"access":"RW","description":"Enable IntStat_PortImpDef_1."},

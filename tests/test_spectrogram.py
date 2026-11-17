@@ -246,3 +246,48 @@ def test_each_bin_is_drawn_centred_on_its_frequency(monkeypatch):
     assert row_hz == pytest.approx((rate / 2) / (bins - 1), rel=1e-6)
     assert rect.top() == pytest.approx(-row_hz / 2, rel=1e-6)        # bin 0 centred on 0 Hz
     assert rect.bottom() == pytest.approx(rate / 2 + row_hz / 2, rel=1e-6)
+
+
+def _count_spectrograms(monkeypatch):
+    from swi3s_studio.ui.audio_view import AudioView
+    calls = []
+    real = AudioView._render_spectro
+
+    def counted(self, plot, img, *a, **k):
+        calls.append(id(plot))
+        return real(self, plot, img, *a, **k)
+
+    monkeypatch.setattr(AudioView, "_render_spectro", counted)
+    return calls
+
+
+def test_a_rebuild_analyses_each_spectrogram_lane_once(win, monkeypatch):
+    import pyqtgraph as pg
+    av = win._audio_view
+    for key in sorted(av._checks)[:2]:
+        av.set_spectrogram(key, True)
+    calls = _count_spectrograms(monkeypatch)
+    av._rebuild_plots()
+    lanes = [pl for pl, curve, *_rest in av._plots if isinstance(curve, pg.ImageItem)]
+    assert len(lanes) == 2
+    assert sorted(calls) == sorted(id(pl) for pl in lanes)      # each lane, once
+
+
+def test_a_burst_of_range_changes_analyses_a_spectrogram_lane_once(win, monkeypatch):
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    av = win._audio_view
+    key = sorted(av._checks)[0]
+    av.set_spectrogram(key, True)
+    plot = av._plots[0][0]
+    lo, hi = plot.getViewBox().viewRange()[0]
+    calls = _count_spectrograms(monkeypatch)
+    for k in range(6):                                  # a drag's steps
+        plot.setXRange(lo + k * 50, hi - k * 50, padding=0)
+    assert calls == []                                  # nothing analysed mid-burst
+    loop = QEventLoop()
+    QTimer.singleShot(150, loop.quit)
+    loop.exec()
+    QApplication.processEvents()
+    assert len(calls) == 1
+    assert plot.getViewBox().viewRange()[0][0] == pytest.approx(lo + 250)

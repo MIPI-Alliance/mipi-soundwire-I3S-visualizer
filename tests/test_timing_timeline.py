@@ -32,12 +32,15 @@ Pinned here:
   being held at the other level to the acquirer's first edge, and an EDE Delay starts at its
   ramp's 80 % point;
 - a turn-on leaves high-Z at the launcher's pin and a t_DD launch does not;
-- a contention leg is drawn at its releaser's pin (M→P) or with both devices at the Manager
+- a contention leg's timeline holds its releaser's pin (M→P) or both devices at the Manager
   (P→M, P→P), at the closing-edge polarity its breakdown reports, the releaser's clock on
   the edge its timing counts from and the acquirer's on the edge its handover count gives;
 - a keeper's response starts at the data's crossing of the keeper's threshold at the Manager
   (V_IH,max / V_IL,min on a SWI3S Manager, V_TH_Keeper,max / V_TL_Keeper,min on a SoundWire
   one), offset by the ground shift for a Peripheral's data;
+- the clock is drawn with each of its edges at each pin the leg places it at: from the leg's
+  first edge to its last, one UI apart and alternating in polarity, every pin holding the same
+  edges, each with one t_RF, the edges' references at two pins the same flight apart;
 - `LegTimeline.event` and `.ramp` raise a KeyError naming the leg and the key for a key the
   timeline does not hold.
 """
@@ -50,14 +53,29 @@ from dataclasses import replace
 import pytest
 
 from swi3s_studio.timing import CalcInputs, compute
-from swi3s_studio.timing.calculator import INEQUALITIES
+from swi3s_studio.timing.calculator import INEQUALITIES, PP_MIS_SYMBOL, anchor_frac
 from swi3s_studio.timing.delta_tpd import _corner_coefficient, per_tdd_offset_frac
 from swi3s_studio.timing.spec_source import (
     LaunchMode,
     data_input_window,
     sw13_keeper_thresholds,
 )
-from swi3s_studio.timing.timeline import CO_LOCATED_NOTE, SUPPORTED_LEGS, leg_timeline
+from swi3s_studio.timing.timeline import (
+    KEEPER_PER_NOTE,
+    KEEPER_PER_NOTE_NO_FLIGHT,
+    NET_ZERO_NOTE,
+    PM_ONE_PIN_NOTE,
+    PM_ONE_PIN_NOTE_NO_FLIGHT,
+    PP_ONE_PIN_NOTE,
+    PP_ONE_PIN_NOTE_NO_FLIGHT,
+    PP_UI_NOTE,
+    SUPPORTED_LEGS,
+    WHOLE_LEGS,
+    contention_flight_ns,
+    leg_timeline,
+)
+
+pytestmark = pytest.mark.usefixtures("shared_compute")
 
 _OTHER = ("MP_contention", "PM_contention", "PP_contention", "keeper_Man", "keeper_Per")
 SETUP_HOLD = tuple(leg for leg in INEQUALITIES if leg not in _OTHER)
@@ -75,6 +93,8 @@ def _cases():
                {"Man_shape": "exp", "Per_shape": "exp", "tRF_Per_DATA_ns": 8.3},
                {"handover_UIs": 0.0}, {"handover_UIs": 2.0},
                {"pp_placement": "driver_far"}, {"pp_placement": "both_far"},
+               {"pp_placement": "both_near"},
+               {"pp_placement": "both_near", "Man_ede": True, "Per_ede": True},
                {"launch_mode": LaunchMode.CLK4, "F_CLK_target_MHz": 12.288},
                {"bus_length_cm": 0.0}, {"tRF_tolerance_frac": 0.0},
                {"V_noise_pp_frac": 0.0, "V_SEOS_tol_frac": 0.0},
@@ -280,13 +300,15 @@ def test_the_crossing_corners_reproduce_the_envelope():
 
 def test_each_term_is_drawn_with_the_ramps_it_connects():
     """Every span's view names ramps the timeline holds and is not empty but a flight
-    mismatch's, and an end on a ramp is on one the span is drawn with."""
+    mismatch's on a setup or hold leg, and an end on a ramp is on one the span is drawn with.
+    A contention leg's trace mismatch is drawn with the acquirer's drive at the releaser's
+    pin."""
     for inp in CASES:
         for leg in SUPPORTED_LEGS:
             tl = leg_timeline(inp, leg)
             keys = {r.key for r in tl.ramps}
             for sp in tl.spans:
-                if sp.label == "t_PD,mis":
+                if sp.label == "t_PD,mis" and not leg.endswith("_contention"):
                     assert sp.view == (), leg
                     continue
                 assert sp.view, (leg, sp.label)
@@ -417,10 +439,12 @@ def test_each_leg_is_drawn_at_the_polarities_of_the_case_it_reports():
 
 def test_a_mismatch_is_the_two_flights_and_a_window_both_signals_at_the_receiver():
     """t_PD,mis is the data's flight against the clock's: drawn with no ramps, beside the
-    clock's flight and the data's from one start, the data's 20 % point at the Manager, and
-    ending at their two ends. The longer flight is t_PD, the shorter t_PD less the mismatch:
-    the data's is the longer on setup, the clock's on hold. A setup or hold window is drawn
-    as the clock and the data at the receiver, beside the margin from the data's crossing."""
+    clock's flight and the data's from one start, the data's 20 % point at its launcher (the
+    Manager on M->P, the Peripheral on P->M), and ending at their two ends. On M->P the longer
+    flight is t_PD, the shorter t_PD less the mismatch: the data's is the longer on setup, the
+    clock's on hold. On P->M the clock's flight is t_PD and the data's flight back t_PD plus
+    the mismatch on setup and less it on hold. A setup or hold window is drawn as the clock
+    and the data at the receiver, beside the margin from the data's crossing."""
     windows = {"MP": ("Per_t_IS", "Per_t_IH", "Peripheral"),
                "PM": ("Man_t_IS", "Man_t_IH", "Manager"),
                "PP": ("Per_t_IS", "Per_t_IH", "Peripheral B")}
@@ -442,13 +466,19 @@ def test_a_mismatch_is_the_two_flights_and_a_window_both_signals_at_the_receiver
                     (c0, c1, c_label), (d0, d1, d_label) = sp.guides
                     assert (c_label, d_label) == ("Clock propagation", "Data propagation")
                     assert c0 == d0 and tl.event(c0).kind == "anchor"
-                    assert tl.ramp(tl.event(c0).ramp).key == "data@man"
+                    launcher = "data@man" if leg.startswith("MP_") else "data@per"
+                    assert tl.ramp(tl.event(c0).ramp).key == launcher, leg
                     clock = tl.event(c1).t_ns - tl.event(c0).t_ns
                     data = tl.event(d1).t_ns - tl.event(d0).t_ns
-                    longer, shorter = (data, clock) if "setup" in leg else (clock, data)
-                    assert longer == pytest.approx(inp.t_PD_ns(), abs=1e-12)
-                    assert shorter == pytest.approx(inp.t_PD_ns() - inp.t_PD_mis_ns(),
-                                                    abs=1e-12)
+                    t_pd, mis = inp.t_PD_ns(), inp.t_PD_mis_ns()
+                    if leg.startswith("MP_"):
+                        longer, shorter = (data, clock) if "setup" in leg else (clock, data)
+                        assert longer == pytest.approx(t_pd, abs=1e-12)
+                        assert shorter == pytest.approx(t_pd - mis, abs=1e-12)
+                    else:
+                        assert clock == pytest.approx(t_pd, abs=1e-12), leg
+                        assert data == pytest.approx(t_pd + (mis if "setup" in leg else -mis),
+                                                     abs=1e-12), leg
                     assert {sp.start, sp.end} == {c1, d1}
                 if sym in windows[leg[:2]][:2]:
                     window_seen.add(leg)
@@ -457,8 +487,35 @@ def test_a_mismatch_is_the_two_flights_and_a_window_both_signals_at_the_receiver
                     (start, end, label), = sp.guides
                     assert label == "margin"
                     assert "crossing" in (start, end)
-    assert mis_seen == {leg for leg in SETUP_HOLD if leg.startswith("MP_")}, mis_seen
+    assert mis_seen == {leg for leg in SETUP_HOLD if leg.startswith(("MP_", "PM_"))}, mis_seen
     assert window_seen == set(SETUP_HOLD), window_seen
+
+
+def test_a_pp_trace_mismatch_moves_as_data_at_b_off_the_clocks_flight():
+    """t_PD,mis,AB is drawn on B's data, from where the clock's flight puts A's data at B (a
+    mark one drawn flight after A's 20 % point) to A's data's 20 % point at B: later on setup
+    and earlier on hold, by the term's value, and at the same instant where the placement
+    gives no separation. The data's crossing at B follows it."""
+    seen = set()
+    for placement in ("unknown", "both_near", "driver_near", "driver_far", "both_far"):
+        for n in (0.0, 1.0):
+            inp = CalcInputs(pp_placement=placement, handover_UIs=n)
+            res = compute(inp).breakdowns
+            for leg in ("PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho"):
+                tl = leg_timeline(inp, leg)
+                (sp,) = [s for s in tl.spans if s.label == PP_MIS_SYMBOL]
+                value = res[leg].terms[sp.term].value_ns
+                assert sp.view == ("data@b",), (leg, sp.view)
+                start, end = tl.event(sp.start), tl.event(sp.end)
+                assert (start.key, start.kind, end.key) == ("anchor_nominal", "mark", "anchor_b")
+                assert tl.ramp(end.ramp).key == "data@b"
+                flown = start.t_ns - tl.event("anchor").t_ns
+                drawn = 0.0 if "t_PD" not in [t.symbol for t in res[leg].terms] else inp.t_PD_ns()
+                assert flown == pytest.approx(drawn, abs=1e-12), (placement, leg)
+                late = -value if "setup" in leg else value
+                assert end.t_ns - start.t_ns == pytest.approx(late, abs=1e-12), (placement, leg)
+                seen.add(round(abs(value), 6))
+    assert seen == {0.0, 0.2}, seen
 
 
 _DEVICE = {"Manager": 0, "Peripheral": 1, "Peripheral A": 1, "Peripheral B": 2}
@@ -481,6 +538,41 @@ def test_one_device_has_one_supply_in_a_leg():
                 assert th.corner.rx_supply == pytest.approx(
                     supplies[_DEVICE[th.receiver]], abs=1e-12), (leg, th.receiver)
                 assert th.corner.vdd_tx == pytest.approx(ramps[th.ramp].vdd_tx, abs=1e-12)
+
+
+def test_the_clock_has_each_of_its_edges_one_ui_apart_at_each_pin():
+    """At every pin a leg places a clock edge at (every leg but an EDE keeper leg, which draws
+    no clock), the clock has every edge from the leg's first
+    to its last: their references one UI apart, alternating in polarity; every pin holds the
+    same edges, an edge with one polarity and t_RF at every pin, and its references at two
+    pins are the same flight apart for every edge."""
+    two_pins = handover = False
+    for inp in CASES:
+        ui = inp.UI_ns()
+        for leg in SUPPORTED_LEGS:
+            tl = leg_timeline(inp, leg)
+            pins: dict = {}
+            for r in tl.ramps:
+                if r.signal == "clock":
+                    ref = r.start_ns + anchor_frac(inp, "Man", r.rising) * r.t_rf_ns
+                    pins.setdefault(r.pin, []).append((ref, r))
+            if not pins:                 # an EDE keeper leg starts at its data's ramp
+                continue
+            edges = {pin: sorted(rs, key=lambda e: e[0]) for pin, rs in pins.items()}
+            first = next(iter(edges.values()))
+            for pin, rs in edges.items():
+                assert len(rs) == len(first), (leg, pin)
+                for (t0, a), (t1, b) in zip(rs, rs[1:]):
+                    assert t1 - t0 == pytest.approx(ui, abs=1e-6), (leg, pin, a.key, b.key)
+                    assert a.rising != b.rising, (leg, pin, a.key, b.key)
+                flights = {round(t - t_first, 9) for (t, _), (t_first, _) in zip(rs, first)}
+                assert len(flights) == 1, (leg, pin, flights)
+                for (_, r), (_, f) in zip(rs, first):
+                    assert (r.rising, r.t_rf_ns) == (f.rising, pytest.approx(f.t_rf_ns)), \
+                        (leg, pin, r.key, f.key)
+            two_pins |= len(edges) > 1 and len(first) > 1
+            handover |= len(first) > 2
+    assert two_pins and handover, "a leg with two edges at two pins, and one with three edges"
 
 
 def test_a_clock_edge_two_peripherals_detect_has_one_t_rf_at_both():
@@ -552,7 +644,10 @@ _RELEASE_CASES = [replace(CalcInputs(), **kw) for kw in (
     {**_SHIFTED, "Per_ede": True}, {"Man_spec": "SW13_1V2"}, {"Per_spec": "SW13_1V2"},
     {"Man_spec": "SW13_1V2", "Man_ede": True, "Per_ede": True},
     {"Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2", "Man_shape": "exp", "Per_shape": "exp"},
-    {**_ASYMMETRIC, "Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2"})]
+    {**_ASYMMETRIC, "Man_spec": "SW13_1V2", "Per_spec": "SW13_1V2"},
+    {"pp_placement": "both_near"}, {"pp_placement": "both_far"},
+    {"pp_placement": "both_near", "Man_ede": True, "Per_ede": True, "handover_UIs": 0.0},
+    {"pp_placement": "both_far", "Man_ede": True, "Per_ede": True})]
 
 
 def _span_of(tl, terms, pred):
@@ -689,15 +784,39 @@ def test_a_turn_on_leaves_high_z_and_a_t_dd_launch_does_not():
     assert seen == {"ZD", "DD"}
 
 
-def test_a_contention_leg_is_drawn_at_the_releasers_pin_or_co_located():
-    """MP_contention: the release and the acquirer's 20 % point the margin runs to are both at
-    the Manager, the clock's flight out the first t_PD and the acquirer's drive flying back,
+def test_a_turn_ons_far_end_is_undriven_until_its_drive_arrives():
+    """On a setup or hold leg the data the receiver crosses its threshold on, at the far end of
+    the bus from the launcher, leaves high-Z where the launch is a turn-on (the _ho variants)
+    and not where it is a t_DD launch."""
+    for inp in _WHOLE_CASES[::3]:
+        for leg in SUPPORTED_LEGS:
+            if leg.endswith("_contention") or leg.startswith("keeper"):
+                continue
+            tl = leg_timeline(inp, leg)
+            far = tl.ramp(tl.event("crossing").ramp)
+            assert far.signal == "data" and far.from_hiz is leg.endswith("_ho"), leg
+
+
+def test_a_contention_leg_is_drawn_at_the_releasers_pin():
+    """The margin runs from the release to the acquirer's 20 % point, both at the releaser's
+    pin: the Manager on MP_contention, the Peripheral on PM_contention, A on PP_contention.
+    MP_contention: the clock's flight out the first t_PD and the acquirer's drive flying back,
     from its 20 % point at its pin to that point at the Manager, the second. PM and
-    PP_contention: the releaser's and the acquirer's data at their own pins, with no flight,
-    and the note says both devices are drawn at the Manager."""
+    PP_contention: no flight term, the acquirer (the Manager, or B at the Manager's end) one
+    t_PD from the releaser, the releaser's clock reference a t_PD after the acquirer's of the
+    same edge and the acquirer's drive reaching the releaser's pin a t_PD after its own; the
+    note says the flights net to zero, where there is a flight. The acquirer's drive rides the
+    DATA trace: it reaches the releaser's pin the trace mismatch sooner than a t_PD after its
+    own 20 % point, a span back from a mark one t_PD on, on the ramp it arrives on. Under a
+    placement that puts every peripheral at one end, PP_contention's two peripherals are no
+    flight apart."""
     for inp in _RELEASE_CASES:
         terms_of = compute(inp).breakdowns
         for leg in _CONTENTION:
+            t_pd = contention_flight_ns(inp, leg)
+            assert t_pd == (0.0 if leg == "PP_contention"
+                            and inp.pp_placement in ("both_near", "both_far")
+                            else inp.t_PD_ns()), leg
             tl = leg_timeline(inp, leg)
             terms = terms_of[leg].terms
             flights = [sp for sp in tl.spans
@@ -706,21 +825,36 @@ def test_a_contention_leg_is_drawn_at_the_releasers_pin_or_co_located():
             start, end = tl.event(margin.start), tl.event(margin.end)
             assert start.kind == "release" and end.kind == "anchor", leg
             pins = (tl.ramp(start.ramp).pin, tl.ramp(end.ramp).pin)
+            assert tl.ramp(end.ramp).from_hiz is False, leg
+            mis = -terms[-1].value_ns
+            (mis_sp,) = [sp for sp in tl.spans if sp.term == len(terms) - 1]
+            nominal = tl.event(mis_sp.start)
+            assert (mis_sp.end, nominal.kind, nominal.ramp) == (margin.end, "mark", end.ramp), leg
+            assert tl.duration(mis_sp) == pytest.approx(-mis, abs=1e-12), leg
             if leg == "MP_contention":
                 assert pins == ("Manager", "Manager") and tl.note == "", leg
-                assert tl.ramp(end.ramp).from_hiz is False
                 assert tl.ramp("data_acq@per").from_hiz
                 assert len(flights) == 2, (leg, [sp.label for sp in flights])
-                back = [sp for sp in flights if sp.end == margin.end]
+                back = [sp for sp in flights if sp.end == mis_sp.start]
                 assert len(back) == 1, leg
                 assert tl.ramp(tl.event(back[0].start).ramp).pin == "Peripheral", leg
                 assert tl.event(back[0].start).kind == "anchor", leg
-            else:
-                assert flights == [], (leg, [sp.label for sp in flights])
-                assert pins == {"PM_contention": ("Peripheral", "Manager"),
-                                "PP_contention": ("Peripheral A", "Peripheral B")}[leg]
-                assert tl.note == CO_LOCATED_NOTE, leg
-                assert tl.ramp(end.ramp).from_hiz, leg
+                continue
+            assert flights == [], (leg, [sp.label for sp in flights])
+            rel = {"PM_contention": "Peripheral", "PP_contention": "Peripheral A"}[leg]
+            assert pins == (rel, rel), leg
+            assert tl.note == (NET_ZERO_NOTE if t_pd > 0 else ""), (leg, inp.pp_placement)
+            own = tl.event("acq_anchor")
+            assert tl.ramp(own.ramp).from_hiz and tl.ramp(own.ramp).pin != rel, leg
+            assert nominal.t_ns - own.t_ns == pytest.approx(t_pd, abs=1e-9), leg
+            assert end.t_ns - own.t_ns == pytest.approx(t_pd - mis, abs=1e-9), leg
+            acq_ref = tl.event("ref" if leg == "PM_contention" else "ref_b")
+            assert tl.ramp(acq_ref.ramp).pin != rel, leg
+            ede = inp.Per_ede
+            close = tl.event(("close@per" if leg == "PM_contention" else "close@a") if ede
+                             else "ref_rel")
+            assert tl.ramp(close.ramp).pin == rel, leg
+            assert close.t_ns - acq_ref.t_ns == pytest.approx(t_pd, abs=1e-9), leg
 
 
 def test_contention_is_drawn_at_the_closing_polarity_it_reports():
@@ -796,3 +930,350 @@ def test_a_missing_event_or_ramp_raises_a_key_error_naming_it():
         tl.event("nowhere")
     with pytest.raises(KeyError, match="MP_setup: no ramp 'nowhere'"):
         tl.ramp("nowhere")
+
+
+# The inequality drawn whole (`WholeView`): the Specification and Example sources on both
+# sides, and the inputs that move its chains: handover UIs, every P→P placement, SoundWire
+# anchors and ramp shapes, a fast data edge, and a negative setup time.
+_WHOLE_CASES = CASES + [replace(CalcInputs(), pp_placement=p, handover_UIs=n)
+                        for p in ("unknown", "driver_far", "both_near", "driver_near",
+                                  "both_far") for n in (0.0, 1.0, 2.0)] + [
+    CalcInputs(Man_spec="SWI3S_PHY2_PROP", Per_spec="SWI3S_PHY2_PROP"),
+    CalcInputs(Per_t_IS_max_ns=-1.0), CalcInputs(Man_t_DD_max_ns=40.0),
+    CalcInputs(Man_t_ZD_ns=40.0, Per_t_ZD_ns=40.0, Man_t_DZ_max_ns=60.0, t_keeper_ns=20.0),
+    CalcInputs(Man_t_IH_max_ns=60.0, Per_t_IH_max_ns=60.0, Per_t_DD_min_ns=30.0),
+    CalcInputs(Per_t_DD_min_ns=30.0, Per_t_IH_max_ns=-2.0, handover_UIs=0.0,
+               Man_t_DZ_max_ns=30.0)]
+
+
+def _links(w, i):
+    """Chain `i` of `w` as (start, end) event pairs in time order."""
+    return [(sp.start, sp.end) for sp in w.chains[i].spans]
+
+
+def _closes(inp, leg, breakdowns):
+    """Assert `leg`'s `WholeView` at `inp` closes on its margin (see the test below); return
+    the margin's sign."""
+    tl = leg_timeline(inp, leg)
+    terms, w = breakdowns[leg].terms, tl.whole
+    assert w is not None, leg
+    first, second = w.chains
+    ends = []
+    for i, c in enumerate(w.chains):
+        links = _links(w, i)
+        for a, b in zip(links, links[1:]):
+            assert tl.event(a[1]).t_ns == pytest.approx(tl.event(b[0]).t_ns,
+                                                        abs=1e-9), (leg, a, b)
+        ends.append((tl.event(links[0][0]).t_ns, tl.event(links[-1][1]).t_ns))
+    assert ends[0] == pytest.approx(ends[1], abs=1e-9), (leg, inp)
+    assert (tl.event(w.start).t_ns, tl.event(w.end).t_ns) == pytest.approx(ends[0], abs=1e-9)
+    margin = second.spans[-1]
+    assert margin is w.margin and margin.term is None and margin.label == "margin"
+    assert tl.duration(margin) == pytest.approx(breakdowns[leg].margin_ns, abs=1e-9)
+    total = [0.0] * len(terms)
+    for sign, c in ((1.0, first), (-1.0, second)):
+        for sp in c.spans:
+            if sp.term is not None:
+                total[sp.term] += sign * tl.duration(sp)
+    for t, got in zip(terms, total):
+        assert got == pytest.approx(t.value_ns, abs=1e-9), (leg, t.symbol, inp)
+    assert sum(t.value_ns for t in terms) == pytest.approx(tl.duration(margin), abs=1e-9)
+    return breakdowns[leg].margin_ns > 0
+
+
+def test_a_whole_legs_chains_close_on_its_margin():
+    """Every leg, over `_WHOLE_CASES`: its two chains run end to end from one instant to one
+    instant; each term's spans last its value on the first chain and the negative of it on
+    the second (a gathered term's two detections together), and the second chain's last span
+    is the margin, so the chains close on it. Every leg is seen with margins of both
+    signs."""
+    signs: dict = {}
+    for inp in _WHOLE_CASES:
+        breakdowns = compute(inp).breakdowns
+        for leg in WHOLE_LEGS:
+            if breakdowns[leg].not_applicable:
+                continue
+            signs.setdefault(leg, set()).add(_closes(inp, leg, breakdowns))
+    assert signs == {leg: {True, False} for leg in WHOLE_LEGS}, signs
+
+
+@pytest.mark.parametrize("man", ("SWI3S_PHY2_EDE", "SWI3S_PHY2", "SW13_1V2"))
+def test_a_whole_legs_chains_close_on_both_columns_of_each_pairing(request, man):
+    """As above, at each column's worst corner of every leg, for a Manager on `man` and a
+    Peripheral on each offered spec (SWI3S PHY2 EDE on either side or both, a SoundWire
+    side), at handover UIs 0, 1 and 2, each with another P→P placement. The platform scope
+    runs the EDE Manager's pairings."""
+    from timing_diagram_support import left_to_the_full_suite
+    from timing_page_inputs import OFFERED, column, worst
+    if man != "SWI3S_PHY2_EDE":
+        left_to_the_full_suite(request)
+    placements = ("unknown", "driver_far", "both_near", "driver_near", "both_far")
+    for i, per in enumerate(OFFERED):
+        for side in ("spec", "proposed"):
+            results, _ = worst(*column(man, per, side))
+            for leg in WHOLE_LEGS:
+                at = results[leg].inputs
+                for n in (0.0, 1.0, 2.0):
+                    inp = replace(at, handover_UIs=n,
+                                  pp_placement=placements[(i + int(n)) % len(placements)])
+                    breakdowns = compute(inp).breakdowns
+                    if not breakdowns[leg].not_applicable:
+                        _closes(inp, leg, breakdowns)
+
+
+# The pins each leg's whole view draws, the pin it is checked at last.
+_WHOLE_PINS = {
+    "MP_setup": ("Peripheral",), "MP_hold": ("Peripheral",),
+    "MP_setup_ho": ("Peripheral",), "MP_hold_ho": ("Peripheral",),
+    **{f"PM_{k}": ("Peripheral", "Manager") for k in ("setup", "hold", "setup_ho", "hold_ho")},
+    **{f"PP_{k}": ("Peripheral A", "Peripheral B")
+       for k in ("setup", "hold", "setup_ho", "hold_ho")},
+    "MP_contention": ("Peripheral", "Manager"), "PM_contention": ("Peripheral",),
+    "PP_contention": ("Peripheral A",), "keeper_Man": ("Manager",),
+    "keeper_Per": ("Peripheral",)}
+
+
+def test_a_whole_legs_spans_are_measured_at_the_pins_it_draws():
+    """Each chain span is measured at a pin the view draws, or on a flight between two; each
+    end of it on a ramp lies on a drawn ramp at a drawn pin. Each leg draws `_WHOLE_PINS`, the
+    pin it is checked at last: a contention leg its releaser's. A gathered term's two
+    detections are each at its own peripheral, on PP_contention both at A, or on keeper_Per
+    each on its own edge, labelled with its crossing. A handover's UIs are counted at the
+    launcher's pin, or on MP_hold_ho and PM_contention, drawn at the Peripheral alone, on the
+    Peripheral's edges, and on PP_contention, drawn at A alone, on A's."""
+    for inp in _WHOLE_CASES[::4]:
+        res = compute(inp).breakdowns
+        for leg in WHOLE_LEGS:
+            if res[leg].not_applicable:
+                continue
+            tl = leg_timeline(inp, leg)
+            w = tl.whole
+            assert w.pins == _WHOLE_PINS[leg] and w.checked_at == w.pins[-1], leg
+            for c in w.chains:
+                assert len(c.pins) == len(c.spans) == len(c.ways)
+                for sp, pin in zip(c.spans, c.pins):
+                    assert set(pin.split(" → ")) <= set(w.pins), (leg, sp.label, pin)
+                    for k in (sp.start, sp.end):
+                        e = tl.event(k)
+                        if e.ramp is not None:
+                            assert tl.ramp(e.ramp).pin in w.pins, (leg, k)
+            ui = [sp for c in w.chains for sp in c.spans if sp.label.endswith("·UI")]
+            if ui and not leg.startswith("keeper"):
+                launcher = {"MP_hold_ho": "Peripheral", "PM_hold_ho": "Peripheral",
+                            "PP_hold_ho": "Peripheral A", "MP_contention": "Peripheral",
+                            "PM_contention": "Peripheral", "PP_contention": "Peripheral A"}[leg]
+                (sp,) = ui
+                for k in (sp.start, sp.end):
+                    assert tl.ramp(tl.event(k).ramp).pin == launcher, (leg, k)
+            if leg.startswith("PP") or (leg == "keeper_Per" and not inp.Per_ede):
+                parts = [(sp, pin) for c in w.chains for sp, pin in zip(c.spans, c.pins)
+                         if sp.term is not None and sp.label.startswith("X_MP,")]
+                assert len(parts) == 2, leg
+                if leg == "keeper_Per":
+                    assert {sp.label.split(" · ")[0].split(",")[-1] for sp, _ in parts} == \
+                        {"late", "early"}
+                    continue
+                if leg == "PP_contention":
+                    assert [pin for _, pin in parts] == ["Peripheral A"] * 2, leg
+                    continue
+                assert sorted(pin for _, pin in parts) == ["Peripheral A", "Peripheral B"]
+                for sp, pin in parts:
+                    assert sp.label.split(",")[1] == pin[-1], (leg, sp.label)
+
+
+def test_every_leg_has_a_whole_view_and_a_term_of_the_wrong_sign_runs_back():
+    """Every leg has a `WholeView`. A negative setup or hold time, or a negative turn-on,
+    runs its span back, which `WholeView.against` names; at the default inputs no span runs
+    against its way."""
+    inp = CalcInputs()
+    for leg in SUPPORTED_LEGS:
+        tl = leg_timeline(inp, leg)
+        assert tl.whole is not None and tl.whole.against == (), leg
+    for leg, kw, sym in (("MP_setup", {"Per_t_IS_max_ns": -1.0}, "Per_t_IS"),
+                         ("PP_setup", {"Per_t_IS_max_ns": -1.0}, "Per_t_IS"),
+                         ("PM_hold_ho", {"Man_t_IH_max_ns": -1.0}, "Man_t_IH"),
+                         ("MP_contention", {"Per_t_ZD_ns": -3.0}, "Per_t_ZD")):
+        w = leg_timeline(CalcInputs(**kw), leg).whole
+        assert w.against == (sym,), (leg, w.against)
+
+
+def test_pm_contention_is_drawn_whole_at_the_peripheral_alone():
+    """PM_contention's whole view is drawn at the Peripheral alone, with no flight: the
+    Manager's chain moved there by the clock's flight, each chain end on a Peripheral ramp or
+    a mark, the UIs and t_ZD between the Peripheral's clock edges and the Manager's drive
+    there. Its note says so in place of the leg's, which the term diagram keeps; at the
+    Manager's pin the release arrives margin − 2·(t_PD − t_PD,mis) before the Manager's
+    turn-on, its flight to the Manager the DATA trace's, as the note says. With no flight the
+    note says only where it is drawn, and the term diagram has no note."""
+    for inp in _RELEASE_CASES:
+        if compute(inp).breakdowns["PM_contention"].not_applicable:
+            continue
+        tl = leg_timeline(inp, "PM_contention")
+        w = tl.whole
+        t_pd, mis = inp.t_PD_ns(), inp.t_PD_mis_ns()
+        flown = t_pd > 0
+        assert w.pins == ("Peripheral",)
+        assert w.note == (PM_ONE_PIN_NOTE if flown else PM_ONE_PIN_NOTE_NO_FLIGHT), inp
+        assert tl.note == (NET_ZERO_NOTE if flown else ""), inp
+        for c in w.chains:
+            for sp in c.spans:
+                for k in (sp.start, sp.end):
+                    e = tl.event(k)
+                    assert e.kind == "mark" or tl.ramp(e.ramp).pin == "Peripheral", (sp.label, k)
+        arrives = tl.event("release").t_ns + t_pd - mis
+        turn_on = tl.event("acq_anchor")
+        assert tl.ramp(turn_on.ramp).pin == "Manager"
+        assert turn_on.t_ns - arrives == pytest.approx(tl.margin_ns - 2 * (t_pd - mis),
+                                                       abs=1e-9)
+        assert tl.duration(w.margin) == pytest.approx(tl.margin_ns, abs=1e-9)
+
+
+def test_pp_contention_is_drawn_whole_at_peripheral_a_alone():
+    """PP_contention's whole view is drawn at A alone, with no flight: B's chain moved there by
+    the clock's flight, each chain end on a ramp at A or a mark, B's detection a mark. Its
+    note says so in place of the leg's, which the term diagram keeps, and with handover UIs
+    and a flight that they are counted at B; at B's pin the release arrives margin − 2·(t_PD −
+    t_PD,mis,AB) before B's turn-on, its flight to B the DATA trace's. With no flight (every
+    peripheral at one end) the note says only where it is drawn."""
+    seen = set()
+    for inp in _RELEASE_CASES:
+        res = compute(inp).breakdowns["PP_contention"]
+        if res.not_applicable:
+            continue
+        tl = leg_timeline(inp, "PP_contention")
+        w = tl.whole
+        t_pd = contention_flight_ns(inp, "PP_contention")
+        flown = t_pd > 0
+        has_ho = any(t.symbol.endswith("·UI") for t in res.terms)
+        seen.add((flown, has_ho))
+        assert w.pins == ("Peripheral A",)
+        note = PP_ONE_PIN_NOTE if flown else PP_ONE_PIN_NOTE_NO_FLIGHT
+        assert w.note == (f"{note} {PP_UI_NOTE}" if has_ho and flown else note), inp
+        assert tl.note == (NET_ZERO_NOTE if flown else ""), inp
+        for c in w.chains:
+            for sp in c.spans:
+                for k in (sp.start, sp.end):
+                    e = tl.event(k)
+                    assert e.kind == "mark" or tl.ramp(e.ramp).pin == "Peripheral A", \
+                        (sp.label, k)
+        mis = next(-t.value_ns for t in res.terms if t.symbol == PP_MIS_SYMBOL)
+        arrives = tl.event("release").t_ns + t_pd - mis
+        turn_on = tl.event("acq_anchor")
+        assert tl.ramp(turn_on.ramp).pin == "Peripheral B"
+        assert turn_on.t_ns - arrives == pytest.approx(tl.margin_ns - 2 * (t_pd - mis),
+                                                       abs=1e-9)
+        assert tl.duration(w.margin) == pytest.approx(tl.margin_ns, abs=1e-9)
+    assert {(True, True), (True, False), (False, False)} <= seen, seen
+
+
+def _term_rule_breaches(tl, terms) -> list[str]:
+    """What breaks the whole view's term rule on `tl`: a span other than the margin with no
+    term, a span labelled other than its term's symbol
+    (but a gathered term's detections, each labelled with its own crossing), a term on no
+    chain or on more than one span (but a gathered term, as its detections), or a term whose
+    spans do not last its value: one span on the first chain or the negative of it on the
+    second, a gathered term's detections together."""
+    w, out = tl.whole, []
+    held = [0.0] * len(terms)
+    count = [0] * len(terms)
+    for sign, c in zip((1.0, -1.0), w.chains):
+        for sp in c.spans:
+            if sp is w.margin:
+                continue
+            if sp.term is None:
+                out.append(f"{sp.label}: no term")
+                continue
+            sym = terms[sp.term].symbol
+            gathered = sym.startswith("(")
+            if sp.label != sym and not (gathered and sp.label.split(" · ")[0] in sym):
+                out.append(f"{sp.label}: labelled other than {sym}")
+            held[sp.term] += sign * tl.duration(sp)
+            count[sp.term] += 1
+    for t, n, got in zip(terms, count, held):
+        if n == 0 or (n > 1 and not t.symbol.startswith("(")):
+            out.append(f"{t.symbol}: on {n} spans")
+        elif abs(got - t.value_ns) > 1e-9:
+            out.append(f"{t.symbol}: spans last {got:.6f}, the term is {t.value_ns:.6f}")
+    return out
+
+
+def test_every_span_of_a_whole_view_is_one_printed_term():
+    """Every leg, over `_WHOLE_CASES` and at both columns' worst corners of the EDE Manager's
+    pairings at handover UIs 0 and 1, each at Worst Per Inequality and at both placements that
+    pin the peripherals' distance (All near the Manager, All at the far end): every span but
+    the margin is a term of the breakdown, labelled with its symbol, each term on exactly one
+    span (a gathered term on its detections) lasting its value, the margin last, so no flight
+    is a chain span."""
+    from timing_page_inputs import OFFERED, column, worst
+    cases = list(_WHOLE_CASES)
+    for per in OFFERED:
+        for side in ("spec", "proposed"):
+            base, rows = column("SWI3S_PHY2_EDE", per, side)
+            for placement in ("unknown", "both_near", "both_far"):
+                results, _ = worst(replace(base, pp_placement=placement), rows)
+                cases += [replace(results[leg].inputs, handover_UIs=n)
+                          for leg in WHOLE_LEGS for n in (0.0, 1.0)]
+    for inp in cases:
+        res = compute(inp).breakdowns
+        for leg in WHOLE_LEGS:
+            if res[leg].not_applicable:
+                continue
+            tl = leg_timeline(inp, leg)
+            assert _term_rule_breaches(tl, res[leg].terms) == [], (leg, inp)
+            assert tl.whole.margin is tl.whole.chains[1].spans[-1]
+
+
+def test_keeper_per_is_drawn_whole_at_the_peripheral_alone():
+    """keeper_Per's whole view is drawn at the Peripheral alone: every chain end on a ramp at
+    the Peripheral or a mark (a SoundWire launch's tabulated point), the keeper's crossing and response on the Peripheral's data a flight
+    before the Manager's, the keeper's threshold read on that data, and the margin from the
+    keeper having followed to the Peripheral's release; its two detections each on its own
+    clock edge there. Its note says so, and that the keeper acts at the Manager, a flight
+    later; with no flight it says only where it is drawn."""
+    seen = set()
+    for inp in (*_RELEASE_CASES, replace(CalcInputs(), Per_ede=True, t_keeper_ns=8.0)):
+        if compute(inp).breakdowns["keeper_Per"].not_applicable:
+            continue
+        tl = leg_timeline(inp, "keeper_Per")
+        w = tl.whole
+        t_pd = inp.t_PD_ns()
+        seen.add((t_pd > 0, inp.Per_ede))
+        assert w.pins == ("Peripheral",)
+        assert w.note == (KEEPER_PER_NOTE if t_pd > 0 else KEEPER_PER_NOTE_NO_FLIGHT), inp
+        for c in w.chains:
+            for sp in c.spans:
+                for k in (sp.start, sp.end):
+                    e = tl.event(k)
+                    assert e.kind == "mark" or tl.ramp(e.ramp).pin == "Peripheral", \
+                        (sp.label, k)
+        cross = next(e for c in w.chains for sp in c.spans for e in (tl.event(sp.end),)
+                     if sp.label.startswith("X_K"))
+        assert cross.ramp == "data@per"
+        assert cross.t_ns == pytest.approx(tl.event("kcross").t_ns - t_pd, abs=1e-12)
+        assert any(th.ramp == "data@per" and th.receiver == "Manager" for th in tl.thresholds)
+        assert tl.event(w.margin.end).key == "release"
+        assert tl.duration(w.margin) == pytest.approx(tl.margin_ns, abs=1e-9)
+        if not inp.Per_ede:
+            parts = [sp for c in w.chains for sp in c.spans if sp.label.startswith("X_MP,")]
+            assert len(parts) == 2
+            assert {tl.event(sp.start).ramp for sp in parts} == {"clk_o@per", "clk_c@per"}
+    assert {(True, False), (True, True), (False, False)} <= seen, seen
+
+
+def test_the_wire_past_a_release_holds_the_level_the_driver_left():
+    """`Ramp.wire` follows the ramp while its driver drives and holds the level at `off_ns`
+    after it, where `Ramp.level` continues the ramp: a keeper leg released in the middle of
+    its ramp, before the keeper has followed."""
+    inp = CalcInputs(Per_t_DZ_max_ns=0.0, Man_t_DZ_max_ns=0.0, t_keeper_ns=5.0,
+                     Per_t_DD_max_ns=25.0, Man_t_DD_max_ns=28.0)
+    for leg in ("keeper_Man", "keeper_Per"):
+        tl = leg_timeline(inp, leg)
+        kept_at = [e for e in tl.events if e.kind == "keeper"]
+        assert len(kept_at) == (2 if leg == "keeper_Per" else 1), leg   # and at the Peripheral
+        for kept in kept_at:
+            r = tl.ramp(kept.ramp)
+            assert r.off_ns is not None and kept.t_ns > r.off_ns, leg
+            assert r.wire(kept.t_ns) == pytest.approx(r.level(r.off_ns)), leg
+            assert r.wire(kept.t_ns) != pytest.approx(r.level(kept.t_ns)), leg
+            t = 0.5 * (r.start_ns + r.off_ns)
+            assert r.wire(t) == r.level(t), leg

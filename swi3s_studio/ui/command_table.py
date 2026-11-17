@@ -469,6 +469,18 @@ class CommandTableView(QuietFocusMixin, QTableView):
         hdr.customContextMenuRequested.connect(self._column_menu)
         hdr.sortIndicatorChanged.connect(self._refuse_unsortable)
 
+    def scroll_row_to_top(self, row: int) -> None:
+        """Scroll so `row` is the top row of the viewport (as far as the scroll range
+        allows). Qt ignores a scroll to an index in a hidden column, so the index is taken
+        in the first visible one."""
+        model, header = self.model(), self.horizontalHeader()
+        if model is None or not 0 <= row < model.rowCount():
+            return
+        col = next((c for c in range(model.columnCount()) if not header.isSectionHidden(c)),
+                   None)
+        if col is not None:
+            self.scrollTo(model.index(row, col), QAbstractItemView.ScrollHint.PositionAtTop)
+
     def _refuse_unsortable(self, section: int, _order) -> None:
         """A header click or sortByColumn on an UNSORTABLE column: the indicator goes back
         to the sort the proxy holds (CommandFilterProxy.sort ignores those columns), with
@@ -500,7 +512,8 @@ class CommandTableView(QuietFocusMixin, QTableView):
     def fit_columns(self) -> None:
         """Size every column to its content, then give the columns DEFAULT_WIDTHS names
         those widths. A hidden column is fitted too (resizeColumnsToContents passes it
-        over), so it has that width when shown. Row is widened toward its widest text
+        over), shown for the measure since a hidden section has no header size hint, so it
+        has its contents' and its header's width when shown. Row is widened toward its widest text
         (resizeColumnsToContents only samples ~1000 rows, so the large bus-row number deep
         in a big capture would otherwise be elided) — but only across a BOUNDED head+tail
         sample, not all rows, so the cost does not grow with the capture. The Row number is
@@ -512,7 +525,9 @@ class CommandTableView(QuietFocusMixin, QTableView):
             return
         for c in range(model.columnCount()):
             if self.isColumnHidden(c):
+                self.setColumnHidden(c, False)
                 self.resizeColumnToContents(c)
+                self.setColumnHidden(c, True)
         fm = self.fontMetrics()
         n = model.rowCount()
         _SAMPLE = 2000                                     # head + tail rows measured per column
@@ -520,13 +535,18 @@ class CommandTableView(QuietFocusMixin, QTableView):
                 else [*range(_SAMPLE), *range(n - _SAMPLE, n)])
 
         def widen_to_true_max(col: int) -> None:
-            widest = self.columnWidth(col) or max(          # a hidden column reads 0 wide
-                self.sizeHintForColumn(col), self.horizontalHeader().sectionSizeHint(col))
+            hidden = self.isColumnHidden(col)
+            if hidden:                     # a hidden section reads 0 wide with no header hint
+                self.setColumnHidden(col, False)
+            widest = max(self.columnWidth(col), self.sizeHintForColumn(col),
+                         self.horizontalHeader().sectionSizeHint(col))
             for r in rows:
                 text = model.data(model.index(r, col), Qt.DisplayRole)
                 if text:
                     widest = max(widest, fm.horizontalAdvance(str(text)) + 24)   # + cell padding
             self.setColumnWidth(col, widest)
+            if hidden:
+                self.setColumnHidden(col, True)
 
         # By header, not _COL index: the All Links view leads with a Link column.
         headers = [model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
@@ -617,7 +637,7 @@ class CommandFilterProxy(QSortFilterProxyModel):
         self._groups: set = set()      # empty = all; else commit-group numbers
         self._batch_depth = 0
         self._batch_dirty = False
-        self._batch_before = None
+        self._batch_before: Optional[tuple] = None
         # True while the rows are re-tested. A filter that hides the current row makes
         # the view pick another current row; that is not a selection, and the shared
         # cursor ignores it (main_window._on_command_selected).

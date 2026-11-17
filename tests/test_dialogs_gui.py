@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QMessageBox,
+    QWidget,
 )
 
 pytestmark = pytest.mark.gui
@@ -102,6 +103,33 @@ def test_export_audio_writes_the_chosen_stream_at_the_chosen_rate(tmp_path, monk
     assert told and told[0][0] == "Audio exported" and "16 kHz" in told[0][1]
 
 
+def test_export_audio_names_a_stream_of_unknown_rate_and_the_rate_assumed(tmp_path, monkeypatch):
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    win = _win()
+    keep = list(win._audio_store.streams())[0]
+    win._audio_store._rates[keep] = 0.0
+
+    def user(dlg):
+        for key, cb in dlg._checks.items():
+            cb.setChecked(key == keep)
+        return QDialog.Accepted
+    _drive(monkeypatch, AudioExportDialog, user)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[1:3]))
+    win.export_audio()
+    assert told and told[0][0] == "Audio exported"
+    assert f"Sample rate unknown, read as 48 kHz: dev{keep[0]}/dp{keep[1]}" in told[0][1]
+
+
+def test_a_play_of_a_stream_of_unknown_rate_says_the_rate_it_plays_at():
+    win = _win()
+    view = win._audio_lanes.views[0]
+    view.assumed_rate_streams = [(0, 3)]
+    win._on_lane_play(view)
+    assert win._status.text() == "Sample rate unknown, played at 48 kHz: dev0/dp3"
+
+
 def test_export_audio_with_nothing_ticked_says_so_and_writes_nothing(tmp_path, monkeypatch):
     from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
     win = _win()
@@ -138,11 +166,13 @@ def test_the_config_dialog_needs_a_source_and_authoring_can_only_compare():
     dlg = OpenVisualizerConfigDialog(None, has_authoring=True)
     dlg._accept()
     assert dlg.result() != QDialog.Accepted              # no file and not authoring
+    dlg._path_edit.setText("typed.csv")
     dlg._from_auth.setChecked(True)
     assert not dlg._act_update.isEnabled() and dlg._act_compare.isChecked()
     dlg._accept()
     assert dlg.result() == QDialog.Accepted
     assert dlg.use_authoring and dlg.do_compare and not dlg.do_update
+    assert dlg.path == ""                                # a typed path is not the source
 
 
 def test_the_config_dialog_without_authoring_offers_only_a_file(monkeypatch, tmp_path):
@@ -176,6 +206,34 @@ def test_importing_a_capture_csv_as_a_config_is_refused(monkeypatch, tmp_path):
     win.open_visualizer_config()
     assert warned and "isn't a Visualizer config" in warned[0]
     assert win._session is session and win._session.source == before   # nothing imposed
+
+
+def test_importing_a_legacy_config_csv_reaches_its_upgrade(monkeypatch, tmp_path):
+    """A v1.73/v1.74 config is a config: the import goes on to the legacy upgrade."""
+    from test_compare import _OLD_CSV
+
+    from swi3s_studio.ingest import visualizer_csv
+    from swi3s_studio.ui.open_config_dialog import OpenVisualizerConfigDialog
+    win = _win()
+    old = tmp_path / "old.csv"
+    old.write_text(_OLD_CSV)
+
+    def user(dlg):
+        dlg._path_edit.setText(str(old))
+        dlg._accept()
+        return dlg.result()
+    _drive(monkeypatch, OpenVisualizerConfigDialog, user)
+    upgraded = []
+
+    def normalized_path(path):
+        upgraded.append(path)
+        raise ValueError("stop here")
+    monkeypatch.setattr(visualizer_csv, "normalized_path", normalized_path)
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    win.open_visualizer_config()
+    assert upgraded == [str(old)]
+    assert warned and "isn't a Visualizer config" not in warned[0]
 
 
 # ---- Import Peripheral Register Map ----
@@ -298,3 +356,35 @@ def test_export_audio_visible_range_covers_the_same_time_on_every_stream(tmp_pat
             secs[(dev, dp)] = w.getnframes() / w.getframerate()
     a, b = secs[(0, 0)], secs[(0, 1)]
     assert a > 0 and abs(a - b) <= 2.0 / 44100, secs
+
+
+# ---- the modal dialogs wear the application's theme ----
+
+def test_every_modal_dialog_takes_the_analyzer_stylesheet_and_its_dim_text_from_the_theme():
+    """A dialog opened under a window whose appearance differs from the platform's draws
+    in the window's palette: each carries analyzer_stylesheet(), its dim text is
+    VizTheme.TEXT_DIM, and a short control's radius is VizTheme.SMALL_RADIUS."""
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    from swi3s_studio.ui.audio_process_dialog import StreamProcessingDialog
+    from swi3s_studio.ui.capture_export_dialog import CaptureExportDialog
+    from swi3s_studio.ui.devices_dialog import DevicesDialog
+    from swi3s_studio.ui.open_config_dialog import OpenVisualizerConfigDialog
+    from swi3s_studio.ui.regmap_import_dialog import RegisterMapImportDialog
+    from swi3s_studio.ui.theme import VizTheme, analyzer_stylesheet
+    win = _win()
+    store = win._audio_store
+    dev, dp = list(store.streams())[0]
+    dialogs = [
+        CaptureExportDialog(win._session, parent=win),
+        AudioExportDialog(store, parent=win),
+        StreamProcessingDialog(store, dev, dp, preview=lambda _p: None, parent=win),
+        DevicesDialog(win, range(2), {}, {}, {}),
+        OpenVisualizerConfigDialog(win, has_authoring=True),
+        RegisterMapImportDialog(win),
+    ]
+    for dlg in dialogs:
+        assert dlg.styleSheet() == analyzer_stylesheet(), type(dlg).__name__
+    reg = dialogs[-1]
+    assert VizTheme.TEXT_DIM in reg._path_label.styleSheet()
+    cell_sheets = [w.styleSheet() for w in dialogs[3].findChildren(QWidget) if "QFrame" in w.styleSheet()]
+    assert cell_sheets and all(f"border-radius: {VizTheme.SMALL_RADIUS}px" in s for s in cell_sheets)

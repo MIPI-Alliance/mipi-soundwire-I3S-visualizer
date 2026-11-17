@@ -18,4 +18,5 @@ release those versions name, is available from the FFmpeg project, https://ffmpe
 the Qt for Python sources from the Qt Project, https://code.qt.io.
 
 The Qt for Python and Qt libraries are covered by the notice in ../Qt-for-Python/NOTICE.txt.
-This project's own licence is LICENSE.md at the top level of the bundle.
+This project's own licence is LICENSE.md, in the directory that holds this licenses/
+directory.

@@ -10,7 +10,7 @@ one per track. X axes are linked across tracks; Y is fit to the data explicitly.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -33,8 +33,8 @@ from ..dsp.spectrogram import FRAME_SIZES, NFFT, held_spectrogram, spectrogram
 from . import line_style
 from .nav import install_jog_shortcuts, match_timeline_label, paged_range
 from .plot_widgets import XWheelViewBox
-from .port_names import port_identity, port_label
-from .theme import VizTheme, analyzer_stylesheet
+from .port_names import menu_text, port_identity, port_label
+from .theme import VizTheme, analyzer_stylesheet, legible_text_color
 
 # Audio playback is optional: QtMultimedia (and an output device) may be absent
 # in a headless/offscreen environment. Guard it so the view still constructs.
@@ -72,6 +72,7 @@ _CHANNEL_LIST_MIN = 80
 # stream's noise sits at, so silence reads dark and the noise floor is still visible.
 _SPECTRO_DB = (-120.0, 0.0)
 _SPECTRO_COLUMNS = 1400     # frames per redraw: about one per pixel of a wide pane
+_SPECTRO_COALESCE_MS = 30   # range changes of a spectrogram lane within this are drawn once
 
 
 def _amp_ticks(ymin: float, ymax: float) -> list:
@@ -91,8 +92,8 @@ def _amp_ticks(ymin: float, ymax: float) -> list:
 
 def _transport_icon(kind: str, color: str = "#ffffff", px: int = 13) -> QIcon:
     """Paint a play / pause / stop glyph as a solid-colour QIcon in the button's text
-    colour, so it stays monochrome in both themes. Font glyphs are not used: Windows
-    renders ◼/▶ as coloured emoji even with a U+FE0E text-presentation selector."""
+    colour, so it stays monochrome in both themes. The glyphs are painted, not font
+    characters."""
     pm = QPixmap(px, px)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -135,7 +136,7 @@ class _PcmSource(QIODevice):
         self._total_frames = self._buf.size // self._nch
         self._fade_frames = max(1, int(fade_frames))
         self._frame = 0                       # next source frame (audio thread)
-        self._fade_at = None                  # source frame where stop-fade began
+        self._fade_at: Optional[int] = None   # source frame where stop-fade began
         self.open(QIODevice.ReadOnly)
 
     # -- transport (called from the GUI thread) --
@@ -309,6 +310,8 @@ class AudioView(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        # The (device, dp) streams of unknown rate the last Play played at ASSUMED_RATE_HZ.
+        self.assumed_rate_streams: List[Tuple[int, int]] = []
         # Flat dark item-view + themed (always-visible) scrollbars, shared with the
         # rest of the Analyzer; the child scroll areas inherit the scrollbar style.
         self.setStyleSheet(analyzer_stylesheet())
@@ -416,7 +419,7 @@ class AudioView(QWidget):
         lay.addLayout(bar)
         lay.addWidget(self._splitter, 1)
 
-        self._store = None
+        self._store: Any = None
         self.shown_state = None   # the Link state this view's zoom and channels belong to
         self._vzoom = False       # Vertical Zoom: fit Y to visible data vs full-scale ±1
         self._plots: list[tuple] = []            # (plotitem, curve, dev, dp, ch, n)
@@ -442,12 +445,19 @@ class AudioView(QWidget):
         self._time_offset = 0.0      # seconds added to the axis labels (set_time_offset)
         self._capture_extent = 1     # full capture length (samples) = the X extent
         self._x_bounds: Optional[Tuple[float, float]] = None   # All Links' shared span (s)
-        self._sink = None         # QAudioSink while playing
-        self._source = None       # _PcmSource feeding the sink (kept alive during play)
+        self._sink: Any = None    # QAudioSink while playing
+        self._source: Optional[_PcmSource] = None   # _PcmSource feeding the sink (kept alive during play)
         # Playback cursor sweep: a timer maps the sink's processed time back to a
         # capture sample and drives the shared cursor so the play head moves. It also
         # ends playback (at the clip end, or once a stop-fade has finished) by
         # stopping the sink while the source is emitting silence -- a clean cut.
+        # Spectrogram lanes waiting to be drawn at their lane's current range: a burst of
+        # range changes (a wheel notch, a drag, a rebuild) costs one analysis per lane.
+        self._spectro_pending: dict = {}
+        self._spectro_timer = QTimer(self)
+        self._spectro_timer.setSingleShot(True)
+        self._spectro_timer.setInterval(_SPECTRO_COALESCE_MS)
+        self._spectro_timer.timeout.connect(self._flush_spectro)
         self._play_timer = QTimer(self)
         # 60 fps play-head sweep: the tick only repositions cursor lines while playing
         # (heavy pane work is deferred), and a finer interval keeps the sweep smooth and
@@ -464,7 +474,9 @@ class AudioView(QWidget):
         self._play_fade_frames = 1       # frames in the de-click / stop ramp
         self._play_idx_per_frame = 1.0   # native-index per played frame (decimation)
         self._want_play = False          # transport intent, drives the Play/Pause button
-        self._rewind_on_stop = False     # Stop button: snap cursor to start once stopped
+        self._rewind_on_stop = False     # Stop button / clip end: return once stopped
+        self._play_origin: Optional[int] = None    # the cursor sample Play started from
+        self._paused_at: Optional[int] = None      # where a Pause left the playhead
 
     def _refresh_devices(self) -> None:
         """Re-scan the available output devices. Keeps the currently-selected device
@@ -513,6 +525,16 @@ class AudioView(QWidget):
 
     def set_play_depth(self, bits: int) -> None:
         self._depth = 24 if int(bits) >= 24 else 16
+
+    def adopt_playback_settings(self, other: "AudioView") -> None:
+        """Take another view's output device (matched by device id) and bit depth."""
+        self.set_play_depth(other.play_depth)
+        if 0 <= other._device_index < len(other._audio_devices):
+            want = other._audio_devices[other._device_index].id()
+            for i, d in enumerate(self._audio_devices):
+                if d.id() == want:
+                    self._device_index = i
+                    break
 
     @property
     def play_rate_targets(self) -> dict:
@@ -576,9 +598,9 @@ class AudioView(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._checks = {}
-        # Stable per-(dev,dp,ch) colour, assigned in stream order — used for BOTH the
-        # waveform pen and the channel checkbox text, so a track is identified by
-        # colour, not just its DP name, and keeps it as channels are toggled.
+        # Stable per-(dev,dp,ch) colour, assigned in stream order — the waveform pen, and
+        # the channel checkbox text (in a legible shade of it, _color_check), so a track is
+        # identified by colour, not just its DP name, and keeps it as channels are toggled.
         self._lane_colors = {}
         for dev, dp in store.streams():
             for ch in store.channels(dev, dp):
@@ -587,7 +609,7 @@ class AudioView(QWidget):
                 cb = QCheckBox()
                 self._label_check(cb, dev, dp, ch)
                 cb.setChecked(True)
-                cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
+                self._color_check(cb, color)
                 cb.toggled.connect(lambda _on: self._rebuild_plots())
                 cb.setContextMenuPolicy(Qt.CustomContextMenu)
                 cb.customContextMenuRequested.connect(
@@ -626,7 +648,8 @@ class AudioView(QWidget):
         setting in its tooltip. The track's title spells it out; the list is too narrow
         to."""
         proc = self._store.processing(dev, dp) if self._store is not None else None
-        cb.setText(f"{port_label(self._stream_names, dev, dp)} CH{ch}" + (" *" if proc else ""))
+        cb.setText(menu_text(f"{port_label(self._stream_names, dev, dp)} CH{ch}")
+                   + (" *" if proc else ""))
         tips = [port_identity(self._stream_names, dev, dp)] if (dev, dp) in self._stream_names \
             else []
         if proc:
@@ -657,8 +680,16 @@ class AudioView(QWidget):
         for key, cb in self._checks.items():
             color = _dp_color(key[0], key[1], self._stream_overrides)
             self._lane_colors[key] = color
-            cb.setStyleSheet(f"QCheckBox {{ color: {color.name()}; }}")
+            self._color_check(cb, color)
         self._rebuild_plots()
+
+    @staticmethod
+    def _color_check(cb, color) -> None:
+        """A channel's checkbox text in its trace's colour, or in the shade of it that reads
+        on the channel list's background (theme.legible_text_color); the trace keeps the
+        colour itself."""
+        text = legible_text_color(color, VizTheme.FRAME_BG)
+        cb.setStyleSheet(f"QCheckBox {{ color: {text}; }}")
 
     def set_stream_colors(self, overrides: line_style.Overrides, redraw: bool = True) -> None:
         """The shown Link's per-stream colour overrides (see line_style). Afterwards it
@@ -812,10 +843,12 @@ class AudioView(QWidget):
 
     def set_channel_selection(self, keys) -> None:
         """Restore a previously captured channel selection so hidden tracks stay hidden
-        across a re-decode (e.g. an SSP phase step) instead of set_store re-showing them
-        all. Only touches lanes still present; a single rebuild follows. No-op if the
-        selection matches none of the current lanes (never blank the view)."""
-        if not keys or not any(k in self._checks for k in keys):
+        across a re-decode (e.g. an SSP phase step). Only touches lanes still present; a
+        single rebuild follows. An empty selection
+        hides every lane; one that names lanes and matches none of the current ones is a
+        no-op (never blank the view)."""
+        keys = set(keys)
+        if keys and not any(k in self._checks for k in keys):
             return
         changed = False
         for key, cb in self._checks.items():
@@ -836,6 +869,8 @@ class AudioView(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._plots = []
+        self._spectro_pending = {}
+        self._spectro_timer.stop()
         self._cursor_lines = []
         self._link = None
 
@@ -897,13 +932,13 @@ class AudioView(QWidget):
             n = self._store.samples(dev, dp, ch).size
             plot.sigXRangeChanged.connect(
                 lambda _vb, rng, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
-                    self._render(p, c, a, d, k, rng, b))
+                    self._render_soon(p, c, a, d, k, rng, b))
             # A wider or narrower track gives each sample more or fewer pixels: whether it
             # is drawn as stems can change with no change of range.
             plot.getViewBox().sigResized.connect(
                 lambda vb, p=plot, c=curve, a=dev, d=dp, k=ch, b=bits:
-                    self._render(p, c, a, d, k, vb.viewRange()[0], b))
-            self._render(plot, curve, dev, dp, ch, (x_lo, x_hi), bits)
+                    self._render_soon(p, c, a, d, k, vb.viewRange()[0], b))
+            self._render_soon(plot, curve, dev, dp, ch, (x_lo, x_hi), bits)
             plot.setXRange(x_lo, x_hi, padding=0)
             if self._link is not None:
                 plot.setXLink(self._link)
@@ -931,6 +966,7 @@ class AudioView(QWidget):
         # Restore the pre-rebuild zoom (X-linked, so the link carries every track).
         if prev_range is not None and self._link is not None:
             self._link.setXRange(prev_range[0], prev_range[1], padding=0)
+        self._flush_spectro()                 # each spectrogram lane drawn once, at its range
         # Make the host tall enough that the scroll area actually scrolls.
         self._tracks_host.setMinimumHeight(_TRACK_H * max(1, len(self._plots)) + 8)
         self._place_cursor_lines()            # the cursor did not move: no follow
@@ -947,7 +983,7 @@ class AudioView(QWidget):
         """Diff/reuse (like raw_view.set_bookmarks): keep existing lines, update their
         position/colour/label in place, only create lines for new labels and drop lines
         for gone labels or plots that no longer exist (e.g. after a channel-selection
-        rebuild) — instead of tearing down and recreating every line on every call."""
+        rebuild); lines are not recreated on every call."""
         live_plots = {id(plot) for plot, *_rest in self._plots}
         want = {(pid, label): s for pid in live_plots
                 for s, label in self._bm_marks}
@@ -999,6 +1035,24 @@ class AudioView(QWidget):
         plot.setYRange(0.0, nyq, padding=0)
         plot.getViewBox().setLimits(yMin=0.0, yMax=nyq)
         return img
+
+    def _render_soon(self, plot, curve, dev, dp, ch, rng, bits=0) -> None:
+        """Draw a lane for a new range: a waveform at once, a spectrogram lane once the
+        burst of range changes ends (or at the next _flush_spectro)."""
+        if isinstance(curve, pg.ImageItem):
+            self._spectro_pending[id(plot)] = (plot, curve, dev, dp, ch, bits)
+            self._spectro_timer.start()
+        else:
+            self._render(plot, curve, dev, dp, ch, rng, bits)
+
+    def _flush_spectro(self) -> None:
+        """Draw every waiting spectrogram lane now, at its plot's current range."""
+        self._spectro_timer.stop()
+        pending, self._spectro_pending = self._spectro_pending, {}
+        live = {id(plot) for plot, *_rest in self._plots}
+        for key, (plot, curve, dev, dp, ch, bits) in pending.items():
+            if key in live:
+                self._render(plot, curve, dev, dp, ch, plot.getViewBox().viewRange()[0], bits)
 
     def _render(self, plot, curve, dev, dp, ch, rng, bits=0) -> None:
         if self._store is None:
@@ -1064,7 +1118,7 @@ class AudioView(QWidget):
         ys = np.zeros(xs.size, dtype=np.float64)
         ys[1::2] = v
         # Each stem is its own two vertices: connect zero -> value, never value -> the next
-        # stem's zero. An array rather than "pairs", which a clip to the view can misalign.
+        # stem's zero. The array is explicit: a clip to the view cannot misalign it.
         conn = np.zeros(xs.size, dtype=np.uint8)
         conn[0::2] = 1
         curve.setData(xs, ys, connect=conn)
@@ -1197,6 +1251,7 @@ class AudioView(QWidget):
         x_lo, x_hi = self._x_extent()
         for plot, _curve, _dev, _dp, _ch, _n in self._plots:
             plot.setXRange(x_lo, x_hi, padding=0)
+        self._flush_spectro()
 
     def jog(self, direction: int) -> None:
         """Page the view one whole visible width left (direction < 0) or right
@@ -1209,6 +1264,7 @@ class AudioView(QWidget):
         rng = paged_range(x0, x1, lo, hi, direction)
         if rng is not None:
             self._link.setXRange(rng[0], rng[1], padding=0)
+            self._flush_spectro()
 
     # ---- lanes (ui/link_lanes.py): X in seconds of this capture ----
     def _emit_range(self, _vb, rng) -> None:
@@ -1230,6 +1286,7 @@ class AudioView(QWidget):
             lo, hi = t0 * rate, t1 * rate
             if math.isfinite(lo) and math.isfinite(hi):
                 self._link.setXRange(lo, hi, padding=0)
+                self._flush_spectro()
 
     def _x_extent(self):
         """The X range the tracks may show, in capture samples: the capture, or in All
@@ -1298,11 +1355,12 @@ class AudioView(QWidget):
     def _on_plot_click(self, ev, plot, dev, dp, ch) -> None:
         if self._store is None or ev.button() != Qt.LeftButton:
             return
-        if not plot.sceneBoundingRect().contains(ev.scenePos()):
-            return
-        # X is the capture sample under the pointer; zoomed in to the samples, the
-        # playhead snaps to the nearest one.
+        if not plot.vb.sceneBoundingRect().contains(ev.scenePos()):
+            return                        # an axis, not the data area
+        # X is the capture sample under the pointer, kept inside the capture; zoomed in to
+        # the samples, the playhead snaps to the nearest one.
         x = plot.vb.mapSceneToView(ev.scenePos()).x()
+        x = min(max(x, 0.0), float(self._capture_extent))
         ev.accept()
         self.seeked.emit(self._snap_to_sample(plot, dev, dp, ch, x))
 
@@ -1460,6 +1518,10 @@ class AudioView(QWidget):
         if device is None or device.isNull():
             return
         self.hard_stop()
+        # A Play that resumes a Pause, the playhead not moved since, keeps the origin.
+        if self._play_origin is None or self._paused_at != self._cursor_sample:
+            self._play_origin = int(self._cursor_sample)
+        self._paused_at = None
         pcm = self._declick(pcm, int(rate), int(nch), qfmt)
         fmt = QAudioFormat()
         fmt.setSampleRate(int(rate))
@@ -1472,6 +1534,7 @@ class AudioView(QWidget):
         # glitches, no end-of-data, and stop() fades in software.
         self._source = _PcmSource(pcm, int(nch), sample_bytes, fade_frames)
         self._sink.start(self._source)
+        self.assumed_rate_streams = [(d, p) for d, p in dps if not self._store.rate_known(d, p)]
         self.playStarted.emit()
         # Remember the mapping so the sweep timer can turn elapsed audio frames
         # back into a capture sample for the shared cursor. With decimation the
@@ -1500,13 +1563,15 @@ class AudioView(QWidget):
         if self._want_play:
             self._want_play = False
             self._set_play_button(False)
+            self._paused_at = int(self._cursor_sample)
             self.stop()                              # pause: keep the playhead where it is
         else:
             self.play()
 
     def stop_and_rewind(self) -> None:
-        """Stop button: fade out cleanly, then return the playhead to the start of
-        the decoded audio once the fade has released (see hard_stop)."""
+        """Stop button: fade out cleanly, then, once the fade has released (see hard_stop),
+        return the playhead to where Play started, or to the start of the decoded audio
+        when it is already there or nothing has played."""
         self._want_play = False
         self._set_play_button(False)
         self._rewind_on_stop = True
@@ -1553,16 +1618,7 @@ class AudioView(QWidget):
                 self.hard_stop()
             return                                            # freeze the cursor while fading
         if out_frames >= self._play_nframes:                  # clip end (incl. baked fade)
-            # Land the cursor exactly on the final sample: the last sweep tick can be up
-            # to one timer interval short of the end.
-            end_idx = self._play_start_idx + int(
-                max(0, self._play_nframes - 1 - self._play_lead_frames) * self._play_idx_per_frame)
-            end_samp = self._store.sample_at_index(self._play_dev, self._play_dp,
-                                                    self._play_chan0, end_idx)
-            if end_samp is not None:
-                self._cursor_sample = int(end_samp)
-                self._apply_cursor()
-                self.playCursorMoved.emit(int(end_samp))
+            self._rewind_on_stop = True                       # back to where Play started
             self.hard_stop()
             return
         # Scale resampled output frames back to the native audio-sample index, then
@@ -1615,9 +1671,10 @@ class AudioView(QWidget):
         return self._store
 
     def hard_stop(self) -> None:
-        """Stop playback immediately and release the sink/source. If a Stop (rewind)
-        is pending, snap the shared cursor to the start of the audio now that the
-        fade has played out."""
+        """Stop playback immediately and release the sink/source. If a return is pending
+        (a Stop, or the clip's end), move the shared cursor to where Play started now that
+        the fade has played out, or to the start of the audio when it is already there or
+        nothing has played."""
         self._play_timer.stop()
         was_playing = self._sink is not None
         if self._sink is not None:
@@ -1630,8 +1687,14 @@ class AudioView(QWidget):
         self._set_play_button(False)
         if self._rewind_on_stop:
             self._rewind_on_stop = False
+            self._paused_at = None
             if self._store is not None:
-                self.playCursorMoved.emit(int(self._audio_start_sample()))
+                origin = self._play_origin
+                to = (origin if origin is not None and origin != self._cursor_sample
+                      else self._audio_start_sample())
+                self._cursor_sample = int(to)
+                self._apply_cursor()
+                self.playCursorMoved.emit(int(to))
         # Heavy per-pane updates are throttled while playing; now that we've stopped
         # (is_playing is False above), ask the owner for one full refresh at the
         # resting cursor so the registers/grid/symbols aren't left slightly stale.
@@ -1691,3 +1754,4 @@ class AudioView(QWidget):
         if s0 is None or s1 is None or s1 <= s0:
             return
         self._link.setXRange(int(s0), int(s1), padding=0)
+        self._flush_spectro()

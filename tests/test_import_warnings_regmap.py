@@ -291,6 +291,35 @@ def test_a_field_default_wider_than_its_field_is_reported():
     assert {f.name: f.reset for f in pmap.registers[0].fields} == {"ONE": 1, "TWO": 3}
 
 
+def test_a_field_default_disagreeing_with_its_register_default_is_reported_and_used():
+    """R[11:4] in a register whose default is 0x00000A50 reads 0xA5 there; a field default
+    that differs on a bit both know is reported, and the field's default is used."""
+    def imported(reg_default, field_default):
+        return import_text(
+            f"<Registers><Register><Name>R</Name><Address>0x10000000</Address>"
+            f"<DefaultValue>{reg_default}</DefaultValue></Register></Registers>"
+            f"<Fields><Field><Name>F</Name><Address>R[11:4]</Address>"
+            f"<DefaultValue>{field_default}</DefaultValue></Field></Fields>", "disagree")
+
+    def disagreements(report):
+        return [w for w in report.warnings if "disagrees with register default" in w]
+
+    pmap, report = imported("0x00000A50", "0xA6")
+    assert disagreements(report) == [
+        "register 'R' field 'F': field default '0xA6' disagrees with register default "
+        "'0x00000A50' at bits 11:4 — the field's default is used"]
+    assert pmap.resolve(0x10000000).fields[0].reset == 0x6
+    assert pmap.resolve(0x10000001).fields[0].reset == 0xA
+    # The byte resets take the field's bits too, so an unwritten register reads them.
+    assert pmap.resolve(0x10000000).reset == 0x60
+    assert pmap.resolve(0x10000000).reset_byte() == 0x60
+    assert pmap.resolve(0x10000001).reset == 0x0A
+    assert disagreements(imported("0x00000A50", "0xX6")[1])     # the low nibble differs
+    for reg_default, field_default in (("0x00000A50", "0xA5"), ("0x00000A50", "0xX5"),
+                                       ("0xXXXXXXXX", "0xA6"), ("0x00000X50", "0x65")):
+        assert disagreements(imported(reg_default, field_default)[1]) == [], field_default
+
+
 def test_a_register_field_xml_field_past_the_register_width_has_no_dead_warning():
     text = """<Registers><Register><Name>R</Name><Address>0x10000000</Address>
 <DefaultValue>0x1</DefaultValue></Register></Registers>
@@ -357,3 +386,21 @@ def test_a_note_raised_twice_is_collected_once_in_constant_time():
             import_notes.warn("f", "a")
         import_notes.warn("f", "a")
     assert len(outer) == 1 and len(inner) == 1
+
+
+def test_a_registers_override_naming_a_missing_file_is_reported_and_the_bundled_map_used(
+        tmp_path, monkeypatch):
+    from swi3s_studio.model import registers
+    missing = str(tmp_path / "regs-new.json")
+    monkeypatch.setenv("SWI3S_REGISTERS", missing)
+    with import_notes.collect() as notes:
+        path = registers._default_registers_json()
+    assert path == registers.bundled_data_path("registers.json")
+    assert [n.source for n in notes] == ["SWI3S_REGISTERS"]
+    assert repr(missing) in notes[0].message and "does not exist" in notes[0].message
+    present = tmp_path / "regs.json"
+    present.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("SWI3S_REGISTERS", str(present))
+    with import_notes.collect() as notes:
+        assert registers._default_registers_json() == str(present)
+    assert list(notes) == []

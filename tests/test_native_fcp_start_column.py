@@ -74,9 +74,11 @@ def test_csv_decode_from_mid_row_keeps_drq_column(flow_levels, offset):
 _INTERVAL_UIS = 16 * _COLUMNS    # the move fixture's 16-row interval
 
 
-def _move_decode(dscr, h_start, offset, delay=0, scrambled=False, bit_width=0, **settings):
+def _move_decode(dscr, h_start, offset, delay=0, scrambled=False, bit_width=0, skipping=(0, 1),
+                 **settings):
     levels = swi3score.make_fcp_move_levels(96, dscr, h_start, offset, delay, scrambled,
-                                            bit_width)
+                                            bit_width, skipping_numerator=skipping[0],
+                                            skipping_denominator=skipping[1])
     st = swi3score.DecoderSettings()
     for k, v in settings.items():
         setattr(st, k, v)
@@ -119,6 +121,35 @@ def test_the_drq_history_reaches_back_d_intervals(delay, offset):
     dec, _ = _move_decode(True, 11, offset, delay)
     stats = dec.flow_control_stats()
     assert stats["checked"] == 192 and stats["fails"] == 0, stats
+
+
+@pytest.mark.parametrize("dscr", [False, True], ids=["sscr", "dscr"])
+def test_a_drq_in_the_last_ui_of_an_interval_follows_that_intervals_skip(dscr):
+    """With every second interval skipped (SkippingNumerator 1 over Denominator 2), a DRQ
+    committed to the interval's last UI (Column 15, FCP_Offset 15) is sent and read in the
+    transported intervals 0, 2, ... from the commit and in no skipped one: every handshake
+    check passes, the audio is the sine, and each gated sample's DRQ sits in the last UI of
+    an even interval."""
+    dec, cut = _move_decode(dscr, 15, 15, skipping=(1, 2))
+    stats = dec.flow_control_stats()
+    assert stats["checked"] >= 48 and stats["fails"] == 0, stats
+    audio = sorted(dec.audio(), key=lambda a: a["index"])
+    assert [a["value"] for a in audio] == [_sine(0, i, 15) for i in range(len(audio))]
+    seg = dec.segments()[-1]
+    row0 = cut + seg["start_sample"] - seg["start_ui"] * _SAMPLES_PER_UI   # the commit row's Column 0
+    read = {divmod((a["drq_sample"] - row0) // _SAMPLES_PER_UI, _INTERVAL_UIS)
+            for a in audio if a["drq_sample"] >= cut}
+    assert len(read) >= 20, sorted(read)
+    assert {(k % 2, ui) for k, ui in read} == {(0, _INTERVAL_UIS - 1)}, sorted(read)[:8]
+
+
+@pytest.mark.parametrize("args", [(1, 0), (2, 2), (-1, 2), (1, 5)])
+def test_a_skipping_ratio_outside_the_fixtures_range_raises(args):
+    """The denominator is 1..4095 and divides the 96 intervals per phase, the numerator below
+    the denominator."""
+    with pytest.raises(ValueError, match="skipping_denominator must be"):
+        swi3score.make_fcp_move_levels(96, skipping_numerator=args[0],
+                                       skipping_denominator=args[1])
 
 
 @pytest.mark.parametrize("dscr", [False, True], ids=["sscr", "dscr"])

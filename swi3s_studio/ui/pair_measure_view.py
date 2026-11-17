@@ -12,15 +12,16 @@ import re
 from typing import List, Sequence, Tuple
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
 from .grid_view import bookmark_pair_color
-from .theme import analyzer_stylesheet
+from .theme import VizTheme, analyzer_stylesheet, legible_text_color
 
 # Pull the leading pair letter out of a row label ("A1", "A2", "A1-A2" → "A"); rows whose
 # label doesn't start with a bookmark letter (unexpected/blank) fall back to the default
-# text colour rather than guessing.
+# text colour rather than guessing. A pair's rows are in the shade of its colour that reads
+# on the table (theme.legible_text_color).
 _PAIR_LETTER_RE = re.compile(r"^([A-Za-z])")
 
 
@@ -76,7 +77,8 @@ class PairMeasureView(QTableWidget):
         for r, row in enumerate(rows):
             label = str(row[0])
             m = _PAIR_LETTER_RE.match(label)
-            brush = QBrush(bookmark_pair_color(m.group(1))) if m else None
+            brush = QBrush(QColor(legible_text_color(bookmark_pair_color(m.group(1)),
+                                                     VizTheme.FRAME_BG))) if m else None
             for c in range(len(self._COLS)):
                 f = self._FIELD[c]
                 text = str(row[f]) if f < len(row) else ""

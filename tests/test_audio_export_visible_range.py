@@ -100,3 +100,18 @@ def test_the_audio_view_reports_its_window_in_capture_samples():
     assert (s0, s1) == (int(max(0, x0)), int(max(0, x1)))
     _plot, _c, dev, dp, ch, _n = av._plots[0]
     assert win._audio_store.stream_index_range(dev, dp, s0, s1) == av.visible_index_range()
+
+
+def test_a_visible_range_with_no_audio_for_a_ticked_stream_is_refused(monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    store = _two_rate_store()
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    # DP0 holds audio from capture sample 1000 on; DP1 not until 5000.
+    dlg = _dialog(store, visible_sample_range=(1_000, 3_000))
+    assert dlg.index_range(0, 1)[0] == dlg.index_range(0, 1)[1]
+    dlg.accept()
+    assert dlg.result() == 0 and told and "DP1" in told[0] and "DP0" not in told[0]
+    dlg._checks[(0, 1)].setChecked(False)
+    dlg.accept()
+    assert dlg.result() == 1

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from ..dsp import filters
 from ..store.audio_store import StreamProcessing
 from .port_names import with_name
+from .theme import analyzer_stylesheet
 
 _GAIN_LIMIT_DB = 100.0      # the field's range; the slider covers the common ±50
 _SLIDER_DB = 50.0
@@ -44,11 +45,12 @@ class StreamProcessingDialog(QDialog):
                  preview: Callable[[Optional[StreamProcessing]], None], parent=None,
                  names=None) -> None:
         super().__init__(parent)
+        self.setStyleSheet(analyzer_stylesheet())
         self.setWindowTitle("Filter & Gain: "
                             + with_name(names or {}, device, dp, f"Dev{device} DP{dp}"))
         self._store, self._dev, self._dp = store, int(device), int(dp)
         self._preview_fn = preview
-        self._original = store.processing(device, dp)
+        self._original = store.setting(device, dp)
         self._previewed = False
         self._reverted = False
         self._gain_touched = self._original is not None
@@ -181,14 +183,22 @@ class StreamProcessingDialog(QDialog):
         self._reverted = True
         super().accept()
 
+    def _allowed(self) -> bool:
+        """Whether the setting as the fields hold it may be applied: a measurement still
+        waiting on its timer is taken first, so the clipping guard judges these fields."""
+        if self._remeasure.isActive():
+            self._remeasure.stop()
+            self._measure()
+        return self._apply_btn.isEnabled()
+
     def preview(self) -> None:
-        if not self._apply_btn.isEnabled():
+        if not self._allowed():
             return
         self._previewed = True
         self._preview_fn(self.processing())
 
     def accept(self) -> None:
-        if not self._apply_btn.isEnabled():
+        if not self._allowed():
             return
         super().accept()
 

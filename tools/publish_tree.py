@@ -206,9 +206,11 @@ _SYNC_FILE = "tools/publish_sync.txt"
 # Every publish commit's message carries this sentence (branch_message). A publish commit is
 # this tree's own change, so check 3b does not hold the release tree to it.
 _PUBLISH_MARK = "This branch replaces the tree wholesale."
-# A line shorter than this, once its whitespace is collapsed, is too common to show whether
-# a change was kept or undone.
+# A line this long, once its whitespace is collapsed, is found anywhere in a file's text, so
+# a re-wrapped paragraph still holds it. A shorter one is compared as a whole line, and one
+# shorter than _MIN_SHORT is too common to show whether a change was kept or undone.
 _MIN_LINE = 20
+_MIN_SHORT = 8
 
 
 def _git(args: list[str], git_dir: str) -> subprocess.CompletedProcess:
@@ -329,15 +331,20 @@ def _hunks(sha: str, git_dir: str) -> dict[str, list[tuple[list[str], list[str]]
 def _undone(sha: str, root: str, git_dir: str) -> list[str]:
     """What the tree at `root` undoes of commit `sha`: a file the commit added or changed that
     is absent, a file the commit deleted that is present with any of its deleted text, or a
-    change whose removed text is back while its added text is not (a line it
-    added that is missing, for a change that only adds; a line it removed that the tree holds
-    more often than the commit's own file does, for a change that only removes). Text is
-    compared with whitespace collapsed and line ends as LF; a later edit of the commit's text,
-    which brings back neither side, is kept. The upstream-owned files are grafted, so they are
-    not checked."""
+    change whose removed text is back while its added text is not. For a change that only
+    adds: every line it added is missing, or a run of them is, with the lines around the run
+    adjacent in the tree. For a change that only removes: a line it removed that the tree
+    holds more often than the commit's own file does. A file with no text change (a binary
+    or empty file, or a mode change) is undone when it is absent, when its content is the
+    parent's again, or when its executable bit is the parent's again. Text is compared with
+    whitespace collapsed and line ends as LF; a line of _MIN_LINE characters or more anywhere
+    in the file's text, a shorter one of at least _MIN_SHORT as a whole line. A later edit of
+    the commit's text, which brings back neither side, is kept. The upstream-owned files are
+    grafted, so they are not checked."""
     found = []
     subject = _git(["log", "-1", "--format=%h %s", sha], git_dir).stdout.decode().strip()
-    for path, changes in _hunks(sha, git_dir).items():
+    hunks = _hunks(sha, git_dir)
+    for path, changes in hunks.items():
         if path in _UPSTREAM_OWNED:
             continue
         full = os.path.join(root, path)
@@ -347,30 +354,143 @@ def _undone(sha: str, root: str, git_dir: str) -> list[str]:
                 found.append(f"{path} is absent from the release tree, undoing {subject}")
             continue
         with open(full, "rb") as f:
-            have = _flat(_lf(f.read()).decode("utf-8", "replace"))
+            text = _lf(f.read()).decode("utf-8", "replace")
+        have = _flat(text)
+        have_lines = [_flat(x) for x in text.split("\n")]
         if after is None:                              # the commit deleted the file
             gone = [_flat(x) for removed, _ in changes for x in removed
                     if len(_flat(x)) >= _MIN_LINE]
             if not gone or any(g in have for g in gone):
                 found.append(f"{path} is back in the release tree, undoing {subject}")
             continue
-        kept_by_commit = _flat(after.decode("utf-8", "replace"))
-        for removed, added in changes:
-            gone = [_flat(x) for x in removed if len(_flat(x)) >= _MIN_LINE]
-            new = [_flat(x) for x in added if len(_flat(x)) >= _MIN_LINE]
-            joined = _flat(" ".join(added))
-            gone = [g for g in gone if g not in joined]   # text the change kept is not removed
-            if new:
-                back = [g for g in gone if g in have]
-            else:                                      # a pure deletion
-                back = [g for g in gone if have.count(g) > kept_by_commit.count(g)]
-            kept = [a for a in new if a in have]
-            if (back and (not new or len(kept) < len(new))) or (new and not gone and not kept):
-                shown = (back or new)[0]
-                found.append(f"{path} undoes {subject}: "
-                             f"{'its old text is back' if back else 'its added text is gone'}"
-                             f" ({shown[:70]!r})")
-                break
+        after_text = after.decode("utf-8", "replace")
+        kept_by_commit = _flat(after_text)
+        after_lines = after_text.split("\n")
+        problem = _undone_change(changes, have, have_lines, kept_by_commit, after_lines)
+        if problem:
+            found.append(f"{path} undoes {subject}: {problem}")
+    found += _undone_paths(sha, root, git_dir, subject, set(hunks))
+    return found
+
+
+def _counted(line: str) -> bool:
+    return len(_flat(line)) >= _MIN_SHORT
+
+
+def _in(line: str, have: str, have_lines: list[str]) -> bool:
+    """Whether the tree holds `line`: in its text, or as a whole line when it is short."""
+    flat = _flat(line)
+    return flat in have if len(flat) >= _MIN_LINE else flat in have_lines
+
+
+def _undone_change(changes, have: str, have_lines: list[str], kept_by_commit: str,
+                   after_lines: list[str]) -> str | None:
+    """Why the tree's text undoes one of the commit's `changes` to a file, or None."""
+    after_flat = [_flat(x) for x in after_lines]
+    for removed, added in changes:
+        new = [a for a in added if _counted(a)]
+        added_flat = {_flat(a) for a in added}
+        joined = _flat(" ".join(added))
+        # Text the change kept is not removed.
+        gone = [g for g in removed if _counted(g) and not
+                (_flat(g) in joined if len(_flat(g)) >= _MIN_LINE else _flat(g) in added_flat)]
+        if new:
+            back = [g for g in gone if _in(g, have, have_lines)]
+        else:                                          # a pure deletion
+            back = [g for g in gone
+                    if (have.count(_flat(g)) > kept_by_commit.count(_flat(g))
+                        if len(_flat(g)) >= _MIN_LINE
+                        else have_lines.count(_flat(g)) > after_flat.count(_flat(g)))]
+        kept = [a for a in new if _in(a, have, have_lines)]
+        if back and (not new or len(kept) < len(new)):
+            return f"its old text is back ({_flat(back[0])[:70]!r})"
+        if new and not gone:
+            if not kept:
+                return f"its added text is gone ({_flat(new[0])[:70]!r})"
+            run = _deleted_run(added, have, have_lines, after_lines)
+            if run is not None:
+                return f"its added text is gone ({run[:70]!r})"
+    return None
+
+
+def _deleted_run(added: list[str], have: str, have_lines: list[str],
+                 after_lines: list[str]) -> str | None:
+    """The first line of a run of `added` lines missing from the tree whose neighbours in the
+    commit's file (`after_lines`) are adjacent in the tree (`have_lines`), so the run was
+    deleted rather than edited; None when there is none or the added lines cannot be placed
+    in the commit's file."""
+    n = len(added)
+    at = next((i for i in range(len(after_lines) - n + 1) if after_lines[i:i + n] == added),
+              None)
+    if at is None:
+        return None
+    tree = [x for x in have_lines if x]
+    nxt = {}
+    for a, b in zip(tree, tree[1:]):
+        nxt.setdefault(a, set()).add(b)
+
+    def missing(i: int) -> bool:
+        return at <= i < at + n and _counted(after_lines[i]) and \
+            not _in(after_lines[i], have, have_lines)
+
+    i = at
+    while i < at + n:
+        if not missing(i):
+            i += 1
+            continue
+        j = i
+        while j < at + n and (missing(j) or not _flat(after_lines[j])):
+            j += 1
+        before = next((_flat(after_lines[k]) for k in range(i - 1, -1, -1)
+                       if _flat(after_lines[k])), None)
+        after = next((_flat(after_lines[k]) for k in range(j, len(after_lines))
+                      if _flat(after_lines[k])), None)
+        if before is None and after is not None:
+            adjacent = bool(tree) and tree[0] == after
+        elif after is None and before is not None:
+            adjacent = bool(tree) and tree[-1] == before
+        else:
+            adjacent = before is not None and after in nxt.get(before, ())
+        if adjacent:
+            return _flat(after_lines[i])
+        i = j
+    return None
+
+
+def _undone_paths(sha: str, root: str, git_dir: str, subject: str,
+                  texts: set[str]) -> list[str]:
+    """What the tree undoes of `sha`'s files that have no text change in `texts`: a binary or
+    empty file added or changed that is absent or holds its parent's content again, one
+    deleted that is present, and an executable bit the commit changed that is the parent's
+    again (not checked on Windows, whose files have no executable bit)."""
+    out = _git(["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-abbrev",
+                f"{sha}^1", sha], git_dir).stdout.decode("utf-8", "replace")
+    fields = out.split("\0")
+    found = []
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        if not meta.startswith(":") or path in _UPSTREAM_OWNED:
+            continue
+        old_mode, new_mode, _old, _new, status = meta[1:].split()[:5]
+        full = os.path.join(root, path)
+        here = os.path.isfile(full)
+        if status in ("A", "M") and path not in texts:
+            if not here:
+                found.append(f"{path} is absent from the release tree, undoing {subject}")
+                continue
+            parent = _blob(f"{sha}^1", path, git_dir) if status == "M" else None
+            with open(full, "rb") as f:
+                content = _lf(f.read())
+            if parent is not None and _old != _new and content == parent:
+                found.append(f"{path} undoes {subject}: its old content is back")
+                continue
+        if status == "D" and path not in texts and here:
+            found.append(f"{path} is back in the release tree, undoing {subject}")
+            continue
+        if status == "M" and here and old_mode != new_mode and sys.platform != "win32":
+            was, now = old_mode == "100755", new_mode == "100755"
+            if was != now and bool(os.stat(full).st_mode & 0o111) == was:
+                found.append(f"{path} undoes {subject}: it is "
+                             f"{'executable' if was else 'not executable'} again")
     return found
 
 
@@ -901,6 +1021,10 @@ def _usage_problems(argv: list[str]) -> list[str]:
         else:
             problems.append(f"unknown option {name}: the options are "
                             f"{', '.join(_FLAGS + _VALUE_OPTIONS)}")
+    names = [a.partition("=")[0] for a in argv if a.startswith("-")]
+    for name in _VALUE_OPTIONS:
+        if names.count(name) > 1:
+            problems.append(f"{name} given more than once: name it once")
     positional = [a for a in argv if not a.startswith("-")]
     if len(positional) > 1:
         problems.append(f"one commit to build, at most; got {' '.join(positional)}")
@@ -1133,7 +1257,11 @@ def _check_assembled(rev: str | None, upstream: str, dest: str, work: str, previ
     # 3b. everything merged upstream is in the release tree, and nothing it changed reverted
     points = read_sync_points(rev)
     sync_problems = check_upstream_sync(dest, upstream, points)
-    print(f"  upstream sync: {len(points)} recorded point(s); "
+    # The check reads the local upstream ref and does not fetch: say which commit it was, so
+    # a ref older than the remote's branch shows.
+    at = _git(["log", "-1", "--format=%h, committed %cs", upstream], _ROOT).stdout.decode()
+    print(f"  upstream sync: {len(points)} recorded point(s), against {upstream} at "
+          f"{at.strip() or 'an unknown commit'} (as last fetched); "
           f"{'OK' if not sync_problems else f'{len(sync_problems)} problem(s)'}")
     failures += sync_problems
 

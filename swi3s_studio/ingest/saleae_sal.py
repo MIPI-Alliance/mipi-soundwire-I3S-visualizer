@@ -418,7 +418,8 @@ def decode_memory_floor() -> int:
 _MEM_HEADROOM = 0.6
 # Peak/final ratio for a streaming windowed decode: a channel's in-window int64 edges
 # and their concatenation are live at once, while the channel decoded first is kept.
-# The rebase to the window start is done in place. Measured with tracemalloc.
+# The rebase to the window start is done in place. An upper bound, enforced by
+# test_a_window_of_a_one_block_channel_peaks_within_the_guard.
 _STREAM_TRANSIENT = 2.0
 # Peak/final ratio for a whole-file decode: the output plus one block's int64 deltas, and
 # one block can be the whole channel. See SalCost.est_peak_bytes.
@@ -427,14 +428,15 @@ _WHOLE_FILE_TRANSIENT = 2.0
 # block's size: a block can be the whole channel.
 _STREAM_CHUNK = 1 << 18
 # Peak working set of decoding one chunk, per byte of delta run in it: the int64 deltas,
-# their positions and masks, and the over-long-code scan. Measured with tracemalloc at
-# up to 21 with the native decoder, and up to 98 with the vectorised NumPy one (its int64
-# and boolean temporaries). A constant whatever the window.
+# their positions and masks, and the over-long-code scan. An upper bound for each decoder
+# (the NumPy one holds more int64 and boolean temporaries), enforced by
+# test_a_window_of_a_one_block_channel_peaks_within_the_guard. A constant whatever the
+# window.
 _STREAM_DECODE_BYTES_PER_BYTE_NATIVE = 24
 _STREAM_DECODE_BYTES_PER_BYTE_NUMPY = 100
 # Fixed working set of a streaming decode whatever the window: the zip member's reader
-# and inflater, one block header at a time and the small per-call arrays. Measured with
-# tracemalloc at under 0.3 MB on a DEFLATE member.
+# and inflater, one block header at a time and the small per-call arrays. An upper bound,
+# enforced by test_a_window_of_a_one_block_channel_peaks_within_the_guard.
 _STREAM_FIXED_BYTES = 1 << 20
 
 
@@ -465,8 +467,7 @@ def whole_channel_peak_bytes(blob_bytes: int) -> int:
 
 # Buckets a channel's block index keeps: on reaching twice this, adjacent buckets are
 # merged in pairs, so an index is under 2 x 4096 buckets of 16 bytes whatever the chain's
-# length. Measured with tracemalloc on a 250,000-block chain: 7,813 buckets, 125 KB
-# held, a header-walk peak of 0.66 MB.
+# length.
 _INDEX_BUCKETS = 1 << 12
 
 
@@ -547,6 +548,7 @@ class SalWindowModel:
     max_block_bytes: int = 0
     channels: Dict[int, _BlockIndex] = field(default_factory=dict)
     whole_channels: Dict[int, int] = field(default_factory=dict)
+    block_bytes: Dict[int, int] = field(default_factory=dict)   # each streamed channel's largest
 
     def edge_bytes(self, s0: int, s1: int) -> int:
         """Upper bound on the in-window edge arrays of ``[s0, s1)``, summed over the
@@ -559,6 +561,19 @@ class SalWindowModel:
             total += min(idx.bytes_overlapping(s0, s1), samples)
         return total * _EDGE_BYTES
 
+    def of(self, channels: Sequence[int]) -> "SalWindowModel":
+        """The model of `channels` alone (the two a Link loads), as window_model of them
+        gives it."""
+        keep = set(channels)
+        idx = {ch: i for ch, i in self.channels.items() if ch in keep}
+        big = {ch: b for ch, b in self.block_bytes.items() if ch in keep}
+        return SalWindowModel(span_samples=self.span_samples,
+                              max_block_bytes=max(big.values(), default=0),
+                              channels=idx,
+                              whole_channels={ch: b for ch, b in self.whole_channels.items()
+                                              if ch in keep},
+                              block_bytes=big)
+
     def peak_bytes(self, s0: int, s1: int) -> int:
         """Rough peak of a windowed decode of ``[s0, s1)``: the streamed channels'
         :func:`window_peak_bytes` plus :func:`whole_channel_peak_bytes` of each channel
@@ -567,19 +582,48 @@ class SalWindowModel:
                 + sum(whole_channel_peak_bytes(b) for b in self.whole_channels.values()))
 
 
+# What reading an inflating zip member raises when its stream is damaged.
+_STREAM_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError, OSError)
+
+
+def _stream_reason(exc: BaseException) -> str:
+    """The import-note wording for a zip member read that failed with `exc`."""
+    return f"the archive member cannot be read ({type(exc).__name__}: {exc})"
+
+
+def _read_head(fh, n: int, step: int = 1 << 12):
+    """``(bytes, exc)``: up to `n` bytes from the start of `fh`, read `step` bytes at a
+    time, and the stream error that ended the read early (None when it did not)."""
+    parts: List[bytes] = []
+    got = 0
+    try:
+        while got < n:
+            chunk = fh.read(min(step, n - got))
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
+    except _STREAM_ERRORS as exc:
+        return b"".join(parts), exc
+    return b"".join(parts), None
+
+
 def _v3_span_streaming(fh, size: int, want_start: bool = False,
-                       want_max_block: bool = False, want_index: bool = False):
+                       want_max_block: bool = False, want_index: bool = False,
+                       unreadable: Optional[list] = None):
     """Last ``B_end`` of a v3 block chain, read by streaming the headers only.
 
     Walks the chain from the start of the stream, seeking past each block's delta
     payload instead of decoding (or even holding) it, so peak memory is one block
-    header regardless of blob size, so it can measure a file too big to open.
+    header and one candidate search step regardless of blob size, so it can measure a
+    file too big to open.
 
     Returns 0 if no self-consistent chain tiles the stream exactly. The candidate
-    first-block offsets are those inside the first
-    `saleae_binary.V3_CHAIN_START_SCAN` bytes and a candidate is accepted by the same
-    header checks as :func:`saleae_binary._find_v3_chain_start`, so the two accept
-    the same chains. With
+    first-block offsets are the zero qwords inside the first
+    `saleae_binary.V3_CHAIN_START_SCAN` bytes, then those in the rest of the stream,
+    read `saleae_binary.V3_CANDIDATE_STEP` bytes at a time, and a candidate is accepted
+    by the same header checks as :func:`saleae_binary._find_v3_chain_start`, so the two
+    accept the same chains. With
     ``want_start`` returns ``(chain_end, start_offset)`` instead — a caller that
     then decodes needs the VALIDATED offset, because a real Logic 2 metadata header
     contains several zero qwords that each look like a candidate first block and
@@ -587,64 +631,140 @@ def _v3_span_streaming(fh, size: int, want_start: bool = False,
     ``(chain_end, start_offset, largest block's delta-run bytes)``; with
     ``want_index``, ``(chain_end, start_offset, largest block's delta-run bytes,
     _BlockIndex)``.
+
+    `unreadable`, when a list, lets a stream that cannot be read to its end (a deflate
+    or CRC failure) end the chain rather than the walk. When no candidate tiles the
+    stream and the stream fails to read to its end, the candidate that walked the most
+    block headers before its chain broke is the chain: its end is its last header's
+    ``B_end``, and ``(readable_end, reason)`` is appended to `unreadable`, where
+    `readable_end` is that last block's ``A_start`` (the blocks ending by then were read
+    and passed the header checks). A chain that breaks in a stream that reads whole is
+    no chain. Without `unreadable` a stream error propagates.
     """
     fail = ((0, -1, 0, _BlockIndex().finish()) if want_index
             else (0, -1, 0) if want_max_block else ((0, -1) if want_start else 0))
-    head = fh.read(saleae_binary.V3_CHAIN_START_SCAN)
+    if unreadable is None:
+        head, head_exc = fh.read(saleae_binary.V3_CHAIN_START_SCAN), None
+    else:
+        head, head_exc = _read_head(fh, saleae_binary.V3_CHAIN_START_SCAN)
     if len(head) < 16 or head[:8] != saleae_binary.SALEAE_MAGIC:
         return fail
     if int.from_bytes(head[8:12], "little") not in saleae_binary.V3_LIKE_VERSIONS:
         return fail
     hdr_len = saleae_binary._V3_BLOCK_HEADER
     bc_off = saleae_binary._V3_BYTECOUNT_OFF
-    for o0 in range(16, len(head) - hdr_len + 1):
-        if int.from_bytes(head[o0:o0 + 8], "little") != 0:      # first block A_start == 0
-            continue
-        pos, prev_b, ok, big = o0, None, True, 0
+
+    def result(o0, chain_end, big, index):
+        if index is not None:
+            return int(chain_end), o0, int(big), index.finish()
+        if want_max_block:
+            return int(chain_end), o0, int(big)
+        return (int(chain_end), o0) if want_start else int(chain_end)
+
+    # With `unreadable`: the walk that read the most blocks before its chain broke, as
+    # (blocks, readable_end, start, last B_end, largest run, index).
+    best: list = []
+
+    def broke(o0, n, prev_a, prev_b, big, index):
+        if unreadable is not None and n and (not best or n > best[0]):
+            best[:] = [n, int(prev_a), o0, prev_b, big, index]
+
+    def walk(o0, buf, base):
+        """The result for a chain starting at `o0`, or None; `buf` holds the stream's
+        bytes from `base`, and a header outside it is read from the stream."""
+        pos, prev_a, prev_b, big, n = o0, 0, None, 0, 0
         index = _BlockIndex() if want_index else None
-        buf = head
         while pos + hdr_len <= size:
-            if pos + hdr_len > len(buf):                        # need more bytes
-                fh.seek(pos)
-                chunk = fh.read(hdr_len)
+            r = pos - base
+            if r + hdr_len > len(buf):                          # need more bytes
+                try:
+                    fh.seek(pos)
+                    chunk = fh.read(hdr_len)
+                except _STREAM_ERRORS:
+                    if unreadable is None:
+                        raise
+                    broke(o0, n, prev_a, prev_b, big, index)
+                    return None
                 if len(chunk) < hdr_len:
-                    ok = False
-                    break
-                a = int.from_bytes(chunk[0:8], "little")
-                b = int.from_bytes(chunk[8:16], "little")
-                cnt = int.from_bytes(chunk[bc_off:bc_off + 8], "little")
+                    broke(o0, n, prev_a, prev_b, big, index)
+                    return None
+                r, hdr = 0, chunk
             else:
-                a = int.from_bytes(buf[pos:pos + 8], "little")
-                b = int.from_bytes(buf[pos + 8:pos + 16], "little")
-                cnt = int.from_bytes(buf[pos + bc_off:pos + bc_off + 8], "little")
+                hdr = buf
+            a = int.from_bytes(hdr[r:r + 8], "little")
+            b = int.from_bytes(hdr[r + 8:r + 16], "little")
+            cnt = int.from_bytes(hdr[r + bc_off:r + bc_off + 8], "little")
             body = pos + hdr_len
             if b < a or body + cnt > size or (prev_b is None and a != 0) or \
                (prev_b is not None and a != prev_b):
-                ok = False
-                break
+                broke(o0, n, prev_a, prev_b, big, index)
+                return None
             if prev_b is None and b == a and body + cnt != size:
-                ok = False
-                break
-            prev_b, pos, big = b, body + cnt, max(big, cnt)
+                return None
+            prev_a, prev_b, pos, big, n = a, b, body + cnt, max(big, cnt), n + 1
             if index is not None:
                 index.add(b, cnt)
-        if ok and pos == size and prev_b is not None:
-            if index is not None:
-                return int(prev_b), o0, int(big), index.finish()
-            if want_max_block:
-                return int(prev_b), o0, int(big)
-            return (int(prev_b), o0) if want_start else int(prev_b)
-        # The next candidate walks from `head`, which is unchanged; the stream is only
-        # sought (absolutely) once a walk passes it.
-    return fail
+        if pos != size or prev_b is None:
+            broke(o0, n, prev_a, prev_b, big, index)
+            return None
+        return result(o0, prev_b, big, index)
 
+    def damaged():
+        """The longest broken walk when the stream cannot be read to its end, else
+        `fail`: a chain that breaks in a stream that reads whole is malformed."""
+        exc = head_exc
+        if exc is None and best:
+            try:
+                fh.seek(0)
+                while fh.read(1 << 20):
+                    pass
+            except _STREAM_ERRORS as e:
+                exc = e
+        if exc is None or not best:
+            if exc is not None and unreadable is None:
+                raise exc
+            return fail
+        assert unreadable is not None
+        _n, readable_end, o0, chain_end, big, index = best
+        unreadable.append((readable_end, _stream_reason(exc)))
+        return result(o0, chain_end, big, index)
+
+    split = len(head) - hdr_len + 1
+    if head_exc is not None:
+        fh.seek(0)                          # a header past `head` is read afresh
+    for o0 in saleae_binary.v3_zero_qwords(head, 16, split):
+        got = walk(o0, head, 0)
+        if got is not None:
+            return got
+    if head_exc is not None:
+        return damaged()
+    step = saleae_binary.V3_CANDIDATE_STEP
+    pos = max(16, split)
+    while pos + hdr_len <= size:                     # past the prefix, a step at a time
+        try:
+            fh.seek(pos)
+            chunk = fh.read(step + hdr_len - 1)
+        except _STREAM_ERRORS:
+            if unreadable is None:
+                raise
+            return damaged()
+        if len(chunk) < hdr_len:
+            break
+        for o in saleae_binary.v3_zero_qwords(chunk, 0, min(step, len(chunk) - hdr_len + 1)):
+            got = walk(pos + o, chunk, pos)
+            if got is not None:
+                return got
+        pos += step
+    return damaged() if unreadable is not None else fail
 
 def _v3_chains(path: str, info: "SalInfo", channels: Sequence[int]) -> Dict[int, tuple]:
     """``{channel: (chain_end, start_offset, largest block's run bytes, _BlockIndex,
-    blob bytes)}`` from one header walk of each channel's blob
-    (:func:`_v3_span_streaming`); ``(0, -1, 0, empty index, blob bytes)`` for a blob
-    that is not a v3 chain or cannot be read, with blob bytes 0 when its size cannot be
-    read either. A windowed load walks each channel once and hands the result to both
+    blob bytes, unreadable)}`` from one header walk of each channel's blob
+    (:func:`_v3_span_streaming`); ``(0, -1, 0, empty index, blob bytes, None)`` for a
+    blob that is not a v3 chain or cannot be read, with blob bytes 0 when its size cannot
+    be read either. `unreadable` is None, or ``(readable_end, reason)`` for a member whose
+    stream cannot be read past sample `readable_end`; its chain ends at the last block
+    header read. A windowed load walks each channel once and hands the result to both
     the guard and the decode."""
     out: Dict[int, tuple] = {}
     with zipfile.ZipFile(path) as z:
@@ -653,11 +773,13 @@ def _v3_chains(path: str, info: "SalInfo", channels: Sequence[int]) -> Dict[int,
             try:
                 name = info.digital_files[ch]
                 size = int(z.getinfo(name).file_size)
+                cut: List[tuple] = []
                 with z.open(name) as fh:
-                    out[ch] = tuple(_v3_span_streaming(fh, size, want_start=True,
-                                                       want_index=True)) + (size,)
+                    walked = tuple(_v3_span_streaming(fh, size, want_start=True,
+                                                      want_index=True, unreadable=cut))
+                out[ch] = walked + (size, cut[0] if cut else None)
             except Exception:
-                out[ch] = (0, -1, 0, _BlockIndex().finish(), size)
+                out[ch] = (0, -1, 0, _BlockIndex().finish(), size, None)
     return out
 
 
@@ -673,7 +795,8 @@ def _model_from_chains(chains: Dict[int, tuple]) -> SalWindowModel:
                           max_block_bytes=max((c[2] for c in walked.values()), default=0),
                           channels={ch: c[3] for ch, c in walked.items()},
                           whole_channels={ch: int(c[4]) for ch, c in chains.items()
-                                          if not _streams(c)})
+                                          if not _streams(c)},
+                          block_bytes={ch: int(c[2]) for ch, c in walked.items()})
 
 
 def window_model(path: str, channels: Optional[Sequence[int]] = None) -> SalWindowModel:
@@ -765,10 +888,11 @@ def read_info(path: str) -> SalInfo:
     # entry["type"]=="Digital" and entry["file"].
     digital_files: Dict[int, str] = {}
     bin_data = _dig(meta, "binData", default=[]) or []
+    named = False                          # a note says the file names give the channels
     if not isinstance(bin_data, list):
         notes.append("meta.json binData is not a list; the digital-N.bin file names "
                      "are used")
-        bin_data = []
+        bin_data, named = [], True
     unusable: List[str] = []
     repeated: List[str] = []
     for entry in bin_data:
@@ -795,14 +919,15 @@ def read_info(path: str) -> SalInfo:
                      f"name{'' if n != 1 else 's'} no file in the archive or no device "
                      f"channel and {'are' if n != 1 else 'is'} skipped: "
                      f"{', '.join(unusable[:4])}{' …' if n > 4 else ''}")
-    # Fall back to positional digital-N.bin if binData is absent/uninformative.
+    # Fall back to positional digital-N.bin if binData is absent/uninformative, and say so.
     if not digital_files:
         i = 0
         while f"digital-{i}.bin" in names:
             digital_files[i] = f"digital-{i}.bin"
             i += 1
-        if digital_files and unusable:
-            notes.append("the channel numbers are taken from the digital-N.bin file names")
+        if digital_files and not named:
+            notes.append("meta.json binData lists no usable digital channel; the channel "
+                         "numbers are taken from the digital-N.bin file names")
     channels = sorted(digital_files)
     return SalInfo(sample_rate_hz=sample_rate, digital_files=digital_files, channels=channels,
                    notes=notes)
@@ -826,7 +951,8 @@ class _UnstampedBlockLevels(Exception):
 
 
 def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
-                                trust_levels: bool = True, chain=None):
+                                trust_levels: bool = True, chain=None,
+                                bad_after: Optional[list] = None):
     """Decode a v3 window straight from the zip stream, never holding the blob.
 
     Unlike :func:`saleae_binary.parse_channel_v3_window`, which needs the whole
@@ -834,7 +960,8 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
     **skipped** as it streams past or decoded when it overlaps the window, a
     `_STREAM_CHUNK` of its delta run at a time. Peak memory is therefore one chunk's
     decode plus the window's own edges, whatever the block size. Inflating is
-    sequential, so the time taken grows with the window's END, not its length.
+    sequential, so the time taken grows with the window's END, not its length, and with
+    the whole blob when `bad_after` is given.
 
     A skipped block contributes only the LINE LEVEL at the window's start. With
     ``trust_levels`` that bit comes from the block headers: each header carries `level`,
@@ -857,8 +984,14 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
 
     Every block that is decoded is checked as the whole-file reader checks it (no delta
     code too long for int64, deltas summing to the header's span) and raises
-    :class:`saleae_binary.MalformedSaleaeV3` if it fails. A block skipped on the
+    :class:`saleae_binary.MalformedSaleaeV3` if it fails. A block that overlaps the
+    window is decoded to its end, past the window's end too. A block skipped on the
     strength of its header is not decoded, so it is not checked.
+
+    `bad_after`, when a list, has the blocks after the window checked the same way, one
+    at a time (:func:`_check_blocks_after`): each that fails appends
+    ``(A_start, B_end, reason)`` to it rather than raising. Without it, decoding stops
+    at the first block past the window.
 
     `chain` is ``(chain_end, start_offset)`` from :func:`_v3_span_streaming` when the
     caller has walked the chain already; otherwise this walks it, then seeks back to 0.
@@ -888,8 +1021,19 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
     initial = None          # line level at capture start, from the first block's header
     level = None            # line level AT s0, from the header of the block containing it
     skipped = 0             # blocks that ended at or before s0
+    after = None            # (A_start, B_end, byte count) of a header read past the window
+    prev_b = 0              # B_end of the last block read
     while pos + hdr_len <= size:
-        h = fh.read(hdr_len)
+        try:
+            h = fh.read(hdr_len)
+        except _STREAM_ERRORS as exc:
+            # The previous block's run was read whole: a header past the window that
+            # cannot be read is reported with the bad blocks, one inside it is refused.
+            if bad_after is None or prev_b < limit:
+                raise
+            bad_after.append((prev_b, prev_b, _stream_reason(exc)))
+            pos = size
+            break
         if len(h) < hdr_len:
             break
         a = int.from_bytes(h[0:8], "little")
@@ -900,6 +1044,7 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
             initial = lvl
         body = pos + hdr_len
         if b < a or body + cnt > size:
+            pos = size                                # nothing after it is a block
             break
         if b <= s0:
             skipped += 1
@@ -909,17 +1054,16 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
                 parity ^= _count_and_discard(fh, cnt, drop_last=(b >= chain_end),
                                              span=(a, b), label=label) & 1
         elif a >= limit:
-            break                                     # past the window; stop inflating
+            after = (a, b, cnt)                       # the first block past the window
+            break
         else:
-            crossed, done = _decode_overlap(fh, cnt, a, b, s0, limit, label, kept)
+            crossed = _decode_overlap(fh, cnt, a, b, s0, limit, label, kept)
             parity ^= crossed
             if level is None and trust_levels and stamped:
                 # This block spans s0, so its own header level plus the transitions it
                 # holds before s0 give the level at s0 -- no earlier block involved.
                 level = lvl ^ crossed
-            if done:
-                break                                 # the rest is past the window
-        pos = body + cnt
+        pos, prev_b = body + cnt, b
     if trust_levels and not stamped and skipped:
         # No metadata header, so the per-block levels may be zeros the writer never filled
         # in. Guessing would invert the line level silently; hand it to the parity walk.
@@ -931,6 +1075,8 @@ def _decode_v3_window_streaming(fh, size: int, s0: int, s1: int, label: str,
         if trust_levels and stamped and skipped:
             raise _UnstampedBlockLevels(label)
         level = (initial or 0) ^ parity
+    if bad_after is not None and pos < size:
+        _check_blocks_after(fh, size, pos, after, label, bad_after, prev_b)
     samples = (np.concatenate(kept) if len(kept) > 1
                else (kept[0] if kept else np.zeros(0, dtype=np.int64)))
     kept.clear()
@@ -992,19 +1138,17 @@ def _stream_deltas(fh, nbytes: int, label: str):
 
 
 def _decode_overlap(fh, cnt: int, a: int, b: int, s0: int, limit: int, label: str,
-                    kept: list):
-    """Decode a block that overlaps the window, appending its in-window positions
-    (int64, strictly between s0 and `limit`) to `kept`.
+                    kept: list) -> int:
+    """Decode a block that overlaps the window to its end, appending its in-window
+    positions (int64, strictly between s0 and `limit`) to `kept`.
 
-    Returns ``(parity of its transitions at or before s0, done)``. `done` is True when
-    the block's positions reached `limit` before its run ended; the rest of the block
-    is then left unread, as is every later block. A block decoded to its end must sum
-    to its header's span, and positions never pass `b`; either failure raises
+    Returns the parity of its transitions at or before s0. The block must sum to its
+    header's span, and positions never pass `b`; either failure raises
     :class:`saleae_binary.MalformedSaleaeV3`. The block's last delta may be the gap to
     capture end (the chain's phantom edge at `b`), which `limit` excludes."""
     base = int(a)
     crossed = 0
-    for deltas, last in _stream_deltas(fh, cnt, label):
+    for deltas, _last in _stream_deltas(fh, cnt, label):
         p = np.cumsum(deltas)
         del deltas
         p += base
@@ -1013,16 +1157,72 @@ def _decode_overlap(fh, cnt: int, a: int, b: int, s0: int, limit: int, label: st
             raise saleae_binary.MalformedSaleaeV3(
                 label, f"a block decodes past its header's end sample {b}")
         crossed ^= int(np.count_nonzero(p <= s0)) & 1
-        sel = p[(p > s0) & (p < limit)]
+        if int(p[0]) < limit:
+            sel = p[(p > s0) & (p < limit)]
+            if sel.size:
+                kept.append(sel)
         del p
-        if sel.size:
-            kept.append(sel)
-        if base >= limit and not last:
-            return crossed, True
     if base != b:
         raise saleae_binary.MalformedSaleaeV3(
             label, f"a block decodes to {base - a} samples, its header says {b - a}")
-    return crossed, False
+    return crossed
+
+
+class _CountingReader:
+    """`fh` with `count`, the bytes read through it since `count` was last set."""
+
+    __slots__ = ("_fh", "count")
+
+    def __init__(self, fh) -> None:
+        self._fh = fh
+        self.count = 0
+
+    def read(self, n: int) -> bytes:
+        got = self._fh.read(n)
+        self.count += len(got)
+        return got
+
+
+def _check_blocks_after(fh, size: int, pos: int, first, label: str, bad: list,
+                        prev_b: int = 0) -> None:
+    """Check each block from offset `pos` to the end of the blob as the whole-file reader
+    does, one block's run at a time, a `_STREAM_CHUNK` of it in memory
+    (:func:`_count_and_discard`). `first` is ``(A_start, B_end, byte count)`` when the
+    header at `pos` has already been read, else None; `prev_b` is the ``B_end`` of the
+    block before `pos`. A block that fails appends ``(A_start, B_end, reason)`` to `bad`
+    and the check goes on with the next block; a header whose run passes the blob's end
+    ends it, and so does a stream that cannot be read further, appending the block it
+    was reading."""
+    hdr_len = saleae_binary._V3_BLOCK_HEADER
+    bc_off = saleae_binary._V3_BYTECOUNT_OFF
+    reader = _CountingReader(fh)
+    a = b = prev_b
+    try:
+        while True:
+            if first is None:
+                if pos + hdr_len > size:
+                    return
+                a = b = prev_b
+                h = fh.read(hdr_len)
+                if len(h) < hdr_len:
+                    return
+                a = int.from_bytes(h[0:8], "little")
+                b = int.from_bytes(h[8:16], "little")
+                cnt = int.from_bytes(h[bc_off:bc_off + 8], "little")
+            else:
+                (a, b, cnt), first = first, None
+            body = pos + hdr_len
+            if b < a or body + cnt > size:
+                return
+            reader.count = 0
+            try:
+                _count_and_discard(reader, cnt, drop_last=False, span=(a, b), label=label)
+            except saleae_binary.MalformedSaleaeV3 as exc:
+                bad.append((a, b, exc.detail))
+                _skip(fh, cnt - reader.count)
+            pos, prev_b = body + cnt, b
+    except _STREAM_ERRORS as exc:
+        bad.append((a, b, _stream_reason(exc)))
 
 
 def _count_and_discard(fh, nbytes: int, drop_last: bool, span=None, label: str = "") -> int:
@@ -1049,7 +1249,7 @@ def _count_and_discard(fh, nbytes: int, drop_last: bool, span=None, label: str =
     return n - 1 if (drop_last and n) else n
 
 
-def _decode_channel(data: bytes, label: str, window=None):
+def _decode_channel(data: bytes, label: str, window=None, src: str = ""):
     """Decode one digital-N blob to (initial_state, times_s, samples, begin_time).
 
     For version 0 `times_s` is the transition times in seconds and `begin_time` is
@@ -1059,7 +1259,8 @@ def _decode_channel(data: bytes, label: str, window=None):
     load_capture so v0 and v3 channels can share ONE capture-start origin: a v3
     channel's sample 0 IS the v0 begin_time, and pre-trigger begin_times are negative
     and would wrap through the uint64 cast. Raises UnsupportedSaleaeVersion for any
-    other version.
+    other version. With `src`, a v0 blob holding bytes past the transitions its header
+    counts is an import warning of `src`, as for a .bin pair.
 
     `window` is an optional (start_sample, end_sample) pair. On v3 it is pushed down
     into the block-chain walk so only overlapping blocks are decoded (see
@@ -1069,14 +1270,17 @@ def _decode_channel(data: bytes, label: str, window=None):
     version = saleae_binary.peek_version(data, label)
     if version == 0:
         ch = saleae_binary.parse_channel(data, label)
+        note = saleae_binary.trailing_bytes_note(len(data), ch.times_s.size)
+        if note and src:
+            import_notes.warn(src, f"{label}: {note}")
         times = np.asarray(ch.times_s, dtype=np.float64)
         return ch.initial_state, times, None, float(ch.begin_time)
     if version in saleae_binary.V3_LIKE_VERSIONS:
         if window is not None:
-            ch = saleae_binary.parse_channel_v3_window(data, window[0], window[1], label)
+            samples = saleae_binary.parse_channel_v3_window(data, window[0], window[1], label)
         else:
-            ch = saleae_binary.parse_channel_v3(data, label)
-        return ch.initial_state, None, ch.transition_samples, 0.0
+            samples = saleae_binary.parse_channel_v3(data, label)
+        return samples.initial_state, None, samples.transition_samples, 0.0
     raise saleae_binary.UnsupportedSaleaeVersion(version, label)
 
 
@@ -1253,6 +1457,25 @@ def _v0_ordered(src: str, label: str, times: Optional[np.ndarray]) -> Optional[n
     return times
 
 
+def _bad_after_note(label: str, bad: List[tuple], rate: int) -> str:
+    """The import warning for the blocks after a window that failed their check: `bad` is
+    what :func:`_check_blocks_after` appended."""
+    n, (a, _b, reason) = len(bad), bad[0]
+    return (f"{label}: {n:,} block{'s' if n != 1 else ''} after the window "
+            f"do{'' if n != 1 else 'es'} not decode{', the first' if n != 1 else ''} "
+            f"starting at sample {a:,} ({_seconds(a, rate):.9g} s): {reason}. The window "
+            f"decodes and is read; the capture after it is damaged")
+
+
+def _unreadable_after_note(label: str, cut: tuple, rate: int) -> str:
+    """The import warning for an archive member that cannot be read past the window:
+    `cut` is the ``(readable_end, reason)`` of :func:`_v3_chains`."""
+    end, reason = cut
+    return (f"{label}: the capture cannot be read past sample {end:,} "
+            f"({_seconds(end, rate):.9g} s), after the window: {reason}. The window "
+            f"decodes and is read")
+
+
 def load_capture(path: str, clock_channel: int, data_channel: int,
                  sample_rate_hz: Optional[int] = None,
                  auto_clock: bool = False,
@@ -1270,10 +1493,15 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     order.
 
     ``window`` is an optional ``(start_sample, end_sample)`` range. Only transitions
-    inside it are decoded — on v3 the block chain is streamed, so memory scales with
-    the window rather than the capture (time with the window's end) — and the returned
-    Capture is REBASED so the window starts at sample 0 (matching Capture.subcapture,
-    so every downstream sample number is window-relative).
+    inside it are kept — on v3 the block chain is streamed, so memory scales with the
+    window rather than the capture — and the returned Capture is REBASED so the window
+    starts at sample 0 (matching Capture.subcapture, so every downstream sample number
+    is window-relative). A streamed v3 channel's blocks after the window are checked one
+    at a time as the whole-file reader checks them, so the time taken grows with the
+    file; a block that fails is an import warning, not a refusal, and so is an archive
+    member that cannot be read past the window (a deflate or CRC failure). A member that
+    cannot be read to the window's end raises ValueError naming the channel and the
+    sample its stream can be read to.
 
     ``max_bytes`` caps the predicted peak memory. When the estimate exceeds it,
     :class:`SalTooLargeError` is raised before any blob is inflated. Pass 0 to
@@ -1314,6 +1542,13 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
     chains = (_v3_chains(path, info, [clock_channel, data_channel])
               if window is not None else {})
     if window is not None:
+        for ch, c in sorted(chains.items()):
+            cut = c[5]
+            if cut is not None and int(window[1]) > cut[0]:
+                raise ValueError(
+                    f"{path}: digital ch{ch} cannot be read past sample {cut[0]:,} "
+                    f"({_seconds(cut[0], rate):.9g} s), inside the window: {cut[1]}. "
+                    f"A window that ends by then opens")
         _check_window(src, window, max((c[0] for c in chains.values()), default=0), rate)
     # --- pre-flight memory guard -------------------------------------------------
     # Estimate from the zip directory (no inflation) and refuse when over budget. A
@@ -1355,11 +1590,19 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
                 for trust in (True, False):
                     try:
                         size = z.getinfo(name).file_size
+                        bad: List[tuple] = []
                         with z.open(name) as fh:
                             got = _decode_v3_window_streaming(
                                 fh, size, int(window[0]), int(window[1]), label,
-                                trust_levels=trust, chain=chains.get(ch))
+                                trust_levels=trust, chain=chains.get(ch), bad_after=bad)
                         if got is not None:
+                            cut = chains[ch][5]
+                            if cut is not None:
+                                bad = [x for x in bad if x[2] != cut[1]]
+                                import_notes.warn(src, _unreadable_after_note(label, cut,
+                                                                              rate))
+                            if bad:
+                                import_notes.warn(src, _bad_after_note(label, bad, rate))
                             return got[0], None, got[1], 0.0
                         break                      # not a v3 chain: the retry won't help
                     except _UnstampedBlockLevels:
@@ -1375,7 +1618,7 @@ def load_capture(path: str, clock_channel: int, data_channel: int,
                                 path, cost, budget, window=window, streamed=False,
                                 cause=f"{type(exc).__name__}: {exc}") from None
                         break
-            return _decode_channel(z.read(name), label, window=window)
+            return _decode_channel(z.read(name), label, window=window, src=src)
 
         clk_init, clk_times, clk_samp, clk_begin = read_channel(clock_channel)
         dat_init, dat_times, dat_samp, dat_begin = read_channel(data_channel)

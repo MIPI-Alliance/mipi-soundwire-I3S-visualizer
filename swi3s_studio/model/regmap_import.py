@@ -595,11 +595,11 @@ class BitListXmlImporter(RegisterMapImporter):
             # Split into runs of contiguous bit positions (ordered high->low).
             members.sort(key=lambda m: -m[0])
             runs: List[List[Tuple[int, int, str]]] = []
-            for m in members:
-                if runs and m[0] == runs[-1][-1][0] - 1:
-                    runs[-1].append(m)
+            for member in members:
+                if runs and member[0] == runs[-1][-1][0] - 1:
+                    runs[-1].append(member)
                 else:
-                    runs.append([m])
+                    runs.append([member])
             for n, run in enumerate(runs):
                 out.append(_field_from_run(base, run, field_reset, report, reg_name,
                                            indexed=n > 0 or len(run) == 1))
@@ -702,6 +702,14 @@ def _parse_default(text: Optional[str], width: int, fmt: str = "") -> Tuple[int,
     return value & full, known & full
 
 
+def _known_bits(value: int, known: int, shift: int, width: int) -> Optional[int]:
+    """Bits `shift + width - 1 .. shift` of a (value, known-bit mask) default as a reset:
+    the number when every one of them is known, else None. A wide field or register is
+    sliced into byte pieces this way, so each piece whose bits are all known keeps them."""
+    mask = (1 << width) - 1
+    return (value >> shift) & mask if (known >> shift) & mask == mask else None
+
+
 def _all_unknown(text: str, fmt: str = "") -> bool:
     """True for a hex or binary default whose digits are all `X` (`0xXX`)."""
     digits, base_bits = _default_digits(text, fmt)
@@ -748,6 +756,10 @@ class RegisterFieldXmlImporter(RegisterMapImporter):
     inside one byte keeps its name; a field across bytes becomes one piece per byte, named
     with the field's own bits (`GAIN[15:8]`). A register's width is the widest of its
     default's digits and its fields' top bits, rounded up to 8, 16, 32 or 64 bits.
+    A field with a non-empty default takes its bits from that default, and each bit that
+    default leaves `X` from its register's default; a field with no default takes them all
+    from its register's default. A field default that differs from its register's default
+    on bits both know is reported, and the field's default is used.
     Registers outside device-defined space are skipped and counted: the spec register map
     decodes those addresses, and a vendor's copy of a spec register would only be listed
     twice."""
@@ -808,9 +820,9 @@ class RegisterFieldXmlImporter(RegisterMapImporter):
                                 f"bits above the field's {hi - lo + 1}-bit width — dropped")
             _note_default(report, f_what, f_el)
             fields_by_reg.setdefault(ref.group("reg"), []).append((
-                hi, lo, _text(f_el, "Name") or ref.group("reg"),
-                dv if dk == (1 << (hi - lo + 1)) - 1 else None,
-                f_el.find("DefaultValue") is not None,
+                hi, lo, _text(f_el, "Name") or ref.group("reg"), dv, dk,
+                bool(_text(f_el, "DefaultValue")),      # an empty default is no default
+                _text(f_el, "DefaultValue"),
                 _access_of(_text(f_el, "Access"), default_access,
                            _text(f_el, "Name") or ref.group("reg"), access_audit),
                 _text(f_el, "Description"), enum))
@@ -877,6 +889,23 @@ class RegisterFieldXmlImporter(RegisterMapImporter):
             _note_default(report, f"register {_clip(name)!r}", r_el)
             if reg_known != (1 << width) - 1:
                 unknown_reset += 1
+            for hi, lo, f_name, f_value, f_known, f_has_default, f_raw, *_ in fields:
+                f_mask = (1 << (hi - lo + 1)) - 1
+                both = f_known & (reg_known >> lo) & f_mask
+                if f_has_default and (f_value ^ (reg_value >> lo)) & both:
+                    report.add_each("field default disagreeing with its register",
+                                    f"register {_clip(name)!r} field {_clip(f_name)!r}: field "
+                                    f"default {_clip(f_raw)!r} disagrees with register default "
+                                    f"{_clip(raw)!r} at bits {hi}:{lo} — the field's default "
+                                    f"is used")
+            # Each byte's reset is the register default with every defaulted field's known
+            # bits laid over it: a field's default wins over its register's.
+            m_value, m_known = reg_value, reg_known
+            for hi, lo, _n, f_value, f_known, f_has_default, *_ in fields:
+                if f_has_default:
+                    f_bits = (f_known & ((1 << (hi - lo + 1)) - 1)) << lo
+                    m_value = (m_value & ~f_bits) | ((f_value << lo) & f_bits)
+                    m_known |= f_bits
             access = _access_of(_text(r_el, "Access"), default_access, name, access_audit)
             for k in range(width // 8):
                 b_lo, b_hi = 8 * k, 8 * k + 7
@@ -887,21 +916,22 @@ class RegisterFieldXmlImporter(RegisterMapImporter):
                                     f"duplicate address 0x{b_addr:08X} ({_clip(b_name)!r} and "
                                     f"{_clip(seen_addr[b_addr])!r})")
                 seen_addr[b_addr] = b_name
-                b_reset = ((reg_value >> b_lo) & 0xFF
-                           if (reg_known >> b_lo) & 0xFF == 0xFF else None)
+                b_reset = _known_bits(m_value, m_known, b_lo, 8)
                 b_fields: List[FieldSpec] = []
-                for hi, lo, f_name, f_reset, f_has_default, f_access, desc, enum in fields:
+                for hi, lo, f_name, f_value, f_known, f_has_default, _raw, f_access, desc, \
+                        enum in fields:
                     p_hi, p_lo = min(hi, b_hi), max(lo, b_lo)
                     if p_hi < p_lo:
                         continue
                     whole = (p_hi, p_lo) == (hi, lo)
                     if f_has_default:
-                        p_reset = (None if f_reset is None
-                                   else (f_reset >> (p_lo - lo)) & ((1 << (p_hi - p_lo + 1)) - 1))
+                        # The field's known bits, and the register default's where the
+                        # field's are X.
+                        r_known = (reg_known >> lo) & ~f_known & ((1 << (hi - lo + 1)) - 1)
+                        p_reset = _known_bits((f_value & f_known) | ((reg_value >> lo) & r_known),
+                                              f_known | r_known, p_lo - lo, p_hi - p_lo + 1)
                     else:
-                        mask = (1 << (p_hi - p_lo + 1)) - 1
-                        p_reset = ((reg_value >> p_lo) & mask
-                                   if (reg_known >> p_lo) & mask == mask else None)
+                        p_reset = _known_bits(reg_value, reg_known, p_lo, p_hi - p_lo + 1)
                     piece = (f_name if whole else
                              f"{f_name}[{p_hi - lo}:{p_lo - lo}]" if p_hi > p_lo
                              else f"{f_name}[{p_hi - lo}]")
@@ -947,7 +977,7 @@ class RegisterFieldXmlImporter(RegisterMapImporter):
 
 
 # Registry — first importer whose sniff() matches wins.
-_IMPORTERS: List[type] = [BitListXmlImporter, RegisterFieldXmlImporter]
+_IMPORTERS: List[type[RegisterMapImporter]] = [BitListXmlImporter, RegisterFieldXmlImporter]
 
 
 def import_text(text: str, source_name: str = "", coalesce: bool = True,

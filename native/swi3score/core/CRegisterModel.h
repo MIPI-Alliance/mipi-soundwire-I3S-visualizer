@@ -113,12 +113,19 @@ public:
     // Full per-register snapshot for driving the display register model from this
     // one authority: (device, base_addr, cur, has_cur, cur_src, next, has_next,
     // next_src). `cur` is the committed value (has_cur = a commit/immediate write or
-    // a _CURR read set it); `next` is the staged (_NEXT) / live-display value
-    // (has_next). Each `*_src` is the value's provenance: 1 = written (bus WriteA32 /
-    // what-if force), 2 = read (revealed by a bus ReadA32). The display's NEXT column
-    // is (next if has_next else cur); its CURR column is cur (dual-ranked). Every
+    // a _CURR read set it); `next` is the value of the _NEXT register (has_next): what
+    // was last written or read there, which a Commit leaves in place. Each `*_src` is the value's provenance: 1 = written (bus WriteA32 /
+    // what-if force), 2 = read (revealed by a bus ReadA32). For a dual-ranked
+    // register the display's NEXT column is next (the reset value while !has_next) and its
+    // CURR column is cur; a single-ranked register's one value is cur. Every
     // touched address (in either bank) is emitted once.
     std::vector<std::tuple<int, U32, U8, bool, U8, U8, bool, U8>> Snapshot() const;
+
+    // Replace the whole register state with `snap`, a Snapshot() of another model: each
+    // entry sets the committed value when has_cur and the staged value when has_next, each
+    // with its provenance. Snapshot() lists every value the model holds, so the restored
+    // model behaves as the one snapshotted for every later write, commit, read and override.
+    void Restore(const std::vector<std::tuple<int, U32, U8, bool, U8, U8, bool, U8>>& snap);
 
     // Provenance tags for a register value in a Snapshot (parallel to the display
     // model's Provenance): distinguish a manager write from a peripheral-revealed read.
@@ -145,7 +152,7 @@ public:
 private:
     struct DeviceRegs {
         std::map<U32, U8> cur;   // committed values, keyed by _NEXT-base address
-        std::map<U32, U8> next;  // staged values awaiting Commit
+        std::map<U32, U8> next;  // _NEXT register values; a Commit copies them to cur and keeps them
         // Parallel provenance for cur/next (Source). Only the write/read entry points
         // stamp these and only Snapshot() reads them, so the decode/config maps above
         // stay plain U8.

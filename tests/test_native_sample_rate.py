@@ -134,14 +134,18 @@ def test_a_rate_that_is_not_positive_reads_as_no_audio(tmp_path, grouping):
 def test_a_sub_row_interval_field_near_the_int_limit_gives_no_wrapped_rate(tmp_path, field):
     """An SRI transport whose width or window is near the int limit gives the rate its
     values carry: a transport wider than its window reports no audio, and a window that
-    holds it reports a positive rate."""
+    holds it reports a positive rate. A window reaching past the row places its transports
+    in the row's columns from HorizontalStart on."""
     cells = {**_SRI, "EnableCh_REG": "1", "SampleSize_REG": "3", "Spacing_REG": "5",
              "HorizontalCount_REG": "11", field: "2147483647"}
-    rate = _reported_rate(_csv(tmp_path, cells))
+    path = _csv(tmp_path, cells)
+    rate = _reported_rate(path)
     if field == "SampleSize_REG":
         assert rate == 0.0
     elif field == "HorizontalCount_REG":
         # A 4-bit transport plus its 4-column gap repeats every 8 columns of the window.
         assert rate == (2**31 + 4) // 8 * _ROW_RATE_HZ
+        # Columns 2..15 of the 16-column row hold the transports at 2..5 and 10..13.
+        assert _completed_per_row(path) == [2] * _ROWS
     else:
         assert rate == _ROW_RATE_HZ

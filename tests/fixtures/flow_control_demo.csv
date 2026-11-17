@@ -9,9 +9,9 @@ CDS_BitWidth_REG,0
 EnforceCDSHandover,True
 RowRate,1536
 RowsToDraw,32
-CDS_GuardEnabledPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
-CDS_GuardPolarityPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
-CDS_TailWidthPerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_GuardEnable_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_GuardPolarity_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
+CDS_TailWidth_REG_PerSource,0,0,0,0,0,0,0,0,0,0,0,0,0
 Enabled,True,True,True,True,True,True,True,True,False,False,False,False
 DeviceNumber_REG,0,0,0,0,0,1,2,3,0,0,0,0
 PortDirection_REG,False,False,True,True,True,True,False,False,False,False,False,False

@@ -190,7 +190,9 @@ class DataPortValidator:
         num_channels = bin(config.EnableCh_REG).count('1')
         effective_channel_grouping = self._effective_channel_grouping(config, num_channels)
         drive_in_group = self._drive_in_group(config, effective_channel_grouping)
-        last_data_column = self._last_data_column(config, drive_in_group)
+        last_data_column = self._last_data_column(
+            config, drive_in_group,
+            self._pattern_length(config, num_channels, effective_channel_grouping))
         columns_after_data = self.interface.num_columns - 1 - last_data_column
 
         self._check_offset_within_interval(result, config)
@@ -245,11 +247,27 @@ class DataPortValidator:
             (config.BitWidth_REG + 1)
         )
 
-    def _last_data_column(self, config: Any, drive_in_group: int) -> int:
+    @staticmethod
+    def _pattern_length(config: Any, num_channels: int, effective_channel_grouping: int) -> int:
+        """UIs one Transport Pattern spans when its channel groups follow each other in a
+        row (Spacing_REG != 0): each group's drive, the trailing group sized by its own
+        channel count, plus Spacing_REG - 1 gap UIs between consecutive groups."""
+        if num_channels == 0 or effective_channel_grouping == 0:
+            return 0
+        per_channel = (DataPortValidator._bits_per_channel_sample(config)
+                       * (config.SampleGrouping_REG + 1) * (config.BitWidth_REG + 1))
+        groups = -(-num_channels // effective_channel_grouping)
+        return num_channels * per_channel + (groups - 1) * (config.Spacing_REG - 1)
+
+    def _last_data_column(self, config: Any, drive_in_group: int,
+                          pattern_length: int = 0) -> int:
         """Absolute column index of the last data slot in a row.
 
-        Accounts for inter-group spacing when Spacing_REG > 0. Clamped to the
-        last column in non-SRI mode (where the pattern stops at row boundary).
+        Accounts for inter-group spacing when Spacing_REG > 0: in SRI mode the pattern
+        repeats across the Horizontal Window; outside it the pattern stops after its last
+        channel group, so the span is capped at `pattern_length` (_pattern_length).
+        Clamped to the last column in non-SRI mode (where the pattern stops at row
+        boundary).
         """
         window_size = config.HorizontalCount_REG + 1
 
@@ -271,6 +289,8 @@ class DataPortValidator:
                     last = config.HorizontalStart_REG + (num_complete - 1) * cadence + drive_in_group - 1
             else:
                 last = config.HorizontalStart_REG
+            if not config.SubRowInterval_REG and pattern_length > 0:
+                last = min(last, config.HorizontalStart_REG + pattern_length - 1)
 
         if not config.SubRowInterval_REG:
             last = min(last, self.interface.num_columns - 1)
@@ -442,8 +462,10 @@ class DataPortValidator:
             )
 
     def _check_tail_fits_row(self, result: ValidationResult, config: Any, columns_after_data: int) -> None:
-        """TailWidth_REG shall fit in the columns remaining after the last data slot (source DP only)."""
-        if config.TailWidth_REG > columns_after_data and not config.PortDirection_REG:
+        """TailWidth_REG shall fit in the columns remaining after the last data slot and its
+        guard UI, which comes first when GuardEnable_REG is set (source DP only)."""
+        needed = config.TailWidth_REG + int(bool(config.GuardEnable_REG))
+        if config.TailWidth_REG and needed > columns_after_data and not config.PortDirection_REG:
             result.add_error(
                 'TailWidth',
                 'Tail would overflow row',

@@ -1,14 +1,16 @@
-"""Per-Link panel state: what the main window keeps for ONE Link, derived from its Session.
+"""Per-Link panel state: what the main window keeps for ONE Link.
 
 The per-Link panels (Bus Grid, Capture, CDS, Audio, Samples, Timing, Registers, Statistics,
 Commands) are one set of widgets bound to the active Link. What they need from that Link
 beyond the Session lives here, one instance per Link, so a later Link switch re-binds the
 panels instead of losing the state.
 
-Only state DERIVED from a Link belongs here, plus the Link's stream colour overrides: those
-are the user's, but a (device, data port) means something only within one Link's capture,
-so they travel with it (and its workspace entry). Display preferences (TX map on/off,
-persist, grid rows, the TX-map scroll row) are window-wide: opening a new capture keeps
+Two kinds of state belong here: state DERIVED from the Link (its audio store, command model,
+cached measurements), and the user's choices for this Link (stream colours, Filter & Gain,
+even timing, Commands filters and column widths, the Audio and Capture panes' views). A
+(device, data port) means something only within one Link's capture, so those choices travel
+with the Link and its workspace entry. Display preferences (TX map on/off, persist, grid
+rows, the TX-map scroll row) are window-wide: opening a new capture keeps
 them, and one set of panels shows them.
 """
 from __future__ import annotations

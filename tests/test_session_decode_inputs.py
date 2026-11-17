@@ -647,6 +647,17 @@ def test_a_demo_phy_or_variant_it_does_not_build_is_noted(field, value, note):
     assert (s.source["phy"], s.source["variant"]) == (2, "")
 
 
+@pytest.mark.parametrize("phy", [[2], float("inf"), "x", True, 2.5])
+@pytest.mark.parametrize("samples", [0, 8])
+def test_a_demo_phy_that_is_not_a_whole_number_is_refused_naming_it(phy, samples):
+    """With or without a clamped sample count, whose note labels the source, a demo phy that
+    is not a whole number raises the ValueError that names it."""
+    with import_notes.collect():
+        with pytest.raises(ValueError, match="phy"):
+            Session.from_source({"type": "demo", "audio_samples_per_channel": samples,
+                                 "phy": phy})
+
+
 def test_a_source_or_decoder_that_fails_to_build_leaves_the_decode(monkeypatch):
     s = Session.from_demo(16, phy=3, cold_start=True)
     before = (s._source, s.decoder, s._cds_horizontal_start, s._forced_column_count,

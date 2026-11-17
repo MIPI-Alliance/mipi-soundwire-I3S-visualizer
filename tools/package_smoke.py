@@ -144,6 +144,7 @@ def main(argv: list[str]) -> int:
         source = os.path.join(work, "source")
         export_source(source)
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PYTHONUTF8"] = "1"       # the children write UTF-8, which is how their output is read
         steps = [[sys.executable, "-m", "venv", venv],
                  [_bin(venv, "python"), "-m", "pip", "install", os.path.join(source, "native")],
                  [_bin(venv, "python"), "-m", "pip", "install", source]]
@@ -154,14 +155,14 @@ def main(argv: list[str]) -> int:
                 return 1
         model = os.path.join(work, "model.json")
         run = subprocess.run([_bin(venv, "swi3s-studio-cli"), "-c", os.path.join(_ROOT, _CONFIG),
-                              "-o", model], cwd=work, env=env, capture_output=True, text=True)
+                              "-o", model], cwd=work, env=env, capture_output=True, encoding="utf-8", errors="replace")
         if run.returncode != 0 or not os.path.isfile(model):
             problems.append(f"swi3s-studio-cli exited {run.returncode}: "
                             f"{(run.stdout + run.stderr).strip()[-300:]}")
         elif model_problem(model):
             problems.append(f"swi3s-studio-cli: {model_problem(model)}")
         got = subprocess.run([_bin(venv, "python"), "-c", "import sys; print(sys.prefix)"],
-                             cwd=work, env=env, capture_output=True, text=True)
+                             cwd=work, env=env, capture_output=True, encoding="utf-8", errors="replace")
         prefix = got.stdout.strip()
         if got.returncode != 0 or not prefix:
             problems.append("the installed interpreter could not report sys.prefix: "
@@ -170,7 +171,7 @@ def main(argv: list[str]) -> int:
             problems += [f"not installed under {prefix}: {rel}"
                          for rel in missing_data_files(prefix)]
             probe = subprocess.run([_bin(venv, "python"), "-c", _PROBE], cwd=work, env=env,
-                                   capture_output=True, text=True)
+                                   capture_output=True, encoding="utf-8", errors="replace")
             try:
                 problems += lookup_problems(json.loads(probe.stdout), prefix)
             except ValueError:

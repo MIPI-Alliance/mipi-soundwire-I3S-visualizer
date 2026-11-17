@@ -33,6 +33,28 @@ def test_pyramid_built_and_decimates():
     assert hi.max() == tri.max()
 
 
+def test_each_decimated_bin_is_the_min_and_max_of_its_samples():
+    """A bin of factor f holds samples [j*f, (j+1)*f) clipped to the channel; its [lo, hi] is
+    their min and max, and the bins cover the window, for a start and stop that are not
+    multiples of the factor and a window that ends in the padded last bin."""
+    n = 200_001                                    # not a multiple of any level's factor
+    store, tri = _ramp_store(n)
+    windows = [(0, n), (12_345, 150_001), (3, 90_000), (77_777, n), (n - 9_000, n),
+               (1, 60_001)]
+    for start, stop in windows:
+        x, lo, hi = store.envelope(DEV, DP, CH, start, stop, max_points=500)
+        assert x.size > 1 and x.size <= 4000, (start, stop, x.size)
+        factor = int(x[1] - x[0])
+        assert factor > 1, (start, stop)
+        first = (int(x[0]) - factor // 2) // factor
+        for k in range(x.size):
+            b0 = (first + k) * factor
+            span = tri[b0:min(b0 + factor, n)]
+            assert (lo[k], hi[k]) == (span.min(), span.max()), (start, stop, k)
+        assert first * factor <= start
+        assert (first + x.size) * factor >= stop
+
+
 def test_envelope_exact_when_zoomed_in():
     store, tri = _ramp_store(200_000)
     x, lo, hi = store.envelope(DEV, DP, CH, 1000, 1100, max_points=2048)

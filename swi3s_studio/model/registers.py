@@ -42,11 +42,18 @@ def bundled_data_path(name: str) -> str:
 
 def _default_registers_json() -> str:
     """Locate data/registers.json across dev, installed, and PyInstaller layouts;
-    $SWI3S_REGISTERS overrides it when that file exists."""
+    $SWI3S_REGISTERS overrides it when that file exists, and names a missing file in an
+    import warning before the bundled map is used."""
     env = os.environ.get("SWI3S_REGISTERS")
     if env and os.path.exists(env):
         return env
-    return bundled_data_path("registers.json")
+    bundled = bundled_data_path("registers.json")
+    if env:
+        from .. import import_notes
+        import_notes.warn("SWI3S_REGISTERS",
+                          f"$SWI3S_REGISTERS names {env!r}, which does not exist — the "
+                          f"bundled register map {bundled!r} is used")
+    return bundled
 
 
 DEFAULT_REGISTERS_JSON = _default_registers_json()
@@ -170,7 +177,7 @@ def _parse_bits(bits: str) -> Tuple[int, int]:
 
 def _parse_enum(valid) -> Dict[int, str]:
     """Parse a field's `valid` string into a {value: name} map for symbolic
-    decode, e.g. '0x0=Stay_Attached,0x4=Enter_Dormant' or 'b1001=v1.1'. Tokens
+    decode, e.g. '0x0=Stay_Attached,0x4=Enter_Dormant' or 'b1000=Idle'. Tokens
     without a parseable integer key (ranges like '0x02-0x0F=Rsvd', or plain
     '0-11') are skipped — only exact single-value labels are kept."""
     out: Dict[int, str] = {}
@@ -588,18 +595,20 @@ class DeviceRegisterFile:
              next_val: int, has_next: bool, next_prov: Provenance) -> None:
         """Seed this file from the C++ decode authority's register snapshot for one
         address (see swi3score.registers_from_commands / CRegisterModel::Snapshot).
-        The NEXT display value is the staged value if present, else the committed
-        value (which persists in the NEXT column after a commit, matching the wire
-        replay). The _CURR bank is set only for dual-ranked registers that have a
-        committed value. Each rank carries its own provenance from the authority
-        (WRITTEN vs READ vs — for a what-if — UI), so a read-revealed value shows as
-        a Bus Read in the map. Used instead of the Python write/commit/read replay so
-        register values AND provenance come from the same model as the grid and audio."""
+        A dual-ranked register's NEXT display value is its _NEXT register's value (the last
+        value written or read there, which a commit leaves in place), and stays at the reset
+        value while the snapshot has none: a change to _CURR alone does not reach it. The
+        _CURR bank is set only for dual-ranked registers that have a committed value; a
+        single-ranked register's one value shows in the NEXT display too. Each rank carries
+        its own provenance from the authority (WRITTEN vs READ vs, for a what-if, UI), so a
+        read-revealed value shows as a Bus Read in the map. Used instead of the Python
+        write/commit/read replay so register values AND provenance come from the same model
+        as the grid and audio."""
         res = self.rmap.resolve(address)
         dual = bool(res and res.register.dual_ranked)
         if has_next:
             self._cells[address] = _Cell(int(next_val) & 0xFF, next_prov)
-        elif has_cur:
+        elif has_cur and not dual:
             self._cells[address] = _Cell(int(cur) & 0xFF, cur_prov)
         if dual and has_cur:
             self._curr[address] = _Cell(int(cur) & 0xFF, cur_prov)
@@ -643,6 +652,14 @@ def selects_one_device(device_mask: int) -> bool:
     return bin(int(device_mask) & ((1 << DEVICE_COUNT) - 1)).count("1") == 1
 
 
+def commit_takes_effect(cmd) -> bool:
+    """True for a commit that commits: confirmed, with no Row_Delay the decode rejected
+    (`row_delay_error`, a Row_Delay outside 14..15), which leaves the command with no
+    effect anywhere (Section 9.1.13)."""
+    return bool(cmd.get("is_commit") and cmd.get("commit_confirmed")
+                and not cmd.get("row_delay_error"))
+
+
 def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = None,
                    peripheral_maps: Optional[Dict[int, "object"]] = None) -> Dict[int, DeviceRegisterFile]:
     """Build per-device register files by replaying CRC-valid WriteA32 and Commit
@@ -680,7 +697,7 @@ def apply_commands(rmap: RegisterMap, commands, up_to_sample: Optional[int] = No
         if c.get("command") == "WriteA32" and c.get("crc_valid") and c.get("has_address"):
             if selects_one_device(mask):
                 file_for((mask & -mask).bit_length() - 1).apply_write(c["address"], c["data"])
-        elif c.get("is_commit") and c.get("commit_confirmed"):
+        elif commit_takes_effect(c):
             group_mask = int(c.get("group_mask", 0))
             # Only the devices the mask selects commit; a zero mask selects none
             # (Section 8.1.1.5.1, "Commit Phase for SSCR and DSCR Commands" table), as in

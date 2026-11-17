@@ -8,21 +8,15 @@ Verifies the capture-backed source decodes identically to the in-memory source,
 that the Saleae binary reader/writer round-trips, and that the command store
 preserves the decode. Run: python3 -m pytest tests/test_capture_pipeline.py
 """
-import math
 import os
 import tempfile
 
 import swi3score
+from demo_samples import sine_sample
 
 from swi3s_studio import decode, decode_capture
 from swi3s_studio.ingest import saleae_binary, transitions
 from swi3s_studio.store import command_store
-
-
-def _expected_sine(channel, index, sample_size):
-    amp = (1 << sample_size) * 0.45
-    v = int(round(amp * math.sin(2.0 * math.pi * (channel + 1) * index / 64.0)))
-    return v & ((1 << (sample_size + 1)) - 1)
 
 
 def _assert_decode_good(res, label):
@@ -47,7 +41,7 @@ def _assert_decode_good(res, label):
         sample_size = pcm[dp][0][1] - 1
         assert sample_size == 15, f"{label}: dp{dp} sample_size={sample_size + 1}"
         for i, v in enumerate(vals):
-            assert v == _expected_sine(dp * 2, i, sample_size), f"{label}: dp{dp}[{i}] {v}"
+            assert v == sine_sample(dp * 2, i, sample_size), f"{label}: dp{dp}[{i}] {v}"
     # Four audio streams overall (dp0-dp3 on one device: 2 PCM + 2 PDM).
     assert {(a.get("device"), a["dp"]) for a in res.audio} == {(0, 0), (0, 1), (0, 2), (0, 3)}
     return writes
@@ -190,10 +184,20 @@ def test_command_store_roundtrip(tmp_path):
     path = str(tmp_path / "commands.parquet")
     command_store.save_commands(table, path)
     back = command_store.load_commands(path)
-    assert back.column("command").to_pylist() == [c["command"] for c in res.commands]
+    assert back.equals(table)
+    for name in back.column_names:
+        assert back.column(name).to_pylist() == [c.get(name) for c in res.commands], name
     writes = list(command_store.register_writes(res.commands))
     assert len(writes) == 31       # see _assert_decode_good for the breakdown
     assert writes[0][1] == 0x1081   # first write programs NumColumns_NEXT
+
+
+def test_the_command_table_schema_and_the_omitted_fields_cover_every_command_field():
+    res = decode_capture(transitions.demo_capture(32))
+    seen = {key for c in res.commands for key in c}
+    stored = set(command_store.SCHEMA.names)
+    assert stored <= seen
+    assert seen - stored == set(command_store.OMITTED_FIELDS)
 
 
 def test_zero_copy_lifetime():

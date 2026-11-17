@@ -64,16 +64,17 @@ _SELF = {"tests/test_publish_tiers.py", "tools/publish_tree.py", "tools/leak_sca
 _BUILD_PRODUCT = re.compile(r"^swi3score.*\.(so|pyd|dylib)$")
 
 
-def _files() -> list[str]:
+def _files(root: str = _ROOT) -> list[str]:
     """Tracked paths in a source tree; a filesystem walk in a tree without .git (a published
-    tree)."""
-    out = subprocess.run(["git", "ls-files"], cwd=_ROOT, capture_output=True, text=True)
-    if out.returncode == 0 and out.stdout.strip():
-        return [p for p in out.stdout.splitlines() if p]
+    tree). The listing is NUL-separated, so a non-ASCII name arrives as written rather than
+    C-quoted."""
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True)
+    if out.returncode == 0 and out.stdout.strip(b"\0"):
+        return [os.fsdecode(p) for p in out.stdout.split(b"\0") if p]
     skip = {".git", "__pycache__", ".venv", "build", "dist", ".mypy_cache", ".ruff_cache",
             ".pytest_cache", "scratch", "node_modules", "dev_docs"}
     found = []
-    for base, dirs, names in os.walk(_ROOT):
+    for base, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in skip]
         # Skip what git never lists: macOS AppleDouble sidecars, and the built native core
         # (matched by the .gitignore patterns, not the bare suffix, so a committed binary
@@ -81,7 +82,7 @@ def _files() -> list[str]:
         names = [n for n in names
                  if not n.startswith('._') and not _BUILD_PRODUCT.match(n)]
         # POSIX separators: every rule below matches a "docs/…" style prefix.
-        found += [os.path.relpath(os.path.join(base, n), _ROOT).replace(os.sep, "/")
+        found += [os.path.relpath(os.path.join(base, n), root).replace(os.sep, "/")
                   for n in names]
     return sorted(found)
 
@@ -251,6 +252,42 @@ def test_no_sync_conflict_duplicates_are_tracked():
           "this is deliberate, rename it — the pattern is indistinguishable from a conflict.")
 
 
+# A tracked text file names no future SWI3S specification version or draft revision. A citation
+# keeps its table, section or rule id and says "the SWI3S specification". The one exception is
+# the Version register's decode, which spells out what a device reports. Written so that none
+# of its own spellings matches.
+_SPEC_REVISION = re.compile(
+    r"\bv\d+\.\d+\s?r\d{2}\b|\bSWI3S\s+v\d+\.\d+|\bspec(?:ification)?\s+v\d+\.\d+"
+    r"|\bv1" + r"\.1\b|\brevision\s+\d{2}\b|\bspec(?:ification)?\s+revisions?\s+r\d{2}\b"
+    r"|\br\d{2}\s*(?:\u2192|->)\s*r\d{2}\b|\bdraft\s+r\d{2}\b|\br\d{2}\s+\{ASW\d+\}",
+    re.IGNORECASE)
+_SPEC_REVISION_ALLOWED = {
+    "data/registers.json": "\"valid\":\"b1001=v1" + ".1,b1000=v1.0\"",
+}
+
+
+def test_no_tracked_file_names_a_spec_version_or_revision():
+    hits = []
+    for rel in _files():
+        if rel.startswith(("data/licenses/", "tests/data/")):
+            continue
+        with open(os.path.join(_ROOT, rel), "rb") as f:
+            raw = f.read()
+        if b"\0" in raw:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        allowed = _SPEC_REVISION_ALLOWED.get(rel)
+        if allowed is not None:
+            assert allowed in text, f"{rel} no longer holds the allowed decode: {allowed}"
+            text = text.replace(allowed, "")
+        for n, line in enumerate(text.splitlines(), 1):
+            if _SPEC_REVISION.search(line):
+                hits.append(f"{rel}:{n}: {line.strip()[:100]}")
+    assert not hits, (
+        "tracked text names a spec version or revision:\n  " + "\n  ".join(hits)
+        + "\n\nCite the table, section or rule id and say 'the SWI3S specification'.")
+
+
 def test_the_tier_boundary_has_one_definition():
     """`publish_tree` prunes the internal tier and `leak_scan` exempts it — from the same path.
 
@@ -349,3 +386,17 @@ def test_a_file_or_directory_the_dangling_check_cannot_read_is_reported(tmp_path
         (tmp_path / "sealed").chmod(0o700)
     assert dangling == [] and sorted(unreadable) == ["locked.md", "sealed/"]
 
+
+
+def test_the_listing_reads_a_non_ascii_tracked_name_as_written(tmp_path):
+    """git C-quotes a non-ASCII path in a line listing; the listing here is NUL-separated,
+    so the name arrives as written and can be opened, classified and scanned."""
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                       cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-q")
+    (tmp_path / "docs").mkdir()
+    name = "docs/café.md"
+    (tmp_path / name).write_text("x\n", encoding="utf-8")
+    git("add", "--", name)
+    assert _files(str(tmp_path)) == [name]

@@ -114,6 +114,11 @@ def _nul_paths(raw: bytes) -> list[str]:
     return [os.fsdecode(f) for f in raw.split(b"\0") if f]
 
 
+class _Unreadable(Exception):
+    """The input to scan cannot be read: a revision git cannot resolve, or git itself missing
+    where one was asked for."""
+
+
 def _files(rev: str | None, tree: str | None = None) -> list[str]:
     """Paths to scan, relative to `tree` when one is given and to _ROOT otherwise.
 
@@ -125,13 +130,24 @@ def _files(rev: str | None, tree: str | None = None) -> list[str]:
         found, _SKIPPED[:] = _walk(tree)
         return found
     if rev:
-        out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", rev],
-                             cwd=_ROOT, capture_output=True, check=True)
+        try:
+            out = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", rev],
+                                 cwd=_ROOT, capture_output=True, check=True)
+        except FileNotFoundError:
+            raise _Unreadable(f"{rev}: git is not installed, so a revision cannot be read")
+        except subprocess.CalledProcessError as e:
+            detail = e.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise _Unreadable(f"{rev}: git cannot read that revision"
+                              f"{': ' + detail[-1] if detail else ''}")
         return _nul_paths(out.stdout)
 
     # Tracked files plus untracked ones that are not ignored: what the next commit can carry.
-    out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-                         cwd=_ROOT, capture_output=True)
+    # Without git, or outside a repository, the tree is walked.
+    try:
+        out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard",
+                              "-z"], cwd=_ROOT, capture_output=True)
+    except FileNotFoundError:
+        out = subprocess.CompletedProcess([], 1, b"", b"")
     if out.returncode == 0 and out.stdout.strip(b"\0 \n"):
         return sorted(set(_nul_paths(out.stdout)))
 
@@ -337,7 +353,7 @@ def _site_patterns() -> tuple[list[tuple[str, str, bool]], str | None]:
         print(f"SWI3S_LEAK_PATTERNS points at {path!r}, which does not exist", file=sys.stderr)
         raise SystemExit(2)
     pats = []
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -354,11 +370,12 @@ def _scan_text(path: str, patterns) -> int:
     """Scan ONE text file that is not part of the tree — a release description or a commit
     message. Same patterns, same exit code, so it can gate a publish step."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
     except OSError as exc:
         print(f"cannot read {path!r}: {exc}", file=sys.stderr)
         return 2
+    text = decode_bytes(raw)[0]          # UTF-16 text is read as text, as in a tree scan
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
         for rx, why, _published_only, _structural in patterns:   # a description IS published
@@ -375,13 +392,30 @@ def _scan_text(path: str, patterns) -> int:
     return 1
 
 
+def _tolerant_output() -> None:
+    """Make stdout and stderr write a character their encoding cannot hold as a '?' rather
+    than raise: the tool echoes repository text, and a Windows console or redirected log is
+    often cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+
+
 def main() -> int:
+    _tolerant_output()
     # REFUSE AN ARGUMENT THIS DOES NOT UNDERSTAND, rather than falling through to the default
     # scan: a mistyped `--text=` must not report a pass about input the caller never named.
     known = [a for a in sys.argv[1:] if a.startswith("-")]
     bad = [a for a in known if not a.startswith(("--text=", "--tree="))]
     if bad:
         print(f"unknown option(s): {' '.join(bad)}\n{__doc__}", file=sys.stderr)
+        return 2
+    repeated = sorted(o for o in ("--text=", "--tree=")
+                      if sum(a.startswith(o) for a in sys.argv[1:]) > 1)
+    if repeated:
+        print(f"{' '.join(o[:-1] for o in repeated)} given more than once: name each "
+              f"option once\n{__doc__}", file=sys.stderr)
         return 2
     text_arg = next((a.split("=", 1)[1] for a in sys.argv[1:]
                      if a.startswith("--text=")), None)
@@ -423,7 +457,11 @@ def main() -> int:
 
     hits: list[tuple[str, int, str, str]] = []
     _UNREADABLE.clear()
-    files = _files(rev, tree)
+    try:
+        files = _files(rev, tree)
+    except _Unreadable as e:
+        print(f"leak scan: {e}", file=sys.stderr)
+        return 2
     if not files:
         print("leak scan: no files to scan, so nothing was scanned", file=sys.stderr)
         for path in _UNREADABLE:

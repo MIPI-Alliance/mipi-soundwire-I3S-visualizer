@@ -7,6 +7,12 @@ from typing import Mapping, Tuple
 Names = Mapping[Tuple[int, int], str]
 
 
+def menu_text(text: str) -> str:
+    """`text` as a menu item, button or checkbox shows it literally: each '&' doubled, so no
+    character of a user's name is taken as a mnemonic."""
+    return str(text).replace("&", "&&")
+
+
 def port_label(names: Names, dev: int, dp: int) -> str:
     """"Mic L", or "Dev1 DP2" for a port with no name."""
     return (names.get((int(dev), int(dp))) or "").strip() or f"Dev{dev} DP{dp}"

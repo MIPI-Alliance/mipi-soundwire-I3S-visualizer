@@ -1,14 +1,17 @@
-"""The payload engine's two diagnostics, both read from the environment when a decode
-configures its ports (CPayloadEngine::Configure):
+"""The payload engine's two diagnostics, both read from the environment:
 
-* SWI3S_SRC_SHIFT=N reads every bit of a peripheral-sourced port with the level N UIs
-  later, leaving manager-driven (sink) ports as they are. The windowed re-decode keeps the
-  same shift queue, so it agrees with the full decode.
-* SWI3S_DUMP_PATH writes one line per assembled data bit, "<sample> <dp> <channel> <bit>
-  <level>", for the port SWI3S_DUMP_DP (every port when unset), up to SWI3S_DUMP_MAX lines.
+* SWI3S_SRC_SHIFT=N, read each time a decode configures its ports
+  (CPayloadEngine::Configure), reads every bit of a peripheral-sourced port with the level
+  N UIs later, leaving manager-driven (sink) ports as they are. The windowed re-decode keeps
+  the same shift queue, so it agrees with the full decode.
+* SWI3S_DUMP_PATH, read once when a decode starts (CPayloadEngine::EnableBitDump), writes
+  one line per assembled data bit, "<sample> <dp> <channel> <bit> <level>", for the port
+  SWI3S_DUMP_DP (every port when unset), up to SWI3S_DUMP_MAX lines over the whole decode,
+  across its reconfigures. The windowed re-decode and the checkpoint read-back write none.
 
 Every input is synthetic: the flow-control demo, whose devices 2 and 3 are source ports,
-built with a fixed 4 samples per UI so a shift of N UIs is 4N samples.
+built with a fixed 4 samples per UI so a shift of N UIs is 4N samples, and the demo stream
+(make_demo_levels), whose ports reconfigure at its 8- to 16-column commit.
 """
 import gc
 
@@ -136,3 +139,44 @@ def test_the_bit_dump_lists_only_the_port_it_names(capture, monkeypatch, tmp_pat
     assert len(rows) == 10 and {r[1] for r in rows} == {0}
     rows, _bits, _audio = _dump(capture, monkeypatch, tmp_path, SWI3S_DUMP_DP="5")
     assert rows == []
+
+
+
+def _dump_rows(path):
+    return [tuple(int(x) for x in line.split()) for line in path.read_text().splitlines()]
+
+
+def test_the_bit_dump_keeps_its_limit_across_reconfigures(monkeypatch, tmp_path):
+    """The limit bounds the whole decode, not each configuration: the demo reconfigures its
+    ports at the 8- to 16-column commit, and the dump still holds exactly the limit's count
+    of lines, the decode's first bits."""
+    path = tmp_path / "dump.txt"
+    monkeypatch.setenv("SWI3S_DUMP_PATH", str(path))
+    monkeypatch.setenv("SWI3S_DUMP_MAX", "1000")
+    settings = swi3score.DecoderSettings()
+    settings.collect_bit_samples = True
+    d = swi3score.Decoder(swi3score.MemorySampleSource(swi3score.make_demo_levels(32), _RATE, _SPU),
+                          settings)
+    d.run()
+    bits = d.bit_samples()
+    assert bits["sample"].size > 1000
+    del d
+    gc.collect()
+    assert [r[0] for r in _dump_rows(path)] == bits["sample"][:1000].tolist()
+
+
+def test_a_windowed_re_decode_leaves_the_dump_as_the_decode_wrote_it(capture, monkeypatch,
+                                                                     tmp_path):
+    """The windowed re-decode and the checkpoint read-back replay bits the decode already
+    listed; the dump keeps the decode's own lines, every bit once, in order."""
+    path = tmp_path / "dump.txt"
+    monkeypatch.setenv("SWI3S_DUMP_PATH", str(path))
+    d = _decode(capture)
+    bits = d.bit_samples()
+    lo = int(np.searchsorted(capture.clock_edges.astype(np.int64),
+                             int(np.median(bits["sample"]))))
+    assert d.bit_samples_window(lo, lo + 3000)["sample"].size > 0
+    assert d.checkpoint_descramblers()
+    del d
+    gc.collect()
+    assert [r[0] for r in _dump_rows(path)] == bits["sample"].tolist()

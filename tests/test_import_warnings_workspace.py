@@ -69,6 +69,17 @@ def test_an_active_link_that_is_not_a_number_is_the_first_with_one_note(value):
     assert _messages(notes) == ["the saved active Link is not a number; the first is used"]
 
 
+@pytest.mark.parametrize("value", [-1, 2, 10**6])
+def test_an_active_link_outside_the_links_saved_is_the_first_with_one_note(value):
+    d = {"active_link": value, "links": [{"source": {"type": "demo"}},
+                                         {"source": {"type": "demo"}}]}
+    with import_notes.collect() as notes:
+        ws = Workspace.from_json(json.dumps(d), "act.swi3s")
+    assert ws.active_link == 0
+    assert _messages(notes) == [f"the saved active Link index {value} is outside the 2 Links "
+                                "saved; the first is used"]
+
+
 @pytest.mark.parametrize("offset", [None, "x", 1.5, float("inf")])
 def test_an_offset_that_is_not_a_whole_number_is_0_with_one_note(offset):
     d = {"links": [{"source": {"type": "demo"}, "name": "Bus", "offset_ps": offset}]}
@@ -101,7 +112,7 @@ def test_each_bookmark_entry_is_read_by_its_own_form():
     with import_notes.collect() as notes:
         ws = Workspace.from_json(json.dumps(d), "bm.swi3s")
     assert ws.bookmarks == [5, _bookmark(7)]
-    assert _messages(notes) == ["5 cursors with no readable sample, index or Link were not read"]
+    assert _messages(notes) == ["5 cursors with no readable sample, index, Link, group or label were not read"]
     from swi3s_studio.model.bookmarks import BookmarkSet
     assert BookmarkSet.from_json(ws.bookmarks).samples() == [5, 7]
 
@@ -109,13 +120,16 @@ def test_each_bookmark_entry_is_read_by_its_own_form():
 @pytest.mark.parametrize("bad", [
     _bookmark(10 ** 30), _bookmark(-5), _bookmark(2 ** 63), _bookmark(3.5), _bookmark("7"),
     _bookmark(float("inf")), _bookmark(True), _bookmark(index=10 ** 30), _bookmark(index=1.5),
-    _bookmark(index=-1), _bookmark(index="1")])
+    _bookmark(index=-1), _bookmark(index="1"), _bookmark(group=None), _bookmark(label=None),
+    _bookmark(group=1), _bookmark(label=["x"])])
 def test_a_bookmark_with_an_unreadable_sample_or_index_is_dropped_and_reported(bad):
+    """A sample or index that is not a whole number in range, and a group or label that is
+    not text, do not read."""
     d = {"bookmarks": [bad, _bookmark(8)], "links": [{"source": {"type": "demo"}}]}
     with import_notes.collect() as notes:
         ws = Workspace.from_json(json.dumps(d), "bm.swi3s")
     assert ws.bookmarks == [_bookmark(8)]
-    assert _messages(notes) == ["1 cursor with no readable sample, index or Link was not read"]
+    assert _messages(notes) == ["1 cursor with no readable sample, index, Link, group or label was not read"]
 
 
 @pytest.mark.parametrize("link", [1, 10 ** 30, -3, 2.5, "0", float("inf")])
@@ -160,7 +174,7 @@ def test_the_bookmark_device_and_scrambler_limits_are_inclusive():
         "Link 1 (Bus): 1 device name not read: the device is not 0..11 or the value is not "
         "text",
         "Link 1 (Bus): 1 hub depth not read: the device is not 0..11 or the value is not 0..5",
-        "1 cursor with no readable sample, index or Link was not read"]
+        "1 cursor with no readable sample, index, Link, group or label was not read"]
 
 
 @pytest.mark.parametrize("key, row", [
@@ -170,7 +184,7 @@ def test_the_bookmark_device_and_scrambler_limits_are_inclusive():
     ("overlay", [0, 1, 0x2090, 2 ** 70]), ("overlay", [0, True, 0x2090, 2]),
     ("device_scramblers", ["1", 2, True]), ("device_scramblers", [1, 2.5, True]),
     ("even_timing", ["1", 2]), ("even_timing", [1, 2.5]), ("even_timing", [12, 0]),
-    ("even_timing", [1, -1])])
+    ("even_timing", [1, -1]), ("even_timing", [-2, 0])])
 def test_a_row_entry_that_is_not_a_whole_json_number_in_range_is_dropped(key, row):
     """Text, a fraction, a bool and a value outside its range are not row entries, as for
     a bookmark's sample; a register value is a byte, 0..255."""
@@ -197,6 +211,16 @@ def test_the_rows_kept_are_integers():
     assert link.even_timing == [[1, 2]]
     assert all(type(x) is int for x in link.even_timing[0])
     assert link.device_hub_depths == {"1": 2} and type(link.device_hub_depths["1"]) is int
+
+
+def test_a_manager_data_ports_evenly_spaced_stream_is_read_back():
+    """A Manager data port's stream is keyed device -1, as the core keys it: its Evenly
+    Spaced row is saved and read back with no note."""
+    ws = Workspace(links=[LinkSpec(source={"type": "demo"}, even_timing=[[-1, 3], [2, 1]])])
+    with import_notes.collect() as notes:
+        again = Workspace.from_json(ws.to_json(), "rows.swi3s")
+    assert notes == []
+    assert again.links[0].even_timing == [[-1, 3], [2, 1]]
 
 
 @pytest.mark.parametrize("key", ["1_0", "+3", " 3", "3 ", "01", "٣", "", "-1", "1.0"])
@@ -607,7 +631,7 @@ def test_what_a_workspace_cannot_read_is_dropped_and_reported():
         "adds is not restored",
         "the saved window view is not a mapping; not read",
         "the saved 'timing' settings are not a mapping; not read",
-        "1 cursor with no readable sample, index or Link was not read",
+        "1 cursor with no readable sample, index, Link, group or label was not read",
     ]
 
 
@@ -749,7 +773,7 @@ def test_a_workspace_authoring_config_keeps_a_reserved_cds_tail_width_and_report
         cfg = BusConfig.from_dict(d, "ws.swi3s")
     assert cfg.cds_tail[1] == 3
     assert [(n.source, n.message) for n in notes] == [(
-        "ws.swi3s", "CDS_TailWidthPerSource: CDS_TailWidth 3 is Reserved (0..2 UI are defined) "
+        "ws.swi3s", "CDS_TailWidth_REG_PerSource: CDS_TailWidth 3 is Reserved (0..2 UI are defined) "
         "for Device 0 = 3; the value is kept as written, the grid draws a 3-UI tail and the "
         "expected registers carry 3.")]
 
@@ -764,6 +788,24 @@ def test_a_workspace_authoring_scalar_cds_tail_width_of_3_names_every_source():
     assert cfg.cds_tail == [3] * 13
     assert len(notes) == 1 and "Manager = 3, Device 0 = 3, Device 1 = 3 and 10 more" \
         in notes[0].message
+
+
+@pytest.mark.parametrize("attr,row,value", [
+    ("tail_width", "TailWidth_REG", 3), ("bit_width", "BitWidth_REG", 3),
+    ("port_mode", "PortMode_REG", 1), ("fcp_bit_width", "FCP_BitWidth_REG", 3),
+    ("fcp_tail_width", "FCP_TailWidth_REG", 3)])
+def test_a_workspace_authoring_config_keeps_a_reserved_port_value_and_reports_it_once(attr, row,
+                                                                                     value):
+    from swi3s_studio.model.bus_config import BusConfig, demo_config, reserved_dp_note
+    d = demo_config().to_dict()
+    d["dataports"][0][attr] = value
+    d["dataports"][1][attr] = value          # a disabled port is not reported
+    with import_notes.collect() as notes:
+        cfg = BusConfig.from_dict(d, "ws.swi3s")
+    assert getattr(cfg.dataports[0], attr) == value
+    assert [(n.source, n.message) for n in notes] == [
+        ("ws.swi3s", reserved_dp_note(row, [f"DP0 = {value}"]))]
+    assert notes[0].message.startswith(f"{row}: ")
 
 
 @pytest.mark.parametrize("tail", [0, 1, 2])

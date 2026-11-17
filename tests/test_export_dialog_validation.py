@@ -9,7 +9,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from swi3s_studio.session import Session
 
@@ -208,3 +208,118 @@ def test_grid_image_export_raises_when_nothing_could_be_written(tmp_path):
             grid.export_image(str(tmp_path / "missing" / name))
     assert grid.export_image(str(tmp_path / "bus_grid")) == str(tmp_path / "bus_grid")
     assert (tmp_path / "bus_grid").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")   # no suffix: PNG
+
+
+def _fmt(dlg, key):
+    dlg._format.setCurrentIndex([dlg._format.itemData(i)[0]
+                                 for i in range(dlg._format.count())].index(key))
+
+
+def _asked(monkeypatch, answer):
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: asked.append(a[2]) or answer))
+    return asked
+
+
+@pytest.mark.parametrize("case", ["typed sal", "csv over csv", "bin channel", "bin both"])
+@pytest.mark.parametrize("answer", [QMessageBox.No, QMessageBox.Yes])
+def test_an_export_over_existing_files_asks_once_and_names_them(case, answer, monkeypatch,
+                                                                tmp_path):
+    """Every file the export writes that exists is named in one question, default No; No
+    keeps the dialog open, Yes accepts it. A .bin export writes <stem>-digital-0.bin and
+    -1.bin, so those are the names asked about."""
+    dlg = _capture_dialog()
+    fmt, path, files = {
+        "typed sal": ("sal", tmp_path / "x.sal", ["x.sal"]),
+        "csv over csv": ("csv", tmp_path / "x.sal", ["x.csv"]),
+        "bin channel": ("bin", tmp_path / "x.bin", ["x-digital-1.bin"]),
+        "bin both": ("bin", tmp_path / "x.bin", ["x-digital-0.bin", "x-digital-1.bin"]),
+    }[case]
+    for name in files:
+        (tmp_path / name).write_text("OLD")
+    dlg._path.setText(str(path))
+    _fmt(dlg, fmt)
+    asked = _asked(monkeypatch, answer)
+    dlg.accept()
+    assert len(asked) == 1 and all(name in asked[0] for name in files), asked
+    assert dlg.result() == (QDialog.Accepted if answer == QMessageBox.Yes else 0)
+    assert all((tmp_path / name).read_text() == "OLD" for name in files)
+
+
+def test_an_export_to_new_files_or_a_name_browse_confirmed_asks_nothing(monkeypatch, tmp_path):
+    dlg = _capture_dialog()
+    dlg._path.setText(str(tmp_path / "new.sal"))
+    asked = _asked(monkeypatch, QMessageBox.No)
+    dlg.accept()
+    assert asked == [] and dlg.result() == QDialog.Accepted
+    (tmp_path / "old.sal").write_text("OLD")
+    dlg = _capture_dialog()
+    monkeypatch.setattr("swi3s_studio.ui.capture_export_dialog.QFileDialog.getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "old.sal"), "")))
+    dlg._browse()
+    dlg.accept()
+    assert asked == [] and dlg.result() == QDialog.Accepted
+
+
+@pytest.mark.parametrize("key, ext, typed, want", [
+    ("sal", ".sal", "/tmp/swi3s_run7", "/tmp/swi3s_run7.sal"),
+    ("sal", ".sal", "/tmp/swi3s_run7.txt", "/tmp/swi3s_run7.txt.sal"),
+    ("csv", ".csv", "/tmp/swi3s_run7", "/tmp/swi3s_run7.csv"),
+    ("csv", ".csv", "/tmp/swi3s_run7.CSV", "/tmp/swi3s_run7.CSV"),
+])
+def test_a_typed_output_path_gets_the_formats_extension(key, ext, typed, want):
+    """The File field takes the extension Browse would add."""
+    dlg = _capture_dialog()
+    dlg._format.setCurrentIndex([dlg._format.itemData(i)[0]
+                                 for i in range(dlg._format.count())].index(key))
+    dlg._path.setText(typed)
+    dlg.accept()
+    assert dlg.result() == QDialog.Accepted
+    assert dlg.output_path() == want
+
+
+def test_a_typed_path_that_names_an_existing_file_is_confirmed_once_with_its_suffix(
+        tmp_path, monkeypatch):
+    dlg = _capture_dialog()
+    (tmp_path / "run7.sal").write_bytes(b"x")
+    dlg._path.setText(str(tmp_path / "run7"))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
+    dlg.accept()
+    assert dlg.result() != QDialog.Accepted
+    assert len(asked) == 1 and asked[0].startswith("run7.sal exists")
+
+
+def _pick_format(dlg, key):
+    keys = [dlg._format.itemData(i)[0] for i in range(dlg._format.count())]
+    dlg._format.setCurrentIndex(keys.index(key))
+
+
+@pytest.mark.parametrize("typed, fmt, want", [
+    ("/tmp/run 1.5", "csv", "/tmp/run 1.5.csv"),
+    ("/tmp/capture_v2.1_amp", "bin", "/tmp/capture_v2.1_amp.bin"),
+    ("/tmp/run 1.5.sal", "csv", "/tmp/run 1.5.csv"),
+    ("/tmp/RUN.BIN", "csv", "/tmp/RUN.csv"),
+])
+def test_switching_the_format_replaces_only_a_format_extension(typed, fmt, want):
+    dlg = _capture_dialog()
+    dlg._path.setText(typed)
+    _pick_format(dlg, fmt)
+    assert dlg.output_path() == want
+
+
+def test_a_bin_export_does_not_confirm_replacing_a_file_it_never_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: pytest.fail(f"asked: {a[2]}"))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: pytest.fail(a[2]))
+    (tmp_path / "run.bin").write_bytes(b"x")
+    dlg = _capture_dialog()
+    _pick_format(dlg, "bin")
+    dlg._path.setText(str(tmp_path / "run"))
+    dlg.accept()
+    assert dlg.result() == QDialog.Accepted
+    assert dlg.output_path() == str(tmp_path / "run.bin")
+    assert dlg.output_files() == [str(tmp_path / "run-digital-0.bin"),
+                                  str(tmp_path / "run-digital-1.bin")]

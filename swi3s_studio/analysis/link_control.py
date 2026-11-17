@@ -22,8 +22,8 @@ On a **Cold Start** the Manager then clocks a 4-bit PHY number on DN — sampled
 off to the selected audio PHY. A **Warm Start** carries **no** PHY number: the
 previously-selected PHY is reused (so a decoder must carry it over).
 
-All thresholds and the PHY-number→type map are sourced from the MIPI SWI3S v1.1 r06
-draft and kept as table-driven constants. The draft leaves the PHY-number encoding
+All thresholds and the PHY-number→type map are sourced from the MIPI SWI3S
+specification and kept as table-driven constants. The specification leaves the PHY-number encoding
 (Table 9) as ``###TBD``, so ``PHY_NUMBER_MAP`` is a 1-based literal.
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ PHY_NUMBER_BITS = 4         # normative 4-bit PHY number, MSb first
 # resolves to 'none'.
 _LC_MAX_EDGES = 8192
 
-# PHY number → (name, kind). The draft leaves the encoding undefined (Table 9 is
+# PHY number → (name, kind). The specification leaves the encoding undefined (Table 9 is
 # ###TBD); the map is 1-based in the order #1 FBCSE-slow, #2 FBCSE-fast, #3 DLV.
 PHY_NUMBER_MAP = {
     0b0001: ("PHY1", "FBCSE-slow"),
@@ -83,7 +83,7 @@ PHY_NUMBER_MAP = {
 PHY_SAFE_LOCK_COLUMNS = {"PHY1": 2, "PHY2": 2, "PHY3": 4}
 
 # Manager Link-Control timing limits — the "DFI Timing Parameters Related to Link Control
-# Sequences" table, §5.2.3 (MIPI SWI3S v1.1 r06).
+# Sequences" table, §5.2.3 (MIPI SWI3S).
 # (param -> (min_us, max_us, description)); None = no bound on that side. The Link
 # Control Timing pane measures each observable parameter and flags it against these.
 LC_TIMING_LIMITS = {
@@ -103,7 +103,7 @@ def _timing_row(param: str, measured_us: float) -> dict:
     True/False against the bounds the parameter has (a one-sided limit tests that side
     only), or None when it has no bound at all (still shown, just not pass/failed)."""
     lo, hi, desc = LC_TIMING_LIMITS.get(param, (None, None, ""))
-    ok = True
+    ok: bool | None = True
     if lo is not None and measured_us < lo:
         ok = False
     if hi is not None and measured_us > hi:
@@ -165,6 +165,57 @@ def _level_at(edges: np.ndarray, initial: bool, sample: int) -> bool:
     return bool(initial) ^ bool(n & 1)
 
 
+def _phystart_row(phystart: int, spp: float, *lines: np.ndarray) -> List[dict]:
+    """The Man_tPhyStart row: PhyStart's falling edge to the first edge of audio mode, the
+    first transition on either line after it (the audio clock is on one line or the other,
+    by how the capture is stored). No row when no edge follows, as the capture ends first.
+
+    `phystart` is an edge of the coalesced clock, and `lines` are raw, so glitches are
+    skipped as _coalesce_edges skips them (GLITCH_MAX_US): the edges chained to PhyStart
+    within the glitch gap (the rest of a ring at its falling edge), and an even cluster of
+    edges, each within the gap of the one before, spanning at most the gap (a glitch that
+    leaves the level unchanged).
+
+    The walk reads the edges near PhyStart only: a cluster is followed no further than the
+    gap past its first edge, and the ring is searched in growing NumPy chunks, so a dense
+    audio clock after PhyStart costs no per-edge Python loop."""
+    min_gap = max(1, int(GLITCH_MAX_US * spp))
+    firsts = []
+    for edges in lines:
+        i = _chain_end(edges, int(_ss(edges, int(phystart), side="right")), int(phystart),
+                       min_gap)                        # past the ring at PhyStart
+        while i < edges.size:
+            start = int(edges[i])
+            j = i + 1
+            wide = False                               # edges[i:j] spans more than the gap
+            while j < edges.size and int(edges[j]) - int(edges[j - 1]) <= min_gap:
+                if int(edges[j]) - start > min_gap:
+                    wide = True
+                    break
+                j += 1                                 # edges[i:j] is one cluster
+            if wide or (j - i) % 2 == 1:
+                firsts.append(start)
+                break
+            i = j
+    return [_timing_row("Man_tPhyStart", (min(firsts) - phystart) / spp)] if firsts else []
+
+
+def _chain_end(edges: np.ndarray, i: int, prev: int, gap: int) -> int:
+    """The index of the first edge from `i` on that lies more than `gap` after the edge
+    before it (`prev` before edges[i]), or edges.size when every one is chained. Searched
+    in chunks that grow from 64 edges, so a short chain reads few of them."""
+    n = int(edges.size)
+    step = 64
+    while i < n:
+        hi = min(n, i + step)
+        seg = np.asarray(edges[i:hi], dtype=np.int64)
+        k = np.flatnonzero(np.diff(seg, prepend=np.int64(prev)) > gap)
+        if k.size:
+            return i + int(k[0])
+        prev, i, step = int(seg[-1]), hi, min(step * 4, 1 << 20)
+    return n
+
+
 def _coalesce_edges(edges: np.ndarray, min_gap: int = 0) -> np.ndarray:
     """Collapse transitions closer together than `min_gap` samples — sub-sample
     glitches in a real capture (a real LC pulse is ≥ ~2.6 µs, so any cluster of
@@ -224,6 +275,21 @@ def _clock_stops(edges: np.ndarray, min_gap: int) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
 
 
+def _link_idle_stops(capture, ce: np.ndarray) -> np.ndarray:
+    """`_clock_stops` of the capture's clock edges `ce` longer than LINK_IDLE_MIN_US, found
+    once per capture and kept on it: they depend on its edges alone, which do not change."""
+    min_gap = int(LINK_IDLE_MIN_US * float(capture.sample_rate_hz) / 1e6)
+    cached = getattr(capture, "_link_idle_stops", None)
+    if cached is not None and cached[0] is ce and cached[1] == min_gap:
+        return cached[2]
+    stops = _clock_stops(ce, min_gap)
+    try:
+        capture._link_idle_stops = (ce, min_gap, stops)
+    except AttributeError:
+        pass                                   # a capture that takes no attribute: not kept
+    return stops
+
+
 def _edges_in(edges: np.ndarray, lo: int, hi: int) -> int:
     """Edges in [lo, hi)."""
     return int(_ss(edges, hi, side="left")) - int(_ss(edges, lo, side="left"))
@@ -266,7 +332,7 @@ def decode_link_controls(capture, first: Optional[LinkControlResult] = None
     spp = float(capture.sample_rate_hz) / 1e6
     one_ms = int(1000.0 * spp)
     after = int(first.audio_start_sample or 0)
-    for g in _clock_stops(ce, int(LINK_IDLE_MIN_US * spp)):
+    for g in _link_idle_stops(capture, ce):
         g = int(g)
         stop, restart = int(ce[g]), int(ce[g + 1])
         if stop < after:
@@ -298,8 +364,12 @@ def decode_link_controls(capture, first: Optional[LinkControlResult] = None
             continue
         if r.sequence == "warm":
             prev = found[-1]
+            # On PHY3 (DLV) the first edge after PhyStart is a Row Sync (see the Cold Start).
+            timing = ([t for t in r.timing if t["param"] != "Man_tPhyStart"]
+                      if prev.phy_name == "PHY3" else r.timing)
             r = replace(r, phy_number=prev.phy_number, phy_name=prev.phy_name,
                         phy_kind=prev.phy_kind, safe_lock_columns=prev.safe_lock_columns,
+                        timing=timing,
                         note=(f"Warm Start: {prev.phy_name} reused from the bring-up before it."
                               if prev.phy_name else
                               "Warm Start: the PHY of the bring-up before it is reused, and "
@@ -328,7 +398,7 @@ def clock_resumes(capture, bringups: List[LinkControlResult]) -> List[int]:
                   else r.audio_start_sample), int(r.audio_start_sample))
              for r in bringups[1:] if r.audio_start_sample is not None]
     out = []
-    for g in _clock_stops(ce, int(LINK_IDLE_MIN_US * spp)):
+    for g in _link_idle_stops(capture, ce):
         stop, resume = int(ce[g]), int(ce[g + 1])
         if stop < after or any(lo <= resume and stop <= hi for lo, hi in spans):
             continue
@@ -450,7 +520,8 @@ def _decode_oriented(clock_edges, initial_clock, data_edges, initial_data,
             audio_start_sample=audio,
             note="Warm Start: PHY reused from the prior Cold Start (not in this capture).",
             sections=sections,
-            timing=[_timing_row("Man_tWarmStart10", (fall_sample - rise_sample) / spp)],
+            timing=[_timing_row("Man_tWarmStart10", (fall_sample - rise_sample) / spp)]
+            + _phystart_row(fall_sample, spp, np.asarray(clock_edges, dtype=np.uint64), dat),
         )
 
     # ---- Cold Start: reset structure → PHY-number clock burst → PhyStart ----
@@ -540,6 +611,11 @@ def _decode_oriented(clock_edges, initial_clock, data_edges, initial_data,
     # PHY-number clock: report the worst-case (nearest a limit) high/low over the burst,
     # pass/failed across every cycle; the range is in the description.
     timing += _clock_timing_rows(clock_highs, clock_lows)
+    # PhyStart → audio mode. On PHY3 (DLV) the first edge after PhyStart is a Row Sync, not
+    # the start of a clock, so the span is not Man_tPhyStart there.
+    if phystart_sample is not None and phy_name != "PHY3":
+        timing += _phystart_row(phystart_sample, spp,
+                                np.asarray(clock_edges, dtype=np.uint64), dat)
 
     return LinkControlResult(
         sequence="cold",

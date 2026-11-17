@@ -178,6 +178,71 @@ def test_a_visualizer_config_csv_is_not_a_capture(tmp_path):
         probe_mod.probe([str(p)])
 
 
+def _four_channel_sal(tmp_path):
+    """Channels 0 and 1 busy over the first tenth of the capture, 2 and 3 over its last
+    tenth only, each ending on the capture's last sample."""
+    import json
+    import zipfile
+    end = 2_000_000
+    early = np.arange(10, end // 10, 3, dtype=np.uint64)
+    late = np.arange(end - end // 10, end, 5, dtype=np.uint64)
+    chans = [np.append(early, end), np.append(early + 1, end), late, late + 1]
+    path = tmp_path / "four.sal"
+    meta = {"data": {"legacySettings": {"sampleRate": {"digital": 100_000_000}}},
+            "binData": [{"type": "Digital", "file": f"digital-{c}.bin", "deviceChannel": c}
+                        for c in range(4)]}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("meta.json", json.dumps(meta))
+        for c, e in enumerate(chans):
+            z.writestr(f"digital-{c}.bin", saleae_binary.build_channel_v3(False, e, chunk_size=500))
+    return str(path)
+
+
+@pytest.mark.gui
+def test_each_link_of_a_sal_is_priced_by_its_own_two_channels(tmp_path):
+    """The probe prices a Link's window by the loader's model of that Link's channels, not
+    by the busiest pair's, and the dialog sums the Links on the page."""
+    from PySide6.QtWidgets import QApplication
+
+    from swi3s_studio.ingest import saleae_sal
+    from swi3s_studio.ui.open_capture_dialog import OpenCaptureDialog
+    path = _four_channel_sal(tmp_path)
+    pr = probe_mod.probe([path])
+    assert set(pr.priced_pair) == {0, 1}
+    rate = pr.sample_rate_hz
+    late = (0.9 * pr.duration_s, pr.duration_s)
+    s0, s1 = int(round(late[0] * rate)), int(round(late[1] * rate)) + 1
+    guard = saleae_sal.window_model(path, channels=[2, 3]).peak_bytes(s0, s1)
+    assert pr.cost_bytes(*late, channels=(2, 3)) == guard
+    assert pr.cost_bytes(*late) == saleae_sal.window_model(path, channels=[0, 1]).peak_bytes(
+        s0, s1) < guard
+    assert pr.cost_bytes(channels=(2, 3)) < pr.cost_bytes() == pr.cost_all_bytes
+    QApplication.instance() or QApplication([])
+    dlg = OpenCaptureDialog(pr, [], budget_bytes=10**12)
+    dlg._append_row(2, 3)
+    pairs = [tuple(pr.channels[i].value for i in r.pair()) for r in dlg.rows()]
+    assert sorted(pairs) == [(0, 1), (2, 3)] or sorted(pairs) == [(1, 0), (2, 3)]
+    assert dlg._cost(*late) == sum(pr.cost_bytes(*late, channels=p) for p in pairs)
+
+
+def test_a_legacy_visualizer_config_csv_is_not_a_capture(tmp_path):
+    """A v1.73/v1.74 config has none of the register-style rows; its own field names mark it."""
+    from test_compare import _OLD_CSV
+    p = tmp_path / "old.csv"
+    p.write_text(_OLD_CSV)
+    with pytest.raises(ValueError, match="Visualizer config CSV"):
+        probe_mod.probe([str(p)])
+
+
+def test_looks_like_config_reads_the_first_field_of_each_row():
+    from swi3s_studio.ingest.visualizer_csv import looks_like_config
+    for lines in (["AppVersion,3.0\n"], ["NumColumns_REG,0,16\n"], ["Columns per Row (2-32),8\n"],
+                  ['"Data Port Name",A,B\n'], ["Save file using excess one,True\n"]):
+        assert looks_like_config(lines), lines
+    for lines in (["Time,D0_REG,D1\n", "0,0,1\n"], ["TIME,CH1\n"], []):
+        assert not looks_like_config(lines), lines
+
+
 # ---- a window, in every format -------------------------------------------------------------
 
 def _files(demo, tmp_path):

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .port_names import with_name
+from .theme import analyzer_stylesheet
 
 # Standard decimation presets offered per stream (label, Hz). None = native rate.
 _RATE_PRESETS = [("Native", None), ("8 kHz", 8000), ("16 kHz", 16000),
@@ -88,9 +89,11 @@ class AudioExportDialog(QDialog):
 
     def __init__(self, store, parent=None, default_rates: Optional[Dict[Tuple[int, int], int]] = None,
                  names=None,
-                 visible_sample_range: Optional[Tuple[int, int]] = None) -> None:
+                 visible_sample_range: Optional[Tuple[int, int]] = None,
+                 title: str = "Export audio as WAV") -> None:
         super().__init__(parent)
-        self.setWindowTitle("Export audio as WAV")
+        self.setWindowTitle(title)
+        self.setStyleSheet(analyzer_stylesheet())
         self._store = store
         self._checks: Dict[Tuple[int, int], QCheckBox] = {}
         self._rates: Dict[Tuple[int, int], QComboBox] = {}
@@ -195,5 +198,18 @@ class AudioExportDialog(QDialog):
                     f"Device {dev} · DP{dp}: {problem}. Pick a preset, or type a rate "
                     "such as 22.05 kHz (a number with no unit is in kHz below 1000, "
                     "else in Hz).")
+                return
+        if self.sample_range() is not None:
+            silent = []
+            for dev, dp in self.selected_streams():
+                span = self.index_range(dev, dp)
+                if span is not None and span[1] <= span[0]:
+                    silent.append((dev, dp))
+            if silent:
+                names = ", ".join(f"Device {dev} · DP{dp}" for dev, dp in silent)
+                QMessageBox.information(
+                    self, "Export audio",
+                    f"No audio in the visible range for {names}. Untick "
+                    f"{'it' if len(silent) == 1 else 'them'}, or choose Whole capture.")
                 return
         super().accept()

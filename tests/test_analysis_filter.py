@@ -292,3 +292,29 @@ def test_the_expression_filter_is_debounced_and_applies_on_demand():
     finally:
         win.join_worker_threads()
         win.close()
+
+
+@pytest.mark.parametrize("row_column_shown", [False, True])
+def test_the_playhead_command_is_the_top_row_whichever_way_the_playhead_moves(row_column_shown):
+    """Moving the playhead down and then up through the commands puts the selected command
+    at the top of the table each time, with the Row column hidden (the default) or shown."""
+    QApplication.instance() or QApplication([])
+    from swi3s_studio.ui.main_window import MainWindow
+    win = MainWindow()
+    win.resize(1200, 800)
+    win.show()
+    win.load_demo(2000)
+    view = win._cmd_view
+    view.setColumnHidden(0, not row_column_shown)
+    view.setFixedHeight(160)
+    QApplication.processEvents()
+    starts = list(win._starts)
+    rows = len(starts)
+    picks = [rows // 4, rows // 2, rows // 3, rows // 6, rows // 2 + 3]
+    assert rows > 30 and all(p < rows - 10 for p in picks), rows
+    for p in picks:
+        win._select_command_for_sample(int(starts[p]))
+        QApplication.processEvents()
+        sel = view.selectionModel().selectedRows()[0].row()
+        assert view.indexAt(view.viewport().rect().topLeft()).row() == sel, (p, sel)
+    win.close()

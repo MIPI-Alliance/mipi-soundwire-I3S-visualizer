@@ -12,7 +12,9 @@
 - DecoderSettings.forced_column_count outside [2, 32] auto-detects, as an out-of-range
   forced_column_sections entry does.
 - A recovered-clock (DLV) decode reports a total UI count, so its progress is a fraction.
-- Edge arrays of a signed or floating-point dtype are refused with TypeError.
+- Edge arrays of a signed dtype, NumPy's default int64 included, are accepted when no
+  value is negative (a C-contiguous int64 array without a copy); a negative edge raises
+  ValueError and a floating-point dtype TypeError.
 - The recovered clock ends where a UI spans under one sample, takes the cold-start count for
   an initial column count outside 2..32, relocks across a stretch with no rising edge for
   more than 64 rows, and ends when no rising edge remains. These run in a child process
@@ -66,6 +68,8 @@ def _source(cap, clock, data):
 
 _CONVERSIONS = {
     "uint32": lambda e: e.astype(np.uint32),
+    "int32": lambda e: e.astype(np.int32),
+    "int64": lambda e: e.astype(np.int64),
     "strided": lambda e: np.stack([e, e], axis=1)[:, 0],
     "list": lambda e: [int(x) for x in e],
 }
@@ -321,17 +325,41 @@ def test_in_range_forced_column_count_is_used():
     assert dec.column_count == 16
 
 
-@pytest.mark.parametrize("dtype", [np.int64, np.float64])
+def _edge_source(which, edges, data=None):
+    if which == "dlv":
+        return swi3score.DlvSampleSource(edges, False, 1_000_000, 4, 0.0)
+    return swi3score.TransitionSampleSource(edges, edges if data is None else data, False,
+                                            False, 1_000_000)
+
+
 @pytest.mark.parametrize("which", ["transition", "dlv"])
-def test_signed_and_float_edge_arrays_are_refused(which, dtype):
-    """The edge arrays convert only from what numpy casts to uint64 safely; a signed or
-    floating-point array raises TypeError rather than being reinterpreted."""
-    edges = np.array([1, 5, 9, 20], dtype=dtype)
-    with pytest.raises(TypeError):
-        if which == "dlv":
-            swi3score.DlvSampleSource(edges, False, 1_000_000, 4, 0.0)
-        else:
-            swi3score.TransitionSampleSource(edges, edges, False, False, 1_000_000)
+def test_float_edge_arrays_are_refused(which):
+    """An edge is a whole sample number: a floating-point array raises TypeError rather
+    than being rounded or reinterpreted."""
+    with pytest.raises(TypeError, match="float64"):
+        _edge_source(which, np.array([1, 5, 9, 20], dtype=np.float64))
+
+
+@pytest.mark.parametrize("dtype", [np.int64, np.int32])
+@pytest.mark.parametrize("which", ["transition", "dlv"])
+def test_a_negative_edge_is_refused(which, dtype):
+    with pytest.raises(ValueError, match="negative sample number"):
+        _edge_source(which, np.array([1, 5, -9, 20], dtype=dtype))
+
+
+def test_contiguous_int64_edges_are_held_not_copied():
+    """NumPy's default integer dtype takes the zero-copy path, one uint64 and one int64
+    array side by side."""
+    cap = transitions.demo_capture(8)
+    clock, data = cap.clock_edges.astype(np.uint64), cap.data_edges.astype(np.int64)
+    ref = _summary(_decode(_source(cap, clock, data.astype(np.uint64)), decode_audio=False))
+    before = (sys.getrefcount(clock), sys.getrefcount(data))
+    src = _source(cap, clock, data)
+    assert (sys.getrefcount(clock), sys.getrefcount(data)) == (before[0] + 1, before[1] + 1)
+    assert _summary(_decode(src, decode_audio=False)) == ref
+    del src
+    gc.collect()
+    assert (sys.getrefcount(clock), sys.getrefcount(data)) == before
 
 
 # ---- the recovered clock's limits ----------------------------------------------------

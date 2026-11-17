@@ -6,7 +6,8 @@ Pinned here:
 - a click on a highlighted term in another inequality draws it there, the highlight kept,
   and a click on the term drawn, in its inequality, clears it; a recompute with no term
   drawn builds no timeline;
-- a launch is drawn with its launcher's clock and data at its own pin;
+- a launch is drawn with its launcher's clock and data at its own pin, and a clock row with
+  each edge the clock makes at its pin within the panel's window;
 - a flight mismatch is drawn as the clock's and the data's flights, with no signal rows,
   and a signal row is named Clk or Data @ its pin;
 - a term the leg holds twice gets a panel per occurrence, and a launch and its SoundWire
@@ -15,10 +16,9 @@ Pinned here:
 - a column without the term, and a section with no timeline, say so;
 - a click on every term of every inequality, the contention and keeper legs too, draws a
   panel in every column; a release, an EDE Delay and a keeper's response are drawn with the
-  data they connect, and the co-located drawing of P→M and P→P contention says so;
+  data they connect, and the drawing of P→M and P→P contention says its two flights net to zero;
 - a driver's high-Z stretches are dotted, after a release and before a turn-on, and a margin
-  short of zero is red, "overlap" on a contention leg and "short" on a keeper leg, and green
-  "margin" where it is a gap;
+  is named "margin" on every leg, red short of zero and green where it is a gap;
 - a percentage of nominal reads to a tenth where it is not whole, and a margin guide's value
   prints a true minus and no sign where it rounds to zero;
 - a level's label at the right end sits on the side away from where the edge rests, chained
@@ -31,7 +31,9 @@ Pinned here:
 - the labels are the diagram's body font in demi-bold in a wide column, smaller in a narrow
   one, and the strokes scale with the line height;
 - a compute error closes the diagram and clears the highlight of the term it drew;
-- every term of every leg paints.
+- every term of every leg paints;
+- the title wraps beside the column choice, or below it at the full width where beside it it
+  would take more lines.
 
 Run: QT_QPA_PLATFORM=offscreen PYTHONPATH=. python3 -m pytest tests/test_timing_diagram.py
 """
@@ -43,9 +45,8 @@ import pytest
 import timing_diagram_support as support
 
 from swi3s_studio.timing import CalcInputs
-from swi3s_studio.timing.timeline import SUPPORTED_LEGS
 
-pytestmark = pytest.mark.gui
+pytestmark = [pytest.mark.gui, pytest.mark.usefixtures("shared_compute")]
 
 
 def _app():
@@ -60,6 +61,7 @@ def _view():
     tv = TimingView()
     tv.resize(1800, 1100)
     tv.show()
+    tv.flush_recompute()
     QApplication.processEvents()
     return tv
 
@@ -69,9 +71,10 @@ def _term_key():
     return _term_key
 
 
-def _term_point(tv, leg, key):
-    """A point on `key` in `leg`'s equation row of the inequalities tree."""
-    from PySide6.QtCore import QPoint, Qt
+def _equation_rows(tv, leg):
+    """The index of each of `leg`'s equation rows in the inequalities tree: one, or one per
+    column where the columns' terms differ."""
+    from PySide6.QtCore import Qt
     tree = tv._tree
     rows = []
     for i in range(tree.topLevelItemCount()):
@@ -80,8 +83,15 @@ def _term_point(tv, leg, key):
             if "≥ 0" in head.child(c).text(0) and head.child(c).data(0, Qt.UserRole) == leg:
                 rows.append(tree.indexFromItem(head.child(c), 0))
     assert rows, leg
-    # A leg whose columns differ has an equation row per column; the term is on one of them.
-    for idx in rows:
+    return rows
+
+
+def _term_point(tv, leg, key):
+    """A point on `key` in `leg`'s equation row of the inequalities tree: the leftmost, on the
+    first row holding it."""
+    from PySide6.QtCore import QPoint
+    tree = tv._tree
+    for idx in _equation_rows(tv, leg):
         tree.scrollTo(idx)
         rect = tree.visualRect(idx)
         hit = next((QPoint(x, rect.center().y()) for x in range(rect.left(), rect.right(), 3)
@@ -91,28 +101,55 @@ def _term_point(tv, leg, key):
     raise AssertionError((leg, key))
 
 
-def _click(tv, leg, key):
-    from PySide6.QtCore import Qt
+def _term_points(tv, leg):
+    """{key: (row index, offset from the row's left)} of every term on `leg`'s equation rows,
+    each at the point `_term_point` finds, from one pass along each row."""
+    from PySide6.QtCore import QPoint
+    tree = tv._tree
+    out = {}
+    for idx in _equation_rows(tv, leg):
+        tree.scrollTo(idx)
+        rect = tree.visualRect(idx)
+        for x in range(rect.left(), rect.right(), 3):
+            key = tree._key_at(QPoint(x, rect.center().y()))
+            if key is not None and key not in out:
+                out[key] = (idx, x - rect.left())
+    return out
+
+
+def _click(tv, leg, key, points=None):
+    """Click `key` in `leg`'s equation row, at `_term_point`, or at its entry of `points` (from
+    `_term_points`), which must still hit it."""
+    from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
-    QTest.mouseClick(tv._tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _term_point(tv, leg, key))
+    if points is None:
+        at = _term_point(tv, leg, key)
+    else:
+        assert key in points, (leg, key)
+        idx, dx = points[key]
+        tv._tree.scrollTo(idx)
+        rect = tv._tree.visualRect(idx)
+        at = QPoint(rect.left() + dx, rect.center().y())
+        assert tv._tree._key_at(at) == key, (leg, key)
+    QTest.mouseClick(tv._tree.viewport(), Qt.LeftButton, Qt.NoModifier, at)
 
 
 def test_clicking_a_term_draws_only_that_term():
     """A click on a term of an inequality's equation row opens the pane and draws that term:
     one panel per column, each holding only spans of the clicked term."""
     tv = _view()
-    assert not tv._diagram_pane.isVisible()
+    assert tv._diagram_pane.isVisible() and tv._diagram_whole       # the default view of 1)
     _click(tv, "MP_setup", "Man_t_DD")
-    assert tv._diagram_pane.isVisible()
+    assert tv._diagram_pane.isVisible() and not tv._diagram_whole
     d = tv._diagram
     assert d.term == "Man_t_DD"
     assert [pn.title for pn in d.panels] == list(tv._column_labels())
     key = _term_key()
     for pn in d.panels:
         assert pn.spans and all(key(sym) == "Man_t_DD" for sym in pn.symbols)
-        assert [(r.pin, r.signal) for row in pn.rows for r in row] == [
+        assert [(row[0].pin, row[0].signal) for row in pn.rows] == [
             ("Manager", "clock"), ("Manager", "data")]
+        assert all(len({(r.pin, r.signal) for r in row}) == 1 for row in pn.rows)
     # Clicking it again clears its highlight, and the diagram with it.
     _click(tv, "MP_setup", "Man_t_DD")
     assert tv._hl == set() and d.panels == []
@@ -193,6 +230,28 @@ def test_a_launch_is_drawn_at_its_own_pin():
     assert [[r.key for r in row] for row in pn.rows] == [["data@per"]]
 
 
+def test_a_clock_row_draws_each_edge_its_pin_makes_in_the_window():
+    """A clock row holds the timeline's other edges at its pin that are drawn in the panel's
+    window, so a launch whose window reaches the next clock edge draws the clock falling
+    there; an edge outside the window is left out."""
+    from dataclasses import replace
+
+    from swi3s_studio.ui.timing_diagram import _settle_ns, panels
+    for inp, held in ((replace(CalcInputs(), Man_t_DD_max_ns=23.0, F_CLK_target_MHz=13.65),
+                       True), (CalcInputs(), False)):
+        secs = support.sections(inp, "MP_setup")
+        (pn,) = panels(secs, "Man_t_DD", _term_key())
+        tl = secs[0].timeline
+        lo, hi = pn.window
+        edges = [r for r in tl.ramps if r.signal == "clock" and r.pin == "Manager"]
+        drawn = {r.key for row in pn.rows for r in row if r.signal == "clock"}
+        shown = {r.key for r in edges if r.start_ns < hi and r.start_ns + _settle_ns(r) > lo}
+        assert drawn == shown, (drawn, shown)
+        assert ("clk_e1@man" in drawn) is held, drawn
+        (row,) = [row for row in pn.rows if row[0].signal == "clock"]
+        assert all(a.rising != b.rising for a, b in zip(row, row[1:]))
+
+
 def test_a_ramp_named_for_its_edge_draws_on_its_data_lanes_panel():
     """The ramp to V_OH / V_OL is `<dev>_t_RF,DATA,rise` or `,fall`, here on an exponential
     ramp at V_OH + V_OL ≠ 1; it keys on its lane's row, and the click on that row
@@ -215,7 +274,7 @@ def test_a_mismatch_is_drawn_as_the_two_flights_and_rows_are_named_short():
     """t_PD,mis is a panel with no signal rows: the clock's and the data's flights from one
     start, and the term between their ends. A signal row is named Clk or Data @ its pin."""
     from swi3s_studio.ui.timing_diagram import _row_name, panels
-    for leg in ("MP_setup", "MP_hold_ho"):
+    for leg in ("MP_setup", "MP_hold_ho", "PM_setup", "PM_hold_ho"):
         (pn,) = panels(support.sections(CalcInputs(), leg), "t_PD,mis fraction", _term_key())
         assert pn.rows == [] and [g[2] for g in pn.guides] == ["Clock propagation",
                                                               "Data propagation"]
@@ -246,7 +305,9 @@ def test_a_repeated_term_gets_a_panel_each_and_a_chained_one_shares_one():
 def test_a_chained_panel_heading_adds_up_to_its_total():
     """A launch and its SoundWire anchor correction: the heading subtracts a span that runs
     against the first, with the operator the inequality gives the correction relative to the
-    launch, so the spans' unsigned lengths with the heading's operators make its total."""
+    launch, so the spans' unsigned lengths with the heading's operators make its total. The
+    Peripheral's case runs its clock at t_Slew_Clock's min, where its min-side correction is
+    the data ramp's alone and runs against the launch."""
     import re
 
     from PySide6.QtWidgets import QApplication
@@ -257,7 +318,7 @@ def test_a_chained_panel_heading_adds_up_to_its_total():
     d = TimingDiagram(_subscript, _term_key())
     sw = dict(Man_spec="SW13_1V2", Per_spec="SW13_1V2")
     negative = False
-    for inp, leg, key in ((CalcInputs(**sw), "PM_hold", "Per_t_DD"),
+    for inp, leg, key in ((CalcInputs(**sw, tRF_Man_CLK_ns=2.0), "PM_hold", "Per_t_DD"),
                           (CalcInputs(**sw, tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3),
                            "MP_setup", "Man_t_DD"),
                           (CalcInputs(**sw, tRF_Man_CLK_ns=8.3, tRF_Man_DATA_ns=8.3,
@@ -369,17 +430,15 @@ def test_a_click_on_a_contention_or_keeper_term_draws_it_in_every_column(leg, ke
 
 def test_a_click_on_every_term_of_every_leg_draws_a_panel():
     """A click on every term the equation row prints, for every inequality at the view's own
-    inputs, with EDE on both sides and with a SoundWire Manager and an EDE Peripheral: each
-    column holding the term draws it, and a P→M or P→P contention column says it is drawn
-    with both devices at the Manager."""
+    inputs with a SoundWire Manager and an EDE Peripheral: each column holding the term draws
+    it, and a P→M or P→P contention column says its two flights net to zero.
+    The panels of every term are checked at the calculator, for this setup, the default one
+    and EDE on both sides, in `test_timing_view_columns.py`."""
     from swi3s_studio.timing.calculator import INEQUALITIES
-    from swi3s_studio.timing.timeline import CO_LOCATED_NOTE
+    from swi3s_studio.timing.timeline import NET_ZERO_NOTE
     tv = _view()
     d = tv._diagram
-    for man, per, ede_terms in (("SWI3S_PHY2", "SWI3S_PHY2", set()),
-                                ("SWI3S_PHY2_EDE", "SWI3S_PHY2_EDE",
-                                 {"Man_t_EDE", "Per_t_EDE"}),
-                                ("SW13_1V2", "SWI3S_PHY2_EDE", {"Per_t_EDE"})):
+    for man, per, ede_terms in (("SW13_1V2", "SWI3S_PHY2_EDE", {"Per_t_EDE"}),):
         setup = (man, per)
         for combo, spec in ((tv._man_spec_combo, man), (tv._per_spec_combo, per)):
             assert combo.findData(spec) >= 0, spec
@@ -393,9 +452,14 @@ def test_a_click_on_every_term_of_every_leg_draws_a_panel():
                     for side in ("spec", "proposed")}
             keys = held["spec"] | held["proposed"]
             swept |= keys
+            points = None
             for key in keys:
                 tv._clear_terms()
-                _click(tv, leg, key)
+                if points is None:
+                    _click(tv, leg, key)         # the pane opens at the first click
+                    points = _term_points(tv, leg)
+                else:
+                    _click(tv, leg, key, points)
                 assert (tv._diagram_leg, d.term) == (leg, key) and d.panels, (setup, leg, key)
                 for col, side in enumerate(("spec", "proposed")):
                     mine = [pn for pn in d.panels if pn.column == col]
@@ -406,7 +470,7 @@ def test_a_click_on_every_term_of_every_leg_draws_a_panel():
                                 setup, leg, key, side, pn.note)
                             continue
                         assert pn.timeline is not None and pn.spans, (setup, leg, key, side)
-                        co = CO_LOCATED_NOTE in pn.corner
+                        co = NET_ZERO_NOTE in pn.corner
                         assert co is (leg in ("PM_contention", "PP_contention")), (
                             leg, pn.corner)
         assert ede_terms <= swept, (setup, ede_terms - swept)
@@ -416,8 +480,8 @@ def test_a_click_on_every_term_of_every_leg_draws_a_panel():
 
 def test_a_high_z_stretch_is_dotted_and_a_short_margin_is_red(monkeypatch):
     """A conventional release goes dotted at its high-Z and a turn-on leaves a dotted
-    stretch; a contention margin short of zero is red and named "overlap", a keeper's
-    "short", and one with room green "margin"."""
+    stretch; a margin short of zero is red and one with room green, each named "margin", on a
+    contention and a keeper leg."""
     from PySide6.QtGui import QColor
 
     from swi3s_studio.ui.theme import VizTheme
@@ -435,9 +499,9 @@ def test_a_high_z_stretch_is_dotted_and_a_short_margin_is_red(monkeypatch):
                              dimension(self, p, x0, x1, y, label, col, *a))[-1])
     red, green = QColor(VizTheme.DIAG_BAD).name(), QColor(VizTheme.DIAG_OK).name()
     for inp, leg, key, name, colour in (
-            (CalcInputs(handover_UIs=0.0), "PM_contention", "Per_t_DZ", "overlap", red),
+            (CalcInputs(handover_UIs=0.0), "PM_contention", "Per_t_DZ", "margin", red),
             (CalcInputs(), "PM_contention", "Man_t_ZD", "margin", green),
-            (CalcInputs(Man_ede=True, t_keeper_ns=8.0), "keeper_Man", "Man_t_EDE", "short",
+            (CalcInputs(Man_ede=True, t_keeper_ns=8.0), "keeper_Man", "Man_t_EDE", "margin",
              red)):
         dotted.clear()
         dims.clear()
@@ -449,6 +513,7 @@ def test_a_high_z_stretch_is_dotted_and_a_short_margin_is_red(monkeypatch):
         assert any(t0 == pytest.approx(rel.t_ns) for _, t0, _ in dotted), (leg, dotted)
         guides = [(label, col) for label, col in dims if label.startswith(name)]
         assert guides and all(col == colour for _, col in guides), (leg, dims)
+        assert not any(label.startswith(("overlap", "short")) for label, _ in dims), dims
     # A turn-on's dotted stretch ends where its ramp leaves high-Z.
     dotted.clear()
     d.show_term("MP_hold_ho", "Man_t_ZD", support.sections(CalcInputs(), "MP_hold_ho"))
@@ -586,7 +651,6 @@ def test_maximized_the_diagram_draws_either_column_or_both():
     tv._draw_term("Man_t_DD", "MP_setup")
     d = tv._diagram
     btns = tv._diagram_show_btns
-    assert not any(b.isVisible() for b in btns.values())
     tv._diagram_max_btn.click()
     QApplication.processEvents()
     assert all(b.isVisible() for b in btns.values())
@@ -599,21 +663,63 @@ def test_maximized_the_diagram_draws_either_column_or_both():
         assert [[pn.column for pn in col] for col in d.columns()] == want, key
         assert not d.grab().isNull()
     btns["proposed"].click()
-    tv._diagram_max_btn.click()          # restored: both stacked, the choice hidden
+    tv._diagram_max_btn.click()          # restored: the choice kept, stacked
     QApplication.processEvents()
-    assert [[pn.column for pn in col] for col in d.columns()] == [[0, 1]]
-    assert not any(b.isVisible() for b in btns.values())
+    assert btns["proposed"].isChecked() and btns["proposed"].isVisible()
+    assert [[pn.column for pn in col] for col in d.columns()] == [[1]]
     tv._diagram_max_btn.click()          # maximized again: the choice kept
     QApplication.processEvents()
     assert btns["proposed"].isChecked()
     assert [[pn.column for pn in col] for col in d.columns()] == [[1]]
 
 
-def test_labels_take_the_body_size_in_a_wide_column_and_strokes_scale(monkeypatch):
-    """A wide column's labels are the diagram's font size, demi-bold; a narrow column's are
-    smaller; a pixel-sized font scales in pixels; an edge's pen is `_W_TRACE` line heights."""
-    from PySide6.QtGui import QFont, QFontMetricsF
+def test_beside_the_inequalities_the_picker_draws_either_column_or_both_and_is_kept():
+    """Beside the inequalities the diagram shows the column picker, Both by default: Both
+    stacks the two columns, either column alone takes the pane's whole width and leaves the
+    other out of the drawing, the footnote and an export, and the choice is kept in QSettings
+    for the next page; a kept value the picker does not offer opens on Both."""
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
 
+    from swi3s_studio.ui.timing_view import TimingView
+    QSettings().remove("timing_diagrams/columns")
+    tv = _view()
+    d = tv._diagram
+    btns = tv._diagram_show_btns
+    assert not tv.is_diagram_maximized() and d.whole
+    assert all(b.isVisible() for b in btns.values()) and btns["both"].isChecked()
+    assert [[pn.column for pn in col] for col in d.columns()] == [[0, 1]]
+    left, right = tv._column_labels()
+    assert left in d.footnote or d.footnote.startswith("Both columns")
+    btns["proposed"].click()
+    QApplication.processEvents()
+    assert [[pn.column for pn in col] for col in d.columns()] == [[1]]
+    assert d._frames() == [(0.0, float(d.width()))]
+    assert d.footnote.startswith(right) and left not in d.footnote
+    svg = d.export("svg").decode()
+    assert right in svg and left not in svg
+    assert QSettings().value("timing_diagrams/columns") == "proposed"
+    tv._hl = {"Man_t_DD"}
+    tv._draw_term("Man_t_DD", "MP_setup")        # a term follows the choice too
+    QApplication.processEvents()
+    assert [[pn.column for pn in col] for col in d.columns()] == [[1]]
+    again = TimingView()
+    assert again._diagram_show == "proposed" and again._diagram_show_btns["proposed"].isChecked()
+    assert [pn.column for col in again._diagram.columns() for pn in col] in ([], [1])
+    btns["both"].click()
+    assert QSettings().value("timing_diagrams/columns") == "both"
+    assert [[pn.column for pn in col] for col in d.columns()] == [[0, 1]]
+    QSettings().setValue("timing_diagrams/columns", "sideways")
+    assert TimingView()._diagram_show == "both"
+
+
+def test_labels_take_the_body_size_in_a_wide_column_and_strokes_scale(monkeypatch):
+    """A wide column's labels are the level labels' size of the diagram's font in their
+    weight; a narrow column's are `label.narrow` of it; a pixel-sized font scales in pixels;
+    an edge's pen is the clock's weight in line heights (`diagram_style`'s defaults)."""
+    from PySide6.QtGui import QFont
+
+    from swi3s_studio.ui import diagram_style as ds
     from swi3s_studio.ui import timing_diagram as td
     from swi3s_studio.ui.timing_view import _subscript
     _app()
@@ -621,13 +727,14 @@ def test_labels_take_the_body_size_in_a_wide_column_and_strokes_scale(monkeypatc
     f = QFont()
     f.setPixelSize(18)
     d.setFont(f)
-    lh = QFontMetricsF(f).height()
+    lh = d.units()[0]
     d._frame = (0.0, td._LABEL_FULL_W * lh)
     wide = d._label_font()
-    assert wide.pixelSize() == 18 and wide.weight() == QFont.DemiBold
+    size = 18 * ds.default("font.level.size")
+    assert wide.pixelSize() == round(size) == 15 and wide.weight() == QFont.Normal
     d._frame = (0.0, td._LABEL_FULL_W * lh - 1.0)
-    assert d._label_font().pixelSize() == round(18 * td._LABEL_NARROW)
-    assert d._small().pixelSize() == round(18 * td._NOTE_SCALE)
+    assert d._label_font().pixelSize() == round(size * ds.default("label.narrow"))
+    assert d._small().pixelSize() == round(18 * ds.default("font.note.size"))
     widths = []
     real = td.TimingDiagram._pen
     monkeypatch.setattr(td.TimingDiagram, "_pen", lambda self, c, w, *a: (
@@ -635,33 +742,71 @@ def test_labels_take_the_body_size_in_a_wide_column_and_strokes_scale(monkeypatc
     d.show_term("MP_setup", "Man_t_DD", support.sections(CalcInputs(), "MP_setup"))
     d.resize(900, d.minimumHeight())
     assert not d.grab().isNull()
-    assert td._W_TRACE in widths
-    assert real(d, td.QColor("red"), td._W_TRACE).widthF() == td._W_TRACE * lh
+    trace = ds.default("clock.weight")
+    assert trace in widths
+    assert real(d, td.QColor("red"), trace).widthF() == trace * lh
 
 
-def test_every_term_of_every_leg_paints():
+# The input sets `test_every_term_of_every_leg_paints` sweeps, by name, and those it draws
+# side by side.
+_EVERY_TERM_INPUTS = (
+    ("default", CalcInputs()),
+    ("exp shapes and 2 UIs", CalcInputs(Man_shape="exp", Per_shape="exp", handover_UIs=2.0)),
+    ("SW13 1.2 V", CalcInputs(Man_spec="SW13_1V2", Per_spec="SW13_1V2")),
+    ("EDE and 0 UIs", CalcInputs(Man_ede=True, Per_ede=True, handover_UIs=0.0)),
+    ("SW13 Manager and EDE", CalcInputs(Man_spec="SW13_1V2", Man_ede=True, Per_ede=True)))
+_SIDE_BY_SIDE = (_EVERY_TERM_INPUTS[1][1], _EVERY_TERM_INPUTS[4][1])
+
+
+@pytest.mark.parametrize("inp,part", support.sweep_params(_EVERY_TERM_INPUTS))
+def test_every_term_of_every_leg_paints(request, inp, part):
+    """Over every leg and term (`part` of them, `timing_diagram_support.PARTS`) at five
+    input sets, 900 px wide, the second and the fifth side by side: a term draws panels,
+    each with a timeline, and paints. On the platform scope every input set but the default
+    is swept over its `cover` part only."""
     from PySide6.QtWidgets import QApplication
 
     from swi3s_studio.ui.timing_diagram import TimingDiagram
     from swi3s_studio.ui.timing_view import _subscript
+    if part == "rest":
+        support.left_to_the_full_suite(request)
     _app()
     d = TimingDiagram(_subscript, _term_key())
     d.resize(900, 600)
-    for side_by_side, inp in ((False, CalcInputs()),
-                              (True, CalcInputs(Man_shape="exp", Per_shape="exp",
-                                                handover_UIs=2.0)),
-                              (False, CalcInputs(Man_spec="SW13_1V2", Per_spec="SW13_1V2")),
-                              (False, CalcInputs(Man_ede=True, Per_ede=True,
-                                                 handover_UIs=0.0)),
-                              (True, CalcInputs(Man_spec="SW13_1V2", Man_ede=True,
-                                                Per_ede=True))):
-        d.set_side_by_side(side_by_side)
-        for leg in SUPPORTED_LEGS:
-            sections = support.sections(inp, leg)
-            for key in {_term_key()(t.symbol) for t in sections[0].terms}:
-                d.show_term(leg, key, sections)
-                assert d.panels and all(pn.timeline is not None for pn in d.panels), (leg, key)
-                d.resize(900, d.minimumHeight())
-                assert not d.grab().isNull()
-                QApplication.processEvents()
+    d.set_side_by_side(inp in _SIDE_BY_SIDE)
+    for leg, key, sections in support.sweep(inp, part):
+        d.show_term(leg, key, sections)
+        assert d.panels and all(pn.timeline is not None for pn in d.panels), (leg, key)
+        d.resize(900, d.minimumHeight())
+        assert not d.grab().isNull()
+        QApplication.processEvents()
 
+
+
+@pytest.mark.parametrize("width, below", [(1100, True), (1800, False)])
+def test_the_title_goes_below_the_column_choice_where_beside_it_it_would_wrap(width, below):
+    """With an EDE pairing the column choice's headings are long. Beside the choice where it
+    fits on as few lines as the full width allows, the title is otherwise below the choice at
+    the full width: one line either way here, and never one character per line."""
+    from PySide6.QtWidgets import QApplication
+    tv = _view()
+    tv.resize(width, 1000)
+    tv._man_spec_combo.setCurrentIndex(tv._man_spec_combo.findData("SWI3S_PHY2"))
+    tv._per_spec_combo.setCurrentIndex(tv._per_spec_combo.findData("SWI3S_PHY2_EDE"))
+    tv.flush_recompute()
+    QApplication.processEvents()
+    tv._show_diagram()
+    QApplication.processEvents()
+    d = tv._diagram
+    corner = d._corner
+    assert d.leg_title and corner is not None
+    one = d._static("X", d._title_font(), -1.0).size().height()
+    assert d._title_text().size().height() < 1.5 * one          # one line
+    assert d._title_below() is below
+    if below:
+        assert d._title_top() >= corner.y() + corner.height()
+        assert d._title_h() >= d._title_top() + one
+    else:
+        assert d._title_top() < corner.y() + corner.height()
+        assert d._title_w() <= corner.x()
+    tv.close()

@@ -27,7 +27,8 @@ _BAR = {
 _FILE = {
     VISUALIZATION: ["Open Visualizer CSV…", "Save Visualizer CSV…", "Export Grid Image…",
                     "Export Bus Model (JSON)…", "Quit"],
-    TIMING: ["Open Timing Settings…", "Save Timing Settings…", "Quit"],
+    TIMING: ["Open Timing Settings…", "Save Timing Settings…", "Export Results…", "Copy Summary",
+             "Export Diagram…", "Export Diagram on Light Background…", "Quit"],
     ANALYSIS: ["Open Capture…", "Open Demo Capture",
                "Open Workspace…", "Save Workspace…", "Export Capture…",
                "Locate Sub-Capture…", "Export Visualizer CSV…", "Export Bus Grid Image…",
@@ -63,6 +64,15 @@ def test_each_mode_shows_only_its_menus_and_file_items(win, mode):
     assert win._quit_action.menuRole() == QAction.MenuRole.QuitRole
 
 
+def test_a_mode_switch_names_the_mode_as_the_mode_menu_does(win):
+    from swi3s_studio.ui.mode_controller import MODE_LABELS
+    for mode in (TIMING, VISUALIZATION, ANALYSIS, TIMING):
+        win._mode_mgr.switch_to(mode)
+        assert win._status.text() == MODE_LABELS[mode]
+        ticked = [a.text() for a in win._mode_mgr._actions.values() if a.isChecked()]
+        assert ticked == [MODE_LABELS[mode]]
+
+
 def test_switching_modes_keeps_every_file_item(win):
     """QMenu.clear() deletes what it removes even when another menu owns it, so File is
     refilled without it and every mode's items survive repeated switches."""
@@ -84,6 +94,10 @@ def test_open_and_save_keys_go_to_the_current_mode(win, mode):
 
 @pytest.mark.parametrize("mode", [VISUALIZATION, TIMING, ANALYSIS])
 def test_no_key_names_two_live_actions(win, mode):
+    """With two Links loaded, so the actions that need a capture or two Links are live."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+    win.load_demo_links()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)   # the replaced Link items
     win._mode_mgr.switch_to(mode)
     keys = Counter()
     for act in win.findChildren(QAction):
@@ -496,6 +510,41 @@ def test_the_shortcuts_help_lists_the_analyzers_keys_only_in_the_analyzer(win, m
     assert "listed in the Bus Analyzer" not in here
 
 
+def _groups(html: str) -> dict:
+    """{group title: its rows' text} of the shortcuts help."""
+    import re
+    out = {}
+    for part in html.split("<b>")[1:]:
+        title, _, body = part.partition("</b>")
+        out[title] = re.sub(r"<[^>]+>|&nbsp;", " ", body)
+    return out
+
+
+def test_the_shortcuts_help_lists_the_timelines_keys_under_the_timeline(win, monkeypatch):
+    """← / → and ⌘← / ⌘→ act only in the focused timeline, and are listed in its group."""
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(self.text()) or 0)
+    win._mode_mgr.switch_to(ANALYSIS)
+    win.show_keyboard_shortcuts()
+    groups = _groups(shown[-1])
+    timeline = groups["Timeline (when focused)"]
+    assert "← / →" in timeline and "SSCR/DSCR commit" in timeline
+    assert "← / →" not in groups["Playhead navigation"]
+
+
+def test_the_shortcuts_help_lists_the_timing_calculators_keys_only_in_timing(win, monkeypatch):
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append(self.text()) or 0)
+    for mode in (TIMING, ANALYSIS, VISUALIZATION):
+        win._mode_mgr.switch_to(mode)
+        win.show_keyboard_shortcuts()
+        listed = "<b>Timing Calculator (" in shown[-1]
+        assert listed == (mode == TIMING), mode
+        if mode == TIMING:
+            group = _groups(shown[-1])["Timing Calculator (the focus in the page)"]
+            assert "Copy Summary" in group and "inequality" in group
+
+
 def _reachable(action) -> bool:
     """Whether a QAction's shortcut can fire: it is enabled and visible, and it sits in a
     menu every one of whose ancestors is shown in the menu bar, or on a visible widget."""
@@ -554,9 +603,14 @@ def test_the_shortcuts_help_lists_every_key_active_in_the_mode(win, monkeypatch,
     monkeypatch.setattr(sys, "platform", "win32")     # keys spelled as Qt's portable text
     win.show_keyboard_shortcuts()
     listed = _listed_keys(shown[0])
-    active = {a.shortcut().toString(QKeySequence.PortableText): _text(a)
-              for a in win.findChildren(QAction)
-              if not a.shortcut().isEmpty() and _reachable(a)}
+    # An action's keys are spellings of one binding (Ctrl+> is also Ctrl+Shift+.), so the
+    # help names the action when it lists any of them.
+    active = {}
+    for a in win.findChildren(QAction):
+        keys = [seq.toString(QKeySequence.PortableText) for seq in a.shortcuts()
+                if not seq.isEmpty()]
+        if keys and _reachable(a):
+            active[next((k for k in keys if k in listed), keys[0])] = _text(a)
     for sc in win.findChildren(QShortcut):
         host = sc.parent()
         if sc.isEnabled() and not sc.key().isEmpty() and host.isVisible():

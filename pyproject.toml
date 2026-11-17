@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swi3s-studio"
-version = "3.2.0"
+version = "3.3.0"
 description = "Desktop MIPI SoundWire I3S (SWI3S) bus analyzer + visualizer + timing suite"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -100,6 +100,7 @@ markers = [
     "gui: builds widgets: a view, a dialog or the main window",
     "platform: depends on the OS, filesystem, encodings, subprocesses, Qt style or DPI, or the Python version",
     "perf: performance-regression benchmark with a wall-clock ceiling (run: -m perf)",
+    "smoke: a test in a core file the platform scope runs whole (tests/conftest.py, CORE_SMOKE)",
 ]
 
 [tool.ruff]
@@ -124,7 +125,7 @@ ignore = ["E501", "E402", "E741", "E701", "E702", "E731"]
 # (numpy's, for one) use 3.12+ syntax such as the `type` statement.
 python_version = "3.12"
 ignore_missing_imports = true       # PySide6 / pyqtgraph / pyarrow ship partial stubs
-check_untyped_defs = false          # lenient start — the tree isn't fully annotated yet
+check_untyped_defs = true           # function bodies are checked whether or not annotated
 warn_unused_ignores = false
 exclude = ["native/build", "build", "dist", "scratch"]
 

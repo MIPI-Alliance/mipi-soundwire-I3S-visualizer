@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Import math at module level for math.lcm
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
 from ..config.constants import InterfaceRanges
 from ..utils.descriptors import ValidatedBool, ValidatedFloat, ValidatedInt
@@ -136,11 +136,14 @@ class Interface:
         # Per-source CDS guard/tail: the CDS (column 0) is time-multiplexed, so
         # the Manager and each peripheral device can drive their own guard
         # polarity / tail width without a bus clash. 13 entries: index 0 =
-        # Manager, index d+1 = Device d (0-11). Guard values: 0 Off, 1 G0,
-        # 2 G1. Tail values: width 0-3. CDS_GuardEnabled_REG / CDS_GuardPolarity_REG
-        # (Manager's) / CDS_TailWidth_REG (max width) remain the derived
-        # aggregates the engine's column budget is computed from.
-        self.CDS_Guard_PerSource: List[int] = [0] * 13
+        # Manager, index d+1 = Device d (0-11). The guard is two independent
+        # lists, its GuardEnable (bool) and GuardPolarity (0 or 1) register
+        # fields: a source keeps its polarity whether or not its guard is enabled.
+        # Tail values: width 0-3. CDS_GuardEnabled_REG (any source) /
+        # CDS_GuardPolarity_REG (Manager's) / CDS_TailWidth_REG (max width) remain
+        # the derived aggregates the engine's column budget is computed from.
+        self.CDS_GuardEnable_PerSource: List[bool] = [False] * 13
+        self.CDS_GuardPolarity_PerSource: List[int] = [0] * 13
         self.CDS_Tail_PerSource: List[int] = [0] * 13
         # Per-source CDS_DriveType, same 13-entry convention: 1 Normal, 0 Special.
         # Defaults to all Normal, not the register's reset of 0, so a CSV with no such
@@ -149,6 +152,13 @@ class Interface:
         # Per-source CDS_EndDriveEarly: 0 drive to the end of the UI, 1 stop before the end of
         # the last UI. Defaults to the register's reset of 0 (unlike CDS_DriveType_PerSource above).
         self.CDS_EndDriveEarly_PerSource: List[int] = [0] * 13
+
+    def cds_guard_drawn(self) -> List[Optional[int]]:
+        """Each source's drawn CDS guard: its polarity (0 or 1) where its guard is
+        enabled, None where it is not. A disabled guard's polarity draws nothing."""
+        return [int(bool(p)) if e else None
+                for e, p in zip(self.CDS_GuardEnable_PerSource,
+                                self.CDS_GuardPolarity_PerSource)]
 
     @property
     def data_ports(self) -> List['DataPort']:
@@ -272,9 +282,16 @@ class Interface:
 
     @property
     def interval_lcm(self) -> int:
-        """Calculate LCM of all enabled data port pattern repetition periods.
+        """The LCM of the pattern periods of every data port with a channel; the
+        Interface holds no enable, so pattern_lcm takes the drawn ports."""
+        return self.pattern_lcm()
 
-        The System SSP Interval is the LCM of all data port pattern periods -
+    def pattern_lcm(self, enabled: Optional[Sequence[bool]] = None) -> int:
+        """The LCM of the pattern repetition periods of the data ports with a channel,
+        only those `enabled` marks when it is given (one flag per data port, as
+        VizConfig.data_ports[i].enabled); 1 when there is none.
+
+        The System SSP Interval is the LCM of the enabled data ports' pattern periods -
         the number of rows after which all patterns align and repeat.
 
         For each data port:
@@ -288,7 +305,9 @@ class Interface:
         (3 active intervals then 1 skipped, repeating every 32 rows)
         """
         interval_list: List[int] = []
-        for data_port in self.data_ports:
+        for i, data_port in enumerate(self.data_ports):
+            if enabled is not None and not (i < len(enabled) and enabled[i]):
+                continue
             # Include data ports that have channels configured (NumChannels > 0)
             # Uses popcount _num_channels property for performance
             if data_port.config._num_channels > 0:

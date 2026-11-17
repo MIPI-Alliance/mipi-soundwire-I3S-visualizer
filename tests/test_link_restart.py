@@ -27,6 +27,7 @@ from swi3s_studio.analysis.link_control import (
 from swi3s_studio.ingest import transitions
 from swi3s_studio.ingest.capture import Capture
 from swi3s_studio.model import Provenance
+from swi3s_studio.model.bus_config import demo_config
 from swi3s_studio.session import Session
 
 pytestmark = pytest.mark.gui
@@ -336,6 +337,35 @@ def test_audio_resumed_out_of_phase_after_a_pause_is_framed_afresh(phy, variant)
     assert not any(g["restart"] or g["cold_start"] for g in s.segments)
 
 
+def test_a_pin_on_the_section_a_resume_opens_outranks_a_config_csv(tmp_path):
+    """Audio resumed out of phase under a config CSV: the section the resume opens frames
+    at a column count pinned on it, as a restart's does, not at the CSV's count."""
+    csv = tmp_path / "demo.csv"
+    csv.write_text(demo_config().to_csv(), encoding="utf-8")
+    a, b = _cold(), _plain()
+    cap, shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+    resume = shift + int(b.clock_edges[0])
+    alone = _session(b)
+    assert alone.segments[0]["column_count"] == 2, "test premise: b opens at 2 columns"
+
+    def decode(pins):
+        st = swi3score.DecoderSettings()
+        st.config_csv_path = str(csv)
+        st.resume_points = [resume]
+        st.forced_column_sections = pins
+        d = swi3score.Decoder(cap.sample_source(), st)
+        d.run()
+        return d
+
+    assert [g["column_count"] for g in decode([]).segments()] == [16, 16]
+    d = decode([(1, 2)])
+    assert [g["column_count"] for g in d.segments()] == [16, 2]
+    after = [c for c in d.commands() if c["start_sample"] >= shift]
+    n = next(i for i, c in enumerate(alone.commands) if c["is_commit"])
+    assert _signature(after[:n]) == _signature(alone.commands[:n])
+    assert all(c["crc_valid"] for c in after[:n])
+
+
 def test_a_clean_pause_decodes_on_as_if_nothing_happened():
     """A clock that only paused: the bus carries on in phase, so the decode goes on through
     the pause in the same framing, every command, segment and audio sample as without it."""
@@ -354,6 +384,49 @@ def test_a_clean_pause_decodes_on_as_if_nothing_happened():
     assert [g["column_count"] for g in s.segments] == [
         g["column_count"] for g in whole.segments]
     assert len(s.audio_columns()["start_sample"]) == len(whole.audio_columns()["start_sample"])
+
+
+def test_a_dlv_clock_pause_is_not_a_resume():
+    """Pause handling is FBCSE only. On DLV a clock that only paused opens no segment: the
+    recovered clock locks again after the 5 ms pause, and every command, segment and audio
+    sample is the capture's without the pause."""
+    a = _cold(phy=3)
+    ce = np.asarray(a.clock_edges, dtype=np.int64)
+    de = np.asarray(a.data_edges, dtype=np.int64)
+    whole = _session(a)
+    cut = int(ce[np.searchsorted(ce, int(whole.segments[-1]["start_sample"]) + 200_000)])
+    pause = int(_GAP_S * a.sample_rate_hz)
+    cap = Capture(np.where(ce > cut, ce + pause, ce).astype(np.uint64),
+                  np.where(de > cut, de + pause, de).astype(np.uint64),
+                  a.initial_clock, a.initial_data, a.sample_rate_hz)
+    s = _session(cap)
+    assert s.is_dlv
+    assert len(clock_resumes(cap, s.link_controls)) == 1
+    assert not s._restart_points()
+    assert _signature(s.commands) == _signature(whole.commands)
+    assert all(c["crc_valid"] for c in s.commands)
+    assert [(g["column_count"], g["restart"]) for g in s.segments] == [
+        (g["column_count"], g["restart"]) for g in whole.segments]
+    assert len(s.audio_columns()["start_sample"]) == len(whole.audio_columns()["start_sample"])
+
+
+@pytest.mark.parametrize("back", [6000, 12000, 20000])
+def test_a_clean_pause_leaves_the_measured_clock_rate(back):
+    """A pause `back` clock edges before the end of the capture: no clock-rate window spans
+    it, so the UI and row rates are the capture's without the pause."""
+    a = _cold()
+    ce = np.asarray(a.clock_edges, dtype=np.int64)
+    de = np.asarray(a.data_edges, dtype=np.int64)
+    whole = _session(a)
+    cut = int(ce[-back])
+    pause = int(_GAP_S * a.sample_rate_hz)
+    cap = Capture(np.where(ce > cut, ce + pause, ce).astype(np.uint64),
+                  np.where(de > cut, de + pause, de).astype(np.uint64),
+                  a.initial_clock, a.initial_data, a.sample_rate_hz)
+    s = _session(cap)
+    assert len(clock_resumes(cap, s.link_controls)) == 1
+    assert s.ui_rate_hz == pytest.approx(whole.ui_rate_hz, rel=0.02)
+    assert s.row_rate_khz == pytest.approx(whole.row_rate_khz, rel=0.02)
 
 
 @pytest.mark.parametrize("column_step", [0, 2, 4])
@@ -458,6 +531,22 @@ def test_the_restart_is_the_first_audio_edge_after_phystart(two):
     assert (cols, cold, inactive_from) == (2, True, int(later.clock_stop_sample) + 1)
 
 
+@pytest.mark.parametrize("trim", [3, 7])
+def test_an_fbcse_restart_opens_the_row_after_the_one_the_stop_cut_short(trim):
+    """The Link stops `trim` UIs before the end of the first demo, mid-row: that row keeps
+    its number, and the restart's first row, on Column 0, opens the next."""
+    a, b = _cold(), _cold()
+    a = a.subcapture(0, int(np.asarray(a.clock_edges)[-1 - trim]) + 1)
+    cap, shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+    s = _session(cap)
+    stop, _restart = _stop_and_restart(cap, shift)
+    seg = next(g for g in s.segments if g["restart"])
+    assert int(seg["row_base"]) == s.bus_row_for_sample(stop) + 1
+    after = _after(s, shift)
+    assert [s.bus_row_for_sample(int(c["start_sample"])) for c in after] == [
+        c["bus_row"] for c in after]
+
+
 def test_nothing_decodes_while_the_link_is_inactive(two):
     s, _alone, _shift = two
     [(restart, _c, _k, inactive_from)] = s._restart_points()
@@ -534,6 +623,25 @@ def test_a_restart_just_after_the_first_edge_still_decodes():
 
 # ---- DLV: the recovered clock locks again -----------------------------------------------
 
+def test_no_timing_region_holds_a_later_bring_up_and_every_margin_is_within_a_ui(two):
+    """A Timing region ends where the Link stopped before the later bring-up, so none
+    overlaps that bring-up's clock stop to audio start, and no setup or hold in any region
+    exceeds its UI plus one sample."""
+    from swi3s_studio.analysis.bus_timing import measure_bus_timing
+    s, _alone, _shift = two
+    later = s.link_controls[1:]
+    assert later and later[0].clock_stop_sample is not None, "test premise"
+    stop, start = int(later[0].clock_stop_sample), int(later[0].audio_start_sample)
+    regions = s.timing_regions()
+    assert len(regions) >= 4
+    for r in regions:
+        assert r["end_sample"] <= stop + 1 or r["start_sample"] >= start, r["label"]
+        t = measure_bus_timing(s.capture, segments=s.segments,
+                               start_sample=r["start_sample"], end_sample=r["end_sample"])
+        limit = t.ui_ns + 1e9 / s.sample_rate_hz
+        assert max(t.tr_setup_ns.max(), t.tr_hold_ns.max()) <= limit, r["label"]
+
+
 @pytest.fixture(scope="module")
 def two_dlv():
     """`two` on PHY3: the DLL locks again at the second bring-up's first Row Sync."""
@@ -589,15 +697,39 @@ def test_nothing_decodes_while_a_dlv_link_is_inactive(two_dlv):
 
 
 def _stopped_mid_row():
-    """A PHY3 demo whose Link stops five UIs into a 16-column row, while its ports run."""
+    """A PHY3 demo whose Link stops 5 to 12 UIs into a 16-column row, while its ports run:
+    at the first data edge in that span of a row."""
     full = Session.from_demo(300, phy=3, cold_start=True)
     rsp = full._recovered_row_syncs()
     ui = float(np.median(np.diff(rsp))) / 16
     ce = np.asarray(full.capture.clock_edges, dtype=np.int64)
     edges = ce[ce > int(full.segments[-1]["start_sample"]) + 200_000]
     opens = rsp[np.searchsorted(rsp, edges, side="right") - 1]
-    last = int(edges[np.flatnonzero((edges - opens) / ui >= 5)[0]])
+    into = (edges - opens) / ui
+    last = int(edges[np.flatnonzero((into >= 5) & (into < 12))[0]])
     return full.capture.subcapture(0, last + 1)
+
+
+def _off_nominal(cap, by=1.03):
+    """`cap` as recorded by an analyzer whose clock runs `by` times nominal."""
+    def scale(edges):
+        return np.round(np.asarray(edges, dtype=np.float64) * by).astype(np.uint64)
+    return Capture(scale(cap.clock_edges), scale(cap.data_edges), cap.initial_clock,
+                   cap.initial_data, cap.sample_rate_hz)
+
+
+def test_a_dlv_restart_off_nominal_rate_samples_as_the_demo_alone():
+    """With the analyzer's clock 3% off nominal, the recovered clock re-acquired at a PHY3
+    restart samples every row as the same demo decoded alone does, its first rows included:
+    both start at the UI the clock locks to from the bring-up's first Row Sync."""
+    a, b = _off_nominal(_cold(3)), _off_nominal(_cold(3))
+    cap, shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+    s, alone = _session(cap), _session(b)
+    d = _decode(cap, s._restart_points(), forced=4, dlv=True, source=s._make_dlv_source())
+    e = _decode(b, [], forced=4, dlv=True, source=alone._make_dlv_source())
+    mine = np.asarray(d.row_sync_samples(), dtype=np.int64)
+    theirs = np.asarray(e.row_sync_samples(), dtype=np.int64)
+    assert np.array_equal(mine[mine >= shift] - shift, theirs)
 
 
 def test_the_dlv_bit_sample_replay_follows_the_restart():
@@ -847,7 +979,8 @@ def test_the_timeline_and_grid_show_the_second_bring_up(two):
     ribbon = w._ribbons[0]
     assert len(ribbon._later_bringups) == 1
     labels = [ribbon._band_label(i, g) for i, g in enumerate(ribbon._segments)]
-    assert labels.count("PHY2 Safe-Lock-2") == 2, labels
+    assert [x for x in labels if "Safe-Lock" in x] == [
+        "PHY2 Safe-Lock-2 1", "PHY2 Safe-Lock-2 2"], labels
     _at(w, shift - 100)                                    # the clock is stopped here
     assert "Link Inactive" in _texts(w)
 
@@ -859,7 +992,7 @@ def test_a_warm_restart_reads_as_one_in_the_window():
     w = _window(s)
     ribbon = w._ribbons[0]
     labels = [ribbon._band_label(i, g) for i, g in enumerate(ribbon._segments)]
-    assert labels.count("PHY2 Safe-Lock-2") == 2, labels
+    assert sum(x.startswith("PHY2 Safe-Lock-2 ") for x in labels) == 2, labels
     _at(w, shift - 100)
     assert "Link Inactive" in _texts(w)
     _at(w, int(s.link_controls[1].phystart_sample) + 10)
@@ -877,3 +1010,173 @@ def test_a_mid_stream_capture_draws_its_later_bring_up():
     assert "Link Inactive" in _texts(w)
     _at(w, int(cap.clock_edges[-1]))
     assert w._reg_view._active_phy == "PHY1"             # the PHY the later one selected
+
+
+def test_a_repeated_column_count_numbers_its_regions_everywhere_they_are_named(two):
+    """Two bring-ups give the regions 2/8/16/2/8/16: each repeated count is numbered from 1
+    over the whole capture, in the Timing picker, the Timeline bands and Statistics, and a
+    name the user gave a region replaces its number without renumbering the others."""
+    from swi3s_studio.analysis import capture_measurements
+    s = _session(two[0].capture)
+    cols = [int(g["column_count"]) for g in s.segments]
+    assert cols == [2, 8, 16, 2, 8, 16], cols
+    assert [s.region_label(i) for i in range(6)] == [
+        "2-col 1", "8-col 1", "16-col 1", "2-col 2", "8-col 2", "16-col 2"]
+    picker = [r["label"].split("  (")[0] for r in s.timing_regions()]
+    assert len(set(picker)) == len(picker) and "16-col 2" in picker, picker
+    assert all(r["column_count"] == cols[r["section"]] for r in s.timing_regions())
+    rows = dict((r[0], r[1]) for r in capture_measurements(s))
+    assert rows["Region 1"] == "2-col 1" and rows["Region 6"] == "16-col 2", rows
+    s.set_region_name(5, "Playback")
+    assert [s.region_label(i) for i in (2, 5)] == ["16-col 1", "Playback"]
+    assert s.region_label(5, user=False) == "16-col 2"
+    assert any(r["label"].startswith("Playback  (") for r in s.timing_regions())
+    assert dict((r[0], r[1]) for r in capture_measurements(s))["Region 6"] == (
+        "Playback · 16-col")
+    w = _window(s)
+    labels = [w._ribbons[0]._band_label(i, g) for i, g in enumerate(w._ribbons[0]._segments)]
+    assert "8-col 2" in labels and "Playback · 16-col 2" in labels, labels
+
+
+def test_the_timing_pane_keeps_its_region_by_section_when_the_region_is_renamed(two):
+    from swi3s_studio.ui import view_state
+    s = _session(two[0].capture)
+    w = _window(s)
+    eye = w._eye_view
+    sections = [r["section"] for r in eye._regions]
+    eye._region.setCurrentIndex(sections.index(5))
+    saved = view_state.timing_state(eye)
+    assert saved["section"] == 5
+    s.set_region_name(5, "Playback")
+    eye.set_analysis_context(s.segments, s.timing_regions(), s.timing_column_roles)
+    eye._region.setCurrentIndex(0)
+    view_state.restore_timing(eye, saved)
+    assert eye._regions[eye._region.currentIndex()]["section"] == 5
+
+
+def test_the_timing_pane_shows_the_playheads_region(two):
+    """The Timing pane selects the region under the playhead as it moves and when its tab
+    is raised; a playhead in no region (a clock stop) keeps the region shown."""
+    from PySide6.QtWidgets import QApplication
+    s = _session(two[0].capture)
+    w = _window(s)
+    eye = w._eye_view
+    regions = list(eye._regions)
+
+    def shown():
+        return eye._regions[eye._region.currentIndex()]["section"]
+
+    w._sample_dock.raise_()
+    QApplication.processEvents()
+    first, last = regions[0], regions[-1]
+    _at(w, (first["start_sample"] + first["end_sample"]) // 2)
+    w._eye_dock.raise_()
+    QApplication.processEvents()
+    assert shown() == first["section"]
+    _at(w, (last["start_sample"] + last["end_sample"]) // 2)
+    w._apply_cursor_heavy()
+    assert shown() == last["section"]
+    stop = int(s.link_controls[1].clock_stop_sample) + 10
+    assert not any(r["start_sample"] <= stop < r["end_sample"] for r in regions)
+    _at(w, stop)
+    w._apply_cursor_heavy()
+    assert shown() == last["section"]
+
+
+def test_statistics_selects_the_playheads_region_at_the_top(two):
+    """Statistics selects the playhead's "Region n" row, at the top of the pane, when the
+    playhead enters another region and when its tab is raised; with Regions folded it
+    selects the section's title."""
+    from PySide6.QtWidgets import QApplication
+    s = _session(two[0].capture)
+    w = _window(s)
+    w._meas_dock.raise_()
+    QApplication.processEvents()
+    view = w._meas_view
+
+    def selected():
+        rows = {i.row() for i in view.selectedIndexes()}
+        assert len(rows) == 1, rows
+        row = rows.pop()
+        return view._title_of(row), view.rowAt(0) == row
+
+    for section in (4, 1):
+        g = s.segments[section]
+        nxt = s.segments[section + 1]
+        _at(w, (int(g["start_sample"]) + int(nxt["start_sample"])) // 2)
+        w._apply_cursor_heavy()
+        assert selected() == (f"Region {section + 1}", True)
+    w._reg_dock.raise_()
+    QApplication.processEvents()
+    view.clearSelection()
+    view._shown_region = None
+    view._collapsed_titles.add("Regions")
+    view._apply_folds()
+    w._meas_dock.raise_()
+    QApplication.processEvents()
+    assert selected() == ("Regions", True)
+
+
+def test_the_clock_stops_are_found_once_per_capture(monkeypatch):
+    """decode_link_controls and every clock_resumes after it, as each (re-)decode calls it,
+    difference the clock edges once for the capture, and find what a fresh scan finds."""
+    a, b = _cold(), _cold()
+    cap, _shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+    fresh = Capture(cap.clock_edges.copy(), cap.data_edges.copy(), cap.initial_clock,
+                    cap.initial_data, cap.sample_rate_hz)
+    found = link_control.decode_link_controls(fresh)
+    resumes = clock_resumes(fresh, found)
+    scans = []
+    real = link_control._clock_stops
+
+    def counted(edges, min_gap):
+        scans.append(min_gap)
+        return real(edges, min_gap)
+    monkeypatch.setattr(link_control, "_clock_stops", counted)
+    bringups = link_control.decode_link_controls(cap)
+    assert [(r.sequence, r.audio_start_sample) for r in bringups] == [
+        (r.sequence, r.audio_start_sample) for r in found]
+    for _ in range(3):
+        assert clock_resumes(cap, bringups) == resumes
+    assert len(scans) == 1
+
+
+def test_the_valid_command_count_matches_a_scan_and_is_built_once_per_decode(two, monkeypatch):
+    """Session._valid_command_count over any range equals a scan of the commands, and only the
+    first call after a decode reads the command list."""
+    s, _b, shift = two
+
+    class Counted(list):
+        reads = 0
+
+        def __iter__(self):
+            Counted.reads += 1
+            return super().__iter__()
+    monkeypatch.setattr(s, "commands", Counted(s.commands))
+    starts = sorted({int(c["start_sample"]) for c in s.commands})
+    edges = [0, 1, shift, shift + 1, 1 << 62] + starts[::max(1, len(starts) // 40)]
+    edges += [x + 1 for x in edges]
+    plain = list.__iter__
+    s._valid_command_count(0, 1)
+    built = Counted.reads
+    for lo in edges:
+        for hi in edges:
+            want = sum(1 for c in plain(s.commands) if c.get("crc_valid")
+                       and lo <= int(c["start_sample"]) < hi)
+            assert s._valid_command_count(lo, hi) == want, (lo, hi)
+            assert s._valid_commands_between(lo, hi) == (want > 0)
+    assert Counted.reads == built
+
+
+def test_a_warm_start_after_a_phy3_cold_start_lists_no_man_tphystart():
+    """On PHY3 (DLV) the first edge after PhyStart is a Row Sync, so a Warm Start that reuses
+    PHY3 has no Man_tPhyStart row, as the Cold Start before it has none; on PHY2 it has one."""
+    for phy, listed in ((3, False), (2, True)):
+        a, b = _cold(phy), _warm_prefixed(_plain(phy))
+        cap, _shift = _relinked(a, b, int(_GAP_S * a.sample_rate_hz))
+        found = decode_link_controls(cap)
+        assert [r.sequence for r in found] == ["cold", "warm"], phy
+        assert found[1].phy_name == f"PHY{phy}"
+        for r in found:
+            params = {t["param"] for t in r.timing}
+            assert ("Man_tPhyStart" in params) is listed, (phy, r.sequence, params)

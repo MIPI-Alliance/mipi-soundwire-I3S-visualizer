@@ -68,6 +68,11 @@ public:
     // the skipping accumulator resets (Section 9.1.6.2.1). Column position is
     // unchanged (the SSP lands on a row boundary).
     void SyncToSSP();
+    // Take the phase of a port `intervals` whole Transport Intervals plus `rows` rows after
+    // an SSP at Column 0, and `column` UIs into that row: Column 0, SyncToSSP, the
+    // accumulator step and skip decision of each later interval start, then the ticks.
+    // `rows` is below Interval + 1, so the ticks start no interval.
+    void AnchorAfterSsp(long long intervals, long long rows, int column);
 
     // The complete mutable transport state (everything clock_tick/SyncToSSP touch;
     // config-derived fields are NOT included — they follow from Configure). Snapshot
