@@ -182,7 +182,7 @@ def test_the_audio_store_imports_without_loading_the_command_table_library():
 
 # ---- command store ----
 
-def test_register_writes_yields_only_crc_valid_addressed_writes():
+def test_register_writes_yields_only_crc_valid_addressed_single_device_writes():
     from swi3s_studio.store.command_store import register_writes
     good = {"command": "WriteA32", "crc_valid": True, "has_address": True, "start_sample": 5,
             "address": 0x1081, "data": b"\x03", "device_mask": 1}
@@ -190,5 +190,8 @@ def test_register_writes_yields_only_crc_valid_addressed_writes():
             {"command": "SSCR", "is_commit": True, "crc_valid": True, "has_address": False,
              "start_sample": 9, "device_mask": 1},
             dict(good, has_address=False, address=0x1083),
-            dict(good, command="ReadA32", address=0x1084)]
+            dict(good, command="ReadA32", address=0x1084),
+            dict(good, device_mask=0b11, address=0x1085),     # two devices: not applied
+            dict(good, device_mask=0, address=0x1086),
+            dict(good, device_mask=1 << 12, address=0x1087)]  # past the 12 bus devices
     assert list(register_writes(cmds)) == [(5, 0x1081, b"\x03", 1)]

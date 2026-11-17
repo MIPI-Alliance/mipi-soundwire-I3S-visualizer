@@ -27,7 +27,8 @@ which has no console on Windows.
 `data/registers.json` is the single source of truth for the register map; the
 loader (`model/registers.py`) finds it via, in order: `$SWI3S_REGISTERS`, a
 PyInstaller bundle's `data/`, the repo `data/` dir, the package dir, then
-`sys.prefix/share/swi3s-studio/`.
+`sys.prefix/share/swi3s-studio/`. A `$SWI3S_REGISTERS` naming a file that does not exist
+is reported as an import warning, and the search goes on without it.
 
 The demo workspaces File ▸ Open Demo Capture applies (`data/demos/*.swi3s`) are found
 in the same order by `workspace.demo_dir`: a PyInstaller bundle's `data/demos`, the repo
@@ -42,26 +43,55 @@ A new file read from beside a module needs a `package-data` glob;
 
 ## 3. Standalone desktop bundle (PyInstaller)
 
+Build in a fresh virtual environment that holds only the runtime requirements, with the Qt
+for Python release pinned:
+
 ```bash
+python3 -m venv build-env && . build-env/bin/activate
+pip install -c tools/bundle_constraints.txt -r requirements.txt
 pip install ./native            # swi3score must be importable in the build env
 pip install pyinstaller
 pyinstaller swi3s-studio.spec    # macOS -> dist/"SWI3S Studio.app";
                                  # Windows/Linux -> dist/"SWI3S Studio"/ (run the exe inside)
 ```
 
+PyInstaller collects the native libraries the frozen modules load from the environment it
+runs in, so a build from a general-purpose environment can carry unrelated libraries. The spec
+stops, naming each one, when the environment holds an installed distribution (user
+site-packages included, when the interpreter enables them) outside the runtime distributions,
+`swi3score` and the build tools: `pyinstaller`, `pyinstaller-hooks-contrib`, `altgraph`,
+`packaging`, `setuptools`, `pip` and `wheel`, with `macholib` on macOS and `pefile` and
+`pywin32-ctypes` on Windows. To build with a distribution outside that set, name it in
+`SWI3S_BUNDLE_ALLOW_EXTRA`, comma-separated (`SWI3S_BUNDLE_ALLOW_EXTRA=name1,name2 pyinstaller
+swi3s-studio.spec`); the spec accepts each name it lists and no other, and the bundle can then
+carry what that distribution brings.
+
 The spec is cross-platform: it wraps the build as a `.app` only on macOS (a plain
 COLLECT folder on Windows/Linux) and is a GUI app (no console window on Windows).
 It bundles the app, the `swi3score` extension (`.pyd`/`.so`/`.dylib`),
 `data/registers.json`, `data/demos/`, the example register map (`data/regmaps/`), the User
 Guide (`docs/USER_GUIDE.md`) and the UI assets (`swi3s_studio/ui/assets/`); the spec's `datas`
-list is the list of record. It carries `LICENSE.md` at its top level and the
+list is the list of record. It carries `LICENSE.md` beside a `licenses/` directory holding the
 licence and notice files of the runtime distributions under
 `licenses/<distribution>/<path inside the distribution>/`, so same-named files all ship. The
 runtime distributions are the names `requirements.txt` lists and what they require; each
-listed one must be installed, or the spec stops. Every wheel of the Qt for Python project
-(shiboken6, PySide6 and each PySide6-* wheel it requires, such as PySide6_WebEngine and
-PySide6_Pdf) carries no notice, so their notices are kept in `data/licenses/Qt-for-Python/`
-and ship as `licenses/Qt-for-Python/`; the bundle holds only the Qt modules the app imports.
+listed one must be installed, or the spec stops. The notices of every wheel of the Qt for
+Python project (shiboken6, PySide6 and each PySide6-* wheel it requires, such as
+PySide6_WebEngine and PySide6_Pdf) are kept in `data/licenses/Qt-for-Python/`, and none of
+the wheels' own files ships. The macOS and Linux wheels carry no notice file; the Windows
+wheels carry `dist-info/licenses/LicenseRef-Qt-Commercial.txt`, a statement of Qt's
+commercial licence, which the spec does not ship: the bundle uses the LGPL-3.0 option, as
+`NOTICE.txt` states. Their `License` metadata is the same on every platform. The notices
+ship as `licenses/Qt-for-Python/`: the Qt for Python notice (`NOTICE.txt`), the licence
+texts it names (`LGPL-3.0.txt`, `GPL-3.0.txt`), and `THIRD-PARTY.txt`, the third-party
+components the shipped Qt libraries and plugins contain, each with the platforms whose bundle
+holds it, its version as Qt's attribution states it, its copyright lines and its licence text.
+The spec stops when any of the four is missing, or when `data/licenses/FFmpeg/` lacks
+`NOTICE.txt` or `LGPL-2.1.txt` (`_REQUIRED_NOTICES`). The bundle holds the Qt modules the app imports
+(QtCore, QtGui, QtWidgets, QtSvg, QtMultimedia) and the ones they or pyqtgraph load (QtNetwork,
+QtOpenGL, QtOpenGLWidgets, QtTest, and what Qt itself links); the spec leaves out, by name
+(`_UNSHIPPED_QT`), the virtual-keyboard and PDF plugins PyInstaller's Qt hooks collect and
+QtVirtualKeyboard, QtQuick, QtQml and QtPdf, which they bring.
 The app imports QtMultimedia, whose PySide6 libraries include the FFmpeg libraries (libavcodec,
 libavformat, libavutil, libswresample, libswscale; LGPL-2.1-or-later), so while any module of
 `swi3s_studio/` imports `PySide6.QtMultimedia` the spec also ships `data/licenses/FFmpeg/`
@@ -70,7 +100,31 @@ The bundle freezes the building interpreter and its standard library, so the spe
 that interpreter's licence text as `licenses/Python/`: `LICENSE.txt` from its standard library
 directory or its installation prefix, or `share/doc/pythonX.Y/copyright` for a Debian-family
 system interpreter. The spec stops when the interpreter's installation holds none of them.
+That licence does not cover the OpenSSL and ncurses libraries the interpreter's `ssl`,
+`hashlib`, `readline` and `curses` extensions may link. After Analysis, the spec reads the
+libraries it collected (`a.binaries`): an OpenSSL 1.1 `libssl` or `libcrypto` ships
+`data/licenses/Python-extras/OpenSSL-1.1.txt` (the dual OpenSSL and SSLeay licence), an
+OpenSSL 3 one (`libssl-3*.dll`, `libssl.3.dylib`, `libssl.so.3`) ships
+`data/licenses/Python-extras/OpenSSL-3.txt` (the Apache License, Version 2.0), and an ncurses library (`libncursesw`,
+`libtinfo`, and its panel, form and menu libraries) ships `data/licenses/Python-extras/ncurses.txt`,
+each under `licenses/Python-extras/`. An OpenSSL library of another release, or one whose name
+carries no release, stops the build: add its notice to `data/licenses/Python-extras/` and to
+`_OPENSSL_NOTICES` in the spec.
+The bundle leaves out the `readline` module (Analysis' `excludes`), which the app does not
+import and whose standard-library users import it only when present. A GNU readline library
+(`libreadline`, GPL) that Analysis still collects stops the build: the interpreter's `readline`
+module must link libedit, or be excluded.
 The spec stops when a runtime distribution has no notice file from either source.
+`data/licenses/Qt-for-Python/NOTICE.txt` names, on its line "Qt for Python versions reviewed
+for this notice:", the release series (`6.11`; several are comma-separated) whose wheels it
+was read against. The spec stops on a Qt for Python wheel of another series, or one whose
+licence statement the notice does not contain. To move to another series, read the new
+wheels' licence statements and the Qt modules the bundle holds against the notice, read the
+shipped Qt libraries and plugins of each platform against the release's `qt_attribution.json`
+files and update `THIRD-PARTY.txt` and the reviewed set `_REVIEWED_QT_COMPONENTS` in
+`tests/test_tool_command_lines.py` together, add the series to that line, and update the pins
+in `tools/bundle_constraints.txt`. The
+`PySide6>=6.6` floor in `requirements.txt` governs source installs, which redistribute no Qt.
 
 The macOS bundle identifier is derived by PyInstaller; set `bundle_identifier` in the spec
 to the publisher's own reverse-DNS identifier before distributing.

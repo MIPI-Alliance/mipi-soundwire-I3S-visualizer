@@ -95,6 +95,13 @@ def parse(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     that have nothing to do with this program's flags.
     """
     args, rest = build_parser().parse_known_args(argv[1:])
+    if args.output is not None and not args.output:
+        build_parser().error("-o/--output needs a file name")
+    if args.config is not None and not args.config:
+        build_parser().error("-c/--config needs a file name")
+    if (args.demo or args.demo_bringup) and (args.config or args.output):
+        build_parser().error("--demo opens the demo capture; it takes no -c/--config or "
+                             "-o/--output")
     if args.output and not args.config:
         build_parser().error("-o/--output requires -c/--config (nothing to build a model from)")
     return args, [argv[0], *rest]
@@ -111,15 +118,42 @@ def _logging_silenced():
         logging.disable(prior)
 
 
+def _report(text: str, out) -> None:
+    """Print one report line to `out`. A character the stream's encoding cannot hold (a
+    non-ASCII path or message on a legacy code page) is written as a backslash escape, so
+    the report never fails after the model is written and the exit code stays the caller's
+    to read."""
+    try:
+        print(text, file=out)
+    except UnicodeEncodeError:
+        enc = getattr(out, "encoding", None) or "ascii"
+        print(text.encode(enc, "backslashreplace").decode(enc), file=out)
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Whether paths `a` and `b` name one file. The device and file index decide it where the
+    volume reports a file index (nonzero); a volume that reports none gives every file index 0,
+    so the resolved paths decide instead."""
+    sa, sb = os.stat(a), os.stat(b)
+    if sa.st_ino and sb.st_ino:
+        return os.path.samestat(sa, sb)
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
 def run_headless(config: str, output: str, out=None) -> int:
     """Build the bus model from `config` and write it to `output` as JSON.
 
-    Returns the process exit code. Imports the engine lazily so that merely parsing arguments
+    Returns the process exit code; an `output` that is the `config` file (by any path or
+    link) is refused before anything is read or written. Imports the engine lazily so that merely parsing arguments
     does not drag in the model layer.
     """
     out = sys.stdout if out is None else out
     if not os.path.isfile(config):
         print(f"error: configuration file not found: {config}", file=sys.stderr)
+        return _EXIT_ERROR
+    if os.path.exists(output) and _same_file(config, output):
+        print(f"error: the output {output} is the configuration file; name another file",
+              file=sys.stderr)
         return _EXIT_ERROR
 
     from .model.viz_engine import MAX_AUTHORED_ROWS, build_bus_model, issues_from_model
@@ -169,16 +203,16 @@ def run_headless(config: str, output: str, out=None) -> int:
         print(f"error: could not write {output}: {exc}", file=sys.stderr)
         return _EXIT_ERROR
 
-    print(f"Bus model written to {output}", file=out)
-    print(f"  rows    {bus_model.num_rows}", file=out)
-    print(f"  columns {bus_model.num_columns}", file=out)
-    print(f"  bits    {len(bus_model.bits)}", file=out)
+    _report(f"Bus model written to {output}", out)
+    _report(f"  rows    {bus_model.num_rows}", out)
+    _report(f"  columns {bus_model.num_columns}", out)
+    _report(f"  bits    {len(bus_model.bits)}", out)
 
     # The SAME issue list the UI's notifications panel shows, from the same function, so a
     # batch run and the window cannot disagree about what is wrong with a config.
     issues = issues_from_model(bus_model)
     for issue in issues:
-        print(f"  {issue.severity.upper():7} {issue.source}: {issue.message}", file=out)
+        _report(f"  {issue.severity.upper():7} {issue.source}: {issue.message}", out)
 
     critical = bool(bus_model.bus_clashes) or bool(bus_model.warnings.drq_truncation_warnings)
     return _EXIT_CRITICAL if critical else _EXIT_OK

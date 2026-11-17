@@ -146,7 +146,7 @@ def test_a_jump_from_a_link_that_is_gone_does_nothing(three):
 def test_an_open_history_window_follows_a_theme_switch(three, monkeypatch):
     from swi3s_studio.ui.theme import VizTheme
     win = three
-    monkeypatch.setattr("swi3s_studio.ui.main_window.save_preference", lambda _p: None)
+    monkeypatch.setattr("swi3s_studio.ui.theme_controller.save_preference", lambda _p: None)
     win.apply_theme("dark")
     dlg = win.show_register_history(*_first_write(win._session)[:2], "label")
     dlg._events.append(_event(99, 10 ** 9, "WRITE_FAILED"))

@@ -33,6 +33,7 @@ Any other argument is refused with exit 2 before mypy runs.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -60,8 +61,11 @@ _BY_PLATFORM: dict[str, dict[str, int]] = {}    # the last run's counts, per pla
 
 
 def _mypy_cmd() -> list[str]:
-    """mypy may be a standalone binary (Homebrew, pipx) or a module in this interpreter.
-    Prefer the binary — a Homebrew install is not importable by an unrelated python3."""
+    """mypy as a module of this interpreter when it has one, so the version installed beside
+    it is the one that runs; otherwise a standalone binary on PATH (Homebrew, pipx), which an
+    unrelated python3 cannot import."""
+    if importlib.util.find_spec("mypy") is not None:
+        return [sys.executable, "-m", "mypy"]
     exe = shutil.which("mypy")
     return [exe] if exe else [sys.executable, "-m", "mypy"]
 
@@ -70,7 +74,7 @@ def _env_fingerprint() -> dict[str, str]:
     """What mypy's output depends on besides the source: mypy's version, and what it reads
     from site-packages (nothing, by `--no-site-packages`). The baseline records it, and the
     gate refuses to call a count from a different environment a regression."""
-    mypy_ver = subprocess.run([*_mypy_cmd(), "--version"], capture_output=True, text=True)
+    mypy_ver = subprocess.run([*_mypy_cmd(), "--version"], capture_output=True, encoding="utf-8", errors="replace")
     return {"mypy": mypy_ver.stdout.split()[1] if mypy_ver.stdout.split() else "?",
             "site_packages": "not read"}
 
@@ -108,9 +112,10 @@ def _run_mypy_on(platform: str) -> tuple[dict[str, int], str]:
     # and no error line would match _LINE.
     env = {k: v for k, v in os.environ.items()
            if k not in ("FORCE_COLOR", "MYPY_FORCE_COLOR", "CLICOLOR_FORCE")}
+    env["PYTHONUTF8"] = "1"     # mypy writes UTF-8, which is how its output is read
     proc = subprocess.run([*_mypy_cmd(), "--no-incremental", "--no-color-output",
                            "--no-site-packages", "--platform", platform, _TARGET],
-                          cwd=_ROOT, capture_output=True, text=True, env=env)
+                          cwd=_ROOT, capture_output=True, encoding="utf-8", errors="replace", env=env)
     if "No module named" in proc.stderr or "usage:" in proc.stderr:
         print(f"mypy is not installed. Install the baseline's version ({_baseline_mypy()}), "
               "which requirements-dev.txt pins:\n"

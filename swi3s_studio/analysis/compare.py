@@ -29,18 +29,19 @@ def register_diff(expected_writes, baseline_writes, rmap) -> List[dict]:
 
 
 def register_diff_report(diffs: List[dict], n_expected: int,
-                         max_lines: int = 80) -> Tuple[str, str]:
+                         max_lines: int = 80, where: str = "") -> Tuple[str, str]:
     """(summary, detail) text for a register-map comparison. `diffs` is the output
-    of register_diff(); `n_expected` is how many expected registers were checked.
+    of register_diff(); `n_expected` is how many expected registers were checked; `where`
+    follows "the decoded registers" / "the decoded bus" in the summary (" at the playhead").
     Detail lists each differing register as decoded vs expected (hex), grouped by device,
     capped at `max_lines` lines (headers and separators count, and a device header is written
     only with a register under it); registers past the cap are counted on one extra
     "(+N more)" line, which appears only when there are some."""
     if not diffs:
-        return (f"Config matches the decoded registers — "
+        return (f"Config matches the decoded registers{where} — "
                 f"0 of {n_expected} register(s) differ.", "")
     summary = (f"{len(diffs)} of {n_expected} register(s) differ between the "
-               f"expected config and the decoded bus.")
+               f"expected config and the decoded bus{where}.")
     by_dev: Dict[int, List[dict]] = {}
     for d in diffs:
         by_dev.setdefault(d["device"], []).append(d)

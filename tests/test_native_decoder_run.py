@@ -1,7 +1,11 @@
 """Decoder.run() framing, resync and windowed-replay rules, and the native demo fixtures.
 
-- A same-width resync (a comma re-hunt after the command-confidence limit) keeps the
-  payload engine in step with the bus: the audio after it equals the undisturbed decode.
+- The command-confidence resync holds the column count: it re-hunts the comma at the
+  current count, the framing carries on, and the segments and audio equal the undisturbed
+  decode's. Only a second command-free window re-runs the blind detector; a different count
+  it adopts is seeded with the detected Column 0 (the audio after it equals the aligned
+  decode's) and recorded (guessed_width_changes). A CRC-valid command between the windows
+  makes the next resync hold again.
 - A resync whose new column count configures nothing records no config epoch, so the
   windowed bit-sample replay agrees with the live decode.
 - A commit that changes no data port rebuilds no port, scrambler overrides included: the
@@ -35,7 +39,6 @@
 
 Every input is synthetic.
 """
-import math
 import os
 import subprocess
 import sys
@@ -47,6 +50,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import swi3score
+from demo_samples import sine_sample
 from test_native_command_parser import _bus
 
 from swi3s_studio.ingest import transitions
@@ -64,43 +68,116 @@ def _decode_levels(levels, settings=None):
 
 def _sine(channel: int, index: int, size: int) -> int:
     """Demo.cpp sineSample(channel, index, size): `size` is the SampleSize field (bits - 1)."""
-    x = (1 << size) * 0.45 * math.sin(2.0 * math.pi * (channel + 1) * index / 64.0)
-    v = math.floor(x + 0.5) if x >= 0 else -math.floor(-x + 0.5)
-    return v & ((1 << (size + 1)) - 1)
+    return sine_sample(channel, index, size)
 
 
 # ---- resync ---------------------------------------------------------------------------
 
-def test_same_width_resync_keeps_the_payload_engine_in_step():
+def test_a_resync_holds_the_column_count_and_keeps_the_payload_engine_in_step():
+    """The 16-column region's CDS held flat for 15000 rows, payload untouched: the resync
+    after 8192 command-free rows re-hunts at 16 columns, the framing carries on, so the
+    segments and every audio sample equal the undisturbed decode's and no width change is
+    recorded."""
     levels = list(swi3score.make_demo_levels(3000))
     clean = _decode_levels(levels)
     seg = clean.segments()[-1]
     assert seg["column_count"] == 16
-    # Hold the Column-0 CDS level flat for 15000 rows of the 16-column region, payload
-    # untouched: more than 8192 rows pass with no CRC-valid command.
     held = list(levels)
     for row in range(seg["row_base"] + 18000, seg["row_base"] + 33000):
         ui = seg["start_ui"] + (row - seg["row_base"]) * 16
         held[ui - 1] = held[ui - 2]
     d = _decode_levels(held)
-    resyncs = [g for g in d.segments() if g["start_ui"] > seg["start_ui"]]
-    assert resyncs and all(g["column_count"] == 16 for g in resyncs), d.segments()
-    after = resyncs[0]["start_sample"]
+    assert d.segments() == clean.segments()
+    assert d.guessed_width_changes() == []
 
     def keyed(dec):
-        return {(a["dp"], a["channel"], a["start_sample"]): a["value"]
-                for a in dec.audio() if a["start_sample"] > after}
+        return {(a["dp"], a["channel"], a["start_sample"]): a["value"] for a in dec.audio()}
 
     want, got = keyed(clean), keyed(d)
     assert len(want) > 1000
     assert got == want
 
 
+def _overrides(dec, section):
+    """Settings imposing `dec`'s committed register state on `section` alone, both ranks of
+    a dual-ranked register (as a region CSV is imposed)."""
+    from swi3s_studio.model.registers import RegisterMap
+    rm = RegisterMap.load()
+    regs = {}
+    for dev, addr, value in dec.committed_registers():
+        regs[(dev, addr)] = value
+        res = rm.resolve(int(addr))
+        if res and res.register.dual_ranked and res.rank == "NEXT":
+            sp = res.register
+            delta = (sp.curr_offset - sp.offset) if sp.curr_offset is not None else 0x40
+            regs[(dev, addr + delta)] = value
+    st = swi3score.DecoderSettings()
+    st.register_overrides = [(section, d, a, v) for (d, a), v in regs.items()]
+    st.imported_config_sections = [section]
+    return st
+
+
+def _mislocked():
+    """A 4-column Ping prefix ahead of an 8-column ramp stream entered mid-row: the
+    leading window locks 4 columns, which frames no command on the 8-column wire. Returns
+    the prefix, the 8-column stream and the ramp port's committed registers' decode."""
+    setup = _decode_levels(list(swi3score.make_skipping_levels(200, 0, 1)))
+    assert setup.segments()[-1]["column_count"] == 8 and setup.audio()
+    full = list(swi3score.make_skipping_levels(4000, 0, 1))
+    body = full[setup.segments()[-1]["start_ui"] - 1 + 8 * 3000 + 2:]
+    prefix = _bus(4, {0: _cds(_pings(150))})
+    assert len(prefix) % 4 == 0
+    return prefix, body, setup
+
+
+def test_a_mislocked_count_is_held_once_then_re_detected_with_its_column_0_seed():
+    """The 4-column lock over the 8-column wire: the first resync holds 4 columns and only
+    the one after a second command-free window re-detects, adopting 8 at the Column 0 the
+    detector placed and recording the change. Every ramp sample decoded from 8 columns on
+    equals the decode of the 8-column stream alone (both re-anchored by the stream's SSPA),
+    which holds only with the engine seeded at that Column 0."""
+    prefix, body, setup = _mislocked()
+    ref = _decode_levels(body, _overrides(setup, 0))
+    d = _decode_levels(prefix + body, _overrides(setup, 1))
+    assert [g["column_count"] for g in d.segments()] == [4, 8]
+    [(at, old, new)] = d.guessed_width_changes()
+    assert (old, new) == (4, 8) and at == d.segments()[1]["start_sample"]
+    held = len(prefix) + 4 * 8192 + 262_144         # the hold's own window, after 8192 rows
+    assert at >= held * _SPU
+    sspa = next(c for c in d.commands()
+                if c["command"] == "SSPA" and c["crc_valid"] and c["start_sample"] > at)
+    sspa = sspa["end_sample"] + (sspa["row_delay"] + 1 + 32) * 8 * _SPU   # past its SSP
+    shift = len(prefix) * _SPU
+    want = {(a["dp"], a["channel"], a["start_sample"] + shift): a["value"]
+            for a in ref.audio() if a["start_sample"] + shift > sspa}
+    got = {(a["dp"], a["channel"], a["start_sample"]): a["value"]
+           for a in d.audio() if a["start_sample"] > sspa}
+    assert len(want) > 1000
+    assert got == want
+
+
+def test_a_crc_valid_command_between_the_windows_resets_the_fallback():
+    """The same mis-lock with one 4-column Ping spliced in after the hold's window: the next
+    resync holds again instead of re-detecting, so 8 columns are adopted one window later."""
+    prefix, body, _setup = _mislocked()
+    base = _decode_levels(prefix + body)
+    [(at, _old, _new)] = base.guessed_width_changes()
+    cut = 4 * 8192 + 262_144 + 4 * 2000             # inside the second confidence window
+    ping = _bus(4, {0: _cds(_pings(1))})
+    d = _decode_levels(prefix + body[:cut] + ping + body[cut:])
+    assert any(c["command"] == "Ping" and c["crc_valid"] and
+               (len(prefix) + cut) * _SPU <= c["start_sample"] < (len(prefix) + cut + len(ping)) * _SPU
+               for c in d.commands()), "the spliced Ping does not decode"
+    [(later, old, new)] = d.guessed_width_changes()
+    assert (old, new) == (4, 8)
+    assert later >= at + 262_144 * _SPU            # one more hold, and its window
+
+
 def test_a_resync_that_configures_nothing_records_no_epoch():
     """Cold restart at Safe-Lock 2 on a 16-column wire: the registers reset, the ports
     stop, and the watchdog later re-detects 16 columns with nothing to configure. The
     windowed replay shows no port bits where the live decode decoded none."""
-    full = Session.from_demo(1500, phy=2, cold_start=False)
+    full = Session.from_demo(3000, phy=2, cold_start=False)
     cap = full.capture
     ce = np.asarray(cap.clock_edges, dtype=np.int64)
     ui0 = int(full.segments[-1]["start_ui"]) + 16 * 5000
@@ -112,6 +189,7 @@ def test_a_resync_that_configures_nothing_records_no_epoch():
     d.run()
     last = d.segments()[-1]
     assert last["column_count"] == 16 and not last["restart"], d.segments()
+    assert [w[1:] for w in d.guessed_width_changes()] == [(2, 16)]
     live = np.asarray(d.bit_samples()["sample"], dtype=np.int64)
     assert not np.any(live > restart)
     window = d.bit_samples_window(int(last["start_ui"]) + 1000, int(last["start_ui"]) + 5000)
@@ -185,9 +263,9 @@ def _pings_after(d, sample):
 def test_a_resync_into_a_pinned_section_searches_the_pinned_count_s_phase():
     """The command-confidence resync opens a section pinned to 16 columns over a window
     with one CRC-valid command: the pinned count's Column-0 phase is searched there, so
-    the command decodes and the framing is not a guess. Unpinned, the blind detector reads
-    nothing and the command is lost; pinned to a width the wire does not carry, the
-    framing is reported as guessed."""
+    the command decodes and the framing is not a guess. Unpinned, the resync holds 16
+    columns and searches their phase the same way, so the command decodes too; pinned to a
+    width the wire does not carry, the framing is reported as guessed."""
     held, segs, k0 = _one_command_window()
     seg = segs[-1]
     kept_from = (seg["start_ui"] + (k0 - 2) * 16) * _SPU
@@ -203,7 +281,8 @@ def test_a_resync_into_a_pinned_section_searches_the_pinned_count_s_phase():
     def guessed(d):
         return [x for x in d.guessed_framing_samples() if x >= seg["start_sample"]]
 
-    assert kept(decode([])) == []
+    unpinned = decode([])
+    assert len(kept(unpinned)) == 1 and guessed(unpinned) == []
     pinned = decode([(len(segs), 16)])
     assert len(kept(pinned)) == 1 and guessed(pinned) == []
     assert guessed(decode([(len(segs), 8)]))

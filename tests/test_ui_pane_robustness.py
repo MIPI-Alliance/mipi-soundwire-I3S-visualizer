@@ -251,8 +251,11 @@ def test_a_huge_range_is_not_applied_to_a_loaded_audio_pane():
 
 class _RegView:
     def __init__(self):
-        self._device = type("D", (), {"findData": lambda s, d: -1})()
         self.hidden = None
+        self.chosen = None
+
+    def choose_device(self, dev):
+        self.chosen = dev
 
     def hidden_provenances(self):
         return set(self.hidden or ())
@@ -378,6 +381,12 @@ class _TimingView:
         def findText(self, text):
             return self._names.index(text) if text in self._names else -1
 
+        def count(self):
+            return len(self._names)
+
+        def itemText(self, i):
+            return self._names[i]
+
         def currentIndex(self):
             return self.current
 
@@ -415,6 +424,14 @@ def test_a_timing_pane_that_reads_makes_no_note():
                                          "region": "Region 2"}, source="w")
     assert notes == [] and view._cat_hidden == {(True, False)}
     assert view._region.current == 1
+
+
+def test_a_timing_region_saved_under_another_name_is_found_by_its_time_span():
+    view = _TimingView(["2-col  (0.00–0.01 s)", "16-col 1  (0.01–0.50 s)",
+                        "16-col 2  (0.60–1.00 s)"])
+    with import_notes.collect() as notes:
+        view_state.restore_timing(view, {"region": "16 col  (0.60–1.00 s)"}, source="w")
+    assert notes == [] and view._region.current == 2
 
 
 def test_a_saved_timing_region_the_pane_lacks_is_named_in_the_note():
@@ -1399,3 +1416,66 @@ def test_a_registers_column_the_user_widened_keeps_its_width_through_rebuilds():
         assert view.column_widths() == {**RegisterView.DEFAULT_WIDTHS, "Fields": 500}
     finally:
         view.deleteLater()
+
+
+def _numbered(start, n):
+    return [{"raw": 0b0101010101, "kind": 3, "value": 0, "start_sample": i * 10, "row": i}
+            for i in range(start, start + n)]
+
+
+def test_prepending_symbols_keeps_the_selection_on_its_symbol():
+    """Earlier symbols added above leave the highlight, and the current cell the Down key
+    moves from, on the symbol they were on."""
+    _app()
+    from swi3s_studio.ui.symbol_view import SymbolView
+    v = SymbolView()
+    got = []
+    v.sampleSelected.connect(got.append)
+    v.set_symbols(_numbered(5, 6))
+    v.select_bus_row(7)                                     # symbol start_sample 70, row 2
+    assert v.currentRow() == 2
+    v.prepend_symbols(_numbered(0, 5))
+    sel = {r for rng in v.selectedRanges() for r in range(rng.topRow(), rng.bottomRow() + 1)}
+    assert v.currentRow() == 7 and sel == {7}
+    assert v.sample_at_row(7) == 70 and got == []
+    v.setCurrentCell(8, 0)                                  # Down: the row after the symbol
+    assert got == [80]
+
+
+def test_a_theme_switch_recolours_the_statistics_pass_and_fail_rows():
+    _app()
+    from PySide6.QtGui import QColor
+
+    from swi3s_studio.ui.measurements_view import MeasurementsView
+    from swi3s_studio.ui.theme import VizTheme, apply_palette
+    apply_palette("dark")
+    try:
+        v = MeasurementsView()
+        v.set_rows([("Section", "", "header"), ("a", "ok", "pass"), ("b", "bad", "fail"),
+                    ("c", "plain", None)])
+        assert v.item(1, 1).foreground().color() == QColor(VizTheme.SEM_OTHER)
+        apply_palette("light")
+        v.retheme()
+        assert v.item(1, 1).foreground().color() == QColor(VizTheme.SEM_OTHER)
+        assert v.item(2, 1).foreground().color() == QColor(VizTheme.SEM_ERROR)
+        assert v.item(0, 0).foreground().color() == QColor(VizTheme.ACCENT)
+    finally:
+        apply_palette("dark")
+
+
+@pytest.mark.parametrize("key, element", [
+    (k, e) for k in ("devices", "groups")
+    for e in ("x", None, 1.5, -1, 10 ** 9, True, [1])])
+def test_a_commands_filter_number_outside_its_range_is_left_out_and_reported(key, element):
+    with import_notes.collect() as notes:
+        snap = view_state.filters_from_json({key: [element, 2]}, source="w")
+    assert snap[key] == {2}
+    assert [n.message for n in notes] == [
+        f"the saved Commands filter view has entries that do not read, left as the pane has "
+        f"them: {key}"]
+
+
+def test_a_commands_filter_keeps_every_device_and_group_in_range():
+    with import_notes.collect() as notes:
+        snap = view_state.filters_from_json({"devices": [0, 11.0], "groups": [0, 3]})
+    assert snap["devices"] == {0, 11} and snap["groups"] == {0, 3} and not notes

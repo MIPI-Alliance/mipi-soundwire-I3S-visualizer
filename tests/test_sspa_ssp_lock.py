@@ -9,8 +9,8 @@ arbitrary phase (only 1/N rows land right).
 An SSPA in the capture announces a real SSP, so it can supply that anchor. The decoder
 already re-anchors when it *reaches* one — but that only fixes rows from the SSPA
 onward; everything before it still decodes at the arbitrary phase. Feeding the row
-through the manual-SSP path reduces it modulo the LCM of the ports' interval periods, so
-the phase holds from row 0 and the WHOLE capture decodes cleanly.
+through the manual-SSP path phases every port from the first row, SSPs recurring every
+pattern period, so the WHOLE capture decodes cleanly.
 """
 import os
 import tempfile

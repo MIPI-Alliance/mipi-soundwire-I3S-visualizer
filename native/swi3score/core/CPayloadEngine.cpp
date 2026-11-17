@@ -50,17 +50,6 @@ void CPayloadEngine::Configure(const SwI3sConfig& cfg, bool keepDrqHistory)
     const char* sh = std::getenv("SWI3S_SRC_SHIFT");
     mSourceShift = sh ? std::atoi(sh) : kDefaultSourceShift;
 
-    // Debug dump of assembled data bits for one DP (see header).
-    mDumpCount = 0;
-    if (!mDumpFile) {
-        const char* dpath = std::getenv("SWI3S_DUMP_PATH");
-        if (dpath) {
-            mDumpFile = std::fopen(dpath, "w");
-            const char* dd = std::getenv("SWI3S_DUMP_DP");  mDumpDp = dd ? std::atoi(dd) : -1;
-            const char* dm = std::getenv("SWI3S_DUMP_MAX"); mDumpMax = dm ? std::atol(dm) : 200000;
-        }
-    }
-
     for (size_t i = 0; i < cfg.dps.size(); ++i) {
         const SwI3sDpConfig& dc = cfg.dps[i];
         if (!dc.Enabled || dc.numChannels() == 0) {
@@ -101,6 +90,10 @@ CPayloadEngine::DpRuntime CPayloadEngine::buildRuntime(const SwI3sDpConfig& dc, 
 
 void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
 {
+    // The column count and SkippingDenominator are bus-wide, held by every port: when
+    // either changes, every survivor takes the new config in place as a changed one does.
+    const bool busChanged = cfg.columnCount() != mCfg.columnCount() ||
+                            cfg.SkippingDenominator != mCfg.SkippingDenominator;
     mCfg = cfg;
     // Carry surviving (device,dp) ports over UNTOUCHED (interval phase + descrambler
     // state preserved — a DSCR commits config but must not re-anchor the SSP); drop ports
@@ -117,7 +110,7 @@ void CPayloadEngine::Reconfigure(const SwI3sConfig& cfg)
         });
         if (it == mDps.end()) {
             next.push_back(buildRuntime(dc, static_cast<int>(i)));   // newly enabled
-        } else if (it->cfg.sameTransport(dc)) {
+        } else if (!busChanged && it->cfg.sameTransport(dc)) {
             next.push_back(std::move(*it));      // unchanged survivor: keep runtime + phase
         } else {
             // Survivor whose config changed, by a DSCR commit (dual-ranked transport
@@ -189,23 +182,29 @@ void CPayloadEngine::Reset()
     Configure(mCfg);
 }
 
-bool CPayloadEngine::SyncToSSP()
+CPayloadEngine::SspCheck CPayloadEngine::CheckSsp() const
 {
-    bool midSkipCycle = false;
-    for (DpRuntime& rt : mDps) {
-        // Is this port ALREADY at its sync point? An SSPA re-asserts the phase the ports
-        // are running at (it must land on a row where row_in_interval == 0, or it would
-        // shift the transport and garble the audio), so for a correctly-placed one the
-        // interval numbering does NOT change and the in-flight DRQ pipeline stays: a DRQ
-        // sent d intervals ago still pairs with the TxPresent that transports after the
-        // SSP. A re-anchor that DOES move the phase (SSCR to a new phase, a manual SSP
-        // row, a misplaced SSPA) invalidates the pipeline, so clear it in that case.
-        const bool alreadyAtSsp = (rt.port.SaveState().rowInInterval == 0);
+    SspCheck check;
+    for (const DpRuntime& rt : mDps) {
+        // An SSP must land on a row where row_in_interval == 0.
+        if (rt.port.SaveState().rowInInterval != 0) check.midInterval = true;
         // A skipping port has a SECOND alignment to satisfy: its pattern repeats every
         // Interval x SkippingDenominator Rows, so a row that is interval-aligned can still
-        // be mid-skip-cycle. Reported by the caller, and asked BEFORE the re-anchor clears
-        // the accumulator (Section 9.1.6.2.1).
-        if (!rt.port.SkipPatternAtCycleStart()) midSkipCycle = true;
+        // be mid-skip-cycle (Section 9.1.6.2.1).
+        if (!rt.port.SkipPatternAtCycleStart()) check.midSkipPattern = true;
+    }
+    return check;
+}
+
+void CPayloadEngine::SyncToSSP()
+{
+    for (DpRuntime& rt : mDps) {
+        // Is this port ALREADY at its sync point? There the SSP re-asserts the phase the
+        // port is running at, the interval numbering does NOT change and the in-flight DRQ
+        // pipeline stays: a DRQ sent d intervals ago still pairs with the TxPresent that
+        // transports after the SSP. An SSP anywhere else (an unexpected SSP, or a manual
+        // SSP row) moves the phase and invalidates the pipeline, so clear it in that case.
+        const bool alreadyAtSsp = (rt.port.SaveState().rowInInterval == 0);
         rt.port.SyncToSSP();
         rt.pending.clear();        // re-anchoring drops in-flight (shifted) bits
         if (rt.hasFcp) {
@@ -219,7 +218,34 @@ bool CPayloadEngine::SyncToSSP()
             }
         }
     }
-    return midSkipCycle;
+}
+
+void CPayloadEngine::AnchorBeforeSsp(long long rowsToSsp)
+{
+    if (rowsToSsp < 0) return;
+    for (DpRuntime& rt : mDps) {
+        if (rt.cfg.Interval < 0) continue;
+        const long long period = mCfg.patternRows(rt.cfg);
+        const long long after = (period - rowsToSsp % period) % period;
+        const long long intervalRows = static_cast<long long>(rt.cfg.Interval) + 1;
+        rt.port.AnchorAfterSsp(after / intervalRows, after % intervalRows, mStartColumn);
+        rt.pending.clear();
+        for (ChannelRuntime& cs : rt.channels) {
+            cs.startedEarlier = true;
+            if (rt.cfg.txpEnabled()) cs.txpValid = false;   // its TX_PRESENT came earlier
+            cs.settling = rt.scramblerEn;
+            cs.settleSeen = 0;
+            cs.settleToggled = false;
+            cs.txpUnsettled = cs.sampleUnsettled = false;
+        }
+        if (rt.hasFcp) {
+            rt.fcp.Initialize(rt.port.Column(), rt.port.RowInInterval());
+            rt.drqHistory.clear();
+            rt.drqBase = 0;
+            rt.drqCount = 0;
+            rt.txpInterval = 0;
+        }
+    }
 }
 
 std::vector<CDataPort::State> CPayloadEngine::SaveState() const
@@ -230,14 +256,47 @@ std::vector<CDataPort::State> CPayloadEngine::SaveState() const
     return out;
 }
 
+std::vector<CPayloadEngine::PortDescramblers> CPayloadEngine::SaveDescramblers() const
+{
+    std::vector<PortDescramblers> out(mDps.size());
+    for (std::size_t i = 0; i < mDps.size(); ++i) {
+        const DpRuntime& rt = mDps[i];
+        out[i].deviceNum = rt.deviceNum;
+        out[i].dpIndex = rt.dpIndex;
+        for (int ch = 0; ch < 16; ++ch) out[i].channels[ch] = rt.channels[ch].descram;
+        out[i].fcp = rt.fcpDescram;
+    }
+    return out;
+}
+
+void CPayloadEngine::EnableBitDump()
+{
+    if (mDumpOpened) return;
+    mDumpOpened = true;
+    const char* dpath = std::getenv("SWI3S_DUMP_PATH");
+    if (!dpath) return;
+    mDumpFile = std::fopen(dpath, "w");
+    const char* dd = std::getenv("SWI3S_DUMP_DP");  mDumpDp = dd ? std::atoi(dd) : -1;
+    const char* dm = std::getenv("SWI3S_DUMP_MAX"); mDumpMax = dm ? std::atol(dm) : 200000;
+    mDumpCount = 0;
+}
+
 void CPayloadEngine::RestoreState(const SwI3sConfig& cfg, int startColumn,
-                                  const std::vector<CDataPort::State>& ports)
+                                  const std::vector<CDataPort::State>& ports,
+                                  const std::vector<PortDescramblers>* descramblers)
 {
     mStartColumn = startColumn;
     mDps.clear();
     Configure(cfg);   // rebuilds mDps for the enabled ports in the saved order
     for (std::size_t i = 0; i < mDps.size() && i < ports.size(); ++i)
         mDps[i].port.RestoreState(ports[i]);
+    if (!descramblers) return;
+    for (std::size_t i = 0; i < mDps.size() && i < descramblers->size(); ++i) {
+        const PortDescramblers& d = (*descramblers)[i];
+        if (d.deviceNum != mDps[i].deviceNum || d.dpIndex != mDps[i].dpIndex) continue;
+        for (int ch = 0; ch < 16; ++ch) mDps[i].channels[ch].descram = d.channels[ch];
+        mDps[i].fcpDescram = d.fcp;
+    }
 }
 
 void CPayloadEngine::TickScheduleOnly()
@@ -271,7 +330,15 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
         // Both DATA and TX_PRESENT bits pass through the channel descrambler (when
         // enabled) to keep the LFSR in step.
         bool recovered = rt.scramblerEn ? cs.descram.Descramble(lvl) : lvl;
+        bool settled = true;
+        if (cs.settling) {
+            settled = false;
+            if (cs.settleSeen > 0 && lvl != cs.settleLast) cs.settleToggled = true;
+            cs.settleLast = lvl;
+            if (++cs.settleSeen >= 9 && cs.settleToggled) cs.settling = false;
+        }
         if (!isData) {
+            cs.txpUnsettled = !settled;
             // TX_PRESENT: not audio, but in the flow-controlled modes its value
             // gates the sample that immediately follows on this channel. recovered
             // == 1 means the transmitter used this transport opportunity (data
@@ -298,7 +365,11 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
         if (bitInChannel == sampleSize) {  // MSB: start a new sample
             cs.acc = 0;
             cs.startSample = sn;
+            cs.startedEarlier = false;
+            cs.sampleUnsettled = cs.txpUnsettled;
+            cs.txpUnsettled = false;
         }
+        cs.sampleUnsettled = cs.sampleUnsettled || !settled;
         if (bitInChannel >= 0 && bitInChannel < 64)   // a shift past the accumulator is UB
             cs.acc |= (static_cast<U64>(recovered ? 1 : 0) << bitInChannel);
         if (bitInChannel == 0) {  // LSB: sample complete
@@ -309,8 +380,14 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
             // samples. Re-arm txpValid for the next sample on this channel (the
             // next TX_PRESENT will re-latch it; NORMAL ports have none, so it must
             // stay true).
-            bool emit = cs.txpValid;
+            bool emit = cs.txpValid && !cs.startedEarlier;
+            if (emit && cs.sampleUnsettled) {
+                ++mWithheld[{rt.deviceNum, rt.dpIndex, channel}];
+                emit = false;
+            }
             cs.txpValid = true;
+            cs.startedEarlier = false;
+            cs.sampleUnsettled = false;
             if (emit) {
                 AudioSample s;
                 s.dp = rt.dpIndex;
@@ -332,6 +409,9 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
     };
 
     for (DpRuntime& rt : mDps) {
+        // The FCP's DRQ gate takes the skip of the interval this UI is in, read before the
+        // port's tick, which in an interval's last UI advances it to the next interval's.
+        const bool intervalSkipped = rt.port.IntervalSkipped();
         DpEmit e = rt.port.clock_tick();
 
         // Flow control (RxControlled / Async): re-drive the FCP in lockstep so we can
@@ -342,7 +422,7 @@ void CPayloadEngine::Tick(bool level, U64 sampleNumber, std::vector<AudioSample>
         // NUMBER (drqCount), so the handshake lookback is correct regardless of whether
         // the DRQ column falls before or after the data window within an interval.
         if (rt.hasFcp) {
-            FcpEmit fe = rt.fcp.clock_tick(rt.port.IntervalSkipped());
+            FcpEmit fe = rt.fcp.clock_tick(intervalSkipped);
             if (fe.slot == SwI3sSlot::Drq && fe.drqObservePoint) {
                 // The DRQ bit is recovered by the FCP's own descrambler when
                 // FCP_ScramblerEn is set (one LFSR step per DRQ bit), else read raw.

@@ -21,7 +21,7 @@ stylesheet builders `authoring_stylesheet()`, `analyzer_stylesheet()`, `chrome_s
 **The palette changes at run time.** `theme.py` holds two palettes, `_DARK` and `_LIGHT`,
 and `apply_palette(mode)` copies one onto `VizTheme`'s colour attributes (dark at import,
 then the saved View ▸ Appearance choice). A theme switch calls `apply_palette`, then
-`MainWindow._restyle()`, which re-applies the chrome and calls `retheme()` on every view
+`ThemeController.restyle()` (ui/theme_controller.py), which re-applies the chrome and calls `retheme()` on every view
 that caches colours. So:
 
 - Read `VizTheme.X` when you build a stylesheet, pen or brush, and call the builder
@@ -32,7 +32,7 @@ that caches colours. So:
   `grid_view._TX_FILL`; the raw view's PLL-error red `raw_view._PLL_ERR_COLOR`) and colour-free
   font-size strings (the Timing page's `_HEADER_CSS` and `_TITLE_CSS`).
 - A widget that caches colours gives itself a `retheme()` that rebuilds them, and is in
-  the list `_restyle()` walks.
+  the list `ThemeController.restyle()` walks.
 - Define a new colour key in BOTH palettes and declare it on `VizTheme`
   (`tests/test_theme.py` checks the declarations against the palettes).
 
@@ -70,6 +70,7 @@ look. When styling a new widget, default its background to `FRAME_BG` and let a
 | Token | Value | Applies to |
 |---|---|---|
 | `CORNER_RADIUS` | `6 px` | Entries, buttons, sub-panel frames, the bus-grid outer frame |
+| `SMALL_RADIUS` | `4 px` | A frame round one short row of controls (the Devices dialog's Register Map cell) |
 | `BORDER_WIDTH` | `1 px` | All borders |
 | Checkbox radius | `4 px` | Checkbox indicator (slightly tighter than 6) |
 | Scrollbar handle radius | `5 px` | Themed scrollbar handle |
@@ -97,10 +98,11 @@ Helvetica/system sans throughout. Sizes are deliberately compact:
 | Notification header | bold | `notifications.py` |
 | Grid in-cell labels | base `10 pt`, scaled | `grid_view._f_label` |
 | Grid row/col numbers | base `12 pt`, scaled, bold | `grid_view._f_num` |
-| Term diagram labels | `_FONT_DIAGRAM`, demi-bold; `_LABEL_NARROW` (0.85) of it in a column narrower than `_LABEL_FULL_W` (34 line heights) | `timing_view._FONT_DIAGRAM`, `timing_diagram._label_font` |
-| Term diagram panel heading | `_HEAD_SCALE` (1.04) of the body size, bold | `timing_diagram._HEAD_SCALE` |
-| Term diagram leg title | `_TITLE_SCALE` (1.12) of the body size, bold | `timing_diagram._TITLE_SCALE` |
-| Term diagram corner note | `_NOTE_SCALE` (0.85) of the body size | `timing_diagram._NOTE_SCALE` |
+| Term diagram labels | 15/18 of `_FONT_DIAGRAM`, normal weight; `label.narrow` (0.85) of it in a column narrower than `_LABEL_FULL_W` (34 line heights) | `diagram_style.FONTS`, `timing_diagram._text_font` |
+| Term diagram panel heading | 15/18 of the body size, normal weight | `diagram_style.FONTS` |
+| Term diagram leg title | 1.12 of the body size, normal weight | `diagram_style.FONTS` |
+| Term diagram corner note | 0.85 of the body size | `diagram_style.FONTS` |
+| Term diagram not maximized | 0.7 of every font, weight and size above | `timing_diagram.REDUCED_SCALE` |
 
 The grid sets point sizes, not pixels: each base size is multiplied by the grid scale
 (1.125) and, on Windows, by 0.8 (`grid_view._fpt`).
@@ -120,7 +122,9 @@ border-radius: 6px; padding: 5px;
 :hover  background: ACCENT_HOVER;
 ```
 Blue, borderless, rounded, white text. Hover darkens to `ACCENT_HOVER`. The stylesheet is
-built from `VizTheme` each time it is applied.
+built from `VizTheme` each time it is applied. The padding is per surface: `5px` in the
+authoring panel (`_action_button_css`), `4px 8px` in `analyzer_stylesheet()`; a new view takes
+the padding of the stylesheet it is themed by.
 
 ### Text entry / multi-line edit (`authoring_stylesheet`)
 ```
@@ -184,8 +188,8 @@ via `VizTheme.GRID_*`:
 | `GRID_CDS_FILL` | `#34373c` | CDS / full-height system fill (blends, but bordered) |
 
 Conventions worth carrying elsewhere:
-- **Scale, don't hardcode sizes.** Cell metrics derive from the Visualizer's base
-  (`COLUMN_SIZE=39`, `ROW_SIZE=30`) through `_s(v)` with `_SCALE = 1.125` and
+- **Scale, don't hardcode sizes.** Cell metrics (`_CW` and `_RH`, 39 × 30 before `_SCALE`) derive from
+  the Visualizer's base through `_s(v)` with `_SCALE = 1.125` and
   round-half-up. Want a bigger grid? Change `_SCALE`, not 30 literals.
 - **Rounded outer frame, square cells.** The grid frame rounds at `_s(6)` to match
   the design language, while interior cells stay square. The corners are produced by
@@ -193,9 +197,9 @@ Conventions worth carrying elsewhere:
   rounded-rect path on top (z=51). **The masks extend ~2px *outward* past the frame
   edge** so they swallow the outer half of the 1px cell-border pen — otherwise a
   square nub pokes out beyond the arc.
-- **Pastel data colours (the Visualizer palette).** The 12-entry `_DP_PALETTE` (also in
-  `authoring_panel._DP_COLORS`) colours data streams; dark `GRID_INK` text sits on
-  top. Keep these two lists in sync.
+- **Pastel data colours (the Visualizer palette).** The 12-entry `grid_view._DP_PALETTE` (the authoring
+  panel's DP name headers import it) colours data streams; dark `GRID_INK` text sits on
+  top. It is defined once.
 - **State via colour, loudly.** Diffs and clashes use 2px outlines in saturated
   semantic colours (yellow=changed/device, red=removed/bus, green=decoded-only,
   blue=read-overlap). These are the *only* place we break the 1px / desaturated
@@ -214,7 +218,7 @@ as local literals per view.
 | Traces | `TRACE_PALETTE` (6 pens), `DP_LINE_PALETTE` (12 data-port line colours), `RAW_DP`, `RAW_DN` | `TRACE_PALETTE`: the timeline's link-control section colours, the Timing (eye) view's edge flavours; `DP_LINE_PALETTE`: audio waveforms, Capture lane overlays and cursor pairs; `RAW_DP` / `RAW_DN`: the raw DP/DN lines |
 | Semantic marks | `SEM_ERROR` / `SEM_ERROR_BG` / `SEM_SSP` / `SEM_COMMIT` / `SEM_READ` / `SEM_OTHER` / `SEM_PING` / `SEM_BOOKMARK` / `SEM_BRINGUP` / `SEM_SYNC` | command table, symbol viewer, timeline ticks, commit Row-Sync-Point markers |
 | Highlight | `HILITE_BG` | the Timing page's highlighted term and parameter |
-| Term diagram | `DIAG_CLOCK` / `DIAG_DATA` / `DIAG_LEVEL` / `DIAG_GROUND` / `DIAG_TEXT` / `DIAG_DIM` / `DIAG_GUIDE` / `DIAG_OK` / `DIAG_BAD` / `DIAG_VALID` / `DIAG_KEEPER` | the Timing page's term diagram: clock and data edges, a receiver's threshold and its offset ground, text and rails, guides, a margin met and missed, a ramp's 80 % point, the keeper. Saturated and darker (light) or brighter (dark) than the shared marks; its strokes are fractions of its line height, not the 1 px rule |
+| Term diagram | `DIAG_CLOCK` / `DIAG_DATA` / `DIAG_DATA_PER` / `DIAG_DATA_PER_B` / `DIAG_LEVEL` / `DIAG_GROUND` / `DIAG_TEXT` / `DIAG_DIM` / `DIAG_GUIDE` / `DIAG_OK` / `DIAG_BAD` / `DIAG_VALID` / `DIAG_KEEPER` | the Timing page's term diagram and its whole-inequality view (`ui/inequality_diagram.py`, the same tokens, fonts and stroke fractions): clock and data edges, the data by the device driving it (the Manager `DIAG_DATA` green, a Peripheral or Peripheral A `DIAG_DATA_PER` orange, Peripheral B `DIAG_DATA_PER_B` magenta, each clear of the clock blue, the threshold navy, the margin green and red, the 80 % amber and the keeper purple), a receiver's threshold and its offset ground, text and rails, guides, a margin met and missed, a ramp's 80 % point, the keeper. Saturated and darker (light) or brighter (dark) than the shared marks; its strokes are fractions of its line height, not the 1 px rule |
 | Provenance | `PROV_DEFAULT` / `PROV_WRITTEN` / `PROV_CSV` / `PROV_UI` | register-map value column |
 | Symbol kinds | `SYM_INVALID` / `SYM_COMMA` / `SYM_ROBUST` / `SYM_DCODE` / `SYM_KCODE` / `SYM_UNKNOWN` | CDS symbol viewer |
 
@@ -223,6 +227,12 @@ Rules:
   `QColor(VizTheme.X)` / a pyqtgraph `mkPen` / `background=`.
 - **Reuse, don't re-shade.** `SYM_COMMA` *is* `SEM_SSP`; trace cyan doubles as `RAW_DP`.
   If two views mean the same thing, they share the token.
+- **Text in a data colour goes through `theme.legible_text_color(colour, background)`.** A
+  label, table cell or checkbox drawn in a trace, data-port or cursor-pair colour on a panel
+  (the Audio channel list, the Samples Port column, the Cursors table) takes the shade it
+  returns: the colour itself when it has `TEXT_ON_DATA_CONTRAST` (3.2):1 on that background,
+  otherwise the same hue moved darker or lighter until it does. The line or fill keeps the
+  colour itself.
 - **One genuinely local exception is allowed**: a colour used in exactly one place and
   nowhere else (e.g. timeline's translucent `_CONFIG_BANDS`, its internal axis-label
   greys) may stay local — over-centralizing single-use values is its own anti-pattern.

@@ -182,7 +182,6 @@ def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
     from swi3s_studio.model.bus_config import (
         CDS_DRIVE_NORMAL,
         CDS_DRIVE_SPECIAL,
-        CDS_GUARD_G1,
     )
     from swi3s_studio.ui.authoring.authoring_panel import AuthoringPanel
     from swi3s_studio.ui.authoring.dialogs import CdsSettingsDialog
@@ -211,7 +210,9 @@ def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
     def _accepted_edits(dlg):
         dlg._pick_bit(3)
         dlg.drive_type[2] = CDS_DRIVE_SPECIAL   # as an accepted CdsDriveTypeDialog would
-        dlg.guard[1] = CDS_GUARD_G1             # ...and an accepted CdsGuardDialog
+        dlg.guard_enable[1] = True              # ...and an accepted CdsGuardDialog
+        dlg.guard_polarity[1] = 1
+        dlg.guard_polarity[2] = 1               # a polarity on a disabled guard
         dlg.tail[3] = 2
         dlg.end_drive_early[4] = 1
         dlg.enforce_handover = not dlg.enforce_handover
@@ -222,7 +223,8 @@ def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
     assert emitted == [1]
     assert panel._cfg.cds_bit_width == 3
     assert panel._cfg.cds_drive_type[2] == CDS_DRIVE_SPECIAL
-    assert panel._cfg.cds_guard[1] == CDS_GUARD_G1
+    assert panel._cfg.cds_guard_enable[1] is True and panel._cfg.cds_guard_polarity[1] == 1
+    assert panel._cfg.cds_guard_enable[2] is False and panel._cfg.cds_guard_polarity[2] == 1
     assert panel._cfg.cds_tail[3] == 2
     assert panel._cfg.cds_end_drive_early[4] == 1
     assert panel._cfg.enforce_cds_handover is (not handover_before)
@@ -230,23 +232,26 @@ def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
 
     tip = btn.toolTip()
     assert "Bit width 3" in tip and "1 device Special" in tip and "1 device G1" in tip, tip
+    assert "1 device off, polarity 1" in tip, tip
 
     # (1) The interface-edit and repopulate paths leave all of it alone.
     panel._on_iface_edit()
     panel._populate()
     assert panel._cfg.cds_drive_type[2] == CDS_DRIVE_SPECIAL
     assert panel._cfg.cds_bit_width == 3
-    assert panel._cfg.cds_guard[1] == CDS_GUARD_G1
+    assert panel._cfg.cds_guard_enable[1] is True and panel._cfg.cds_guard_polarity[1] == 1
     assert panel._cfg.cds_guard_enabled is True     # still derived, still read-only
 
     # (2) A CANCELLED outer dialog discards an inner accepted change.
     before = (panel._cfg.cds_bit_width, list(panel._cfg.cds_drive_type),
               list(panel._cfg.cds_end_drive_early), panel._cfg.enforce_cds_handover,
-              list(panel._cfg.cds_guard), list(panel._cfg.cds_tail))
+              list(panel._cfg.cds_guard_enable), list(panel._cfg.cds_guard_polarity),
+              list(panel._cfg.cds_tail))
 
     def _cancelled_edits(dlg):
         dlg._pick_bit(5)
-        dlg.guard[4] = CDS_GUARD_G1
+        dlg.guard_enable[4] = True
+        dlg.guard_polarity[5] = 1
         dlg.drive_type[5] = CDS_DRIVE_SPECIAL
         dlg.tail[6] = 3
         dlg.end_drive_early[7] = 1
@@ -258,7 +263,8 @@ def test_cds_settings_dialog_owns_every_cds_field(monkeypatch):
     assert len(emitted) == emitted_before, "a cancelled dialog announced a change"
     assert before == (panel._cfg.cds_bit_width, list(panel._cfg.cds_drive_type),
                       list(panel._cfg.cds_end_drive_early), panel._cfg.enforce_cds_handover,
-                      list(panel._cfg.cds_guard), list(panel._cfg.cds_tail)), \
+                      list(panel._cfg.cds_guard_enable), list(panel._cfg.cds_guard_polarity),
+                      list(panel._cfg.cds_tail)), \
         "a cancelled dialog wrote through"
 
 
@@ -328,7 +334,7 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     def settings(**kw):
         base = dict(bit_width=0, drive_type=[CDS_DRIVE_NORMAL] * 13,
                     end_drive_early=[0] * 13, enforce_handover=True,
-                    guard=[0] * 13, tail=[0] * 13)
+                    guard_enable=[False] * 13, guard_polarity=[0] * 13, tail=[0] * 13)
         base.update(kw)
         return CdsSettingsDialog(None, **base)
 
@@ -356,7 +362,7 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
                 "width — this platform's font is unexpectedly narrow, so the "
                 "check is not equivalent to what the Windows runner exercises")
         app.setFont(wide)
-        for dlg in (settings(), CdsGuardDialog(None, [0] * 13),
+        for dlg in (settings(), CdsGuardDialog(None, [False] * 13, [0] * 13),
                     CdsTailDialog(None, [0] * 13), CdsDriveTypeDialog(None, [CDS_DRIVE_NORMAL] * 13)):
             assert not squeezed(dlg), f"{type(dlg).__name__} clips at the stress font: {squeezed(dlg)}"
     finally:
@@ -365,7 +371,7 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     # Width must not depend on the values — the note is static and the summaries live in a
     # stretched cell, so a long summary cannot widen the window.
     busy = settings(bit_width=7, drive_type=[CDS_DRIVE_SPECIAL] * 13,
-                    guard=[2] * 13, tail=[3] * 13)
+                    guard_enable=[True] * 13, guard_polarity=[1] * 13, tail=[3] * 13)
     assert busy.width() == plain.width(), "the dialog resized with its content"
     assert not squeezed(busy), f"clipped with full values: {squeezed(busy)}"
 
@@ -410,9 +416,10 @@ def test_cds_dialogs_are_laid_out_within_their_own_bounds():
     long.close()
 
     # All 13 source rows visible inside every per-source dialog, none half-drawn.
-    for cls, values in ((CdsGuardDialog, [0] * 13), (CdsTailDialog, [0] * 13),
-                        (CdsDriveTypeDialog, [CDS_DRIVE_NORMAL] * 13)):
-        dlg = cls(None, values)
+    for cls, values in ((CdsGuardDialog, ([False] * 13, [0] * 13)),
+                        (CdsTailDialog, ([0] * 13,)),
+                        (CdsDriveTypeDialog, ([CDS_DRIVE_NORMAL] * 13,))):
+        dlg = cls(None, *values)
         assert len(dlg._rows) == 13
         assert not squeezed(dlg), f"{cls.__name__} clips a control: {squeezed(dlg)}"
 
@@ -421,8 +428,8 @@ def test_one_selected_colour_across_every_selector_including_off():
     """Green marks the CHOSEN option in a group — including when that option means "off".
 
     This pins the convention across the per-source dialogs AND the per-DP
-    `GuardSelectorDialog` that established it (it offers the identical Off / Guard 0 /
-    Guard 1). There is exactly ONE selected style; the label carries the value and
+    `GuardSelectorDialog` (both offer the guard Polarity 0 / 1 beside an Enable checkbox).
+    There is exactly ONE selected style; the label carries the value and
     the colour carries the selection. A bus-wide "nothing is set" reading belongs in the
     summary TEXT, which `cds_summary` provides and which this asserts alongside.
     """
@@ -444,6 +451,7 @@ def test_one_selected_colour_across_every_selector_including_off():
         CdsGuardDialog,
         CdsTailDialog,
         GuardSelectorDialog,
+        cds_guard_summary,
         cds_summary,
     )
 
@@ -455,13 +463,14 @@ def test_one_selected_colour_across_every_selector_including_off():
     sel_names = sorted(n for n in vars(dlg_mod) if "SEL" in n)
     assert sel_names == ["_SELECTED", "_SEL_CSS", "_UNSELECTED", "_UNSEL_CSS"], sel_names
 
-    # The per-DP guard dialog, which set the convention: a chosen "Off" is green.
+    # The per-DP guard dialog: a chosen polarity 0 is green, with the guard off.
     per_dp = GuardSelectorDialog(None, False, 0, 0)
-    assert _SEL_CSS in per_dp._off.styleSheet(), "the per-DP guard changed its Off colour"
+    assert per_dp._pol_btns[0].styleSheet() == _SEL_CSS
+    assert per_dp._pol_btns[1].styleSheet() == _UNSEL_CSS
 
     # ...and the per-SOURCE dialogs agree, on every off-ish value.
-    guard = CdsGuardDialog(None, [0] * 13)
-    assert guard._rows[0][0].styleSheet() == _SEL_CSS, "per-source Off differs from per-DP Off"
+    guard = CdsGuardDialog(None, [False] * 13, [0] * 13)
+    assert guard._rows[0][0].styleSheet() == _SEL_CSS, "per-source polarity differs from per-DP"
     assert guard._rows[0][1].styleSheet() == _UNSEL_CSS
     tail = CdsTailDialog(None, [0] * 13)
     assert tail._rows[0][0].styleSheet() == _SEL_CSS
@@ -479,32 +488,28 @@ def test_one_selected_colour_across_every_selector_including_off():
     assert drive._rows[0][CDS_DRIVE_SPECIAL].styleSheet() == _SEL_CSS
 
     # The "nothing is set" reading lives in the summary text.
-    assert cds_summary([0] * 13, "guard") == "off"
+    assert cds_guard_summary([False] * 13, [0] * 13) == "off"
     assert cds_summary([CDS_EDE_FULL_UI] * 13, "ede") == "All Full"
     assert cds_summary([CDS_DRIVE_NORMAL] * 13, "drive") == "all Normal"
 
 
 def test_cds_guard_polarity_roundtrip():
-    """Both cds_guard_enabled and cds_guard_polarity survive CSV and dict round-trips,
-    with the polarity row written exactly once. cds_guard_enabled/polarity are derived
-    (read-only) from the per-source cds_guard list — drive them via the Manager's slot
-    (index 0), which is what the legacy singular properties reflect."""
-    from swi3s_studio.model.bus_config import CDS_GUARD_G1
-
+    """The per-source guard enable and polarity survive CSV and dict round-trips, the
+    polarity row written exactly once and a polarity of 1 kept on a disabled guard."""
     cfg = BusConfig()
-    cfg.cds_guard[0] = CDS_GUARD_G1
+    cfg.cds_guard_enable[0] = True
+    cfg.cds_guard_polarity[0] = 1
+    cfg.cds_guard_polarity[3] = 1
     with tempfile.TemporaryDirectory() as d:
         path = cfg.to_csv_file(os.path.join(d, "c.csv"))
         text = pathlib.Path(path).read_text()
         back = BusConfig.from_csv(path)
     assert sum(1 for l in text.splitlines()
-               if l.startswith("CDS_GuardPolarityPerSource")) == 1
-    assert back.cds_guard_enabled is True
-    assert back.cds_guard_polarity is True
-    # dict round-trip (workspace persistence)
-    back2 = BusConfig.from_dict(cfg.to_dict())
-    assert back2.cds_guard_enabled is True
-    assert back2.cds_guard_polarity is True
+               if l.startswith("CDS_GuardPolarity_REG_PerSource")) == 1
+    for got in (back, BusConfig.from_dict(cfg.to_dict())):
+        assert got.cds_guard_enabled is True
+        assert got.cds_guard_enable == cfg.cds_guard_enable
+        assert got.cds_guard_polarity == cfg.cds_guard_polarity
 
 
 def test_wide_bit_interval_overflow_detected():
@@ -538,6 +543,41 @@ def test_wide_bit_interval_overflow_detected():
     assert _build(bit_width=0, interval=1) == []
 
 
+@pytest.mark.parametrize("numerator", [16, 20])
+def test_every_interval_skipped_is_not_an_interval_overflow(numerator):
+    """A port whose SkippingNumerator_REG is at least SkippingDenominator_REG skips every
+    interval and places nothing. It reports its own notification naming both registers,
+    not an interval overflow; a numerator below the denominator still takes the check."""
+    from swi3s_studio.model import viz_engine
+
+    def _build(num):
+        cfg = BusConfig(num_columns=8, row_rate_khz=3072.0, rows_to_draw=4,
+                        skipping_denominator=16)
+        dp = cfg.dataports[0]
+        dp.enabled = True
+        dp.enable_ch = 0b1
+        dp.sample_size = 3
+        dp.interval = 1
+        dp.horizontal_start = 0
+        dp.horizontal_count = 6
+        dp.skipping_numerator = num
+        with tempfile.TemporaryDirectory() as d:
+            bm, _i, _v = viz_engine.build_bus_model(cfg.to_csv_file(os.path.join(d, "s.csv")))
+        return bm
+
+    bm = _build(numerator)
+    assert bm.warnings.interval_overflow_warnings == []
+    assert bm.warnings.all_intervals_skipped_warnings == [("DP0", numerator, 16)]
+    msgs = [(i.severity, i.message) for i in viz_engine.issues_from_model(bm)
+            if i.source == "DP0"]
+    assert msgs == [("info", f"every interval is skipped (SkippingNumerator_REG {numerator}"
+                              f" >= SkippingDenominator_REG 16): nothing is placed")], msgs
+
+    partial = _build(4)
+    assert partial.warnings.all_intervals_skipped_warnings == []
+    assert partial.warnings.interval_overflow_warnings == []
+
+
 def test_per_source_cds_handover_placement_and_clash():
     """Each CDS source hands the bus over right AFTER its own last-driven CDS column,
     not uniformly at the region end. A guard-only source (no tail) therefore hands
@@ -556,8 +596,9 @@ def test_per_source_cds_handover_placement_and_clash():
     def _clash_cols(guard, tail, dp_dev, dp_col):
         cfg = BusConfig(num_columns=15, row_rate_khz=3072.0)
         cfg.cds_bit_width = 0                       # CDS col0, guard col1, tails col2..
-        for i, g in guard.items():
-            cfg.cds_guard[i] = g
+        for i, pol in guard.items():           # source -> polarity of an enabled guard
+            cfg.cds_guard_enable[i] = True
+            cfg.cds_guard_polarity[i] = pol
         for i, t in tail.items():
             cfg.cds_tail[i] = t
         dp = cfg.dataports[0]
@@ -575,16 +616,16 @@ def test_per_source_cds_handover_placement_and_clash():
     # Manager G1 + Device-0 G0 guards, Manager tail width 3, and a
     # MANAGER data port at the region-end column (col5). Same device as the Manager's
     # own tail+handover there => no clash. Device-0 (guard only) hands over at col2.
-    assert _clash_cols({0: 2, 1: 1}, {0: 3}, dp_dev=-1, dp_col=5) == []
+    assert _clash_cols({0: 1, 1: 0}, {0: 3}, dp_dev=-1, dp_col=5) == []
     # Manager guard-only (no tail) => Manager handover at col2; a DEVICE-0 data port
     # there is a different device => clash.
-    assert _clash_cols({0: 2}, {}, dp_dev=0, dp_col=2) == [2]
+    assert _clash_cols({0: 1}, {}, dp_dev=0, dp_col=2) == [2]
     # Device-0 guard-only => Device-0 handover at col2; a DEVICE-0 data port there is
     # the same device => reconciles, no clash.
-    assert _clash_cols({1: 1}, {}, dp_dev=0, dp_col=2) == []
+    assert _clash_cols({1: 0}, {}, dp_dev=0, dp_col=2) == []
     # A DEVICE-0 data port landing on the Manager's tail columns is a different-device
     # write => still a real clash (the CDS exemption is for turnarounds, not writes).
-    assert _clash_cols({0: 2}, {0: 3}, dp_dev=0, dp_col=3) == [3, 4]
+    assert _clash_cols({0: 1}, {0: 3}, dp_dev=0, dp_col=3) == [3, 4]
 
 
 def test_cds_drive_type_reaches_both_engines_and_the_grid_label():
@@ -632,7 +673,7 @@ def test_cds_drive_type_reaches_both_engines_and_the_grid_label():
     cfg = demo_config()
     cfg.cds_drive_type = [CDS_DRIVE_SPECIAL] * CDS_NUM_SOURCES
     text = cfg.to_csv()
-    rows = [l for l in text.splitlines() if l.startswith("CDS_DriveTypePerSource")]
+    rows = [l for l in text.splitlines() if l.startswith("CDS_DriveType_REG_PerSource")]
     assert len(rows) == 1, "written exactly once"
     assert len(rows[0].split(",")) == CDS_NUM_SOURCES + 1, f"not 13-wide: {rows[0]}"
 
@@ -651,7 +692,7 @@ def test_cds_drive_type_reaches_both_engines_and_the_grid_label():
         legacy = os.path.join(d, "legacy.csv")
         with open(legacy, "w") as f:
             f.write("\n".join(l for l in text.splitlines()
-                              if not l.startswith("CDS_DriveTypePerSource")))
+                              if not l.startswith("CDS_DriveType_REG_PerSource")))
         assert BusConfig.from_csv(legacy).cds_drive_type == [CDS_DRIVE_NORMAL] * 13
         iface2, viz2 = Interface(), VizConfig()
         result2 = CSVHandler.load_csv(legacy, iface2, viz2)
@@ -685,15 +726,15 @@ def test_cds_summary_cannot_report_an_all_special_bus_as_off():
     """
     from swi3s_studio.model.bus_config import CDS_DRIVE_NORMAL as N
     from swi3s_studio.model.bus_config import CDS_DRIVE_SPECIAL as S
-    from swi3s_studio.ui.authoring.dialogs import cds_summary
+    from swi3s_studio.ui.authoring.dialogs import cds_guard_summary, cds_summary
 
     assert cds_summary([S] * 13, "drive") == "all Special"
     assert cds_summary([N] * 13, "drive") == "all Normal"
     assert cds_summary([S] + [N] * 12, "drive") == "Manager Special"
     assert cds_summary([N, S, S] + [N] * 10, "drive") == "2 devices Special"
     assert cds_summary([S, S] + [N] * 11, "drive") == "Manager + 1 device Special"
-    # ...and the other two keep their own vocabulary.
-    assert cds_summary([0] * 13, "guard") == "off"
+    # ...and the tail and the guard keep their own vocabulary.
+    assert cds_guard_summary([False] * 13, [0] * 13) == "off"
     assert cds_summary([0] * 13, "tail") == "off"
 
 
@@ -785,7 +826,7 @@ def test_cds_end_drive_early_is_per_source_through_both_engines():
     cfg = demo_config()
     cfg.cds_end_drive_early = [CDS_EDE_HALF_EARLY] + [CDS_EDE_FULL_UI] * 12  # Manager only
     text = cfg.to_csv()
-    rows = [l for l in text.splitlines() if l.startswith("CDS_EndDriveEarlyPerSource")]
+    rows = [l for l in text.splitlines() if l.startswith("CDS_EndDriveEarly_REG_PerSource")]
     assert len(rows) == 1, "written exactly once"
     assert len(rows[0].split(",")) == CDS_NUM_SOURCES + 1, f"not 13-wide: {rows[0]}"
 
@@ -804,7 +845,7 @@ def test_cds_end_drive_early_is_per_source_through_both_engines():
         legacy = os.path.join(d, "legacy.csv")
         with open(legacy, "w") as f:
             f.write("\n".join(l for l in text.splitlines()
-                              if not l.startswith("CDS_EndDriveEarlyPerSource")))
+                              if not l.startswith("CDS_EndDriveEarly_REG_PerSource")))
         assert BusConfig.from_csv(legacy).cds_end_drive_early == [CDS_EDE_FULL_UI] * 13
         iface2, viz2 = Interface(), VizConfig()
         result2 = CSVHandler.load_csv(legacy, iface2, viz2)
@@ -829,15 +870,15 @@ def test_a_truncated_per_source_row_takes_the_fields_default_not_zero():
     )
 
     # Two cells given, eleven missing: the given ones parse, the rest take Normal.
-    cfg = BusConfig.from_csv_text("CDS_DriveTypePerSource,0,0")
+    cfg = BusConfig.from_csv_text("CDS_DriveType_REG_PerSource,0,0")
     assert cfg.cds_drive_type == [CDS_DRIVE_SPECIAL] * 2 + [CDS_DRIVE_NORMAL] * 11
     # A blank cell mid-row is a gap, not a zero.
-    cfg2 = BusConfig.from_csv_text("CDS_DriveTypePerSource,0,,0" + ",1" * 10)
+    cfg2 = BusConfig.from_csv_text("CDS_DriveType_REG_PerSource,0,,0" + ",1" * 10)
     assert cfg2.cds_drive_type[1] == CDS_DRIVE_NORMAL, cfg2.cds_drive_type
     # Where zero IS the default, the fallback is indistinguishable — and that is correct.
-    assert BusConfig.from_csv_text("CDS_TailWidthPerSource,3").cds_tail == [3] + [0] * 12
+    assert BusConfig.from_csv_text("CDS_TailWidth_REG_PerSource,3").cds_tail == [3] + [0] * 12
     assert BusConfig.from_csv_text(
-        "CDS_EndDriveEarlyPerSource,1").cds_end_drive_early == [1] + [CDS_EDE_FULL_UI] * 12
+        "CDS_EndDriveEarly_REG_PerSource,1").cds_end_drive_early == [1] + [CDS_EDE_FULL_UI] * 12
 
 
 def test_manager_dataport_beats_device_number_in_either_row_order_in_both_engines():
@@ -915,7 +956,6 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
         CDS_DRIVE_SPECIAL,
         CDS_EDE_FULL_UI,
         CDS_EDE_HALF_EARLY,
-        CDS_GUARD_G1,
     )
 
     # ---- direction 1: authored CSV -> register writes ----
@@ -923,7 +963,8 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
     cfg.cds_bit_width = 3
     cfg.cds_drive_type[1] = CDS_DRIVE_SPECIAL          # device 0
     cfg.cds_end_drive_early[1] = CDS_EDE_HALF_EARLY
-    cfg.cds_guard[1] = CDS_GUARD_G1
+    cfg.cds_guard_enable[1] = True
+    cfg.cds_guard_polarity[1] = 1
     cfg.cds_tail[1] = 2
     with tempfile.TemporaryDirectory() as d:
         regs = swi3score.registers_from_csv(cfg.to_csv_file(os.path.join(d, "c.csv")))
@@ -953,12 +994,12 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
     assert got["cds_bit_width"] == 3
     assert got["cds_drive_type"][1] == CDS_DRIVE_SPECIAL
     assert got["cds_end_drive_early"][1] == CDS_EDE_HALF_EARLY
-    assert got["cds_guard"][1] == CDS_GUARD_G1
+    assert got["cds_guard_enable"][1] == 1 and got["cds_guard_polarity"][1] == 1
     assert got["cds_tail"][1] == 2
     # The Manager slot is untouched by anything on the wire.
     assert got["cds_drive_type"][0] == CDS_DRIVE_NORMAL
     assert got["cds_end_drive_early"][0] == CDS_EDE_FULL_UI
-    assert got["cds_guard"][0] == 0 and got["cds_tail"][0] == 0
+    assert got["cds_guard_enable"][0] == 0 and got["cds_tail"][0] == 0
     # A device that wrote nothing keeps the config default, not a half-read register.
     assert got["cds_drive_type"][5] == CDS_DRIVE_NORMAL
 
@@ -967,9 +1008,9 @@ def test_cds_crosses_the_csv_register_boundary_in_both_directions():
     assert exported.cds_drive_type[1] == CDS_DRIVE_SPECIAL
     assert exported.cds_end_drive_early[1] == CDS_EDE_HALF_EARLY
     text = exported.to_csv()
-    assert "CDS_DriveTypePerSource,1,0," in text, [
+    assert "CDS_DriveType_REG_PerSource,1,0," in text, [
         l for l in text.splitlines() if "DriveType" in l]
-    assert "CDS_EndDriveEarlyPerSource,0,1," in text
+    assert "CDS_EndDriveEarly_REG_PerSource,0,1," in text
 
 
 def test_the_cds_csv_round_trips_through_the_cpp_loader_too():
@@ -982,11 +1023,9 @@ def test_the_cds_csv_round_trips_through_the_cpp_loader_too():
     """
     import swi3score
 
-    from swi3s_studio.model.bus_config import CDS_GUARD_G0
-
     cfg = demo_config()
     cfg.cds_tail = [1] * 13
-    cfg.cds_guard = [CDS_GUARD_G0] * 13
+    cfg.cds_guard_enable = [True] * 13
     with tempfile.TemporaryDirectory() as d:
         text = cfg.to_csv()
         regs = swi3score.registers_from_csv(cfg.to_csv_file(os.path.join(d, "a.csv")))

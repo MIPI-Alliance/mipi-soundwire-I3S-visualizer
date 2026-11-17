@@ -29,10 +29,12 @@ the staleness check rather than skipping it.
 
 TWO RULES for comparing the models:
 
-1. THE TWO MODELS NAME LEGS BY OPPOSITE CONVENTIONS. The reference names a leg for the
-   HANDOVER direction, this project for the DATA direction, and they are inverted --
-   `emit_ede.setup_mp` says in its own docstring "= Timing Analysis PM setup". Comparing
-   like-named legs reports an error that does not exist.
+1. THE SETUP AND HOLD LEGS ARE NAMED BY OPPOSITE CONVENTIONS. The reference names its
+   `setup_*` / `hold_*` legs for the HANDOVER direction, this project for the DATA direction,
+   and they are inverted -- `emit_ede.setup_mp` says in its own docstring "= Timing Analysis
+   PM setup". Comparing like-named setup or hold legs reports an error that does not exist.
+   The contention and keeper legs share their names: `nc_mp` is MP_contention, `nc_pm`
+   PM_contention, `nc_pp` PP_contention and `keeper_man` keeper_Man.
 
 2. EACH REFERENCE LEG CARRIES ITS OWN CORNER IN ITS DEFAULT ARGUMENTS, not a global one.
    `hold_mp` defaults to T_RF_FAST and t_pd=0.0 because it is CREDITED 2·t_PD and Σ_hold, so
@@ -325,8 +327,8 @@ def _unbounded_edges(monkeypatch):
 # gathers into a single product.
 #
 # Worth 2.617 ns in this model's favour. It narrows P→P contention's deficit and does not flip
-# its sign: at the matched configuration the leg reads −18.48 in the reference, and here −14.96
-# with the slew-range limit lifted (`_unbounded_edges`) and −14.63 with the limit in force, all
+# its sign: at the matched configuration the leg reads −18.68 in the reference, and here −15.16
+# with the slew-range limit lifted (`_unbounded_edges`) and −14.83 with the limit in force, all
 # three pinned by test_pp_contention_differs_by_the_slew_split_this_model_declines_to_make.
 # The gap carries the shared edge's factor and the supply cornering on top of this split
 # (`_shared_edge`, `_supply_split`).
@@ -728,11 +730,11 @@ def test_pp_contention_differs_by_the_slew_split_this_model_declines_to_make(mon
     assert got - ref == pytest.approx(_PP_SLEW_SPLIT + shared + split, abs=5e-4), (
         f"the P→P slew-split divergence moved: reference {ref:+.4f}, here {got:+.4f}")
     assert got > ref, "declining the split is the GENEROUS direction — never silently"
-    assert (ref, got) == pytest.approx((-18.48, -14.96), abs=5e-3)
+    assert (ref, got) == pytest.approx((-18.68, -15.16), abs=5e-3)
     monkeypatch.undo()                      # the slew-range limit back in force
     bounded = _margin(inp, "PP_contention", Per_t_ZD_ns=E.PER_ZD_MIN,
                       Per_t_DZ_max_ns=E.PER_DZ_MAX_T129)
-    assert bounded == pytest.approx(-14.63, abs=5e-3), bounded
+    assert bounded == pytest.approx(-14.83, abs=5e-3), bounded
 
 
 def test_the_peripheral_ede_release_differs_by_the_ede_release_delta():

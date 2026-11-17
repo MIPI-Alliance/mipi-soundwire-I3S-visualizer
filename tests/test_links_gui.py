@@ -464,6 +464,15 @@ def test_rename_link_updates_every_place_it_is_shown(monkeypatch):
     assert win._link_actions[1].text() == "Amp bus"
 
 
+def test_a_link_name_with_an_ampersand_is_shown_literally_in_the_links_menu(monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win, first, second = _with_added_link()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("R&D", True))
+    win.rename_link()
+    assert win.links[1].name == "R&D" and win._link_combo.itemText(1) == "R&D"
+    assert win._link_actions[1].text() == "R&&D"
+
+
 def test_add_link_is_open_capture_on_add(monkeypatch):
     win = _win()
     seen = []
@@ -483,19 +492,22 @@ def test_add_link_with_nothing_loaded_is_a_plain_open(monkeypatch):
 
 def test_the_load_queue_supersedes_only_what_a_request_makes_pointless():
     """With a decode in flight: an added Link is never dropped by a re-decode, a re-decode
-    replaces only an earlier re-decode of the SAME session, and an open replaces all."""
+    replaces only an earlier re-decode of the SAME session that sets the same thing (an
+    equal `supersede` key), one without a key replaces nothing, and an open replaces all."""
     win, first, second = _with_added_link()
     win._load_thread = object()                         # pretend a decode is running
     try:
-        f = [lambda **kw: None for _ in range(6)]
+        f = [lambda **kw: None for _ in range(8)]
         win._load_async(f[0], kind="add")
-        win._load_async(f[1], kind="redecode")          # re-decode of Link 2 (active)
+        win._load_async(f[1], kind="redecode", supersede="ssp")   # Link 2's SSP (active)
         win.links.set_active(0)
-        win._load_async(f[2], kind="redecode")          # re-decode of Link 1
-        win._load_async(f[3], kind="redecode")          # supersedes f[2] only
-        assert [r[0] for r in win._load_pending] == [f[0], f[1], f[3]]
-        win._load_async(f[4])                           # an open: supersedes everything
-        assert [r[0] for r in win._load_pending] == [f[4]]
+        win._load_async(f[2], kind="redecode", supersede="ssp")   # Link 1's SSP
+        win._load_async(f[3], kind="redecode", supersede=("csv", 0))
+        win._load_async(f[4], kind="redecode")          # no key: drops nothing
+        win._load_async(f[5], kind="redecode", supersede="ssp")   # supersedes f[2] only
+        assert [r[0] for r in win._load_pending] == [f[0], f[1], f[3], f[4], f[5]]
+        win._load_async(f[6])                           # an open: supersedes everything
+        assert [r[0] for r in win._load_pending] == [f[6]]
     finally:
         win._load_thread = None
         win._load_pending = []
@@ -504,7 +516,8 @@ def test_the_load_queue_supersedes_only_what_a_request_makes_pointless():
 def test_a_switch_re_measures_and_refits_nothing(monkeypatch):
     """What makes a switch cheap, pinned as COUNTS (a wall clock loose enough for a shared
     runner could not tell these apart): the Timing pane's whole-capture measurement and the
-    command table's fit-to-content are done once per decode and reused per Link."""
+    command table's fit-to-content are done once and reused per Link; a re-decode measures
+    again and keeps the widths."""
     from swi3s_studio.ui import command_table, eye_view
     win, first, second = _with_added_link()
     for i in (0, 1):                                    # each Link shown and measured once
@@ -529,7 +542,7 @@ def test_a_switch_re_measures_and_refits_nothing(monkeypatch):
     assert calls == {"measure": 0, "fit": 0}
     win.load_session(win._session)                      # a re-decode IS a new measurement
     win._eye_view._render()
-    assert calls == {"measure": 1, "fit": 1}
+    assert calls == {"measure": 1, "fit": 0}            # and keeps the column widths
 
 
 def test_each_link_keeps_the_column_widths_the_user_set():
@@ -958,6 +971,22 @@ def test_a_bookmarks_row_makes_its_link_active_and_seeks_it():
     assert win.links.active_index == 0 and win.cursor.sample == s
 
 
+def test_each_cursor_row_seeks_its_own_cursor_and_the_delta_row_seeks_a1():
+    win, first, second = _with_added_link()
+    late = int(first.commands[14]["start_sample"])
+    early = int(first.commands[6]["start_sample"])
+    assert early < late
+    win._bookmarks.add(late, link=0)                     # A1, the later of the two
+    win._bookmarks.add(early, link=0)                    # A2, the earlier
+    win._push_bookmarks()
+    seen = []
+    for row in range(3):                                 # A1, A2, then the A1-A2 delta
+        win.cursor.set_sample(0)
+        win._pair_view._on_cell(row, 0)
+        seen.append(win.cursor.sample)
+    assert seen == [late, early, late]
+
+
 def test_next_bookmark_stays_on_the_active_link():
     win, first, second = _with_added_link()             # Link 2 active
     win.cursor.set_sample(0)
@@ -1135,7 +1164,9 @@ def test_a_re_decode_of_a_removed_link_is_discarded_not_loaded_as_a_new_capture(
     win.remove_link(1, confirm=False)
     assert win._load_pending == []                       # its queued re-decode is purged
     win._load_kind, win._load_after = "redecode", None   # one already running lands now
-    win._on_load_done(second, None, {})
+    fork = second.fork()
+    win._load_redecode = (second, fork)
+    win._on_load_done(fork, None, {})
     assert [e.session for e in win.links] == [first]     # not replaced by the removed Link
 
 
@@ -1192,7 +1223,7 @@ def test_a_workspace_whose_first_link_fails_adds_nothing_to_the_open_analysis(
 
 def test_a_re_decode_keeps_bookmarks_placed_while_it_ran():
     win, first, second = _with_added_link()
-    win._redecode_preserving(lambda **kw: win._session)
+    win._redecode_preserving(lambda fork: fork)
     added = win._bookmarks.add(123, link=0)              # placed while the decode runs
     pump_loads(win)
     assert added in list(win._bookmarks)
@@ -1210,6 +1241,27 @@ def test_a_click_in_a_floating_dock_makes_its_groups_link_active():
     assert win._reg_view.window() is not win             # the premise: its own window
     _PaneTouchFilter._installed.eventFilter(win._reg_view, QFocusEvent(QEvent.FocusIn))
     assert win.links.active_index == 0
+
+
+def test_focus_given_back_by_the_windows_activation_or_a_popup_leaves_the_active_link():
+    """With Commands showing Link 2 and Link 1 active, the focus the table gets back as the
+    window is activated or a menu closes leaves Link 1 active; focus moved into the table, by
+    Tab or a click, makes Link 2 active."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QFocusEvent
+
+    from swi3s_studio.ui.main_window import _PaneTouchFilter
+    win, first, second = _with_added_link()
+    assert win._pane_link["commands"] == 1
+    win._activate_link(0)
+    for reason in (Qt.ActiveWindowFocusReason, Qt.PopupFocusReason):
+        QApplication.sendEvent(win._cmd_view, QFocusEvent(QEvent.FocusIn, reason))
+        assert win.links.active_index == 0, reason
+    for reason in (Qt.TabFocusReason, Qt.MouseFocusReason):
+        win._activate_link(0)
+        _PaneTouchFilter._installed.eventFilter(win._cmd_view,
+                                                QFocusEvent(QEvent.FocusIn, reason))
+        assert win.links.active_index == 1, reason
 
 
 def test_a_bookmarks_row_seeks_its_instant_on_the_link_active_when_clicked():
@@ -1355,6 +1407,43 @@ def test_a_background_persistence_result_keeps_the_grid_links_cds_column(monkeyp
     win._on_tx_persist_done(np.zeros(cols, dtype=bool), cols, token)
     assert drawn == [2, 2]
 
+
+
+def test_a_background_persistence_result_does_not_paint_over_a_bring_up_message(monkeypatch):
+    """A scan asked for in audio mode lands after the cursor moved into the bring-up: the
+    grid keeps its message, and a scan asked for on one Link does not paint the grid once it
+    shows another Link's bring-up."""
+    import numpy as np
+
+    import swi3s_studio.ui.main_window as mw
+    win, first, second = _with_added_link()
+    for s in (first, second):
+        monkeypatch.setattr(s, "tx_persist_cached", lambda sample: None)
+    monkeypatch.setattr(mw, "_TX_PERSIST_SYNC_MAX_UIS", -1)            # every scan in the background
+    asked = []
+    monkeypatch.setattr(win, "_start_tx_persist_worker", lambda *a: asked.append(a))
+    drawn, messages = [], []
+    monkeypatch.setattr(win._grid_view, "set_tx_raster", lambda r: drawn.append(r))
+    monkeypatch.setattr(win._grid_view, "show_message", lambda *a: messages.append(a[0]))
+    win.switch_link(0)
+    win.cursor.set_sample(int(first.commands[-5]["start_sample"]))      # Link 1, in audio
+    win._toggle_tx_map(True)
+    win._toggle_tx_persist(True)
+    session, sample, token = asked[-1]
+    assert session is first and first.bringup_at(0) is not None
+    win.cursor.set_sample(0)                            # into the bring-up, mid-scan
+    assert messages[-1] == "No PHY Selected"
+    drawn.clear()
+    cols = session.column_count_at(sample) or 1
+    win._on_tx_persist_done(np.zeros(cols, dtype=bool), cols, token)
+    assert drawn == []
+    win.cursor.set_sample(int(first.commands[-5]["start_sample"]))
+    session, sample, token = asked[-1]
+    win.set_group_link("grid", 1)                        # Link 2 from its start: its bring-up
+    assert win._pane_link["grid"] == 1 and messages[-1] == "No PHY Selected"
+    drawn.clear()
+    win._on_tx_persist_done(np.zeros(cols, dtype=bool), cols, token)
+    assert drawn == []
 
 def test_all_links_keeps_its_column_widths_across_a_rebuild():
     win, first, second = _with_added_link()
@@ -1599,3 +1688,223 @@ def test_a_row_picked_in_the_commands_table_is_read_from_the_link_the_table_show
     win._cmd_view.setCurrentIndex(proxy.index(row, 0))
     assert win.links.active_index == 1
     assert win.cursor.sample == second.command_cursor_sample(cmd)
+
+
+def test_a_capture_replacing_the_links_leaves_all_links_in_the_commands_table():
+    """Opening a capture that replaces the Links while Commands shows All Links puts the
+    table, the Devices filter's title and the sort back as one Link has them."""
+    win, _first, _second = _with_added_link()
+    win.set_commands_scope_all(True)
+    assert win._dev_menu.title() == "&Devices (every Link)"
+    win.load_session(_flow_control(win))                   # not an added Link: a new capture
+    assert len(win.links) == 1 and not win._cmd_all and win._all_model is None
+    assert win._dev_menu.title() == "&Devices"
+    assert win._cmd_view.horizontalHeader().sortIndicatorSection() == -1
+    assert win._cmd_proxy.sourceModel() is win._cmd_model
+
+
+# ---------------------------------------------- a dialog that outlives a change of active Link
+def _flip_active_on_exec(monkeypatch, cls, win, result, to=0):
+    """`cls.exec()` makes Link `to` active, as closing a dialog can (focus returns to a pane
+    of another Link), and returns `result`."""
+    monkeypatch.setattr(cls, "exec", lambda self: (win._activate_link(to), result)[-1])
+
+
+def test_export_audio_writes_the_link_the_dialog_was_opened_on(tmp_path, monkeypatch):
+    import os
+
+    from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
+
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    win, _first, second = _with_added_link()
+    assert win.links.active_index == 1 and win._audio_store.streams()
+    _flip_active_on_exec(monkeypatch, AudioExportDialog, win, QDialog.Accepted)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[1]))
+    stem = win._link_stem(1)
+    assert stem and stem != win._link_stem(0)
+    streams = list(win.links[1].view.audio_store.streams())
+    win.export_audio()
+    assert win.links.active_index == 0
+    assert sorted(os.listdir(tmp_path)) == sorted(
+        f"swi3s{stem}_dev{d}_dp{p}.wav" for d, p in streams)
+    assert told == [win._titled("Audio exported", 1)]
+
+
+def test_export_audio_notes_only_the_streams_it_resampled(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
+
+    from swi3s_studio.ui.audio_export_dialog import AudioExportDialog
+    win = _win()
+    store = win._audio_store
+    streams = sorted(store.streams())
+    assert len(streams) >= 2
+    (d0, p0), (d1, p1) = streams[:2]
+    native = {k: int(round(store.rate(*k))) for k in streams[:2]}
+    assert native[(d1, p1)] != 16000
+    asked = {(d0, p0): float(native[(d0, p0)]), (d1, p1): 16000.0}
+    monkeypatch.setattr(AudioExportDialog, "exec", lambda self: QDialog.Accepted)
+    monkeypatch.setattr(AudioExportDialog, "selected_streams", lambda self: streams[:2])
+    monkeypatch.setattr(AudioExportDialog, "target_rate", lambda self, d, p: asked[(d, p)])
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    told = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: told.append(a[2]))
+    win.export_audio()
+    assert len(told) == 1
+    assert f"Resampled: dev{d1}/dp{p1} → 16 kHz" in told[0]
+    assert f"dev{d0}/dp{p0} →" not in told[0]
+
+
+def test_scrambler_overrides_apply_to_the_link_the_dialog_was_opened_on(monkeypatch):
+    from PySide6.QtWidgets import QComboBox, QDialog
+    win, first, second = _with_added_link()
+    assert win._session is second
+
+    def exec_(dlg):
+        dlg.findChildren(QComboBox)[0].setCurrentIndex(2)       # Off for its first port
+        win._activate_link(0)
+        return QDialog.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", exec_)
+    win.scrambler_overrides_dialog()
+    pump_loads(win)
+    assert second.scrambler_overrides and not first.scrambler_overrides
+
+
+def test_devices_apply_to_the_link_the_dialog_was_opened_on(monkeypatch):
+    from PySide6.QtWidgets import QDialog
+
+    from swi3s_studio.ui.devices_dialog import DevicesDialog
+    win, first, second = _with_added_link()
+    assert win._session is second and win.links.active_index == 1
+    seen = []
+    real = type(win._links[1].view.cmd_model).set_peripheral_maps
+
+    def spy(model, maps):
+        seen.append(model)
+        return real(model, maps)
+
+    monkeypatch.setattr(type(win._links[1].view.cmd_model), "set_peripheral_maps", spy)
+    _flip_active_on_exec(monkeypatch, DevicesDialog, win, QDialog.Accepted)
+    win.manage_device_names()
+    assert seen == [win._links[1].view.cmd_model]
+
+
+def test_export_commands_writes_the_link_its_file_is_named_for(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from swi3s_studio.export import write_commands_csv
+    win, first, second = _with_added_link()
+    assert win._session is second and len(first.commands) != len(second.commands)
+    named = []
+
+    def save(_parent, _title, start, _filter):
+        named.append(os.path.basename(start))
+        win._activate_link(0)
+        return str(tmp_path / "out.csv"), ""
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", save)
+    win.export_commands()
+    assert win.links.active_index == 0
+    assert named == [f"commands{win._link_stem(1)}.csv"]
+    want = tmp_path / "want.csv"
+    write_commands_csv(second.commands, str(want), win._rmap, second.peripheral_maps)
+    assert (tmp_path / "out.csv").read_bytes() == want.read_bytes()
+
+
+def _re_decoded_sessions(monkeypatch, win):
+    """The `session` each re-decode is asked for, the load itself not started."""
+    asked = []
+    monkeypatch.setattr(win, "_load_async",
+                        lambda *a, **k: asked.append(k.get("session")))
+    return asked
+
+
+def test_force_column_count_pins_the_link_the_prompt_was_opened_on(monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win, first, second = _with_added_link()
+    assert win._session is second
+    monkeypatch.setattr(QInputDialog, "getInt",
+                        lambda *a, **k: (win._activate_link(0), (8, True))[-1])
+    asked = _re_decoded_sessions(monkeypatch, win)
+    win.force_column_count()
+    assert win.links.active_index == 0
+    assert asked == [second]
+
+
+def test_a_csv_import_confirmed_in_its_prompt_imposes_on_the_link_it_was_asked_for(
+        monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QMessageBox
+
+    from swi3s_studio.model.bus_config import demo_config
+    win, first, second = _with_added_link()
+    assert win._session is second
+    cfg = demo_config()
+    dp = cfg.dataports[1]
+    dp.enabled, dp.enable_ch, dp.name = True, 0b11, "TooWide"
+    dp.horizontal_start, dp.horizontal_count = int(second.column_count) - 1, 3
+    path = cfg.to_csv_file(str(tmp_path / "wide.csv"))
+    prompts = []
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(
+        lambda *a, **k: (prompts.append(a[1]), win._activate_link(0), QMessageBox.Yes)[-1]))
+    asked = _re_decoded_sessions(monkeypatch, win)
+    win._apply_config_csv_path(path)
+    assert prompts and win.links.active_index == 0
+    assert asked == [second]
+
+
+def test_a_re_decode_asked_for_a_session_re_decodes_that_session_not_the_active_one():
+    win, first, second = _with_added_link()
+    assert win._session is second
+    first.marker = "first"
+    second.marker = "second"
+    forks = []
+
+    def build(fork):
+        forks.append(fork.marker)
+        return fork
+
+    win._redecode_preserving(build, session=first)
+    pump_loads(win)
+    assert forks == ["first"]
+    win._redecode_preserving(build)
+    pump_loads(win)
+    assert forks == ["first", "second"]
+
+
+def test_a_commands_filter_in_all_links_reaches_every_links_band():
+    """In All Links each band draws, and its Left/Right steps through, its own Link's rows
+    the filter shows; leaving All Links, a band whose Link the table does not show draws
+    every command."""
+    win, first, second = _with_added_link()
+    win.set_commands_scope_all(True)
+    excl = next(a for a in win._kind_menu.actions() if a.text() == "All excl. Ping")
+    excl.trigger()
+    for k, sess in enumerate((first, second)):
+        want = {int(c["start_sample"]) for c in sess.commands if c.get("command") != "Ping"}
+        pings = {int(c["start_sample"]) for c in sess.commands if c.get("command") == "Ping"}
+        band = win._ribbons[k]
+        assert pings and band._draw_set is not None, k
+        assert want <= band._draw_set and not (pings - want) & band._draw_set, k
+        assert band._nav_starts is not None and len(band._nav_starts) < len(sess.commands)
+    win.set_commands_scope_all(False)
+    shown = win._pane_link["commands"]
+    other = 1 - shown
+    assert win._ribbons[other]._draw_set is None and win._ribbons[other]._nav_starts is None
+    assert win._ribbons[shown]._draw_set is not None
+
+
+def test_the_samples_and_cds_windows_are_read_from_the_active_links_panel_state():
+    """The window's Samples and CDS window attributes are the active Link's LinkPanelState
+    fields, so a Link added and made active reads them before its tables are bound."""
+    win = _win()
+    names = ("sample_range", "sample_total", "sample_filters", "symbol_range")
+    fresh = LinkPanelState()
+    assert [getattr(fresh, n) for n in names] == [None, 0, None, None]
+    win._sample_range = (3, 9)
+    win._symbol_range = (100, 200)
+    state = win._link_state()
+    assert state.sample_range == (3, 9) and state.symbol_range == (100, 200)
+    win.links.add(win._session, view=LinkPanelState())
+    win.links.set_active(len(win.links) - 1)
+    assert win._sample_range is None and win._symbol_range is None

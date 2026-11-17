@@ -1,6 +1,6 @@
 """SWI3S Studio application entry point.
 
-    python3 -m swi3s_studio.app                          # empty window (File > Load Demo)
+    python3 -m swi3s_studio.app                          # empty window (File ▸ Open Demo Capture)
     python3 -m swi3s_studio.app --demo                   # open the synthetic PHY2 demo capture
     python3 -m swi3s_studio.app --demo-bringup           # same as --demo
     python3 -m swi3s_studio.app -c cfg.csv               # open a Visualizer config CSV
@@ -22,6 +22,9 @@ from . import cli
 
 _APP_NAME = "SWI3S Studio"
 _MIN_PY = (3, 11)
+# Qt logging rules the app sets before QApplication: Qt's FFmpeg multimedia backend's
+# version banner (an info message) is hidden; its warnings still print.
+_QT_LOG_RULES = "qt.multimedia.ffmpeg.info=false"
 
 
 def _centered_tab_style():
@@ -51,6 +54,13 @@ def _centered_tab_style():
 
 
 
+def _set_qt_log_rules() -> None:
+    """Apply `_QT_LOG_RULES`. Qt applies QT_LOGGING_RULES after them, so the environment can
+    turn a hidden message back on."""
+    from PySide6.QtCore import QLoggingCategory
+    QLoggingCategory.setFilterRules(_QT_LOG_RULES)
+
+
 def _require_python() -> None:
     """Fail early (before building anything) if the interpreter is too old. A clear
     message beats a later, cryptic failure from a 3.11+ feature."""
@@ -68,7 +78,7 @@ def main(argv=None) -> int:
     # -o IMPLIES HEADLESS: return before any QApplication, window or event loop exists, so a
     # batch run needs no display and cannot be affected by a saved appearance preference or a
     # restored workspace. cli is Qt-free; this is the only place that decides between the two.
-    if args.output:
+    if args.output is not None:
         return cli.run_headless(args.config, args.output)
     # Qt and the UI package are imported HERE, past the headless return, so a model dump does
     # not pay for them and cannot fail on them.
@@ -86,6 +96,7 @@ def main(argv=None) -> int:
     QApplication.setOrganizationName("MIPI SWI3S")
     _name_macos_app_menu()
     _set_regular_activation_policy()   # become a normal GUI app BEFORE QApplication
+    _set_qt_log_rules()
     app = QApplication(qt_argv)
     from .ui.singleton_pin import pin_singletons
     pin_singletons()                   # again, now Qt is up: it pins only what is not pinned

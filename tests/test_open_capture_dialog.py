@@ -207,6 +207,16 @@ def test_analog_thresholds_are_both_or_neither():
     assert link.clock_thresh == (1.2, 0.4) and link.data_thresh == (0.9, 0.3)
 
 
+@pytest.mark.parametrize("hi, lo", [("abc", "0.4"), ("1,2", "0.4"), ("1.2", "x"), ("inf", "0.4")])
+def test_an_analog_threshold_that_is_not_a_number_asks_for_volts(hi, lo):
+    dlg = _dlg(_probe(n=3, edges=None, analog=True, kind="analog_csv"))
+    ch, cl, _dh, _dl = dlg.rows()[0].thresh
+    ch.setText(hi)
+    cl.setText(lo)
+    assert not dlg._open_btn.isEnabled()
+    assert dlg._problem.text() == "Link 1: thresholds: give each as a number of volts."
+
+
 def test_a_bin_pair_without_a_readable_rate_asks_for_one():
     pr = _probe(n=2, edges=(10, 1), kind="saleae_binary", rate=None, two_file=True)
     dlg = _dlg(pr)
@@ -731,3 +741,25 @@ def test_the_window_can_reach_the_end_of_the_capture():
         spin = _TimeSpin(span)
         spin.set_seconds(span)
         assert spin.seconds() == span
+
+
+def test_locate_refuses_a_wfm_reference_whose_files_do_not_share_a_time_base(tmp_path):
+    """Locate's reference loader reads a .wfm pair as Open Capture does, so a pair that is
+    not one acquisition is refused the same way."""
+    from types import SimpleNamespace
+
+    from test_analog_import import _square_wave_codes, _write_synthetic_wfm
+
+    from swi3s_studio.ui.locate_controller import reference_capture
+    codes = _square_wave_codes(4000, period=20)
+    clock, data = str(tmp_path / "clock.wfm"), str(tmp_path / "data.wfm")
+    _write_synthetic_wfm(clock, codes, dt=1e-9)
+    _write_synthetic_wfm(data, codes, dt=2e-9)
+    pr = SimpleNamespace(kind="wfm", name="pair", paths=[clock, data], sample_rate_hz=None)
+    req = SimpleNamespace(links=[SimpleNamespace(clock=clock, data=data, auto_clock=True,
+                                                 clock_thresh=None, data_thresh=None)],
+                          sample_rate_hz=None, window_s=None)
+    with pytest.raises(ValueError, match=r"from_wfm.*disagree"):
+        reference_capture(pr, req)
+    _write_synthetic_wfm(data, codes, dt=1e-9)
+    assert reference_capture(pr, req).clock_edges.size > 0

@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -135,34 +136,109 @@ V3_TYPE_DIGITAL = _V3_TYPE_DIGITAL
 _V3_BLOCK_HEADER = 26
 _V3_LEVEL_OFF = 16             # u16 line-level (initial state in the first block)
 _V3_BYTECOUNT_OFF = 18         # u64 byte_count offset within the block header
-# Bytes from the blob's start in which the first block header must begin. Every reader
-# of the chain (parse_channel_v3, _find_v3_chain_start, saleae_sal._v3_span_streaming)
-# tries candidate offsets only inside this prefix, so all of them accept the same blobs.
-# The Logic 2 metadata header before the chain is 51 bytes (build_logic2_channel_v3).
+# Bytes from the blob's start in which the first block header is looked for first. Every
+# reader of the chain (parse_channel_v3, _find_v3_chain_start,
+# saleae_sal._v3_span_streaming) tries the candidate offsets inside this prefix, then those
+# in the rest of the blob, in order, so all of them accept the same blobs. The Logic 2
+# metadata header before the chain is 51 bytes (build_logic2_channel_v3).
 V3_CHAIN_START_SCAN = 1 << 16
+# Bytes of a stream read at a time when its candidate offsets past the prefix are searched.
+V3_CANDIDATE_STEP = 1 << 22
+_ZERO_QWORD = bytes(8)
+_V3_NO_CHAIN = ("no self-consistent transition-block chain found, in the first "
+                f"{V3_CHAIN_START_SCAN // 1024} KiB or past them "
+                "(unrecognised version-3 layout)")
+
+
+def v3_zero_qwords(buf, lo: int, hi: int):
+    """Offsets o in [lo, hi), in order, where the eight bytes of `buf` at o are zero: each a
+    candidate first block (A_start == 0). Found by the buffer's own search, so it holds no
+    scratch; a buffer without one (a memoryview) is copied to bytes first."""
+    if not hasattr(buf, "find"):
+        buf = bytes(buf)
+    o = buf.find(_ZERO_QWORD, lo, hi + 7)
+    while 0 <= o < hi:
+        yield o
+        o = buf.find(_ZERO_QWORD, o + 1, hi + 7)
+
+
+def _v3_start_candidates(data):
+    """Candidate first-block offsets of a v3 blob: the zero qwords inside the first
+    V3_CHAIN_START_SCAN bytes, then those in the rest of the blob."""
+    n = len(data)
+    split = min(n, V3_CHAIN_START_SCAN) - _V3_BLOCK_HEADER + 1
+    yield from v3_zero_qwords(data, 16, split)
+    yield from v3_zero_qwords(data, max(16, split), n - _V3_BLOCK_HEADER + 1)
+
+
+# The v3 code of `delta - 1 = v` is one byte below 0x40, two bytes below 0x80 (a zero MSB
+# digit, then the raw digit), and otherwise one byte per base-128 digit: k bytes from 128**(k-1)
+# up to 128**k. A uint64 holds at most ten digits.
+_V3_MAX_CODE_BYTES = 10
+_V3_DIGIT_FLOORS = tuple(np.uint64(1 << (7 * k)) for k in range(2, _V3_MAX_CODE_BYTES))
+# Deltas encoded per pass of encode_v3_deltas: the pass holds about 40 bytes per delta.
+_V3_ENCODE_CHUNK = 1 << 20
+
+
+def _v3_encode_np(v: np.ndarray) -> tuple:
+    """``(codes, lengths)`` for a uint64 array of ``delta - 1`` values: the concatenated v3
+    codes as a uint8 array and each code's byte length (int64). Codes of one byte length
+    are written together, one byte position at a time."""
+    lens = np.ones(v.size, dtype=np.int64)
+    lens += v >= np.uint64(0x40)
+    for floor in _V3_DIGIT_FLOORS:
+        lens += v >= floor
+    ends = np.cumsum(lens)
+    out = np.empty(int(ends[-1]) if ends.size else 0, dtype=np.uint8)
+    starts = ends - lens
+    for k in range(1, _V3_MAX_CODE_BYTES + 1):
+        sel = np.flatnonzero(lens == k)
+        if sel.size == 0:
+            continue
+        vk = v[sel]
+        st = starts[sel]
+        if k == 1:
+            out[st] = vk
+            continue
+        for j in range(k):
+            digit = (vk >> np.uint64(7 * (k - 1 - j))) & np.uint64(0x7f)
+            if j == 0:
+                digit += np.uint64(0x40)           # MSB
+            elif j < k - 1:
+                digit += np.uint64(0x80)           # interior; the terminal digit stays raw
+            out[st + j] = digit
+    return out, lens
+
+
+def _v3_delta_values(deltas) -> np.ndarray:
+    """``deltas - 1`` as uint64, after checking every delta is an integer >= 1."""
+    d = np.asarray(deltas)
+    if d.dtype.kind not in "iu":
+        raise TypeError(f"v3 deltas must be integers, not {d.dtype}")
+    if d.size and (d.min() < 1):
+        raise ValueError("v3 delta must be >= 1")
+    return d.astype(np.uint64, copy=False).ravel() - np.uint64(1)
+
+
+def encode_v3_deltas(deltas) -> bytes:
+    """Encode an integer array of sample deltas (each in 1 .. 2**64 - 1) as the v3 base-128
+    code run, the inverse of :func:`decode_v3_deltas`: per delta, the big-endian base-128
+    digits of ``delta - 1`` where the MSB byte adds 0x40, interior bytes add 0x80 and the final
+    byte is the raw low digit (< 0x80); a value below 0x40 is the single byte itself. Raises
+    ValueError for a delta below 1 and TypeError for a non-integer array."""
+    v = _v3_delta_values(deltas)
+    parts = [_v3_encode_np(v[i:i + _V3_ENCODE_CHUNK])[0].tobytes()
+             for i in range(0, v.size, _V3_ENCODE_CHUNK)]
+    return b"".join(parts)
 
 
 def encode_v3_delta(delta: int) -> bytes:
-    """Encode one sample delta (>= 1) as the v3 base-128 code (inverse of the
-    decode in :func:`decode_v3_deltas`): big-endian base-128 digits of
-    ``delta - 1`` where the MSB byte adds 0x40, interior bytes add 0x80, and the
-    final byte is the raw low digit (< 0x80)."""
-    v = int(delta) - 1
-    if v < 0:
+    """Encode one sample delta (1 .. 2**64 - 1) as its v3 code (see
+    :func:`encode_v3_deltas`)."""
+    d = int(delta)
+    if d < 1:
         raise ValueError("v3 delta must be >= 1")
-    digits = [0] if v == 0 else []
-    while v:
-        digits.append(v & 0x7f)
-        v >>= 7
-    digits.reverse()
-    if len(digits) == 1 and digits[0] < 0x40:
-        return bytes(digits)                       # single-byte code
-    if len(digits) == 1:                           # low digit >= 0x40: needs MSB + terminal
-        digits = [0] + digits
-    out = bytearray([digits[0] + 0x40])            # MSB
-    out += bytes(d + 0x80 for d in digits[1:-1])   # interior digits
-    out.append(digits[-1])                         # terminal (raw)
-    return bytes(out)
+    return encode_v3_deltas(np.array([d], dtype=np.uint64))
 
 
 def decode_v3_deltas(buf: bytes, off: int, nbytes: int):
@@ -306,19 +382,30 @@ def _emit_v3_blocks(init: int, deltas: np.ndarray, block_size: int,
     each block's true level (``init ^ (start_index & 1)``, what Logic renders from);
     ``False`` stamps 0 for non-first blocks (only block 0's level is read back).
     ``block_size <= 0`` emits a single block. An empty ``deltas`` still emits one
-    (empty) block carrying just the initial level."""
+    (empty) block carrying just the initial level.
+
+    The deltas are encoded a group of whole blocks at a time (about `_V3_ENCODE_CHUNK`
+    deltas), and each block's run is cut from the group's codes by its code lengths."""
     step = block_size if block_size and block_size > 0 else max(deltas.size, 1)
-    starts = list(range(0, deltas.size, step)) or [0]
+    if deltas.size == 0:
+        return struct.pack("<QQHQ", 0, 0, init, 0)
+    group = step * max(1, _V3_ENCODE_CHUNK // step)
     out = bytearray()
     a = 0
-    for i in starts:
-        chunk = deltas[i:i + step]
-        level = (init ^ (i & 1)) if per_block_level else (init if i == 0 else 0)
-        b_end = a + int(chunk.sum())
-        body = b"".join(encode_v3_delta(int(d)) for d in chunk.tolist())
-        out += struct.pack("<QQHQ", a, b_end, level, len(body))
-        out += body
-        a = b_end
+    for g in range(0, deltas.size, group):
+        seg = deltas[g:g + group]
+        codes, lens = _v3_encode_np(_v3_delta_values(seg))
+        firsts = np.arange(0, seg.size, step)
+        sums = np.add.reduceat(seg, firsts).tolist()
+        cuts = np.concatenate(([0], np.cumsum(lens)[np.minimum(firsts + step, seg.size) - 1]))
+        cuts = cuts.tolist()
+        for b, first in enumerate(firsts.tolist()):
+            i = g + first
+            level = (init ^ (i & 1)) if per_block_level else (init if i == 0 else 0)
+            b_end = a + int(sums[b])
+            out += struct.pack("<QQHQ", a, b_end, level, cuts[b + 1] - cuts[b])
+            out += codes[cuts[b]:cuts[b + 1]].data
+            a = b_end
     return bytes(out)
 
 
@@ -353,8 +440,8 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
     transition samples = cumsum(deltas)[:-1].
 
     The variable-length metadata means the first block isn't at a fixed offset, so
-    it's found by scanning the first `V3_CHAIN_START_SCAN` bytes for the start of a
-    self-consistent chain that tiles the blob exactly.
+    it's found by scanning the first `V3_CHAIN_START_SCAN` bytes, then the rest of the
+    blob, for the start of a self-consistent chain that tiles the blob exactly.
     Raises UnsupportedSaleaeVersion for non-v3 blobs and MalformedSaleaeV3 when no
     such chain is found."""
     if len(data) < 16 or data[:8] != _MAGIC:
@@ -431,13 +518,10 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
             o = body + cnt
         return (initial, blocks) if o == n else None
 
-    # The first self-consistent chain start inside the first V3_CHAIN_START_SCAN bytes.
-    # walk() is only invoked where the u64 at o0 is 0 (a candidate first block,
-    # A_start == 0) and bails on the first block that doesn't fit/sum, so a spurious
-    # zero-qword is cheap.
-    for o0 in range(16, min(n, V3_CHAIN_START_SCAN) - _V3_BLOCK_HEADER + 1):
-        if struct.unpack_from("<Q", data, o0)[0] != 0:   # first block A_start == 0
-            continue
+    # The first self-consistent chain start (_v3_start_candidates). walk() is only invoked
+    # where the u64 at o0 is 0 (a candidate first block, A_start == 0) and bails on the
+    # first block that doesn't fit/sum, so a spurious zero-qword is cheap.
+    for o0 in _v3_start_candidates(data):
         r = walk(o0)
         if r is None:
             continue
@@ -464,8 +548,7 @@ def parse_channel_v3(data: bytes, label: str = "") -> DigitalChannelSamples:
                     pos += k
             samples = out[:-1]
         return DigitalChannelSamples(bool(initial), np.ascontiguousarray(samples))
-    raise MalformedSaleaeV3(label, "no self-consistent transition-block chain found "
-                                   "(unrecognised version-3 layout)")
+    raise MalformedSaleaeV3(label, _V3_NO_CHAIN)
 
 
 
@@ -482,7 +565,7 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
 
     The metadata header is variable-length, so the chain is located by the same
     self-consistency scan :func:`parse_channel_v3` uses, over the same candidate
-    offsets (inside the first `V3_CHAIN_START_SCAN` bytes) — but this only VALIDATES
+    offsets (_v3_start_candidates) — but this only VALIDATES
     the chain by walking block headers (checking they tile the blob exactly and
     chain A_start == prev B_end); it never decodes a delta run. That makes it
     cheap enough to call before deciding what to decode.
@@ -491,9 +574,7 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
     delta that the whole-blob reader drops (the gap to capture end), which a
     windowed read must drop too."""
     n = len(data)
-    for o0 in range(16, min(n, V3_CHAIN_START_SCAN) - _V3_BLOCK_HEADER + 1):
-        if struct.unpack_from("<Q", data, o0)[0] != 0:      # first block A_start == 0
-            continue
+    for o0 in _v3_start_candidates(data):
         o, prev_b, ok = o0, None, True
         while o + _V3_BLOCK_HEADER <= n:
             a, b = struct.unpack_from("<QQ", data, o)
@@ -509,8 +590,7 @@ def _find_v3_chain_start(data: bytes, label: str = "") -> tuple:
             prev_b, o = b, body + cnt
         if ok and o == n:
             return o0, int(prev_b if prev_b is not None else 0)
-    raise MalformedSaleaeV3(label, "no self-consistent transition-block chain found "
-                                   "(unrecognised version-3 layout)")
+    raise MalformedSaleaeV3(label, _V3_NO_CHAIN)
 
 
 def parse_channel_v3_window(data: bytes, start_sample: int, end_sample: int,
@@ -825,8 +905,8 @@ def _times_to_samples(times_s: np.ndarray, sample_rate_hz: int,
 # until the pair is built (8), and the uint64 edge array built from them (8).
 _PAIR_BYTES_PER_EDGE = 16
 # Bytes per transition of one `_TIMES_CHUNK` step of `_times_to_samples`: the float64
-# copy of the chunk and its uint64 cast. Measured with tracemalloc within these figures:
-# 16.0 per edge plus 16 MB on a 3M + 1M transition pair, 26 per edge on 300k + 100k.
+# copy of the chunk and its uint64 cast; with the fixed bytes below, an upper bound,
+# enforced by test_a_bin_pair_peaks_within_its_prediction.
 _CHUNK_BYTES_PER_EDGE = 16
 # The two headers, the Capture, the small per-call arrays and the interpreter's own
 # allocations during a load, which differ by platform (about 130 KB on Windows).
@@ -924,6 +1004,16 @@ def begin_times_note(clock_begin: float, data_begin: float, rate: int) -> str:
             f"{data_begin:.9g} s); both are read on one timeline from the earlier start")
 
 
+def trailing_bytes_note(blob_bytes: int, n: int) -> Optional[str]:
+    """The import warning for a version-0 blob of `blob_bytes` bytes holding more than
+    the `n` transitions its header counts, or None when it holds no more."""
+    extra = int(blob_bytes) - V0_HEADER.size - 8 * int(n)
+    if extra <= 0:
+        return None
+    return (f"{extra:,} byte{'s' if extra != 1 else ''} past the {int(n):,} transitions "
+            f"the header counts {'are' if extra != 1 else 'is'} ignored")
+
+
 def _pair_notes(clock_path: str, data_path: str, clk: DigitalChannel, dat: DigitalChannel,
                 rate: int, origin: float, counted: tuple) -> list:
     """The import warnings of one `load_capture` that need the times: [(source, message)],
@@ -933,11 +1023,9 @@ def _pair_notes(clock_path: str, data_path: str, clk: DigitalChannel, dat: Digit
     out = []
     for (path, ch), n in zip(((clock_path, clk), (data_path, dat)), counted):
         src = import_notes.source_name(path)
-        extra = os.path.getsize(path) - V0_HEADER.size - 8 * n
-        if extra > 0:
-            out.append((src, f"{extra:,} byte{'s' if extra != 1 else ''} past the "
-                             f"{n:,} transitions the header counts "
-                             f"{'are' if extra != 1 else 'is'} ignored"))
+        note = trailing_bytes_note(os.path.getsize(path), n)
+        if note:
+            out.append((src, note))
         ch.times_s, note = time_order(ch.times_s)
         if note:
             out.append((src, note))

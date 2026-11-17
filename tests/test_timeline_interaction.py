@@ -266,3 +266,113 @@ def test_a_click_on_the_other_link_s_band_makes_it_active_at_that_sample():
     assert win.links.active_index == 1                   # the band clicked is now active
     assert abs(win.cursor.sample - target) <= 1          # at most a snap to the edge grid
     assert win._pane_link == {"commands": 0, "right": 0, "grid": 0, "bottom": 0}   # groups unmoved
+
+
+def _commands():
+    return [
+        {"command": "Ping", "start_sample": 200_000, "bus_row": 4},
+        {"command": "Ping", "start_sample": 400_000, "bus_row": 8, "has_manager_packet": True,
+         "crc_valid": False},
+        {"command": "ReadA32", "start_sample": 600_000, "bus_row": 12},
+    ]
+
+
+def test_hover_names_only_the_commands_whose_ticks_are_drawn(ribbon):
+    """A command the draw filter hides has no tick, so the pointer beside it names nothing."""
+    ribbon.set_events(_commands(), _TOTAL)
+    ribbon.set_row_origin(0)
+    ping_x = ribbon._x_for(200_000)
+    assert ribbon._hover_text(ping_x).startswith("Ping")
+    ribbon.set_draw_filter({400_000})                 # Errors Only: the CRC error stays
+    assert ribbon._nearest(ping_x) is None
+    assert ribbon._hover_text(ping_x) == ""
+    assert ribbon._hover_text(ribbon._x_for(400_000)).startswith("Ping (CRC error)")
+    ribbon.set_draw_filter(None)
+    assert ribbon._hover_text(ping_x).startswith("Ping")
+
+
+def _key(widget, key, modifiers=Qt.NoModifier):
+    from PySide6.QtTest import QTest
+    QTest.keyClick(widget, key, modifiers)
+    if modifiers:
+        QTest.keyRelease(widget, Qt.Key_Control)       # QTest keeps the modifier held
+
+
+@pytest.fixture
+def stepper(ribbon):
+    ribbon.set_events(_commands(), _TOTAL)
+    seen = []
+    ribbon.seeked.connect(seen.append)
+    return ribbon, seen
+
+
+def test_arrow_keys_step_to_the_previous_and_next_command(stepper):
+    r, seen = stepper
+    r.set_cursor(0)
+    _key(r, Qt.Key_Right)
+    assert seen == [200_000]
+    r.set_cursor(200_000)                              # a tie: the command under the cursor
+    _key(r, Qt.Key_Right)                              # is passed, not re-selected
+    r.set_cursor(400_000)
+    _key(r, Qt.Key_Left)
+    assert seen == [200_000, 400_000, 200_000]
+    r.set_cursor(200_000)
+    _key(r, Qt.Key_Left)                               # before the first command: stays
+    r.set_cursor(600_000)
+    _key(r, Qt.Key_Right)                              # after the last command: stays
+    assert seen == [200_000, 400_000, 200_000]
+
+
+def test_arrow_keys_follow_the_command_filter_when_one_is_set(stepper):
+    r, seen = stepper
+    r.set_nav_starts([200_000, 600_000])               # the table shows these two
+    r.set_cursor(200_000)
+    _key(r, Qt.Key_Right)
+    assert seen == [600_000]
+    r.set_nav_starts([])                               # a filter that shows nothing
+    _key(r, Qt.Key_Left)
+    assert seen == [600_000]
+    r.set_nav_starts(None)                             # no filter: every command
+    r.set_cursor(600_000)
+    _key(r, Qt.Key_Left)
+    assert seen == [600_000, 400_000]
+
+
+def test_control_arrow_jumps_between_the_commit_commands(stepper):
+    r, seen = stepper
+    r.set_commit_starts([300_000, 500_000])
+    r.set_cursor(0)
+    _key(r, Qt.Key_Right, Qt.ControlModifier)
+    r.set_cursor(300_000)
+    _key(r, Qt.Key_Right, Qt.ControlModifier)
+    r.set_cursor(500_000)
+    _key(r, Qt.Key_Left, Qt.ControlModifier)
+    assert seen == [300_000, 500_000, 300_000]
+    _key(r, Qt.Key_Up, Qt.ControlModifier)             # not an arrow it handles
+    r.set_commit_starts([])
+    _key(r, Qt.Key_Right, Qt.ControlModifier)          # no commits: nothing to jump to
+    assert seen == [300_000, 500_000, 300_000]
+
+
+def test_an_arrow_step_recentres_a_zoomed_view_on_the_command(stepper):
+    r, seen = stepper
+    for _ in range(20):
+        _wheel(r, 100.0, dy=240)                       # zoom in at the left edge
+    r.set_cursor(0)
+    _key(r, Qt.Key_Right)
+    lo, hi = _view(r)
+    assert seen == [200_000] and (lo + hi) / 2 == pytest.approx(200_000)
+
+
+def test_hover_describes_a_commit_point_then_a_config_band(ribbon):
+    ribbon.set_events(_commands(), _TOTAL)
+    ribbon.set_sample_rate(1_000_000)
+    ribbon.set_row_label(lambda s: int(s) // 1000)
+    ribbon.set_segments([{"start_sample": 0, "column_count": 4, "row_base": 0}], _TOTAL)
+    ribbon.set_commit_points([800_000])
+    cmd = ribbon._hover_text(ribbon._x_for(600_000))
+    assert cmd.startswith("ReadA32 · row ") and cmd.endswith("600,000.0 µs")
+    assert ribbon._hover_text(ribbon._x_for(800_000)) == "Commit Sync Point · row 800 · 800,000.0 µs"
+    assert ribbon._hover_text(ribbon._x_for(900_000)).startswith("Bus config: ")
+    ribbon.set_segments([], _TOTAL)
+    assert ribbon._hover_text(ribbon._x_for(900_000)) == ""

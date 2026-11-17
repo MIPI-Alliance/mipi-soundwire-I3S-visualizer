@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "swi3score"
 # The minor version is the module's score_abi (bindings.cpp); bump both together.
-version = "0.18.0"
+version = "0.19.0"
 description = "SWI3S decode core (pybind11): PHY1, PHY2 and PHY3/DLV"
 readme = "README.md"
 # LICENSE.md is the repository root's LICENSE.md, copied so the wheel and sdist carry it.

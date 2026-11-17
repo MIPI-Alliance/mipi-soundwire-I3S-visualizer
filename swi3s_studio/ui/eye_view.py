@@ -5,7 +5,8 @@ up as transitions creeping toward the sample point. Two histograms share the Y a
 and meet at the sample point: setup on the left (time before the sample point) and
 hold on the right (time after). Each side scales and bins to its own margins, so a
 long-UI region (a slow-clock section) keeps hold detail that a single symmetric axis
-would crush. Each transition contributes one setup and one hold, split into the four
+would crush. The wheel over a side zooms that side alone, 0 kept at the join, and
+re-bins it over the shown span; Reset Zoom shows both whole. Each transition contributes one setup and one hold, split into the four
 (clock-edge polarity × data-transition direction) types so a duty-skewed edge or an
 asymmetric data slew (rise vs fall) stands out. Log Y so a single edge too close to
 the sample point (count = 1) is still visible.
@@ -16,8 +17,8 @@ peripheral), data ports, or columns, so you can see whose edges are marginal. CD
 UI" navigator jumps the shared cursor to the worst transitions so they can be inspected in
 the Raw Capture pane.
 
-Compute lives in `analysis.bus_timing`; this view only renders it. Aggregate over the
-capture (not cursor-driven), so it has no time cursor.
+Compute lives in `analysis.bus_timing`; this view only renders it. The plot aggregates
+the region, so it has no time cursor; the region selector follows the playhead (set_cursor).
 """
 from __future__ import annotations
 
@@ -39,14 +40,20 @@ from PySide6.QtWidgets import (
 from ..analysis.bus_timing import measure_bus_timing
 from . import line_style
 from .click_label import ClickLabel
-from .port_names import with_name
+from .port_names import menu_text, with_name
 from .theme import VizTheme, analyzer_stylesheet
 
-# Y is plotted as log10(count) in a LINEAR view (we transform ourselves rather than use
-# pyqtgraph's log mode, whose fillLevel/fill polygon disagree with the pen). This floor
-# is the display baseline: the x-axis line and the level bars fill down to. It sits below
-# log10(1)=0 so a single-count bar still draws a visible sliver above the axis.
+# Y is plotted as log10(count) in a LINEAR view: the counts are transformed here, and
+# pyqtgraph's log mode is not used. This floor is the display baseline: the x-axis line and
+# the level bars fill down to it. It sits below log10(1)=0 so a single-count bar still
+# draws a visible sliver above the axis.
 _LOG_FLOOR = -0.35
+
+# Horizontal zoom: one wheel notch (120) scales a side's shown span by this factor; the
+# narrowest span holds 4 sample periods or a thousandth of the side's full span.
+_ZOOM_STEP = 1.25
+_ZOOM_MIN_BINS = 4
+_ZOOM_MAX = 1000.0
 
 
 def _grid_alpha() -> float:
@@ -81,6 +88,19 @@ class _MultiMenu(QMenu):
         super().mouseReleaseEvent(event)
 
 
+class _XZoomBox(pg.ViewBox):
+    """A ViewBox that hands its wheel to `on_wheel(delta)` and neither pans nor zooms by
+    itself, so the pane sets each side's range with 0 kept at the join."""
+
+    def __init__(self, on_wheel) -> None:
+        super().__init__()
+        self._on_wheel = on_wheel
+
+    def wheelEvent(self, ev, axis=None):  # noqa: N802 (pyqtgraph signature)
+        self._on_wheel(ev.delta())
+        ev.accept()
+
+
 class EyeView(QWidget):
     """Combined setup/hold margin histogram, rendered from a Capture's raw edges."""
 
@@ -108,6 +128,9 @@ class EyeView(QWidget):
         self._worst_i = 0
         self._navigating = False
         self._rate = 1
+        self._x_full: dict[str, float] = {}      # side -> its whole margin span (ns)
+        self._x_span: dict[str, float] = {}      # side -> the zoomed span (ns); absent = whole
+        self._sides: dict = {}                   # side -> (margins, clock polarity) shown
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -122,7 +145,7 @@ class EyeView(QWidget):
         self._region.setToolTip("A commit can change the bus clock rate mid-capture "
                                 "(e.g. 2 col → 16 col); setup/hold is measured per region "
                                 "since it only makes sense within one clock rate.")
-        self._region.setMinimumWidth(150)
+        self._region.setMinimumWidth(150)       # widened to its names in set_analysis_context
         self._region.currentIndexChanged.connect(lambda _=0: self._on_region_changed())
         row.addWidget(self._region)
         row.addSpacing(16)
@@ -149,6 +172,13 @@ class EyeView(QWidget):
             row.addWidget(lab)
         self._update_legend()
         row.addStretch(1)
+        self._zoom_reset = QPushButton("Reset Zoom")
+        self._zoom_reset.setToolTip("Show each side's whole margin range. Scroll over the "
+                                    "setup or the hold histogram to zoom that side; 0, the "
+                                    "sample point, stays at the join.")
+        self._zoom_reset.clicked.connect(self.reset_zoom)
+        self._zoom_reset.setEnabled(False)
+        row.addWidget(self._zoom_reset)
 
         # Worst-UI navigator: a single 'View Worst UI' button that becomes prev/next
         # once pressed, with no running readout.
@@ -173,20 +203,17 @@ class EyeView(QWidget):
         # keeps hold detail that a single symmetric axis would crush into a sliver.
         plots = QHBoxLayout()
         plots.setSpacing(0)
-        self._setup_plot = self._make_plot("← setup (ns)")
+        self._setup_plot = self._make_plot("← setup (ns)", "setup")
         self._setup_plot.getViewBox().invertX(True)     # 0 on the right, at the join
         self._setup_plot.setLabel("left", "transitions (log)")
-        self._hold_plot = self._make_plot("hold (ns) →")
+        self._hold_plot = self._make_plot("hold (ns) →", "hold")
         self._hold_plot.setYLink(self._setup_plot)       # shared Y range
-        # Drop the hold plot's Y axis entirely (label lives on the left plot). hideAxis
-        # RECLAIMS the axis's layout width; setVisible(False) would leave a blank strip on
-        # the hold plot's inner edge, splitting the two 0-ns points.
+        # The hold plot has no left Y axis (the label lives on the left plot): hideAxis
+        # gives up the axis's layout width, so the two 0-ns points meet.
         self._hold_plot.hideAxis("left")
-        # The horizontal (Y) grid lines are painted by the left axis, so the hold plot
-        # routes its Y grid through the OUTER right axis instead — hide its ticks +
-        # numbers, but leave the pen at the axis default (pyqtgraph paints grid lines in
-        # the axis's OWN pen colour, so a background pen would make them invisible) so it
-        # matches setup's.
+        # The hold plot's Y grid is drawn by its right axis, whose ticks and values are
+        # hidden. The axis keeps its default pen, the colour its grid lines are drawn in, so
+        # the grid matches the setup plot's.
         self._hold_plot.showAxis("right")
         _right = self._hold_plot.getAxis("right")
         _right.setStyle(showValues=False, tickLength=0)
@@ -234,13 +261,13 @@ class EyeView(QWidget):
         self._update_legend()
         self._redraw()
 
-    def _make_plot(self, xlabel: str) -> pg.PlotWidget:
-        p = pg.PlotWidget(background=VizTheme.PLOT_BG)
+    def _make_plot(self, xlabel: str, side: str) -> pg.PlotWidget:
+        p = pg.PlotWidget(background=VizTheme.PLOT_BG,
+                          viewBox=_XZoomBox(lambda d, s=side: self._zoom_x(s, d)))
         p.showGrid(x=True, y=True, alpha=_grid_alpha())
         p.setMenuEnabled(False)
         p.getPlotItem().hideButtons()      # drop the corner auto-range "A" button
-        # A fixed-scale histogram, not an explorable trace — disable mouse pan/zoom so a
-        # stray scroll/drag doesn't rescale the axes.
+        # No drag pan or zoom: the wheel zooms the side's X span through _XZoomBox.
         p.setMouseEnabled(x=False, y=False)
         p.getViewBox().setMouseEnabled(x=False, y=False)
         p.setLabel("bottom", xlabel)
@@ -327,7 +354,8 @@ class EyeView(QWidget):
         for item in self._filter_items:
             if item.get("port") is not None:
                 d, p = item["port"]
-                item["action"].setText(with_name(self._port_names, d, p, f"Device {d} DP{p}"))
+                item["action"].setText(
+                    menu_text(with_name(self._port_names, d, p, f"Device {d} DP{p}")))
         if self._filter_items:
             self._update_filter_text()
 
@@ -353,6 +381,7 @@ class EyeView(QWidget):
         self._region.clear()
         for r in self._regions:
             self._region.addItem(r.get("label", "region"))
+        self._fit_region_names()
         if self._regions:
             default = max(range(len(self._regions)),
                           key=lambda i: self._regions[i].get("edges", 0))
@@ -363,6 +392,34 @@ class EyeView(QWidget):
         self._region_label.setVisible(multi)
         self._apply_region()
         self._dirty = True
+
+    def set_region_labels(self, regions) -> None:
+        """Rename the region selector's entries from `regions` (Session.timing_regions of
+        the capture shown), keeping the selection and the analysis. A list of another
+        length is ignored."""
+        regions = list(regions or [])
+        if len(regions) != len(self._regions):
+            return
+        for i, r in enumerate(regions):
+            label = r.get("label", "region")
+            self._regions[i] = {**self._regions[i], "label": label}
+            self._region.setItemText(i, label)
+        self._fit_region_names()
+
+    def _fit_region_names(self) -> None:
+        """Widen the region selector, and its list, to its longest name (150 px at least),
+        so no name is clipped."""
+        from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
+        fm = self._region.fontMetrics()
+        text = max((fm.horizontalAdvance(self._region.itemText(i))
+                    for i in range(self._region.count())), default=0)
+        opt = QStyleOptionComboBox()
+        self._region.initStyleOption(opt)
+        size = self._region.style().sizeFromContents(
+            QStyle.ContentsType.CT_ComboBox, opt, fm.size(Qt.TextSingleLine, "M"), self._region)
+        frame = size.width() - fm.horizontalAdvance("M")        # arrow, margins and frame
+        self._region.setMinimumWidth(max(150, text + frame + 4))
+        self._region.view().setMinimumWidth(text + 24)
 
     def _apply_region(self) -> None:
         """Adopt the selected region's sample range + column roles (computed lazily via
@@ -427,6 +484,7 @@ class EyeView(QWidget):
                 cache[key] = t
         self._timing = t
         self._rate = int(t.sample_rate_hz) if t is not None else 1
+        self._x_span = {}                    # a new measurement shows its whole range
         self._redraw()
 
     # ---- filter -----------------------------------------------------------------
@@ -470,7 +528,7 @@ class EyeView(QWidget):
                             if r.get("kind") == "peripheral"}):
             cs = frozenset(c for c, r in roles.items() if r.get("kind") == "peripheral"
                            and r["device"] == d and r["dp"] == p)
-            add_check(with_name(self._port_names, d, p, f"Device {d} DP{p}"), cs,
+            add_check(menu_text(with_name(self._port_names, d, p, f"Device {d} DP{p}")), cs,
                       "peripheral", port=(d, p))
         if cds:
             add_check("CDS (Col 0)", cds, "cds")
@@ -549,12 +607,10 @@ class EyeView(QWidget):
     def _redraw(self) -> None:
         """Draw both histograms + recompute the worst list for the current filter, from
         the already-measured timing (cheap — no re-measure)."""
-        for p in (self._setup_plot, self._hold_plot):
-            p.clear()
-            p.addItem(pg.InfiniteLine(pos=0.0, angle=90,       # sample-point line at the join
-                      pen=pg.mkPen(VizTheme.CURSOR, width=1, style=Qt.DashLine)))
         t = self._timing
         if t is None:
+            self._sides = {}
+            self._draw_sides()
             self._worst = []
             self._reset_worst_buttons()
             return
@@ -564,17 +620,50 @@ class EyeView(QWidget):
         dr = t.tr_data_rising[m]
         scr, hcr = t.tr_setup_clk_rising[m], t.tr_hold_clk_rising[m]
         samp = t.tr_sample[m]
+        self._sides = {"setup": (su, scr), "hold": (ho, hcr), "data_rising": dr}
+        self._draw_sides()
 
-        def draw_side(plot, vals, pol):
-            """Histogram `vals` (setup or hold ns) into `plot` over its own [0, max] range
-            (independent per-side scale) and return (x-max, tallest-bar count). Flavours
-            hidden via the colour key are skipped."""
-            hi = float(np.max(vals)) if vals.size else 1.0
-            hi = hi if hi > 0 else 1.0
+        # Worst-UI navigator excludes hidden flavours: a transition's setup is flavour
+        # (setup-clk-pol, data-dir) and its hold (hold-clk-pol, data-dir), so mask each
+        # side to +inf when its flavour is hidden, and drop transitions with both sides
+        # hidden (they no longer contribute a visible margin).
+        if self._cat_hidden:
+            su_w, ho_w = su.astype(float).copy(), ho.astype(float).copy()
+            for ck, dk in self._cat_hidden:
+                su_w[(scr == ck) & (dr == dk)] = np.inf
+                ho_w[(hcr == ck) & (dr == dk)] = np.inf
+            keep = np.isfinite(np.minimum(su_w, ho_w))
+            self._worst = self._compute_worst(samp[keep], su_w[keep], ho_w[keep])
+        else:
+            self._worst = self._compute_worst(samp, su, ho)
+        self._reset_worst_buttons()
+
+    def _draw_sides(self) -> None:
+        """Histogram each side over its shown span: the whole margin range, or the span the
+        wheel zoomed it to, binned anew. Values beyond a zoomed span are off the plot."""
+        for p in (self._setup_plot, self._hold_plot):
+            p.clear()
+            p.addItem(pg.InfiniteLine(pos=0.0, angle=90,       # sample-point line at the join
+                      pen=pg.mkPen(VizTheme.CURSOR, width=1, style=Qt.DashLine)))
+        self._zoom_reset.setEnabled(bool(self._x_span))
+        if not self._sides:
+            self._x_full = {}
+            return
+        dr = self._sides["data_rising"]
+        res_ns = (1e9 / self._rate) if self._rate else 0.0
+
+        def draw_side(side, plot):
+            """Histogram the side's margins into `plot` over [0, span] (independent per-side
+            scale) and return (span, tallest-bar count). Flavours hidden via the colour key
+            are skipped."""
+            vals, pol = self._sides[side]
+            full = float(np.max(vals)) if vals.size else 1.0
+            full = full if full > 0 else 1.0
+            self._x_full[side] = full
+            hi = min(full, self._x_span.get(side, full))
             # No bar narrower than the capture's timing resolution (one sample period):
             # setup/hold are quantised to 1/sample_rate, so finer bins would imply a
             # precision the capture doesn't have (e.g. a 500 MHz capture -> 2 ns floor).
-            res_ns = (1e9 / self._rate) if self._rate else 0.0
             nbins = 40 if res_ns <= 0 else int(max(1, min(40, np.floor(hi / res_ns))))
             edges = np.linspace(0.0, hi, nbins + 1)
             mx = 1
@@ -587,8 +676,8 @@ class EyeView(QWidget):
                 mx = max(mx, int(hist.max(initial=0)))
             return hi, mx
 
-        su_hi, su_mx = draw_side(self._setup_plot, su, scr)
-        ho_hi, ho_mx = draw_side(self._hold_plot, ho, hcr)
+        su_hi, su_mx = draw_side("setup", self._setup_plot)
+        ho_hi, ho_mx = draw_side("hold", self._hold_plot)
         mx = max(su_mx, ho_mx)
         # Shared log-Y range + decade ticks (on the left plot's visible axis); each side
         # keeps its own x scale so 0 (the sample point) meets at the join.
@@ -606,20 +695,27 @@ class EyeView(QWidget):
         self._setup_plot.getAxis("bottom").setTicks([self._x_ticks(su_hi)])
         self._hold_plot.getAxis("bottom").setTicks([self._x_ticks(ho_hi)])
 
-        # Worst-UI navigator excludes hidden flavours: a transition's setup is flavour
-        # (setup-clk-pol, data-dir) and its hold (hold-clk-pol, data-dir), so mask each
-        # side to +inf when its flavour is hidden, and drop transitions with both sides
-        # hidden (they no longer contribute a visible margin).
-        if self._cat_hidden:
-            su_w, ho_w = su.astype(float).copy(), ho.astype(float).copy()
-            for ck, dk in self._cat_hidden:
-                su_w[(scr == ck) & (dr == dk)] = np.inf
-                ho_w[(hcr == ck) & (dr == dk)] = np.inf
-            keep = np.isfinite(np.minimum(su_w, ho_w))
-            self._worst = self._compute_worst(samp[keep], su_w[keep], ho_w[keep])
+    def _zoom_x(self, side: str, delta: float) -> None:
+        """Zoom `side` ("setup" or "hold") by a wheel `delta` (120 a notch; up zooms in),
+        keeping 0 at the join, between its whole span and the narrowest _ZOOM_MIN_BINS
+        sample periods (or 1/_ZOOM_MAX of the whole span, if wider)."""
+        full = self._x_full.get(side)
+        if not full or not delta:
+            return
+        res_ns = (1e9 / self._rate) if self._rate else 0.0
+        floor = min(full, max(_ZOOM_MIN_BINS * res_ns, full / _ZOOM_MAX))
+        span = self._x_span.get(side, full) * _ZOOM_STEP ** (-float(delta) / 120.0)
+        span = min(full, max(floor, span))
+        if span >= full:
+            self._x_span.pop(side, None)
         else:
-            self._worst = self._compute_worst(samp, su, ho)
-        self._reset_worst_buttons()
+            self._x_span[side] = span
+        self._draw_sides()
+
+    def reset_zoom(self) -> None:
+        """Show each side's whole margin range."""
+        self._x_span = {}
+        self._draw_sides()
 
     @staticmethod
     def _compute_worst(sample, setup, hold, take: int = 500):
@@ -633,10 +729,14 @@ class EyeView(QWidget):
 
     # ---- worst-UI navigation ----------------------------------------------------
 
-    # Aggregate view — no time cursor to track, but main_window calls set_cursor on
-    # every analyzer view; accept and ignore it.
     def set_cursor(self, sample: int) -> None:
-        pass
+        """Select the region holding `sample`. A sample in no region (the link control
+        before the audio start, a clock stop) keeps the region shown."""
+        for i, r in enumerate(self._regions):
+            if int(r.get("start_sample") or 0) <= sample < int(r.get("end_sample") or 0):
+                if i != self._region.currentIndex():
+                    self._region.setCurrentIndex(i)
+                return
 
     def _reset_worst_buttons(self) -> None:
         """Back to the initial state: just the 'View Worst UI' button (called whenever
@@ -679,7 +779,8 @@ class EyeView(QWidget):
     def retheme(self) -> None:
         """Re-apply the palette after a theme switch: refresh the legend + category
         colours (read live from the palette), the plot background + axis pens and the
-        item-view stylesheet, then re-draw (lazily — only if visible, else on next show)."""
+        item-view stylesheet, then re-draw from the measurement already held, so the zoom
+        stays; a capture waiting to be measured is measured when the pane is next shown."""
         self.setStyleSheet(analyzer_stylesheet())
         self._update_legend()
         for p in (self._setup_plot, self._hold_plot):
@@ -687,6 +788,9 @@ class EyeView(QWidget):
             p.showGrid(x=True, y=True, alpha=_grid_alpha())
             p.getAxis("left").setTextPen(VizTheme.AXIS)
             p.getAxis("bottom").setTextPen(VizTheme.AXIS)
-        self._dirty = True
-        if self.isVisible():
-            self._render()
+        if self._timing is not None and not self._dirty:
+            self._redraw()
+        else:
+            self._dirty = True
+            if self.isVisible():
+                self._render()

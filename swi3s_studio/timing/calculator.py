@@ -25,7 +25,6 @@ exactly.
 
 from __future__ import annotations
 
-import contextvars
 import dataclasses
 import functools
 import itertools
@@ -51,6 +50,7 @@ from .spec_source import (
     PROPOSAL_NOTE,
     PROPOSAL_UI_RELATIVE_NOTE,
     SNAP_TOL_NS,
+    SWI3S_INPUT_WINDOW,
     THRESHOLD_NOTE,
     TRF_NOTE,
     LaunchMode,
@@ -63,9 +63,12 @@ from .spec_source import (
     launch_grid_UI,
     snap_to_launch_grid,
     sw13_anchor_correction,
+    sw13_clock_lead_frac,
     sw13_equivalent_slews,
     sw13_keeper_thresholds,
     sw13_ramp_fracs,
+    sw13_receive_correction,
+    sw13_receive_slew,
     trf_range_ns,
 )
 
@@ -174,9 +177,10 @@ INEQUALITIES: tuple[Inequality, ...] = ("MP_setup", "MP_setup_ho",
 #      `,anchor` term names its edges (`anchor_symbol`): a Peripheral's data edge,
 #      `,anchor,rise` / `,anchor,fall`, and a Manager's clock then data edge with the case
 #      letters, `,anchor,rr` / `,rf` / `,fr` / `,ff`, then `,fast` on the max corner where the
-#      side's DATA lane is in `CalcInputs.fast_data_edge`. A slew ROW inside a product,
-#      `Man_t_RF,CLK`, `Man_t_RF,DATA`, `Per_t_RF,DATA`, is one lane's slew for both edges and
-#      names none.
+#      side's DATA lane is in `CalcInputs.fast_data_edge`; a SoundWire receive-row correction
+#      names its sampling clock edge (`receive_symbol`), `<dev>_t_<IS|IH>,ref,rise` / `,fall`.
+#      A slew ROW inside a product, `Man_t_RF,CLK`, `Man_t_RF,DATA`, `Per_t_RF,DATA`, is one
+#      lane's slew for both edges and names none.
 #      -> test_every_displayed_symbol_follows_one_naming_scheme,
 #         test_every_crossing_and_ramp_symbol_names_its_edge (tests/test_timing.py),
 #         test_a_crossing_symbol_carries_one_coefficient_wherever_it_appears,
@@ -285,17 +289,37 @@ INEQUALITIES: tuple[Inequality, ...] = ("MP_setup", "MP_setup_ho",
 #         test_the_corner_search_is_exact_at_asymmetric_soundwire_levels,
 #         test_the_corner_search_is_exact_on_a_swi3s_bus_whatever_the_slew_and_noise_ranges,
 #         test_the_corner_search_is_exact_on_both_keeper_legs
-#         and test_the_other_rows_move_a_margin_independently_of_the_coupled_rows
+#         and test_the_other_rows_move_a_margin_independently_of_the_coupled_rows, and
+#         test_the_corner_search_finds_a_tau_minimum_between_two_samples
+#         (tests/test_timing_corner_refine.py)
 #
 #   5. ZEROS.  Three kinds, and they are not interchangeable: structurally zero (`0·t_PD`,
 #      a Manager end's clock crossing on a contention leg -- dropped), nothing-allocated
 #      (`0·UI`, dropped), and a PARAMETER that happens to read zero (`Man_t_IH`, `Per_t_DZ`
-#      at its min -- SHOWN, because the value is the spec's).
-#      -> test_no_leg_shows_a_structurally_zero_term (tests/test_timing.py)
+#      at its min, `Man_t_Keeper_Response` at 0 ns -- SHOWN, because the value is the spec's).
+#      A term a PLACEMENT sets to zero is a parameter reading zero and is SHOWN, so a leg
+#      prints one equation and one drawing at every placement: t_PD and t_PD,mis under All
+#      near the Manager, and t_PD,mis,AB with both peripherals at one end. The P->P flights `pp_net_pd` counts are the exception:
+#      a count of zero is `0·t_PD`.
+#      -> test_no_leg_shows_a_structurally_zero_term (tests/test_timing.py),
+#         test_a_term_a_placement_sets_to_zero_is_shown_and_drawn and
+#         test_a_zero_keeper_response_is_shown_and_drawn (tests/test_timing_cross_spec.py)
 #
 #   6. THE REFERENCE.  If the leg exists in the vendored reference fixture, it is compared
 #      against it and any delta must be declared.
 #      -> tests/test_timing_vs_reference.py, and docs/anchors.md for what is deliberate
+#
+#   7. THE SEARCH'S MARGINS.  The corner search reads each leg's margin from `_margins_at`, the
+#      values `_compute_at` sums, in its order, built without terms or notes; a new leg or term
+#      gets its values there too, those no supply assignment moves in `_margin_statics`. A leg
+#      that reads Peripheral B's supply is listed in `_LEGS_READING_PERIPHERAL_B`, and one that
+#      reads a DATA lane's slow-edge role in `_LEGS_READING_SLOW_EDGE`: `compute` and the
+#      search evaluate a leg only on the runs those let it differ on (`_runs_of`).
+#      -> test_the_margins_the_corner_search_reads_are_the_ones_compute_reports,
+#         test_only_the_pp_legs_read_peripheral_bs_supply,
+#         test_every_leg_listed_as_reading_peripheral_bs_supply_reads_it and
+#         test_only_the_listed_legs_read_a_data_lanes_slow_edge
+#         (tests/test_timing_search_margins.py)
 #
 # When one of these rules CHANGES, the tests above are the list of places to review: each
 # names the legs it covers, so "does this apply elsewhere?" is answered by running them rather
@@ -326,20 +350,42 @@ class RowPoint(str):
 # A row's pick: a corner of its range, or a slew row's point inside it.
 RowPick = Pick | RowPoint
 
-# Where the two peripherals sit, for the P->P data legs. See `CalcInputs.pp_placement`.
+# Where the peripherals sit on the bus, for every leg. See `CalcInputs.pp_placement`.
 #
-# FOUR PLACEMENTS: two ends times two devices.
+# FOUR PLACEMENTS: two ends times two devices, and "unknown", each leg at its own worst.
 #
 # The key `unknown` is the PERSISTED token and does not change with the label -- it is written
 # into saved sessions and read back by `set_from_dict`.
 PPPlacement = Literal["unknown", "both_near", "driver_near", "driver_far", "both_far"]
 PP_PLACEMENT_LABELS: dict[str, str] = {
-    "unknown": "Worst Per Leg",
-    "both_near": "both near the Manager",
-    "driver_near": "driver near, sampler far",
-    "driver_far": "driver far, sampler near",
-    "both_far": "both far from the Manager",
+    "unknown": "Worst Per Inequality",
+    "both_near": "All near the Manager",
+    "driver_near": "Driver near, sampler far",
+    "driver_far": "Driver far, sampler near",
+    "both_far": "All at the far end",
 }
+
+# The placements that fix every peripheral's distance from the Manager, on every leg
+# (`peripheral_distance_cm`, `placement_row_picks`).
+PINNED_PLACEMENTS = frozenset({"both_near", "both_far"})
+
+# The placements that put the P->P driver at one end of the bus and its sampler at the other.
+# Each is one layout, so the P->P setup and hold legs (`PP_SETUP_HOLD_LEGS`) read the bus-length
+# row at its max under them (`placement_row_picks`); every other leg is at its own worst, as
+# under "unknown".
+DRIVER_PLACEMENTS = frozenset({"driver_near", "driver_far"})
+
+# The legs on which a peripheral samples another peripheral's data.
+PP_SETUP_HOLD_LEGS: frozenset[str] = frozenset(
+    {"PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho"})
+
+
+def placement_fixes_distance(placement: str, leg: str) -> bool:
+    """Whether `placement` fixes the peripherals' distance on `leg`: every leg under a
+    `PINNED_PLACEMENTS` placement, and the `PP_SETUP_HOLD_LEGS` under a `DRIVER_PLACEMENTS`
+    one."""
+    return placement in PINNED_PLACEMENTS or (
+        placement in DRIVER_PLACEMENTS and leg in PP_SETUP_HOLD_LEGS)
 
 
 def pp_net_pd(placement: str, *, is_setup: bool) -> float:
@@ -358,6 +404,72 @@ def pp_net_pd(placement: str, *, is_setup: bool) -> float:
     if placement in ("both_near", "driver_near", "both_far"):
         return 0.0
     return 2.0 if is_setup else 0.0
+
+
+# The P->P trace mismatch's symbol: t_PD,mis over the separation of A and B.
+PP_MIS_SYMBOL = "t_PD,mis,AB"
+
+# The note on a contention leg's trace mismatch term.
+_CONTENTION_MIS_NOTE = ("the CLK-vs-DATA trace mismatch: the releaser's clock rides the CLK trace "
+                        "and the acquirer's drive reaches it on the DATA trace, so the overlap "
+                        "allowance is short of the clock's flight by up to t_PD,mis")
+
+
+def pp_net_mis(placement: str) -> float:
+    """The P->P bracket's trace mismatch in t_PD,mis, for one placement, on every P->P setup and
+    hold leg and on PP_contention.
+
+    The clock reaches each peripheral on the CLK trace and A's data reaches B on the DATA
+    trace, so the bracket `t_clk(A) + t_data(A->B) − t_clk(B)` carries the CLK-vs-DATA
+    mismatch over A and B's separation, `vPCB_err_frac · |x_A − x_B| / v`: one t_PD,mis with
+    the two at opposite ends of the bus, and none with both at one end. "unknown" takes one on
+    every leg: setup's worst layout (driver far, sampler near) and hold's (driver near,
+    sampler far) both put them at opposite ends. PP_contention's releaser and acquirer are at
+    opposite ends but under a placement that puts both at one end, so it takes the same count.
+    Returning a COUNT keeps the bus length and the mismatch fraction rows the corner search's
+    (`CalcInputs.pp_placement`).
+
+    An unrecognised placement falls through to one, as `pp_net_pd` falls through to the
+    "unknown" answer.
+    """
+    return 0.0 if placement in ("both_near", "both_far") else 1.0
+
+
+def peripheral_distance_cm(inp: CalcInputs) -> float:
+    """Each peripheral's distance from the Manager, in cm, which every t_PD and t_PD,mis term
+    reads (`CalcInputs.t_PD_ns`): 0 under "both_near" (All near the Manager), and the bus
+    length otherwise. The corner search pins the bus-length row at its max on the legs whose
+    distance the placement fixes (`placement_row_picks`) and searches it per leg on the
+    others."""
+    return 0.0 if inp.pp_placement == "both_near" else inp.bus_length_cm
+
+
+def placement_row_picks(placement: str, rows: Sequence[CalcRow], leg: str) -> dict[str, Pick]:
+    """The row picks `placement` fixes on `leg`, which the corner search does not search
+    (`find_worst_corner_rows`): every master row bound to the bus length at its max where the
+    placement fixes the leg's distance at the far end (`placement_fixes_distance`), every leg
+    under "both_far" (All at the far end) and the P->P data legs under a driver placement;
+    none otherwise. "both_near" fixes the distance at 0 whatever the row holds."""
+    if placement == "both_near" or not placement_fixes_distance(placement, leg):
+        return {}
+    return {r.name: "max" for r in rows
+            if "bus_length_cm" in r.binds and r.linked_to is None and not r.is_window}
+
+
+def placement_corner_text(inp: CalcInputs, leg: str) -> str:
+    """The words `leg`'s worst-corner line names a fixed distance by, in place of a bus-length
+    pick: "peripherals at 0 cm", "peripherals at 30 cm" at a 30 cm bus length row's max, and on
+    a P->P data leg under a driver placement "driver at 0 cm, sampler at 30 cm" or "driver at
+    30 cm, sampler at 0 cm"; "" where the placement does not fix the leg's distance
+    (`placement_fixes_distance`)."""
+    if not placement_fixes_distance(inp.pp_placement, leg):
+        return ""
+    far = f"{peripheral_distance_cm(inp):g} cm"
+    if inp.pp_placement == "driver_near":
+        return f"driver at 0 cm, sampler at {far}"
+    if inp.pp_placement == "driver_far":
+        return f"driver at {far}, sampler at 0 cm"
+    return f"peripherals at {far}"
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +515,10 @@ class CalcInputs:
     # Voltage thresholds (fractions of V_SEOS)
     V_OH_min_frac: float = 0.80
     V_OL_max_frac: float = 0.20
-    V_IH_min_frac: float = 0.45
-    V_IH_max_frac: float = 0.65
-    V_IL_min_frac: float = 0.35
-    V_IL_max_frac: float = 0.55
+    V_IH_min_frac: float = SWI3S_INPUT_WINDOW[0]
+    V_IH_max_frac: float = SWI3S_INPUT_WINDOW[1]
+    V_IL_min_frac: float = SWI3S_INPUT_WINDOW[2]
+    V_IL_max_frac: float = SWI3S_INPUT_WINDOW[3]
 
     # Supply
     V_SEOS_nom_V: float = 1.2
@@ -422,6 +534,10 @@ class CalcInputs:
     tRF_Man_CLK_ns: float = 5.0
     tRF_Man_DATA_ns: float = 5.0
     tRF_Per_DATA_ns: float = 5.0
+    # The slowest t_RF any lane's row allows, the top of its range (`apply_row_picks`); 0
+    # where no row sets it. The toggle ceiling reads it, so every corner of one set of rows
+    # has one ceiling.
+    tRF_row_max_ns: float = 0.0
     # Ramp shape per device
     Man_shape: RampShape = "linear"
     Per_shape: RampShape = "linear"
@@ -450,7 +566,8 @@ class CalcInputs:
     # are.  This is a PHY property with a programmable default, NOT a constant:
     # PHY1 hands over intra-UI (0), PHY2 schedules one UI (1), and both may be
     # programmed longer for a larger system (§11.1.1.1).  Seeded per-PHY by
-    # `default_handover_UIs`; overridable to explore a handover programmed longer.
+    # `default_handover_UIs`; overridable to explore a handover programmed longer. A whole
+    # number: a launch out of high-Z is on a clock edge.
     handover_UIs: float = 1.0
 
     # EndDriveEarly, per side.  A side that uses it holds its level for its EDE Delay
@@ -489,6 +606,26 @@ class CalcInputs:
     # not drive.
     Man_keeper_forced: bool = False
 
+    # PERIPHERAL PLACEMENT. The bus length is an input; the placement decides each peripheral's
+    # distance from the Manager (`peripheral_distance_cm`), which every t_PD and t_PD,mis term
+    # reads, and the P->P bracket below:
+    #
+    #   placement (label)                 M<->P, contention, keeper           P->P data legs
+    #   unknown (Worst Per Inequality)    bus-length row searched per leg     row searched;
+    #                                                                         setup 2, hold 0
+    #   both_near (All near the Manager)  0 cm: t_PD and t_PD,mis are 0       0
+    #   both_far (All at the far end)     the bus-length row's max, pinned    row's max; 0
+    #   driver_near                       as unknown                          row's max; 0
+    #   driver_far                        as unknown                          row's max; 2
+    #
+    # One peripheral cannot be both driver and sampler, so the two driver placements leave the
+    # M<->P legs at each leg's own worst. Each is ONE LAYOUT, a peripheral at each end of the
+    # bus, so the P->P setup and hold legs read the bus-length row at its max under it, as under
+    # "both_far": at 0 cm the far device would sit at the Manager. The keeper legs read no
+    # t_PD, and PM_contention and PP_contention net their flights to zero at any placement, so
+    # only their trace mismatch moves with it there (`_NET_PD` in `_compute_at`),
+    # PP_contention's over A and B's separation (`pp_net_mis`), as on the P->P data legs.
+    #
     # P->P PLACEMENT. A peripheral references its launch to ITS OWN clock arrival and the
     # sampler its edge to its own, so what a P->P leg pays is the bracket
     # `t_clk(driver) + t_data(driver->sampler) − t_clk(sampler)`. Two ends and two devices is
@@ -505,14 +642,33 @@ class CalcInputs:
     #   driver FAR, sampler near             2·t_PD     the data runs back against the clock
     #
     # The bracket is a COST for setup and a CREDIT for hold, so one placement cannot be
-    # worst for both: "Worst Per Leg" (the default) gives each leg its own worst — setup 2,
-    # hold 0 — and a pinned layout gives both legs that layout's bracket.
+    # worst for both: "Worst Per Inequality" (the default) gives each leg its own worst —
+    # setup 2, hold 0 — and a pinned layout gives both legs that layout's bracket.
+    #
+    # THE BRACKET ALSO CARRIES THE TRACE MISMATCH (`pp_net_mis`, `PP_MIS_SYMBOL`): the clock
+    # reaches each peripheral on the CLK trace and A's data reaches B on the DATA trace, so the
+    # bracket is good to within the mismatch over A and B's separation:
+    #
+    #   both near, both far                    0                no separation
+    #   driver near, sampler far               ± t_PD,mis       the data chases the clock, as
+    #                                                           on M->P
+    #   driver far, sampler near               2·t_PD ± t_PD,mis
+    #
+    # Every P->P setup and hold leg is charged it at the sign that hurts, on every placement,
+    # so its term is shown at 0 where the placement gives no separation. Under "unknown" each
+    # leg's worst layout has the two at opposite ends.
     #
     # A SELECTOR AND NOT A CORNER ROW. As a row its value would multiply the bus-length row,
     # so the direction the bus row moves a margin would depend on this row's pick, which
     # breaks checklist rule 4: `find_worst_corner_rows` moves the bus row on its own. As a
     # selector the count is a constant per (placement, leg), and the search sees only the
     # bus row.
+    #
+    # THE PINNED DISTANCES ARE SELECTORS TOO. "both_near" sets the distance to 0 whatever the
+    # bus row holds, so the row moves no margin; "both_far", and a driver placement on the P->P
+    # data legs, pin the bus row at its max in the corner search (`placement_row_picks`)
+    # instead of searching it. Every row the search moves still moves each margin in one
+    # direction.
     pp_placement: PPPlacement = "unknown"
 
     # Bus & topology
@@ -566,16 +722,16 @@ class CalcInputs:
         the fast edge than on the slow one: a SoundWire side's, whose t_OV ends at 80 % of the
         ramp, and an EndDriveEarly side's, whose keeper leg credits the ramp to V_OH / V_OL
         against the data's crossing of the keeper's threshold. A lane whose two edge factors
-        are equal is not named."""
-        out = []
-        for lane, spec, ede in (("Man DATA", self.Man_spec, self.Man_ede),
-                                ("Per DATA", self.Per_spec, self.Per_ede)):
-            if not (is_soundwire(spec) or ede):
-                continue
-            plain = replace(self, fast_data_edge=frozenset())
-            if edge_factor(plain, lane, "late") != edge_factor(plain, lane, "early"):
-                out.append(lane)
-        return tuple(out)
+        are equal is not named. Computed once per instance (`_memo`)."""
+        memo = _memo(self)
+        if "fast_edge_lanes" not in memo:
+            plain = self if not self.fast_data_edge else replace(self, fast_data_edge=frozenset())
+            memo["fast_edge_lanes"] = tuple(
+                lane for lane, spec, ede in (("Man DATA", self.Man_spec, self.Man_ede),
+                                             ("Per DATA", self.Per_spec, self.Per_ede))
+                if (is_soundwire(spec) or ede)
+                and edge_factor(plain, lane, "late") != edge_factor(plain, lane, "early"))
+        return memo["fast_edge_lanes"]
 
     def man_launch_mode(self) -> LaunchMode:
         """The launch mode in force: `launch_mode` for a SWI3S Manager, ANALOG for a SoundWire
@@ -600,9 +756,12 @@ class CalcInputs:
         return self.F_CLK_target_MHz <= self.F_CLK_ceiling_MHz() + 1e-9
 
     def t_PD_ns(self) -> float:
-        return self.bus_length_cm / self.vPCB_cm_per_ns
+        """The clock's flight from the Manager to a peripheral: the peripheral's distance
+        (`peripheral_distance_cm`) over the trace velocity."""
+        return peripheral_distance_cm(self) / self.vPCB_cm_per_ns
 
     def t_PD_mis_ns(self) -> float:
+        """The trace mismatch over the same distance: a fraction of `t_PD_ns`."""
         return self.vPCB_err_frac * self.t_PD_ns()
 
     def UI_ns(self) -> float:
@@ -719,11 +878,22 @@ class Term:
     factors: tuple[float, ...] | None = None
 
 
-# Set while `find_worst_corner_rows_all` evaluates its candidate corners, of which it reads only
-# the margins: a breakdown keeps its terms as built (`InequalityBreakdown.__post_init__`) and
-# reports no passing rates (`_rate_windows`). No result built under it leaves the search.
-_MARGINS_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("margins_only",
-                                                                     default=False)
+def _inp_cached(fn):
+    """`fn(inp, ...)`, a function of `inp`'s fields and its other arguments alone, computed once
+    per instance (`_memo`) and argument set. A list result is returned as a new list of the
+    same items."""
+    name = fn.__name__
+
+    @functools.wraps(fn)
+    def cached(inp, *args, **kwargs):
+        memo = _memo(inp)
+        key = (name, args, tuple(kwargs.items()))
+        out = memo.get(key)
+        if out is None:
+            out = memo[key] = fn(inp, *args, **kwargs)
+        return list(out) if isinstance(out, list) else out
+
+    return cached
 
 
 @dataclass(frozen=True)
@@ -760,10 +930,7 @@ class InequalityBreakdown:
         # of physics: `Man_t_RF,CLK` is one pin and two products of it are one product. Done
         # at construction, so a leg added later gets it too. Margin-preserving, so the
         # separately-computed `required_ns` / `margin_ns` stay valid — asserted by
-        # test_every_leg_displays_the_margin_it_reports. Not done for a corner the search
-        # reads only the margin of (`_MARGINS_ONLY`).
-        if _MARGINS_ONLY.get():
-            return
+        # test_every_leg_displays_the_margin_it_reports.
         object.__setattr__(self, "terms",
                            _gather_lane_terms([_positive_coefficient(t) for t in self.terms]))
 
@@ -844,6 +1011,17 @@ class CalcResults:
         return min(items, key=lambda kv: kv[1])[0]
 
 
+def binding_at_own_corners(
+        per_leg: Mapping[Inequality, CalcResults]) -> tuple[float, Inequality] | None:
+    """`F_max_binding_MHz` and `binding_inequality` where each inequality is evaluated at its
+    own worst corner: `per_leg[leg]` is the result at `leg`'s corner, and each leg is read
+    from its own result, over the legs `CalcResults._bounding` keeps. The first in
+    `INEQUALITIES` order wins a tie. None where no leg bounds the bus."""
+    items = [(r._rate_bound_MHz(r.breakdowns[leg]), leg) for leg in INEQUALITIES
+             if (r := per_leg.get(leg)) is not None and leg in r._bounding()]
+    return min(items, key=lambda kv: kv[0]) if items else None
+
+
 # ---------------------------------------------------------------------------
 # compute()
 # ---------------------------------------------------------------------------
@@ -864,6 +1042,21 @@ class _ClosingCase:
     pp_acq: CrossParts
 
 
+def _closing_case(inp: CalcInputs, env: DeltaTpdEnvelope, closing: bool) -> _ClosingCase:
+    """The contention case at a closing edge rising (`closing`) or falling (`_ClosingCase`)."""
+    rel_rising = closing != inp.Per_ede
+    acq_rising = closing != handover_flips_edge(inp)
+    rel_edge, acq_edge = pp_clock_edges(inp, env, "PP_contention", closing_rising=closing)
+    return _ClosingCase(
+        rel_rising, acq_rising, rel_edge, acq_edge,
+        late=_per_clk_cross_parts(inp, env, corner="late", rising=rel_rising),
+        early=_per_clk_cross_parts(inp, env, corner="early", rising=acq_rising),
+        pp_rel=_per_clk_cross_parts(inp, env, corner="late", edge=rel_edge,
+                                    rising=rel_rising),
+        pp_acq=_per_clk_cross_parts(inp, env, corner="early", device="B", edge=acq_edge,
+                                    rising=acq_rising))
+
+
 def _releaser_ede(inp: CalcInputs, releasing: str) -> bool:
     return inp.Man_ede if releasing == "Man" else inp.Per_ede
 
@@ -878,6 +1071,7 @@ def to_voh_frac(inp: CalcInputs, lane: str, rising: bool) -> float:
                               rising=rising)
 
 
+@_inp_cached
 def valid_edge_rising(inp: CalcInputs, lane: str, *, tie: bool,
                       clk_rising: bool = True) -> bool:
     """The polarity of a releasing driver's last data edge where nothing else sets it: the one
@@ -899,6 +1093,7 @@ def valid_edge_rising(inp: CalcInputs, lane: str, *, tie: bool,
     return rise > fall
 
 
+@_inp_cached
 def keeper_open_rising(inp: CalcInputs) -> bool:
     """The polarity of the clock edge opening keeper_Man's last driven UI: the one that places
     the Manager's launch the later (`sw_anchor_ns` at the max corner), which leaves the keeper
@@ -923,6 +1118,7 @@ def to_voh_symbol(inp: CalcInputs, lane: str, dev: str, rising: bool) -> str:
     return sym + (",fast" if lane in inp.fast_data_edge else "")
 
 
+@_inp_cached
 def _to_voh_term(inp: CalcInputs, lane: str, dev: str, rising: bool, *, credit: bool) -> "Term":
     """The ramp from a launch's anchor to V_OH / V_OL as a term (`to_voh_symbol`): a charge, or
     with `credit` a credit; its factors are (crossing time × edge factor, t_RF)."""
@@ -986,6 +1182,7 @@ def _ede_keeper_note(inp: CalcInputs, side: str, t_ede_ns: float) -> str:
             "V_OH / V_OL is credited back")
 
 
+@_inp_cached
 def _handover_ui_terms(inp: CalcInputs, UI: float) -> list["Term"]:
     """The allocated handover UIs as a term — or NO TERM when none are allocated.
 
@@ -1075,11 +1272,12 @@ def keeper_corners(inp: CalcInputs, lane: str,
 
 
 def _keeper_case(inp: CalcInputs, lane: str, supplies: Supplies, *,
-                 ede: bool, clk_rising: bool = True) -> tuple[bool, float, str]:
-    """A keeper leg's crossing, as (rising, coefficient, note): from the releasing launch's
-    anchor to its data crossing the keeper's threshold at the Manager (`keeper_corners`), on a
-    late edge, as a coefficient of the lane's t_RF. The releaser's ramp swings to its own
-    supply, and a Peripheral's data reaches the keeper offset by the ground shift α.
+                 ede: bool, clk_rising: bool = True) -> tuple[CrossingCorner, float, str]:
+    """A keeper leg's crossing, as (corner, coefficient, note): the corner of `keeper_corners`
+    on the edge the leg is priced on, the one `timeline` draws, and from the releasing
+    launch's anchor to its data crossing the keeper's threshold at the Manager, on a late edge,
+    as a coefficient of the lane's t_RF. The releaser's ramp swings to its own supply, and a
+    Peripheral's data reaches the keeper offset by the ground shift α.
 
     The leg is evaluated on one data edge. A conventional release takes the edge whose
     crossing is the later after the side's clock reference: the launch's anchor
@@ -1087,9 +1285,27 @@ def _keeper_case(inp: CalcInputs, lane: str, supplies: Supplies, *,
     plus the crossing after it, rising on a tie. An EndDriveEarly release (`ede`), whose leg
     counts from the anchor and also credits the ramp to V_OH / V_OL on the same edge, takes
     the edge whose crossing less that ramp (`to_voh_frac`) is the larger."""
+    c, coef, edge = _keeper_pick(inp, lane, supplies, ede=ede, clk_rising=clk_rising)
+    alpha = 0.0 if lane == "Man DATA" else inp.V_noise_pp_frac
+    why = ("leaves the less held level past V_OH / V_OL" if ede else
+           "crosses later after the clock reference")
+    src = ("SoundWire keeper (Figures 18 and 19, Table 12)" if is_soundwire(inp.Man_spec)
+           else 'keeper ("PHY1 & PHY2 Bus Keeper Behavior" table)')
+    note = (f"{src}: the response counts from the data crossing {c.bound} at the Manager, "
+            f"{100 * c.rx_threshold:.1f} % of nominal at its {100 * c.rx_supply:.0f} % supply"
+            + (f", offset {100 * c.ground_shift:+.0f} % by the ground shift α"
+               if alpha else "")
+            + f", on a ramp to {100 * c.vdd_tx:.0f} %; the {edge} edge {why}, crossing "
+            + f"{coef:.3f}·t_RF after the anchor on a "
+            + ("fast" if lane in inp.fast_data_edge else "slow") + " edge")
+    return c, coef, note
+
+
+def _keeper_pick(inp: CalcInputs, lane: str, supplies: Supplies, *,
+                 ede: bool, clk_rising: bool = True) -> tuple[CrossingCorner, float, str]:
+    """`_keeper_case`'s corner and coefficient, and its edge, "rising" or "falling"."""
     side = "Man" if lane == "Man DATA" else "Per"
     shape = inp.Man_shape if side == "Man" else inp.Per_shape
-    alpha = 0.0 if side == "Man" else inp.V_noise_pp_frac
     swing = inp.V_OH_min_frac - inp.V_OL_max_frac
     corners = keeper_corners(inp, lane, supplies)
     edges = {"rising": corners[True], "falling": corners[False]}
@@ -1107,19 +1323,7 @@ def _keeper_case(inp: CalcInputs, lane: str, supplies: Supplies, *,
     tie = math.isclose(held["rising"], held["falling"], rel_tol=0.0, abs_tol=1e-12)
     edge = "rising" if tie or held["rising"] > held["falling"] else "falling"
     coef = fracs[edge] * edge_factor(inp, lane, "late")
-    c = edges[edge]
-    why = ("leaves the less held level past V_OH / V_OL" if ede else
-           "crosses later after the clock reference")
-    src = ("SoundWire keeper (Figures 18 and 19, Table 12)" if is_soundwire(inp.Man_spec)
-           else 'keeper ("PHY1 & PHY2 Bus Keeper Behavior" table)')
-    note = (f"{src}: the response counts from the data crossing {c.bound} at the Manager, "
-            f"{100 * c.rx_threshold:.1f} % of nominal at its {100 * c.rx_supply:.0f} % supply"
-            + (f", offset {100 * c.ground_shift:+.0f} % by the ground shift α"
-               if alpha else "")
-            + f", on a ramp to {100 * c.vdd_tx:.0f} %; the {edge} edge {why}, crossing "
-            + f"{coef:.3f}·t_RF after the anchor on a "
-            + ("fast" if lane in inp.fast_data_edge else "slow") + " edge")
-    return c.rising, coef, note
+    return edges[edge], coef, edge
 
 
 def lane_ns(inp: CalcInputs, lane: str) -> float:
@@ -1189,10 +1393,27 @@ def _cross_terms(inp: CalcInputs, base_sym: str,
         role = _fast_role(inp, lane, role)
         pair = clk_pair if clk_pair and lane.endswith("CLK") else base_sym
         out.append(Term(f"{pair},{role} · {_trf_sym(lane)}",
-                        (-1.0 if lane_op == "-" else 1.0) * coeff * trf, op=lane_op,
+                        _cross_value(coeff, trf, lane_op), op=lane_op,
                         note=f"{abs(coeff):.2f} (dimensionless) · {trf:.2f} ns",
                         factors=(coeff, trf)))
     return out
+
+
+def _cross_value(coeff: float, trf: float, lane_op: str) -> float:
+    """One lane's crossing term's signed value (`_cross_terms`)."""
+    return (-1.0 if lane_op == "-" else 1.0) * coeff * trf
+
+
+def _split_cross_values(inp: CalcInputs,
+                        lanes: tuple[CrossLane, ...]) -> tuple[list[float], list[float]]:
+    """The values of `_split_cross_terms(_cross_terms(inp, ..., lanes))`, (clock lane, data
+    lane), each in its order there."""
+    clk: list[float] = []
+    data: list[float] = []
+    for _role, lane, coeff, lane_op in lanes:
+        (clk if lane == "Man CLK" else data).append(
+            _cross_value(coeff, lane_ns(inp, lane), lane_op))
+    return clk, data
 
 
 def _split_cross_terms(terms: list[Term]) -> tuple[list[Term], list[Term]]:
@@ -1229,6 +1450,12 @@ def _pd_term(t_PD_ns: float, *, credit: bool, note: str) -> Term:
 # Which flight each traversal is, on a leg whose launcher is a peripheral.
 _PD_TO_LAUNCHER = "the clock's flight from the Manager to the launching peripheral"
 _PD_FROM_LAUNCHER = "the launched data's flight back across the bus to the sampler"
+
+# The note on a P->M setup or hold leg's trace mismatch term.
+_PM_MIS_NOTE = ("the CLK-vs-DATA trace mismatch: the clock reaches the Peripheral on the CLK "
+                "trace and its data returns on the DATA trace, so the data's flight back is "
+                "t_PD to within t_PD,mis; charged at the sign that hurts, later on setup and "
+                "earlier on hold")
 
 
 def _trf_sym(lane: str) -> str:
@@ -1517,6 +1744,7 @@ def _ede_release_vs_edge_ns(inp: CalcInputs, side: str, *, clk_rising: bool = Tr
     return sum(_ede_terms(inp, side, clk_rising=clk_rising)) - inp.UI_ns()
 
 
+@_inp_cached
 def _ede_release_terms(inp: CalcInputs, side: str, *, clk_rising: bool = True) -> list["Term"]:
     """An EndDriveEarly release as a contention leg shows it, in time order from the edge that
     opens the driven UI, of polarity `clk_rising`: the launch to its anchor (`_launch_terms` at
@@ -1638,6 +1866,7 @@ def _piece_windows(duty_min: float, b: float,
     return out
 
 
+@_inp_cached
 def toggle_ceiling_MHz(inp: CalcInputs) -> float:
     """The highest rate at which the bus can toggle at all, ``1000 · duty_min / t_RF,max``: the
     shortest half period, the UI every leg is evaluated on (`CalcInputs.UI_ns`), holds one
@@ -1645,12 +1874,14 @@ def toggle_ceiling_MHz(inp: CalcInputs) -> float:
     V_OH and V_OL. Above it no edge completes and no margin has a meaning.
 
     t_RF,max is the slowest edge any of the three lanes may have: the top of its spec's range
-    (`trf_range_ns`, the per-edge slew tolerance included), or the lane's row value where that
-    is higher (`edge_factor` widens the range the same way).
+    (`trf_range_ns`, the per-edge slew tolerance included), the lane's value where that is
+    higher (`edge_factor` widens the range the same way), or the top of a slew row's range
+    (`tRF_row_max_ns`), whichever corner of the rows is evaluated.
     """
-    t_max = max(max(trf_range_ns(inp.Per_spec if lane == "Per DATA" else inp.Man_spec,
-                                 inp.system_size)[1], lane_ns(inp, lane))
-                for lane in ("Man CLK", "Man DATA", "Per DATA"))
+    t_max = max(max(max(trf_range_ns(inp.Per_spec if lane == "Per DATA" else inp.Man_spec,
+                                     inp.system_size)[1], lane_ns(inp, lane))
+                    for lane in ("Man CLK", "Man DATA", "Per DATA")),
+                inp.tRF_row_max_ns)
     return 1000.0 * inp.duty_min / t_max if t_max > 0.0 else math.inf
 
 
@@ -1686,14 +1917,9 @@ def _rate_windows(inp: CalcInputs, *, margin_ns: float, ui_part_ns: float,
     Every leg reports its F_max through here, setup or not (`_fmax_from_windows`); a leg with
     no UI-scaled part passes at every rate or at none.
 
-    An empty list under `_MARGINS_ONLY`: a breakdown built there carries F_max 0.0 and no
-    note, and never leaves the corner search.
-
     A leg with a UI-scaled part passes no rate above `toggle_ceiling_MHz`, so its F_max is
     at most the ceiling; a leg without one keeps its every-rate-or-none answer.
     """
-    if _MARGINS_ONLY.get():
-        return []
     windows = _rate_windows_unbounded(inp, margin_ns=margin_ns, ui_part_ns=ui_part_ns,
                                       clocked=clocked)
     if ui_part_ns == 0.0:
@@ -1819,6 +2045,7 @@ def _man_clocked_ui_part_ns(inp: CalcInputs, value_ns: float) -> float:
     return value_ns if launch_grid_UI(inp.man_launch_mode()) is not None else 0.0
 
 
+@_inp_cached
 def _man_tdd_range(inp: CalcInputs) -> tuple[float, float]:
     """(min, max) Man_t_DD after applying the launch mode.
 
@@ -1872,6 +2099,7 @@ def _man_clocked_grid_ns(inp: CalcInputs, value_ns: float,
                      f"{snapped:.2f} ns ({snapped / UI:.2f} UI)")
 
 
+@_inp_cached
 def _man_tzd_parts(inp: CalcInputs) -> tuple[float, str]:
     """Man_t_ZD as the model uses it, on the launch mode's grid (`_man_clocked_grid_ns`), plus
     the note saying how it got there.
@@ -1892,6 +2120,7 @@ def _man_tzd_ns(inp: CalcInputs) -> float:
     return _man_tzd_parts(inp)[0]
 
 
+@_inp_cached
 def man_tdz_parts(inp: CalcInputs) -> tuple[float, str]:
     """Man_t_DZ,max as the model uses it, on the launch mode's grid (`_man_clocked_grid_ns`),
     plus the note saying how it got there.
@@ -1911,7 +2140,10 @@ def _memo(inp: CalcInputs) -> dict:
     """The memo of values computed from `inp`, held on the instance. `CalcInputs` is frozen, so
     a value that is a function of its fields alone is computed once per instance; `replace`
     builds a new instance with an empty memo."""
-    return inp.__dict__.setdefault("_memo", {})
+    memo = inp.__dict__.get("_memo")
+    if memo is None:
+        memo = inp.__dict__["_memo"] = {}
+    return memo
 
 
 def edge_factor(inp: CalcInputs, lane: str, role: str) -> float:
@@ -1978,9 +2210,15 @@ def tau_adj(inp: CalcInputs, lane: str, role: str) -> float:
 def _slew_adj(inp: CalcInputs, lane: str, corner: str, edge: str) -> float:
     """What turns an envelope coefficient of corner `corner` ("late" carries (1 + τ), "early"
     (1 − τ)) into one on an edge of slew factor `edge`: `edge_factor` for `edge` over the
-    corner's own (1 ± τ)."""
-    tau = inp.tRF_tolerance_frac
-    return edge_factor(inp, lane, edge) / (1.0 + tau if corner == "late" else 1.0 - tau)
+    corner's own (1 ± τ). Computed once per instance (`_memo`)."""
+    memo = _memo(inp)
+    key = ("slew_adj", lane, corner, edge)
+    adj = memo.get(key)
+    if adj is None:
+        tau = inp.tRF_tolerance_frac
+        adj = memo[key] = (edge_factor(inp, lane, edge)
+                           / (1.0 + tau if corner == "late" else 1.0 - tau))
+    return adj
 
 
 # The qualifier a crossing symbol carries when its edge's slew factor is not its corner's own:
@@ -2007,9 +2245,9 @@ def _worse_case(cases: Sequence[tuple[bool, list[Term]]]) -> tuple[bool, list[Te
 
 
 def handover_whole_UIs(inp: CalcInputs) -> int:
-    """The handover count as a whole number of UIs: a fractional count takes the nearest
-    whole one, a tie going up. Every edge rule reads this one count."""
-    return math.floor(max(inp.handover_UIs, 0.0) + 0.5)
+    """The handover count, a whole number of UIs (`_check_inputs` refuses any other). Every
+    edge rule reads this one count."""
+    return int(inp.handover_UIs)
 
 
 def pp_shares_clock_edge(inp: CalcInputs, leg: Inequality) -> bool:
@@ -2118,13 +2356,15 @@ def _sw_anchor_slews(inp: CalcInputs, side: str, corner: str) -> tuple[float, fl
     edges' own (`edge_factor`). The data edge is the slow-edge role on the max corner, which
     setup, the keeper and an EndDriveEarly release's launch on a contention leg read (the fast
     edge for a lane in `CalcInputs.fast_data_edge`), and early on the min corner, which hold
-    and a turn-on read. The Manager's clock is always its
-    late edge, the one the Manager's reference sits on when the launch is on the edge a
-    Peripheral detects late; a launch on a later edge (N_HO >= 1) is priced at the same
-    clock slew, which is the model's one clock slew for an anchor."""
+    and a turn-on read. A Manager's clock is always its late edge, the one the Manager's
+    reference sits on when the launch is on the edge a Peripheral detects late; a launch on a
+    later edge (N_HO >= 1) is priced at the same clock slew, which is the model's one clock
+    slew for a Manager's anchor. A Peripheral's clock part is its min corner's lead from its
+    earliest detection, which is on the early clock edge."""
     lane = "Man DATA" if side == "Man" else "Per DATA"
     data = lane_ns(inp, lane) * edge_factor(inp, lane, "late" if corner == "max" else "early")
-    clk = inp.tRF_Man_CLK_ns * edge_factor(inp, "Man CLK", "late")
+    clk_role = "early" if side == "Per" and corner == "min" else "late"
+    clk = inp.tRF_Man_CLK_ns * edge_factor(inp, "Man CLK", clk_role)
     return clk, data
 
 
@@ -2132,10 +2372,24 @@ def sw_anchor_ns(inp: CalcInputs, side: str, corner: str, *, rising: bool = True
                  clk_rising: bool = True) -> float:
     """A SoundWire side's anchor correction at the operating slews (`sw13_anchor_correction`,
     at `_sw_anchor_slews` and the bus's system size), for a launched data edge of polarity
-    `rising` from a Manager clock edge of polarity `clk_rising`; 0 on a SWI3S side. A
-    Peripheral's correction has no clock part, so `clk_rising` does not move it. Where
-    V_OH + V_OL = 1 the two polarities place a ramp alike, and the rising placement is taken
-    for both."""
+    `rising` from a Manager clock edge of polarity `clk_rising`; 0 on a SWI3S side. The clock
+    ramp is the Manager's (`CalcInputs.Man_shape`) and its detection window the V_IH / V_IL
+    rows in force. A Peripheral's correction is taken at the clock polarity that places its
+    launch the earlier, so `clk_rising` does not move it; its clock part, the min corner's
+    lead from V_IH,min / V_IL,max to 50 %, has one value at both polarities where
+    V_IH,min + V_IL,max = 1. Where V_OH + V_OL = 1 the two polarities place a ramp alike, and
+    the rising placement is taken for both."""
+    memo = _memo(inp)
+    call = ("anchor_call", side, corner, rising, clk_rising)
+    held = memo.get(call)
+    if held is None:
+        held = memo[call] = _sw_anchor_ns(inp, side, corner, rising, clk_rising)
+    return held
+
+
+def _sw_anchor_ns(inp: CalcInputs, side: str, corner: str, rising: bool,
+                  clk_rising: bool) -> float:
+    """`sw_anchor_ns`, evaluated."""
     spec = inp.Man_spec if side == "Man" else inp.Per_spec
     if not is_soundwire(spec):
         return 0.0
@@ -2148,14 +2402,21 @@ def sw_anchor_ns(inp: CalcInputs, side: str, corner: str, *, rising: bool = True
     corr = memo.get(key)
     if corr is None:
         clk, data = _sw_anchor_slews(inp, side, corner)
-        corr = memo[key] = sw13_anchor_correction(
-            spec, side,  # type: ignore[arg-type]
-            corner=corner,  # type: ignore[arg-type]
-            t_rf_clk_ns=clk, t_rf_data_ns=data,
-            system_size=inp.system_size,
-            shape=inp.Man_shape if side == "Man" else inp.Per_shape,
-            V_OH_frac=inp.V_OH_min_frac, V_OL_frac=inp.V_OL_max_frac,
-            rising=rising, clk_rising=clk_rising)
+
+        def at(clk_edge_rising: bool) -> float:
+            return sw13_anchor_correction(
+                spec, side,  # type: ignore[arg-type]
+                corner=corner,  # type: ignore[arg-type]
+                t_rf_clk_ns=clk, t_rf_data_ns=data,
+                system_size=inp.system_size,
+                shape=inp.Man_shape if side == "Man" else inp.Per_shape,
+                clk_shape=inp.Man_shape,
+                V_OH_frac=inp.V_OH_min_frac, V_OL_frac=inp.V_OL_max_frac,
+                V_IH_min_frac=inp.V_IH_min_frac, V_IL_max_frac=inp.V_IL_max_frac,
+                rising=rising, clk_rising=clk_edge_rising)
+
+        corr = memo[key] = (min(at(True), at(False)) if side == "Per" and corner == "min"
+                            else at(clk_rising))
     return corr
 
 
@@ -2170,9 +2431,15 @@ def _launch_anchor_ns(inp: CalcInputs, side: str, which: str, corner: str, *,
                       rising: bool = True, clk_rising: bool = True) -> float:
     """When a launch of data polarity `rising`, from a Manager clock edge of polarity
     `clk_rising`, reaches its anchor, after the side's clock reference: the row value, plus a
-    SoundWire side's anchor correction (`sw_anchor_ns`)."""
-    return launch_row_ns(inp, side, which, corner) + sw_anchor_ns(
-        inp, side, corner, rising=rising, clk_rising=clk_rising)
+    SoundWire side's anchor correction (`sw_anchor_ns`). Computed once per instance and
+    argument set (`_memo`)."""
+    memo = _memo(inp)
+    key = ("launch_anchor", side, which, corner, rising, clk_rising)
+    held = memo.get(key)
+    if held is None:
+        held = memo[key] = launch_row_ns(inp, side, which, corner) + sw_anchor_ns(
+            inp, side, corner, rising=rising, clk_rising=clk_rising)
+    return held
 
 
 def anchor_symbol(inp: CalcInputs, side: str, which: str, corner: str, *, rising: bool,
@@ -2195,6 +2462,7 @@ def anchor_symbol(inp: CalcInputs, side: str, which: str, corner: str, *, rising
     return f"{sym},{'rise' if rising else 'fall'}{fast}"
 
 
+@_inp_cached
 def turn_on_rising(inp: CalcInputs, side: str, *, clk_rising: bool = True) -> bool:
     """The data polarity of a contention leg's turn-on by `side`, from a Manager clock edge of
     polarity `clk_rising`: the one whose anchor is the earlier (`sw_anchor_ns` at the min
@@ -2205,6 +2473,7 @@ def turn_on_rising(inp: CalcInputs, side: str, *, clk_rising: bool = True) -> bo
     return math.isclose(rise, fall, rel_tol=0.0, abs_tol=1e-12) or rise < fall
 
 
+@_inp_cached
 def _launch_terms(inp: CalcInputs, side: str, which: str, corner: str, *, credit: bool,
                   note: str = "", rising: bool = True, clk_rising: bool = True) -> list[Term]:
     """A launch as displayed: its row, and on a SoundWire side the anchor correction that
@@ -2220,23 +2489,39 @@ def _launch_terms(inp: CalcInputs, side: str, which: str, corner: str, *, credit
     its note names the corner and the edges.
 
     A Manager's t_DD or t_ZD row carries its launch-mode placement note
-    (`_man_clocked_grid_ns`) wherever it is shown, unless `note` is given."""
-    sign = 1.0 if credit else -1.0
-    row = launch_row_ns(inp, side, which, corner)
+    (`_man_clocked_grid_ns`) wherever it is shown, unless `note` is given. The terms' values
+    are `_launch_values`."""
+    values = _launch_values(inp, side, which, corner, credit, rising, clk_rising)
     if side == "Man" and not note and which in ("DD", "ZD"):
         note = (_man_clocked_grid_ns(inp, inp.Man_t_DD_max_ns, inp.Man_t_DD_floor_ns)[1]
                 if which == "DD" else _man_tzd_parts(inp)[1])
-    out = [Term(f"{side}_t_{which}", sign * row, op="+" if credit else "-", note=note)]
-    spec = inp.Man_spec if side == "Man" else inp.Per_spec
-    if is_soundwire(spec):
+    out = [Term(f"{side}_t_{which}", values[0], op="+" if credit else "-", note=note)]
+    if len(values) > 1:
         corr = sw_anchor_ns(inp, side, corner, rising=rising, clk_rising=clk_rising)
-        if abs(corr) > 1e-12:
-            v = sign * corr
-            out.append(Term(anchor_symbol(inp, side, which, corner, rising=rising,
-                                          clk_rising=clk_rising),
-                            v, op="+" if v >= 0 else "-",
-                            note=_sw_anchor_note(inp, side, corner, corr, rising=rising,
-                                                 clk_rising=clk_rising)))
+        v = values[1]
+        out.append(Term(anchor_symbol(inp, side, which, corner, rising=rising,
+                                      clk_rising=clk_rising),
+                        v, op="+" if v >= 0 else "-",
+                        note=_sw_anchor_note(inp, side, corner, corr, rising=rising,
+                                             clk_rising=clk_rising)))
+    return out
+
+
+def _launch_values(inp: CalcInputs, side: str, which: str, corner: str, credit: bool,
+                   rising: bool, clk_rising: bool) -> tuple[float, ...]:
+    """The signed values of `_launch_terms`' terms, in its order: the row, then a SoundWire
+    anchor correction that is not zero. Computed once per `inp` and argument set (`_memo`)."""
+    memo = _memo(inp)
+    key = ("launch", side, which, corner, credit, rising, clk_rising)
+    out = memo.get(key)
+    if out is None:
+        sign = 1.0 if credit else -1.0
+        out = (sign * launch_row_ns(inp, side, which, corner),)
+        if is_soundwire(inp.Man_spec if side == "Man" else inp.Per_spec):
+            corr = sw_anchor_ns(inp, side, corner, rising=rising, clk_rising=clk_rising)
+            if abs(corr) > 1e-12:
+                out = (out[0], sign * corr)
+        memo[key] = out
     return out
 
 
@@ -2252,9 +2537,15 @@ def _sw_anchor_note(inp: CalcInputs, side: str, corner: str, corr: float, *,
                                  V_OL_frac=inp.V_OL_max_frac, rising=clk_rising)
     rs = "s" if math.isclose(r, 1.0, abs_tol=1e-9) else f"{r:.3g}·s"
     tp = "65" if clk_rising else "35"
+    e = min(sw13_clock_lead_frac(inp.Man_shape, V_OH_frac=inp.V_OH_min_frac,
+                                 V_OL_frac=inp.V_OL_max_frac,
+                                 V_IH_min_frac=inp.V_IH_min_frac,
+                                 V_IL_max_frac=inp.V_IL_max_frac, rising=c)
+            for c in (True, False))
     what = {("Per", "max"): f"t_OV ends at 80 % of the data ramp: the 20 % point is t_OV − {rs}",
-            ("Per", "min"): f"t_ZD_Data ends at low impedance: the 20 % point is "
-                            f"t_ZD + {z:.3g}·s",
+            ("Per", "min"): f"t_ZD_Data runs from the clock's 50 % crossing, {e:.3g}·k after "
+                            f"the earliest detection at V_IH,min (V_IL,max falling), to low "
+                            f"impedance: the 20 % point is t_ZD + {e:.3g}·k + {z:.3g}·s",
             ("Man", "max"): f"t_OV runs from the clock's {tp} % crossing to 80 % of the data "
                             f"ramp: the 20 % point is t_OV + {p:.3g}·k − {rs}",
             ("Man", "min"): f"t_ZD_Data runs from the clock's 50 % crossing to low impedance: "
@@ -2268,11 +2559,18 @@ def _sw_anchor_note(inp: CalcInputs, side: str, corner: str, corr: float, *,
     edge = "slow" if corner == "max" and lane not in inp.fast_data_edge else "fast"
     data_pol = "rising" if rising else "falling"
 
-    def slews(kk: float, ss: float) -> str:
-        return f"k = {kk:.2f}, s = {ss:.2f} ns" if side == "Man" else f"s = {ss:.2f} ns"
+    with_k = side == "Man" or corner == "min"
 
-    edges = (f"the late {'rising' if clk_rising else 'falling'} clock edge and the {edge} "
-             f"{data_pol} data edge" if side == "Man" else f"the {edge} {data_pol} data edge")
+    def slews(kk: float, ss: float) -> str:
+        return f"k = {kk:.2f}, s = {ss:.2f} ns" if with_k else f"s = {ss:.2f} ns"
+
+    if side == "Man":
+        edges = (f"the late {'rising' if clk_rising else 'falling'} clock edge and the {edge} "
+                 f"{data_pol} data edge")
+    elif with_k:
+        edges = f"the early clock edge and the {edge} {data_pol} data edge"
+    else:
+        edges = f"the {edge} {data_pol} data edge"
     sym = anchor_symbol(inp, side, "DD", corner, rising=rising,
                         clk_rising=clk_rising).removesuffix(",fast")
     if side == "Man" and sym.count(",") == 2:
@@ -2283,13 +2581,136 @@ def _sw_anchor_note(inp: CalcInputs, side: str, corner: str, corr: float, *,
             f"{corr:+.2f} ns")
 
 
+def sw_receive_ns(inp: CalcInputs, side: str, which: str, *, clk_rising: bool = True) -> float:
+    """A SoundWire side's receive-row correction at the operating clock slew
+    (`sw13_receive_correction`), `which` "IS" or "IH", for a sampling clock edge of polarity
+    `clk_rising`; 0 on a SWI3S side and on a Peripheral's t_IH, which starts at 65 %
+    (V_IH,max) and has no clock part. The clock is the Manager's lane on its ramp shape
+    (`CalcInputs.Man_shape`) at the V_OH / V_OL and V_IH / V_IL rows in force, each demand on
+    the clock edge that makes it the larger (`edge_factor`): a t_IS on the early edge, a
+    Manager's t_IH on the late one. Where the polarities place the clock alike, V_OH + V_OL =
+    1 on a Manager and V_IH,min + V_IL,max = 1 on a Peripheral, the rising placement is taken
+    for both."""
+    spec = inp.Man_spec if side == "Man" else inp.Per_spec
+    if not is_soundwire(spec) or (side == "Per" and which == "IH"):
+        return 0.0
+    levels = ((inp.V_OH_min_frac, inp.V_OL_max_frac) if side == "Man"
+              else (inp.V_IH_min_frac, inp.V_IL_max_frac))
+    if math.isclose(sum(levels), 1.0, rel_tol=0.0, abs_tol=1e-12):
+        clk_rising = True
+    memo = _memo(inp)
+    key = ("receive", side, which, clk_rising)
+    corr = memo.get(key)
+    if corr is None:
+        role = "early" if which == "IS" else "late"
+        k = inp.tRF_Man_CLK_ns * edge_factor(inp, "Man CLK", role)
+        corr = memo[key] = sw13_receive_correction(
+            spec, side,  # type: ignore[arg-type]
+            which,  # type: ignore[arg-type]
+            t_rf_clk_ns=k, system_size=inp.system_size, clk_shape=inp.Man_shape,
+            V_OH_frac=inp.V_OH_min_frac, V_OL_frac=inp.V_OL_max_frac,
+            V_IH_min_frac=inp.V_IH_min_frac, V_IL_max_frac=inp.V_IL_max_frac,
+            clk_rising=clk_rising)
+    return corr
+
+
+def receive_ns(inp: CalcInputs, side: str, which: str, *, clk_rising: bool = True) -> float:
+    """A receive demand as a leg reads it: the row (`<side>_t_IS_max_ns` /
+    `<side>_t_IH_max_ns`) plus a SoundWire side's correction (`sw_receive_ns`) for a sampling
+    clock edge of polarity `clk_rising`. Computed once per instance and argument set
+    (`_memo`)."""
+    memo = _memo(inp)
+    key = ("receive_ns", side, which, clk_rising)
+    held = memo.get(key)
+    if held is None:
+        row = getattr(inp, f"{side}_t_{which}_max_ns")
+        held = memo[key] = row + sw_receive_ns(inp, side, which, clk_rising=clk_rising)
+    return held
+
+
+def receive_symbol(side: str, which: str, *, clk_rising: bool) -> str:
+    """The symbol of a SoundWire receive-row correction (`sw_receive_ns`), which moves the
+    clock end the demand is measured from: `<side>_t_<IS|IH>,ref,rise` / `,fall`, naming the
+    sampling clock edge it is placed on, whether or not the two polarities' corrections
+    differ."""
+    return f"{side}_t_{which},ref,{'rise' if clk_rising else 'fall'}"
+
+
+@_inp_cached
+def _receive_terms(inp: CalcInputs, side: str, which: str, *, clk_rising: bool,
+                   note: str = "") -> list[Term]:
+    """A receive demand as displayed, charged: its row and, on a SoundWire side, the
+    correction that moves the equivalent to the operating clock slew (`receive_symbol`).
+    Together they are `receive_ns`. A correction of zero is no term. `note` is the row's, and
+    leads the correction's. The terms' values are `_receive_values`."""
+    values = _receive_values(inp, side, which, clk_rising)
+    out = [Term(f"{side}_t_{which}", values[0], op="-", note=note)]
+    if len(values) > 1:
+        corr = sw_receive_ns(inp, side, which, clk_rising=clk_rising)
+        how = _sw_receive_note(inp, side, which, corr, clk_rising=clk_rising)
+        out.append(Term(receive_symbol(side, which, clk_rising=clk_rising), values[1],
+                        op="-" if corr >= 0 else "+",
+                        note=f"{note}; {how}" if note else how))
+    return out
+
+
+def _receive_values(inp: CalcInputs, side: str, which: str,
+                    clk_rising: bool) -> tuple[float, ...]:
+    """The signed values of `_receive_terms`' terms, in its order: the row, then a SoundWire
+    correction that is not zero. Computed once per `inp` and argument set (`_memo`)."""
+    memo = _memo(inp)
+    key = ("receive_values", side, which, clk_rising)
+    out = memo.get(key)
+    if out is None:
+        out = (-getattr(inp, f"{side}_t_{which}_max_ns"),)
+        corr = sw_receive_ns(inp, side, which, clk_rising=clk_rising)
+        if abs(corr) > 1e-12:
+            out = (out[0], -corr)
+        memo[key] = out
+    return out
+
+
+def _sw_receive_note(inp: CalcInputs, side: str, which: str, corr: float, *,
+                     clk_rising: bool) -> str:
+    """Provenance for a SoundWire receive-row correction `corr` (`sw_receive_ns`) on a
+    sampling clock edge of polarity `clk_rising`: what the equivalent assumed and how the
+    demand moves at the operating clock slew."""
+    shape = inp.Man_shape
+    _, p, q, _ = sw13_ramp_fracs(shape, V_OH_frac=inp.V_OH_min_frac,
+                                 V_OL_frac=inp.V_OL_max_frac, rising=clk_rising)
+    if side == "Per":
+        e = sw13_clock_lead_frac(shape, V_OH_frac=inp.V_OH_min_frac,
+                                 V_OL_frac=inp.V_OL_max_frac,
+                                 V_IH_min_frac=inp.V_IH_min_frac,
+                                 V_IL_max_frac=inp.V_IL_max_frac, rising=clk_rising)
+        what = (f"t_ISetup is measured to the clock's 50 % crossing, {e:.3g}·k after the "
+                f"earliest detection at {'V_IH,min' if clk_rising else 'V_IL,max'}: the demand "
+                f"is t_ISetup − {e:.3g}·k")
+    elif which == "IS":
+        what = (f"t_ISetup is measured to the clock's 50 % crossing, {q:.3g}·k after the clock "
+                f"reference: the demand is t_ISetup − {q:.3g}·k")
+    else:
+        what = (f"t_IHold is measured from the clock's {'65' if clk_rising else '35'} % "
+                f"crossing, {p:.3g}·k after the clock reference: the demand is "
+                f"t_IHold + {p:.3g}·k")
+    spec = inp.Man_spec if side == "Man" else inp.Per_spec
+    k0 = sw13_receive_slew(spec, side, which,  # type: ignore[arg-type]
+                           system_size=inp.system_size)
+    role = "early" if which == "IS" else "late"
+    k = inp.tRF_Man_CLK_ns * edge_factor(inp, "Man CLK", role)
+    edge = f"the {role} {'rising' if clk_rising else 'falling'} clock edge"
+    return (f"SoundWire: {what}; the row is that at the slew it is derived at "
+            f"(k = {k0:.2f} ns), so at k = {k:.2f} ns ({edge}) the demand moves by "
+            f"{corr:+.2f} ns")
+
+
 def _check_inputs(inp: CalcInputs) -> None:
     """Raise ValueError, naming the field, for an input no leg can be evaluated at: a number
     that is not finite, a per-edge slew tolerance τ outside [0, 1) (a fast edge is (1 − τ)
     of its row), a supply tolerance δ outside [0, 1) (a low supply is (1 − δ) of nominal),
     a clock rate, trace velocity or nominal supply that is not positive, a duty
-    floor outside (0, 0.5] (the shorter clock phase's share of the period), a negative
-    handover UI count, or a negative slew, bus length, trace mismatch, noise fraction or
+    floor outside (0, 0.5] (the shorter clock phase's share of the period), a handover UI
+    count that is negative or not a whole number, or a negative slew, bus length, trace mismatch, noise fraction or
     keeper response (`_NON_NEGATIVE_INPUTS`)."""
     for f in dataclasses.fields(inp):
         v = getattr(inp, f.name)
@@ -2312,9 +2733,9 @@ def _check_inputs(inp: CalcInputs) -> None:
     if not 0.0 < inp.duty_min <= 0.5:
         raise ValueError(f"the duty floor duty_min is {inp.duty_min:g}; the shorter clock "
                          "phase is more than 0 and at most half the period")
-    if inp.handover_UIs < 0.0:
+    if not (inp.handover_UIs >= 0.0 and float(inp.handover_UIs).is_integer()):
         raise ValueError(f"the handover UI count handover_UIs is {inp.handover_UIs:g}; it "
-                         "must be 0 or more")
+                         "is a whole number of UIs, 0 or more")
     for name, what in _NON_NEGATIVE_INPUTS:
         if getattr(inp, name) < 0.0:
             raise ValueError(f"{what} {name} is {getattr(inp, name):g}; it must be 0 or more")
@@ -2330,6 +2751,27 @@ _NON_NEGATIVE_INPUTS = (
     ("V_noise_pp_frac", "the noise fraction α"),
     ("t_keeper_ns", "the keeper response"),
 )
+
+
+def _runs_of(inp: CalcInputs) -> list[tuple[CalcInputs, Supplies, frozenset[Inequality]]]:
+    """The runs `compute` evaluates, in its order, as (inputs, supplies, legs): every supply
+    assignment (`CalcInputs.supply_corners`) on the slow data-edge set, then on the fast one
+    where `CalcInputs.fast_edge_lanes` names a lane, one instance per set so its supply
+    assignments share its memo (`_memo`). A leg is in a run only where its margin can differ
+    from an earlier run's: at Peripheral B's first supply end unless it reads B's supply
+    (`_LEGS_READING_PERIPHERAL_B`), and on the fast set only if it reads the slow-edge role of
+    a lane in it (`_LEGS_READING_SLOW_EDGE`)."""
+    lanes = inp.fast_edge_lanes()
+    corners = inp.supply_corners()
+    first_b = corners[0][2]
+    sets: list[tuple[frozenset[str], frozenset[Inequality]]] = [
+        (frozenset(), frozenset(INEQUALITIES))]
+    if lanes:
+        sets.append((frozenset(lanes), frozenset(
+            leg for lane in lanes for leg in _LEGS_READING_SLOW_EDGE[lane])))
+    return [(at, s, legs if s[2] == first_b else legs & _LEGS_READING_PERIPHERAL_B)
+            for at, legs in ((replace(inp, fast_data_edge=e), legs) for e, legs in sets)
+            for s in corners]
 
 
 def compute(inp: CalcInputs) -> CalcResults:
@@ -2349,11 +2791,9 @@ def compute(inp: CalcInputs) -> CalcResults:
     """
     _check_inputs(inp)
     # No leg reads the slow-edge role of two DATA lanes, so every lane `fast_edge_lanes`
-    # names is evaluated slow together and fast together.
-    lanes = inp.fast_edge_lanes()
-    edges = [frozenset(), frozenset(lanes)] if lanes else [frozenset()]
-    runs = [_compute_at(replace(inp, fast_data_edge=e), s)
-            for e in edges for s in inp.supply_corners()]
+    # names is evaluated slow together and fast together. A tie keeps the first run (below),
+    # so a leg is evaluated only where it can differ from an earlier run (`_runs_of`).
+    runs = [_compute_at(at, s, legs) for at, s, legs in _runs_of(inp)]
     pick: dict[Inequality, CalcResults] = {}
     breakdowns: dict[Inequality, InequalityBreakdown] = {}
     # A tie between assignments, margins within 1e-12 ns as in `_worse_case`, keeps a setup,
@@ -2364,8 +2804,9 @@ def compute(inp: CalcInputs) -> CalcResults:
                 or b.closing_rising is False)
 
     for leg in INEQUALITIES:
-        least = min(r.breakdowns[leg].margin_ns for r in runs)
-        tied = [r for r in runs if r.breakdowns[leg].margin_ns <= least + 1e-12]
+        held = [r for r in runs if leg in r.breakdowns]
+        least = min(r.breakdowns[leg].margin_ns for r in held)
+        tied = [r for r in held if r.breakdowns[leg].margin_ns <= least + 1e-12]
         r = min(tied, key=lambda r: _second_case(r, leg))
         pick[leg] = r
         breakdowns[leg] = r.breakdowns[leg]
@@ -2376,31 +2817,59 @@ def compute(inp: CalcInputs) -> CalcResults:
                    sigma_pm_hold_ns=pick["PM_hold"].sigma_pm_hold_ns)
 
 
-def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
-    """Evaluate every leg in `INEQUALITIES` at the supplied corner and at `supplies`, one
-    V_SEOS per device.
+@dataclass(frozen=True)
+class _Crossings:
+    """The crossing envelopes every leg reads at one corner and one supply assignment
+    (`_crossing_lanes`): the ns values and their lane decompositions (`CrossLane`), keyed
+    by (direction, sampling edge rising) for Delta_cross,MP and its P->P construction and
+    by the launching edge's polarity for Sigma_cross,PM, with the data edge each Sigma
+    case places its launch on."""
+    delta_MP: dict[tuple[str, bool], float]
+    DELTA_MP: dict[tuple[str, bool], tuple[CrossLane, ...]]
+    delta_PP: dict[tuple[str, bool], float]
+    DELTA_PP: dict[tuple[str, bool], tuple[CrossLane, ...]]
+    sigma_setup: dict[bool, float]
+    SIGMA_SETUP: dict[bool, tuple[CrossLane, ...]]
+    SIGMA_SETUP_DATA_RISING: dict[bool, bool]
+    sigma_hold: dict[bool, float]
+    SIGMA_HOLD: dict[bool, tuple[CrossLane, ...]]
+    SIGMA_HOLD_CLK_PAIR: dict[bool, str]
+    SIGMA_HOLD_DATA_RISING: dict[bool, bool]
 
-    Returns t_cross values (Δ_cross,MP, Σ_cross,PM,setup, Σ_cross,PM,hold)
-    and a per-inequality breakdown with terms in ns and signs baked in.
-    """
-    env = inp.envelope(supplies)
-    t_PD = inp.t_PD_ns()
-    t_PDmis = inp.t_PD_mis_ns()
-    UI = inp.UI_ns()
 
+def _role_slews(inp: CalcInputs) -> tuple[dict[tuple[str, str], float],
+                                          dict[tuple[str, str], float]]:
+    """Per (lane, role): `tau_adj`, and the lane's t_RF times it. Computed once per instance
+    (`_memo`)."""
+    memo = _memo(inp)
+    held = memo.get("role_slews")
+    if held is None:
+        adj = {(lane, role): tau_adj(inp, lane, role)
+               for lane in _LANE_FIELDS for role in ("late", "early")}
+        held = memo["role_slews"] = (
+            adj, {(lane, role): lane_ns(inp, lane) * a for (lane, role), a in adj.items()})
+    return held
+
+
+def _crossing_lanes(inp: CalcInputs, env: DeltaTpdEnvelope, *,
+                    pp_only: bool = False) -> _Crossings:
+    """The crossing envelopes of `env` at `inp`'s slews, as `_compute_at` and `_margins_at`
+    read them (`_Crossings`); with `pp_only`, the P->P ones alone, the others left empty."""
     # Δ_cross,MP differs between setup and hold once the Manager's two lanes
     # carry different t_RF: the LATE crossing sits on the data for setup and on
     # the clock for hold. Identical when the lanes match, which is the default.
     # EACH EDGE'S SLEW FACTOR IS KEPT INSIDE ITS RANGE (`edge_factor`). The envelope's
     # coefficients carry (1 ± τ); a lane value scaled by `tau_adj` for the role it plays
     # corrects them where the range binds, and leaves them alone elsewhere.
+    adj, slews = _role_slews(inp)
+
     def _t(lane: str, role: str) -> float:
-        return lane_ns(inp, lane) * tau_adj(inp, lane, role)
+        return slews[lane, role]
 
     def _roled(pair):
         (late_lane, late_c), (early_lane, early_c) = pair
-        return ((late_lane, late_c * tau_adj(inp, late_lane, "late")),
-                (early_lane, early_c * tau_adj(inp, early_lane, "early")))
+        return ((late_lane, late_c * adj[late_lane, "late"]),
+                (early_lane, early_c * adj[early_lane, "early"]))
 
     # EVERY SETUP AND HOLD LEG IS EVALUATED AT BOTH POLARITIES OF ITS SAMPLING EDGE and
     # reports the worse (`_worse_case`). The envelopes below are keyed by the polarity their
@@ -2440,14 +2909,15 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         _clk_role, _data_role = _ROLES[_dir]
         for _rising in (True, False):
             _k = (_dir, _rising)
-            delta_MP[_k] = env.delta_cross_MP_ns(
-                _t("Man CLK", _clk_role), _t("Man DATA", _data_role),
-                direction=_dir, sampling_rising=_rising)
+            if not pp_only:
+                delta_MP[_k] = env.delta_cross_MP_ns(
+                    _t("Man CLK", _clk_role), _t("Man DATA", _data_role),
+                    direction=_dir, sampling_rising=_rising)
+                DELTA_MP[_k] = _delta_lanes(env.delta_cross_MP_lanes(
+                    direction=_dir, sampling_rising=_rising), _dir, _rising)
             delta_PP[_k] = env.delta_cross_PP_ns(
                 _t("Man CLK", _clk_role), _t("Per DATA", _data_role),
                 direction=_dir, sampling_rising=_rising)
-            DELTA_MP[_k] = _delta_lanes(env.delta_cross_MP_lanes(
-                direction=_dir, sampling_rising=_rising), _dir, _rising)
             DELTA_PP[_k] = _delta_lanes(env.delta_cross_PP_lanes(
                 direction=_dir, sampling_rising=_rising), _dir, _rising)
 
@@ -2457,7 +2927,7 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # THE SAME QUANTITIES, LANE BY LANE, for display. Each envelope is a sum of
     # (dimensionless coefficient) x (that lane's t_RF); the accessors return the branch
     # the max/min actually selects, so the products below sum to the ns values above
-    # exactly. Asserted at the end of this block rather than trusted.
+    # exactly. Asserted in `_compute_at` rather than trusted.
     #
     # A SoundWire Peripheral's launch reaches its anchor at a time that depends on its data
     # edge's polarity (`sw_anchor_ns`), so each envelope selects its case with the anchor of
@@ -2472,9 +2942,9 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     SIGMA_HOLD_DATA_RISING: dict[bool, bool] = {}
     _per_anchor_max = per_anchor_offsets(inp, "max")
     _per_anchor_min = per_anchor_offsets(inp, "min")
-    _adj_clk_late, _adj_clk_early = (tau_adj(inp, "Man CLK", r) for r in ("late", "early"))
-    _adj_per_late, _adj_per_early = (tau_adj(inp, "Per DATA", r) for r in ("late", "early"))
-    for _rising in (True, False):
+    _adj_clk_late, _adj_clk_early = adj["Man CLK", "late"], adj["Man CLK", "early"]
+    _adj_per_late, _adj_per_early = adj["Per DATA", "late"], adj["Per DATA", "early"]
+    for _rising in (() if pp_only else (True, False)):
         _late_k, _late_s = _t("Man CLK", "late"), _t("Per DATA", "late")
         _early_k, _early_s = _t("Man CLK", "early"), _t("Per DATA", "early")
         sigma_setup[_rising] = env.sigma_pm_setup_ns(_late_k, _late_s, launch_rising=_rising,
@@ -2513,6 +2983,33 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
             SIGMA_HOLD_CLK_PAIR[_rising] = "X_MP"
         SIGMA_HOLD[_rising] = ((_h_roles[0], "Man CLK", _h_pair[0] * _adj_clk_early, "+"),
                                (_h_roles[1], "Per DATA", _h_pair[1] * _adj_per_early, "+"))
+    return _Crossings(delta_MP=delta_MP, DELTA_MP=DELTA_MP, delta_PP=delta_PP,
+                      DELTA_PP=DELTA_PP, sigma_setup=sigma_setup, SIGMA_SETUP=SIGMA_SETUP,
+                      SIGMA_SETUP_DATA_RISING=SIGMA_SETUP_DATA_RISING, sigma_hold=sigma_hold,
+                      SIGMA_HOLD=SIGMA_HOLD, SIGMA_HOLD_CLK_PAIR=SIGMA_HOLD_CLK_PAIR,
+                      SIGMA_HOLD_DATA_RISING=SIGMA_HOLD_DATA_RISING)
+
+
+def _compute_at(inp: CalcInputs, supplies: Supplies,
+                legs: frozenset[Inequality] = frozenset(INEQUALITIES)) -> CalcResults:
+    """Evaluate each of `legs`, every leg in `INEQUALITIES` by default, at the supplied corner
+    and at `supplies`, one V_SEOS per device. A t_cross value whose leg is not evaluated is
+    NaN.
+
+    Returns t_cross values (Δ_cross,MP, Σ_cross,PM,setup, Σ_cross,PM,hold)
+    and a per-inequality breakdown with terms in ns and signs baked in.
+    """
+    env = inp.envelope(supplies)
+    t_PD = inp.t_PD_ns()
+    t_PDmis = inp.t_PD_mis_ns()
+    UI = inp.UI_ns()
+
+    _x = _crossing_lanes(inp, env, pp_only=legs <= _LEGS_READING_PERIPHERAL_B)
+    (delta_MP, DELTA_MP, delta_PP, DELTA_PP, sigma_setup, SIGMA_SETUP, SIGMA_SETUP_DATA_RISING,
+     sigma_hold, SIGMA_HOLD, SIGMA_HOLD_CLK_PAIR, SIGMA_HOLD_DATA_RISING) = (
+        _x.delta_MP, _x.DELTA_MP, _x.delta_PP, _x.DELTA_PP, _x.sigma_setup, _x.SIGMA_SETUP,
+        _x.SIGMA_SETUP_DATA_RISING, _x.sigma_hold, _x.SIGMA_HOLD, _x.SIGMA_HOLD_CLK_PAIR,
+        _x.SIGMA_HOLD_DATA_RISING)
     _checks: list[tuple[tuple[CrossLane, ...], float, float]] = [
         *((DELTA_MP[k], delta_MP[k], -1.0) for k in DELTA_MP),
         *((DELTA_PP[k], delta_PP[k], -1.0) for k in DELTA_PP),
@@ -2540,151 +3037,162 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
 
     breakdowns: dict[Inequality, InequalityBreakdown] = {}
 
-    # ----- MP setup: UI ≥ Man_t_DD,max + Per_t_IS,max + t_PD,mis + Δ_cross,MP --------
-    # (Δ_cross,MP from the Manager's clock reference and from the data's anchor.)
-    # Both sampling polarities; a tie keeps the falling one.
-    # The data edge and the launching clock edge are of the other polarity to the sampling
-    # edge.
-    _mp_setup_rising, mp_setup_terms = _worse_case([(_r, [
-        Term("UI", +UI, op="+"),
-        *_launch_terms(inp, "Man", "DD", "max", credit=False, rising=not _r,
-                       clk_rising=not _r),
-        Term("t_PD,mis", -t_PDmis, op="-"),
-        *_cross_terms(inp, "X_MP", DELTA_MP["setup", _r]),
-        Term("Per_t_IS", -inp.Per_t_IS_max_ns, op="-"),
-    ]) for _r in (False, True)])
-    mp_setup_required = (
-        _launch_anchor_ns(inp, "Man", "DD", "max", rising=not _mp_setup_rising,
-                          clk_rising=not _mp_setup_rising)
-        + inp.Per_t_IS_max_ns + t_PDmis
-        + delta_MP["setup", _mp_setup_rising]
-    )
-    breakdowns["MP_setup"] = InequalityBreakdown(
-        name="MP_setup",
-        terms=mp_setup_terms,
-        required_ns=mp_setup_required,
-        margin_ns=UI - mp_setup_required,
-        # A clocked Man_t_DD is a fraction of the UI, so it shrinks with the rate.
-        **_fmax_fields(inp, _rate_windows(
-            inp, margin_ns=UI - mp_setup_required,
-            ui_part_ns=UI - _man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[1]),
-            clocked=[("DD", -1.0, _man_tdd_range(inp)[1])])),
-        is_setup=True,
-        sampling_rising=_mp_setup_rising,
-    )
+    if "MP_setup" in legs:
+        # ----- MP setup: UI ≥ Man_t_DD,max + Per_t_IS,max + t_PD,mis + Δ_cross,MP --------
+        # (Δ_cross,MP from the Manager's clock reference and from the data's anchor.)
+        # Both sampling polarities; a tie keeps the falling one.
+        # The data edge and the launching clock edge are of the other polarity to the sampling
+        # edge.
+        _mp_setup_rising, mp_setup_terms = _worse_case([(_r, [
+            Term("UI", +UI, op="+"),
+            *_launch_terms(inp, "Man", "DD", "max", credit=False, rising=not _r,
+                           clk_rising=not _r),
+            Term("t_PD,mis", -t_PDmis, op="-"),
+            *_cross_terms(inp, "X_MP", DELTA_MP["setup", _r]),
+            *_receive_terms(inp, "Per", "IS", clk_rising=_r),
+        ]) for _r in (False, True)])
+        mp_setup_required = (
+            _launch_anchor_ns(inp, "Man", "DD", "max", rising=not _mp_setup_rising,
+                              clk_rising=not _mp_setup_rising)
+            + receive_ns(inp, "Per", "IS", clk_rising=_mp_setup_rising) + t_PDmis
+            + delta_MP["setup", _mp_setup_rising]
+        )
+        breakdowns["MP_setup"] = InequalityBreakdown(
+            name="MP_setup",
+            terms=mp_setup_terms,
+            required_ns=mp_setup_required,
+            margin_ns=UI - mp_setup_required,
+            # A clocked Man_t_DD is a fraction of the UI, so it shrinks with the rate.
+            **_fmax_fields(inp, _rate_windows(
+                inp, margin_ns=UI - mp_setup_required,
+                ui_part_ns=UI - _man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[1]),
+                clocked=[("DD", -1.0, _man_tdd_range(inp)[1])])),
+            is_setup=True,
+            sampling_rising=_mp_setup_rising,
+        )
 
-    # ----- MP setup, handover UI: as MP_setup but Man_t_DD,max → Man_t_ZD,max -----
-    _mp_setup_ho_rising, mp_setup_ho_terms = _worse_case([(_r, [
-        Term("UI", +UI, op="+"),
-        # The launch mode may have snapped the value onto a placeable grid point; the note
-        # `_launch_terms` attaches says so.
-        *_launch_terms(inp, "Man", "ZD", "max", credit=False, rising=not _r,
-                       clk_rising=not _r),
-        Term("t_PD,mis", -t_PDmis, op="-"),
-        *_cross_terms(inp, "X_MP", DELTA_MP["setup", _r]),
-        Term("Per_t_IS", -inp.Per_t_IS_max_ns, op="-"),
-    ]) for _r in (False, True)])
-    mp_setup_ho_required = (
-        _launch_anchor_ns(inp, "Man", "ZD", "max", rising=not _mp_setup_ho_rising,
-                          clk_rising=not _mp_setup_ho_rising)
-        + inp.Per_t_IS_max_ns + t_PDmis
-        + delta_MP["setup", _mp_setup_ho_rising]
-    )
-    breakdowns["MP_setup_ho"] = InequalityBreakdown(
-        name="MP_setup_ho",
-        terms=mp_setup_ho_terms,
-        required_ns=mp_setup_ho_required,
-        margin_ns=UI - mp_setup_ho_required,
-        **_fmax_fields(inp, _rate_windows(
-            inp, margin_ns=UI - mp_setup_ho_required,
-            ui_part_ns=UI - _man_clocked_ui_part_ns(inp, man_zd_ns),
-            clocked=[("ZD", -1.0, man_zd_ns)])),
-        is_setup=True,
-        sampling_rising=_mp_setup_ho_rising,
-    )
+    if "MP_setup_ho" in legs:
+        # ----- MP setup, handover UI: as MP_setup but Man_t_DD,max → Man_t_ZD,max -----
+        _mp_setup_ho_rising, mp_setup_ho_terms = _worse_case([(_r, [
+            Term("UI", +UI, op="+"),
+            # The launch mode may have snapped the value onto a placeable grid point; the note
+            # `_launch_terms` attaches says so.
+            *_launch_terms(inp, "Man", "ZD", "max", credit=False, rising=not _r,
+                           clk_rising=not _r),
+            Term("t_PD,mis", -t_PDmis, op="-"),
+            *_cross_terms(inp, "X_MP", DELTA_MP["setup", _r]),
+            *_receive_terms(inp, "Per", "IS", clk_rising=_r),
+        ]) for _r in (False, True)])
+        mp_setup_ho_required = (
+            _launch_anchor_ns(inp, "Man", "ZD", "max", rising=not _mp_setup_ho_rising,
+                              clk_rising=not _mp_setup_ho_rising)
+            + receive_ns(inp, "Per", "IS", clk_rising=_mp_setup_ho_rising) + t_PDmis
+            + delta_MP["setup", _mp_setup_ho_rising]
+        )
+        breakdowns["MP_setup_ho"] = InequalityBreakdown(
+            name="MP_setup_ho",
+            terms=mp_setup_ho_terms,
+            required_ns=mp_setup_ho_required,
+            margin_ns=UI - mp_setup_ho_required,
+            **_fmax_fields(inp, _rate_windows(
+                inp, margin_ns=UI - mp_setup_ho_required,
+                ui_part_ns=UI - _man_clocked_ui_part_ns(inp, man_zd_ns),
+                clocked=[("ZD", -1.0, man_zd_ns)])),
+            is_setup=True,
+            sampling_rising=_mp_setup_ho_rising,
+        )
 
-    # ----- MP hold: Man_t_DD,min ≥ Per_t_IH,max + t_PD,mis + Δ_cross,MP -----
-    # Both sampling polarities; a tie keeps the rising one. The Manager launches on the
-    # sampling edge, its data edge of the other polarity.
-    _mp_hold_rising, mp_hold_terms = _worse_case([(_r, [
-        *_launch_terms(inp, "Man", "DD", "min", credit=True, rising=not _r, clk_rising=_r),
-        Term("t_PD,mis", -t_PDmis, op="-"),
-        *_cross_terms(inp, "X_MP", DELTA_MP["hold", _r]),
-        Term("Per_t_IH", -inp.Per_t_IH_max_ns, op="-"),
-    ]) for _r in (True, False)])
-    mp_hold_margin = sum(t.value_ns for t in mp_hold_terms)
-    breakdowns["MP_hold"] = InequalityBreakdown(
-        name="MP_hold",
-        terms=mp_hold_terms,
-        required_ns=0.0,
-        margin_ns=mp_hold_margin,
-        # A clocked Man_t_DD,min is a fraction of the UI, so the hold it funds shrinks
-        # with the rate.
-        **_fmax_fields(inp, _rate_windows(
-            inp, margin_ns=mp_hold_margin,
-            ui_part_ns=_man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[0]),
-            clocked=[("DD", +1.0, _man_tdd_range(inp)[0])])),
-        is_setup=False,
-        sampling_rising=_mp_hold_rising,
-    )
+    if "MP_hold" in legs:
+        # ----- MP hold: Man_t_DD,min ≥ Per_t_IH,max + t_PD,mis + Δ_cross,MP -----
+        # Both sampling polarities; a tie keeps the rising one. The Manager launches on the
+        # sampling edge, its data edge of the other polarity.
+        _mp_hold_rising, mp_hold_terms = _worse_case([(_r, [
+            *_launch_terms(inp, "Man", "DD", "min", credit=True, rising=not _r, clk_rising=_r),
+            Term("t_PD,mis", -t_PDmis, op="-"),
+            *_cross_terms(inp, "X_MP", DELTA_MP["hold", _r]),
+            *_receive_terms(inp, "Per", "IH", clk_rising=_r),
+        ]) for _r in (True, False)])
+        mp_hold_margin = sum(t.value_ns for t in mp_hold_terms)
+        breakdowns["MP_hold"] = InequalityBreakdown(
+            name="MP_hold",
+            terms=mp_hold_terms,
+            required_ns=0.0,
+            margin_ns=mp_hold_margin,
+            # A clocked Man_t_DD,min is a fraction of the UI, so the hold it funds shrinks
+            # with the rate.
+            **_fmax_fields(inp, _rate_windows(
+                inp, margin_ns=mp_hold_margin,
+                ui_part_ns=_man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[0]),
+                clocked=[("DD", +1.0, _man_tdd_range(inp)[0])])),
+            is_setup=False,
+            sampling_rising=_mp_hold_rising,
+        )
 
-    # ----- MP hold on a t_ZD launch: the fourth of the 2x2 ---------------------
-    #
-    # t_DD and t_ZD are the two ways the Manager launches a data edge, and the
-    # peripheral's hold requirement applies to BOTH -- it is one requirement at the
-    # receiver, which cannot tell which path produced the edge.  So this leg is the
-    # t_ZD quarter of (launch method) x (setup, hold).
-    #
-    # Concretely: the bit sampled at the UI-opening edge must stay valid for
-    # Per_t_IH,max past that edge, and the Manager's turn-on out of high-Z is what
-    # ends it.  So t_ZD,min funds hold exactly as t_DD,min does on an ordinary UI.
-    #
-    # NOTHING ELSE COVERS IT.  Non-contention bounds driver OVERLAP: once the
-    # releaser is off, the keeper holds the level and the acquirer may drive a
-    # DIFFERENT level immediately with no driver conflict at all.  The keeper legs
-    # bound the RELEASING side -- whether the keeper followed the level before the release.
-    # Neither says the sampled bit survives its hold window.
-    #
-    # Each allocated handover UI puts the turn-on a whole UI further from the sampling edge,
-    # a credit of N_HO·UI on the leg, so a zero-UI handover is the one that binds it.
-    #
-    # Man_t_ZD is ONE field and the auto-worst solver drives it to whichever corner
-    # hurts each inequality -- its max for setup, its min here.  A SoundWire side's anchor
-    # correction also differs by corner, so this reads the min corner.
-    #
-    # The Manager's turn-on enters no crossing; it reads both sampling polarities as MP_hold
-    # does, its data edge of the other polarity to the sampling edge and its launching clock
-    # edge the one its handover count gives (`handover_flips_edge`), which places a SoundWire
-    # Manager's anchor.
-    _mp_hold_ho_rising, mp_hold_ho_terms = _worse_case([(_r, [
-        *_handover_ui_terms(inp, UI),
-        *_launch_terms(inp, "Man", "ZD", "min", credit=True, rising=not _r,
-                       clk_rising=_r != handover_flips_edge(inp)),
-        Term("t_PD,mis", -t_PDmis, op="-"),
-        *_cross_terms(inp, "X_MP", DELTA_MP["hold", _r]),
-        Term("Per_t_IH", -inp.Per_t_IH_max_ns, op="-"),
-    ]) for _r in (True, False)])
-    mp_hold_ho_margin = sum(t.value_ns for t in mp_hold_ho_terms)
-    breakdowns["MP_hold_ho"] = InequalityBreakdown(
-        name="MP_hold_ho",
-        terms=mp_hold_ho_terms,
-        required_ns=0.0,
-        margin_ns=mp_hold_ho_margin,
-        **_fmax_fields(inp, _rate_windows(
-            inp, margin_ns=mp_hold_ho_margin,
-            ui_part_ns=_handover_ui_ns(inp, UI) + _man_clocked_ui_part_ns(inp, man_zd_ns),
-            clocked=[("ZD", +1.0, man_zd_ns)])),
-        is_setup=False,
-        sampling_rising=_mp_hold_ho_rising,
-    )
+    if "MP_hold_ho" in legs:
+        # ----- MP hold on a t_ZD launch: the fourth of the 2x2 ---------------------
+        #
+        # t_DD and t_ZD are the two ways the Manager launches a data edge, and the
+        # peripheral's hold requirement applies to BOTH -- it is one requirement at the
+        # receiver, which cannot tell which path produced the edge.  So this leg is the
+        # t_ZD quarter of (launch method) x (setup, hold).
+        #
+        # Concretely: the bit sampled at the UI-opening edge must stay valid for
+        # Per_t_IH,max past that edge, and the Manager's turn-on out of high-Z is what
+        # ends it.  So t_ZD,min funds hold exactly as t_DD,min does on an ordinary UI.
+        #
+        # NOTHING ELSE COVERS IT.  Non-contention bounds driver OVERLAP: once the
+        # releaser is off, the keeper holds the level and the acquirer may drive a
+        # DIFFERENT level immediately with no driver conflict at all.  The keeper legs
+        # bound the RELEASING side -- whether the keeper followed the level before the release.
+        # Neither says the sampled bit survives its hold window.
+        #
+        # Each allocated handover UI puts the turn-on a whole UI further from the sampling edge,
+        # a credit of N_HO·UI on the leg, so a zero-UI handover is the one that binds it.
+        #
+        # Man_t_ZD is ONE field and the auto-worst solver drives it to whichever corner
+        # hurts each inequality -- its max for setup, its min here.  A SoundWire side's anchor
+        # correction also differs by corner, so this reads the min corner.
+        #
+        # The Manager's turn-on enters no crossing; it reads both sampling polarities as MP_hold
+        # does, its data edge of the other polarity to the sampling edge and its launching clock
+        # edge the one its handover count gives (`handover_flips_edge`), which places a SoundWire
+        # Manager's anchor.
+        _mp_hold_ho_rising, mp_hold_ho_terms = _worse_case([(_r, [
+            *_handover_ui_terms(inp, UI),
+            *_launch_terms(inp, "Man", "ZD", "min", credit=True, rising=not _r,
+                           clk_rising=_r != handover_flips_edge(inp)),
+            Term("t_PD,mis", -t_PDmis, op="-"),
+            *_cross_terms(inp, "X_MP", DELTA_MP["hold", _r]),
+            *_receive_terms(inp, "Per", "IH", clk_rising=_r),
+        ]) for _r in (True, False)])
+        mp_hold_ho_margin = sum(t.value_ns for t in mp_hold_ho_terms)
+        breakdowns["MP_hold_ho"] = InequalityBreakdown(
+            name="MP_hold_ho",
+            terms=mp_hold_ho_terms,
+            required_ns=0.0,
+            margin_ns=mp_hold_ho_margin,
+            **_fmax_fields(inp, _rate_windows(
+                inp, margin_ns=mp_hold_ho_margin,
+                ui_part_ns=_handover_ui_ns(inp, UI) + _man_clocked_ui_part_ns(inp, man_zd_ns),
+                clocked=[("ZD", +1.0, man_zd_ns)])),
+            is_setup=False,
+            sampling_rising=_mp_hold_ho_rising,
+        )
 
-    # ----- PM setup: UI ≥ Per_t_DD,max + Man_t_IS,max + 2·t_PD + Σ_PM,setup -----
+    # ----- PM setup: UI ≥ Per_t_DD,max + Man_t_IS,max + 2·t_PD + t_PD,mis + Σ_PM,setup -----
     # (Σ_PM,setup from the Manager's clock reference and from the data's anchor.)
     # IN TIME ORDER, which is what the two traversals and the split envelope buy: the clock
     # leaves the Manager, reaches the peripheral, the peripheral recognises it, launches, the
     # data crosses back, the Manager's receiver recognises THAT, and only then is the
     # Manager's own setup window the thing left to satisfy. Every leg below traces the same
     # way, so a reader can follow one row and know what happens next.
+    #
+    # THE TWO FLIGHTS RIDE DIFFERENT TRACES: the clock goes out on the CLK trace and the data
+    # comes back on the DATA trace. t_PD is the flight common to both and t_PD,mis the
+    # CLK-vs-DATA difference over the same distance, so the pair carries one t_PD,mis, after
+    # the data's flight back, at the sign that hurts: a cost on setup, and on hold a cost
+    # that reduces the two flights' credit. It reads 0 under All near the Manager and is shown
+    # there (checklist rule 5).
     #
     # The Peripheral launches on the edge before the Manager's sampling edge, of the other
     # polarity. Both sampling polarities; a tie keeps the falling one, whose launching edge
@@ -2699,20 +3207,23 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
             *_launch_terms(inp, "Per", which, "max", credit=False,
                            rising=SIGMA_SETUP_DATA_RISING[not sampling_rising]),
             _pd_term(t_PD, credit=False, note=_PD_FROM_LAUNCHER),
+            Term("t_PD,mis", -t_PDmis, op="-", note=_PM_MIS_NOTE),
             *_data,
-            Term("Man_t_IS", -inp.Man_t_IS_max_ns, op="-"),
+            *_receive_terms(inp, "Man", "IS", clk_rising=sampling_rising),
         ]
 
     _pm_setup_legs: tuple[tuple[Inequality, str], ...] = (
         ("PM_setup", "DD"), ("PM_setup_ho", "ZD"))
     _pm_setup_launch: dict[str, bool] = {}
     for _name, _which in _pm_setup_legs:
+        if _name not in legs:
+            continue
         _rising, _terms = _worse_case([(_r, _pm_setup_case(_which, _r)) for _r in (False, True)])
         _pm_setup_launch[_name] = not _rising
         _launch_ns = _launch_anchor_ns(inp, "Per", _which, "max",
                                        rising=SIGMA_SETUP_DATA_RISING[not _rising])
-        _required = (_launch_ns + inp.Man_t_IS_max_ns + 2.0 * t_PD
-                     + sigma_setup[not _rising])
+        _required = (_launch_ns + receive_ns(inp, "Man", "IS", clk_rising=_rising)
+                     + 2.0 * t_PD + t_PDmis + sigma_setup[not _rising])
         breakdowns[_name] = InequalityBreakdown(
             name=_name,
             terms=_terms,
@@ -2723,7 +3234,7 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
             sampling_rising=_rising,
         )
 
-    # ----- PM hold: Per_t_DD,min − Man_t_IH,max + 2·t_PD + Σ_PM,hold ≥ 0 -----
+    # ----- PM hold: Per_t_DD,min − Man_t_IH,max + 2·t_PD − t_PD,mis + Σ_PM,hold ≥ 0 -----
     #
     # ----- PM hold on the ACQUIRED UI: Per_t_ZD in place of Per_t_DD ------------
     #
@@ -2737,7 +3248,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # after the Manager's sampling edge: on PM_hold that edge itself, and on PM_hold_ho the
     # other polarity at an odd count. The leg reads Sigma_cross,PM,hold at the launching
     # edge's polarity (`SIGMA_HOLD`). Both sampling polarities; a tie keeps the rising one.
-    def _pm_hold_case(which: str, launch_rising: bool, ho: bool) -> list[Term]:
+    def _pm_hold_case(which: str, launch_rising: bool, ho: bool,
+                      sampling_rising: bool) -> list[Term]:
         _clk, _data = _split_cross_terms(_cross_terms(
             inp, "X_PM", SIGMA_HOLD[launch_rising], clk_pair=SIGMA_HOLD_CLK_PAIR[launch_rising]))
         return [
@@ -2747,16 +3259,19 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
             *_launch_terms(inp, "Per", which, "min", credit=True,
                            rising=SIGMA_HOLD_DATA_RISING[launch_rising]),
             _pd_term(t_PD, credit=True, note=_PD_FROM_LAUNCHER),
+            Term("t_PD,mis", -t_PDmis, op="-", note=_PM_MIS_NOTE),
             *_data,
-            Term("Man_t_IH", -inp.Man_t_IH_max_ns, op="-"),
+            *_receive_terms(inp, "Man", "IH", clk_rising=sampling_rising),
         ]
 
     _pm_hold_legs: tuple[tuple[Inequality, str, bool], ...] = (
         ("PM_hold", "DD", False), ("PM_hold_ho", "ZD", True))
     _pm_hold_launch: dict[str, bool] = {}
     for _name, _which, _ho in _pm_hold_legs:
+        if _name not in legs:
+            continue
         _flip = _ho and handover_flips_edge(inp)
-        _rising, _terms = _worse_case([(_r, _pm_hold_case(_which, _r != _flip, _ho))
+        _rising, _terms = _worse_case([(_r, _pm_hold_case(_which, _r != _flip, _ho, _r))
                                        for _r in (True, False)])
         _pm_hold_launch[_name] = _rising != _flip
         _margin = sum(t.value_ns for t in _terms)
@@ -2777,8 +3292,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # references its own arrival of it, which is what makes this a third direction rather
     # than PM with the labels changed:
     #
-    #   setup:  UI  >=  Per_t_DD,max + Per_t_IS + net·t_PD + Sigma_cross,PP,setup
-    #   hold:   Per_t_DD,min - Per_t_IH + net·t_PD + Sigma_cross,PP,hold  >=  0
+    #   setup:  UI  >=  Per_t_DD,max + Per_t_IS + net·t_PD + t_PD,mis,AB + Sigma_cross,PP,setup
+    #   hold:   Per_t_DD,min - Per_t_IH + net·t_PD - t_PD,mis,AB + Sigma_cross,PP,hold  >=  0
     #
     # and the same pair again with Per_t_ZD in place of Per_t_DD -- the launch-method half
     # of the 2x2 this file treats as structural. The receiver cannot tell which path
@@ -2786,8 +3301,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     #
     # THE FLIGHT TERM IS THE PLACEMENT, NOT THE BUS LENGTH, and it is signed by geometry
     # rather than by direction: see `pp_net_pd` and `CalcInputs.pp_placement`. Under the
-    # unknown placement (Worst Per Leg) setup reads the bracket at 2 (driver at the far end,
-    # sampler at the near end, data running back against the clock) and hold reads it at 0
+    # unknown placement (Worst Per Inequality) setup reads the bracket at 2 (driver at the far
+    # end, sampler at the near end, data running back against the clock) and hold reads it at 0
     # (any placement whose bracket is zero), so the two legs sit at OPPOSITE ends of one row
     # -- exactly what the per-inequality corner search is for. Hold then gets NO flight
     # credit, where PM hold banks +2·t_PD, and that difference is most of why P->P hold is
@@ -2827,6 +3342,15 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         return [_pd_term(t_PD, credit=not is_setup, note=notes[i]) for i in range(int(n))]
 
     pp_setup_pd_ns = pp_net_pd(inp.pp_placement, is_setup=True) * t_PD
+    # The trace mismatch over A and B's separation, a cost on every P->P setup and hold leg
+    # (`pp_net_mis`). Shown at every placement, 0 where the two share an end.
+    pp_mis_ns = pp_net_mis(inp.pp_placement) * t_PDmis
+    pp_mis_term = Term(
+        PP_MIS_SYMBOL, -pp_mis_ns, op="-",
+        note="the CLK-vs-DATA trace mismatch over A and B's separation: the clock reaches each "
+             "peripheral on the CLK trace and A's data reaches B on the DATA trace, so the "
+             "data arrives up to t_PD,mis from where the clock's flight puts it; charged at "
+             "the sign that hurts, and 0 with both peripherals at one end")
 
     # Annotated so `_name` keeps the `Inequality` Literal rather than widening to `str`,
     # which the breakdowns dict and InequalityBreakdown.name both require. Same reason
@@ -2846,8 +3370,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         launch_ns = _launch_anchor_ns(inp, "Per", which, "max", rising=not b_rising)
         a_p = _per_clk_cross_parts(inp, env, corner="late", rising=not b_rising)
         a_sym = clock_detection_symbol("late", rising=not b_rising, device="A")
-        required = (launch_ns + inp.Per_t_IS_max_ns + pp_setup_pd_ns
-                    + a_p[0] + delta_PP["setup", b_rising])
+        required = (launch_ns + receive_ns(inp, "Per", "IS", clk_rising=b_rising)
+                    + pp_setup_pd_ns + pp_mis_ns + a_p[0] + delta_PP["setup", b_rising])
         _pd = _pp_pd_terms(is_setup=True)
         _b_clk, _b_data = _split_cross_terms(
             _cross_terms(inp, "X_PP,B", DELTA_PP["setup", b_rising], clk_pair="X_MP,B"))
@@ -2868,12 +3392,15 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
                            note=_pp_device_note("A, the driver", "its launch"),
                            rising=not b_rising),
             *_pd[1:],
+            pp_mis_term,
             *_b_data,
-            Term("Per_t_IS", -inp.Per_t_IS_max_ns, op="-",
-                 note=_pp_device_note("B, the sampler", "its setup window")),
+            *_receive_terms(inp, "Per", "IS", clk_rising=b_rising,
+                            note=_pp_device_note("B, the sampler", "its setup window")),
         ]
 
     for _name, _which in _pp_setup_legs:
+        if _name not in legs:
+            continue
         _pp_s = {_r: _pp_setup_case(_which, _r) for _r in (False, True)}
         _rising, _terms = _worse_case([(_r, _pp_s[_r][1]) for _r in (False, True)])
         _required = _pp_s[_rising][0]
@@ -2890,6 +3417,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         ("PP_hold_ho", "ZD", True),
     )
     for _name, _which, _ho in _pp_hold_legs:
+        if _name not in legs:
+            continue
         # A DRIVES ON EVERY P->P LEG, BUT ON A HOLD LEG ITS LAUNCH IS THE AGGRESSOR, and on
         # the handover variant the level it destroys is not even A's:
         #
@@ -2963,9 +3492,10 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
                 *_launch_terms(inp, "Per", _which, "min", credit=True,
                                note=_pp_device_note(_who, _level), rising=not _b_rising),
                 *_pd[1:],
+                pp_mis_term,
                 *_b_dat,
-                Term("Per_t_IH", -inp.Per_t_IH_max_ns, op="-",
-                     note=_pp_device_note("B, the sampler", "its hold window")),
+                *_receive_terms(inp, "Per", "IH", clk_rising=_b_rising,
+                                note=_pp_device_note("B, the sampler", "its hold window")),
             ]))
         # The worse case; a tie keeps the first, B sampling on a rising edge.
         _rising, _terms = _worse_case(_cases)
@@ -2979,17 +3509,20 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
 
     # ----- Handover non-contention, both directions -----
     #
-    #   N_HO·UI + t_ZD,min(acquiring) − t_DZ,max(releasing) + t_PD ≥ 0
+    #   N_HO·UI + t_ZD,min(acquiring) − t_DZ,max(releasing) + (t_PD − t_PD,mis) ≥ 0
     #
-    # The final term is the overlap allowance: two drivers may be on together for one
-    # flight time without contending. See the criterion note below. Reading the margin
+    # before the clock skew below; with it, M->P carries 2·t_PD − t_PD,mis and P->M and P->P
+    # only the mismatch, − t_PD,mis and − t_PD,mis,AB. The bracket is the overlap allowance
+    # A = t_PD − t_PD,mis: two drivers may be on together for one flight time between them
+    # without contending, and that flight rides the DATA trace, the shorter by t_PD,mis at the
+    # worst corner. See the criterion and trace-mismatch notes below. Reading the margin
     # against the overlap it permits, where O is how long both drivers are on:
     #
-    #   margin  =  t_PD − O
-    #     > t_PD    an undriven (float) gap of (margin − t_PD), which the Manager's
+    #   margin  =  A − O
+    #     > A       an undriven (float) gap of (margin − A), which the Manager's
     #               bus keeper holds the level through (§10.1.4.4.2, {ASW3805})
-    #     = t_PD    the two drivers meet exactly, O = 0
-    #     = 0       O = t_PD, the limit -- current still bounded by V/Z0
+    #     = A       the two drivers meet exactly, O = 0
+    #     = 0       O = A, the limit -- current still bounded by V/Z0
     #     < 0       CONTENTION: two drivers fighting, which nothing in the spec
     #               permits for an audio-mode data handover
     #
@@ -3011,9 +3544,9 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # Both terms take the corner that hurts, and the auto-worst solver finds it
     # without help: t_ZD enters with a + sign here and a − sign in the "_ho"
     # setup variants, so the same single `*_t_ZD_ns` field is driven to its min
-    # for contention and its max for setup. `handover_UIs` is a float so a
-    # fractional allocation can be explored, and 0 is meaningful (PHY1 intra-UI,
-    # or PHY2 with EndDriveEarly).
+    # for contention and its max for setup. `handover_UIs` is a whole number of UIs, since
+    # a launch out of high-Z is on a clock edge, and 0 is meaningful (PHY1 intra-UI, or PHY2
+    # with EndDriveEarly).
     #
     # CLOCK SKEW is the third term, and it is not optional. Each device's t_DZ /
     # t_ZD is referenced to ITS OWN clock, and the clock propagates from the
@@ -3033,7 +3566,9 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # `bus_length_cm`, so the worst-case skew is the full −t_PD (releaser at the
     # far end, acquirer at the Manager end). A real pair has a separation of its
     # own that can be shorter — this is the bounding case, not a measurement of a
-    # specific topology.
+    # specific topology. A pinned placement (`PINNED_PLACEMENTS`) puts both at one end:
+    # their separation is 0 and both detect the clock equally late, so the leg still nets
+    # no flight, and its trace mismatch reads 0.
     #
     # WHAT COUNTS AS CONTENTION, which is a SPICE result and not a reading of the
     # spec. Two drivers may be on together for up to the flight time between them
@@ -3043,7 +3578,9 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # traversal later, and only then is there a low-impedance path between two
     # opposing drivers. So the bound is on OVERLAP, and it is not zero:
     #
-    #   overlap  =  T_off(releaser) − T_on(acquirer)  ≤  t_PD      benign
+    #   overlap  =  T_off(releaser) − T_on(acquirer)  ≤  t_PD − t_PD,mis      benign
+    #
+    # the allowance being the acquirer's drive's flight to the releaser on the DATA trace.
     #
     # The event being bounded is two drivers being on at once, which is not located at
     # either pin, so no data-flight traversal is charged. What remains is the clock
@@ -3053,7 +3590,10 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # NO NEW PARAMETER. The two contending devices are taken to sit at opposite ends
     # of the bus, so their separation IS `t_PD` — and the bus row already sweeps
     # 0..30 cm, which lets the corner search find whichever end binds each leg. The
-    # short end binds MP, since a co-located pair has no allowance to spend.
+    # short end binds MP, since a co-located pair has no allowance to spend. A pinned
+    # placement fixes the distance instead (`peripheral_distance_cm`): MP's two flights are
+    # 0 with every peripheral at the Manager and the bus row's max with every one at the far
+    # end.
     #
     # WHERE THE LEVEL IS COVERED, since this bounds driver CURRENT and not the
     # voltage on the line during the overlap. The `*_hold_ho` legs own that: the bit
@@ -3083,20 +3623,7 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # coefficient (`pp_clock_edges`). Otherwise the acquirer's edge is N_HO UIs after the
     # releaser's, or an EDE release is referenced to the edge before it, and each edge takes
     # its corner's own factor.
-    def _contention_parts(closing: bool) -> _ClosingCase:
-        rel_rising = closing != inp.Per_ede
-        acq_rising = closing != handover_flips_edge(inp)
-        rel_edge, acq_edge = pp_clock_edges(inp, env, "PP_contention", closing_rising=closing)
-        return _ClosingCase(
-            rel_rising, acq_rising, rel_edge, acq_edge,
-            late=_per_clk_cross_parts(inp, env, corner="late", rising=rel_rising),
-            early=_per_clk_cross_parts(inp, env, corner="early", rising=acq_rising),
-            pp_rel=_per_clk_cross_parts(inp, env, corner="late", edge=rel_edge,
-                                        rising=rel_rising),
-            pp_acq=_per_clk_cross_parts(inp, env, corner="early", device="B", edge=acq_edge,
-                                        rising=acq_rising))
-
-    _closing_parts = {_c: _contention_parts(_c) for _c in (True, False)}
+    _closing_parts = {_c: _closing_case(inp, env, _c) for _c in (True, False)}
     #
     # A Manager end has no clock crossing: the Manager sources the clock (Manager Output Timing
     # figure). Its detection is "" in the table below, and its term is structurally zero, so it
@@ -3110,7 +3637,7 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     #
     #   acquirer drives at      N_HO*UI + a_pd + [detect if Per] + t_ZD,min
     #   releaser is off at              r_pd + [detect if Per] + t_DZ,eff
-    #   ...and the two may OVERLAP by                            t_PD
+    #   ...and the two may OVERLAP by                            t_PD − t_PD,mis
     #
     # a_pd is the acquiring device's clock arrival delay, r_pd the releasing one's.
     # A Manager sources the clock, so both are zero for it; a peripheral pays t_PD.
@@ -3138,6 +3665,20 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # releasing peripheral late is the same distance that licenses the overlap, so the
     # skew and the allowance are the same quantity with opposite signs. M->P's two are
     # shown as two `t_PD` terms, the clock's flight out and the acquirer's drive back.
+    #
+    # THE TWO RIDE DIFFERENT TRACES, so the count holds only to within the trace mismatch:
+    # a device's clock reaches it on the CLK trace (`t_PD`, the clock's flight) and the
+    # acquirer's drive reaches the releaser on the DATA trace, which at the worst corner is
+    # the shorter by t_PD,mis and takes that much off the allowance. Every contention leg
+    # pays it, last, after the acquirer's turn-on (M->P: after its drive's flight back):
+    #
+    #   M->P   2 t_PD − t_PD,mis       the clock's flight out and the drive back, both
+    #                                  credits, the drive's the shorter
+    #   P->M   − t_PD,mis              the Manager's drive reaches the Peripheral early
+    #   P->P   − t_PD,mis,AB           the same over A and B's separation (`pp_net_mis`)
+    #
+    # A placement that puts the two at one end, or a peripheral at the Manager, has no
+    # separation: the term reads 0 and is shown (checklist rule 5).
     _NET_PD = {"MP_contention": +2.0, "PM_contention": 0.0, "PP_contention": 0.0}
     _contention_legs: tuple[
         tuple[Inequality, str, str, str, str, str], ...] = (
@@ -3170,6 +3711,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         ("PP_contention", "Per", "Per", "pp_acq", "pp_rel", ""),
     )
     for (name, releasing, acquiring, acq_key, rel_key, dz_note) in _contention_legs:
+        if name not in legs:
+            continue
         # For the rate solve below: `dz_ui` is the UI-scaled part of the release, `zd_ui`
         # that of the turn-on, and `clocked` the clocked Manager timings among them.
         clocked: list[ClockedPart] = []
@@ -3227,6 +3770,11 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         # closing edge.
         assert n_pd in (0.0, 2.0), (name, n_pd)
         flight = [Term("t_PD", +t_PD, op="+")] if n_pd else []
+        # The trace mismatch (`_NET_PD`'s note), a cost on every contention leg.
+        mis = ([Term(PP_MIS_SYMBOL, -pp_net_mis(inp.pp_placement) * t_PDmis, op="-",
+                     note=_CONTENTION_MIS_NOTE + " over A and B's separation, 0 with both "
+                          "peripherals at one end")] if pp
+               else [Term("t_PD,mis", -t_PDmis, op="-", note=_CONTENTION_MIS_NOTE)])
 
         # THE TURN-ON IS PLACED ON ITS WORSE DATA EDGE (`turn_on_rising`), from the clock edge
         # its handover count gives; an EndDriveEarly release on the edge `ede_release_rising`
@@ -3260,9 +3808,9 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
                           if acq_p is not None else [])
             if pp:                                     # P->P: one gathered detection
                 return [*rel_detect, *acq_detect, *release, *_handover_ui_terms(inp, UI),
-                        *acq_terms]
+                        *acq_terms, *mis]
             return [*rel_detect, *release, *_handover_ui_terms(inp, UI), *flight,
-                    *acq_detect, *acq_terms, *flight]
+                    *acq_detect, *acq_terms, *flight, *mis]
 
         closing_rising, terms = _worse_case([(_c, _case(_c)) for _c in (True, False)])
         margin = sum(t.value_ns for t in terms)
@@ -3320,7 +3868,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # The contention legs take the turn-on at t_ZD's 20 % point: overlap is counted from
     # there to the releaser's t_DZ, so a NEGATIVE contention margin's magnitude IS the
     # overlap in excess of what the flight time licenses -- the overlap itself is
-    # `t_PD − margin`. Conduction before the 20 % point is not counted.
+    # `(t_PD − t_PD,mis) − margin`, `(t_PD − t_PD,mis,AB) − margin` on P->P. Conduction before
+    # the 20 % point is not counted.
     # ONE keeper, and it is in the MANAGER ({ASW3805}) -- there is no peripheral
     # keeper.  The two legs below are therefore not "the Manager's keeper margin"
     # and "the Peripheral's": they are the same single keeper, evaluated for each
@@ -3342,8 +3891,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # release after it (t_DZ, or the ramp to V_OH / V_OL and the EDE Delay), and last the
     # keeper's response, the time the level held past the crossing must cover.
     #
-    # A 0 ns keeper requirement (a corner sweep's low end, or a spec that states none) drops
-    # the term rather than printing a zero row.
+    # A keeper response of 0 ns is a parameter reading zero and is SHOWN (checklist rule 5), so
+    # each keeper leg prints one equation and one drawing whatever the response.
     keeper_term = inp.t_keeper_ns
 
     def keeper_crossing(lane: str, dev: str, *, ede: bool,
@@ -3351,7 +3900,8 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         """(the data edge's polarity, the term) from the release's anchor to the data's
         crossing of the keeper's threshold at the Manager (`_keeper_case`), on a launch from a
         clock edge of polarity `clk_rising`."""
-        rising, coef, note = _keeper_case(inp, lane, supplies, ede=ede, clk_rising=clk_rising)
+        corner, coef, note = _keeper_case(inp, lane, supplies, ede=ede, clk_rising=clk_rising)
+        rising = corner.rising
         k = lane_ns(inp, lane)
         role = _fast_role(inp, lane, f"{'rise' if rising else 'fall'},late")
         return rising, Term(f"X_K,{role} · {dev}_t_RF,DATA",
@@ -3395,47 +3945,47 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # output stage has one release time. See `man_tdz_parts`.
     # The opening edge is the polarity that places a SoundWire Manager's launch the later
     # (`keeper_open_rising`), and the data edge the one `keeper_crossing` gives from it.
-    if inp.Man_ede:
-        man_keeper_terms = ede_held("Man DATA", "Man", inp.Man_t_EDE_ns)
-    else:
-        _open = keeper_open_rising(inp)
-        _man_k_rising, _man_crossing = keeper_crossing("Man DATA", "Man", ede=False,
-                                                       clk_rising=_open)
-        man_keeper_terms = [
-            *_launch_terms(inp, "Man", "DD", "max", credit=False, rising=_man_k_rising,
-                           clk_rising=_open),
-            _man_crossing,
-            Term("1·UI", +UI, op="+"),
-            Term("Man_t_DZ", +man_dz_ns, op="+",
-                 note="; ".join(n for n in (man_dz_note, _release_note(man_dz_ns)) if n)),
-        ]
-    # The keeper's response term is the spec's Man_tKeeper_Response, shown with its t
-    # subscripted like every timing symbol here (the table's Man_tDD is `Man_t_DD`).
-    if keeper_term:
+    if "keeper_Man" in legs:
+        if inp.Man_ede:
+            man_keeper_terms = ede_held("Man DATA", "Man", inp.Man_t_EDE_ns)
+        else:
+            _open = keeper_open_rising(inp)
+            _man_k_rising, _man_crossing = keeper_crossing("Man DATA", "Man", ede=False,
+                                                           clk_rising=_open)
+            man_keeper_terms = [
+                *_launch_terms(inp, "Man", "DD", "max", credit=False, rising=_man_k_rising,
+                               clk_rising=_open),
+                _man_crossing,
+                Term("1·UI", +UI, op="+"),
+                Term("Man_t_DZ", +man_dz_ns, op="+",
+                     note="; ".join(n for n in (man_dz_note, _release_note(man_dz_ns)) if n)),
+            ]
+        # The keeper's response term is the spec's Man_tKeeper_Response, shown with its t
+        # subscripted like every timing symbol here (the table's Man_tDD is `Man_t_DD`).
         man_keeper_terms.append(Term("Man_t_Keeper_Response", -keeper_term, op="-",
                                      note=_keeper_note(inp)))
-    man_keeper_margin = sum(t.value_ns for t in man_keeper_terms)
-    if inp.Man_keeper_forced:
-        breakdowns["keeper_Man"] = InequalityBreakdown(
-            name="keeper_Man", terms=[], required_ns=0.0, margin_ns=math.inf,
-            F_max_MHz=math.inf, is_setup=False,
-            not_applicable=("the Manager forces its keeper to the level it drives, so its "
-                            "release waits for no keeper response"))
-    else:
-        breakdowns["keeper_Man"] = InequalityBreakdown(
-            name="keeper_Man", terms=man_keeper_terms, required_ns=0.0,
-            margin_ns=man_keeper_margin,
-            # The conventional release adds the whole closing UI and a clocked t_DZ, a fraction
-            # of the UI; a clocked launch's t_DD is a fraction of the UI and comes off it. An
-            # EndDriveEarly leg has no UI-scaled part.
-            **_fmax_fields(inp, _rate_windows(inp, margin_ns=man_keeper_margin, ui_part_ns=0.0)
-                           if inp.Man_ede else _rate_windows(
-                               inp, margin_ns=man_keeper_margin,
-                               ui_part_ns=UI + _man_clocked_ui_part_ns(inp, man_dz_ns)
-                               - _man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[1]),
-                               clocked=[("DZ", +1.0, man_dz_ns),
-                                        ("DD", -1.0, _man_tdd_range(inp)[1])])),
-            is_setup=False)
+        man_keeper_margin = sum(t.value_ns for t in man_keeper_terms)
+        if inp.Man_keeper_forced:
+            breakdowns["keeper_Man"] = InequalityBreakdown(
+                name="keeper_Man", terms=[], required_ns=0.0, margin_ns=math.inf,
+                F_max_MHz=math.inf, is_setup=False,
+                not_applicable=("the Manager forces its keeper to the level it drives, so its "
+                                "release waits for no keeper response"))
+        else:
+            breakdowns["keeper_Man"] = InequalityBreakdown(
+                name="keeper_Man", terms=man_keeper_terms, required_ns=0.0,
+                margin_ns=man_keeper_margin,
+                # The conventional release adds the whole closing UI and a clocked t_DZ, a fraction
+                # of the UI; a clocked launch's t_DD is a fraction of the UI and comes off it. An
+                # EndDriveEarly leg has no UI-scaled part.
+                **_fmax_fields(inp, _rate_windows(inp, margin_ns=man_keeper_margin, ui_part_ns=0.0)
+                               if inp.Man_ede else _rate_windows(
+                                   inp, margin_ns=man_keeper_margin,
+                                   ui_part_ns=UI + _man_clocked_ui_part_ns(inp, man_dz_ns)
+                                   - _man_clocked_ui_part_ns(inp, _man_tdd_range(inp)[1]),
+                                   clocked=[("DZ", +1.0, man_dz_ns),
+                                            ("DD", -1.0, _man_tdd_range(inp)[1])])),
+                is_setup=False)
 
     # --- a peripheral releasing ------------------------------------------------
     #
@@ -3454,46 +4004,46 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
     # its one supply. Both read the clock row, so they show as one gathered product
     # (`_gather_lane_terms`), placed after the UI it corrects. The leg is evaluated at both
     # polarities of the closing edge and reports the worse (`_worse_case`, rising first).
-    per_keeper_closing: bool | None = None
-    if inp.Per_ede:
-        per_keeper_terms = ede_held("Per DATA", "Per", inp.Per_t_EDE_ns)
-    else:
-        def _per_keeper_case(closing: bool) -> list[Term]:
-            opening = not closing
-            late = _per_clk_cross_parts(inp, env, corner="late", rising=opening)
-            early = _per_clk_cross_parts(inp, env, corner="early", rising=closing)
-            _k_rising, _crossing = keeper_crossing("Per DATA", "Per", ede=False,
-                                                   clk_rising=opening)
-            return [
-                *_launch_terms(inp, "Per", "DD", "max", credit=False, rising=_k_rising),
-                _crossing,
-                Term("1·UI", +UI, op="+"),
-                Term(f"{clock_detection_symbol('late', rising=opening)} · Man_t_RF,CLK",
-                     -late[0], op="-", note=_coeff_note(late), factors=late[1:]),
-                Term(f"{clock_detection_symbol('early', rising=closing)} · Man_t_RF,CLK",
-                     +early[0], op="+", note=_coeff_note(early), factors=early[1:]),
-                # Same release point as the Manager's conventional leg: the peripheral
-                # drives its UI and goes on driving into the next one until t_DZ. The
-                # corner search reads the low end of the Per_t_DZ row here, which is what
-                # makes this the earliest release rather than the guaranteed-by one.
-                Term("Per_t_DZ", +inp.Per_t_DZ_max_ns, op="+",
-                     note=_release_note(inp.Per_t_DZ_max_ns)),
-            ]
+    if "keeper_Per" in legs:
+        per_keeper_closing: bool | None = None
+        if inp.Per_ede:
+            per_keeper_terms = ede_held("Per DATA", "Per", inp.Per_t_EDE_ns)
+        else:
+            def _per_keeper_case(closing: bool) -> list[Term]:
+                opening = not closing
+                late = _per_clk_cross_parts(inp, env, corner="late", rising=opening)
+                early = _per_clk_cross_parts(inp, env, corner="early", rising=closing)
+                _k_rising, _crossing = keeper_crossing("Per DATA", "Per", ede=False,
+                                                       clk_rising=opening)
+                return [
+                    *_launch_terms(inp, "Per", "DD", "max", credit=False, rising=_k_rising),
+                    _crossing,
+                    Term("1·UI", +UI, op="+"),
+                    Term(f"{clock_detection_symbol('late', rising=opening)} · Man_t_RF,CLK",
+                         -late[0], op="-", note=_coeff_note(late), factors=late[1:]),
+                    Term(f"{clock_detection_symbol('early', rising=closing)} · Man_t_RF,CLK",
+                         +early[0], op="+", note=_coeff_note(early), factors=early[1:]),
+                    # Same release point as the Manager's conventional leg: the peripheral
+                    # drives its UI and goes on driving into the next one until t_DZ. The
+                    # corner search reads the low end of the Per_t_DZ row here, which is what
+                    # makes this the earliest release rather than the guaranteed-by one.
+                    Term("Per_t_DZ", +inp.Per_t_DZ_max_ns, op="+",
+                         note=_release_note(inp.Per_t_DZ_max_ns)),
+                ]
 
-        per_keeper_closing, per_keeper_terms = _worse_case(
-            [(_c, _per_keeper_case(_c)) for _c in (True, False)])
-    if keeper_term:
+            per_keeper_closing, per_keeper_terms = _worse_case(
+                [(_c, _per_keeper_case(_c)) for _c in (True, False)])
         per_keeper_terms.append(Term("Man_t_Keeper_Response", -keeper_term, op="-",
                                      note=_keeper_note(inp)))
-    per_keeper_margin = sum(t.value_ns for t in per_keeper_terms)
-    breakdowns["keeper_Per"] = InequalityBreakdown(
-        name="keeper_Per", terms=per_keeper_terms, required_ns=0.0,
-        margin_ns=per_keeper_margin,
-        # The conventional release carries the closing UI; the EDE Delay does not.
-        **_fmax_fields(inp, _rate_windows(inp, margin_ns=per_keeper_margin,
-                                 ui_part_ns=0.0 if inp.Per_ede else UI)),
-        is_setup=False,
-        closing_rising=per_keeper_closing)
+        per_keeper_margin = sum(t.value_ns for t in per_keeper_terms)
+        breakdowns["keeper_Per"] = InequalityBreakdown(
+            name="keeper_Per", terms=per_keeper_terms, required_ns=0.0,
+            margin_ns=per_keeper_margin,
+            # The conventional release carries the closing UI; the EDE Delay does not.
+            **_fmax_fields(inp, _rate_windows(inp, margin_ns=per_keeper_margin,
+                                     ui_part_ns=0.0 if inp.Per_ede else UI)),
+            is_setup=False,
+            closing_rising=per_keeper_closing)
 
     # Cross-spec advisories: which threshold window a SoundWire Data input uses, and the
     # t_Slew_Data assumption.
@@ -3519,15 +4069,314 @@ def _compute_at(inp: CalcInputs, supplies: Supplies) -> CalcResults:
         object.__setattr__(b, "fast_data_edge", inp.fast_data_edge)
     return CalcResults(
         inputs=inp,
-        delta_cross_MP_setup_ns=delta_MP["setup", _mp_setup_rising],
-        delta_cross_MP_hold_ns=delta_MP["hold", _mp_hold_rising],
-        sigma_pm_setup_ns=sigma_setup[_pm_setup_launch["PM_setup"]],
-        sigma_pm_hold_ns=sigma_hold[_pm_hold_launch["PM_hold"]],
+        delta_cross_MP_setup_ns=(delta_MP["setup", _mp_setup_rising]
+                                 if "MP_setup" in breakdowns else math.nan),
+        delta_cross_MP_hold_ns=(delta_MP["hold", _mp_hold_rising]
+                                if "MP_hold" in breakdowns else math.nan),
+        sigma_pm_setup_ns=(sigma_setup[_pm_setup_launch["PM_setup"]]
+                           if "PM_setup" in breakdowns else math.nan),
+        sigma_pm_hold_ns=(sigma_hold[_pm_hold_launch["PM_hold"]]
+                          if "PM_hold" in breakdowns else math.nan),
         breakdowns=breakdowns,
         F_CLK_ceiling_MHz=inp.F_CLK_ceiling_MHz(),
         F_CLK_legal=inp.F_CLK_is_legal(),
         caveats=tuple(caveats),
     )
+
+
+# The legs whose margin reads Peripheral B's supply, the third of an assignment (`Supplies`):
+# every other leg has one margin at the assignments that differ in it alone, so `_leg_margins`
+# evaluates them at its first end only. Pinned by
+# test_only_the_pp_legs_read_peripheral_bs_supply.
+_LEGS_READING_PERIPHERAL_B: frozenset[Inequality] = frozenset(
+    {"PP_setup", "PP_setup_ho", "PP_hold", "PP_hold_ho", "PP_contention"})
+
+# The legs that read the slow-edge role of each DATA lane (`edge_factor`'s "late"): every other
+# leg has one margin on the slow and the fast data-edge sets (`CalcInputs.fast_data_edge`), so
+# `_leg_margins` evaluates it on the slow set only. Pinned by
+# test_only_the_listed_legs_read_a_data_lanes_slow_edge.
+_LEGS_READING_SLOW_EDGE: dict[str, frozenset[Inequality]] = {
+    "Man DATA": frozenset({"MP_setup", "MP_setup_ho", "MP_contention", "keeper_Man"}),
+    "Per DATA": frozenset({"PM_setup", "PM_setup_ho", "PP_setup", "PP_setup_ho",
+                           "PM_contention", "PP_contention", "keeper_Per"}),
+}
+
+
+def _pair(first: Inequality, second: Inequality) -> tuple[Inequality, Inequality]:
+    """A leg on t_DD and its t_ZD variant, typed as legs."""
+    return first, second
+
+
+def _worse2(first: bool, first_values: list[float], second: bool,
+            second_values: list[float]) -> tuple[bool, float]:
+    """`_worse_case` over two cases given as their terms' values: the edge of the one it
+    takes and their sum."""
+    m1, m2 = sum(first_values), sum(second_values)
+    least = min([m1, m2])
+    if m1 <= least + 1e-12:
+        return first, m1
+    if m2 <= least + 1e-12:
+        return second, m2
+    raise StopIteration
+
+
+def _ede_release_values(inp: CalcInputs, side: str, clk_rising: bool) -> list[float]:
+    """The values of `_ede_release_terms`' terms, in its order."""
+    lane = "Man DATA" if side == "Man" else "Per DATA"
+    rising = ede_release_rising(inp, side, clk_rising=clk_rising)
+    return [*_launch_values(inp, side, "DD", "max", False, rising, clk_rising),
+            -_to_voh_ns(inp, lane, rising),
+            -(inp.Man_t_EDE_ns if side == "Man" else inp.Per_t_EDE_ns),
+            +inp.UI_ns()]
+
+
+def _margin_statics(inp: CalcInputs) -> dict:
+    """The values `_margins_at` reads that no supply assignment moves, by leg and case: the
+    runs of each case's values between its crossing terms, and the part of a setup leg's
+    required time summed before its crossing parts. Computed once per instance (`_memo`)."""
+    memo = _memo(inp)
+    held = memo.get("margin_statics")
+    if held is not None:
+        return held
+    lv, rv = _launch_values, _receive_values
+    t_PD, t_PDmis, UI = inp.t_PD_ns(), inp.t_PD_mis_ns(), inp.UI_ns()
+    flips = handover_flips_edge(inp)
+    ho = [+inp.handover_UIs * UI] if inp.handover_UIs > 0.0 else []
+    S: dict = {}
+    for name, which in (("MP_setup", "DD"), ("MP_setup_ho", "ZD")):
+        S[name] = {r: ([UI, *lv(inp, "Man", which, "max", False, not r, not r), -t_PDmis],
+                       list(rv(inp, "Per", "IS", r)),
+                       _launch_anchor_ns(inp, "Man", which, "max", rising=not r,
+                                         clk_rising=not r)
+                       + receive_ns(inp, "Per", "IS", clk_rising=r) + t_PDmis)
+                   for r in (False, True)}
+    for name, which, with_ho in (("MP_hold", "DD", False), ("MP_hold_ho", "ZD", True)):
+        S[name] = {r: ([*(ho if with_ho else ()),
+                        *lv(inp, "Man", which, "min", True, not r, r != (with_ho and flips)),
+                        -t_PDmis],
+                       list(rv(inp, "Per", "IH", r)))
+                   for r in (True, False)}
+    for name, which in (("PM_setup", "DD"), ("PM_setup_ho", "ZD")):
+        S[name] = ({dr: [*lv(inp, "Per", which, "max", False, dr, True), -t_PD, -t_PDmis]
+                    for dr in (True, False)},
+                   {r: list(rv(inp, "Man", "IS", r)) for r in (False, True)},
+                   {(dr, r): _launch_anchor_ns(inp, "Per", which, "max", rising=dr)
+                    + receive_ns(inp, "Man", "IS", clk_rising=r) + 2.0 * t_PD + t_PDmis
+                    for dr in (True, False) for r in (False, True)})
+    for name, which, with_ho in (("PM_hold", "DD", False), ("PM_hold_ho", "ZD", True)):
+        S[name] = ([*(ho if with_ho else ()), +t_PD],
+                   {dr: [*lv(inp, "Per", which, "min", True, dr, True), +t_PD, -t_PDmis]
+                    for dr in (True, False)},
+                   {r: list(rv(inp, "Man", "IH", r)) for r in (True, False)})
+    pp_mis_ns = pp_net_mis(inp.pp_placement) * t_PDmis
+    pp_setup_pd_ns = pp_net_pd(inp.pp_placement, is_setup=True) * t_PD
+    pd = [-t_PD] * int(pp_net_pd(inp.pp_placement, is_setup=True))
+    for name, which in (("PP_setup", "DD"), ("PP_setup_ho", "ZD")):
+        S[name] = {r: ([UI, *pd[:1]],
+                       [*lv(inp, "Per", which, "max", False, not r, True), *pd[1:], -pp_mis_ns],
+                       list(rv(inp, "Per", "IS", r)),
+                       _launch_anchor_ns(inp, "Per", which, "max", rising=not r)
+                       + receive_ns(inp, "Per", "IS", clk_rising=r)
+                       + pp_setup_pd_ns + pp_mis_ns)
+                   for r in (False, True)}
+    pd = [+t_PD] * int(pp_net_pd(inp.pp_placement, is_setup=False))
+    for name, which, with_ho in (("PP_hold", "DD", False), ("PP_hold_ho", "ZD", True)):
+        S[name] = {b: ([*(ho if with_ho else ()), *pd[:1]],
+                       [*lv(inp, "Per", which, "min", True, not b, True), *pd[1:], -pp_mis_ns],
+                       list(rv(inp, "Per", "IH", b)))
+                   for b in (True, False)}
+    for name, releasing, acquiring in (("MP_contention", "Man", "Per"),
+                                       ("PM_contention", "Per", "Man"),
+                                       ("PP_contention", "Per", "Per")):
+        ede = _releaser_ede(inp, releasing)
+        t_dz = (0.0 if ede else man_tdz_parts(inp)[0] if releasing == "Man"
+                else inp.Per_t_DZ_max_ns)
+        flight = [+t_PD] if name == "MP_contention" else []
+        mis = ([-pp_net_mis(inp.pp_placement) * t_PDmis] if releasing == acquiring
+               else [-t_PDmis])
+        S[name] = {}
+        for closing in (True, False):
+            release = _ede_release_values(inp, releasing, not closing) if ede else [-t_dz]
+            acq_clk = (closing != flips) or acquiring == "Per"
+            acq = lv(inp, acquiring, "ZD", "min", True,
+                     turn_on_rising(inp, acquiring, clk_rising=acq_clk), acq_clk)
+            S[name][closing] = ([*release, *ho, *acq, *mis] if releasing == acquiring
+                                else ([*release, *ho, *flight], [*acq, *flight, *mis]))
+    S["keeper"] = [-inp.t_keeper_ns]
+    if not inp.Man_ede:
+        open_rising = keeper_open_rising(inp)
+        S["keeper_Man"] = (open_rising,
+                           {k: list(lv(inp, "Man", "DD", "max", False, k, open_rising))
+                            for k in (True, False)},
+                           [+UI, +man_tdz_parts(inp)[0]])
+    S["keeper_Per"] = ({k: list(lv(inp, "Per", "DD", "max", False, k, True))
+                        for k in (True, False)}, [+UI], [+inp.Per_t_DZ_max_ns])
+    memo["margin_statics"] = S
+    return S
+
+
+def _margins_at(inp: CalcInputs, supplies: Supplies,
+                legs: frozenset[Inequality] = frozenset(INEQUALITIES)
+                ) -> dict[Inequality, tuple[float, bool]]:
+    """The margin of each of `legs` at `supplies` as `_compute_at(inp, supplies)` reports it,
+    from the same values summed in the same order, with whether its breakdown is the second
+    case `compute` breaks a tie against (`_second_case`). Builds no term and no note: the
+    corner search reads these (`_leg_margins`). The values no supply assignment moves are
+    `_margin_statics`.
+    test_the_margins_the_corner_search_reads_are_the_ones_compute_reports holds the two
+    equal."""
+    env = inp.envelope(supplies)
+    UI = inp.UI_ns()
+    x = _crossing_lanes(inp, env, pp_only=legs <= _LEGS_READING_PERIPHERAL_B)
+    S = _margin_statics(inp)
+    out: dict[Inequality, tuple[float, bool]] = {}
+    split = _split_cross_values
+
+    # M->P setup and hold, each on t_DD and on t_ZD.
+    for name in _pair("MP_setup", "MP_setup_ho"):
+        if name in legs:
+            st = S[name]
+            cases = []
+            for _r in (False, True):
+                clk, data = split(inp, x.DELTA_MP["setup", _r])
+                pre, post, _ = st[_r]
+                cases.append(pre + clk + data + post)
+            r, _ = _worse2(False, cases[0], True, cases[1])
+            out[name] = (UI - (st[r][2] + x.delta_MP["setup", r]), r)
+    for name in _pair("MP_hold", "MP_hold_ho"):
+        if name in legs:
+            st = S[name]
+            cases = []
+            for _r in (True, False):
+                clk, data = split(inp, x.DELTA_MP["hold", _r])
+                pre, post = st[_r]
+                cases.append(pre + clk + data + post)
+            r, m = _worse2(True, cases[0], False, cases[1])
+            out[name] = (m, not r)
+
+    # P->M setup and hold.
+    for name in _pair("PM_setup", "PM_setup_ho"):
+        if name in legs:
+            mid, post, req = S[name]
+            cases = []
+            for _r in (False, True):
+                clk, data = split(inp, x.SIGMA_SETUP[not _r])
+                cases.append([UI, -inp.t_PD_ns()] + clk + mid[x.SIGMA_SETUP_DATA_RISING[not _r]]
+                             + data + post[_r])
+            r, _ = _worse2(False, cases[0], True, cases[1])
+            out[name] = (UI - (req[x.SIGMA_SETUP_DATA_RISING[not r], r]
+                               + x.sigma_setup[not r]), r)
+    for name, with_ho in zip(_pair("PM_hold", "PM_hold_ho"), (False, True)):
+        if name in legs:
+            pre, mid, post = S[name]
+            flip = with_ho and handover_flips_edge(inp)
+            cases = []
+            for _r in (True, False):
+                lr = _r != flip
+                clk, data = split(inp, x.SIGMA_HOLD[lr])
+                cases.append(pre + clk + mid[x.SIGMA_HOLD_DATA_RISING[lr]] + data + post[_r])
+            r, m = _worse2(True, cases[0], False, cases[1])
+            out[name] = (m, not r)
+
+    # P->P setup and hold.
+    for name in _pair("PP_setup", "PP_setup_ho"):
+        if name in legs:
+            st = S[name]
+            cases, required_of = [], {}
+            for _r in (False, True):
+                a_p = _per_clk_cross_parts(inp, env, corner="late", rising=not _r)
+                pre, mid, post, req = st[_r]
+                required_of[_r] = req + a_p[0] + x.delta_PP["setup", _r]
+                b_clk, b_data = split(inp, x.DELTA_PP["setup", _r])
+                cases.append(pre + [-a_p[0]] + b_clk + mid + b_data + post)
+            r, _ = _worse2(False, cases[0], True, cases[1])
+            out[name] = (UI - required_of[r], r)
+    for name in _pair("PP_hold", "PP_hold_ho"):
+        if name in legs:
+            st = S[name]
+            cases = []
+            for a_rising, b_rising in pp_hold_edges(inp, name):
+                a_edge, b_edge = pp_clock_edges(inp, env, name, sampling_rising=b_rising)
+                a_p = _per_clk_cross_parts(inp, env, corner="early", edge=a_edge,
+                                           rising=a_rising)
+                b_p = _per_clk_cross_parts(inp, env, corner="late", device="B", edge=b_edge,
+                                           rising=b_rising)
+                b_clk, b_dat = split(
+                    inp, (("", "Man CLK", b_p[1], "-"), x.DELTA_PP["hold", b_rising][1]))
+                pre, mid, post = st[b_rising]
+                cases.append(pre + [+a_p[0]] + b_clk + mid + b_dat + post)
+            r, m = _worse2(True, cases[0], False, cases[1])
+            out[name] = (m, not r)
+
+    # Contention.
+    if not legs.isdisjoint(("MP_contention", "PM_contention", "PP_contention")):
+        parts = {_c: _closing_case(inp, env, _c) for _c in (True, False)}
+        if "MP_contention" in legs:
+            st = S["MP_contention"]
+            cases = [st[c][0] + [+parts[c].early[0]] + st[c][1] for c in (True, False)]
+            closing_rising, m = _worse2(True, cases[0], False, cases[1])
+            out["MP_contention"] = (m, closing_rising is False)
+        if "PM_contention" in legs:
+            st = S["PM_contention"]
+            cases = [[-parts[c].late[0]] + st[c][0] + st[c][1] for c in (True, False)]
+            closing_rising, m = _worse2(True, cases[0], False, cases[1])
+            out["PM_contention"] = (m, closing_rising is False)
+        if "PP_contention" in legs:
+            st = S["PP_contention"]
+            cases = [[-parts[c].pp_rel[0], +parts[c].pp_acq[0]] + st[c] for c in (True, False)]
+            closing_rising, m = _worse2(True, cases[0], False, cases[1])
+            out["PP_contention"] = (m, closing_rising is False)
+
+    # The keeper, the Manager releasing, then a Peripheral.
+    def keeper_crossing(lane: str, ede: bool, clk_rising: bool = True) -> tuple[bool, float]:
+        corner, coef, _ = _keeper_pick(inp, lane, supplies, ede=ede, clk_rising=clk_rising)
+        return corner.rising, -coef * lane_ns(inp, lane)
+
+    def ede_held(lane: str, t_ede_ns: float) -> list[float]:
+        rising, crossing = keeper_crossing(lane, True)
+        return [crossing, +_to_voh_ns(inp, lane, rising), +t_ede_ns]
+
+    if "keeper_Man" in legs:
+        if inp.Man_keeper_forced:
+            out["keeper_Man"] = (math.inf, False)
+        else:
+            if inp.Man_ede:
+                values = ede_held("Man DATA", inp.Man_t_EDE_ns)
+            else:
+                open_rising, launches, tail = S["keeper_Man"]
+                k_rising, crossing = keeper_crossing("Man DATA", False, open_rising)
+                values = launches[k_rising] + [crossing] + tail
+            out["keeper_Man"] = (sum(values + S["keeper"]), False)
+    if "keeper_Per" in legs:
+        per_closing: bool | None = None
+        if inp.Per_ede:
+            values = ede_held("Per DATA", inp.Per_t_EDE_ns)
+        else:
+            launches, ui, dz = S["keeper_Per"]
+            cases = []
+            for _c in (True, False):
+                late = _per_clk_cross_parts(inp, env, corner="late", rising=not _c)
+                early = _per_clk_cross_parts(inp, env, corner="early", rising=_c)
+                k_rising, crossing = keeper_crossing("Per DATA", False, not _c)
+                cases.append(launches[k_rising] + [crossing] + ui + [-late[0], +early[0]] + dz)
+            per_closing, _ = _worse2(True, cases[0], False, cases[1])
+            values = cases[0] if per_closing else cases[1]
+        out["keeper_Per"] = (sum(values + S["keeper"]), per_closing is False)
+    return out
+
+
+def _leg_margins(inp: CalcInputs) -> dict[Inequality, float]:
+    """Each leg's margin as `compute(inp)` reports it: over the runs `compute` evaluates
+    (`_runs_of`), the same tie broken the same way, from `_margins_at`. Raises what `compute`
+    raises for an input the model cannot evaluate."""
+    _check_inputs(inp)
+    runs = [_margins_at(at, s, legs) for at, s, legs in _runs_of(inp)]
+    out: dict[Inequality, float] = {}
+    for leg in INEQUALITIES:
+        cands = [r[leg] for r in runs if leg in r]
+        least = min([m for m, _ in cands])
+        out[leg] = min([mt for mt in cands if mt[0] <= least + 1e-12], key=lambda mt: mt[1])[0]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3586,8 +4435,14 @@ def apply_row_picks(
     A WINDOW ROW IS NOT COLLAPSED: its two bound fields take the range's two ends, so
     both remain in force and the envelope can corner two receivers at opposite ends of
     one compliance window.  See `CalcRow.is_window`.
+
+    `tRF_row_max_ns` takes the largest max of the rows bound to a lane's t_RF, at every pick.
     """
     overrides: dict[str, float] = {}
+    lanes = set(_LANE_FIELDS.values())
+    slowest = [row.range.max for row in rows if lanes & set(row.binds)]
+    if slowest:
+        overrides["tRF_row_max_ns"] = max(slowest)
     for row in rows:
         if row.is_window:
             lo_field, hi_field = row.binds        # (min-bound, max-bound), in that order
@@ -3656,23 +4511,35 @@ def _pick_rank(p: RowPick) -> float:
     return 3.0 + p.at if isinstance(p, RowPoint) else ("typ", "min", "max").index(p)
 
 
-# `_refine_fraction_row`: the samples across a row's range (positions k / _REFINE_SAMPLES), and
-# the parabolic steps that polish the least of them.
+# `_refine_fraction_row`: the samples that bracket a row's minima (positions k / _REFINE_SAMPLES
+# of its range); the margin tolerance each bracket is minimised to, a hundredth of the 0.01 ns
+# a margin is shown to; the position width at which a bracket stops whatever its margins; the
+# probe's distance from an end sample, as a fraction of the end interval; the evaluations one
+# bracket may take; and the golden-section fraction, (3 - sqrt 5) / 2.
 _REFINE_SAMPLES = 4
-_REFINE_STEPS = 2
+_REFINE_TOL_NS = 1e-4
+_REFINE_MIN_WIDTH = 1e-6
+_REFINE_PROBE = 1e-3
+_REFINE_MAX_EVALS = 40
+_GOLDEN = 0.3819660112501051
 
 
 def _refine_fraction_row(row: CalcRow, i: int, best_m: float, best_c: tuple[RowPick, ...],
                          margin_of: Callable[[tuple[RowPick, ...]], float]
                          ) -> tuple[float, tuple[RowPick, ...]]:
     """`best_c` with the τ, α or δ row at index `i` moved inside its range where that leaves a
-    smaller margin, and that margin (`find_worst_corner_rows`). The row is sampled at
-    positions k / `_REFINE_SAMPLES` of its range (0 at min, 0.5 at typ, 1 at max), the others
-    held; around the least sample inside the range, up to `_REFINE_STEPS` steps of parabolic
-    interpolation through it and its two neighbours, each kept only where the parabola is
-    convex and its vertex lies between them. A margin is the least of smooth cases, so it
-    can turn at a case boundary as well as inside a case; the samples find the case, the
-    steps its least point. No sample is taken with `_REFINE_SAMPLES` 0."""
+    smaller margin, and that margin (`find_worst_corner_rows`). The others are held.
+
+    The row is sampled at positions k / `_REFINE_SAMPLES` of its range (0 at min, 0.5 at typ,
+    1 at max), the samples a set of legs at one combination shares. Every sample no greater
+    than its neighbours brackets a minimum: an interior one with its two neighbours, and an
+    end one with its neighbour where a probe `_REFINE_PROBE` of the interval inside the end
+    is smaller than the end. Each bracket is minimised (`_minimise_bracket`) until a convex
+    margin through its three points could fall no more than `_REFINE_TOL_NS` below the least,
+    and the least point of all is the result. A margin is the least of smooth cases, so it can
+    turn at a case boundary or at a kink of an edge's slew factor as well as inside a case;
+    a minimum in an interval that no sample marks as a bracket is not searched. A row whose
+    samples are all equal is not searched, and none is with `_REFINE_SAMPLES` 0."""
     if _REFINE_SAMPLES <= 0:
         return best_m, best_c
 
@@ -3682,26 +4549,71 @@ def _refine_fraction_row(row: CalcRow, i: int, best_m: float, best_c: tuple[RowP
                          else RowPoint(pos, value, f"at {100.0 * value:.2f} %"))
         return (*best_c[:i], pick, *best_c[i + 1:])
 
-    points = {k / _REFINE_SAMPLES: margin_of(at(k / _REFINE_SAMPLES))
-              for k in range(_REFINE_SAMPLES + 1)}
-    for _ in range(_REFINE_STEPS):
-        xs = sorted(points)
-        j = min(range(len(xs)), key=lambda n: points[xs[n]])
-        if j in (0, len(xs) - 1):
-            break
-        (x0, x1, x2) = xs[j - 1:j + 2]
-        y0, y1, y2 = points[x0], points[x1], points[x2]
-        den = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0)
-        if not (y0 - y1) / (x0 - x1) < (y1 - y2) / (x1 - x2) or den == 0.0:
-            break
-        x = x1 - 0.5 * ((x1 - x0) ** 2 * (y1 - y2) - (x1 - x2) ** 2 * (y1 - y0)) / den
-        if not x0 < x < x2 or min(abs(x - p) for p in points) < 1e-4:
-            break
-        points[x] = margin_of(at(x))
+    points: dict[float, float] = {}
+
+    def f(pos: float) -> float:
+        if pos not in points:
+            points[pos] = margin_of(at(pos))
+        return points[pos]
+
+    xs = [k / _REFINE_SAMPLES for k in range(_REFINE_SAMPLES + 1)]
+    ys = [f(x) for x in xs]
+    if max(ys) - min(ys) > 1e-12:
+        last = len(xs) - 1
+        for j in range(len(xs)):
+            if (j > 0 and ys[j] > ys[j - 1]) or (j < last and ys[j] > ys[j + 1]):
+                continue
+            if 0 < j < last:
+                _minimise_bracket(f, xs[j - 1], xs[j], xs[j + 1])
+                continue
+            inner = xs[1] if j == 0 else xs[last - 1]
+            probe = xs[j] + _REFINE_PROBE * (inner - xs[j])
+            if f(probe) < ys[j] - 1e-12:
+                _minimise_bracket(f, *sorted((xs[j], probe, inner)))
     pos, m = min(points.items(), key=lambda kv: kv[1])
     if m < best_m - 1e-12:
         return m, at(pos)
     return best_m, best_c
+
+
+def _convex_shortfall(f: Callable[[float], float], a: float, c: float, b: float) -> float:
+    """How far below f(c) a convex function through (a, f(a)), (c, f(c)) and (b, f(b)) can
+    fall on [a, b]: the extension of each side's chord across the other side."""
+    fa, fc, fb = f(a), f(c), f(b)
+    return max((fa - fc) / (c - a) * (b - c), (fb - fc) / (b - c) * (c - a), 0.0)
+
+
+def _minimise_bracket(f: Callable[[float], float], a: float, c: float, b: float) -> None:
+    """Minimise `f` on [a, b] from c, f(c) no greater than f(a) or f(b), evaluating `f` at
+    each point it tries: each step takes the vertex of the parabola through the three points
+    where it lies inside the bracket and away from its points, else the golden-section point
+    of the longer side, and a step after a parabolic one that left the bracket wider than 0.7
+    of its width is a golden-section one. It stops where `_convex_shortfall` is below
+    `_REFINE_TOL_NS`, the bracket is narrower than `_REFINE_MIN_WIDTH`, or after
+    `_REFINE_MAX_EVALS` steps."""
+    golden = False
+    for _ in range(_REFINE_MAX_EVALS):
+        width = b - a
+        if width < _REFINE_MIN_WIDTH or _convex_shortfall(f, a, c, b) < _REFINE_TOL_NS:
+            return
+        fa, fc, fb = f(a), f(c), f(b)
+        clear = 0.01 * width
+        u = None
+        den = (c - a) * (fc - fb) - (c - b) * (fc - fa)
+        if not golden and den != 0.0:
+            vertex = c - 0.5 * ((c - a) ** 2 * (fc - fb) - (c - b) ** 2 * (fc - fa)) / den
+            if a + clear < vertex < b - clear and abs(vertex - c) > clear:
+                u = vertex
+        parabolic = u is not None
+        if u is None:
+            u = c + _GOLDEN * (b - c) if b - c > c - a else c - _GOLDEN * (c - a)
+        if f(u) < fc:
+            a, c, b = (a, u, c) if u < c else (c, u, b)
+        elif u < c:
+            a = u
+        else:
+            b = u
+        golden = parabolic and b - a > 0.7 * width
 
 
 def find_worst_corner_rows(
@@ -3741,10 +4653,9 @@ def find_worst_corner_rows(
     τ, α AND δ ARE REFINED INSIDE THEIR RANGES. A crossing coefficient is not affine in α or δ,
     nor a kink's place in τ, so a margin can be least between two of their picks. Each leg's
     best combination is searched further along each of the three in turn, the others held
-    (`_refine_fraction_row`): sampled at quarters of its range, and the least sample polished
-    by parabolic interpolation. A point is kept only where its margin is smaller, so the
-    refinement never reports a better margin than the grid's. A minimum narrower than a
-    quarter of the range that no sample falls in can still be missed.
+    (`_refine_fraction_row`): samples across its range bracket each minimum they mark, and each
+    bracket is minimised to `_REFINE_TOL_NS`. A point is kept only where its margin is
+    smaller, so the refinement never reports a better margin than the grid's.
 
     A MIN of two functions that move a row in different directions violates the single-row
     condition: the margin is flat at the typ base wherever the other branch binds.  So a NEW
@@ -3753,6 +4664,11 @@ def find_worst_corner_rows(
     assignment moves a row the same way, and the brute-force tests confirm it. So is its min
     over the slow and fast data-edge sets (`CalcInputs.fast_data_edge`): the two differ only in
     the DATA lanes' slew factors, which the joint rows set.
+
+    A PLACEMENT THAT PINS THE PERIPHERALS' DISTANCE fixes the rows `placement_row_picks` names
+    for a leg, the bus-length row at its max under "both_far" (All at the far end) and on the
+    P->P setup and hold legs under a driver placement: they are not searched, and the leg's
+    picks hold them there.
 
     WINDOW ROWS ARE NOT PERTURBED and get no pick, which is not a gap in the search.
     Their two ends are BOTH in force, and the envelope reads whichever end each role
@@ -3770,38 +4686,52 @@ def find_worst_corner_rows_all(
 ) -> dict[Inequality, dict[str, RowPick]]:
     """`find_worst_corner_rows` for each of `inequalities`, from one evaluation of each set of
     picks: a set's inputs are the same for every inequality, and two sets that give the same
-    inputs are evaluated once. A set is evaluated for its margins only (`_MARGINS_ONLY`)."""
-    token = _MARGINS_ONLY.set(True)
-    try:
-        return _worst_corner_rows_all(inequalities, rows, base)
-    finally:
-        _MARGINS_ONLY.reset(token)
+    inputs are evaluated once. A set is evaluated for its margins only (`_leg_margins`)."""
+    # The legs whose placement pins the same rows are searched together, every set of picks
+    # evaluated once across them.
+    groups: dict[tuple[tuple[str, Pick], ...], list[Inequality]] = {}
+    for leg in inequalities:
+        pinned = placement_row_picks(base.pp_placement, rows, leg)
+        groups.setdefault(tuple(sorted(pinned.items())), []).append(leg)
+    evaluated: dict[CalcInputs, dict[Inequality, float]] = {}
+    out: dict[Inequality, dict[str, RowPick]] = {}
+    for pinned_items, legs in groups.items():
+        out.update(_search_corner_rows(legs, rows, base, dict(pinned_items), evaluated))
+    return {leg: out[leg] for leg in inequalities}
 
 
-def _worst_corner_rows_all(
+def _search_corner_rows(
     inequalities: Sequence[Inequality],
     rows: list[CalcRow],
     base: CalcInputs,
+    pinned: Mapping[str, Pick],
+    evaluated: dict[CalcInputs, dict[Inequality, float]],
 ) -> dict[Inequality, dict[str, RowPick]]:
+    """`find_worst_corner_rows_all` for `inequalities`, the rows `pinned` names held at their
+    picks, each set of picks evaluated once into `evaluated`."""
     joint = _joint_rows(rows)
     joint_names = [r.name for r in joint]
     masters = [r for r in rows if r.linked_to is None and not r.is_window]
-    single = [r for r in masters if r.name not in joint_names]
-    base_picks: dict[str, RowPick] = {row.name: "typ" for row in masters}
-    out: dict[Inequality, dict[str, RowPick]] = {leg: {} for leg in inequalities}
-    evaluated: dict[CalcInputs, CalcResults] = {}
+    single = [r for r in masters if r.name not in joint_names and r.name not in pinned]
+    base_picks: dict[str, RowPick] = {**{row.name: "typ" for row in masters}, **pinned}
+    # Every row at its min, then every row at its max, is checked before any corner is
+    # evaluated, so a refusal quotes a value a row holds. Each check is an interval on one
+    # field, so valid ends make every pick valid.
+    for end in ("min", "max"):
+        _check_inputs(apply_row_picks(base, rows, {row.name: end for row in masters}))
+    out: dict[Inequality, dict[str, RowPick]] = {leg: dict(pinned) for leg in inequalities}
 
-    def run(picks: Mapping[str, RowPick]) -> CalcResults:
+    def run(picks: Mapping[str, RowPick]) -> dict[Inequality, float]:
         inp = apply_row_picks(base, rows, picks)
         if inp not in evaluated:
-            evaluated[inp] = compute(inp)
+            evaluated[inp] = _leg_margins(inp)
         return evaluated[inp]
 
     for row in single:
-        results: dict[Pick, CalcResults] = {p: run({**base_picks, row.name: p})
-                                            for p in ("typ", "min", "max")}
+        results: dict[Pick, dict[Inequality, float]] = {p: run({**base_picks, row.name: p})
+                                                        for p in ("typ", "min", "max")}
         for leg in inequalities:
-            margins = {p: r.breakdowns[leg].margin_ns for p, r in results.items()}
+            margins = {p: r[leg] for p, r in results.items()}
             smallest = min(margins.values())
             # Ties go to typ, so an insensitive row is not reported as if its corner
             # had been chosen for a reason.
@@ -3825,13 +4755,13 @@ def _worst_corner_rows_all(
     combos.sort(key=lambda c: tuple(_pick_rank(p) for p in c))
 
     def margin(leg: Inequality, combo: Sequence[RowPick]) -> float:
-        return run({**base_picks, **dict(zip(joint_names, combo))}).breakdowns[leg].margin_ns
+        return run({**base_picks, **dict(zip(joint_names, combo))})[leg]
 
     grid = [run({**base_picks, **dict(zip(joint_names, combo))}) for combo in combos]
     for leg in inequalities:
         best_m, best_c = math.inf, combos[0]
         for combo, r in zip(combos, grid):
-            m = r.breakdowns[leg].margin_ns
+            m = r[leg]
             # Ties go to the combination with more rows at typ, as for a single row.
             if math.isclose(m, best_m, abs_tol=1e-12):
                 if combo.count("typ") > best_c.count("typ"):
@@ -3869,6 +4799,7 @@ def default_swi3s_rows(lock_mgr_lanes: bool = True) -> list[CalcRow]:
     same Mgr chip's CLK and DATA lanes to opposite spec edges.  Numeric
     min/typ/max values for the two lanes remain independently editable.
     """
+    _IH_MIN, _IH_MAX, _IL_MIN, _IL_MAX = SWI3S_INPUT_WINDOW
     return [
         # Receiver thresholds: a COMPLIANCE WINDOW, kept as one. Each device's own
         # rising/falling threshold is a corner of THAT device somewhere inside it, so
@@ -3876,9 +4807,9 @@ def default_swi3s_rows(lock_mgr_lanes: bool = True) -> list[CalcRow]:
         # case on every leg that nets two peripherals' crossings. A collapsed pick would
         # assert one threshold for the whole bus.
         CalcRow("V_IH", ("V_IH_min_frac", "V_IH_max_frac"),
-                ParamRange(0.45, 0.55, 0.65), is_window=True),
+                ParamRange(_IH_MIN, (_IH_MIN + _IH_MAX) / 2, _IH_MAX), is_window=True),
         CalcRow("V_IL", ("V_IL_min_frac", "V_IL_max_frac"),
-                ParamRange(0.35, 0.45, 0.55), is_window=True),
+                ParamRange(_IL_MIN, (_IL_MIN + _IL_MAX) / 2, _IL_MAX), is_window=True),
 
         # Output timing range (picker collapses min/max to one value)
         CalcRow("Man_t_DD", ("Man_t_DD_min_ns", "Man_t_DD_max_ns"),

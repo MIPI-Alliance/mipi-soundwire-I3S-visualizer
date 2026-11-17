@@ -79,6 +79,11 @@ public:
         return sent;
     }
 
+    // The state, for a checkpoint and the diagnostic that reads it back: the LFSR register
+    // Q8..Q0 and the No-Toggle FSM state (0..16, NT_0..NT_16).
+    U16 Q() const { return mQ; }
+    int NoToggleState() const { return mNtState; }
+
 private:
     // Y^-k is register bit Q(9-k): Q8 holds the most recent bit. kTapBitY5 is the bit
     // index of the Y^-5 tap (Q4), kTapBitY9 that of the Y^-9 tap (Q0).

@@ -117,6 +117,21 @@ def test_changing_the_skipping_numerator_high_byte_of_a_running_port_is_flagged(
     assert flagged(0x00) is False                # the value already there
 
 
+@pytest.mark.parametrize("address,value,denominator", [(0x13, 8, 8), (0x12, 0x01, 0x100)])
+def test_an_immediate_skipping_denominator_write_updates_the_decoded_config(address, value,
+                                                                           denominator):
+    """SkippingDenominator (0x1012 [11:8], 0x1013 [7:0]) is single-ranked: a write to it
+    mid-stream takes effect in the decoded config without a commit. The running port has no
+    skipping, so this pins the config the decode reports, not the payload placement."""
+    levels = swi3score.make_running_port_write_levels(32, address, value, base=0x1000)
+    d = swi3score.Decoder(swi3score.MemorySampleSource(levels, 98_304_000, 4),
+                          swi3score.DecoderSettings())
+    d.run()
+    assert [c for c in d.commands() if c["command"] == "WriteA32" and c["crc_valid"]
+            and c["address"] == 0x1000 + address]
+    assert d.config_dataports()["skipping_denominator"] == denominator
+
+
 def test_num_columns_reads_its_five_bits():
     for value in (3, 15, 16, 17, 30, 31):
         cmds = [{"is_write": True, "device_mask": 1, "address": SLC_NEXT, "data": bytes([value])},

@@ -162,11 +162,11 @@ def test_a_contact_sheet_that_cannot_be_written_or_an_image_it_cannot_read_is_a_
     (False, None, None),
 ])
 def test_render_asks_for_every_state_of_every_mode(tmp_path, monkeypatch, native, asked, note):
-    """render() visits each mode in exactly the four named states, and the contact sheet
-    orders by those names, so a state renamed in one place and not the other fails here.
-    A QT_QPA_PLATFORM that differs from the platform the renders run on is named, as
-    "is not used" when a platform was forced and "is cleared" when the native one ran; one
-    equal to it, or none, is not named."""
+    """render() visits each mode and each dialog in DIALOGS in exactly the four named
+    states, and the contact sheet orders by those names, so a state renamed in one place
+    and not the other fails here. A QT_QPA_PLATFORM that differs from the platform the
+    renders run on is named, as "is not used" when a platform was forced and "is cleared"
+    when the native one ran; one equal to it, or none, is not named."""
     from PySide6.QtCore import QCoreApplication, QSettings
 
     from swi3s_studio.ui.mode_controller import MODE_LABELS, MODES
@@ -215,7 +215,92 @@ def test_render_asks_for_every_state_of_every_mode(tmp_path, monkeypatch, native
                 f"{_app.platformName()}") in report
     else:
         assert "QT_QPA_PLATFORM" not in report
-    labels = [MODE_LABELS[m].replace(" ", "_") for m in MODES]
+    assert [d for d, _ in S.DIALOGS] == ["Filter_Expression", "Open_Capture", "Export_Capture",
+                                         "Export_Audio", "Preferences", "Devices"]
+    labels = [MODE_LABELS[m].replace(" ", "_") for m in MODES] + [d for d, _ in S.DIALOGS]
     states = {st for n in seen for st in S._STATES if n.endswith("_" + st)}
     assert states == set(S._STATES)
     assert sorted(seen) == sorted(f"{lb}_{st}" for lb in labels for st in S._STATES)
+
+
+def _window_with(*widgets, size=(300, 120)):
+    """A white window holding `widgets` (each a (class, text, x, y) tuple), shown and settled;
+    the widgets are returned with it."""
+    window = QWidget()
+    window.setFixedSize(*size)
+    window.setStyleSheet("QWidget { background: white; }")
+    made = []
+    for cls, text, x, y in widgets:
+        w = cls(text, window)
+        w.move(x, y)
+        w.adjustSize()
+        made.append(w)
+    window.show()
+    for _ in range(5):
+        _app.processEvents()
+    return window, made
+
+
+def test_a_widget_that_is_disabled_hidden_or_partly_shown_is_not_read():
+    window, (on, off, hidden, partly, empty) = _window_with(
+        (QPushButton, "Enabled", 10, 10), (QPushButton, "Disabled", 110, 10),
+        (QPushButton, "Hidden", 10, 50), (QPushButton, "Partly", 250, 50),
+        (QPushButton, "  ", 110, 50))
+    off.setEnabled(False)
+    hidden.hide()
+    for _ in range(5):
+        _app.processEvents()
+    assert partly.visibleRegion().boundingRect().size() != partly.size()
+    assert [t for _, t, _ in S._text_widgets(window)] == ["Enabled"]
+    window.close()
+
+
+def test_check_window_flags_faint_text_and_a_clipped_button():
+    """check_window composes the findings of one rendered state: a button whose text is
+    faint on its background is a CONTRAST finding, one narrower than its text a CLIPPED
+    finding, and a legible, fitting one neither."""
+    window, (faint, narrow, fine) = _window_with(
+        (QPushButton, "Faint label", 10, 10), (QPushButton, "A label too long to fit", 10, 50),
+        (QPushButton, "Legible", 150, 10))
+    for b in (faint, narrow, fine):
+        b.setFlat(True)
+    faint.setStyleSheet("QPushButton { color: #eeeeee; background: white; border: none; }")
+    fine.setStyleSheet("QPushButton { color: #101010; background: white; border: none; }")
+    narrow.setFixedWidth(40)
+    for _ in range(5):
+        _app.processEvents()
+    found, _ = S.check_window(window, window.grab().toImage(), "light")
+    assert any(f.startswith("CONTRAST") and "Faint label" in f for f in found), found
+    assert any(f.startswith("CLIPPED") and "too long" in f for f in found), found
+    assert not any("Legible" in f for f in found), found
+    window.close()
+
+
+def _faint(widget):
+    from PySide6.QtGui import QColor, QPalette
+    pal = widget.palette()
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(238, 238, 238))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(238, 238, 238))
+    widget.setPalette(pal)
+
+
+@pytest.mark.parametrize("cls_name", ["QCheckBox", "QRadioButton"])
+def test_a_faint_label_beside_a_strong_indicator_is_flagged(cls_name):
+    """The check box's or radio button's text is read to the right of its indicator, so an
+    indicator drawn in a strong colour does not carry the reading of a label that cannot be
+    read; a legible label next to it passes."""
+    from PySide6 import QtWidgets
+    cls = getattr(QtWidgets, cls_name)
+    window, (faint, plain) = _window_with((cls, "Enable the faint option", 10, 10),
+                                          (cls, "Enable the plain option", 10, 50))
+    faint.setChecked(True)
+    plain.setChecked(True)
+    _faint(faint)
+    for _ in range(5):
+        _app.processEvents()
+    assert S._label_left(faint) > 8
+    found, _ = S.check_window(window, window.grab().toImage(), "light")
+    contrast = [f for f in found if f.startswith("CONTRAST")]
+    assert any("faint option" in f for f in contrast), found
+    assert not any("plain option" in f for f in contrast), found
+    window.close()

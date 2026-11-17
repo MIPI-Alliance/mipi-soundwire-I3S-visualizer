@@ -283,7 +283,8 @@
       "expanded": []
     },
     "timing_pane": {
-      "region": "16 col  (0.34–1.00 s)",
+      "region": "1x44.1k, 2x48k, 2x3.072M  (0.34\u20131.00 s)",
+      "section": 2,
       "filter": [
         "Manager",
         "AMP1 · Device 0 DP0",

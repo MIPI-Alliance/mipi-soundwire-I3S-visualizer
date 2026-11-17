@@ -14,20 +14,20 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location -Path $repo
 
-# The interpreters run.ps1 supports: 3.11-3.13, newest first via the py launcher.
+# The interpreters run.ps1 supports: 3.11-3.15, newest first via the py launcher.
 $pyCmd = $null
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    foreach ($v in "3.13", "3.12", "3.11") {
+    foreach ($v in "3.15", "3.14", "3.13", "3.12", "3.11") {
         & cmd /c "py -$v -c ""import sys"" 2>nul"
         if ($LASTEXITCODE -eq 0) { $pyCmd = "py -$v"; break }
     }
 }
 if (-not $pyCmd) {
-    & cmd /c "python -c ""import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)"" 2>nul"
+    & cmd /c "python -c ""import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,15) else 1)"" 2>nul"
     if ($LASTEXITCODE -eq 0) { $pyCmd = "python" }
 }
 if (-not $pyCmd) {
-    Write-Error "Need Python 3.11-3.13. Install one, e.g.:  winget install --id Python.Python.3.12 -e"
+    Write-Error "Need Python 3.11-3.15. Install one, e.g.:  winget install --id Python.Python.3.12 -e"
     exit 1
 }
 

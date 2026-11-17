@@ -193,8 +193,8 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
     Shared by the app's silent open path and the convert_174 CLI. Unrecognised
     fields are reported via ``warn``. A value the converter changes to fit (a count below
     1, more channels than a port has, Row Rate or Rows to Draw outside its range, a flag that is not
-    true/false/1/0/yes/no, which reads as false, a CDS/S0 Handover Width outside 0..3, a CDS
-    Guard Polarity on a disabled guard) is reported via ``clamped`` as text
+    true/false/1/0/yes/no, which reads as false, a CDS/S0 Handover Width outside 0..3) is
+    reported via ``clamped`` as text
     naming the field, the port and the value used. The CDS guard, polarity and tail width
     are written to every CDS source. A cell that is not a whole number, a Row Rate that is
     not a finite number, and an interface value the model refuses (Columns per Row, S0 Width,
@@ -236,20 +236,14 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
                'S0 Width', old['S0 Width'][0])
     if old.get('CDS Guard Enabled'):
         iface.CDS_GuardEnabled_REG = flag('CDS Guard Enabled')
-    # Older files predate the Guard 0/Guard 1 polarity choice; absent -> Guard 0
-    # (False), matching the pre-polarity behaviour.
+    # A file with no polarity row reads polarity 0 (Guard 0).
     if old.get('CDS Guard Polarity'):
         iface.CDS_GuardPolarity_REG = flag('CDS Guard Polarity')
-    # One guard for every source, as the current format's per-source rows carry it (0 off,
-    # 1 Guard 0, 2 Guard 1). Those rows hold a polarity only with its guard enabled, so a
-    # polarity set on a disabled guard is reported and written as Guard 0.
-    if iface.CDS_GuardPolarity_REG and not iface.CDS_GuardEnabled_REG:
-        if clamped:
-            clamped("CDS Guard Polarity is true while CDS Guard Enabled is false; a polarity "
-                    "is kept only with its guard, so false is used")
-        iface.CDS_GuardPolarity_REG = False
-    guard = (2 if iface.CDS_GuardPolarity_REG else 1) if iface.CDS_GuardEnabled_REG else 0
-    iface.CDS_Guard_PerSource = [guard] * len(iface.CDS_Guard_PerSource)
+    # One guard for every source, as the current format's per-source rows carry it: the
+    # enable and the polarity independently, a polarity kept whether or not the guard is on.
+    sources = len(iface.CDS_GuardEnable_PerSource)
+    iface.CDS_GuardEnable_PerSource = [bool(iface.CDS_GuardEnabled_REG)] * sources
+    iface.CDS_GuardPolarity_PerSource = [int(bool(iface.CDS_GuardPolarity_REG))] * sources
     if old.get('CDS Tail Width'):
         _store(iface, 'CDS_TailWidth_REG', _whole(old['CDS Tail Width'][0], 'CDS Tail Width'),
                'CDS Tail Width', old['CDS Tail Width'][0])
@@ -379,6 +373,19 @@ def convert(old: Dict[str, List[str]], warn: Callable[[str], None],
 
 # ---- version detection + upgrade ------------------------------------------
 
+def looks_like_config(lines) -> bool:
+    """Whether the first `lines` of a CSV are a Visualizer config: a row whose name (its
+    first field) is AppVersion or NumColumns, ends _REG, or starts with a legacy
+    v1.73/v1.74 field name (_LEGACY_MARKERS). A capture CSV's first field is Time, so a
+    channel named …_REG does not make one."""
+    for ln in lines:
+        name = _normalize(ln.split(",", 1)[0].strip().strip('"'))
+        if (name.startswith(("AppVersion", "NumColumns")) or name.endswith("_REG")
+                or name.startswith(_LEGACY_MARKERS)):
+            return True
+    return False
+
+
 def detect_version(text: str) -> str:
     """Classify config-CSV `text` as 'legacy', 'register_old' (v2.0, no
     DataPortNumber), 'current' (v3.0), or 'unknown'."""
@@ -388,6 +395,16 @@ def detect_version(text: str) -> str:
     if any(f == "NumColumns_REG" or f.endswith("_REG") for f in fields):
         return "current" if "DataPortNumber" in fields else "register_old"
     return "unknown"
+
+
+def _fcp_cleared_note(iface) -> str:
+    """The import note for the FCP registers the current-format text writes as 0, or ''."""
+    from ..swviz.io.csv_handler import CSVHandler
+    cleared = CSVHandler.fcp_cleared_on_save(iface)
+    if not cleared:
+        return ""
+    return ("a flow control port is not in use in FlowMode 0 or 1, so its non-zero FCP "
+            f"registers are written as 0: {'; '.join(cleared)}.")
 
 
 def _model_to_text(iface, viz) -> str:
@@ -411,8 +428,9 @@ def _upgrade_register_text(text: str, source: str = "") -> str:
     swviz model (which fills in the fields v2.0 predates, e.g. DataPortNumber).
     Falls back to the original text if the model can't load it (the C++/BusConfig
     parsers already tolerate a v2.0 file, so opening still works). Fields the model
-    does not recognise, which the upgraded text leaves out, and the fallback are
-    import warnings for `source`."""
+    does not recognise, which the upgraded text leaves out, the non-zero FCP registers of
+    a port in FlowMode 0 or 1, which it writes as 0, and the fallback are import warnings
+    for `source`."""
     from ..swviz.io.csv_handler import CSVHandler
     from ..swviz.models import Interface
     from ..swviz.viz import VizConfig
@@ -430,7 +448,11 @@ def _upgrade_register_text(text: str, source: str = "") -> str:
                               "it is read as written, and fields v2.0 does not have take "
                               "their defaults.")
             return text
-        for note in res.notes(missing=False):
+        notes = res.notes(missing=False)
+        cleared = _fcp_cleared_note(iface)
+        if cleared:
+            notes.append(cleared)
+        for note in notes:
             import_notes.warn(source, f"upgrading this v2.0 config: {note}")
         return _model_to_text(iface, viz)
     except Exception as exc:  # noqa: BLE001 — never block opening a readable v2.0 file
@@ -453,13 +475,34 @@ def _legacy_short_rows(old: Dict[str, List[str]]) -> List[str]:
             if name in _DP_FIELDS and len(vals) < NUM_DP]
 
 
+# The legacy rows every v1.73 and v1.74 export writes. The interval is one row in v1.73
+# and two in v1.74; each name in a tuple is one form of the same row.
+_LEGACY_INTERFACE_ROWS: Tuple[Tuple[str, ...], ...] = (('Columns per Row',),
+                                                        ('Row Rate [kHz]',))
+_LEGACY_DP_ROWS: Tuple[Tuple[str, ...], ...] = (
+    ('Data Port Device Number',), ('Data Port Channels',), ('Data Port Sample Width',),
+    ('Data Port Interval', 'Data Port Interval Integer'), ('Data Port Offset',),
+    ('Data Port Horizontal Start',), ('Data Port Horizontal Count',), ('Source',),
+    ('Data Port Enabled',))
+
+
+def _legacy_absent_rows(old: Dict[str, List[str]]) -> List[str]:
+    """The rows of `_LEGACY_INTERFACE_ROWS`, and of `_LEGACY_DP_ROWS` when the file has
+    any per-port row, that `old` lacks, each by its last name."""
+    want = list(_LEGACY_INTERFACE_ROWS)
+    if any(name in _DP_FIELDS for name in old):
+        want += _LEGACY_DP_ROWS
+    return [forms[-1] for forms in want if not any(f in old for f in forms)]
+
+
 def to_current_text(text: str, source: str = "") -> str:
     """Upgrade config-CSV `text` to the CURRENT register-style format.
 
     Already-current (or unrecognised) text is returned unchanged; legacy
     (v1.73/v1.74) and v2.0 files are converted. `source` names the file in the import
-    warnings: unrecognised legacy fields, legacy per-port rows short of a value per data
-    port, a v2.0 file that does not upgrade, and text with no config fields at all (an empty
+    warnings: unrecognised legacy fields, legacy rows every legacy export writes that
+    are missing (the per-port ones when the file has a per-port row), legacy per-port rows
+    short of a value per data port, a v2.0 file that does not upgrade, and text with no config fields at all (an empty
     or blank file included)."""
     version = detect_version(text)
     if version == "unknown":
@@ -494,6 +537,10 @@ def to_current_text(text: str, source: str = "") -> str:
             shown = '; '.join(changed[:4]) + (' …' if n > 4 else '')
             import_notes.warn(source, f"{n} legacy value{'s' if n != 1 else ''} did not fit "
                               f"and {'were' if n != 1 else 'was'} changed: {shown}.")
+        absent = _legacy_absent_rows(old)
+        if absent:
+            import_notes.warn(source, "legacy rows missing, each taking its default for "
+                              f"every data port or the interface: {', '.join(absent)}.")
         short = _legacy_short_rows(old)
         if short:
             import_notes.warn(source, "legacy per-port rows with fewer values than data "
@@ -528,8 +575,9 @@ def report_csv_warnings(cfg_path: str, source_path: str = "") -> List[str]:
     """Report, as import warnings for `source_path` (default `cfg_path`), what the native
     loader does not read as written in the current-format CSV at `cfg_path`
     (`swi3score.csv_warnings`): a port disabled for its DeviceNumber_REG, a value masked
-    or clamped to its register field, a Reserved CDS_TailWidth 3 (worded as BusConfig words
-    it, so one file read by both reports it once), an unreadable cell. Returns the messages; empty
+    or clamped to its register field, a Reserved value (CDS_TailWidth 3 and the per-port
+    `bus_config.DP_RESERVED` fields, worded as BusConfig words them, so one file read by both
+    reports each once), an unreadable cell. Returns the messages; empty
     when the loaded core does not provide `csv_warnings`."""
     import swi3score
     fn = getattr(swi3score, "csv_warnings", None)

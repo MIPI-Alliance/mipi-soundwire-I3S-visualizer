@@ -2,7 +2,7 @@
 """THE gate — one implementation, every platform. Exit 0 is the gate.
 
     python3 tools/gate.py              # the commit gate: everything, in parallel
-    python3 tools/gate.py --guest      # a test guest, per batch: gui + platform + a core smoke set
+    python3 tools/gate.py --guest      # a test guest, per batch: the platform scope
     python3 tools/gate.py --release    # before a tag: also the single-process run
     python3 tools/gate.py --release --on-guest   # before a tag, on a test guest
     python3 tools/gate.py --quick      # the commit gate without the perf ceilings
@@ -22,18 +22,23 @@ Checks, in order (a failure never stops the rest — you get the whole picture):
   1. native core rebuilt, the imported module ASSERTED to be the one just built, and its
      score_abi ASSERTED against session.py's _REQUIRED_SCORE_ABI
   2. suite: every test file in its own process, several at once ($SWI3S_TEST_WORKERS, else one
-     per CPU), which catches a teardown crash a pooled run can mask; --guest runs the `gui`
-     and `platform` tests and _CORE_SMOKE. Each run writes its per-test durations to
+     per CPU), which catches a teardown crash a pooled run can mask; --guest runs the platform
+     scope, _GUEST_SCOPE. Each run writes its per-test durations to
      build/test-durations/<platform>.txt (<platform>-guest.txt for --guest)
   3. pytest -m perf, in one process          (skipped by --quick)
-  4. the single-process run of the suite     (--release only, and not --on-guest) — catches
+  4. diagram cover: the platform scope reaches every branch of the term diagram and the
+     whole-inequality view the full sweep reaches (tools/diagram_cover.py; --release only, and
+     not --on-guest)
+  5. the single-process run of the suite     (--release only, and not --on-guest) — catches
      state leaking from one file to the next, which is a property of the tests, not the platform
-  5. ruff                                    (not on --guest: the same on every platform)
-  6. mypy, non-regression vs tools/mypy_baseline.json   (not on --guest)
-  7. leak scan
-  8. screenshots: every mode in both themes, checked for theme, contrast and clipped-text
+  6. ruff                                    (not on --guest: the same on every platform)
+  7. mypy, non-regression vs tools/mypy_baseline.json   (not on --guest)
+     and, beside it, mypy with the installed numpy and PySide6 types: ADVISORY, its count is
+     printed in the summary and it never fails the gate
+  8. leak scan
+  9. screenshots: every mode in both themes, checked for theme, contrast and clipped-text
      faults (tools/screenshots.py); the contact sheet is the gate's visual review
-  9. native coverage from an instrumented core (--release only, and not --on-guest;
+  10. native coverage from an instrumented core (--release only, and not --on-guest;
      tools/native_coverage.py), reported in build/native-coverage/report.txt
   (native-cpp, an external C++ suite, runs only when named with --only and only when
    $SWI3S_NATIVE_CPP_SUITE names its runner script; otherwise the check is NOT RUN)
@@ -60,6 +65,7 @@ import site as _site
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -68,6 +74,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WINDOWS = os.name == "nt"
 _FAILED: list[str] = []
 _NOT_RUN: list[str] = []      # a check that CANNOT apply here — listed loudly, never hidden
+_ADVISORY: list[str] = []     # a count or note for the summary; never part of the result
 
 
 def _env() -> dict[str, str]:
@@ -177,16 +184,16 @@ def _step(title: str) -> None:
 
 
 def _tool(name: str) -> list[str] | None:
-    """A tool as a runnable command: prefer the executable, fall back to `-m` so a
-    venv-installed linter works without PATH surgery (the Windows case)."""
+    """A tool as a runnable command. The gate interpreter's own module (`-m`) comes first, so
+    the version installed beside it, the one requirements-dev.txt pins, is the one that runs;
+    an executable on PATH is the fallback."""
+    if importlib.util.find_spec(name) is not None:
+        probe = _run([sys.executable, "-m", name, "--version"],
+                     capture_output=True, encoding="utf-8", errors="replace")
+        if probe.returncode == 0:
+            return [sys.executable, "-m", name]
     exe = shutil.which(name)
-    if exe:
-        return [exe]
-    probe = _run([sys.executable, "-m", name, "--version"],
-                 capture_output=True, encoding="utf-8", errors="replace")
-    if probe.returncode == 0:
-        return [sys.executable, "-m", name]
-    return None
+    return [exe] if exe else None
 
 
 def _core_location_problem(path: str) -> str | None:
@@ -279,21 +286,22 @@ def check_pytest(marker: str, label: str) -> None:
         _FAILED.append(label)
 
 
-# Core test files the guest gate runs besides the `gui` and `platform` tests, one per area, so
-# a guest still decodes, replays registers, times and parses on its own interpreter.
-_CORE_SMOKE = ("tests/test_swi3score.py", "tests/test_register_model.py",
-               "tests/test_timing_cross_spec.py", "tests/test_ingest_formats.py",
-               "tests/test_regmap_import.py", "tests/test_publish_sync.py")
+# The platform scope: the `gui` and `platform` tests and the core smoke files
+# (tests/conftest.py, CORE_SMOKE). The guest gate runs it, and so does every CI configuration
+# but the one that runs the whole suite (tests/test_release_gate.py holds the two equal).
+_GUEST_SCOPE = "(gui or platform or smoke) and not perf"
 # The heaviest files, each spread over this many workers of its own (pytest-xdist, --dist
 # load): the suite takes as long as its slowest file. Each file's tests are independent of
 # order; tests/test_exit_teardown.py times the app's exit and stays whole.
 _SPLIT = {"tests/test_links_gui.py": 6, "tests/test_maximize_pane.py": 4,
           "tests/test_bottom_all_links.py": 4, "tests/test_menus.py": 4,
-          "tests/test_timing_cross_spec.py": 4, "tests/test_open_capture_dialog.py": 3,
+          "tests/test_timing_cross_spec.py": 6, "tests/test_open_capture_dialog.py": 3,
           "tests/test_command_deltas.py": 3, "tests/test_load_queue_settles.py": 3,
           "tests/test_timing_view_page.py": 4, "tests/test_timing_view_settings.py": 3,
-          "tests/test_timing_diagram_layout.py": 3}
-_DURATION = re.compile(r"^\s*([0-9.]+)s (call|setup|teardown)\s+(\S+)")
+          "tests/test_timing_diagram_layout.py": 3, "tests/test_timing_view_columns.py": 3,
+          "tests/test_inequality_diagram.py": 4, "tests/test_main_window_rules.py": 4,
+          "tests/test_timing_timeline.py": 3, "tests/test_timing.py": 2}
+_DURATION = re.compile(r"^\s*([0-9.]+)s (call|setup|teardown)\s+(\S.*?)\s*$")
 DURATIONS_DIR = os.path.join("build", "test-durations")
 # Seconds one test file may run before it is killed, with every process it started, and
 # counted as failed, so a hung file (a deadlocked window, a teardown that never returns) ends
@@ -304,9 +312,10 @@ _TIMED_OUT = 124            # the exit status a timed-out file is reported with
 
 
 def _workers() -> int:
-    """$SWI3S_TEST_WORKERS, else one per CPU."""
-    env = os.environ.get("SWI3S_TEST_WORKERS", "")
-    return max(1, int(env)) if env.isdigit() else (os.cpu_count() or 1)
+    """$SWI3S_TEST_WORKERS (surrounding blanks ignored: `set VAR=4 && ...` in cmd.exe stores
+    "4 "), else one per CPU."""
+    env = os.environ.get("SWI3S_TEST_WORKERS", "").strip()
+    return max(1, int(env)) if env.isascii() and env.isdigit() else (os.cpu_count() or 1)
 
 
 def _durations_record(guest: bool) -> str:
@@ -323,11 +332,7 @@ def _suite_files(guest: bool) -> list[tuple[str, str]]:
     slowest files do not start last. A record line that does not parse is skipped."""
     files = sorted(glob.glob(os.path.join(_ROOT, "tests", "test_*.py")))
     rels = [os.path.relpath(f, _ROOT).replace(os.sep, "/") for f in files]
-    if guest:
-        runs = [(r, "not perf" if r in _CORE_SMOKE else "(gui or platform) and not perf")
-                for r in rels]
-    else:
-        runs = [(r, "not perf") for r in rels]
+    runs = [(r, _GUEST_SCOPE if guest else "not perf") for r in rels]
     last: dict[str, float] = {}
     record = _durations_record(guest)
     if os.path.isfile(record):
@@ -343,11 +348,15 @@ def _suite_files(guest: bool) -> list[tuple[str, str]]:
         os.path.join(_ROOT, fr[0])) / 1e4)))
 
 
-def _run_file(rel: str, marker: str) -> tuple[str, subprocess.CompletedProcess, float]:
+def _run_file(rel: str, marker: str,
+              basetemp: str) -> tuple[str, subprocess.CompletedProcess, float]:
+    """One test file in its own pytest process, whose temporary directories live under
+    `basetemp`. Every file gets a directory of its own: pytest clears and prunes the root it
+    uses, so processes sharing the default root can delete each other's entries."""
     start = time.monotonic()
     spread = ["-n", str(_SPLIT[rel]), "--dist", "load"] if rel in _SPLIT else []
     cmd = [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider",
-           "-m", marker, "--durations=0", "--durations-min=0", *spread, rel]
+           "--basetemp", basetemp, "-m", marker, "--durations=0", "--durations-min=0", *spread, rel]
     try:
         p = _run_bounded(cmd, _FILE_TIMEOUT)
     except subprocess.TimeoutExpired as e:
@@ -366,12 +375,15 @@ def check_suite() -> None:
     runs = _suite_files(guest)
     workers = _workers()
     _step(f"suite: each file in its own process, {workers} at a time"
-          f"{' (guest scope: gui + platform + core smoke)' if guest else ''}")
+          f"{' (guest scope: gui + platform + smoke)' if guest else ''}")
     bad, empty, per_test, per_file = [], [], {}, {}
     totals = {"passed": 0, "skipped": 0}
+    temp_root = tempfile.mkdtemp(prefix="swi3s-gate-")   # removed below, whatever happens
     with ThreadPoolExecutor(max_workers=workers) as pool:
         try:
-            for rel, p, took in pool.map(lambda fr: _run_file(*fr), runs):
+            for rel, p, took in pool.map(
+                    lambda nfr: _run_file(*nfr[1], os.path.join(temp_root, str(nfr[0]))),
+                    enumerate(runs)):
                 per_file[rel] = took
                 for key in totals:
                     m = re.search(rf"(\d+) {key}", p.stdout)
@@ -399,12 +411,16 @@ def check_suite() -> None:
             for running in list(_LIVE):
                 _kill_tree(running)
             raise
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
     print(f"  {len(runs) - len(bad) - len(empty)} files ok, {len(bad)} failed, "
           f"{len(empty)} with no tests in scope; {totals['passed']} passed, "
           f"{totals['skipped']} skipped")
     _write_durations(per_test, per_file, guest)
     if bad:
         _FAILED.append(f"suite ({len(bad)} files)")
+    elif totals["passed"] == 0:
+        _FAILED.append("suite (no test ran: every file had no test in scope, or no file was found)")
 
 
 def _write_durations(per_test: dict[str, float], per_file: dict[str, float],
@@ -450,6 +466,48 @@ def check_mypy() -> None:
         _FAILED.append("mypy could not run (environment problem, not a regression)")
     elif rc != 0:
         _FAILED.append("mypy regression")
+
+
+# Seconds the advisory mypy run may take before it is given up (a note, not a failure).
+_ADVISORY_TIMEOUT = 600
+_MYPY_ERROR = re.compile(r"^(?P<file>[^:]+):\d+:(?:\d+:)? error:")
+
+
+def _typed_mypy_note() -> str:
+    """mypy over swi3s_studio on this platform WITH site-packages, so numpy's and PySide6's
+    installed types apply, as one summary line: the error count, or why there is none.
+    Raises on anything that stops it; check_mypy_typed turns that into the note."""
+    cmd = _tool("mypy")
+    if cmd is None:
+        return "mypy with installed types: could not run (mypy is not installed)"
+    proc = _run_bounded(cmd + ["--no-incremental", "--no-color-output", "swi3s_studio"],
+                        _ADVISORY_TIMEOUT)
+    out = proc.stdout or ""
+    if proc.returncode == 2 or "prevented further checking" in out:
+        return (f"mypy with installed types: could not run (mypy exited {proc.returncode} "
+                "before checking the whole tree)")
+    files: dict[str, int] = {}
+    for line in out.splitlines():
+        m = _MYPY_ERROR.match(line)
+        if m and m.group("file").replace("\\", "/").startswith("swi3s_studio/"):
+            f = m.group("file").replace("\\", "/")
+            files[f] = files.get(f, 0) + 1
+    if proc.returncode != 0 and not files:
+        return "mypy with installed types: could not run (no error line could be read)"
+    return (f"mypy with installed types: {sum(files.values())} errors in {len(files)} files "
+            f"({sys.platform} only; the ratchet's counts are unchanged)")
+
+
+def check_mypy_typed() -> None:
+    """The advisory mypy run: its note goes to the summary, and nothing here can fail the gate
+    or be listed as not run, whatever the run does."""
+    _step("mypy with the installed types (advisory)")
+    try:
+        note = _typed_mypy_note()
+    except Exception as e:                      # noqa: BLE001 — nothing may fail the gate
+        note = f"mypy with installed types: could not run ({type(e).__name__}: {e})"
+    print(f"  {note}")
+    _ADVISORY.append(note)
 
 
 _SCAN_COUNTS = re.compile(r"\((\d+) structural, (\d+) site-specific\)")
@@ -522,6 +580,15 @@ def check_native_coverage() -> None:
                        "an empty report or the command line)")
 
 
+def check_diagram_cover() -> None:
+    """tools/diagram_cover.py: the platform scope reaches every branch of the term diagram
+    and the whole-inequality view (swi3s_studio/ui/timing_diagram.py,
+    swi3s_studio/ui/inequality_diagram.py) the full sweep reaches (docs/TESTING.md §1.1)."""
+    _step("diagram cover (tools/diagram_cover.py, the platform scope's diagram branches)")
+    if _run([sys.executable, os.path.join("tools", "diagram_cover.py")]).returncode != 0:
+        _FAILED.append("diagram cover (see the output above)")
+
+
 def check_native_cpp() -> None:
     """An external native C++ suite, run through the shell script that $SWI3S_NATIVE_CPP_SUITE
     names. Opt-in (`--only native-cpp`): not part of the full gate, and an unset variable or a
@@ -540,9 +607,9 @@ _VERBOSE = False
 _MODE = "commit"             # commit | guest | release, from the command line
 _ON_GUEST = False            # --on-guest: a test guest, which leaves _DEV_ONLY to the
                              # development machine
-# Checks of the release gate the development machine runs for every platform (docs/TESTING.md
-# §1.1): what they find does not depend on where they run.
-_DEV_ONLY = ("single-process", "native-coverage")
+# Checks the development machine runs for every platform (docs/TESTING.md §1.1): what they
+# find does not depend on where they run.
+_DEV_ONLY = ("single-process", "native-coverage", "diagram-cover")
 
 # Seconds a stage may take before the summary names it (docs/TESTING.md §1.1).
 _BUDGETS = {"commit": 600, "guest": 1200}
@@ -554,12 +621,14 @@ _CHECKS = {
     "native": (lambda: check_native(), _ALL, False),
     "suite": (lambda: check_suite(), _ALL, False),
     "perf": (lambda: check_pytest("perf", "pytest perf"), _ALL, True),
+    "diagram-cover": (lambda: check_diagram_cover(), frozenset({"release"}), False),
     "single-process": (lambda: check_pytest("not perf", "pytest single-process"),
                        frozenset({"release"}), False),
     "ruff": (lambda: check_tool("ruff", ["check", "."], "ruff",
                                 "python -m pip install -r requirements-dev.txt"),
              frozenset({"commit", "release"}), False),
     "mypy": (lambda: check_mypy(), frozenset({"commit", "release"}), False),
+    "mypy-typed": (lambda: check_mypy_typed(), frozenset({"commit", "release"}), False),
     "leaks": (lambda: check_leaks(), _ALL, False),
     "screenshots": (lambda: check_screenshots(), _ALL, False),
     "native-coverage": (lambda: check_native_coverage(), frozenset({"release"}), False),
@@ -567,18 +636,29 @@ _CHECKS = {
 }
 
 
-def _selected(argv: list[str]) -> list[str] | None:
-    """The checks named by --only (None = the stage's checks). An unknown name is an error,
-    not a silently empty run."""
+def _only_names(argv: list[str]) -> list[str]:
+    """The names in --only's comma-separated value: empty when there is no value."""
+    i = argv.index("--only")
+    return [n for n in (argv[i + 1] if i + 1 < len(argv) else "").split(",") if n]
+
+
+def _only_problem(argv: list[str]) -> str | None:
+    """Why --only's value is not a list of known checks, or None (also when there is no
+    --only). An unknown name is an error, not a silently empty run."""
     if "--only" not in argv:
         return None
-    i = argv.index("--only")
-    names = [n for n in (argv[i + 1] if i + 1 < len(argv) else "").split(",") if n]
+    names = _only_names(argv)
     unknown = [n for n in names if n not in _CHECKS]
     if not names or unknown:
-        raise SystemExit(f"--only needs a comma-separated list of {', '.join(_CHECKS)}"
-                         + (f" (unknown: {', '.join(unknown)})" if unknown else ""))
-    return names
+        return (f"--only needs a comma-separated list of {', '.join(_CHECKS)}"
+                + (f" (unknown: {', '.join(unknown)})" if unknown else ""))
+    return None
+
+
+def _selected(argv: list[str]) -> list[str] | None:
+    """The checks named by --only (None = the stage's checks); the names are valid once
+    `_bad_arguments` has passed."""
+    return _only_names(argv) if "--only" in argv else None
 
 
 _FLAGS = frozenset({"--guest", "--release", "--on-guest", "--quick", "--verbose", "--only"})
@@ -602,7 +682,7 @@ def _bad_arguments(argv: list[str]) -> str | None:
         return f"--quick trims the commit gate only; {stage} runs its perf ceilings"
     if "--on-guest" in args and not stage:
         return "--on-guest goes with a stage: --release --on-guest or --guest --on-guest"
-    return None
+    return _only_problem(argv)
 
 
 def _tolerant_output() -> None:
@@ -672,6 +752,10 @@ def main() -> int:
     if _NOT_RUN:
         print(f"  NOT RUN HERE ({len(_NOT_RUN)}):")
         for n in _NOT_RUN:
+            print(f"    - {n}")
+    if _ADVISORY:
+        print("  ADVISORY (not part of the result):")
+        for n in _ADVISORY:
             print(f"    - {n}")
     if not _FAILED:
         if only is not None:

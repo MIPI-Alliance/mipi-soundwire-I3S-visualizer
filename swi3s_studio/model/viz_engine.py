@@ -22,7 +22,7 @@ import tempfile
 logging.getLogger("swi3s_visualizer").setLevel(logging.ERROR)
 
 # The most rows an authored model builds: the UI's Bus Grid and JSON export
-# (ui.main_window._authored_rows) and the headless `--config` export (cli) both clamp
+# (ui.authoring_controller.authored_rows) and the headless `--config` export (cli) both clamp
 # RowsToDraw to 1..MAX_AUTHORED_ROWS and report the clamp.
 MAX_AUTHORED_ROWS = 1024
 
@@ -70,6 +70,13 @@ def model_json(csv_path: str, num_rows: int | None = None) -> dict:
         os.remove(tmp)
 
 
+def authored_model_json(cfg, num_rows: int | None = None) -> dict:
+    """`model_json` of an authored `BusConfig`: the config is written to a CSV and built from
+    that file, as the Visualizer's Export Bus Model (JSON) does."""
+    with tempfile.TemporaryDirectory() as d:
+        return model_json(cfg.to_csv_file(os.path.join(d, "authored.csv")), num_rows)
+
+
 # Visualizer authoring SlotType (swviz.models.enums) -> the shared GridSlot ints the
 # GridView renders. Built from named members on both sides, not magic numbers.
 # CDS is handled separately (is_cds); EMPTY/CLASH are never emitted as data cells.
@@ -115,7 +122,7 @@ def render_payload(csv_path: str, num_rows: int | None = None):
     # where only the Manager drives a guard emits a single Manager cell (devices are
     # off/bare), indistinguishable from the uniform case by cells alone — so pass the
     # divergence explicitly for the grid to honour (see GridView._draw_row).
-    cds_split = (len(set(_iface.CDS_Guard_PerSource)) > 1
+    cds_split = (len(set(_iface.cds_guard_drawn())) > 1
                  or len(set(_iface.CDS_Tail_PerSource)) > 1)
 
     # A cell's `dp` is the LOGICAL DataPortNumber, not swviz's slot index. The two diverge
@@ -253,6 +260,10 @@ def issues_from_model(bm):
         out.append(Issue(INFO, dp_name, "sink data ports don't need handovers"))
     for dp_name, _n in w.enabled_no_channels_warnings:
         out.append(Issue(INFO, dp_name, "drawn but no channel enabled"))
+    for dp_name, numerator, denominator in w.all_intervals_skipped_warnings:
+        out.append(Issue(INFO, dp_name,
+                         f"every interval is skipped (SkippingNumerator_REG {numerator} >= "
+                         f"SkippingDenominator_REG {denominator}): nothing is placed"))
     for dp_name, interval, shown in w.display_truncation_warnings:
         out.append(Issue(INFO, dp_name,
                          f"interval is {interval} rows, only {shown} displayed"))

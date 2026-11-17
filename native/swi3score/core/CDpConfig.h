@@ -73,7 +73,11 @@ struct SwI3sDpConfig
         for (int i = 0; i < 16; ++i) if (EnableCh & (1u << i)) ++c;
         return c;
     }
-    int horizontalEnd() const { return HorizontalStart + HorizontalCount; }
+    // Last window column. 64-bit: both fields arrive unmasked from a config CSV.
+    long long horizontalEnd() const
+    {
+        return static_cast<long long>(HorizontalStart) + HorizontalCount;
+    }
     bool isSource() const { return !PortDirection; }
     // TX_PRESENT is present in ALL three flow-controlled modes ({ASW5203}):
     // TX_CONTROLLED/ASYNC carry data-validity, RX_CONTROLLED carries a copy of the
@@ -142,6 +146,9 @@ struct SwI3sConfig
     int  CdsHorizontalStart = -1;
     int  S1TailWidth = 0;
     bool S1Handover = true;
+    // PHY3: the UIs of the Manager's Sync0 that close each row (the Visualizer's S0Width,
+    // 1..8). Read by LoadCsv for the authored grid; a decoded config keeps 1.
+    int  S0Width = 1;
     std::string description;
 
     // --- Control Data Stream, PER SOURCE ---
@@ -163,14 +170,19 @@ struct SwI3sConfig
     // CDS_* constants in bus_config.py.
     static const int kCdsSources = 13;               // Manager + Device 0..11
     int  CdsBitWidth = 0;                            // excess-1: UIs per CDS bit - 1
-    std::vector<int>  CdsGuard;                      // 0 off, 1 G0, 2 G1
+    // The guard's two register fields, independent of each other: GuardEnable (0 off,
+    // 1 on) and GuardPolarity (0 or 1). A source's polarity is held whether or not its
+    // guard is enabled; a guard cell is driven only where the guard is enabled.
+    std::vector<int>  CdsGuardEnable;
+    std::vector<int>  CdsGuardPolarity;
     std::vector<int>  CdsTailWidth;                  // 0..2 UIs defined; the 2-bit field
                                                      // also holds the Reserved 3
     std::vector<int>  CdsDriveType;                  // 0 Special, 1 Normal
     std::vector<int>  CdsEndDriveEarly;              // 0 full UI, 1 stop early
 
     SwI3sConfig()
-        : CdsGuard(kCdsSources, 0), CdsTailWidth(kCdsSources, 0),
+        : CdsGuardEnable(kCdsSources, 0), CdsGuardPolarity(kCdsSources, 0),
+          CdsTailWidth(kCdsSources, 0),
           CdsDriveType(kCdsSources, 1), CdsEndDriveEarly(kCdsSources, 0) {}
 
     std::vector<SwI3sDpConfig> dps;   // positional; a port's number is its dpNumber
@@ -192,10 +204,10 @@ struct SwI3sConfig
     // CDataPort/CFlowControlPort::Configure) and sameEnabledConfig.
     int columnCount() const
     {
-        const int c = NumColumns + 1;
+        const long long c = static_cast<long long>(NumColumns) + 1;
         if (c < swi3s::kMinColumnCount) return swi3s::kMinColumnCount;
         if (c > swi3s::kMaxColumnCount) return swi3s::kMaxColumnCount;
-        return c;
+        return static_cast<int>(c);
     }
 
     // Rows after which a port's transport pattern repeats. Without skipping that is one
@@ -232,7 +244,9 @@ struct SwI3sConfig
     }
 
     // What LoadCsv did not read as written, one line per field: a port disabled for its
-    // DeviceNumber_REG, a value masked or clamped to its register field, a cell that is
+    // DeviceNumber_REG, a value masked or clamped to its register field, a Reserved value
+    // kept as written (CDS_TailWidth 3, a port's TailWidth, BitWidth, FCP_BitWidth or
+    // FCP_TailWidth 3, PortMode 1), a cell that is
     // not a number or a boolean, values beyond the last data-port column, a key that is not
     // a config field, a file that cannot be opened. Cleared and filled by every LoadCsv;
     // empty for a config built any other way.

@@ -18,6 +18,7 @@ envelope (see `AudioStore.envelope`).
 """
 from __future__ import annotations
 
+import math
 import os
 import struct
 from dataclasses import dataclass, field
@@ -97,6 +98,7 @@ def wav_header(n_channels: int, rate: int, container: int, valid_bits: int,
 
 _INT32_MIN, _INT32_MAX = -(1 << 31), (1 << 31) - 1
 _PDM_PCM_RATE = 48000   # 1-bit PDM streams are decimated to this PCM rate at build
+ASSUMED_RATE_HZ = 48000  # the rate a stream of unknown rate (0) plays and exports at
 
 
 def decode_pdm(bits: np.ndarray, native_rate: float,
@@ -352,7 +354,9 @@ class StreamProcessing:
     `dc_block` runs the DC blocker (dsp.filters.dc_block: a 2nd-order zero-phase Butterworth
     high-pass at 1 Hz), for a PDM mic's density bias or a PCM stream's offset, drifting or
     not. `highpass_hz` is the corner of the 4th-order zero-phase Butterworth high-pass, or
-    None for none; `gain_db` is applied after it. The result is rounded and saturates at the
+    None for none, applied at most at the stream's dsp.filters.max_cutoff_hz; `gain_db` is
+    applied after it. A stream whose rate cannot be filtered (dsp.filters.can_filter: an
+    unknown rate) takes neither filter and keeps its gain. The result is rounded and saturates at the
     stream's full scale, as a DAC would. `allow_clipping` is the choice the user made in
     the dialog (whether a gain that clips may be applied); it is kept so a saved workspace
     reopens the dialog as it was left."""
@@ -362,7 +366,12 @@ class StreamProcessing:
     dc_block: bool = False
 
     def is_identity(self) -> bool:
+        """Whether it leaves the samples as decoded (Allow clipping alone changes none)."""
         return self.highpass_hz is None and self.gain_db == 0.0 and not self.dc_block
+
+    def is_default(self) -> bool:
+        """Whether there is nothing to keep: the samples as decoded and Allow clipping off."""
+        return self.is_identity() and not self.allow_clipping
 
     def describe(self) -> str:
         """Short label for the stream's checkbox: "HPF 20 Hz, +12.0 dB"."""
@@ -381,16 +390,31 @@ class StreamProcessing:
 
     @classmethod
     def from_json(cls, d) -> Optional["StreamProcessing"]:
-        """None for anything that is not a usable setting (a hand-edited workspace)."""
+        """None for anything that is not a usable setting (a hand-edited workspace): a
+        corner that is not a positive finite number, a gain that is not finite, or an
+        on/off flag that is not true, false, 0 or 1. A corner and a gain are JSON numbers:
+        a boolean or a string is refused."""
+        def flag(v):
+            if isinstance(v, bool) or (isinstance(v, int) and v in (0, 1)):
+                return bool(v)
+            raise ValueError(v)
+
+        def number(v):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(v)
+            return float(v)
         try:
             hp = d.get("highpass_hz")
-            out = cls(highpass_hz=None if hp is None else float(hp),
-                      gain_db=float(d.get("gain_db", 0.0)),
-                      allow_clipping=bool(d.get("allow_clipping", False)),
-                      dc_block=bool(d.get("dc_block", False)))
+            out = cls(highpass_hz=None if hp is None else number(hp),
+                      gain_db=number(d.get("gain_db", 0.0)),
+                      allow_clipping=flag(d.get("allow_clipping", False)),
+                      dc_block=flag(d.get("dc_block", False)))
         except (AttributeError, TypeError, ValueError):
             return None
-        if out.highpass_hz is not None and not out.highpass_hz > 0:
+        if out.highpass_hz is not None and not (out.highpass_hz > 0
+                                                and math.isfinite(out.highpass_hz)):
+            return None
+        if not math.isfinite(out.gain_db):
             return None
         return out
 
@@ -409,6 +433,8 @@ class AudioStore:
     # On-bus sample size in bits (before PDM decode promotes 1-bit → 16-bit PCM).
     # Used for the true DP bandwidth; _sample_bits holds the stored/PCM width.
     _native_bits: Dict[Tuple[int, int, int], int] = field(default_factory=dict)
+    # (smallest, widest) on-bus size of a channel whose SampleSize changes between runs.
+    _native_sizes: Dict[Tuple[int, int, int], Tuple[int, int]] = field(default_factory=dict)
     _rates: Dict[Tuple[int, int], float] = field(default_factory=dict)   # (device, dp) -> Hz
     # Native (pre-decimation) per-DP sample rate. `_rates` is overwritten with the
     # decimated PCM rate for 1-bit/PDM streams (for playback/render); this keeps the
@@ -443,6 +469,8 @@ class AudioStore:
     # Capture samples per second of the positions in _sample_at, 0 when unknown; with
     # `_rates` it gives a NORMAL port's expected step for transport_gaps().
     _capture_rate_hz: float = 0.0
+    # Set by close(): the sample arrays are released and must not be read.
+    _closed: bool = False
 
     @classmethod
     def from_session(cls, session, mmap_dir: Optional[str] = None,
@@ -515,9 +543,10 @@ class AudioStore:
         if total == 0:
             return store
         # One lexical sort groups all samples by (device, dp, channel) AND orders each
-        # group by capture sample in a single pass: start_sample is the primary
-        # (first-listed) lexsort key, so a run of equal (device, dp, channel) is one
-        # contiguous, already-time-sorted slice — no separate per-channel argsort.
+        # group by capture sample in a single pass. np.lexsort orders by its LAST key
+        # first: device is the primary key, then dp, then channel, and start_sample (the
+        # first-listed, least significant key) orders each group in time. A run of equal
+        # (device, dp, channel) is therefore one contiguous, time-sorted slice.
         # Ordered by start_sample, not the core's per-(dp,channel) `index`: that counter
         # RESETS to 0 on every bus reconfiguration, while start_sample is globally
         # monotonic, so all config epochs stitch into one time-ordered channel.
@@ -642,9 +671,9 @@ class AudioStore:
             store._channels[key] = arr
             store._sample_bits[key] = sbits
             store._native_bits[key] = bits          # widest on-bus size (1 for PDM), for bandwidth
-            # Render pyramid is built LAZILY on first envelope() — most channels are
-            # never viewed, so building all of them at load is wasted work + memory on
-            # wide (mic-array) captures.
+            if size_cuts.size:
+                store._native_sizes[key] = (int(sizes.min()), int(sizes.max()))
+            # A channel's render pyramid is built on its first envelope(), not at load.
         return store
 
     # ---- queries ----
@@ -680,8 +709,23 @@ class AudioStore:
         key = (device, dp, channel)
         return self._native_bits.get(key) or self._sample_bits.get(key, 16)
 
+    def native_size_range(self, device: int, dp: int,
+                          channel: int) -> Optional[Tuple[int, int]]:
+        """``(smallest, widest)`` on-bus sample size of a channel whose SampleSize changes
+        between runs, None for a channel of one size."""
+        return self._native_sizes.get((device, dp, channel))
+
     def rate(self, device: int, dp: int) -> float:
         return self._rates.get((device, dp), 0.0)
+
+    def rate_known(self, device: int, dp: int) -> bool:
+        """Whether the stream has a sample rate: one of 0 (under 0.5 Hz) is unknown."""
+        return int(round(self.rate(device, dp))) > 0
+
+    def output_rate(self, device: int, dp: int) -> int:
+        """The rate (Hz) the stream plays and exports at: its rate, or ASSUMED_RATE_HZ when
+        that is unknown (`rate_known`). A caller says so where it plays or writes one."""
+        return int(round(self.rate(device, dp))) or ASSUMED_RATE_HZ
 
     def native_rate(self, device: int, dp: int) -> float:
         """The on-bus sample rate (Hz) before any playback decimation — what to
@@ -706,13 +750,18 @@ class AudioStore:
                 mm.close()
         self._channels.clear()
         self._raw.clear()
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        """True once `close()` has run."""
+        return self._closed
 
     def __enter__(self) -> "AudioStore":
         return self
 
-    def __exit__(self, *exc) -> bool:
+    def __exit__(self, *exc) -> None:
         self.close()
-        return False
 
     def _pyramid(self, key):
         """The render pyramid for a channel, built + memoised on first use (lazy)."""
@@ -990,6 +1039,12 @@ class AudioStore:
         return raw if raw is not None else self.samples(device, dp, channel)
 
     def processing(self, device: int, dp: int) -> Optional[StreamProcessing]:
+        """The stream's setting when it changes the samples, else None."""
+        proc = self._processing.get((device, dp))
+        return None if proc is None or proc.is_identity() else proc
+
+    def setting(self, device: int, dp: int) -> Optional[StreamProcessing]:
+        """The stream's kept setting, one that only allows clipping included."""
         return self._processing.get((device, dp))
 
     def _processed(self, device: int, dp: int, channel: int,
@@ -999,7 +1054,7 @@ class AudioStore:
         rate = self.rate(device, dp)
         if proc.dc_block and x.size and filters.can_filter(rate):
             x = filters.dc_block(x, rate)
-        if proc.highpass_hz is not None and x.size:
+        if proc.highpass_hz is not None and x.size and filters.can_filter(rate):
             x = filters.highpass(x, min(proc.highpass_hz, filters.max_cutoff_hz(rate)), rate)
         if proc.gain_db:
             x = x * (10.0 ** (proc.gain_db / 20.0))
@@ -1010,8 +1065,9 @@ class AudioStore:
                        proc: Optional[StreamProcessing]) -> None:
         """Apply `proc` to every channel of the stream, replacing any earlier processing
         (it always starts from the decoded samples), or revert to them with None or an
-        identity setting. The render pyramid and envelope memo of each channel are
-        dropped, so the waveform, playback and export all follow."""
+        identity setting; an identity setting that allows clipping is kept (setting()).
+        The render pyramid and envelope memo of each channel are dropped, so the waveform,
+        playback and export all follow."""
         changed = []
         if proc is None or proc.is_identity():
             for ch in self.channels(device, dp):
@@ -1019,7 +1075,10 @@ class AudioStore:
                 if key in self._raw:
                     self._channels[key] = self._raw.pop(key)
                     changed.append(key)
-            self._processing.pop((device, dp), None)
+            if proc is None or proc.is_default():
+                self._processing.pop((device, dp), None)
+            else:
+                self._processing[(device, dp)] = proc
         else:
             for ch in self.channels(device, dp):
                 key = (device, dp, ch)
@@ -1047,7 +1106,7 @@ class AudioStore:
             rate = self.rate(device, dp)
             if dc_block and filters.can_filter(rate):
                 x = filters.dc_block(x, rate)
-            if highpass_hz is not None:
+            if highpass_hz is not None and filters.can_filter(rate):
                 x = filters.highpass(x, min(highpass_hz, filters.max_cutoff_hz(rate)), rate)
             fs = float(full_scale(self.sample_bits(device, dp, ch)))
             peak = max(peak, float(np.max(np.abs(x))) / fs)
@@ -1064,22 +1123,22 @@ class AudioStore:
         Each channel is scaled from its own bit width so all play at comparable
         loudness; `start`/`stop` window by sample index. `target_rate` (Hz)
         band-limited-resamples before packing (e.g. play a PDM/odd-rate stream
-        decimated to 48 kHz); the returned rate is the actual playback rate."""
+        decimated to 48 kHz); the returned rate is the actual playback rate. A stream of
+        unknown rate plays at, and resamples from, ASSUMED_RATE_HZ (`output_rate`)."""
         chans = [c for c in (channels if channels is not None
                              else self.channels(device, dp))
                  if (device, dp, c) in self._channels]
-        native = int(round(self.rate(device, dp))) or 48000
+        native = self.output_rate(device, dp)
         if not chans:
             return b"", native, 0, "Int16"
         wide = (depth >= 24)
         out_bits = 32 if wide else 16
         dt = np.int32 if wide else np.int16
         lo, hi = (-(1 << 31), (1 << 31) - 1) if wide else (-32768, 32767)
-        out_rate = native
-        do_resample = bool(target_rate) and int(target_rate) != native
+        out_rate = int(target_rate) if target_rate else native
+        do_resample = out_rate != native
         if do_resample:
             from ..dsp import resample
-            out_rate = int(target_rate)
         cols = []
         for ch in chans:
             s = self.samples(device, dp, ch)[start:stop].astype(np.float64)
@@ -1108,7 +1167,7 @@ class AudioStore:
                              else self.channels(device, dp))
                  if (device, dp, c) in self._channels]
         if not chans:
-            return np.zeros(0, dtype=np.int16), int(round(self.rate(device, dp))) or 48000, 0
+            return np.zeros(0, dtype=np.int16), self.output_rate(device, dp), 0
         cols = []
         for ch in chans:
             s = self.samples(device, dp, ch)[start:stop]
@@ -1121,8 +1180,17 @@ class AudioStore:
         out = np.zeros(n * nch, dtype=np.int16)
         for i, c in enumerate(cols):
             out[i::nch][:c.size] = c                # interleave channel-major, zero-fill tail
-        rate = int(round(self.rate(device, dp))) or 48000
+        rate = self.output_rate(device, dp)
         return out, rate, len(cols)
+
+    def wav_rate(self, device: int, dp: int, target_rate: Optional[float] = None) -> int:
+        """The sample rate (Hz) export_wav writes the stream at with `target_rate`: the
+        target rounded to whole Hz, or with none the stream's output_rate. The stream is
+        resampled when this differs from wav_rate(device, dp)."""
+        native = self.output_rate(device, dp)
+        if target_rate and int(round(target_rate)) != native:
+            return int(round(target_rate))
+        return native
 
     def export_wav(self, device: int, dp: int, path: str,
                    channels: Optional[List[int]] = None,
@@ -1132,7 +1200,8 @@ class AudioStore:
 
         `target_rate` (Hz) resamples every channel to that rate before writing
         (band-limited; see dsp.resample) — e.g. decimate a PDM/odd-rate stream to
-        48 kHz. None keeps the native rate.
+        48 kHz. None keeps the native rate. A stream of unknown rate is written at, and
+        resampled from, ASSUMED_RATE_HZ (`output_rate`).
 
         The file is WAVE_FORMAT_EXTENSIBLE integer PCM. The container is 16, 24 or 32 bits
         (the widest channel's size, `container_bits`) and wValidBitsPerSample is that size.
@@ -1150,10 +1219,8 @@ class AudioStore:
             i0, i1 = index_range
             slices = {ch: s[i0:i1] for ch, s in slices.items()}
 
-        native = int(round(self.rate(device, dp))) or 48000
-        out_rate = native
-        if target_rate and int(round(target_rate)) != native:
-            out_rate = int(round(target_rate))
+        native = self.wav_rate(device, dp)
+        out_rate = self.wav_rate(device, dp, target_rate)
         bits = max(self.sample_bits(device, dp, ch) for ch in chans)
         cbits = container_bits(bits)
         try:                                    # before any resampling work
@@ -1171,10 +1238,9 @@ class AudioStore:
             raise ValueError(f"{data_bytes} bytes of audio exceed the 4 GiB a WAV file holds; "
                              "export a narrower range or fewer channels")
 
-        # Build the interleave buffer at the CONTAINER width (little-endian) directly, not
-        # int64 then downcast, using 2-4x less memory. 24-bit builds in int32 and packs the
-        # low 3 bytes. Each value is clipped to its channel's size, then shifted up to the
-        # container's top bit.
+        # The interleave buffer is built at the container width (little-endian): 16-bit in
+        # int16, 24- and 32-bit in int32, 24-bit packing the low 3 bytes. Each value is
+        # clipped to its channel's size, then shifted up to the container's top bit.
         dt = np.dtype("<i2") if cbits == 16 else np.dtype("<i4")
         frames = np.zeros((length, len(chans)), dtype=dt)
         for col, ch in enumerate(chans):

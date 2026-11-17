@@ -6,6 +6,9 @@ Pinned here:
   by that gap, zero-filling before it, and the mix runs to the end of the latest-ending port;
 - the cursor sweep waits for the swept stream's first sample;
 - a lead is converted from capture samples to frames at the play rate;
+- a Play names the streams of unknown rate it plays at the assumed rate;
+- the clip's end and Stop return the playhead to where Play started (Stop there goes to
+  the audio's start), and a Play resuming a Pause keeps that origin;
 - the channel menu disables Evenly Spaced with its explanation for a stream that already
   arrives evenly, and offers it with no tooltip for one that does not.
 
@@ -212,3 +215,85 @@ def test_the_channel_menu_offers_evenly_spaced_for_irregular_timing_with_no_tool
     av = _view(_store())
     on, enabled, tip = _evenly_spaced_entry(monkeypatch, av, irregular=True)
     assert enabled and tip == "Evenly Spaced"   # Qt's tooltip for an action with none set
+
+
+def _playing(monkeypatch, offset=2000):
+    """(a view playing data port 2 into a sink that reads back its frames, the cursor
+    sample it started from, `offset` capture samples into the audio)."""
+    from swi3s_studio.ui import audio_view
+    if not audio_view._HAVE_AUDIO:
+        pytest.skip("no QtMultimedia")
+    av = _view(_store())
+    monkeypatch.setattr(av, "_selected", lambda: [(0, 2, 0)])
+    av._cursor_sample = av._audio_start_sample() + offset
+    monkeypatch.setattr(audio_view, "QAudioSink", _Sink)
+    monkeypatch.setattr(av, "_selected_device", lambda: type("D", (), {"isNull": lambda s: False})())
+    av.play()
+    assert av._sink is not None, "play() did not start"
+    return av, av._cursor_sample
+
+
+def _sweep(av, frames):
+    av._sink.frames = frames
+    av._on_play_tick()
+
+
+def test_the_end_of_the_clip_returns_the_playhead_to_where_play_started(monkeypatch):
+    av, origin = _playing(monkeypatch)
+    moved = []
+    av.playCursorMoved.connect(moved.append)
+    _sweep(av, av._play_nframes // 2)
+    assert moved and moved[-1] > origin
+    _sweep(av, av._play_nframes)
+    assert av._sink is None and moved[-1] == origin == av._cursor_sample
+
+
+def test_stop_returns_to_where_play_started_then_to_the_start_of_the_audio(monkeypatch):
+    av, origin = _playing(monkeypatch)
+    moved = []
+    av.playCursorMoved.connect(moved.append)
+    _sweep(av, av._play_nframes // 2)
+    av.stop_and_rewind()
+    _sweep(av, av._play_nframes + av._play_fade_frames)     # the stop fade plays out
+    assert av._sink is None and moved[-1] == origin
+    av.stop_and_rewind()                             # already there: the audio's start
+    assert moved[-1] == av._audio_start_sample() < origin
+
+
+def test_a_resumed_pause_keeps_the_origin_and_a_moved_playhead_starts_a_new_one(monkeypatch):
+    av, origin = _playing(monkeypatch)
+    _sweep(av, av._play_nframes // 4)
+    paused = av._cursor_sample
+    av._toggle_play()                                # pause
+    _sweep(av, av._play_nframes + av._play_fade_frames)
+    assert av._sink is None and av._cursor_sample == paused
+    av.play()                                        # resume from where it paused
+    assert av._play_origin == origin
+    av._toggle_play()                                # pause the resumed playback
+    _sweep(av, av._play_nframes + av._play_fade_frames)
+    assert av._sink is None and av._paused_at is not None
+    av.set_cursor(origin + 2000)                     # moved while paused: a new Play
+    av.play()
+    assert av._play_origin == origin + 2000
+    av.hard_stop()
+
+
+def test_play_names_the_streams_of_unknown_rate_it_plays_at_the_assumed_rate(monkeypatch):
+    from swi3s_studio.ui import audio_view
+    if not audio_view._HAVE_AUDIO:
+        pytest.skip("no QtMultimedia")
+    av, store = _delayed_mix()
+    store._rates[(0, 3)] = 0.0
+    monkeypatch.setattr(audio_view, "QAudioSink", _Sink)
+    monkeypatch.setattr(av, "_selected_device", lambda: type("D", (), {"isNull": lambda s: False})())
+    av.play()
+    try:
+        assert av.assumed_rate_streams == [(0, 3)]
+    finally:
+        av.hard_stop()
+    store._rates[(0, 3)] = 48000.0
+    av.play()
+    try:
+        assert av.assumed_rate_streams == []
+    finally:
+        av.hard_stop()

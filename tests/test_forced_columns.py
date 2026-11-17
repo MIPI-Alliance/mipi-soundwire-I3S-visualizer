@@ -247,8 +247,9 @@ def test_timeline_label_carries_the_forced_badge_of_a_pinned_section():
     assert s.forced_column_sections == {sect: 12}
 
     tl = TimelineRibbon()
-    assert tl._segment_label(sect, 12, True) == "12col (forced)"
-    assert tl._segment_label(sect, 12, False) == "12col"
+    assert tl._segment_label(sect, 12, True) == "12-col (forced)"
+    assert tl._segment_label(sect, 12, False) == "12-col"
+    assert tl._segment_label(sect, 12, True, number=2) == "12-col 2 (forced)"
 
 
 def test_forced_outline_is_confined_to_the_pinned_region():
@@ -330,7 +331,7 @@ def test_menu_action_pins_the_cursor_region_and_labels_it():
         labels = [w._timeline._segment_label(i, int(b["column_count"]),
                                              bool(b.get("forced")))
                   for i, b in enumerate(bands)]
-        assert "12col (forced)" in labels
+        assert "12-col (forced)" in labels
         assert not bands[0].get("forced"), "an untouched region must not read as forced"
     finally:
         w.join_worker_threads()
@@ -345,3 +346,21 @@ def test_pin_applies_to_an_imported_csv_region(tmp_path):
     s.force_column_count_at(sample, CSV_COLUMNS)
     assert s.forced_column_count_at(sample) == CSV_COLUMNS
     assert _grid_width(s, sample) == CSV_COLUMNS
+
+
+# ------------------------------------------------ a caller's forced count, decode_capture
+
+@pytest.mark.parametrize("with_csv", [False, True], ids=["safe-lock seed", "config csv"])
+def test_a_callers_forced_count_outranks_the_safe_lock_seed_and_a_config_csv(tmp_path, with_csv):
+    """decode_capture and api.decode agree: the caller's count is the decode's, whether the
+    capture's bring-up recovered a Safe-Lock width or a config CSV pins another."""
+    from swi3s_studio import api
+    cap = Session.from_demo(48, phy=2, cold_start=True).capture
+    csv = _write_config_csv(tmp_path / "cfg.csv") if with_csv else ""
+    s = Session(cap, forced_column_count=8, config_csv=csv)
+    assert s._forced_column_count == 8
+    assert s.segments[0]["column_count"] == 8
+    assert api.decode_capture(cap, forced_column_count=8, config_csv=csv).commands == s.commands
+    s.apply_config_csv(_write_config_csv(tmp_path / "again.csv", columns=12))
+    assert s._forced_column_count == 8 and s.segments[0]["column_count"] == 8
+    assert Session(cap, config_csv=csv)._forced_column_count == (0 if with_csv else 2)

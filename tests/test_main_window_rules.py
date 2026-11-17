@@ -62,18 +62,14 @@ def test_the_cds_pane_selects_the_command_the_table_rows_name(monkeypatch):
 # ---- a failed TX-persist scan ends its request and frees the slot ----
 
 def test_a_failed_persist_scan_reports_no_result():
-    from swi3s_studio.ui.main_window import _TxPersistWorker
+    from swi3s_studio.ui.main_window import _tx_persist_scan
 
     class Broken:
         def tx_persist_columns(self, _sample):
             raise RuntimeError("no data")
 
     token = object()
-    got = []
-    worker = _TxPersistWorker(Broken(), 0, token)
-    worker.done.connect(lambda lit, cols, tok, err: got.append((lit, cols, tok, err)))
-    worker.run()
-    assert got == [(None, 0, token, "no data")]
+    assert _tx_persist_scan(Broken(), 0, token) == (None, 0, token, "no data")
 
 
 def test_a_failed_persist_scan_names_its_error_in_the_status_bar():
@@ -108,32 +104,62 @@ def test_a_failed_persist_scan_does_not_wedge_later_requests(monkeypatch):
 
     drawn = []
     monkeypatch.setattr(win, "_render_tx_persist", lambda lit, cols, token: drawn.append(lit))
+    job = win._tx_persist_job
     win._start_tx_persist_worker(Broken(), 0, object())
     win._start_tx_persist_worker(Fine(), 0, object())          # arrives while the first runs
-    assert win._tx_persist_pending is not None and Fine.calls == 0
+    assert job.busy and Fine.calls == 0
     release.set()
-    _pump_until(lambda: win._tx_persist_thread is None and Fine.calls == 1)
+    _pump_until(lambda: not job.busy and Fine.calls == 1)
     assert len(drawn) == 1 and drawn[0] is not None
     win._start_tx_persist_worker(Fine(), 0, object())          # the slot is free again
-    _pump_until(lambda: win._tx_persist_thread is None and Fine.calls == 2)
+    _pump_until(lambda: not job.busy and Fine.calls == 2)
+    win.join_worker_threads()
 
 
-def test_the_persist_slot_is_held_until_its_thread_has_finished():
+def test_a_close_waits_for_the_persist_scan_running_and_applies_nothing(monkeypatch):
     win = _win()
+    ended = []
 
     class Slow:
         def tx_persist_columns(self, _sample):
             import numpy as np
             time.sleep(0.2)
+            ended.append(True)
             return np.zeros(2, dtype=bool), 2
 
-    token = object()
-    win._start_tx_persist_worker(Slow(), 0, token)
-    thread = win._tx_persist_thread
-    win._on_tx_persist_done(None, 0, token)         # the scan's result has been handled
-    assert win._tx_persist_thread is thread         # …but its thread has not stopped yet
-    win.join_worker_threads()                       # a close now waits for it
-    assert not thread.isRunning() and win._tx_persist_thread is None
+    drawn = []
+    monkeypatch.setattr(win, "_render_tx_persist", lambda lit, cols, token: drawn.append(lit))
+    win._start_tx_persist_worker(Slow(), 0, object())
+    win._start_tx_persist_worker(Slow(), 0, object())          # pending: dropped by the close
+    win.join_worker_threads()                                  # a close waits for the scan
+    assert ended == [True] and not win._tx_persist_job.busy
+    time.sleep(0.05)
+    QApplication.processEvents()
+    assert drawn == [] and ended == [True]                     # nothing applied, nothing ran
+
+
+def test_the_persist_scan_runs_on_a_plain_worker_thread_with_collection_off():
+    """The scan runs on the persistence LatestJob's worker, a plain Python thread whose result
+    the UI thread polls for, so no Qt object lives on or crosses to the scan's thread, and
+    with automatic collection off, so no collection runs on that thread."""
+    import gc
+    import threading
+
+    import numpy as np
+
+    from swi3s_studio.ui import latest_job
+    win = _win()
+    seen = []
+
+    class Probe:
+        def tx_persist_columns(self, _sample):
+            seen.append((threading.current_thread().name, gc.isenabled()))
+            return np.zeros(2, dtype=bool), 2
+
+    win._start_tx_persist_worker(Probe(), 0, object())
+    _pump_until(lambda: seen)
+    win.join_worker_threads()
+    assert seen == [(latest_job.THREAD_NAME, False)]
 
 
 # ---- Compare is read from the Link whose Registers pane shows the overlay ----
@@ -236,6 +262,42 @@ def test_the_compare_overlay_goes_when_the_registers_pane_shows_another_link(
     assert not win._reg_view.has_expected()
 
 
+def _compare_at(monkeypatch, sample):
+    """A Compare of one register the demo's bus writes (Dev0 0x1013 = 0xA0), run with the
+    playhead at `sample`: the box's text, and the window."""
+    import swi3s_studio.ui.main_window as mw
+    win = _win()
+    win._show_dock(win._reg_dock)
+    win.cursor.set_sample(sample)
+    monkeypatch.setattr(mw.swi3score, "registers_from_csv", lambda _p: [(0, 0x1013, 0xA0)])
+    texts = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: texts.append(self.text()) or 0)
+    win._run_compare("expected.csv")
+    return texts, win
+
+
+def test_compare_diffs_against_the_registers_at_the_playhead(monkeypatch):
+    texts, win = _compare_at(monkeypatch, 0)           # before the bus writes the register
+    assert texts == ["1 of 1 register(s) differ between the expected config and the "
+                     "decoded bus at the playhead."]
+    texts, win = _compare_at(monkeypatch, win._session.last_sample())
+    assert texts == ["Config matches the decoded registers at the playhead — "
+                     "0 of 1 register(s) differ."]
+
+
+def test_the_compare_count_follows_the_playhead(monkeypatch):
+    _texts, win = _compare_at(monkeypatch, 0)
+    assert win._compare_count == 1
+    win._show_registers_at(win._session.last_sample())   # the Registers pane's cursor refresh
+    assert win._compare_count == 0
+    assert win._status.text().startswith("Config vs decoded at the playhead: 0 register(s)")
+    win._show_registers_at(0)
+    assert win._compare_count == 1
+    win.clear_comparison()
+    win._show_registers_at(win._session.last_sample())
+    assert win._compare_count is None
+
+
 def test_clear_compare_removes_the_overlay_with_no_capture_loaded(monkeypatch):
     win = _compared(monkeypatch)
     win._session = None
@@ -266,7 +328,8 @@ def test_a_wfm_capture_is_opened_with_the_supplied_config(monkeypatch):
 # ---- a limit on Rows To Draw is told to the user ----
 
 def test_rows_over_the_authored_limit_are_named_in_the_notifications(monkeypatch):
-    from swi3s_studio.ui.main_window import _AUTHORED_ROWS_MAX, _authored_rows
+    from swi3s_studio.model.viz_engine import MAX_AUTHORED_ROWS as _AUTHORED_ROWS_MAX
+    from swi3s_studio.ui.authoring_controller import authored_rows as _authored_rows
     assert _authored_rows(50) == (50, None)
     assert _authored_rows(_AUTHORED_ROWS_MAX) == (_AUTHORED_ROWS_MAX, None)
     rows, note = _authored_rows(5000)
@@ -352,7 +415,7 @@ def test_force_column_count_accepts_a_legal_count_and_0_to_remove_the_pin(monkey
     win.force_column_count()
     assert told == [] and len(decoded) == 1
     sect = win._session.segment_index_for_sample(int(win.cursor.sample))
-    decoded[0]()
+    decoded[0](win._session)
     assert int(win._session.forced_column_sections.get(sect, 0)) == count
 
 
@@ -361,10 +424,11 @@ def test_the_register_column_range_is_the_cores_less_one():
 
     import swi3s_studio.ui.main_window as mw
     from swi3s_studio.swviz.config.constants import InterfaceRanges
+    from swi3s_studio.ui.authoring_controller import NUM_COLUMNS_REG
     assert (mw._MIN_COLUMNS, mw._MAX_COLUMNS) == (swi3score.min_column_count,
                                                    swi3score.max_column_count)
-    assert mw._NUM_COLUMNS_REG == (InterfaceRanges.MIN_COLUMNS_PER_ROW,
-                                   InterfaceRanges.MAX_COLUMNS_PER_ROW)
+    assert NUM_COLUMNS_REG == (InterfaceRanges.MIN_COLUMNS_PER_ROW,
+                               InterfaceRanges.MAX_COLUMNS_PER_ROW)
 
 
 def test_the_authored_grid_fallback_draws_at_most_the_registers_columns(monkeypatch):
@@ -422,13 +486,13 @@ def test_the_bus_model_export_writes_at_most_the_authored_row_limit_and_says_so(
 
 
 def test_a_bus_model_export_that_fails_leaves_the_previous_file(monkeypatch, tmp_path):
-    import swi3s_studio.ui.main_window as mw
+    from swi3s_studio.model import viz_engine
     win = _win()
     path = tmp_path / "bus_model.json"
     path.write_text('{"kept": true}', encoding="utf-8")
     monkeypatch.setattr(QFileDialog, "getSaveFileName",
                         staticmethod(lambda *a, **k: (str(path), "")))
-    monkeypatch.setattr(mw.viz_engine, "model_json", lambda *_a: {"bits": [object()]})
+    monkeypatch.setattr(viz_engine, "model_json", lambda *_a: {"bits": [object()]})
     shown = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: shown.append(a[2]))
     win.export_bus_model_json()
@@ -471,7 +535,7 @@ def test_a_saved_window_entry_that_is_not_a_mapping_is_reported(saved):
 
 
 def test_a_locate_that_fails_after_its_read_still_shows_the_reads_warnings(monkeypatch):
-    from swi3s_studio.ui.main_window import _LocateWorker
+    from swi3s_studio.ui.locate_controller import _LocateWorker
 
     def load():
         import_notes.warn("ref.bin", "clamped a value")
@@ -496,7 +560,7 @@ def test_a_locate_that_fails_after_its_read_still_shows_the_reads_warnings(monke
                                        (IndexError(), "IndexError: "),
                                        (ValueError("unreadable"), "unreadable")])
 def test_a_locate_failure_names_an_exception_that_has_no_text_of_its_own(exc, text):
-    from swi3s_studio.ui.main_window import _LocateWorker
+    from swi3s_studio.ui.locate_controller import _LocateWorker
 
     def load():
         raise exc
@@ -530,7 +594,7 @@ def test_a_failed_re_decode_is_titled_as_one_and_names_the_error(monkeypatch):
     win = _win()
     said = _critical_into(monkeypatch)
 
-    def broken():
+    def broken(_fork):
         raise KeyError("missing")
     win._load_async(broken, kind="redecode")
     pump_loads(win)
@@ -554,8 +618,7 @@ def test_a_failing_after_step_is_not_reported_as_the_views_failing(monkeypatch):
 
     def after(_session):
         raise RuntimeError("step failed")
-    session = win._session
-    win._load_async(lambda: session, after=after, kind="redecode")
+    win._load_async(lambda fork: fork, after=after, kind="redecode")
     pump_loads(win)
     assert len(said) == 1 and "views failed" not in said[0][1]
     assert "a step after it failed" in said[0][1]
@@ -569,8 +632,7 @@ def test_loads_and_menus_do_not_accumulate_children():
     dialogs = len(win.findChildren(QProgressDialog))
     link_actions = len(win._links_menu.findChildren(QAction))
     for _ in range(3):
-        session = win._session
-        win._load_async(lambda s=session: s, kind="redecode")
+        win._load_async(lambda fork: fork, kind="redecode")
         pump_loads(win)
         win._update_link_switcher()
     _flush_deletes()
@@ -622,7 +684,7 @@ def test_the_ssp_step_does_not_touch_a_lane_that_is_gone(monkeypatch):
     monkeypatch.setattr(lane, "set_channel_selection", kept.append)
     after_hooks = []
     monkeypatch.setattr(win, "_redecode_preserving",
-                        lambda apply, status="", *, after=None: after_hooks.append(after))
+                        lambda apply, status="", *, after=None, **_kw: after_hooks.append(after))
     win.set_ssp_row_async(3)
     after_hooks[0]()                                              # the same lane: restored
     assert len(kept) == 1
@@ -775,7 +837,7 @@ def test_export_grid_asks_before_an_added_suffix_replaces_an_existing_file(
 
 def test_save_workspace_asks_before_an_added_suffix_replaces_an_existing_file(
         tmp_path, monkeypatch):
-    from swi3s_studio.ui.main_window import WORKSPACE_SUFFIX
+    from swi3s_studio.workspace import WORKSPACE_SUFFIX
     win = _win()
     existing = tmp_path / f"ws{WORKSPACE_SUFFIX}"
     existing.write_text("earlier workspace")
@@ -791,7 +853,7 @@ def test_save_workspace_asks_before_an_added_suffix_replaces_an_existing_file(
 
 def test_save_workspace_adds_its_suffix_to_a_dotted_name_and_keeps_a_json_one(
         tmp_path, monkeypatch):
-    from swi3s_studio.ui.main_window import WORKSPACE_SUFFIX
+    from swi3s_studio.workspace import WORKSPACE_SUFFIX
     win = _win()
     for typed, written in (("run 1.5", f"run 1.5{WORKSPACE_SUFFIX}"),
                            ("run.json", "run.json"),

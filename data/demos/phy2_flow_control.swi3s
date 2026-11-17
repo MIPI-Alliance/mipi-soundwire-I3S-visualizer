@@ -174,7 +174,8 @@
       "expanded": []
     },
     "timing_pane": {
-      "region": "16 col  (0.00\u20132.00 s)",
+      "region": "All Flow Control Modes  (0.00\u20132.00 s)",
+      "section": 1,
       "filter": [
         "Manager",
         "CDS (Col 0)"

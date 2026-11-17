@@ -107,3 +107,70 @@ def test_the_device_dropdown_keeps_its_selection_across_a_rename(view):
     v._device.setCurrentIndex(v._device.findData(1))
     v.set_device_names({1: "Mic", 0: "Mgr"})
     assert v.current_device() == 1 and "Mic" in v._device.currentText()
+
+
+def test_a_device_chosen_before_it_has_a_file_stays_chosen(view):
+    """Moving the cursor to an instant before the chosen device has any activity keeps it
+    in the dropdown and selected, and the choice is still there when its file returns."""
+    v, f = view
+    late = DeviceRegisterFile(RegisterMap.load(), 3)
+    v.set_files({0: f, 3: late})
+    v._device.setCurrentIndex(v._device.findData(3))
+    assert v.current_device() == 3
+    v.set_files({0: f})                              # an instant before device 3 is written
+    assert v.current_device() == 3
+    v.set_files({})
+    assert v.current_device() == 3
+    v.set_files({0: f, 3: late})
+    assert v.current_device() == 3
+
+
+def test_binding_another_link_forgets_the_chosen_device(view):
+    v, f = view
+
+    class _Sess:
+        pass
+
+    a, b = _Sess(), _Sess()
+    v.bind_link(a)
+    v.set_files({0: f, 3: DeviceRegisterFile(RegisterMap.load(), 3)})
+    v._device.setCurrentIndex(v._device.findData(3))
+    v.bind_link(a)                                   # the same Link again: kept
+    assert v._chosen_device == 3
+    v.bind_link(b)
+    v.set_files({0: f})
+    assert v.current_device() == 0
+
+
+def test_a_saved_device_with_no_file_at_the_cursor_is_chosen_and_kept(view):
+    from swi3s_studio.ui import view_state
+    v, f = view
+    late = DeviceRegisterFile(RegisterMap.load(), 3)
+    assert v._device.findData(3) < 0                      # nothing written to device 3 yet
+    view_state.restore_registers(v, {"device": 3})
+    assert v.current_device() == 3
+    v.set_files({0: f})                                   # a scrub keeps the restored pick
+    assert v.current_device() == 3
+    v.set_files({0: f, 3: late})
+    assert v.current_device() == 3
+
+
+def test_a_saved_device_that_is_already_current_is_still_a_pick(view):
+    from swi3s_studio.ui import view_state
+    v, f = view
+    assert v.current_device() == 0 and v._chosen_device is None
+    view_state.restore_registers(v, {"device": 0})
+    assert v._chosen_device == 0
+    v.set_files({})
+    assert v.current_device() == 0
+
+
+@pytest.mark.parametrize("saved", [12, -1, 10 ** 9, 1.5, "3", True])
+def test_a_saved_device_outside_the_device_range_is_reported(view, saved):
+    from swi3s_studio import import_notes
+    from swi3s_studio.ui import view_state
+    v, f = view
+    with import_notes.collect() as notes:
+        view_state.restore_registers(v, {"device": saved}, source="ws.json")
+    assert len(notes) == 1 and "device" in notes[0].message
+    assert v.current_device() == 0

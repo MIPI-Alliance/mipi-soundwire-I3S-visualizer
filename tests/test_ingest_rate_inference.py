@@ -134,6 +134,37 @@ def test_a_subnormal_spacing_gives_a_rate_above_the_limit_not_an_overflow(tmp_pa
         digital_csv.load_capture(str(path), 1, 2)
 
 
+@pytest.mark.parametrize("rate, lead_s", [(1_000_000, 100.0), (1_000_000, 1000.0),
+                                          (24_576_000, 2.0)])
+def test_an_idle_lead_in_before_the_bus_keeps_the_rate(rate, lead_s):
+    """A first row at capture start and the bus coming up seconds later: the finest spacing
+    is measured far from the first time, and the grid is still found."""
+    e = np.cumsum(np.random.default_rng(3).integers(1, 40, 20_000))
+    t = np.concatenate(([0.0], lead_s + e / rate))
+    assert timebase.rate_from_times(t) == rate
+
+
+def test_a_few_timestamps_off_the_grid_name_the_coarser_grid_the_rest_sit_on(tmp_path):
+    """One time printed 0.3 of a sample off a 1 MHz grid puts every time on a 10 MHz grid:
+    that rate is read, and the import warning names the 1 MHz grid the rest sit on."""
+    from swi3s_studio import import_notes
+    e = np.cumsum(np.random.default_rng(5).integers(2, 40, 5_000))
+    t = e / 1e6
+    t[700] += 0.3e-6
+    assert timebase.rate_from_times(t) == 10_000_000
+    note = timebase.coarser_grid_note(t, 10_000_000)
+    assert note.startswith("1 of the 5,000 timestamps read for the rate is off the "
+                           "1,000,000 Hz grid") and note.endswith("read at 10,000,000 Hz, the grid that holds "
+                                                     "them all")
+    assert timebase.coarser_grid_note(e / 1e6, 1_000_000) == ""
+    path = tmp_path / "off.csv"
+    path.write_text("Time [s],A,B\n" + "".join(f"{x:.9f},{i & 1},0\n" for i, x in enumerate(t)))
+    with import_notes.collect() as notes:
+        got = digital_csv.load_capture(str(path), 1, 2)
+    assert got.sample_rate_hz == 10_000_000
+    assert any("off the 1,000,000 Hz grid" in n.message for n in notes)
+
+
 def _grid_csv(path, first_rows, later_rows):
     """Rows on a 100 MHz grid, then rows half a sample off it, so a rate taken from every
     row (200 MHz) differs from the rate of the first rows."""

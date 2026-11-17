@@ -7,7 +7,7 @@ decode and timing analysis. See docs/architecture.md.
 `__version__` is shown in the window title and kept in sync with pyproject.toml. Release
 notes, one file per version, are in docs/releases/.
 """
-__version__ = "3.2.0"
+__version__ = "3.3.1"
 
 from .api import DecodeResult, decode, decode_capture
 from .ingest import saleae_binary

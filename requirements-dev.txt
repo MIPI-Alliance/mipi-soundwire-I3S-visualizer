@@ -17,7 +17,9 @@ pytest-cov>=7.0      # the coverage floor CI enforces
 # [tool.coverage.run] patch = ["subprocess"] (pyproject.toml) needs coverage 7.10 or later.
 coverage>=7.10
 pytest-xdist>=3.6    # the gate spreads its heaviest test files over workers
-ruff>=0.16
+# Pinned: a ruff release changes what the lint check reports. Raise it on its own, with the
+# findings the new release adds.
+ruff==0.16.1
 # Pinned to the version tools/mypy_baseline.json records under "env": another mypy makes the
 # type ratchet NOT COMPARABLE. Change the two together.
 mypy==2.3.0

@@ -1,0 +1,8 @@
+# The Qt for Python release a PyInstaller bundle is built with: a release series that
+# data/licenses/Qt-for-Python/NOTICE.txt names. swi3s-studio.spec stops on any other.
+#
+#     python3 -m pip install -c tools/bundle_constraints.txt -r requirements.txt
+PySide6==6.11.1
+PySide6_Essentials==6.11.1
+PySide6_Addons==6.11.1
+shiboken6==6.11.1

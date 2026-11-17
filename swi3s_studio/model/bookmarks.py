@@ -88,25 +88,28 @@ class BookmarkSet:
     # ---- mutations ----
     def add(self, sample: int, link: int = 0) -> Bookmark:
         """Add a bookmark at `sample` on Link `link`, filling the earliest incomplete pair
-        (index 2) or opening a new group (index 1). Returns the new Bookmark."""
+        (with the index its one member leaves free) or opening a new group (index 1).
+        Returns the new Bookmark."""
         sample = int(sample)
         g = self._incomplete_group()
         if g is not None:
-            bm = Bookmark(sample=sample, group=g, index=2, link=int(link))
+            other = next(b for b in self._items if b.group == g)
+            bm = Bookmark(sample=sample, group=g, index=1 if other.index == 2 else 2,
+                          link=int(link))
         else:
             bm = Bookmark(sample=sample, group=self._next_new_group(), index=1, link=int(link))
         self._items.append(bm)
         return bm
 
     def remove_at(self, sample: int, tol: int = 0, link: Optional[int] = None) -> bool:
-        """Remove the bookmark nearest `sample` within `tol` samples. True if removed. With
-        `link`, only that Link's bookmarks are candidates (samples of different Links are
-        not comparable)."""
+        """Remove the bookmark nearest `sample` within `tol` samples (0: at `sample` itself).
+        True if removed. With `link`, only that Link's bookmarks are candidates (samples of
+        different Links are not comparable)."""
         cands = [b for b in self._items if link is None or b.link == link]
         if not cands:
             return False
         nearest = min(cands, key=lambda b: abs(b.sample - sample))
-        if tol and abs(nearest.sample - sample) > tol:
+        if abs(nearest.sample - sample) > tol:
             return False
         self._items.remove(nearest)
         return True
@@ -121,6 +124,15 @@ class BookmarkSet:
     def clear(self) -> None:
         self._items.clear()
 
+    def merge(self, other: "BookmarkSet") -> None:
+        """Add `other`'s bookmarks after these, each of its groups under the next group name
+        free here, keeping each bookmark's index, label and Link."""
+        renamed: Dict[str, str] = {}
+        for b in list(other):
+            if b.group not in renamed:
+                renamed[b.group] = self._next_new_group()   # free: each is added at once
+            self._items.append(Bookmark(b.sample, renamed[b.group], b.index, b.label, b.link))
+
     def copy(self) -> "BookmarkSet":
         """Deep-ish copy (new Bookmark objects) so a snapshot survives re-decodes and
         edits to the live set don't leak into it."""
@@ -132,7 +144,7 @@ class BookmarkSet:
         """(group, first, second) for every COMPLETE pair, ordered by group letter.
         Members are returned in sample order (left, right) for a positive delta — which is
         time order only when both are on one Link; the window times cross-Link pairs itself
-        (MainWindow._cross_link_delta)."""
+        (BookmarksController._cross_link_delta)."""
         by_group: Dict[str, List[Bookmark]] = {}
         for b in self._items:
             by_group.setdefault(b.group, []).append(b)

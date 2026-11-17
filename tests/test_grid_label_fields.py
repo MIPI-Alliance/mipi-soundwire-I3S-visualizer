@@ -205,7 +205,30 @@ def test_clicking_a_swatch_emits_its_port(session, qapp):
     gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos, gv.mapToGlobal(pos),
                                    Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
                                    QPointingDevice.primaryPointingDevice()))
+    assert got == [], "the swatch's dialog opens on the release, not the press"
+    gv.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, pos, gv.mapToGlobal(pos),
+                                     Qt.LeftButton, Qt.NoButton, Qt.NoModifier,
+                                     QPointingDevice.primaryPointingDevice()))
     assert got == [key]
+
+
+def test_a_swatch_press_released_elsewhere_emits_nothing(session, qapp):
+    """A press on a swatch released off it is no click."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent, QPointingDevice
+
+    gv = _grid(session, qapp)
+    got = []
+    gv.dpKeyClicked.connect(lambda d, p: got.append((d, p)))
+    rect, _ = gv._key_hits[2]
+    pos = QPointF(gv.mapFromScene(rect.center()))
+    off = QPointF(gv.mapFromScene(rect.center().x(), rect.center().y() + 120))
+    dev = QPointingDevice.primaryPointingDevice()
+    gv.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos, gv.mapToGlobal(pos),
+                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier, dev))
+    gv.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, off, gv.mapToGlobal(off),
+                                     Qt.LeftButton, Qt.NoButton, Qt.NoModifier, dev))
+    assert got == []
 
 
 def test_clicking_the_grid_body_emits_nothing(session, qapp):

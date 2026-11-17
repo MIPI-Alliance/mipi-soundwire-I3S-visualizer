@@ -1,6 +1,6 @@
 // SWI3S (PHY1, PHY2, PHY3) protocol constants.
 //
-// Values follow the MIPI SoundWire I3S (SWI3S) Specification v1.1r06.
+// Values follow the MIPI SoundWire I3S (SWI3S) Specification.
 
 #ifndef SWI3S_PROTOCOL_DEFS_H
 #define SWI3S_PROTOCOL_DEFS_H
@@ -94,9 +94,9 @@ enum Opcode {
 };
 
 // Protocol Spacer sizes in bits ("Size of Protocol Spacer" table). PM default assumes
-// ShortProtocolSpacer = 0 (reset default).
+// ShortProtocolSpacer = 0 (reset default). No phase the parser reads carries a
+// Peripheral -> Peripheral spacer, so the table's PP size is not defined here.
 static const int kSpacerBitsMP = 10;  // Manager -> Peripheral
-static const int kSpacerBitsPP = 10;  // Peripheral -> Peripheral
 static const int kSpacerBitsPM = 20;  // Peripheral -> Manager (default)
 
 static const int kMaxPeripherals = 12;  // 12-bit Device Mask

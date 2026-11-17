@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import ntpath
 import os
+import posixpath
 import warnings
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Sequence
@@ -98,8 +100,18 @@ def names_listed(names: Iterable[object], shown: int = NAMES_SHOWN) -> str:
 
 
 def source_name(path) -> str:
-    """The base name `warn` expects for a file path (a path-like or a string)."""
-    return os.path.basename(os.fspath(path)) if path else ""
+    """The base name `warn` expects for a file path (a path-like or a string). On Windows
+    both `/` and `\\` separate; elsewhere `\\` separates only in a Windows-shaped path (one
+    with a drive or UNC prefix, or with no `/`), so a path saved on Windows is named by its
+    file on every platform and a POSIX file name holding `\\` keeps it."""
+    if not path:
+        return ""
+    p = os.fspath(path)
+    if isinstance(p, bytes):
+        p = os.fsdecode(p)
+    if os.sep == "\\" or ntpath.splitdrive(p)[0] or "/" not in p:
+        return ntpath.basename(p)
+    return posixpath.basename(p)
 
 
 @contextlib.contextmanager

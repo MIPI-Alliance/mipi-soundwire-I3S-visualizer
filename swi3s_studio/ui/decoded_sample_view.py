@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from .port_names import port_label
 from .row_origin import RowOriginMixin
-from .theme import VizTheme, analyzer_stylesheet
+from .theme import VizTheme, analyzer_stylesheet, legible_text_color
 
 _COLS = ["Row", "Time (µs)", "Port", "Binary", "Hex", "Decimal"]
 _OPS = ["—", "≤", "<", "=", "≠", "≥", ">"]        # "—" = no value filter
@@ -214,7 +214,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         lanes = [(int(d), int(p), int(ch)) for d, p, ch in (lanes or [])]
         self._cols_sized = False          # new capture -> re-measure columns on the next fill
         # Same stable per-(device,dp) line colours as the Audio / Capture views, so the
-        # Port column's text matches those overlays (channels of a DP share the DP colour).
+        # Port column's text matches those overlays (channels of a DP share the DP colour),
+        # drawn in the shade of it that reads on the table (theme.legible_text_color).
         from .grid_view import dp_line_color
         self._lane_colors = {key: dp_line_color(key[0], key[1], self._stream_overrides)
                              for key in lanes}
@@ -295,7 +296,7 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             if c == 2:
                 col = self._lane_colors.get((dev, dp, ch))
                 if col is not None:
-                    item.setForeground(col)
+                    item.setForeground(QColor(legible_text_color(col, VizTheme.FRAME_BG)))
             t.setItem(r, c, item)
 
     def _rebuild_starts(self) -> None:
@@ -472,7 +473,8 @@ class DecodedSampleView(RowOriginMixin, QWidget):
         `_starts` array instead of a Python linear scan (same result: the last row
         with start_sample <= sample, else row 0).
 
-        `scroll=True` (default) also centres it in view; pass `scroll=False` (e.g.
+        `scroll=True` (default) also scrolls it to the top of the view, as far as the scroll
+        range allows; pass `scroll=False` (e.g.
         from prepend_samples, which anchors the scrollbar itself) to select without
         touching the scroll position — `scrollToItem` would otherwise yank the view
         back off whatever anchor the caller just set."""
@@ -492,10 +494,10 @@ class DecodedSampleView(RowOriginMixin, QWidget):
             return
         item = t.item(idx, 0)
         if item is not None:
-            prev = self._suppress_scroll         # a centring scroll must not trigger edge-loads
+            prev = self._suppress_scroll         # this scroll must not trigger edge-loads
             self._suppress_scroll = True
             try:
-                t.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                t.scrollToItem(item, QAbstractItemView.PositionAtTop)
             finally:
                 self._suppress_scroll = prev
 

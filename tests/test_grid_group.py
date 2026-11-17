@@ -79,7 +79,7 @@ def test_every_grid_handler_draws_the_grid_s_link(two, monkeypatch, handler):
     elif handler == "raise":
         win._on_grid_dock_visible(True)
     elif handler == "theme":
-        monkeypatch.setattr("swi3s_studio.ui.main_window.save_preference", lambda _p: None)
+        monkeypatch.setattr("swi3s_studio.ui.theme_controller.save_preference", lambda _p: None)
         win.apply_theme("light")
     elif handler == "compare":
         win.clear_comparison()

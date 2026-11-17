@@ -86,7 +86,7 @@ def test_rows_are_withheld_where_the_row_rates_differ_and_uis_still_shown(pair):
 
 def test_both_are_shown_where_both_links_share_both_rates(pair):
     win, phy2, fc = pair
-    s1, s2 = 2_600_000, 3_400_000                        # 16 columns on both Links
+    s1, s2 = 3_100_000, 3_900_000                        # 16 columns on both Links
     for sess in (phy2, fc):
         assert _region(sess, 16)[0] < s1 < s2 < _region(sess, 16)[1]
     dui, drows, _dt = _delta(win, s1, 0, s2, 1)
@@ -99,7 +99,7 @@ def test_an_interval_across_a_geometry_change_has_no_common_row_rate(pair):
     """Link 1 changes from 8 to 16 columns inside the interval: its row rate is not one
     number there, so ΔRows is withheld. The UI rate holds, so ΔUI is shown."""
     win, phy2, fc = pair
-    s1, s2 = 2_000_000, 2_600_000                        # Link 1: 8 -> 16 columns
+    s1, s2 = 2_400_000, 3_200_000                        # Link 1: 8 -> 16 columns
     assert _region(phy2, 8)[0] < s1 < _region(phy2, 16)[0] < s2
     assert _region(fc, 16)[0] < s1                       # Link 2: 16 throughout
     dui, drows, _dt = _delta(win, s1, 0, s2, 1)

@@ -3,7 +3,8 @@
 The verified C++ SWI3S decode (PHY1, PHY2 and PHY3/DLV), kept in-repo under `swi3score/core/`
 so this repository builds standalone. `compat/LogicPublicTypes.h` is a small SDK-free
 type shim, and `ISampleSource` + `Decoder` run the pipeline from an in-memory or edge-array
-source. See `swi3score/core/README.md` for the file list.
+source. `VcdReader` reads a VCD's value changes for `swi3s_studio/ingest/vcd.py`. See
+`swi3score/core/README.md` for the file list.
 
 ## Build
 

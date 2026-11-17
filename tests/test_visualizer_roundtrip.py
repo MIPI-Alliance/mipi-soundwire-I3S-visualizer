@@ -1,8 +1,9 @@
 """Full-corpus CSV round-trip — every example config survives save -> reload intact.
 
 Each config is loaded, saved and reloaded through the CSVHandler save/load path the app
-uses. The built bus model JSON, the description and each data port's name, number, enable,
-handover and display fields are compared with the original's. Every example must also
+uses. The built bus model JSON, the Interface's registers and per-source lists, each data
+port's and Flow Control Port's registers, the description and each data port's name, number,
+enable, handover and display fields are compared with the original's. Every example must also
 parse as strict CSV.
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_visualizer_roundtrip.py
@@ -32,18 +33,28 @@ def _resave(src_csv: str, dst_csv: str) -> None:
 
 
 def _authoring_fields(csv: str):
-    """The fields a CSV carries that the bus model does not: the description and each data
-    port's name, number, enable, handover and label fields."""
+    """What a CSV loads into: the Interface's scalars and per-source lists, the description,
+    each data port's name, number, enable, handover and label fields and its registers
+    (`vars(dp.config)`), and each Flow Control Port's registers (zeroed where its data port's
+    FlowMode_REG is 0 or 1, as the registers are then unused)."""
     iface, viz = Interface(), VizConfig()
     CSVHandler.load_csv(csv, iface, viz)
-    return iface.description, [(d.name, d.dp_number, d.enabled, d.enable_handover,
-                                d.display_fields) for d in viz.data_ports]
+    scalars = {k: v for k, v in vars(iface).items() if k not in ("devices", "flow_control_ports")}
+    ports = []
+    for dp, drawn in zip(iface.data_ports, viz.data_ports):
+        fcp = vars(iface.get_fcp(dp.dp_index).config)
+        if dp.config.FlowMode_REG in (0, 1):
+            fcp = dict.fromkeys(fcp, 0)
+        ports.append((drawn.name, drawn.dp_number, drawn.enabled, drawn.enable_handover,
+                      drawn.display_fields, dict(vars(dp.config)), dict(fcp)))
+    return scalars, ports
 
 
 def test_all_configs_csv_roundtrip():
-    """load -> save -> reload leaves the built bus model byte-for-byte identical, and the
-    description and each data port's drawing fields equal, for every example config. Catches
-    any authoring field dropped/reordered by the CSV writer."""
+    """load -> save -> reload leaves the built bus model byte-for-byte identical, and every
+    register the CSV loads (the Interface's scalars and per-source lists, each data port's and
+    Flow Control Port's registers) and the description and data ports' drawing fields equal,
+    for every example config. Catches any of them dropped or reordered by the CSV writer."""
     csvs = _all_example_csvs()
     assert len(csvs) == 96, f"expected the example corpus of 96 configs, found {len(csvs)}"
     fails = []
@@ -54,8 +65,8 @@ def test_all_configs_csv_roundtrip():
             _resave(csv, resaved)
             roundtripped = viz_engine.model_json(resaved)
             if _authoring_fields(resaved) != _authoring_fields(csv):
-                fails.append(f"{os.path.relpath(csv, _EXAMPLES)}: description or "
-                             f"data-port drawing fields changed")
+                fails.append(f"{os.path.relpath(csv, _EXAMPLES)}: a loaded register, the description "
+                             f"or a data port's drawing field changed")
             if roundtripped != original:
                 diff = [k for k in set(original) | set(roundtripped)
                         if original.get(k) != roundtripped.get(k)]

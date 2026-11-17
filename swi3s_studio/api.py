@@ -39,9 +39,21 @@ def decode(source: "swi3score.ISampleSource", *, forced_column_count: int = 0,
            scrambler_overrides=None) -> DecodeResult:
     """Decode a bare sample source. A source carries no link bring-up to read, so this
     decodes with neither a Safe-Lock seed nor restart points: for a Capture use
-    decode_capture, which decodes as Session does."""
+    decode_capture, which decodes as Session does.
+
+    A forced column count outside 2..32 and a scrambler override whose key is not
+    (device -1..11, data port) are reported as import notes, as Session reports them; the
+    count is then detected and the entry left out. A forced count outranks a config CSV.
+    A native core built for another ABI raises RuntimeError naming the rebuild, as Session
+    does."""
+    from .session import (
+        _require_score_abi,
+        checked_forced_column_count,
+        checked_scrambler_overrides,
+    )
+    _require_score_abi()
     settings = swi3score.DecoderSettings()
-    settings.forced_column_count = int(forced_column_count)
+    settings.forced_column_count = checked_forced_column_count(forced_column_count, "decode")
     settings.decode_audio = bool(decode_audio)
     original, upgraded = config_csv, ""
     if config_csv:
@@ -54,8 +66,10 @@ def decode(source: "swi3score.ISampleSource", *, forced_column_count: int = 0,
             visualizer_csv.report_csv_warnings(config_csv, original)
         settings.config_csv_path = config_csv or ""
         if scrambler_overrides:
-            settings.scrambler_overrides = [(int(d), int(p), 1 if on else 0)
-                                            for (d, p), on in dict(scrambler_overrides).items()]
+            settings.scrambler_overrides = [
+                (d, p, 1 if on else 0)
+                for (d, p), on in checked_scrambler_overrides(scrambler_overrides,
+                                                              "decode").items()]
         dec = swi3score.Decoder(source, settings)
         dec.run()
     finally:
@@ -74,9 +88,14 @@ def decode_capture(capture: Capture, *, forced_column_count: int = 0,
                    scrambler_overrides=None) -> DecodeResult:
     """Decode a Capture exactly as Session does: the bring-ups read from its edges seed
     the Safe-Lock column count and restart the decode at each later one, and a detected
-    bring-up the decode contradicts is dropped."""
+    bring-up the decode contradicts is dropped. A forced column count outranks the Safe-Lock
+    seed and a config CSV, as it does in decode. The Session it decodes with is closed
+    before it returns, so its on-disk results and config CSV upgrade copy are removed."""
     from .session import Session
     s = Session(capture, forced_column_count=forced_column_count, decode_audio=decode_audio,
                 config_csv=config_csv, scrambler_overrides=scrambler_overrides)
-    return DecodeResult(commands=s.commands, audio=s.audio, column_count=s.column_count,
-                        row_rate_khz=s.row_rate_khz, ui_rate_hz=s.ui_rate_hz)
+    try:
+        return DecodeResult(commands=s.commands, audio=s.audio, column_count=s.column_count,
+                            row_rate_khz=s.row_rate_khz, ui_rate_hz=s.ui_rate_hz)
+    finally:
+        s.close()

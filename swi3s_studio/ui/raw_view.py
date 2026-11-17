@@ -26,7 +26,7 @@ expected number of UIs late.
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -91,16 +91,15 @@ def _step_xy_from(win: np.ndarray, init_level: bool, lo: int, hi: int, y0: float
     """Step (x, y) arrays for a digital line over [lo, hi] samples given the edges
     already windowed to that range (`win`) and the level just before `lo`
     (`init_level`). Drawn between `y0` (low) and `y1` (high); x stays in samples."""
-    level = bool(init_level)
-    xs = [lo]
-    ys = [y1 if level else y0]
-    for e in win:
-        e = int(e)
-        xs.append(e); ys.append(y1 if level else y0)  # hold up to the edge
-        level = not level
-        xs.append(e); ys.append(y1 if level else y0)  # transition
-    xs.append(hi); ys.append(y1 if level else y0)
-    return xs, ys
+    n = int(win.size)
+    xs = np.empty(2 * n + 2, dtype=np.float64)
+    xs[0], xs[-1] = lo, hi
+    xs[1:-1] = np.repeat(win, 2)
+    # Each edge appears twice (hold, then transition), so the level flips after every
+    # second point: point i has seen i // 2 edges.
+    flips = np.arange(2 * n + 2) // 2
+    high = (flips & 1).astype(bool) ^ bool(init_level)
+    return xs, np.where(high, y1, y0)
 
 
 class _RawTimeAxis(pg.AxisItem):
@@ -139,6 +138,8 @@ class _RawTimeAxis(pg.AxisItem):
 class RawCaptureView(QWidget):
     """Two stacked digital traces (DP above DN) over a sample window, with a cursor
     line that tracks the shared time cursor. Wheel/drag zoom & pan the X axis."""
+
+    _legend_btn: Any            # the toolbar's Show / Hide Legend button
 
     sampleSelected = Signal('qlonglong')             # x clicked → shared cursor
     #: a bookmark line was dragged: (label, new_sample, final)
@@ -241,7 +242,7 @@ class RawCaptureView(QWidget):
                                                   pen=pg.mkPen(_PLL_ERR_COLOR, width=2))
         self._plot.addItem(self._missing_lines)
         self._plot.addItem(self._missing_arrows)
-        self._missing_provider = None
+        self._missing_provider: Optional[Callable[[int, int], Any]] = None
         self._pll_unlocked = False
         # A "PLL UNLOCK" banner shown (top-left) when the recovered clock lost the row
         # cadence over the capture (more missing RSP edges than the session's threshold).
@@ -386,6 +387,8 @@ class RawCaptureView(QWidget):
         self._show_clock = bool(on)
         self._clock_btn.setText("Hide Clock" if on else "Show Clock")
         self._apply_clock_visibility()
+        if on and self._total > 1:
+            self._render_visible()           # the bottom band is not built while hidden
 
     def _on_legend_toggled(self, on: bool) -> None:
         """Show/Hide the symbol-key legend (also driven by clicking the legend)."""
@@ -562,6 +565,7 @@ class RawCaptureView(QWidget):
             line.setPen(pg.mkPen(bmc, width=1))
             line.label.setColor(bmc)
         self._cursor.setPen(pg.mkPen(VizTheme.CURSOR, width=1))
+        self._rec_clk_curve.setPen(pg.mkPen(VizTheme.TEXT, width=1))
         x0, x1 = self._plot.getViewBox().viewRange()[0]
         self._render_range(int(x0 * self._rate), int(x1 * self._rate))
 
@@ -672,14 +676,15 @@ class RawCaptureView(QWidget):
     def _refresh_missing(self) -> None:
         """Redraw the missing-RSP flags for the visible window (red verticals + 'x'),
         gated by the RSP toggle, and (re)position the PLL-unlock banner."""
-        show = self._show_cds and self._missing_provider is not None and self._total > 1
+        provider = self._missing_provider
+        show = self._show_cds and provider is not None and self._total > 1
         x0, x1 = self._plot.getViewBox().viewRange()[0]
-        if not show:
+        if provider is None or not show:
             self._missing_lines.setData([], [])
             self._missing_arrows.setData([], [])
         else:
             lo, hi = int(x0 * self._rate), int(x1 * self._rate)
-            samples = np.asarray(self._missing_provider(lo, hi))
+            samples = np.asarray(provider(lo, hi))
             if samples.size == 0:
                 self._missing_lines.setData([], [])
                 self._missing_arrows.setData([], [])
@@ -845,6 +850,7 @@ class RawCaptureView(QWidget):
             if s.size == 0:
                 item.setData([], [])
                 line.setData([], [])
+                self._set_lane_labels(key, np.zeros(0), 0.0, c)
                 continue
             st = is_start[sel]
             order = np.argsort(s, kind="stable")       # bits in sample order (MSB→LSB)
@@ -1033,12 +1039,29 @@ class RawCaptureView(QWidget):
         spans more edges than we'll draw, decimate so a zoomed-out overview still
         renders instantly (full detail returns as you zoom in)."""
         if self._dp_edges.size == 0 and self._dn_edges.size == 0:
+            for curve in (self._dp_curve, self._dn_curve, self._rec_clk_curve):
+                curve.setData([], [])        # a capture with no transitions draws no trace
+            self._refresh_marks()
             return
         lo = max(0, int(lo))
         hi = max(lo + 1, int(hi))
         to_s = 1.0 / self._rate
         xd, yd = self._steps(self._dp_edges, self._dp_init, lo, hi, 1.6, 2.4)
-        self._dp_curve.setData(np.asarray(xd) * to_s, yd)
+        self._dp_curve.setData(xd * to_s, yd)
+        if self._show_clock:
+            self._render_clock(lo, hi, to_s)
+        self._refresh_marks()
+
+    def _refresh_marks(self) -> None:
+        """Re-place the marks that follow the visible window."""
+        self._refresh_cds()               # CDS marks follow the same visible window
+        self._refresh_commits()           # commit RSP marks too
+        self._refresh_missing()           # missing-RSP (PLL lock-gap) flags too
+        self._refresh_ports()             # active-port sample dots too
+
+    def _render_clock(self, lo: int, hi: int, to_s: float) -> None:
+        """Build the bottom band's traces: the clock line, and in a DLV capture the
+        recovered bit clock. Only drawn (and so only built) while the clock is shown."""
         if self._dlv:
             # DLV: DP is the differential+ signal (top band, whole window). The bottom
             # band shows the physical DN only in the LC bring-up region (< audio_start);
@@ -1047,19 +1070,15 @@ class RawCaptureView(QWidget):
             if lo < self._audio_start:
                 xn, yn = self._steps(self._dn_edges, self._dn_init,
                                      lo, min(hi, self._audio_start), 0.1, 0.9)
-                self._dn_curve.setData(np.asarray(xn) * to_s, yn)
+                self._dn_curve.setData(xn * to_s, yn)
             else:
                 self._dn_curve.setData([], [])
             xc, yc = self._rec_clock_xy(lo, hi, 0.1, 0.9)
             self._rec_clk_curve.setData(xc, yc)
         else:
             xn, yn = self._steps(self._dn_edges, self._dn_init, lo, hi, 0.1, 0.9)
-            self._dn_curve.setData(np.asarray(xn) * to_s, yn)
+            self._dn_curve.setData(xn * to_s, yn)
             self._rec_clk_curve.setData([], [])
-        self._refresh_cds()               # CDS marks follow the same visible window
-        self._refresh_commits()           # commit RSP marks too
-        self._refresh_missing()           # missing-RSP (PLL lock-gap) flags too
-        self._refresh_ports()             # active-port sample dots too
 
     def _rec_clock_xy(self, lo: int, hi: int, y0: float, y1: float):
         """Square-wave step points for the recovered bit clock over [lo, hi] samples: one
@@ -1215,8 +1234,11 @@ class RawCaptureView(QWidget):
         if ev.button() != Qt.LeftButton:
             return
         vb = self._plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(ev.scenePos()):
+            return                        # an axis, not the data area
         x_s = vb.mapSceneToView(ev.scenePos()).x()
-        self.sampleSelected.emit(self._snap_click(int(x_s * self._rate)))
+        sample = min(max(int(x_s * self._rate), 0), int(self._total))   # the pad past the end seeks to the end
+        self.sampleSelected.emit(self._snap_click(sample))
 
     def _snap_click(self, sample: int) -> int:
         """Magnetically snap a click to a shown CDS/Commit Row-Sync-Point marker when it

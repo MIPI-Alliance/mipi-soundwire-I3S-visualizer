@@ -22,7 +22,7 @@ def _model(tmp_path, **overrides):
     for r in rows:
         if not r:
             continue
-        if r[0] == "CDS_GuardEnabledPerSource":
+        if r[0] == "CDS_GuardEnable_REG_PerSource":
             r[1:] = ["1"] * 13
         elif r[0] in overrides:
             r[1] = str(overrides[r[0]])

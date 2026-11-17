@@ -14,10 +14,10 @@ If one engine's cascade changes without the other, this fails. The
 placement rule such as {ASW5203} TX_PRESENT in RX_CONTROLLED must land in both engines.
 
 Scope note: the sweep compares DATA + TX_PRESENT, which are DataPort-exclusive slots.
-The Flow Control Port's cells (DRQ, and the FCP's own guard/tail) are rendered by
-swviz but NOT by the C++ `grid_from_csv` (which lays out data ports only), so they are
-out of scope here; their DataPort-guard/tail counterparts are covered by
-test_visualizer_placement's golden.
+The Flow Control Port's guard and tail share their slot kinds with the data port's, so the
+sweep leaves the FCP out; the DataPort guard/tail are covered by test_visualizer_placement's
+golden. The DRQ of a port with interval skipping is compared directly
+(`test_a_drq_in_the_last_ui_of_an_interval_follows_that_intervals_skip`).
 
 Run: PYTHONPATH=. python3 -m pytest tests/test_grid_cross_engine.py
 """
@@ -88,7 +88,7 @@ def test_cross_engine_all_configs_data_placement():
     DATA + TX_PRESENT cells for each solo data port, so a placement rule (e.g. {ASW5203}
     TX_PRESENT) must land in both engines."""
     csvs = _all_example_csvs()
-    assert len(csvs) >= 89, f"expected the vendored example corpus, found {len(csvs)}"
+    assert len(csvs) == 96, f"expected the vendored example corpus of 96 configs, found {len(csvs)}"
     fails = []
     for csv in csvs:
         cfg = BusConfig.from_csv(csv)
@@ -200,3 +200,86 @@ def test_cell_dp_is_the_logical_dataport_number_not_the_slot_index():
 
     assert any(dev < 0 for dev, _n in declared.values()), \
         "fixture no longer contains a manager data port — the sentinel case is now untested"
+
+
+_TAIL_FIGURE = os.path.join(_EXAMPLES, "spec_figures", "PCM_AND_PDM_Streams_with_PHY_Tail_Bits.csv")
+_TAIL = int(GridSlot.TAIL)
+_S0 = int(GridSlot.S0)
+
+
+def _cells_at(cells):
+    """{(row, col): {(dp, slot)}} of `cells`, the CDS excluded."""
+    out: dict = {}
+    for c in cells:
+        if not c.get("is_cds"):
+            out.setdefault((c["row"], c["col"]), set()).add((c["dp"], c["slot"]))
+    return out
+
+
+def test_a_managers_tail_into_its_own_two_ui_sync0_is_suppressed():
+    """The spec's "PCM & PDM Streams with PHY Tail Bits" figure: the Manager's DP8 data ends
+    in Column 17 of Rows 0-2 and its Tail is suppressed, the Manager owning the next UI, the
+    first of its 2-UI Sync0 in Columns 18 and 19; DP8's Tail in Column 10 of Row 3 and DP2's in
+    Column 16 are placed. The swviz engine renders exactly those cells."""
+    with import_notes.collect():
+        cfg = BusConfig.from_csv(_TAIL_FIGURE)
+    assert cfg.s0_width == 2 and cfg.num_columns + 1 == 20
+    at = _cells_at(viz_engine.render_payload(_TAIL_FIGURE, 8)[0])
+    for row in range(3):
+        assert (8, int(GridSlot.DATA)) in at[(row, 17)]
+        assert at[(row, 18)] == at[(row, 19)] == {(-1, _S0)}, row
+    assert (8, _TAIL) in at[(3, 10)] and (2, _TAIL) in at[(3, 16)]
+    tails = {(rc, dp) for rc, owned in at.items() for dp, slot in owned if slot == _TAIL
+             and dp >= 0}
+    assert {(rc, dp) for rc, dp in tails if rc[1] >= 18} == set()
+
+
+def test_the_core_places_the_figures_cells_as_the_swviz_engine_does():
+    """`grid_from_csv` lays out the same figure as the swviz engine: Sync0 in its S0Width
+    columns, 18 and 19, of every row, no Tail in them, and the same per-port cells."""
+    cells = swi3score.grid_from_csv(_TAIL_FIGURE, 8)
+    at = _cells_at(cells)
+    for row in range(8):
+        assert (-1, _S0) in at[(row, 18)] and (-1, _S0) in at[(row, 19)], row
+        assert not {dp for dp, slot in at[(row, 18)] | at[(row, 19)] if slot == _TAIL}, row
+    assert _owned(cells) == _owned(viz_engine.render_payload(_TAIL_FIGURE, 8)[0])
+
+
+def test_a_one_ui_sync0_leaves_the_managers_tail_before_it(tmp_path):
+    """With S0Width 1 the same figure's Sync0 is Column 19 alone, and both engines place
+    DP8's Tail in Column 18 of Rows 0-2."""
+    with open(_TAIL_FIGURE, encoding="utf-8") as f:
+        text = f.read().replace("\nS0Width,2\n", "\nS0Width,1\n")
+    path = tmp_path / "s0_1.csv"
+    path.write_text(text, encoding="utf-8")
+    cpp = _owned(swi3score.grid_from_csv(str(path), 8))
+    assert cpp == _owned(viz_engine.render_payload(str(path), 8)[0])
+    assert {(8, row, 18, _TAIL) for row in range(3)} <= cpp
+
+
+def test_a_drq_in_the_last_ui_of_an_interval_follows_that_intervals_skip(tmp_path):
+    """Both engines gate a DRQ in the last UI of an interval by that interval's skip.
+
+    The config of the swviz engine's own test (test_drq_clash.py): a Sink port in
+    RX_CONTROLLED with two-row intervals and every second interval skipped, its DRQ at
+    FCP_Offset 1 in the last column, so the DRQ is the interval's last UI. The two engines
+    place the same DATA, TX_PRESENT and DRQ cells, and the DRQ lands in Rows 1 and 5."""
+    from swi3s_studio.swviz.models.enums import FlowMode
+    cfg = BusConfig(num_columns=15, skipping_denominator=2, rows_to_draw=8)
+    dp = cfg.dataports[0]
+    dp.enabled = True
+    dp.device_number = 3
+    dp.port_direction = True
+    dp.flow_mode = int(FlowMode.RX_CONTROLLED)
+    dp.enable_ch = 0b1
+    dp.horizontal_start = 2
+    dp.interval = 1
+    dp.skipping_numerator = 1
+    dp.fcp_horizontal_start = 15
+    dp.fcp_offset = 1
+    path = cfg.to_csv_file(str(tmp_path / "drq_last_ui.csv"))
+    kinds = _DP_ONLY_KINDS | {int(GridSlot.DRQ)}
+    cpp = _owned(swi3score.grid_from_csv(path, 8), kinds)
+    viz = _owned(viz_engine.render_payload(path, 8)[0], kinds)
+    assert cpp == viz, f"C++-only={sorted(cpp - viz)} swviz-only={sorted(viz - cpp)}"
+    assert sorted(row for _dp, row, _col, slot in cpp if slot == int(GridSlot.DRQ)) == [1, 5]

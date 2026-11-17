@@ -65,6 +65,30 @@ def test_all_flavours_hidden_renders_without_error():
     assert ev._worst == []            # nothing visible -> no worst-UI candidates
 
 
+def test_the_region_picker_is_wide_enough_for_its_longest_name():
+    """The picker sizes to its regions whenever they change, so a long name is not clipped
+    in the closed picker."""
+    from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
+    QApplication.instance() or QApplication([])
+    ev = EyeView()
+    ev.resize(1600, 500)
+    ev.show()
+    QApplication.processEvents()
+    s = Session.from_demo(300, cold_start=True)
+    s.set_region_name(2, "A rather long name for the playback region")
+    ev.set_analysis_context(s.segments, s.timing_regions(), s.timing_column_roles)
+    QApplication.processEvents()
+    combo = ev._region
+    longest = max(range(combo.count()), key=lambda i: combo.fontMetrics().horizontalAdvance(
+        combo.itemText(i)))
+    combo.setCurrentIndex(longest)
+    opt = QStyleOptionComboBox()
+    combo.initStyleOption(opt)
+    field = combo.style().subControlRect(QStyle.ComplexControl.CC_ComboBox, opt,
+                                         QStyle.SubControl.SC_ComboBoxEditField, combo)
+    assert field.width() >= combo.fontMetrics().horizontalAdvance(combo.currentText())
+
+
 def test_a_cached_timing_pane_measures_each_region_on_its_own():
     """The app gives the pane a per-Link cache (so a Link switch does not re-scan the
     capture). The cache is per REGION: each region shows its own setup/hold."""
@@ -145,3 +169,81 @@ def test_the_count_ticks_are_decades_up_to_the_one_above_the_count(count, labels
     ticks = EyeView._decade_ticks(count)
     assert [lab for _k, lab in ticks] == labels
     assert [k for k, _lab in ticks] == [float(k) for k in range(len(labels))]
+
+
+def _wheel(plot, notches):
+    """Scroll `notches` wheel notches (up is positive) over the middle of `plot`."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    vp = plot.viewport()
+    c = QPointF(vp.width() / 2, vp.height() / 2)
+    ev = QWheelEvent(c, QPointF(vp.mapToGlobal(c.toPoint())), QPoint(0, 0),
+                     QPoint(0, 120 * notches), Qt.NoButton, Qt.NoModifier,
+                     Qt.ScrollPhase.NoScrollPhase, False)
+    QApplication.sendEvent(vp, ev)
+    QApplication.processEvents()
+
+
+def test_the_wheel_zooms_one_side_with_0_at_the_join_and_reset_restores_both():
+    ev = _view()
+    ev.resize(1200, 500)
+    ev.show()
+    QApplication.processEvents()
+    full_setup = ev._setup_plot.viewRange()[0]
+    full_hold = ev._hold_plot.viewRange()[0]
+    assert not ev._zoom_reset.isEnabled()
+    _wheel(ev._hold_plot, 3)
+    lo, hi = ev._hold_plot.viewRange()[0]
+    assert lo == 0 and hi < full_hold[1] / 1.9
+    assert ev._setup_plot.viewRange()[0] == full_setup          # the other side stays
+    ticks = ev._hold_plot.getAxis("bottom")._tickLevels[0]
+    assert ticks[0] == (0.0, "0") and ticks[-1][0] <= hi
+    assert ev._zoom_reset.isEnabled()
+    _wheel(ev._setup_plot, 2)
+    assert ev._setup_plot.viewRange()[0][1] < full_setup[1]
+    _wheel(ev._hold_plot, -50)                                  # out past the whole span
+    assert ev._hold_plot.viewRange()[0] == full_hold and "hold" not in ev._x_span
+    ev._zoom_reset.click()
+    assert ev._setup_plot.viewRange()[0] == full_setup and not ev._zoom_reset.isEnabled()
+
+
+@pytest.mark.parametrize("shown", [True, False])
+def test_a_theme_switch_keeps_the_zoom_of_a_side(shown):
+    ev = _view()
+    ev.resize(1200, 500)
+    if shown:
+        ev.show()
+    QApplication.processEvents()
+    _wheel(ev._hold_plot, 3)
+    zoomed = ev._hold_plot.viewRange()[0]
+    assert ev._zoom_reset.isEnabled() and "hold" in ev._x_span
+    ev.retheme()
+    ev.show()
+    QApplication.processEvents()
+    assert ev._hold_plot.viewRange()[0] == zoomed and "hold" in ev._x_span
+    assert ev._zoom_reset.isEnabled()
+
+
+def test_a_theme_switch_before_a_capture_is_measured_measures_it_when_shown():
+    QApplication.instance() or QApplication([])
+    ev = EyeView()
+    s = Session.from_demo(64)
+    ev.set_capture(s.capture)
+    ev.set_analysis_context(s.segments, s.timing_regions(), s.timing_column_roles)
+    ev.retheme()
+    assert ev._timing is None
+    ev.show()
+    assert ev._timing is not None
+
+
+def test_a_zoomed_side_is_binned_anew_and_stops_at_4_sample_periods():
+    ev = _view()
+    ev._render()
+    res = 1e9 / ev._rate
+    ev._zoom_x("setup", 120 * 200)
+    assert ev._x_span["setup"] == pytest.approx(max(4 * res, ev._x_full["setup"] / 1000))
+    # A filter change keeps the zoom; a new measurement (region or capture) drops it.
+    ev._redraw()
+    assert "setup" in ev._x_span
+    ev._render()
+    assert ev._x_span == {}

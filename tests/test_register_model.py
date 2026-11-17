@@ -151,11 +151,14 @@ def test_register_override_unifies_grid_registers_audio():
     base_audio = s.audio_count
     base_grid = sorted(map(repr, s.grid_cells_at(smp, 8)))
 
+    before = s.register_files_at(smp)
     s.set_register_override(sect, dev, 0x20C1, 0x00)     # _CURR alias of DP0 EnableCh0/HCount (0x2081)
     assert s.audio_count != base_audio, "CURR override did not reach the audio decode"
     assert sorted(map(repr, s.grid_cells_at(smp, 8))) != base_grid, \
         "CURR override did not reach the bus grid"
+    next_before = (before[dev].value(0x2081), before[dev].provenance(0x2081))
     f = s.register_files_at(smp)
+    assert (f[dev].value(0x2081), f[dev].provenance(0x2081)) == next_before   # _NEXT row unchanged
     assert f[dev].curr_value(0x2081) == 0x00
     assert f[dev].curr_provenance(0x2081) == Provenance.UI   # display provenance, section-scoped
 
@@ -276,6 +279,60 @@ def test_register_reads_sourced_from_cpp_match_oracle():
     assert cpp[0].value(0x200B) == 0x08 and cpp[0].provenance(0x200B) == Provenance.READ
     assert cpp[0].value(0x1081) == 0x07 and cpp[0].provenance(0x1081) == Provenance.READ
     assert checked > 0
+
+
+def _assert_cpp_matches_oracle(s, cmds):
+    """The C++-sourced files and the apply_commands oracle agree on every touched register's
+    _NEXT value and provenance, and on the _CURR value and provenance of a dual-ranked one."""
+    from swi3s_studio.model import DeviceRegisterFile
+    rm = s.register_map
+    cpp = s._build_register_files(cmds, None)
+    oracle = apply_commands(rm, cmds)
+    for dev in sorted(set(cpp) | set(oracle)):
+        cf = cpp.get(dev) or DeviceRegisterFile(rm, dev)
+        of = oracle.get(dev) or DeviceRegisterFile(rm, dev)
+        for a in {a for a, _ in cf.items()} | {a for a, _ in of.items()}:
+            res = rm.resolve(a)
+            assert (cf.value(a), cf.provenance(a)) == (of.value(a), of.provenance(a)), hex(a)
+            if res and res.register.dual_ranked:
+                assert (cf.curr_value(a), cf.curr_provenance(a)) == (
+                    of.curr_value(a), of.curr_provenance(a)), hex(a)
+    return cpp
+
+
+def test_a_curr_alias_read_after_a_commit_leaves_the_next_row_alone():
+    """NumColumns (_NEXT 0x1081, _CURR 0x10C1) is written and committed; a bus read of the
+    _CURR alias then changes _CURR only. The _NEXT row still holds the value written there,
+    as the oracle holds it."""
+    from swi3s_studio.session import Session
+    s = Session.from_demo(8)
+    cmds = [_oracle_write(0x1081, bytes([0x0F]), 1), _oracle_commit(True, 2),
+            _oracle_read(0x10C1, bytes([0x07]), 3, True)]
+    f = _assert_cpp_matches_oracle(s, cmds)[0]
+    assert (f.value(0x1081), f.provenance(0x1081)) == (0x0F, Provenance.WRITTEN)
+    assert (f.curr_value(0x1081), f.curr_provenance(0x1081)) == (0x07, Provenance.READ)
+
+
+def test_a_curr_alias_read_of_a_register_never_written_leaves_the_next_row_at_reset():
+    from swi3s_studio.session import Session
+    s = Session.from_demo(8)
+    f = _assert_cpp_matches_oracle(
+        s, [_oracle_read(0x10C1, bytes([0x07]), 1, True)])[0]
+    assert f.value(0x1081) == DeviceRegisterFile(s.register_map, 0).value(0x1081)
+    assert f.provenance(0x1081) == Provenance.DEFAULT
+    assert (f.curr_value(0x1081), f.curr_provenance(0x1081)) == (0x07, Provenance.READ)
+
+
+def test_a_commit_leaves_the_next_register_holding_its_value():
+    """After a commit the _NEXT row still shows the committed value, WRITTEN, and a second
+    commit of the same group changes neither rank."""
+    from swi3s_studio.session import Session
+    s = Session.from_demo(8)
+    cmds = [_oracle_write(0x1081, bytes([0x0F]), 1), _oracle_commit(True, 2),
+            _oracle_commit(True, 3)]
+    f = _assert_cpp_matches_oracle(s, cmds)[0]
+    assert (f.value(0x1081), f.curr_value(0x1081)) == (0x0F, 0x0F)
+    assert f.provenance(0x1081) == f.curr_provenance(0x1081) == Provenance.WRITTEN
 
 
 def test_last_access_provenance_wins():
@@ -755,7 +812,7 @@ def test_a_one_address_range_is_a_one_address_span():
 
 def test_an_enum_keeps_single_values_in_hex_or_b_tokens_and_drops_ranges():
     from swi3s_studio.model.registers import _parse_enum
-    assert _parse_enum("b1001=v1.1, 0x02-0x0F=Rsvd, 0x0=Zero, 0x3=") == {9: "v1.1", 0: "Zero"}
+    assert _parse_enum("b1000=Idle, 0x02-0x0F=Rsvd, 0x0=Zero, 0x3=") == {8: "Idle", 0: "Zero"}
 
 
 def test_a_negative_address_is_labelled_by_its_32_bit_region():

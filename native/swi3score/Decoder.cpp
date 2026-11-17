@@ -21,7 +21,7 @@
 namespace swi3score {
 
 // Rows without a CRC-valid command phase before command confidence is lost and we
-// declare the framing stale (re-detect the column count + re-hunt the comma). This is
+// declare the framing stale (re-hunt the comma, see resync()). This is
 // the spec's device command-confidence limit: a peripheral falls off the bus after
 // 8192 Rows with no valid command addressed to it, and the Manager must issue a Ping
 // at least every 4096 Rows ({ASW2601}) to hold it. Counted in Rows (not UIs), so the
@@ -89,21 +89,17 @@ std::vector<SymbolRec> decodeSymbols(ISampleSource& src, int columnCount,
                                      const std::vector<int>& hubDepths)
 {
     std::vector<SymbolRec> out;
-    // Hub-aware framing: a command parser carrying the depths frames the symbols. Only the
-    // first kMaxPeripherals depths reach the parser, which reads a negative one as 0, so
-    // the framing is hub-aware when one of those is above 0.
+    // A command parser carrying the depths runs beside the symbol decoder and drives its
+    // framing as the decode frames the bits: a hub-delay gap bit frames no symbol and the
+    // next symbol starts after the gap, and inside a Manager Packet or a ReadData delivery
+    // a K.28.7 bit pattern does not re-frame. Between phases the symbol decoder keeps its
+    // framing, so the idle symbols show. Only the first kMaxPeripherals depths reach the
+    // parser, which reads a negative one as 0.
     int depths[swi3s::kMaxPeripherals] = {0};
-    bool hubbed = false;
-    for (int i = 0; i < swi3s::kMaxPeripherals && i < (int)hubDepths.size(); ++i) {
+    for (int i = 0; i < swi3s::kMaxPeripherals && i < (int)hubDepths.size(); ++i)
         depths[i] = hubDepths[i];
-        hubbed = hubbed || hubDepths[i] > 0;
-    }
     CCommandTransportParser parser;
-    std::vector<C8b10bDecoder::Symbol> framed;
-    if (hubbed) {
-        parser.SetHubDepths(depths);
-        parser.SetSymbolSink(&framed);
-    }
+    parser.SetHubDepths(depths);
     if (columnCount < swi3s::kMinColumnCount) columnCount = swi3s::kColdStartColumnCount;
     const bool segMode = (rowOriginUi != ~0ull);   // explicit segment row origin
     // DLV reads the CDS at Column `cdsColumn` (§12.1.10.1) as a PLAIN-NRZ bit — the sampled
@@ -155,19 +151,16 @@ std::vector<SymbolRec> decodeSymbols(ISampleSource& src, int columnCount,
         if (column == cdsCol) {
             bool bit = dlv ? (level == BIT_HIGH) : nrzs.Decode(level);   // DLV: level IS the bit
             // A hub-delay gap bit belongs to no symbol: the next symbol starts after it.
-            if (hubbed && parser.InHubGap()) ring.clear();
+            const bool gap = parser.InHubGap();
+            if (gap) ring.clear();
             else ring.emplace_back(sn, curUi);
             if (static_cast<int>(ring.size()) > swi3s::kSymbolBits) ring.pop_front();
+            dec.SetFramingLocked(parser.FramingLocked());
+            parser.PushCdsBit(bit, sn);
             C8b10bDecoder::Symbol sym;
-            bool got;
-            if (hubbed) {
-                framed.clear();
-                parser.PushCdsBit(bit, sn);
-                got = !framed.empty();
-                if (got) sym = framed.back();
-            } else {
-                got = dec.PushBit(bit, sym);
-            }
+            bool got = false;
+            if (!gap) got = dec.PushBit(bit, sym);
+            else if (!parser.InHubGap()) dec.ResyncSymbolPhase();
             // Require a FULL ring before stamping a symbol: it occupies kSymbolBits
             // real CDS bits, so its first bit is ring.front(). Right after a fresh or
             // seeked start the ring (and the 8b10b shift window) isn't full yet, so the
@@ -273,7 +266,21 @@ void Decoder::snapshotCheckpoint(std::uint64_t ui)
     cp.epoch = mCurrentEpoch;
     cp.startColumn = mEngine.StartColumn();
     cp.ports = mEngine.SaveState();
+    cp.descramblers = mEngine.SaveDescramblers();
     mCheckpoints.push_back(std::move(cp));
+}
+
+std::vector<std::pair<std::uint64_t, std::vector<CPayloadEngine::PortDescramblers>>>
+Decoder::checkpointDescramblers() const
+{
+    std::vector<std::pair<std::uint64_t, std::vector<CPayloadEngine::PortDescramblers>>> out;
+    for (const Checkpoint& cp : mCheckpoints) {
+        if (cp.epoch < 0 || cp.epoch >= static_cast<int>(mConfigEpochs.size())) continue;
+        CPayloadEngine engine;
+        engine.RestoreState(mConfigEpochs[cp.epoch], cp.startColumn, cp.ports, &cp.descramblers);
+        out.emplace_back(cp.ui, engine.SaveDescramblers());
+    }
+    return out;
 }
 
 void Decoder::applyTransportEvent(CPayloadEngine& engine, const TransportEvent& e,
@@ -309,7 +316,7 @@ std::vector<BitSample> Decoder::bitSamplesInWindow(std::uint64_t startUi, std::u
     if (cp.epoch < 0 || cp.epoch >= static_cast<int>(mConfigEpochs.size())) return out;
 
     CPayloadEngine engine;
-    engine.RestoreState(mConfigEpochs[cp.epoch], cp.startColumn, cp.ports);
+    engine.RestoreState(mConfigEpochs[cp.epoch], cp.startColumn, cp.ports, &cp.descramblers);
     if (!engine.Enabled()) return out;
 
     std::uint64_t ui = cp.ui;
@@ -552,7 +559,7 @@ void Decoder::recordCommand(const SwI3sCommand& cmd)
 }
 
 std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int rows,
-                                 bool dlv, int cdsColumn)
+                                 bool dlv, int cdsColumn, int s0Width)
 {
     std::vector<GridCell> out;
     if (rows <= 0) return out;   // no rows to lay out
@@ -565,6 +572,9 @@ std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int ro
     // grid-only system slot ints shared with grid_view.py (_S0=7, _S1=8).
     const int cdsCol = dlv ? cfg.cdsColumn(cols, cdsColumn) : swi3s::kCdsColumn;
     constexpr int kGridSlotS0 = 7, kGridSlotS1 = 8;
+    // DLV: Sync0 is the last s0Cols columns, Sync1 Column 0 (see the header).
+    const int s0Cols = std::clamp(s0Width, 1, std::max(1, cols - 2));
+    auto isSync0 = [&](int c) { return dlv && c >= cols - s0Cols; };
 
     // Build a placement port per enabled data port.
     std::vector<CDataPort> ports;
@@ -610,14 +620,20 @@ std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int ro
     std::vector<int> lastCh(ports.size(), -1), lastSamp(ports.size(), 0), lastBit(ports.size(), 0);
     std::vector<DpEmit> emits(ports.size());   // reused each UI (fully overwritten below), not
     //                                            re-allocated per (row, col) — see the tick loop.
+    // Each port's IntervalSkipped() read before its tick: the FCP's DRQ gate takes the skip of
+    // the interval the UI is in, which the port's tick in an interval's last UI already
+    // advances to the next interval's.
+    std::vector<char> skipped(ports.size(), 0);
     out.reserve((size_t)rows * cols);
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             bool isCds = (c == cdsCol);
             // Tick EVERY port each UI (incl. Column 0) to keep them in lockstep.
-            for (size_t i = 0; i < ports.size(); ++i)
+            for (size_t i = 0; i < ports.size(); ++i) {
+                skipped[i] = ports[i].IntervalSkipped();
                 emits[i] = ports[i].clock_tick();
-            if (dlv && (c == 0 || c == cols - 1)) {
+            }
+            if (dlv && (c == 0 || isSync0(c))) {
                 // DLV framing: Sync1 opens the row at Column 0, Sync0 closes it at the
                 // last column — full-height system cells (Manager-owned, device = -1).
                 GridCell sc;
@@ -642,6 +658,7 @@ std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int ro
             for (size_t i = 0; i < ports.size(); ++i) {
                 const DpEmit& e = emits[i];
                 if (e.slot == SwI3sSlot::Empty) continue;
+                if (e.slot == SwI3sSlot::Tail && isSync0(c)) continue;   // the Manager's UI
                 GridCell cell;
                 cell.row = r; cell.col = c;
                 cell.slot = (int)e.slot;
@@ -669,8 +686,9 @@ std::vector<GridCell> layoutGrid(const SwI3sConfig& cfg, int columnCount, int ro
             // renderer draws them like the visualizer's FCP row.
             for (size_t i = 0; i < ports.size(); ++i) {
                 if (!portHasFcp[i]) continue;
-                FcpEmit fe = fcps[i].clock_tick(ports[i].IntervalSkipped());
+                FcpEmit fe = fcps[i].clock_tick(skipped[i] != 0);
                 if (fe.slot == SwI3sSlot::Empty) continue;
+                if (fe.slot == SwI3sSlot::Tail && isSync0(c)) continue;  // the Manager's UI
                 // Wide-bit occupancy follows direction (as for data bits): a SOURCE DRQ
                 // DRIVES every UI of the wide bit, but a SINK DRQ SAMPLES only the last
                 // UI — so a sink's earlier (non-sample-point) read UIs are sparse and get
@@ -736,11 +754,8 @@ std::vector<GridCell> gridFromRegisters(const std::vector<std::tuple<int, std::u
 // register build shared by the bus grid AND the register-map export, so they can't
 // disagree. `overrides` are (device, address, value), pre-filtered to the cursor's
 // config section by the caller.
-static CRegisterModel buildModelFromCommands(
-    const std::vector<CommandReplay>& cmds,
-    const std::vector<std::tuple<int, std::uint32_t, int>>& overrides)
+static void replayCommands(CRegisterModel& regs, const std::vector<CommandReplay>& cmds)
 {
-    CRegisterModel regs;
     for (const auto& c : cmds) {
         if (c.isWrite) {
             SwI3sCommand w;
@@ -756,6 +771,17 @@ static CRegisterModel buildModelFromCommands(
             regs.Commit(static_cast<std::uint8_t>(c.groupMask & 0xFF), c.deviceMask);
         }
     }
+}
+
+// `base`, when non-null, is the model a ReplayCheckpoint holds: `cmds` replay on a copy
+// of it, which equals replaying the checkpoint's own commands followed by `cmds`.
+static CRegisterModel buildModelFromCommands(
+    const std::vector<CommandReplay>& cmds,
+    const std::vector<std::tuple<int, std::uint32_t, int>>& overrides,
+    const CRegisterModel* base = nullptr)
+{
+    CRegisterModel regs = base ? *base : CRegisterModel();
+    replayCommands(regs, cmds);
     if (!overrides.empty()) {
         for (const auto& ov : overrides)
             regs.ForceOverride(std::get<0>(ov), std::get<1>(ov),
@@ -767,9 +793,9 @@ static CRegisterModel buildModelFromCommands(
 std::vector<GridCell> gridFromCommands(const std::vector<CommandReplay>& cmds,
                                        int rows, int forceColumns,
                                        const std::vector<std::tuple<int, std::uint32_t, int>>& overrides,
-                                       bool dlv, int cdsColumn)
+                                       bool dlv, int cdsColumn, const CRegisterModel* base)
 {
-    CRegisterModel regs = buildModelFromCommands(cmds, overrides);
+    CRegisterModel regs = buildModelFromCommands(cmds, overrides, base);
     SwI3sConfig cfg;
     regs.BuildConfig(cfg);
     int cols = regs.ColumnCount();
@@ -783,6 +809,13 @@ std::vector<GridCell> gridFromCommands(const std::vector<CommandReplay>& cmds,
 // The decoded CONFIG as-of a command replay (same model build as gridFromCommands, minus
 // the layout) — so the visualizer-CSV export can reflect the geometry in effect at the
 // cursor's segment, not always the final operational config.
+CRegisterModel modelFromCommands(const std::vector<CommandReplay>& cmds)
+{
+    CRegisterModel regs;
+    replayCommands(regs, cmds);
+    return regs;
+}
+
 SwI3sConfig configFromCommands(const std::vector<CommandReplay>& cmds, int forceColumns,
                                const std::vector<std::tuple<int, std::uint32_t, int>>& overrides)
 {
@@ -804,10 +837,10 @@ SwI3sConfig configFromCommands(const std::vector<CommandReplay>& cmds, int force
 // register wins), then the overrides are forced, so an override wins over any read. Reads
 // apply ONLY here — gridFromCommands never applies reads, so a read colours the register
 // map without perturbing the grid/audio config.
-std::vector<std::tuple<int, std::uint32_t, std::uint8_t, bool, std::uint8_t,
-                       std::uint8_t, bool, std::uint8_t>>
+RegisterSnapshot
 registersFromCommands(const std::vector<CommandReplay>& cmds,
-                      const std::vector<std::tuple<int, std::uint32_t, int>>& overrides)
+                      const std::vector<std::tuple<int, std::uint32_t, int>>& overrides,
+                      const RegisterSnapshot& start)
 {
     // Single CHRONOLOGICAL pass so the LAST access to a register wins (a write after a
     // read reads WRITTEN, a read after a write reads READ). ApplyRead lands in the banks
@@ -815,6 +848,7 @@ registersFromCommands(const std::vector<CommandReplay>& cmds,
     // separate from the grid/audio one (gridFromCommands): they cannot perturb the
     // decoded config.
     CRegisterModel regs;
+    if (!start.empty()) regs.Restore(start);
     for (const auto& c : cmds) {
         if (c.isWrite) {
             SwI3sCommand w;
@@ -853,11 +887,11 @@ std::vector<GridCell> gridFromCsv(const std::string& csvPath, int rows)
     if (!cfg.LoadCsv(csvPath, err)) return {};
     // Mirror the decode path's frame geometry so an AUTHORED CSV places like a decoded
     // capture: a PHY3 (DLV) config frames S1 at column 0 and the CDS after S1's tail and
-    // handover (SwI3sConfig::CdsHorizontalStart, from LoadCsv); FBCSE keeps the CDS at
-    // column 0.
+    // handover (SwI3sConfig::CdsHorizontalStart, from LoadCsv), and closes each row with
+    // the Manager's S0Width-UI Sync0; FBCSE keeps the CDS at column 0.
     const bool dlv = cfg.PHY3Enabled;
     const int cdsColumn = dlv ? swi3s::kDlvCdsColumn : swi3s::kCdsColumn;
-    return layoutGrid(cfg, cfg.columnCount(), rows, dlv, cdsColumn);
+    return layoutGrid(cfg, cfg.columnCount(), rows, dlv, cdsColumn, cfg.S0Width);
 }
 
 std::vector<std::tuple<int, std::uint32_t, int>> registersFromConfig(const SwI3sConfig& cfg)
@@ -906,12 +940,11 @@ std::vector<std::tuple<int, std::uint32_t, int>> registersFromConfig(const SwI3s
         // geometry already follows, since `deviceSeen` is the only roster available.
         const int src = dev + 1;
         emit(dev, r::kCdsDriveType_N, (cfg.CdsDriveType[src] & 0x1) << 7);
-        const int guard = cfg.CdsGuard[src];              // 0 off, 1 G0, 2 G1
         emit(dev, r::kCdsBitWidthGuardTail_N,
              ((cfg.CdsBitWidth & 0x7) << 5) |
              ((cfg.CdsEndDriveEarly[src] & 0x1) << 4) |
-             ((guard != 0 ? 1 : 0) << 3) |
-             ((guard == 2 ? 1 : 0) << 2) |
+             ((cfg.CdsGuardEnable[src] & 0x1) << 3) |
+             ((cfg.CdsGuardPolarity[src] & 0x1) << 2) |
              (cfg.CdsTailWidth[src] & 0x3));
     }
 
@@ -1028,6 +1061,7 @@ void Decoder::run()
     mDecodeAudio = mSettings.decodeAudio;
     mEngine.SetCollectBits(mSettings.collectBitSamples);   // persists across reconfigures
     mEngine.SetBitSampleStart(mSettings.bitSampleStart);   // windowed collection
+    mEngine.EnableBitDump();   // the decode's own engine; replay engines write no dump
     // Windowed-decode reconstruction log (transport events + phase checkpoints), rebuilt
     // fresh each run so bitSamplesInWindow replays THIS decode's engine timeline.
     mConfigEpochs.clear();
@@ -1160,12 +1194,13 @@ void Decoder::run()
             recordReconfig(segStartUi, mColumn);
     }
     mRowCounter = 0;
-    // Manual SSP: reduce the chosen bus row modulo the LCM of the enabled ports'
-    // transport pattern periods, so we re-anchor at the FIRST congruent row near the
-    // decode start — making the chosen row (and every period from it) row_in_interval ==
-    // 0 across the whole capture, not just after it.
+    // Manual SSP: SSPs recur every SSP Interval, so the chosen bus row phases every port
+    // from the decode start (AnchorBeforeSsp: row 0 is (-sspRow) mod patternRows rows
+    // after an SSP). The row reduced modulo the LCM of the ports' pattern periods is the
+    // first congruent row, where feed() re-anchors the ports at the phase they hold.
     mSspSyncRow = -1;
     if (mSettings.sspRow >= 0 && mEngine.Enabled()) {
+        mEngine.AnchorBeforeSsp(mSettings.sspRow);
         // A period above sspRow leaves the row as it is, so the LCM is capped one past it
         // (patternPeriod never overflows and never returns below 1, and it skips a port
         // with a negative Interval, which an applied config CSV may carry).
@@ -1174,15 +1209,9 @@ void Decoder::run()
             mConfig.patternPeriod(row < LLONG_MAX ? row + 1 : LLONG_MAX);
         // sspRow >= 0, so the reduced row is at most sspRow and fits its type.
         mSspSyncRow = static_cast<long>(row % period);
-        // A reduced row of 0 means the SSP falls on the decode-start row. The feed()
-        // re-anchor only fires on a row *wrap* (mRowCounter >= 1), so anchor row 0
-        // explicitly here rather than relying on Initialize's coincident row_in_interval
-        // == 0. Consume it so feed() doesn't look for row 0 again.
-        if (mSspSyncRow == 0) {
-            mEngine.SyncToSSP();
-            recordSync(segStartUi);            // row-0 manual SSP re-anchor (windowed decode)
-            mSspSyncRow = -1;
-        }
+        // A reduced row of 0 is the decode-start row, which AnchorBeforeSsp has phased;
+        // the feed() re-anchor fires only on a row wrap (mRowCounter >= 1), so consume it.
+        if (mSspSyncRow == 0) mSspSyncRow = -1;
     }
     mRowSyncSamples.clear();   // per-run row-start (RSP) samples; reset with the framing
     mSegments.clear();         // resetFraming set mSegmentPending: Column 0 anchors segment 0
@@ -1192,10 +1221,9 @@ void Decoder::run()
     snapshotCheckpoint(segStartUi);
 
     // Feed the buffered window, then stream the remainder of the capture. If the
-    // framing goes stale for a long run (a bus reconfiguration / cold restart we
-    // never saw the commit for, e.g. 2 -> 8 columns), re-detect the column count
-    // on a fresh window and re-hunt the comma, then continue. `srcUi` (the
-    // absolute source UI of each fed UI) anchors segment row numbering.
+    // framing goes stale for a long run, resync() re-hunts the comma on a fresh window
+    // (at the current column count, then with the blind detector), then continues.
+    // `srcUi` (the absolute source UI of each fed UI) anchors segment row numbering.
     for (std::size_t i = 0; i < levels.size(); ++i)
         feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
     takeRestarts(crossing);           // the leading window ended at a later bring-up
@@ -1252,12 +1280,23 @@ void Decoder::streamRemainder(Src& src)
     }
 }
 
-// Re-detect the column count on the next window and reset framing. Registers are
-// kept (config persists across the gap and the snoop will refine it); only the
-// bit-level framing (NRZS phase, comma hunt, column/row counters) is reset.
-// Column 0 begins on a rising clock edge, so re-align there first (as run() does).
-// The edge hunt and the window both stop at the next restart point (readUi): with no
-// Safe-Lock seed the watchdog runs while restart points are pending.
+// Re-frame after kCommandConfidenceRows rows with no CRC-valid command. Registers are kept
+// (config persists across the gap and the snoop refines it). Column 0 begins on a rising
+// clock edge, so the window starts on the UI after one (as run() does). The edge hunt and
+// the window both stop at the next restart point (readUi): with no Safe-Lock seed the
+// watchdog runs while restart points are pending.
+//
+// The column count is held first: the first resync re-hunts the comma at the current
+// count only, its Column-0 phase searched there (BestOffset). The blind detector runs only
+// at a resync that follows a hold with no CRC-valid command in between (mResyncHeld, which
+// a CRC-valid command or a restart clears); a different count it detects is adopted and
+// recorded in guessedWidthChanges(). When no CRC-valid command in the window places
+// Column 0 at the count kept, the current phase is kept. A pin on the section a resync
+// would open outranks both, and that section is opened.
+//
+// At an unchanged count the payload engine keeps its configuration and SSP-anchored
+// interval counter and ticks every UI the re-hunt consumes, so it stays in step with the
+// bus; without a pin, a phase that carries on from the current framing opens no segment.
 void Decoder::resync()
 {
     // Read to the next rising edge, keeping the UIs read.
@@ -1266,11 +1305,9 @@ void Decoder::resync()
     std::vector<std::uint64_t> leadSamples;
     Crossing crossing = alignToRising(aligned, &leadLevels, &leadSamples);
     if (!aligned) { mNeedResync = false; takeRestarts(crossing); return; }
-    std::uint64_t segStartUi = mSrc.UiIndex();   // source UI of the new segment's Column 0
+    const std::uint64_t leadUi = mSrc.UiIndex() - leadLevels.size();   // first lead UI
+    std::uint64_t segStartUi = mSrc.UiIndex();   // source UI of the window's first UI
 
-    // The rising edge is the alignment UI; Column 0 is the NEXT UI (matching
-    // run()). Start the window there, not at the alignment edge, or the framing
-    // is shifted by one UI and Column 0 lands on indices the offset search skips.
     const int kWindow = mSettings.dlv ? kDlvDetectWindow : kDetectWindow;
     std::vector<bool> levels;
     std::vector<std::uint64_t> samples;
@@ -1283,53 +1320,74 @@ void Decoder::resync()
     // and audio sample rates for the new phase.
     measureUiRate(samples);
 
+    // The column the window's first UI takes if the framing carries on.
+    const int inPhase = static_cast<int>(
+        (static_cast<std::uint64_t>(mColumn) + leadLevels.size()) % mColumnCount);
+    const int oldCount = mColumnCount;
     int phaseOffset = 0;
     int c = 0;
-    // A pin on the section this resync would open outranks the blind detector, and the
-    // pinned count's own Column-0 phase is searched, as run() searches a known count's.
-    if (int pin = forcedColumnsForSection(static_cast<int>(mSegments.size()))) {
+    bool keepPhase = false;   // no CRC-valid command placed Column 0: carry on in phase
+    bool detected = false;    // the blind detector chose the count
+    const int pin = forcedColumnsForSection(static_cast<int>(mSegments.size()));
+    if (pin) {
+        // The pinned count's own Column-0 phase is searched, as run() searches a known
+        // count's.
         c = pin;
         bool found = true;
         phaseOffset = CColumnDetector::BestOffset(levels, c, 1, &found);
         if (!found) mGuessedFramingSamples.push_back(samples.front());
+    } else if (!mResyncHeld) {
+        c = mColumnCount;
+        bool found = true;
+        phaseOffset = CColumnDetector::BestOffset(levels, c, 1, &found);
+        keepPhase = !found;
+        mResyncHeld = true;
     } else {
         c = CColumnDetector::Detect(levels, &phaseOffset);
+        detected = c >= swi3s::kMinColumnCount;
+        if (!detected) { c = mColumnCount; keepPhase = true; }
     }
     const bool reconfigure = c >= swi3s::kMinColumnCount && c != mColumnCount;
     if (reconfigure) {
-        // Genuine reconfiguration (e.g. 2 -> 8 columns): adopt the new geometry
-        // and rebuild the payload engine for it.
+        // Adopt the new geometry and rebuild the payload engine for it, seeded with this
+        // window's Column-0 phase (the window can start mid-row), matching the mColumn
+        // resetFraming sets below. A new section is anchored there and takes the next
+        // segment index; a configure that took effect records the new config epoch +
+        // phase so a windowed re-decode can start here, and an engine left idle records
+        // none.
         mColumnCount = c;
         updateRowRateFromCapture(mColumnCount);
-        // Seed the rebuilt engine with this segment's Column-0 phase (the resync
-        // re-aligned to a rising edge and re-detected, so it can start mid-row too),
-        // matching the mColumn set below.
-        mEngine.SetStartColumn((mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
-        // Reconfiguration → a NEW section is about to be anchored (resetFraming sets
-        // mSegmentPending below); it will take the next segment index. A configure that
-        // took effect records the new config epoch + phase so a windowed re-decode can
-        // start here; an engine left idle records none.
+        const int seed = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
+        mEngine.SetStartColumn(seed);
         if (maybeConfigureFromSnoop(mColumnCount, static_cast<int>(mSegments.size()))) {
-            recordReconfig(segStartUi,
-                           (mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
+            recordReconfig(segStartUi, seed);
             snapshotCheckpoint(segStartUi);
         }
-    } else if (c < swi3s::kMinColumnCount) {
-        phaseOffset = 0;   // detection failed; keep prior count, restart at col 0
+        if (detected) {
+            const std::size_t at = static_cast<std::size_t>(phaseOffset % mColumnCount);
+            mGuessedWidthChanges.push_back(
+                {at < samples.size() ? samples[at] : samples.front(), oldCount, c});
+        }
     }
-    // An unchanged (or undetected) column count is a comma re-hunt only: the payload
-    // engine keeps its configuration and SSP-anchored interval counter, and ticks every
-    // UI the re-hunt consumed (the alignment UIs here, the window through feed() below),
-    // so it stays in step with the bus.
-    if (!reconfigure && mEngine.Enabled())
-        for (std::size_t i = 0; i < leadLevels.size(); ++i)
-            mEngine.Tick(leadLevels[i], leadSamples[i], mAudio);
+    const int startColumn =
+        keepPhase ? inPhase : (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
 
-    // Bus rows stay CONTINUOUS across the resync (resetFraming leaves mRowCounter): the
-    // new segment's rows carry on from where the old one left off, so the command
-    // table and symbol viewer share one monotonic row scale rather than each
-    // segment restarting at 0.
-    resetFraming((mColumnCount - phaseOffset % mColumnCount) % mColumnCount);
+    if (!pin && !reconfigure && startColumn == inPhase) {
+        // The framing carries on: every UI read is fed in order, and no segment opens. A
+        // pinned section is always opened.
+        mRowsSinceCommand = 0;
+        mNeedResync = false;
+        for (std::size_t i = 0; i < leadLevels.size(); ++i)
+            feed(leadLevels[i] ? BIT_HIGH : BIT_LOW, leadSamples[i], leadUi + i);
+    } else {
+        if (!reconfigure && mEngine.Enabled())
+            for (std::size_t i = 0; i < leadLevels.size(); ++i)
+                mEngine.Tick(leadLevels[i], leadSamples[i], mAudio);
+        // Bus rows stay CONTINUOUS across the resync (resetFraming leaves mRowCounter):
+        // the new segment's rows carry on from where the old one left off, so the
+        // command table and symbol viewer share one monotonic row scale.
+        resetFraming(startColumn);
+    }
 
     for (std::size_t i = 0; i < levels.size(); ++i)
         feed(levels[i] ? BIT_HIGH : BIT_LOW, samples[i], segStartUi + i);
@@ -1499,6 +1557,7 @@ void Decoder::takeRestarts(Crossing crossing)
 {
     while (crossing != Crossing::None && mNextRestart < mRestarts.size()) {
         const Restart r = mRestarts[mNextRestart++];
+        mResyncHeld = false;   // a restart frames afresh: the next resync holds first
         if (mInactive) stopPorts();   // every UI before the stretch has been fed
         mInactive = false;
         updateNextStop();
@@ -1515,6 +1574,7 @@ void Decoder::takeRestarts(Crossing crossing)
 // payload engine moved to the new phase too (UIs were lost to it as well).
 Decoder::Crossing Decoder::resumeAt(bool rising)
 {
+    mRateWinUiCount = 0;              // no clock-rate window spans the pause
     // The pause's UI and those up to the next rising edge, where Column 0 can open.
     std::vector<bool> lead{mCrossHigh};
     std::vector<std::uint64_t> leadSamples{mCrossSample};
@@ -1537,10 +1597,10 @@ Decoder::Crossing Decoder::resumeAt(bool rising)
     if (mHalted) return Crossing::None;
     // The column the window's first UI takes if the bus carried on in phase, and the one
     // the wire says. A short window cannot tell them apart: it decodes on. The column
-    // count is detected afresh, as at the start of a capture that begins mid-stream (a
-    // pin on the section a re-frame would open outranks it); a window it cannot read
-    // keeps the current one, and a window with no CRC-valid command at the current count
-    // keeps the current phase.
+    // count is detected afresh, as at the start of a capture that begins mid-stream; a pin
+    // on the section a re-frame would open outranks it and a config CSV, which otherwise
+    // keeps its count. A window it cannot read keeps the current count, and a window with
+    // no CRC-valid command at the current count keeps the current phase.
     int cols = mColumnCount;
     const int inPhase =
         static_cast<int>((static_cast<std::uint64_t>(mColumn) + (segStartUi - leadUi)) % cols);
@@ -1549,7 +1609,7 @@ Decoder::Crossing Decoder::resumeAt(bool rising)
         int phaseOffset = 0;
         const int pin = forcedColumnsForSection(static_cast<int>(mSegments.size()));
         const int c = pin ? pin : CColumnDetector::Detect(levels, &phaseOffset);
-        if (c >= swi3s::kMinColumnCount && c <= swi3s::kMaxColumnCount && !mHaveCsv)
+        if (c >= swi3s::kMinColumnCount && c <= swi3s::kMaxColumnCount && (pin || !mHaveCsv))
             cols = c;
         // Detect's phase belongs to the count it detected; any other count (a pin, or the
         // current one) has its own Column-0 phase searched.
@@ -1643,9 +1703,11 @@ Decoder::Crossing Decoder::restartAt(const Restart& r, bool rising)
     if (!phaseFound) mGuessedFramingSamples.push_back(samples.front());
     const int startColumn = (mColumnCount - phaseOffset % mColumnCount) % mColumnCount;
     updateRowRateFromCapture(mColumnCount);
-    // DLV numbers its rows by their Row Sync Points (one per Column 0 fed), so a row the
-    // stop cut short keeps its number and the restart opens the next.
-    if (mSettings.dlv && mColumn != 0) ++mRowCounter;
+    // A row the stop cut short keeps its number and the restart's first whole row opens
+    // the next. DLV numbers its rows by their Row Sync Points (one per Column 0 fed); on
+    // FBCSE a window that opens mid-row ends the cut-short row's number at its first
+    // Column 0, and one that opens on Column 0 opens the next row at once.
+    if (mColumn != 0 && (mSettings.dlv || startColumn == 0)) ++mRowCounter;
 
     // Every port restarts with the bus, on the new Column-0 phase: always a full
     // Configure, even of a config that did not change (a Warm Start's).
@@ -1753,25 +1815,37 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
             // what the watchdog needs to see to re-sync.
             if (cmd.crcValid) {
                 mRowsSinceCommand = 0;
+                mResyncHeld = false;
                 const bool runningWrite = changesRunningPortControl(cmd);
                 mRegisters.OnCommand(cmd);
                 if (runningWrite) mCommands.back().runningPortWriteError = true;
                 if (writesReadOnly(cmd)) mCommands.back().readOnlyWriteError = true;
 
-                // A single-ranked WriteA32 to a data-port register takes committed effect
-                // IMMEDIATELY (no commit) — e.g. PortControl (ScramblerEn/PortMode/Direction),
-                // FlowMode, SampleSizeGrouping. Reconfigure the engine at the next row
-                // boundary so the decode tracks the register state however it was set, not
-                // only at a commit. (Dual-ranked writes stage and take effect at their commit.)
+                // A single-ranked WriteA32 to a register BuildConfig reads takes committed
+                // effect IMMEDIATELY (no commit) — a data-port register (PortControl, FlowMode,
+                // SampleSizeGrouping, ...) or the SLC SkippingDenominator. Reconfigure the
+                // engine at the next row boundary so the decode tracks the register state
+                // however it was set, not only at a commit. (Dual-ranked writes stage and take
+                // effect at their commit.) Every byte the write covers is asked: a write may
+                // start on a byte that is not immediate and cover one that is.
                 if (cmd.phase == swi3s::kPhaseWrite && cmd.opcode == swi3s::kOpWriteA32 &&
-                    cmd.hasAddress && cmd.address >= swi3s::reg::kDpBase &&
-                    mRegisters.WriteIsImmediate(cmd.address))
-                    mPendingImmediateReconfig = true;
+                    cmd.hasAddress) {
+                    for (std::size_t bi = 0; bi < cmd.data.size(); ++bi) {
+                        const U32 a = cmd.address + static_cast<U32>(bi);
+                        const bool configReg = a >= swi3s::reg::kDpBase ||
+                                               a == swi3s::reg::kSkippingDenomHi ||
+                                               a == swi3s::reg::kSkippingDenomLo;
+                        if (configReg && mRegisters.WriteIsImmediate(a)) {
+                            mPendingImmediateReconfig = true;
+                            break;
+                        }
+                    }
+                }
 
                 // ERROR CHECK (see CommandRec::enablechCurrError): a WriteA32 that touches an
                 // EnableCh _CURR byte (0xC1/0xD0/0xD1 within a DP block) writes the channel-
                 // enable register's committed rank directly, bypassing the normal _NEXT ->
-                // _CURR promotion at an SSP/Commit. Per SWI3S v1.1, EnableCh is dual-ranked
+                // _CURR promotion at an SSP/Commit. Per the SWI3S specification, EnableCh is dual-ranked
                 // for exactly this reason: an immediate change to which channels transport is
                 // only safe when the port's Interval is 1 Row (every row transports, so there
                 // is no mid-interval phase for the channel set to change under). Flag it
@@ -1804,11 +1878,15 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
                 // reconfigure to that row (below), the same as an SSP. The only
                 // difference is a DSCR does NOT re-anchor the SSP (see mPendingSspSyncPoint).
                 // An SSPA (Announce with sync point, not a commit) re-anchors only.
+                // A Row_Delay outside 14..15 (Section 9.1.13) names no SSP row: the
+                // command schedules nothing and carries CommandRec::rowDelayError.
                 bool willCommit = cmd.isCommit && cmd.commitConfirmed;
                 bool sspaReanchor = cmd.hasSyncPoint && !cmd.isCommit;
-                if ((willCommit || sspaReanchor) &&
-                    cmd.rowDelay >= swi3s::kSspRowDelayMin &&
-                    cmd.rowDelay <= swi3s::kSspRowDelayMax) {
+                const bool rowDelayValid = cmd.rowDelay >= swi3s::kSspRowDelayMin &&
+                                           cmd.rowDelay <= swi3s::kSspRowDelayMax;
+                if ((willCommit || sspaReanchor) && !rowDelayValid)
+                    mCommands.back().rowDelayError = true;
+                if ((willCommit || sspaReanchor) && rowDelayValid) {
                     int spo = mHaveCsv ? swi3s::kSspDefaultSyncPointOffset
                                        : mRegisters.SyncPointOffset(firstSelectedDevice(cmd.deviceMask));
                     int delay = static_cast<int>(cmd.rowDelay) - spo;
@@ -1859,6 +1937,11 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
             mSspSyncRow = -1;                 // once (the phase then holds for the capture)
         }
         if (mPendingSspRow >= 0 && static_cast<long>(mRowCounter) >= mPendingSspRow) {
+            // Where the SSP lands for the ports running when it arrives, before the commit
+            // it carries rebuilds them.
+            const CPayloadEngine::SspCheck sspAtArrival =
+                (mPendingSspSyncPoint && mEngine.Enabled()) ? mEngine.CheckSsp()
+                                                            : CPayloadEngine::SspCheck{};
             if (mPendingSspCommit) {
                 // The commit takes effect NOW, at the SSP row. Record it on the command
                 // as the authoritative commit point (the UI reads this instead of
@@ -1935,15 +2018,16 @@ void Decoder::feed(BitState level, std::uint64_t sampleNumber, std::uint64_t src
             // Re-anchor the ports' interval timing only for events that generate an SSP
             // (SSCR / SSPA). A DSCR is synced but must NOT reset the SSP, so it skips this.
             if (mEngine.Enabled() && mPendingSspSyncPoint) {
-                const bool midSkipCycle = mEngine.SyncToSSP();
+                mEngine.SyncToSSP();
                 recordSync(evUi);
-                // Flag the SSP that landed mid-skip-pattern on the command that generated
-                // it (CommandRec::unexpectedSspError). Only meaningful for a port that was
-                // already running: a commit that (re)configured the ports this same row
-                // Initialized them, which leaves the accumulator at the top of its cycle.
-                if (midSkipCycle && mPendingSspCmdIndex >= 0 &&
-                    mPendingSspCmdIndex < static_cast<long>(mCommands.size()))
-                    mCommands[mPendingSspCmdIndex].unexpectedSspError = true;
+                // Flag an unexpected SSP on the command that generated it
+                // (CommandRec::unexpectedSspError).
+                if (sspAtArrival.unexpected() && mPendingSspCmdIndex >= 0 &&
+                    mPendingSspCmdIndex < static_cast<long>(mCommands.size())) {
+                    CommandRec& rec = mCommands[mPendingSspCmdIndex];
+                    rec.unexpectedSspError = true;
+                    rec.unexpectedSspMidInterval = sspAtArrival.midInterval;
+                }
             }
             // Checkpoint the post-re-anchor phase so a windowed re-decode can restore it
             // (every commit/SSP gets one, bounding fast-forward regardless of spacing).

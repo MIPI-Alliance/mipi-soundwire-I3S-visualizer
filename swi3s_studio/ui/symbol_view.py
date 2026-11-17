@@ -125,8 +125,12 @@ class SymbolView(QuietFocusMixin, RowOriginMixin, QTableWidget):
             self._at_start = True
             return
         n = len(symbols)
+        cur = (self.currentRow(), self.currentColumn())
+        rows = {r for rng in self.selectedRanges()
+                for r in range(rng.topRow(), rng.bottomRow() + 1)}
         self._symbols = list(symbols) + self._symbols
         self._populate()
+        self._reselect(cur, rows, n)
         anchor = self.item(n, 0)          # the row that was at the top before
         if anchor is not None:
             # Suppress the fetch during this programmatic scroll: if a small chunk
@@ -136,6 +140,25 @@ class SymbolView(QuietFocusMixin, RowOriginMixin, QTableWidget):
                 self.scrollToItem(anchor, QAbstractItemView.PositionAtTop)
             finally:
                 self._suppress_fetch = False
+
+    def _reselect(self, cur, rows, shift: int) -> None:
+        """Put the current cell and the selected rows back on the symbols they were on,
+        `shift` rows lower. Programmatic: it does not echo as a selection."""
+        prev = self._suppress_select
+        self._suppress_select = True
+        self.blockSignals(True)
+        try:
+            self.clearSelection()
+            row, col = cur
+            if row >= 0:
+                self.setCurrentCell(row + shift, max(0, col))
+            for r in sorted(rows):
+                self.setRangeSelected(
+                    QTableWidgetSelectionRange(r + shift, 0, r + shift, self.columnCount() - 1),
+                    True)
+        finally:
+            self.blockSignals(False)
+            self._suppress_select = prev
 
     def set_sample_rate(self, rate_hz: float) -> None:
         self._rate = float(rate_hz or 0.0)

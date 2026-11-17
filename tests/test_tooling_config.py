@@ -179,7 +179,7 @@ def test_the_dev_requirements_floor_the_coverage_release_the_subprocess_option_n
 
 def test_ci_installs_the_package_into_a_clean_environment_and_runs_it():
     ci = _text(".github", "workflows", "ci.yml")
-    job = ci.split("  package:", 1)[1].split("\n  coverage:", 1)[0]
+    job = ci.split("  package:", 1)[1].split("\n  lint:", 1)[0]
     assert "python tools/package_smoke.py" in job
     assert 'PYTHONPATH: ""' in job, "the checkout must not be on the import path"
     # The console launcher and the installed layout differ on Windows.
@@ -289,6 +289,21 @@ def test_the_smoke_tool_copies_the_tree_when_git_is_not_usable(tmp_path, monkeyp
     assert copied == ["pkg/a.py"]
 
 
+def test_the_smoke_tool_makes_its_children_write_utf8(monkeypatch):
+    """Its output is read as UTF-8, so each child is told to write it: a `sys.prefix` with a
+    non-ASCII character reads back whole on Windows, whose pipes use the ANSI code page."""
+    tool = load_tool("package_smoke")
+    monkeypatch.setattr(tool, "export_source", lambda dest, root=None: None)
+    envs = []
+
+    def fake_run(cmd, **kw):
+        envs.append(kw.get("env"))
+        return subprocess.CompletedProcess(cmd, 1, "", "stop")
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+    tool.main([])
+    assert envs and all(e is not None and e.get("PYTHONUTF8") == "1" for e in envs), envs
+
+
 def test_the_smoke_tool_names_an_interpreter_that_cannot_report_its_prefix(monkeypatch, capsys):
     tool = load_tool("package_smoke")
     monkeypatch.setattr(tool, "export_source", lambda dest, root=None: None)
@@ -334,3 +349,40 @@ def test_the_launcher_treats_every_spelling_the_parser_accepts_as_headless(args)
 @pytest.mark.parametrize("args", [[], ["--demo"], ["-c", "x.csv"], ["--rebuild"]])
 def test_the_launcher_opens_a_window_for_everything_else(args):
     assert not _headless_by_launcher(*args)
+
+
+# ---- a bundle is built with a Qt for Python release the vendored notice was reviewed for
+
+_QT_NOTICE = os.path.join("data", "licenses", "Qt-for-Python", "NOTICE.txt")
+_QT_REVIEWED = re.compile(r"^Qt for Python versions reviewed for this notice: (.+)$", re.M)
+_QT_WHEELS = ("pyside6", "pyside6-essentials", "pyside6-addons", "shiboken6")
+
+
+def _qt_reviewed():
+    """The (major, minor) release series the notice's machine-readable line names."""
+    found = _QT_REVIEWED.findall(_text(_QT_NOTICE))
+    assert len(found) == 1, f"{_QT_NOTICE} must carry exactly one 'reviewed for this notice' line"
+    return {tuple(int(x) for x in item.strip().split(".")) for item in found[0].split(",")}
+
+
+def test_the_bundle_constraints_pin_every_qt_for_python_wheel_to_one_reviewed_release():
+    pins = {}
+    for line in _text("tools", "bundle_constraints.txt").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            req = Requirement(line)
+            spec, = req.specifier
+            assert spec.operator == "==", line
+            pins[canonicalize_name(req.name)] = spec.version
+    assert set(_QT_WHEELS) <= set(pins), pins
+    assert all(n == "shiboken6" or n.startswith("pyside6") for n in pins), pins
+    assert len(set(pins.values())) == 1, pins
+    series = tuple(int(x) for x in pins["pyside6"].split(".")[:2])
+    assert series in _qt_reviewed(), (
+        f"the bundle pins PySide6 {pins['pyside6']}, a series {_QT_NOTICE} was not reviewed for")
+
+
+def test_the_pyside6_requirement_floor_is_the_same_in_both_requirement_files():
+    floors = [_requirement_floors(lines).get("pyside6") for lines in (
+        _text("requirements.txt").splitlines(), _pyproject()["project"]["dependencies"])]
+    assert floors[0] and floors[0] == floors[1], floors

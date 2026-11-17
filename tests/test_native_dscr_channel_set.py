@@ -1,6 +1,6 @@
 """A DSCR that changes a running port's channel set applies it from its commit point.
 
-SSCR and DSCR generate the same Commit operation (SWI3S v1.1 §4.9.4), which takes effect at
+SSCR and DSCR generate the same Commit operation (SWI3S §4.9.4), which takes effect at
 the commit point's Row Sync Point (§9.1.13). A DSCR generates no SSP, so the port keeps its
 interval phase and skipping accumulator. Rules:
 

@@ -497,6 +497,37 @@ def test_a_capped_result_keeps_the_best_scoring_occurrences():
     assert sorted(m["score"] for m in everything) == [0.99] * 6 + [1.0] * 6
 
 
+def test_diagnostics_report_the_matches_cut_by_max_matches():
+    sub = _aperiodic_sub()
+    main, _starts = _main_with_occurrences([False] * 12, sub)
+    diag: dict = {}
+    matches = locate_subcapture(main, _cap_from_bits(sub), max_matches=4, diagnostics=diag)
+    assert len(matches) == 4
+    assert (diag["total_matches"], diag["hits_capped"], diag["truncated"]) == (12, False, True)
+    diag = {}
+    matches = locate_subcapture(main, _cap_from_bits(sub), max_matches=64, diagnostics=diag)
+    assert len(matches) == 12
+    assert (diag["total_matches"], diag["hits_capped"], diag["truncated"]) == (12, False, False)
+
+
+def test_diagnostics_report_a_hit_list_cut_at_the_hit_limit(monkeypatch):
+    """Both search paths limit the raw hit list; the result says so, and that its
+    total is a lower bound."""
+    from swi3s_studio.analysis import subcapture
+    bits = np.zeros(3000, dtype=np.int64)
+    main, sub = _cap_from_bits(bits), _cap_from_bits(bits[:100])
+    for budget in (10 ** 12, 0):                       # the convolve path, then the exact path
+        monkeypatch.setattr(subcapture, "_CONVOLVE_BUDGET", budget)
+        monkeypatch.setattr(subcapture, "_MAX_HITS", 50)
+        diag: dict = {}
+        locate_subcapture(main, sub, max_matches=1000, diagnostics=diag)
+        assert diag["hits_capped"] is True and diag["truncated"] is True, (budget, diag)
+        monkeypatch.setattr(subcapture, "_MAX_HITS", 10 ** 9)
+        diag = {}
+        locate_subcapture(main, sub, max_matches=1000, diagnostics=diag)
+        assert diag["hits_capped"] is False and diag["truncated"] is False, (budget, diag)
+
+
 def test_a_capped_result_is_reported_in_time_order_not_score_order():
     sub = _aperiodic_sub()
     flags = [True, True, False, False, True]                  # scores .99 .99 1 1 .99

@@ -1,5 +1,5 @@
 """Import warnings from Timing Calculator settings (File ▸ Open Timing Settings, a
-workspace's timing inputs, and the Example side's Load Example): a key this version does not
+workspace's timing inputs, and the Example side's Load Example Settings): a key this version does not
 read, a choice no selector offers, and a number outside its field's range are reported."""
 import json
 import os
@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 
 from swi3s_studio import import_notes
 
-pytestmark = pytest.mark.gui
+pytestmark = [pytest.mark.gui, pytest.mark.usefixtures("shared_compute")]
 
 
 def _tv():
@@ -20,20 +20,33 @@ def _tv():
     return TimingView()
 
 
-def test_saved_settings_read_back_without_warnings_on_every_bus_choice():
-    tv = _tv()
-    for i in range(tv._man_spec_combo.count()):
-        tv._man_spec_combo.setCurrentIndex(i)
-        d = tv.to_dict()
+def test_saved_settings_read_back_unchanged_on_a_pair_of_every_bus_choice():
+    """Pairing each source as Manager with the next as Peripheral covers every source on
+    both sides. Each pair is saved, loaded into a second page set to the opposite pair and
+    read back without a note, with both selectors and every saved value as they were."""
+    saved, loaded = _tv(), _tv()
+    n = saved._man_spec_combo.count()
+    assert saved._per_spec_combo.count() == n and n > 2
+    for m in range(n):
+        p = (m + 1) % n
+        saved._man_spec_combo.setCurrentIndex(m)
+        saved._per_spec_combo.setCurrentIndex(p)
+        d = saved.to_dict()
+        pair = (d["man_spec"], d["per_spec"])
+        loaded._man_spec_combo.setCurrentIndex(p)
+        loaded._per_spec_combo.setCurrentIndex(m)
         with import_notes.collect() as notes:
-            _tv().set_from_dict(d, source="t.json")
-        assert notes == [], tv._man_spec_combo.itemData(i)
+            loaded.set_from_dict(d, source="t.json")
+        assert notes == [], (pair, [note.message for note in notes])
+        assert (loaded._man_spec_combo.currentData(),
+                loaded._per_spec_combo.currentData()) == pair
+        assert loaded.to_dict() == d, pair
 
 
 def test_unknown_keys_choices_and_out_of_range_numbers_are_reported():
     tv = _tv()
     d = tv.to_dict()
-    row_key = next(k for k in d if k.endswith("::max"))
+    row_key = next(k for k in d if k.startswith("proposed::") and k.endswith("::max"))
     d.update({"color_scheme": "blue", "man_spec": "NO_SUCH_PHY", "fclk_target": 1e9,
               row_key: 1e12, "phy": 2, "spec::man_shape": d["man_shape"]})
     with import_notes.collect() as notes:
@@ -86,6 +99,31 @@ def test_open_timing_settings_shows_its_warnings(tmp_path, monkeypatch):
     assert dlgs[0].windowTitle() == "Import warnings — timing_settings.json"
     assert dlgs[0].lines()[0].startswith(
         "timing_settings.json: 'launch_mode' 'telepathy' is not one of the choices offered")
+
+
+def test_open_timing_settings_reads_a_bom_and_reports_an_unreadable_file(tmp_path,
+                                                                         monkeypatch):
+    """A settings file with a UTF-8 byte-order mark loads; one nested too deep to parse, or
+    larger than the cap, is reported in the box."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from swi3s_studio.ui.timing_view import _MAX_EXAMPLE_BYTES
+    win = _window()
+    d = win._timing_page.to_dict()
+    d["fclk_target"] = 12.0
+    path = tmp_path / "timing_settings.json"
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    told = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: told.append(a[2]))
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(d).encode("utf-8"))
+    win.open_timing_settings()
+    assert told == [] and win._timing_page.to_dict()["fclk_target"] == 12.0
+    path.write_text("[" * 100_000, encoding="utf-8")
+    win.open_timing_settings()
+    path.write_bytes(b" " * (_MAX_EXAMPLE_BYTES + 1))
+    win.open_timing_settings()
+    assert len(told) == 2 and all(t.startswith("Couldn't read that file: ") for t in told)
+    assert "larger than" in told[1]
 
 
 def test_load_example_reports_rows_it_does_not_have(tmp_path, monkeypatch):
@@ -144,10 +182,31 @@ def test_settings_the_model_cannot_evaluate_show_why_and_warn():
 
 def test_a_saved_clocked_launch_on_a_soundwire_manager_warns():
     tv = _tv()
-    d = {**tv.to_dict(), "man_spec": "SW13_1V2", "launch_mode": "4x"}
+    # The Specification column's PHY2 values are left out: they are not a SoundWire table.
+    d = {**{k: v for k, v in tv.to_dict().items() if not k.startswith("spec::")},
+         "man_spec": "SW13_1V2", "launch_mode": "4x"}
     with import_notes.collect() as notes:
         tv.set_from_dict(d, source="t.json")
     assert [n.message for n in notes] == [
         f"'launch_mode' '4x' does not apply to a SoundWire Manager; "
         f"{tv._launch_combo.currentText()!r} is used"]
     assert not tv._launch_combo.isEnabled()
+
+
+def test_load_example_reports_entries_with_no_range_and_keys_it_does_not_read(
+        tmp_path, monkeypatch):
+    win = _window()
+    tv = win._timing_page
+    payload = tv._serialize_side("proposed")
+    first, second, third = list(payload)[:3]
+    payload[first] = {"lo": 10, "hi": 20}                  # another tool's names
+    payload[second] = {}
+    payload[third]["minimum"] = 5                          # a range, plus a key not read
+    path = tmp_path / "example.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    tv._load_proposed()
+    lines = win.import_warning_dialogs()[0].lines()
+    assert (f"example.json: 2 row(s) this version does not have or cannot read, ignored: "
+            f"{first}, {second}") in lines
+    assert f"example.json: 1 key(s) this version does not read, ignored: {third}.minimum" in lines

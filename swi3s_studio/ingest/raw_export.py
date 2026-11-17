@@ -27,6 +27,13 @@ from . import saleae_binary
 from .capture import Capture
 
 
+def bin_paths(path: str, channels) -> list[str]:
+    """The files `export_bin` writes for `path` and `channels`: the stem of `path` (a
+    trailing ``.bin`` removed) plus ``-digital-<channel>.bin`` for each channel."""
+    stem = path[:-4] if path.lower().endswith(".bin") else path
+    return [f"{stem}-digital-{int(ch)}.bin" for ch in channels]
+
+
 def export_bin(capture: Capture, path: str, *,
                clock_channel: int = 0, data_channel: int = 1,
                include_clock: bool = True, include_data: bool = True) -> list[str]:
@@ -52,10 +59,8 @@ def export_bin(capture: Capture, path: str, *,
         signals.append((data_channel, capture.data_edges, capture.initial_data))
     if not signals:
         raise ValueError("export_bin: no signals selected")
-    stem = path[:-4] if path.lower().endswith(".bin") else path
     written: list[str] = []
-    for ch, edges, init in signals:
-        p = f"{stem}-digital-{int(ch)}.bin"
+    for (ch, edges, init), p in zip(signals, bin_paths(path, [ch for ch, _e, _i in signals])):
         times = np.ascontiguousarray(edges, dtype=np.float64) / rate
         saleae_binary.write_channel(p, bool(init), times, begin_time=0.0)
         written.append(p)

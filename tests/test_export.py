@@ -163,3 +163,55 @@ def test_a_failed_commands_export_keeps_the_previous_file(tmp_path, monkeypatch,
     export()
     assert "Ping" in path.read_text(encoding="utf-8")
     assert [p.name for p in tmp_path.iterdir()] == ["commands.csv"]
+
+
+def test_a_vendor_register_is_named_from_the_links_peripheral_map(tmp_path):
+    """An address outside the SWI3S map is named from the addressed device's peripheral map,
+    as the Commands table names it, in the one-Link and the All Links export; with no map
+    for that device it reads as its address region."""
+    from types import SimpleNamespace
+
+    from swi3s_studio.export import write_links_commands_csv
+    from swi3s_studio.model.registers import region_name
+    addr = 0x0040_1000
+    pmap = SimpleNamespace(resolve=lambda a: SimpleNamespace(name="AMP_GAIN") if a == addr else None)
+    cmd = {"command": "WriteA32", "has_address": True, "address": addr, "device_mask": 1 << 3,
+           "data": b"\x01"}
+    other = dict(cmd, device_mask=1 << 4)
+    rmap = RegisterMap.load()
+    assert rmap.resolve(addr) is None
+    one = str(tmp_path / "one.csv")
+    write_commands_csv([cmd, other], one, rmap, {3: pmap})
+    rows = list(csv.DictReader(pathlib.Path(one).read_text(encoding="utf-8").splitlines()))
+    assert [r["register"] for r in rows] == ["AMP_GAIN", region_name(addr)]
+    both = str(tmp_path / "all.csv")
+    write_links_commands_csv([("Link 1", [cmd], lambda s: s, {3: pmap}),
+                              ("Link 2", [dict(cmd, start_sample=1)], lambda s: s, {})],
+                             both, rmap)
+    rows = list(csv.DictReader(pathlib.Path(both).read_text(encoding="utf-8").splitlines()))
+    assert [(r["link"], r["register"]) for r in rows] == [
+        ("Link 1", "AMP_GAIN"), ("Link 2", region_name(addr))]
+
+
+def test_a_vendor_register_name_with_a_formula_character_is_quoted(tmp_path):
+    """A register name from an imported peripheral map is quoted like a Link name, in the
+    one-Link and the All Links export, whichever of = + - @ it starts with."""
+    from types import SimpleNamespace
+
+    from swi3s_studio.export import write_links_commands_csv
+    addr = 0x0040_1000
+    names = ['=HYPERLINK("http://x","Gain")', "+SUM(A1)", "-2+3", "@cmd", "AMP_GAIN"]
+    cmd = {"command": "WriteA32", "has_address": True, "address": addr, "device_mask": 1 << 3,
+           "data": b"\x01"}
+    rmap = RegisterMap.load()
+    for name in names:
+        pmap = SimpleNamespace(resolve=lambda a, n=name: SimpleNamespace(name=n))
+        want = name if name == "AMP_GAIN" else "'" + name
+        one = str(tmp_path / "one.csv")
+        write_commands_csv([cmd], one, rmap, {3: pmap})
+        rows = list(csv.DictReader(pathlib.Path(one).read_text(encoding="utf-8").splitlines()))
+        assert [r["register"] for r in rows] == [want]
+        both = str(tmp_path / "all.csv")
+        write_links_commands_csv([("Link 1", [cmd], lambda s: s, {3: pmap})], both, rmap)
+        rows = list(csv.DictReader(pathlib.Path(both).read_text(encoding="utf-8").splitlines()))
+        assert [r["register"] for r in rows] == [want]

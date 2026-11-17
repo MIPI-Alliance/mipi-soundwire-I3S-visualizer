@@ -1,7 +1,9 @@
 """What a capture file is, before anything is decoded: the Open Capture dialog's Source.
 
-`probe(paths)` reads only what is cheap and bounded: a .sal's zip directory, a header, the
-tail of a text file for its last timestamp, and a capped prefix for edge counts.
+`probe(paths)` reads what is bounded in memory: a .sal's zip directory and the block
+headers of each digital channel (each blob is inflated once and nothing of it is kept, so
+the time taken grows with the file), a header, the tail of a text file for its last
+timestamp, and a capped prefix for edge counts.
 Whatever a format cannot report that way is None, and the dialog
 shows "—" rather than a guess.
 
@@ -13,7 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .timebase import MAX_LINE_CHARS
 
@@ -41,48 +43,61 @@ class CaptureProbe:
     analog: bool = False         # volts, thresholded on load (per-channel hi/lo)
     two_file: bool = False       # the two channels are two files (.bin / .wfm pair)
     cost_all_bytes: Optional[int] = None   # rough peak to load ONE Link, all of it
-    # A windowed read's model (saleae_sal.SalWindowModel) over one Link's two channels:
-    # the figure the loader's guard prices a window by.
+    # A windowed read's model (saleae_sal.SalWindowModel) over every channel: the figure
+    # the loader's guard prices a window by, taken for a Link's two (SalWindowModel.of).
     window_model: Any = None
+    # Each channel's share of a whole load's peak, where a Link's cost is the sum over its
+    # two channels; empty when a Link costs cost_all_bytes whichever two it loads.
+    cost_by_channel: Dict[Any, int] = field(default_factory=dict)
+    # The two channels cost_all_bytes and window_model price when no Link names its own.
+    priced_pair: Tuple[Any, ...] = ()
 
     @property
     def name(self) -> str:
         return " + ".join(os.path.basename(p) for p in self.paths)
 
-    def cost_bytes(self, t0: Optional[float] = None, t1: Optional[float] = None) -> Optional[int]:
-        """Rough peak to load one Link's [t0, t1) s (None: all). A windowed read is priced
-        by the loader's own window model (saleae_sal.SalWindowModel.peak_bytes, the
-        blocks the window decodes), so a window this calls fitting is one the loader's
+    def cost_bytes(self, t0: Optional[float] = None, t1: Optional[float] = None,
+                   channels: Optional[Sequence[Any]] = None) -> Optional[int]:
+        """Rough peak to load one Link's [t0, t1) s (None: all), the Link loading
+        `channels` (channel values; None: `priced_pair`). A windowed read is priced by the
+        loader's own window model of those channels (saleae_sal.SalWindowModel.peak_bytes,
+        the blocks the window decodes), so a window this calls fitting is one the loader's
         guard admits; any other format reads the whole file whatever the window. Each
-        further Link from the file is loaded, and kept, as well: the dialog
-        multiplies."""
+        further Link from the file is loaded, and kept, as well: the dialog sums."""
         if self.cost_all_bytes is None:
             return None
+        whole = self.cost_all_bytes
+        if channels is not None and self.cost_by_channel:
+            whole = sum(self.cost_by_channel.get(c, 0) for c in channels)
         if t0 is None or t1 is None or not self.windowed or not self.duration_s:
-            return self.cost_all_bytes
+            return whole
         rate = float(self.sample_rate_hz or 0.0)
         if self.window_model is not None and rate > 0:
             # The samples the loader will be asked for (Session.window_samples: the
             # nearest samples, the end one past).
             s0, s1 = int(round(t0 * rate)), int(round(t1 * rate)) + 1
-            return self.window_model.peak_bytes(s0, s1)
-        return int(self.cost_all_bytes * max(0.0, min(1.0, (t1 - t0) / self.duration_s)))
+            pair = self.priced_pair if channels is None else channels
+            return self.window_model.of(pair).peak_bytes(s0, s1)
+        return int(whole * max(0.0, min(1.0, (t1 - t0) / self.duration_s)))
 
-    def largest_window_s(self, budget_bytes: int) -> Optional[float]:
-        """Length in seconds of the longest window from the capture start whose
-        `cost_bytes` is within `budget_bytes` (one Link); None when the cost or the
+    def largest_window_s(self, budget_bytes: int,
+                         cost: Optional[Callable[[float, float], Optional[int]]] = None
+                         ) -> Optional[float]:
+        """Length in seconds of the longest window from the capture start whose `cost`
+        (default `cost_bytes`, one Link) is within `budget_bytes`; None when the cost or the
         length is unknown, or a window is not read on its own; 0.0 when no window fits."""
+        cost = cost or self.cost_bytes
         span = float(self.duration_s or 0.0)
         if self.cost_all_bytes is None or not self.windowed or span <= 0:
             return None
-        if (self.cost_bytes(0.0, span) or 0) <= budget_bytes:
+        if (cost(0.0, span) or 0) <= budget_bytes:
             return span
         lo, hi = 0.0, span
-        if (self.cost_bytes(0.0, 0.0) or 0) > budget_bytes:
+        if (cost(0.0, 0.0) or 0) > budget_bytes:
             return 0.0
-        for _ in range(60):                  # cost_bytes is non-decreasing in the length
+        for _ in range(60):                  # the cost is non-decreasing in the length
             mid = (lo + hi) / 2.0
-            if (self.cost_bytes(0.0, mid) or 0) <= budget_bytes:
+            if (cost(0.0, mid) or 0) <= budget_bytes:
                 lo = mid
             else:
                 hi = mid
@@ -143,20 +158,24 @@ def _probe_sal(path: str) -> CaptureProbe:
         cost, per = None, {}
     pr.channels = [ProbedChannel(c, f"Channel {c}", per.get(c), approx=True)
                    for c in info.channels]
-    # Two channels are loaded per Link: price, and measure, the busiest two, as a first
-    # Link would.
+    # Two channels are loaded per Link, each Link priced by its own two (cost_bytes); with
+    # none named, the busiest two, as a first Link would load.
     two = sorted(info.channels, key=lambda c: per.get(c, 0), reverse=True)[:2]
+    pr.priced_pair = tuple(two)
     model = None
     try:
-        model = saleae_sal.window_model(path, channels=two)
+        model = saleae_sal.window_model(path)
         if model.span_samples and info.sample_rate_hz:
             pr.duration_s = model.span_samples / float(info.sample_rate_hz)
     except Exception:  # noqa: BLE001
         pass
     if cost is not None:
-        edge_bytes = sum(per.get(c, 0) for c in two) * _EDGE_BYTES
-        frac = (edge_bytes / cost.est_edge_bytes) if cost.est_edge_bytes else 1.0
-        pr.cost_all_bytes = int(cost.est_peak_bytes * min(1.0, max(frac, 0.0)))
+        def share(c):
+            frac = (per.get(c, 0) * _EDGE_BYTES / cost.est_edge_bytes
+                    if cost.est_edge_bytes else 0.5)
+            return int(cost.est_peak_bytes * min(1.0, max(frac, 0.0)))
+        pr.cost_by_channel = {c: share(c) for c in info.channels}
+        pr.cost_all_bytes = min(int(cost.est_peak_bytes), sum(share(c) for c in two))
         # A v0 blob has no block chain: a window is read whole, like the other formats.
         pr.windowed = cost.streamable
         if cost.streamable and model is not None and model.span_samples:
@@ -343,13 +362,10 @@ def probe(paths: List[str]) -> CaptureProbe:
     if lp.endswith(".vcd"):
         return _probe_vcd(path)
     if lp.endswith(".csv"):
-        from . import analog_csv
+        from . import analog_csv, visualizer_csv
         with open(path, encoding="utf-8-sig", errors="replace") as f:   # a BOM is no cell
             head = [f.readline(MAX_LINE_CHARS) for _ in range(40)]
-        # A config CSV is "Name,value" rows, a register's name ending _REG; a capture CSV's
-        # first field is Time, so a CHANNEL named …_REG does not make it one.
-        if any(ln.startswith("AppVersion") or ln.split(",")[0].strip().endswith("_REG")
-               or ln.startswith("NumColumns") for ln in head):
+        if visualizer_csv.looks_like_config(head):
             raise ValueError("This looks like a Visualizer config CSV, not a capture.\n\n"
                              "Open it in the Bus Visualizer with File ▸ Open Visualizer CSV.")
         if analog_csv.is_analog_csv(path):
